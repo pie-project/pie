@@ -69,7 +69,7 @@ use objc2::runtime::ProtocolObject;
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{
     MTLBuffer, MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType,
-    MTLResidencySet, MTLResourceOptions, MTLSharedEvent, MTLSparsePageSize,
+    MTLPurgeableState, MTLResidencySet, MTLResourceOptions, MTLSharedEvent, MTLSparsePageSize,
     MTLSparseTextureMappingMode, MTLStorageMode,
 };
 
@@ -276,6 +276,18 @@ struct Chunk {
 
 #[cfg(target_vendor = "apple")]
 impl Chunk {
+    /// Keeps what the heap holds, or lets the system drop it. A heap kept
+    /// again may have lost it (the system then says empty): its reader
+    /// zeroes it first, as it does one whose contents stood.
+    fn hold(&self, kept: bool) {
+        let state = if kept {
+            MTLPurgeableState::NonVolatile
+        } else {
+            MTLPurgeableState::Volatile
+        };
+        self.heap.setPurgeableState(state);
+    }
+
     /// Names the heap in the residency set (`resident`) or takes it out; the
     /// caller commits the set. Answers whether it changed.
     fn reside(&mut self, sparse: &Sparse, resident: bool) -> bool {
@@ -691,13 +703,15 @@ impl Elastic {
     }
 
     /// Takes the spare heaps whose unmap has landed out of the residency
-    /// set. They stay allocated, so a map of the top makes none.
+    /// set and lets the system drop what they hold (volatile): no fire reads
+    /// it. They stay allocated, so a map of the top makes none.
     fn rest_spare(&mut self) {
         let signalled = self.sparse.signalled();
         let mut changed = false;
         for spare in &mut self.spare {
-            if spare.through <= signalled {
-                changed |= spare.chunk.reside(&self.sparse, false);
+            if spare.through <= signalled && spare.chunk.reside(&self.sparse, false) {
+                changed = true;
+                spare.chunk.hold(false);
             }
         }
         if changed {
@@ -751,6 +765,9 @@ impl Elastic {
                 .map(|at| self.spare.swap_remove(at).chunk);
             let made = match reused {
                 Some(chunk) => {
+                    // Kept again before it is zeroed: the system may have
+                    // dropped what it held, or drops it now.
+                    chunk.hold(true);
                     // A heap given back holds what its last owner wrote; a
                     // made one comes zeroed, and so does this. Its unmap has
                     // landed, so no GPU work touches it. One never mapped is
