@@ -39,24 +39,24 @@ impl Run<'_> {
             } if self.rs_seat().is_some() => {
                 const OP: &str = "gather.ngram_ids_committed";
                 let seat = self.rs_seat().expect("guarded");
-                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                let Some(hash) = self.ple_hash(mults, primes, offsets)? else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
                 let ext_ids = self.rs_extend(OP, &seat, *ids)?;
                 gather::ngram::ngram_ids_committed(
                     self.ctx(),
                     ext_ids,
-                    self.qo_indptr(),
-                    &self.rs_committed(&seat, *state),
-                    &self.recurrent(*state),
+                    self.qo_indptr()?,
+                    &self.rs_committed(&seat, *state)?,
+                    &self.recurrent(*state)?,
                     hash,
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    map.map(|id| self.tensor(id)),
-                    self.tensor(*ngram_ids),
+                    map.map(|id| self.tensor(id)).transpose()?,
+                    self.tensor(*ngram_ids)?,
                 )
             }
             Gather::NgramIds {
@@ -70,21 +70,21 @@ impl Run<'_> {
                 map,
                 ngram_ids,
             } => {
-                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                let Some(hash) = self.ple_hash(mults, primes, offsets)? else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
                 gather::ngram::ngram_ids(
                     self.ctx(),
-                    self.tensor(*ids),
-                    &self.recurrent(*state),
+                    self.tensor(*ids)?,
+                    &self.recurrent(*state)?,
                     hash,
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    map.map(|id| self.tensor(id)),
-                    self.tensor(*ngram_ids),
+                    map.map(|id| self.tensor(id)).transpose()?,
+                    self.tensor(*ngram_ids)?,
                 )
             }
             Gather::NgramIdsChunked {
@@ -98,21 +98,21 @@ impl Run<'_> {
                 map,
                 ngram_ids,
             } => {
-                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                let Some(hash) = self.ple_hash(mults, primes, offsets)? else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
                 gather::ngram::ngram_ids_chunked(
                     self.ctx(),
-                    self.ragged(*ids),
-                    &self.recurrent(*state),
+                    self.ragged(*ids)?,
+                    &self.recurrent(*state)?,
                     hash,
                     *eos,
                     mults,
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    map.map(|id| self.tensor(id)),
-                    self.tensor(*ngram_ids),
+                    map.map(|id| self.tensor(id)).transpose()?,
+                    self.tensor(*ngram_ids)?,
                 )
             }
             Gather::Embed {
@@ -124,22 +124,22 @@ impl Run<'_> {
                 scales: None,
                 concat: false,
                 ..
-            } => match self.banked(*table) {
+            } => match self.banked(*table)? {
                 Some(bank) => gather::embed_gather_mb_4bit(
                     self.ctx(),
-                    self.tensor(*ids),
+                    self.tensor(*ids)?,
                     bank,
                     self.bank_rows(*table),
                     *vocab,
-                    self.tensor(*y),
+                    self.tensor(*y)?,
                 ),
                 None => gather::embed_tabled(
                     self.ctx(),
-                    self.tensor(*ids),
-                    self.tensor(*table),
+                    self.tensor(*ids)?,
+                    self.tensor(*table)?,
                     self.row_table(*table),
                     *vocab,
-                    self.tensor(*y),
+                    self.tensor(*y)?,
                 ),
             },
             Gather::Embed {
@@ -158,26 +158,26 @@ impl Run<'_> {
                 y,
                 weights: None,
                 concat: true,
-            } => match self.banked(*table) {
+            } => match self.banked(*table)? {
                 Some(bank) => {
                     let guard = bank.codes.rows.min(*vocab);
                     gather::embed_concat_mb_4bit(
                         self.ctx(),
-                        self.tensor(*ids),
+                        self.tensor(*ids)?,
                         bank,
                         guard,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                     )
                 }
                 None => {
-                    let plane = self.tensor(*table);
+                    let plane = self.tensor(*table)?;
                     let guard = plane.rows.min(*vocab);
                     gather::embed_concat(
                         self.ctx(),
-                        self.tensor(*ids),
+                        self.tensor(*ids)?,
                         plane,
                         guard,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                     )
                 }
             },
@@ -190,12 +190,12 @@ impl Run<'_> {
                 v,
             } => gather::split_qkv(
                 self.ctx(),
-                self.tensor(*packed),
+                self.tensor(*packed)?,
                 *q_width,
                 *kv_width,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*v)?,
             ),
             Gather::SplitQGate {
                 packed,
@@ -204,10 +204,10 @@ impl Run<'_> {
                 gate,
             } => gate::split_q_gate(
                 self.ctx(),
-                self.tensor(*packed),
+                self.tensor(*packed)?,
                 *head_dim,
-                self.tensor(*q),
-                self.tensor(*gate),
+                self.tensor(*q)?,
+                self.tensor(*gate)?,
             ),
             // A segment launch of the projection it splits landed both halves.
             Gather::SplitRows { left, .. } if self.landed_ahead(*left) => Ok(()),
@@ -218,16 +218,16 @@ impl Run<'_> {
                 right,
             } => gather::split_rows(
                 self.ctx(),
-                self.tensor(*x),
+                self.tensor(*x)?,
                 *width,
-                self.tensor(*left),
-                self.tensor(*right),
+                self.tensor(*left)?,
+                self.tensor(*right)?,
             ),
             Gather::PoolRows { x, side, y } => {
-                gather::pool_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+                gather::pool_rows(self.ctx(), self.tensor(*x)?, *side, self.tensor(*y)?)
             }
             Gather::MergeRows { x, side, y } => {
-                gather::merge_rows(self.ctx(), self.tensor(*x), *side, self.tensor(*y))
+                gather::merge_rows(self.ctx(), self.tensor(*x)?, *side, self.tensor(*y)?)
             }
             Gather::Pixels {
                 x,
@@ -239,13 +239,13 @@ impl Run<'_> {
                 y,
             } => gather::pixels(
                 self.ctx(),
-                self.tensor(*x),
+                self.tensor(*x)?,
                 *patch,
                 *mean,
                 *std,
                 *order == poem_ir::PixelOrder::Chw,
                 *temporal,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Gather::GroupFirst {
                 x,
@@ -255,11 +255,11 @@ impl Run<'_> {
                 y,
             } => kernels_metal::conv::rule::group_first(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*csr),
-                self.tensor(*groups),
-                self.tensor(*lanes),
-                self.tensor(*y),
+                self.tensor(*x)?,
+                self.tensor(*csr)?,
+                self.tensor(*groups)?,
+                self.tensor(*lanes)?,
+                self.tensor(*y)?,
             ),
             Gather::GroupRows {
                 csr,
@@ -268,14 +268,14 @@ impl Run<'_> {
                 y,
             } => kernels_metal::conv::rule::group_rows(
                 self.ctx(),
-                self.tensor(*csr),
-                self.tensor(*groups),
-                self.tensor(*lanes),
-                self.tensor(*y),
+                self.tensor(*csr)?,
+                self.tensor(*groups)?,
+                self.tensor(*lanes)?,
+                self.tensor(*y)?,
             ),
             Gather::ConcatCols { xs, y } => {
-                let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
-                gather::concat_cols(self.ctx(), &xs, self.tensor(*y))
+                let xs = xs.iter().map(|x| self.tensor(*x)).collect::<crate::run::Ran<Vec<_>>>()?;
+                gather::concat_cols(self.ctx(), &xs, self.tensor(*y)?)
             }
             Gather::SplitQkvPadded { .. } => Err(kernels_metal::Error::Unsupported {
                 op: "gather.split_qkv_padded",
@@ -290,13 +290,13 @@ impl Run<'_> {
                 weights,
             } => gather::grid_taps(
                 self.ctx(),
-                self.tensor(*positions),
-                self.tensor(*grids),
-                self.tensor(*segments),
+                self.tensor(*positions)?,
+                self.tensor(*grids)?,
+                self.tensor(*segments)?,
                 *kind == poem_ir::TapKind::Bilinear,
                 *side,
-                self.tensor(*ids),
-                self.tensor(*weights),
+                self.tensor(*ids)?,
+                self.tensor(*weights)?,
             ),
             Gather::ScatterLiveRows {
                 src,
@@ -305,9 +305,9 @@ impl Run<'_> {
                 y_out: _,
             } => gather::scatter_live_rows(
                 self.ctx(),
-                self.tensor(*src),
-                self.tensor(*routes),
-                self.uncut(*y),
+                self.tensor(*src)?,
+                self.tensor(*routes)?,
+                self.uncut(*y)?,
             ),
             Gather::Embed {
                 ids,
@@ -320,11 +320,11 @@ impl Run<'_> {
                 ..
             } => gather::embed_weighted(
                 self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*weights),
-                self.tensor(*table),
+                self.tensor(*ids)?,
+                self.tensor(*weights)?,
+                self.tensor(*table)?,
                 *vocab,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             // The forms no builder makes.
             Gather::Embed { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -335,27 +335,27 @@ impl Run<'_> {
                 y_out: _,
             } => gather::scatter_rows(
                 self.ctx(),
-                self.tensor(*src),
-                self.tensor(*routes),
-                self.uncut(*y),
+                self.tensor(*src)?,
+                self.tensor(*routes)?,
+                self.uncut(*y)?,
             ),
             Gather::PackRows { x, perm, y } => gather::pack_rows(
                 self.ctx(),
-                self.uncut(*x),
-                self.tensor(*perm),
-                self.tensor(*y),
+                self.uncut(*x)?,
+                self.tensor(*perm)?,
+                self.tensor(*y)?,
             ),
             Gather::UnpackRows { x, perm, y } => gather::unpack_rows(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*perm),
-                self.uncut(*y),
+                self.tensor(*x)?,
+                self.tensor(*perm)?,
+                self.uncut(*y)?,
             ),
             Gather::Rows { x, rows, y } => gather::gather_rows(
                 self.ctx(),
-                self.uncut(*x),
-                self.tensor(*rows),
-                self.tensor(*y),
+                self.uncut(*x)?,
+                self.tensor(*rows)?,
+                self.tensor(*y)?,
             ),
             Gather::Select {
                 table,
@@ -364,10 +364,10 @@ impl Run<'_> {
                 y,
             } => gather::select(
                 self.ctx(),
-                self.tensor(*table),
+                self.tensor(*table)?,
                 *layer,
                 *width,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
         }
     }

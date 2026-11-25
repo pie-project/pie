@@ -915,8 +915,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Ok(ids) => ids,
                 Err(error) => return Ok(Err(error)),
             };
-        let windowed = crate::model::model().rs_caps().window_tokens > 0;
-        // On a set with a recurrent state or windows a run-ahead fire folds
+        // On a set with a recurrent state a run-ahead fire folds
         // no further than the rows the program has accepted, so a stop can
         // take back the rest; a fire whose tokens the host places is
         // accepted as it is submitted, and everything before it with it.
@@ -959,9 +958,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && groups.len() == 1
             && !adapted
             && !fire_wide_mask;
-        // A pass that may start from a prefix the cache holds may be cut, a
-        // window's too: each piece lands its rows in the window lists and
-        // trims behind them as a fire of its own.
+        // A pass that may start from a prefix the cache holds may be cut.
         let cuttable = decode_envelope.is_none()
             && !wide
             && plain
@@ -1161,17 +1158,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             _ => Vec::new(),
         };
         // An engine that lands a lane's state at rows inside a fire is cut only
-        // past as many as it lands at once. A window's piece keeps the
-        // furthest row inside it as of that row (checkpoint_at), so it forces
-        // no cut.
-        let snapshots = if windowed {
-            0
-        } else {
-            crate::model::model().eta_caps().rs_snapshots as usize
-        };
+        // past as many as it lands at once.
+        let snapshots = crate::model::model().eta_caps().rs_snapshots as usize;
         let forced: Vec<u32> = checkpoints
             .iter()
-            .filter(|_| !windowed)
             .skip(snapshots)
             .step_by(snapshots + 1)
             .map(|&row| (row - held) as u32)
@@ -1200,7 +1190,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             &rs_ws_ids,
             &groups,
             full.lanes.len(),
-            windowed || window_state,
+            window_state,
         ) {
             Ok(frozen) => frozen,
             Err(error) => return Ok(Err(error)),
@@ -1527,16 +1517,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     snapshot,
                     pages,
                     key: keys[pages as usize - 1],
-                    window_at: None,
                 }
             };
-            let (window_at, keep) = piece_window_rows(&checkpoints, windowed, held, &slots);
-            let mut checkpoints_here: Vec<TakeCheckpoint> = match (state, window_at) {
-                (Some(rs), Some(row)) => vec![TakeCheckpoint {
-                    window_at: u32::try_from(row).ok(),
-                    ..at_row(rs, row, false)
-                }],
-                (Some(rs), None) if checkpoints.contains(&slots.end) => {
+            let mut checkpoints_here: Vec<TakeCheckpoint> = match state {
+                Some(rs) if checkpoints.contains(&slots.end) => {
                     vec![at_row(rs, slots.end, false)]
                 }
                 _ => Vec::new(),
@@ -1596,20 +1580,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 present.iter().map(|&group| piece_groups[group].1.clone()).collect()
             };
             let rs_plan = || {
-                if windowed {
-                    host_window_plan(&req, &piece_fold, &piece_rs_ids, keep)
-                } else {
-                    host_rs_plan(
-                        &stores,
-                        &piece_rs_ids,
-                        &piece_rs_groups,
-                        &req,
-                        &piece_fold,
-                        &inside,
-                        (!piece_beam_ends.is_empty()).then_some(piece_beam_ends.as_slice()),
-                        (!piece_beam_ends.is_empty()).then_some(piece_beam_commons.as_slice()),
-                    )
-                }
+                host_rs_plan(
+                    &stores,
+                    &piece_rs_ids,
+                    &piece_rs_groups,
+                    &req,
+                    &piece_fold,
+                    &inside,
+                    (!piece_beam_ends.is_empty()).then_some(piece_beam_ends.as_slice()),
+                    (!piece_beam_ends.is_empty()).then_some(piece_beam_commons.as_slice()),
+                )
             };
             let reserved = reserve(
                 ctx,
@@ -1621,7 +1601,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 &set_lanes,
                 &piece_rs_ids,
                 rs_plan,
-                windowed,
             )
             .await;
             let Reserved {
@@ -1649,7 +1628,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let (set, (slots, written)) = (&group_sets[group], &spans[group]);
                 let lanes = &groups[group].1;
                 let mut tags = Vec::new();
-                let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
+                let rs = rs_ws_ids.get(lanes[0]).copied();
                 let by = fold_at(
                     &pass_lanes,
                     lanes,
@@ -1765,7 +1744,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     .map(|snap| at_row(snap.snapshot, slots.start + u64::from(snap.row), true)),
             );
             let rs_copy = rs_prepared.state_copy();
-            let window_copies = rs_prepared.windowed_copies();
             let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
             let completion = ctx
                 .resources()
@@ -1794,7 +1772,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     completion.clone(),
                     copy_src,
                     copy_dst,
-                    window_copies,
                     rs_copy,
                     frames[at],
                     adapted,

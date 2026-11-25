@@ -5,7 +5,7 @@ use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
 use crate::error::{Fault, Result};
-use crate::weights::{AdapterPlane, BankSeat};
+use crate::weights::BankSeat;
 
 pub const LORA: &str = "lora";
 
@@ -406,24 +406,9 @@ pub fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Source<'a> {
-    Own {
-        instance: InstanceId,
-
-        planes: &'a [AdapterPlane<'a>],
-    },
-
-    Shared {
-        name: &'a str,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub slot: u32,
-
-    pub shared: bool,
 
     pub landed: bool,
 
@@ -433,8 +418,6 @@ pub struct Binding {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Key {
     Instance(InstanceId),
-
-    Shared(crate::blob::Stamp),
 }
 
 #[derive(Debug, Default)]

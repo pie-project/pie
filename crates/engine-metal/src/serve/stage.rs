@@ -774,6 +774,19 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A load for a runtime lays no seat runs: every chunk is the
+        // runtime's to name, so a lane it did not address by ref has none.
+        if self.addressing == super::Addressing::Refs
+            && let Some(seated) = lanes.iter().find(|seated| !seated.refs)
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a seat-addressed lane (seat {}) on a load placed for the runtime: its \
+                     pool lays no seat runs, and every lane names its slots by ref",
+                    seated.lane.slot
+                ),
+            });
+        }
         // A seat-addressed lane writes the seat runs' chunks; a weight slot
         // named there would be overwritten under the cache's feet.
         if lanes.iter().any(|seated| !seated.refs) && self.pools.weights_in_seats() {
@@ -2834,12 +2847,20 @@ impl Shell {
                     ..*seated
                 };
                 self.windowed_pages(k, &seat, fold, None, have, row.rows)?
+            } else if !self.warming {
+                return Err(Fault::program(
+                    "serve::windowed",
+                    format!(
+                        "lane in slot {} of a load whose windowed layers are ring + buffer \
+                         states no ring pieces and no window fold (`Lane::window`)",
+                        lane.slot
+                    ),
+                ));
             } else {
-                // A runtime lane with no fold and no ring (arming, the
-                // load's own fires, the pipeline walk): nothing reads
-                // what such a fire computes, so every page it names is
-                // one scratch page, in the own-row region's last chunk
-                // (past every arm's share).
+                // The pipeline walk drops its fires: nothing reads what
+                // one computes, so every page it names is one scratch
+                // page, in the own-row region's last chunk (past every
+                // arm's share).
                 let page_size = self.pools.window_paging(k).page_size.max(1);
                 let (first, chunks) = self.own_top;
                 if chunks == 0 {

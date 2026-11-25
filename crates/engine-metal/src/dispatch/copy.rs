@@ -63,34 +63,34 @@ fn overflowed(bytes: u64) -> KernelError {
 }
 
 impl Run<'_> {
-    fn copy_plan(&self, region: &Region) -> CopyPlan {
+    fn copy_plan(&self, region: &Region) -> crate::run::Ran<CopyPlan> {
         let mut plan = CopyPlan {
             region: self.at_region(),
             ..CopyPlan::default()
         };
-        let rows = self.window().span.rows;
+        let rows = self.window()?.span.rows;
         let mut at = 0u64;
-        let mut note = |plan: &mut CopyPlan, id: ValueId, written: bool| {
+        let mut note = |plan: &mut CopyPlan, id: ValueId, written: bool| -> crate::run::Ran<()> {
             let Some(decl) = self.values().get(id.0 as usize) else {
-                return;
+                return Ok(());
             };
             if matches!(decl.def, Def::Cache(_)) || matches!(decl.ty, Ty::Struct(_)) {
-                return;
+                return Ok(());
             }
             let Ty::Tensor { shape, .. } = &decl.ty else {
-                return;
+                return Ok(());
             };
             if !matches!(shape.first(), Some(Dim::Tokens)) {
-                return;
+                return Ok(());
             }
-            let wide = self.uncut(id);
+            let wide = self.uncut(id)?;
             let Some(key) = self.address(wide.buf) else {
-                return;
+                return Ok(());
             };
             if let Some(held) = plan.slots.iter_mut().find(|slot| slot.key == key) {
                 held.read |= !written;
                 held.written |= written;
-                return;
+                return Ok(());
             }
             let offset = align(at);
             at = offset + u64::from(rows) * row_bytes(wide);
@@ -102,16 +102,17 @@ impl Run<'_> {
                 read: !written,
                 written,
             });
+            Ok(())
         };
 
         let Some((ins, outs)) = fallback::operands(self.nodes(), region) else {
-            return plan;
+            return Ok(plan);
         };
         for id in ins {
-            note(&mut plan, id, false);
+            note(&mut plan, id, false)?;
         }
         for id in outs {
-            note(&mut plan, id, true);
+            note(&mut plan, id, true)?;
         }
         // The fire's masks are per row: where it stages any, the copy carries
         // each gathered row's word and mask row, as 4-byte words, which the
@@ -139,13 +140,13 @@ impl Run<'_> {
             }
         }
         plan.bytes = at;
-        plan
+        Ok(plan)
     }
 
     fn mint_copy(&self, plan: &mut CopyPlan) -> Result<(), KernelError> {
         for slot in &mut plan.slots {
             let bytes = u64::from(slot.tight.rows) * row_bytes(slot.tight);
-            let Some(handle) = self.copy_room(slot.offset, bytes) else {
+            let Some(handle) = self.copy_room(slot.offset, bytes).map_err(crate::error::kernel)? else {
                 return Err(overflowed(plan.bytes));
             };
             slot.tight.buf = handle;
@@ -174,7 +175,7 @@ impl Run<'_> {
     /// is a mis-carved fire, refused by name.
     fn gathered_rows(&self, region: &Region) -> Result<Tensor, kernels_metal::Error> {
         self.window()
-            .gathered
+            ?.gathered
             .as_ref()
             .map(|gathered| gathered.rows)
             .ok_or_else(|| kernels_metal::Error::Backend {
@@ -189,11 +190,12 @@ impl Run<'_> {
 
 impl Serve for Run<'_> {
     fn copies(&self, _region: &Region) -> bool {
-        self.window().gathered.is_some()
+        // A run past the fire's windows refuses at its gather (`Run::window`).
+        self.window().is_ok_and(|window| window.gathered.is_some())
     }
 
     fn gather(&mut self, region: &Region) -> Result<(), KernelError> {
-        let mut plan = self.copy_plan(region);
+        let mut plan = self.copy_plan(region).map_err(crate::error::kernel)?;
         if !plan.slots.is_empty() {
             self.mint_copy(&mut plan)?;
         }

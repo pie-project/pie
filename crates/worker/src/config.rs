@@ -600,110 +600,16 @@ pub struct ModelConfig {
     /// artifact store at `$PIE_HOME/artifacts`).
     #[serde(default)]
     pub weight_cache_dir: String,
-    /// Where this deployment's shared adapters live, or empty to mount none.
-    /// A read-only directory with one subdirectory per adapter, each holding
-    /// an `adapter.toml` and the plane files it names.
-    #[serde(default)]
-    pub adapter_dir: String,
     /// Dtype weights are materialized in.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
-    /// How many adapter seats this deployment intends to use, and which
-    /// adapters to write into them at boot. Absent means zero seats.
-    #[serde(default)]
-    pub adapters: AdapterConfig,
 }
 
 fn default_weight_dtype() -> String {
     "bfloat16".to_string()
 }
 
-/// What an operator states about LoRA adapters: a capacity and a roster.
-///
-/// The capacity is an intent, not a pool size: `seats` states how many the
-/// deployment intends to register, and a load whose intent exceeds what the
-/// model text seats is refused at compile.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AdapterConfig {
-    /// How many adapter rows this deployment intends to use. Omit to derive
-    /// it from [`registered`](AdapterConfig::registered); state it to reserve
-    /// room for adapters that arrive later.
-    /// The adapters to write into those seats at boot, in the order given.
-    #[serde(default)]
-    pub seats: Option<u32>,
-    #[serde(default)]
-    pub registered: Vec<RegisteredAdapter>,
-}
-
-/// One adapter, as an operator names it.
-///
-/// The planes are raw bytes and the padding is the caller's: a file here is
-/// one bank's slot, exactly, in the bank's declared dtype and layout. A file
-/// of the wrong length is refused by the engine, by name, with both numbers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RegisteredAdapter {
-    /// Which row of every named bank this fills — the id a lane routes to.
-    pub id: u32,
-    /// Bank name (the plan's own `Param` spelling) to the file holding one
-    /// slot of it. A bank this map omits keeps what it held.
-    #[serde(default)]
-    pub planes: std::collections::BTreeMap<String, String>,
-}
-
-impl AdapterConfig {
-    /// The capacity to bake against: what the operator stated, else what the
-    /// roster needs (a roster whose highest id is `n` needs `n + 1` seats).
-    /// Nothing to seat and nothing to register.
-    #[must_use]
-    pub fn seats(&self) -> u32 {
-        self.seats.unwrap_or_else(|| {
-            self.registered
-                .iter()
-                .map(|adapter| adapter.id.saturating_add(1))
-                .max()
-                .unwrap_or(0)
-        })
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.seats() == 0 && self.registered.is_empty()
-    }
-
-    /// Checks what this layer can answer without a device: whether the
-    /// roster fits the stated capacity, and every plane path is absolute.
-    fn validate(&self) -> Result<()> {
-        let seats = self.seats();
-        for adapter in &self.registered {
-            ensure!(
-                adapter.id < seats,
-                "model.adapters: adapter id {} is past the {seats} seat(s) this \
-                 deployment asks for; raise `[model.adapters] seats` or renumber it",
-                adapter.id
-            );
-            for (bank, path) in &adapter.planes {
-                ensure!(
-                    Path::new(path).is_absolute(),
-                    "model.adapters: the plane for bank {bank:?} of adapter {} must be \
-                     an absolute path (got {path:?})",
-                    adapter.id
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 impl ModelConfig {
-    /// The shared-adapter mount as the boot seam spells it: `Some(path)` when
-    /// the operator stated one, `None` (the feature off) for the empty
-    /// default.
-    pub fn adapter_mount(&self) -> Option<std::path::PathBuf> {
-        (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
-    }
-
     /// What this config changes about the deployment its checkpoint states.
     ///
     /// # Errors
@@ -783,13 +689,6 @@ impl ModelConfig {
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
-        ensure!(
-            self.adapter_dir.is_empty() || Path::new(&self.adapter_dir).is_absolute(),
-            "model.adapter_dir must be an absolute path (got {:?}); \
-             leave it empty to mount no shared adapters at all",
-            self.adapter_dir
-        );
-        self.adapters.validate()?;
         Ok(())
     }
 }
@@ -1267,9 +1166,7 @@ device = ["metal:0"]
         an_engine_s_own_key_is_written_beside_the_common_ones();
         parses_minimal_metal_config();
         every_engine_kind_round_trips_through_its_config_string();
-        adapters_are_absent_by_default_and_that_is_zero_seats();
-        the_seat_count_is_stated_once_or_derived_from_the_roster();
-        an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
+        the_operator_adapter_keys_are_unknown_fields();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
     }
 
@@ -1348,12 +1245,12 @@ device = ["metal:0"]
     fn a_distributed_worker_states_no_cluster_policies() {
         let toml = format!(
             "{MINIMAL_METAL}\n[cluster]\ncontroller = \"10.0.0.1:7000\"\nrole = \"decode\"\n\
-             cluster_policies = [\"persist-prefix\"]\n"
+             cluster_policies = [\"my-policy\"]\n"
         );
         let err = Config::parse(&toml).unwrap_err().to_string();
         assert!(err.contains("the controller's to run"), "got: {err}");
         let alone =
-            format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"persist-prefix\"]\n");
+            format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"my-policy\"]\n");
         Config::parse(&alone).expect("single-node runs them in its own controller");
     }
 
@@ -1482,83 +1379,19 @@ device = ["metal:0"]
         );
     }
 
-    /// `[model.adapters]` absent is zero seats, no roster, and the
-    /// correction op never launches.
-    fn adapters_are_absent_by_default_and_that_is_zero_seats() {
-        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        cfg.validate().unwrap();
-        assert!(cfg.model.adapters.is_empty());
-        assert_eq!(cfg.model.adapters.seats(), 0);
-        assert!(cfg.model.adapters.registered.is_empty());
-    }
-
-    /// The capacity is stated once: either the operator says it, or the
-    /// roster does — one number, one owner.
-    fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
-        let plane = if cfg!(windows) {
-            "C:/adapters/0/a.bin"
-        } else {
-            "/adapters/0/a.bin"
-        };
-        let toml = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            &format!(
-                "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-                 [[model.adapters.registered]]\n\
-                 id = 2\n\
-                 planes = {{ \"layer.0.lora_a\" = \"{plane}\" }}\n"
-            ),
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.model.adapters.seats(), 3);
-        assert_eq!(cfg.model.adapters.registered.len(), 1);
-        assert_eq!(
-            cfg.model.adapters.registered[0].planes["layer.0.lora_a"],
-            plane
-        );
-
-        let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");
-        let cfg: Config = toml::from_str(&stated).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.model.adapters.seats(), 8);
-    }
-
-    /// The two refusals this layer can make without a device.
-    fn an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name() {
-        let past = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseats = 2\n\
-             [[model.adapters.registered]]\n\
-             id = 5\n",
-        );
-        let cfg: Config = toml::from_str(&past).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("adapter id 5 is past the 2 seat"),
-            "got: {err}"
-        );
-
-        let relative = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-             [[model.adapters.registered]]\n\
-             id = 0\n\
-             planes = { \"layer.0.lora_a\" = \"a.bin\" }\n",
-        );
-        let cfg: Config = toml::from_str(&relative).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("must be \n             an absolute path")
-                || err.contains("absolute path"),
-            "got: {err}"
-        );
-
-        let typo = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseat = 2\n",
-        );
-        toml::from_str::<Config>(&typo)
-            .expect_err("a near-miss of `seats` must be refused by name");
+    /// An adapter comes through a program: `[model]` declares neither an
+    /// adapter directory nor a roster.
+    fn the_operator_adapter_keys_are_unknown_fields() {
+        for (key, line) in [
+            ("adapter_dir", "adapter_dir = \"/srv/adapters\""),
+            ("adapters", "[model.adapters]\nseats = 1"),
+        ] {
+            let toml = MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                &format!("source = \"Qwen/Qwen3-0.6B\"\n{line}"),
+            );
+            let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown field `{key}`")), "{err}");
+        }
     }
 }

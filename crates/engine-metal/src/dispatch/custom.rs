@@ -15,12 +15,12 @@ pub(crate) fn refuses(op: &Fused) -> bool {
 
 impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
-        match op {
+        let ran = match op {
             _ if refuses(op) => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Fused::MatmulSwigluMatmul { .. } => self.fused_linear(op),
             _ => self.fused_elemwise(op),
-        }
-        .map_err(crate::error::kernel)
+        };
+        self.settled(ran).map_err(crate::error::kernel)
     }
 }
 
@@ -37,7 +37,7 @@ impl Run<'_> {
         match op {
             Conv::Grid { grid, rule, y } => conv::rule::derive_grid(
                 self.ctx(),
-                self.tensor(*grid),
+                self.tensor(*grid)?,
                 match *rule {
                     poem_ir::GridRule::Conv {
                         k,
@@ -67,7 +67,7 @@ impl Run<'_> {
                         conv::rule::GridRule::AvgDown { factor }
                     }
                 },
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Conv::Conv3d {
                 x,
@@ -93,10 +93,10 @@ impl Run<'_> {
                 }
                 conv::conv3d::conv3d(
                     self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*grid),
-                    self.tensor(*w),
-                    bias.map(|bias| self.tensor(bias)),
+                    self.tensor(*x)?,
+                    self.tensor(*grid)?,
+                    self.tensor(*w)?,
+                    bias.map(|bias| self.tensor(bias)).transpose()?,
                     None,
                     conv::conv3d::Conv3d {
                         k: *k,
@@ -111,9 +111,9 @@ impl Run<'_> {
                         dilation: *dilation,
                         depthwise: *depthwise,
                     },
-                    self.tensor(*y_grid),
-                    self.tensor(*y),
-                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+                    self.tensor(*y_grid)?,
+                    self.tensor(*y)?,
+                    [self.grid_base(*grid, *x)?, self.grid_base(*y_grid, *y)?],
                 )
             }
             Conv::GroupNorm {
@@ -126,8 +126,8 @@ impl Run<'_> {
                 silu,
                 y,
             } => {
-                let clips = self.tensor(*grid).rows;
-                let (partials, stats) = self.spatial_moments(clips, *groups).ok_or_else(|| {
+                let clips = self.tensor(*grid)?.rows;
+                let (partials, stats) = self.spatial_moments(clips, *groups)?.ok_or_else(|| {
                     kernels_metal::Error::Backend {
                         op: "conv.group_norm",
                         detail: format!(
@@ -138,17 +138,17 @@ impl Run<'_> {
                 })?;
                 conv::group_norm::group_norm(
                     self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*grid),
+                    self.tensor(*x)?,
+                    self.tensor(*grid)?,
                     *groups,
-                    self.tensor(*weight),
-                    self.tensor(*bias),
+                    self.tensor(*weight)?,
+                    self.tensor(*bias)?,
                     *eps,
                     *silu,
                     partials,
                     stats,
-                    self.tensor(*y),
-                    self.grid_base(*grid, *x),
+                    self.tensor(*y)?,
+                    self.grid_base(*grid, *x)?,
                 )
             }
             Conv::Upsample {
@@ -160,13 +160,13 @@ impl Run<'_> {
                 y,
             } => conv::resample::upsample_nearest(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
+                self.tensor(*x)?,
+                self.tensor(*grid)?,
                 *factor,
                 *keep_first_frame,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+                self.tensor(*y_grid)?,
+                self.tensor(*y)?,
+                [self.grid_base(*grid, *x)?, self.grid_base(*y_grid, *y)?],
             ),
             Conv::PixelShuffle {
                 x,
@@ -177,13 +177,13 @@ impl Run<'_> {
                 y,
             } => conv::resample::pixel_shuffle(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
+                self.tensor(*x)?,
+                self.tensor(*grid)?,
                 *r,
                 *trim_t,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+                self.tensor(*y_grid)?,
+                self.tensor(*y)?,
+                [self.grid_base(*grid, *x)?, self.grid_base(*y_grid, *y)?],
             ),
             Conv::PixelUnshuffle {
                 x,
@@ -193,12 +193,12 @@ impl Run<'_> {
                 y,
             } => conv::resample::pixel_unshuffle(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
+                self.tensor(*x)?,
+                self.tensor(*grid)?,
                 *r,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+                self.tensor(*y_grid)?,
+                self.tensor(*y)?,
+                [self.grid_base(*grid, *x)?, self.grid_base(*y_grid, *y)?],
             ),
             Conv::AvgDown {
                 x,
@@ -209,13 +209,13 @@ impl Run<'_> {
                 y,
             } => conv::resample::avg_down(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
+                self.tensor(*x)?,
+                self.tensor(*grid)?,
                 *factor,
                 *group,
-                self.tensor(*y_grid),
-                self.tensor(*y),
-                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+                self.tensor(*y_grid)?,
+                self.tensor(*y)?,
+                [self.grid_base(*grid, *x)?, self.grid_base(*y_grid, *y)?],
             ),
             Conv::CacheStore {
                 x,
@@ -225,10 +225,10 @@ impl Run<'_> {
                 x_out: _,
             } => {
                 let base = self.grid_base(*grid, *x);
-                let x = self.tensor(*x);
-                let grid = self.tensor(*grid);
-                let pool = self.recurrent(*cache);
-                let slots = self.clip_slots().ok_or(kernels_metal::Error::Backend {
+                let x = self.tensor(*x)?;
+                let grid = self.tensor(*grid)?;
+                let pool = self.recurrent(*cache)?;
+                let slots = self.clip_slots()?.ok_or(kernels_metal::Error::Backend {
                     op: "conv.cache_store",
                     detail: "a frame-cache store needs the fire's clip slot table, which no \
                              lane of it staged"
@@ -243,7 +243,7 @@ impl Run<'_> {
                     grid,
                     *frames,
                     pool.state,
-                    base,
+                    base?,
                 )
             }
             Conv::Patchify {
@@ -254,12 +254,12 @@ impl Run<'_> {
                 y,
             } => conv::resample::pixel_unshuffle(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*grid),
+                self.tensor(*x)?,
+                self.tensor(*grid)?,
                 *p,
-                self.tensor(*tgrid),
-                self.tensor(*y),
-                [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)],
+                self.tensor(*tgrid)?,
+                self.tensor(*y)?,
+                [self.grid_base(*grid, *x)?, self.grid_base(*tgrid, *y)?],
             ),
             Conv::Unpatchify {
                 x,
@@ -269,13 +269,13 @@ impl Run<'_> {
                 y,
             } => conv::resample::pixel_shuffle(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*tgrid),
+                self.tensor(*x)?,
+                self.tensor(*tgrid)?,
                 *p,
                 0,
-                self.tensor(*grid),
-                self.tensor(*y),
-                [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)],
+                self.tensor(*grid)?,
+                self.tensor(*y)?,
+                [self.grid_base(*tgrid, *x)?, self.grid_base(*grid, *y)?],
             ),
             Conv::Cells {
                 tgrid,
@@ -284,11 +284,11 @@ impl Run<'_> {
                 y,
             } => conv::rule::cells(
                 self.ctx(),
-                self.tensor(*tgrid),
-                self.tensor(*positions),
+                self.tensor(*tgrid)?,
+                self.tensor(*positions)?,
                 *axis,
-                self.tensor(*y),
-                self.grid_base(*tgrid, *y),
+                self.tensor(*y)?,
+                self.grid_base(*tgrid, *y)?,
             ),
         }
     }
@@ -309,7 +309,9 @@ impl poem_exec::DispatchProbe for Run<'_> {
             if !self.resolvable(id) {
                 continue;
             }
-            let t = self.tensor(id);
+            let Ok(t) = self.tensor(id) else {
+                continue;
+            };
             if !matches!(
                 t.dtype,
                 poem_ir::Dtype::F32 | poem_ir::Dtype::Bf16 | poem_ir::Dtype::F16

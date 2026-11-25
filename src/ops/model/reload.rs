@@ -18,7 +18,7 @@ pub struct ReloadArgs {
 }
 
 pub fn run(args: ReloadArgs, global: &crate::args::GlobalArgs) -> Result<crate::ui::Answer> {
-    let source = super::import::resolve_source(&args.source)?;
+    let source = super::import::resolve_source(&args.source, None, false)?;
     let path = std::fs::canonicalize(&source.path)
         .with_context(|| format!("resolve {}", source.path.display()))?;
     let addr = match args.server {

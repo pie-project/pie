@@ -391,6 +391,20 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
+    /// Every recording dropped and none made again, `why`: each fire from
+    /// here walks eagerly, as its plan states (a backend that records).
+    fn refuse_recording(shelf: &mut Self::Shelf, why: &'static str) {
+        let _ = why;
+        Self::forget(shelf);
+    }
+
+    /// Why this load records no fire at all, where it records none (its
+    /// weights stream): every fire runs eager, stated at load.
+    fn records_none(shelf: &Self::Shelf) -> Option<&'static str> {
+        let _ = shelf;
+        None
+    }
+
     /// The pool's segments were backed or given back: a backend whose kept
     /// steps bind them by place rebinds each to what stands there now; one
     /// whose kept steps hold the segments' buffers forgets them. Called with
@@ -1437,7 +1451,6 @@ pub struct Shell<B: Serve> {
 
     adapters: crate::adapter::Slots,
 
-    blobs: crate::blob::Store,
 
     held: Vec<u32>,
 
@@ -3250,7 +3263,6 @@ impl<B: Serve> Shell<B> {
             adapters: adapter_slots,
 
             beam_appended: std::sync::Mutex::new(std::collections::HashMap::new()),
-            blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             bound: 0,
             rs_layout,
@@ -4938,8 +4950,20 @@ impl<B: Serve> Shell<B> {
         // stage; a routed expert's between a recording's segments, one cut a
         // layer with an expert in no slot, so a recording stands only while
         // those layers do (and the stage they bind with them).
+        // Only the load's arm walk records: once armed, recordings dropped
+        // are made again by none, so every fire from here runs eager, stated
+        // here by name.
         if self.expert_caches.staged_layers() != staged {
-            B::forget(&mut self.shelf);
+            if self.armed && B::RECORDS {
+                const WHY: &str = "a weight residency change staged a routed expert layer";
+                tracing::warn!(
+                    "{WHY}: every recording is dropped and every fire from here runs eager \
+                     (counted eager)"
+                );
+                B::refuse_recording(&mut self.shelf, WHY);
+            } else {
+                B::forget(&mut self.shelf);
+            }
         }
         Ok(())
     }
@@ -5646,7 +5670,6 @@ impl<B: Serve> Shell<B> {
             let seats = self.pools.seat_segments();
             self.commit_segments(seats)?;
         }
-        let t = std::time::Instant::now();
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -5662,17 +5685,9 @@ impl<B: Serve> Shell<B> {
             },
             None,
         )?;
-        crate::kernel_profile::phase_if(0, t);
-        let t = std::time::Instant::now();
         let enqueued = FrameShell::enqueue(self, prepared)?;
-        crate::kernel_profile::phase_if(1, t);
-        let t = std::time::Instant::now();
         let landed = FrameShell::settle(self, enqueued)?;
-        crate::kernel_profile::phase_if(2, t);
-        let t = std::time::Instant::now();
-        let rows = self.rows_of(&landed);
-        crate::kernel_profile::phase_if(3, t);
-        rows
+        self.rows_of(&landed)
     }
 
     /// Fires `lanes` and reads back every output their programs read, the
@@ -5899,52 +5914,26 @@ impl<B: Serve> Shell<B> {
         self.weights.banks()
     }
 
+    /// Binds instance `instance`'s adapter, `planes` its program's lora
+    /// sink laid at bind: a slot of its own, its planes registered there
+    /// the first time it is taken.
     pub fn bind_adapter(
         &mut self,
-        source: crate::adapter::Source<'_>,
+        instance: engine::program::InstanceId,
+        planes: &[crate::weights::AdapterPlane<'_>],
     ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
+        let key = crate::adapter::Key::Instance(instance);
         let grant = self.adapters.acquire(key.clone())?;
         if !grant.fresh {
             return Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: false,
                 key,
             });
         }
-
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights.register_adapter(grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.bank_seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(grant.slot, &planes)
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
-        match landed {
+        match self.weights.register_adapter(grant.slot, planes) {
             Ok(()) => Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: true,
                 key,
             }),
@@ -5953,10 +5942,6 @@ impl<B: Serve> Shell<B> {
                 Err(why)
             }
         }
-    }
-
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.blobs.mount(root);
     }
 
     #[must_use]
@@ -8713,9 +8698,7 @@ impl<B: Serve> Shell<B> {
             Some(len) => handles.rewind_to(len),
             None => handles.rewind(),
         };
-        let t = std::time::Instant::now();
         let walked = self.walk_fill(prepared);
-        crate::kernel_profile::phase_if(4, t);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
@@ -8733,10 +8716,7 @@ impl<B: Serve> Shell<B> {
         });
         rewind(&self.handles);
         let layout = laid?;
-        let t = std::time::Instant::now();
-        let filled = B::fill(self, frame, prepared, &layout, walked.launches);
-        crate::kernel_profile::phase_if(5, t);
-        filled
+        B::fill(self, frame, prepared, &layout, walked.launches)
     }
 
     /// A serving fire whose walk matched no armed body and which the load
@@ -9433,10 +9413,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 B::ready_fill(self, &prepared);
                 self.fill_once(&mut prepared)?
             };
-            let t = std::time::Instant::now();
-            let plan = B::plan(self, &mut prepared)?;
-            crate::kernel_profile::phase_if(6, t);
-            plan
+            B::plan(self, &mut prepared)?
         } else {
             B::plan(self, &mut prepared)?
         };
@@ -9546,10 +9523,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 picks: Vec::new(),
             })
         } else {
-            let t = std::time::Instant::now();
-            let walked = self.walk_once(&prepared, keep.is_some(), split);
-            crate::kernel_profile::phase_if(8, t);
-            walked
+            self.walk_once(&prepared, keep.is_some(), split)
         };
         self.split_layers = 1;
         let walked = walked?;
@@ -11033,24 +11007,7 @@ impl<B: Serve> Shell<B> {
         // `flags`: 1 a capturing lane of the pageless form (its key rows
         // alone), 2 every lane reading out its class's outputs, 4 no lane
         // capturing (a class that captures, fired with none).
-        let mut stride = (std::time::Instant::now(), [0u64; 10]);
         for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
-            // Under the kernel profile, each 64 shapes' time and its phases:
-            // whether the walk slows as it goes.
-            if crate::kernel_profile::phases_timed() && at % 64 == 0 && at > 0 {
-                let now: [u64; 10] = std::array::from_fn(|phase| {
-                    crate::kernel_profile::WALK_PHASES[phase].load(std::sync::atomic::Ordering::Relaxed)
-                });
-                let ms: Vec<u64> = now.iter().zip(&stride.1).map(|(n, b)| (n - b) / 1_000_000).collect();
-                tracing::info!(
-                    at,
-                    of = shapes.len(),
-                    ms = stride.0.elapsed().as_millis() as u64,
-                    phases_ms = ?ms,
-                    "arm walk stride"
-                );
-                stride = (std::time::Instant::now(), now);
-            }
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -11061,7 +11018,6 @@ impl<B: Serve> Shell<B> {
             }) {
                 break;
             }
-            let probed = std::time::Instant::now();
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
             // each arm: on the host (its resident bytes) and on the device
@@ -11085,7 +11041,6 @@ impl<B: Serve> Shell<B> {
                     .saturating_add(maps_before)
                     >= most
             });
-            crate::kernel_profile::phase_if(9, probed);
             if device_short || host_short || cmds_short || maps_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
@@ -11142,13 +11097,11 @@ impl<B: Serve> Shell<B> {
             }
             let families = self.recorded;
             for arm in 0..depth {
-                let probed = std::time::Instant::now();
                 let ahead = rss();
                 let cmds_ahead = B::command_buffers(self).0;
                 let maps_ahead = maps_seen;
                 let left_ahead = self.device.left();
                 let bodies_ahead = self.recorded;
-                crate::kernel_profile::phase_if(9, probed);
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -11200,9 +11153,6 @@ impl<B: Serve> Shell<B> {
                 for before in 0..arm {
                     self.arms.take(before);
                 }
-                crate::kernel_profile::family_log(&format!(
-                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} flags {flags}"
-                ));
                 self.walk_at = Some(at);
                 let fired = self.fire_seated(&seated);
                 self.walk_at = None;
@@ -11245,7 +11195,6 @@ impl<B: Serve> Shell<B> {
                     recorded += 1;
                     continue;
                 }
-                let probed = std::time::Instant::now();
                 let on_device = left_ahead.saturating_sub(self.device.left());
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
@@ -11255,7 +11204,6 @@ impl<B: Serve> Shell<B> {
                 if let (Some(ahead), Some(after)) = (maps_ahead, maps_seen) {
                     dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
                 }
-                crate::kernel_profile::phase_if(9, probed);
                 recorded += 1;
             }
             if self.recorded > families {

@@ -427,48 +427,6 @@ fn bound_rs_working_sets<C: FireContext>(
     Ok(Ok(ids))
 }
 
-/// The window plan of a host fire on a model whose state is window lists:
-/// each lane lands its rows from `held`, which every earlier token of its
-/// sequence precedes, and reads its tables through them.
-/// `keep`: the position a checkpoint inside the fire lands at, whose slots
-/// stay past it.
-///
-/// Window-list path: what an engine that does not state
-/// `Capabilities::windowed_state` is served by.
-fn host_window_plan(
-    req: &crate::engine::FireRequest,
-    fold: &geometry::Fold,
-    ids: &[crate::store::rs::RsWorkingSetId],
-    keep: Option<u32>,
-) -> Result<rs::RsPlan, String> {
-    if ids.is_empty() {
-        return Ok(rs::RsPlan::Groups(Vec::new()));
-    }
-    Ok(rs::RsPlan::Window(
-        req.lanes
-            .iter()
-            .enumerate()
-            .map(|(row, lane)| {
-                let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
-                let end = lane.kv.held.saturating_add(rows);
-                rs::WindowRow {
-                    writes: lane.kv.held..end,
-                    reads: end,
-                    advance: crate::store::rs::WindowAdvance {
-                        positioned: true,
-                        settled: lane.kv.held,
-                        reach: lane.kv.held,
-                        fold: fold.of(row),
-                        commit_end: end,
-                        head: (rows > 0).then_some(end),
-                        keep,
-                    },
-                }
-            })
-            .collect(),
-    ))
-}
-
 /// A working set one lane writes from where its state ends, folding all it
 /// writes, buffers nothing; that lane lands its state as of `snapshots` too.
 fn host_rs_plan(
@@ -922,7 +880,7 @@ fn checkpoints_ahead(
 ) {
     for checkpoint in checkpoints
         .iter_mut()
-        .filter(|checkpoint| !checkpoint.snapshot && checkpoint.window_at.is_none())
+        .filter(|checkpoint| !checkpoint.snapshot)
     {
         let forked = stores.rs.lock().unwrap().checkpoint_ahead(checkpoint.rs);
         let snapshot = match forked {
@@ -1121,11 +1079,11 @@ pub(crate) fn take_checkpoint(
             }
         }
     } else {
-        let mut rs = stores.rs.lock().unwrap();
-        match checkpoint.window_at {
-            Some(at) => rs.checkpoint_at(checkpoint.rs, checkpoint.key, owner, at),
-            None => rs.checkpoint(checkpoint.rs, checkpoint.key, owner),
-        }
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .checkpoint(checkpoint.rs, checkpoint.key, owner)
     };
     match taken {
         Ok(true) => {
@@ -1180,8 +1138,6 @@ pub(crate) struct TakeCheckpoint {
     pub(crate) snapshot: bool,
     pub(crate) pages: u64,
     pub(crate) key: crate::store::kv::hash::Hash256,
-    /// A window's, as of this position, at or behind the fire's end.
-    pub(crate) window_at: Option<u32>,
 }
 
 pub struct PendingFire {

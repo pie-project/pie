@@ -89,47 +89,7 @@ pub fn profile_kernels(on: bool) {
 
 #[must_use]
 pub fn profiling() -> bool {
-    PROFILING.load(std::sync::atomic::Ordering::Acquire) || profile_path().is_some()
-}
-
-/// Diagnostic: where `PIE_VK_KERNEL_PROFILE` names a file, every frame is
-/// timed by dispatch, kept ones on every replay, and the totals written there
-/// every 16 frames harvested.
-fn profile_path() -> Option<&'static std::path::Path> {
-    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| std::env::var_os("PIE_VK_KERNEL_PROFILE").map(std::path::PathBuf::from))
-        .as_deref()
-}
-
-#[cfg(feature = "vulkan")]
-pub(crate) fn dump_profile() {
-    static HARVESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let Some(path) = profile_path() else { return };
-    if HARVESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 16 != 15 {
-        return;
-    }
-    let _ = std::fs::write(path, profile_text());
-}
-
-/// The profile's totals as its file lays them: a header, then a kernel a
-/// line, its device ns, its calls and its ns a call.
-fn profile_text() -> String {
-    let mut text = String::from("name\tns\tcalls\tns_per_call\n");
-    for (name, ns, calls) in KERNEL_PROFILE.rows() {
-        let per = ns.checked_div(calls).unwrap_or(0);
-        text.push_str(&format!("{name}\t{ns}\t{calls}\t{per}\n"));
-    }
-    text
-}
-
-/// Under `PIE_VK_KERNEL_PROFILE`, the totals at ready, beside the file
-/// (`<file>.ready`): what the arm walk ran, for a reader to take from the
-/// serving totals.
-pub(crate) fn profile_ready() {
-    let Some(path) = profile_path() else { return };
-    let mut ready = path.as_os_str().to_owned();
-    ready.push(".ready");
-    let _ = std::fs::write(ready, profile_text());
+    PROFILING.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[must_use]
@@ -712,7 +672,7 @@ impl Sink<'_> {
                     "bake"
                 );
             }
-            self.frame.bake_named(fire.entrypoint, &(
+            self.frame.bake_dispatch(&(
                 key,
                 &scratch.baked,
                 fired.map(|(place, _)| place),

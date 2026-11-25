@@ -1862,107 +1862,15 @@ impl Prepared {
         region: &Region,
     ) -> Result<(Vec<(StepWord, u32)>, usize)> {
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-            };
-            let grouped = self.grouped.as_ref().ok_or_else(|| {
-                Fault::program(
-                    "program::launch",
-                    "a region was compiled for the streamed form and this stage carries no \
-                     lane table; the plan said the grouped path could not cover it",
-                )
-            })?;
-            let layout = grouped
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!("region {} has no group layout", region.region_index),
-                    )
-                })?;
-            encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset lies inside its slot.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.table.raw()),
-                    grouped.table.offset() as usize,
-                    0,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.descriptors.raw()),
-                    self.descriptors.offset() as usize,
-                    1,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.params.raw()),
-                    self.params.offset() as usize,
-                    2,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.offsets.raw()),
-                    self.offsets.offset() as usize,
-                    3,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.lane_scratch.raw()),
-                    grouped.lane_scratch.offset() as usize,
-                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
-                );
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.bindings.raw()),
-                    grouped.bindings.offset() as usize,
-                    6,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.pending_flags.raw()),
-                    grouped.pending_flags.offset() as usize,
-                    7,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.lane_indices.raw()),
-                    grouped.lane_indices.offset() as usize,
-                    8,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.row_meta.raw()),
-                    grouped.row_meta.offset() as usize,
-                    9,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.row_indices.raw()),
-                    grouped.row_indices.offset() as usize,
-                    10,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    self.addresses.offset() as usize,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            // The lanes reach their scratch by the addresses in the lane
-            // scratch table.
-            resident(
-                &self.scratch()?.buffer,
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            use objc2_metal::MTLComputePipelineState;
+            let (grouped, layout) = self.group_layout(region, "streamed")?;
+            bind_group(
+                encoder,
+                region,
+                self.group_tables(grouped, layout),
+                [&self.scratch()?.buffer],
+                [self],
             );
-            resident(
-                self.status.buffer(),
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-            );
-            for cell in &self.bound {
-                resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-            }
-            for held in self.seated() {
-                resident(&held.base, MTLResourceUsage::Read);
-            }
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
             let temporary_bytes =
                 u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
@@ -2089,152 +1997,76 @@ impl Prepared {
     fn encode_grouped(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-                MTLSize,
-            };
-
-            let grouped = self.grouped.as_ref().ok_or_else(|| {
-                Fault::program(
-                    "program::launch",
-                    "a region was compiled for the grouped form and this stage carries no \
-                     lane table; the plan said the grouped path could not cover it",
-                )
-            })?;
-            let layout = grouped
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!(
-                            "region {} has no group layout, so its library sampler would \
-                             decompose its grid by a row count nobody stated",
-                            region.region_index
-                        ),
-                    )
-                })?;
-
+            let (grouped, layout) = self.group_layout(region, "grouped")?;
             let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset lies inside its slot (the kernel strides off `layout`).
-            unsafe {
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.table.raw()),
-                    grouped.table.offset() as usize,
-                    0,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.descriptors.raw()),
-                    self.descriptors.offset() as usize,
-                    1,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.params.raw()),
-                    self.params.offset() as usize,
-                    2,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.offsets.raw()),
-                    self.offsets.offset() as usize,
-                    3,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.lane_scratch.raw()),
-                    grouped.lane_scratch.offset() as usize,
-                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
-                );
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), layout.offset() as usize, 5);
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.bindings.raw()),
-                    grouped.bindings.offset() as usize,
-                    6,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.pending_flags.raw()),
-                    grouped.pending_flags.offset() as usize,
-                    7,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.lane_indices.raw()),
-                    grouped.lane_indices.offset() as usize,
-                    8,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.row_meta.raw()),
-                    grouped.row_meta.offset() as usize,
-                    9,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(grouped.row_indices.raw()),
-                    grouped.row_indices.offset() as usize,
-                    10,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    self.addresses.offset() as usize,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            // The lanes reach their scratch by the addresses in the lane
-            // scratch table.
-            resident(
-                &self.scratch()?.buffer,
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            bind_group(
+                &encoder,
+                region,
+                self.group_tables(grouped, layout),
+                [&self.scratch()?.buffer],
+                [self],
             );
-            resident(
-                self.status.buffer(),
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-            );
-            for cell in &self.bound {
-                resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-            }
-            for held in self.seated() {
-                resident(&held.base, MTLResourceUsage::Read);
-            }
-
             let rows = grouped
                 .layout_words
                 .get(region.region_index as usize)
                 .map_or(1, |words| words.reserved1 as usize);
-            let (groups, threads) = match region.form {
-                Form::Fused | Form::Streamed => {
-                    unreachable!("`encode_into` routes the single-lane and streamed forms")
-                }
-                Form::GroupedLibrary => ((GROUPED_LANES as usize) * rows, LIBRARY_SAMPLER_THREADS),
-                Form::Grouped => (
-                    GROUPED_LANES as usize,
-                    region
-                        .pipeline()
-                        .maxTotalThreadsPerThreadgroup()
-                        .clamp(1, REGION_THREADS as usize),
-                ),
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: groups.max(1),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threads,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            dispatch_grouped(&encoder, region, GROUPED_LANES as usize, rows);
             Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
             Err(Fault::Deviceless)
         }
+    }
+
+    /// This member's lane table and region `region`'s group layout, which a
+    /// region compiled for the `form` (grouped or streamed) reads.
+    #[cfg(target_vendor = "apple")]
+    fn group_layout(&self, region: &Region, form: &str) -> Result<(&Grouped, &Held)> {
+        let grouped = self.grouped.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                format!(
+                    "a region was compiled for the {form} form and this stage carries no \
+                     lane table; the plan said the grouped path could not cover it"
+                ),
+            )
+        })?;
+        let layout = grouped
+            .layouts
+            .get(region.region_index as usize)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "region {} has no group layout, so its kernel would stride its \
+                         lanes by a layout nobody stated",
+                        region.region_index
+                    ),
+                )
+            })?;
+        Ok((grouped, layout))
+    }
+
+    /// This member's tables at the slots a grouped or streamed region binds
+    /// ([`GROUP_SLOTS`]).
+    #[cfg(target_vendor = "apple")]
+    fn group_tables<'a>(&'a self, grouped: &'a Grouped, layout: &'a Held) -> [Bind<'a>; 12] {
+        let at = |held: &'a Held| (held.raw(), held.offset());
+        [
+            at(&grouped.table),
+            at(&self.descriptors),
+            at(&self.params),
+            at(&self.offsets),
+            at(&grouped.lane_scratch),
+            at(layout),
+            at(&grouped.bindings),
+            at(&grouped.pending_flags),
+            at(&grouped.lane_indices),
+            at(&grouped.row_meta),
+            at(&grouped.row_indices),
+            at(&self.addresses),
+        ]
     }
 
     /// Fires `region` in a frame of its own; `zero` (a stage's first
@@ -2783,109 +2615,16 @@ impl Batch {
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-            };
-            let layout = self
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!(
-                            "region {} has no group layout in this batch",
-                            region.region_index
-                        ),
-                    )
-                })?;
+            use objc2_metal::MTLComputePipelineState;
+            let layout = self.layout(region)?;
             let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every buffer is retained by `self`; every offset is zero.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.table.view().raw()),
-                    self.table.at(0) as usize,
-                    0,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.descriptors.view().raw()),
-                    self.descriptors.at(0) as usize,
-                    1,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.params.view().raw()),
-                    self.params.at(0) as usize,
-                    2,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.offsets.view().raw()),
-                    self.offsets.at(0) as usize,
-                    3,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.lane_scratch.view().raw()),
-                    self.lane_scratch.at(0) as usize,
-                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(layout.view().raw()),
-                    layout.at(0) as usize,
-                    5,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.bindings.view().raw()),
-                    self.bindings.at(0) as usize,
-                    6,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.pending_flags.view().raw()),
-                    self.pending_flags.at(0) as usize,
-                    7,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.lane_indices.view().raw()),
-                    self.lane_indices.at(0) as usize,
-                    8,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.row_meta.view().raw()),
-                    self.row_meta.at(0) as usize,
-                    9,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.row_indices.view().raw()),
-                    self.row_indices.at(0) as usize,
-                    10,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.view().raw()),
-                    self.addresses.at(0) as usize,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            // The lanes reach their scratch by the addresses in the lane
-            // scratch table: each member's own, wherever it lies.
-            for lane in &self.scratch {
-                resident(&lane.buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
-            }
-            for member in members {
-                resident(
-                    member.status.buffer(),
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
-                for cell in &member.bound {
-                    resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-                }
-                for held in member.seated() {
-                    resident(&held.base, MTLResourceUsage::Read);
-                }
-            }
+            bind_group(
+                &encoder,
+                region,
+                self.group_tables(layout),
+                self.scratch.iter().map(|lane| &lane.buffer),
+                members.iter().map(|member| &**member),
+            );
             let template = members
                 .first()
                 .ok_or_else(|| Fault::program("program::launch", "a batch with no members"))?;
@@ -2963,142 +2702,23 @@ impl Batch {
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-                MTLSize,
-            };
-            let layout = self
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!(
-                            "region {} has no group layout in this batch",
-                            region.region_index
-                        ),
-                    )
-                })?;
-            let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
+            let layout = self.layout(region)?;
             if let Some(template) = members.first() {
                 self.dump_streamed_tables(region, template)?;
             }
-            // SAFETY: every buffer is retained by `self`; every offset is zero (the kernel strides off `layout`).
-            unsafe {
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.table.view().raw()),
-                    self.table.at(0) as usize,
-                    0,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.descriptors.view().raw()),
-                    self.descriptors.at(0) as usize,
-                    1,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.params.view().raw()),
-                    self.params.at(0) as usize,
-                    2,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.offsets.view().raw()),
-                    self.offsets.at(0) as usize,
-                    3,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.lane_scratch.view().raw()),
-                    self.lane_scratch.at(0) as usize,
-                    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(layout.view().raw()),
-                    layout.at(0) as usize,
-                    5,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.bindings.view().raw()),
-                    self.bindings.at(0) as usize,
-                    6,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.pending_flags.view().raw()),
-                    self.pending_flags.at(0) as usize,
-                    7,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.lane_indices.view().raw()),
-                    self.lane_indices.at(0) as usize,
-                    8,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.row_meta.view().raw()),
-                    self.row_meta.at(0) as usize,
-                    9,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.row_indices.view().raw()),
-                    self.row_indices.at(0) as usize,
-                    10,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.view().raw()),
-                    self.addresses.at(0) as usize,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            // The lanes reach their scratch by the addresses in the lane
-            // scratch table: each member's own, wherever it lies.
-            for lane in &self.scratch {
-                resident(&lane.buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
-            }
-            for member in members {
-                resident(
-                    member.status.buffer(),
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
-                for cell in &member.bound {
-                    resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-                }
-                for held in member.seated() {
-                    resident(&held.base, MTLResourceUsage::Read);
-                }
-            }
+            let encoder = frame.encoder();
+            bind_group(
+                &encoder,
+                region,
+                self.group_tables(layout),
+                self.scratch.iter().map(|lane| &lane.buffer),
+                members.iter().map(|member| &**member),
+            );
             let rows = self
                 .layout_words
                 .get(region.region_index as usize)
                 .map_or(1, |words| words.reserved1 as usize);
-            let (groups, threads) = match region.form {
-                Form::Fused | Form::Streamed => {
-                    unreachable!("`Batch::encode` routes the single-lane and streamed forms")
-                }
-                Form::GroupedLibrary => ((count as usize) * rows, LIBRARY_SAMPLER_THREADS),
-                Form::Grouped => (
-                    count as usize,
-                    region
-                        .pipeline()
-                        .maxTotalThreadsPerThreadgroup()
-                        .clamp(1, REGION_THREADS as usize),
-                ),
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: groups.max(1),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threads,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            dispatch_grouped(&encoder, region, count as usize, rows);
             Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -3106,6 +2726,146 @@ impl Batch {
             Err(Fault::Deviceless)
         }
     }
+
+    /// Region `region`'s group layout in this batch.
+    #[cfg(target_vendor = "apple")]
+    fn layout(&self, region: &Region) -> Result<&SpanRegion> {
+        self.layouts
+            .get(region.region_index as usize)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "region {} has no group layout in this batch",
+                        region.region_index
+                    ),
+                )
+            })
+    }
+
+    /// The batch's tables at the slots a grouped or streamed region binds
+    /// ([`GROUP_SLOTS`]).
+    #[cfg(target_vendor = "apple")]
+    fn group_tables<'a>(&'a self, layout: &'a SpanRegion) -> [Bind<'a>; 12] {
+        let at = |region: &'a SpanRegion| (region.view().raw(), region.at(0));
+        [
+            at(&self.table),
+            at(&self.descriptors),
+            at(&self.params),
+            at(&self.offsets),
+            at(&self.lane_scratch),
+            at(layout),
+            at(&self.bindings),
+            at(&self.pending_flags),
+            at(&self.lane_indices),
+            at(&self.row_meta),
+            at(&self.row_indices),
+            at(&self.addresses),
+        ]
+    }
+}
+
+/// A buffer and the byte a kernel binds it at.
+#[cfg(target_vendor = "apple")]
+type Bind<'a> = (&'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>, u64);
+
+/// The slots a grouped or streamed region reads its tables at: the lane
+/// table, descriptors, params, offsets, lane scratch, group layout,
+/// bindings, pending flags, lane indices, row meta, row indices and the
+/// intrinsic address table.
+#[cfg(target_vendor = "apple")]
+const GROUP_SLOTS: [usize; 12] = [
+    0,
+    1,
+    2,
+    3,
+    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
+];
+
+/// Binds a grouped or streamed region on `encoder`: its pipeline, `tables`
+/// at [`GROUP_SLOTS`], and as resident the lanes' `scratch` (which they
+/// reach by the addresses in the lane scratch table) and each member's
+/// status, bound cells and seated rows. One member ([`Prepared`]) or a
+/// batch's ([`Batch`]) bind alike.
+#[cfg(target_vendor = "apple")]
+fn bind_group<'m>(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    region: &Region,
+    tables: [Bind<'_>; 12],
+    scratch: impl IntoIterator<Item = &'m Buffer>,
+    members: impl IntoIterator<Item = &'m Prepared>,
+) {
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLComputeCommandEncoder, MTLResource, MTLResourceUsage};
+    encoder.setComputePipelineState(region.pipeline());
+    for (slot, (buffer, offset)) in GROUP_SLOTS.into_iter().zip(tables) {
+        // SAFETY: the caller retains every table; every offset lies inside its region (the kernel strides off the layout).
+        unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), offset as usize, slot) };
+    }
+    let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
+        let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buffer.slab());
+        encoder.useResource_usage(resource, usage);
+    };
+    for buffer in scratch {
+        resident(buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    }
+    for member in members {
+        resident(
+            member.status.buffer(),
+            MTLResourceUsage::Read | MTLResourceUsage::Write,
+        );
+        for cell in &member.bound {
+            resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        }
+        for held in member.seated() {
+            resident(&held.base, MTLResourceUsage::Read);
+        }
+    }
+}
+
+/// Dispatches a grouped region bound by [`bind_group`] over `lanes` lanes:
+/// a library sampler takes a threadgroup per lane row (`rows` a lane, from
+/// its group layout), a region kernel one per lane.
+#[cfg(target_vendor = "apple")]
+fn dispatch_grouped(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    region: &Region,
+    lanes: usize,
+    rows: usize,
+) {
+    use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+    let (groups, threads) = match region.form {
+        Form::Fused | Form::Streamed => {
+            unreachable!("the single-lane and streamed forms encode by their own paths")
+        }
+        Form::GroupedLibrary => (lanes * rows, LIBRARY_SAMPLER_THREADS),
+        Form::Grouped => (
+            lanes,
+            region
+                .pipeline()
+                .maxTotalThreadsPerThreadgroup()
+                .clamp(1, REGION_THREADS as usize),
+        ),
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: groups.max(1),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 /// One streamed step of a member bound on `encoder` ([`Prepared::bind_streamed`]).

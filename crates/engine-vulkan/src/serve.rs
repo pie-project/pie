@@ -38,11 +38,11 @@ pub struct Shelf {
     /// Each first-arm family's on every other arm, as the walk recorded it.
     arm_families: std::collections::HashMap<(crate::record::Key, usize), crate::record::Key>,
 
-    /// Fills laid without a walk; fills a verification walk found other
-    /// than its derived one (`PIE_VK_VERIFY_ARMS`).
+    /// Fills derived without a walk.
     derived_fills: u64,
-    derived_checked: u64,
-    derived_mismatches: u64,
+
+    /// What a verifying load's walks held its fills to.
+    verified: Verified,
     /// The first arm's fills' image bytes, and how many.
     image_bytes: (u64, u64),
 
@@ -53,8 +53,27 @@ pub struct Shelf {
     by_picks: std::collections::HashMap<u64, Option<crate::record::Key>>,
 
     /// A fill a lay-only pass laid, which the fire's own fill walk is held
-    /// to (`PIE_VK_VERIFY_DERIVED`).
+    /// to (`DeviceBoot::verify_fills`).
     pending_check: Option<(crate::record::Key, crate::record::Fill)>,
+}
+
+/// What a verifying load (`DeviceBoot::verify_fills`) held to the walks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Verified {
+    /// Fills a lay-only pass laid, held to the fire's own fill walk.
+    pub laid: u64,
+    /// Fills an arm past the first walked, held to the first arm's.
+    pub derived: u64,
+    /// Those of either that differed in any part.
+    pub mismatched: u64,
+}
+
+impl Shelf {
+    /// What a verifying load has held to its walks.
+    #[must_use]
+    pub fn verified(&self) -> Verified {
+        self.verified
+    }
 }
 
 /// A walk's picks on its arm and rung: what names its family to a
@@ -80,13 +99,6 @@ fn note_picks(shell: &mut Shell<Api>, picks: u64, family: crate::record::Key) {
         .or_insert(Some(family));
 }
 
-/// Whether a lay-only pass's fill is held to the fire's own fill walk,
-/// which then lays it (`PIE_VK_VERIFY_DERIVED`).
-fn verifying_derived() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_VK_VERIFY_DERIVED").is_some())
-}
-
 /// A first-arm fill, as an arm past it lays it.
 struct Derived {
     family: crate::record::Key,
@@ -95,13 +107,6 @@ struct Derived {
     layout: Vec<ReadSpan>,
     launches: u32,
     room_pasts: std::sync::Arc<Vec<u64>>,
-}
-
-/// Whether the arm walk walks every arm and checks each fill against the
-/// one it would derive (`PIE_VK_VERIFY_ARMS`), deriving none.
-fn verifying_arms() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_VK_VERIFY_ARMS").is_some())
 }
 
 /// The arm walk filled composition `walk_at` on `arm` into `family`: the
@@ -143,8 +148,8 @@ fn note_fill(
         return;
     };
     let first_family = first.family;
-    if verifying_arms() {
-        shell.shelf.derived_checked += 1;
+    if shell.device.verifies_fills() {
+        shell.shelf.verified.derived += 1;
         let mut parts = Vec::new();
         if shell.shelf.arm_families.get(&(first_family, arm)).is_some_and(|&held| held != family) {
             parts.push("family");
@@ -165,7 +170,7 @@ fn note_fill(
             parts.push("room_pasts");
         }
         if !parts.is_empty() {
-            shell.shelf.derived_mismatches += 1;
+            shell.shelf.verified.mismatched += 1;
             tracing::warn!(at, arm, parts = ?parts, "an arm's fill is not the one the first arm's derives");
         }
     }
@@ -536,7 +541,7 @@ impl Serve for Api {
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
         Ok(Shelf {
             recorder: if weights_stream {
-                crate::record::Recorder::refusing("the weights plane streams")
+                crate::record::Recorder::refusing("this load streams weights")
             } else {
                 crate::record::Recorder::new()
             },
@@ -547,8 +552,7 @@ impl Serve for Api {
             derived: None,
             arm_families: std::collections::HashMap::new(),
             derived_fills: 0,
-            derived_checked: 0,
-            derived_mismatches: 0,
+            verified: Verified::default(),
             image_bytes: (0, 0),
             by_picks: std::collections::HashMap::new(),
             pending_check: None,
@@ -565,6 +569,14 @@ impl Serve for Api {
         shelf.recorder.forget();
     }
 
+    fn refuse_recording(shelf: &mut Shelf, why: &'static str) {
+        shelf.recorder = crate::record::Recorder::refusing(why);
+    }
+
+    fn records_none(shelf: &Shelf) -> Option<&'static str> {
+        shelf.recorder.refused()
+    }
+
     fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
         Ok(())
     }
@@ -573,31 +585,16 @@ impl Serve for Api {
     /// and none made after: each arm's forward, the feed and the guest
     /// passes behind it, and the one a settle or a walk holds beside them.
     fn serving(shell: &mut Shell<Api>) -> Result<()> {
-        crate::encode::profile_ready();
-        if shell.shelf.derived_fills > 0 || shell.laid_walk > 0 || verifying_arms() {
+        if shell.shelf.derived_fills > 0 || shell.laid_walk > 0 {
             tracing::info!(
                 derived = shell.shelf.derived_fills,
                 laid = shell.laid_walk,
                 lay_ms = shell.lay_walk_ns / 1_000_000,
-                checked = shell.shelf.derived_checked,
                 image_bytes = ?shell.shelf.image_bytes,
-                mismatches = shell.shelf.derived_mismatches,
-                verifying = verifying_arms(),
                 "vulkan arm walk: fills laid from the first arm's"
             );
         }
         shell.shelf.derived = None;
-        if crate::encode::profiling() {
-            tracing::info!(
-                encode_ms = crate::encode::host_encode_ns() / 1_000_000,
-                between_ms = crate::encode::between_fires_ns() / 1_000_000,
-                phases_ms = ?engine_gpu::kernel_profile::WALK_PHASES
-                    .iter()
-                    .map(|ns| ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
-                    .collect::<Vec<_>>(),
-                "vulkan host encode before ready (the arm walk's dispatches)"
-            );
-        }
         shell.device().name_descriptor_sets();
         shell
             .device()
@@ -796,7 +793,7 @@ impl Serve for Api {
     /// into the family this arm recorded for the first's, where it did and
     /// its recording serves the fill's counts.
     fn derive_fill(shell: &mut Shell<Api>, prepared: &Prepared<'_, Api>) -> bool {
-        if prepared.arm == 0 || !shell.arming || verifying_arms() {
+        if prepared.arm == 0 || !shell.arming || shell.device.verifies_fills() {
             return false;
         }
         let Some((_, first)) = shell
@@ -865,7 +862,7 @@ impl Serve for Api {
             std::sync::Arc::new(fill.room_pasts),
         );
         // The arm walk's first-arm fill, laid: an arm past it derives its own.
-        if !verifying_derived() {
+        if !shell.device.verifies_fills() {
             note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
         }
         let laid = crate::record::Fill::new(
@@ -877,7 +874,7 @@ impl Serve for Api {
             room_pasts,
         );
         // Verifying, the fire walks for its fill all the same, held to this.
-        if verifying_derived() {
+        if shell.device.verifies_fills() {
             shell.shelf.pending_check = Some((shape, laid));
             return Ok(false);
         }
@@ -904,14 +901,6 @@ impl Serve for Api {
         let fill = frame.into_fill();
         let shape = record_key(shell, prepared);
         let family = family_key(fill.baked, prepared.arm, (fill.cuts > 0).then_some(shape));
-        if crate::device::ctx::trailing() && shell.shelf.recorder.family(family).is_none() {
-            nearest(shell, &fill.trail, prepared);
-        }
-        engine_gpu::kernel_profile::family_log(&format!(
-            "family {family:?} held {} rung {}",
-            shell.shelf.recorder.family(family).is_some(),
-            prepared.rung
-        ));
         let Some(held) = shell.shelf.recorder.family(family) else {
             tracing::debug!(
                 arm = prepared.arm,
@@ -923,41 +912,6 @@ impl Serve for Api {
             return Ok(false);
         };
         if held.recording.cuts.len() != fill.cuts || !held.recording.serves(&fill.groups) {
-            if crate::device::ctx::trailing() {
-                let recorded = held.recording.kept.groups();
-                let parts: Vec<String> = (recorded.iter().zip(&fill.groups).enumerate())
-                    .filter(|&(at, (held, wanted))| {
-                        held != wanted && !held_indirect(&held_family_kept(shell, family), at)
-                    })
-                    .take(8)
-                    .map(|(at, (held, wanted))| {
-                        format!(
-                            "dispatch {at} ({}): held {held:?}, the fire's {wanted:?}",
-                            fill.trail
-                                .iter()
-                                .filter(|entry| !entry.starts_with('"'))
-                                .nth(at)
-                                .map_or("?", String::as_str)
-                                .chars()
-                                .take(160)
-                                .collect::<String>()
-                        )
-                    })
-                    .collect();
-                eprintln!(
-                    "[vk-bake] arm {} rung {} rows {:?}: the armed family's commands are the fill \
-                     walk's, and its recording carries group counts the fire's differ from \
-                     ({} dispatches held, {} walked; cuts {} / {}):\n  {}",
-                    prepared.arm,
-                    prepared.rung,
-                    prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
-                    recorded.len(),
-                    fill.groups.len(),
-                    held.recording.cuts.len(),
-                    fill.cuts,
-                    parts.join("\n  ")
-                );
-            }
             return Ok(false);
         }
         if fill.cuts == 0 {
@@ -990,10 +944,14 @@ impl Serve for Api {
             if laid.room_pasts.as_ref() != room_pasts.as_ref() {
                 parts.push("room_pasts");
             }
-            tracing::warn!(
-                differs = ?parts,
-                "verifying: a lay-only pass's fill against the fire's own fill walk"
-            );
+            shell.shelf.verified.laid += 1;
+            if !parts.is_empty() {
+                shell.shelf.verified.mismatched += 1;
+                tracing::warn!(
+                    differs = ?parts,
+                    "a lay-only pass's fill is not the fire's own fill walk's"
+                );
+            }
         }
         if fill.cuts == 0 {
             note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
@@ -1093,14 +1051,6 @@ impl Serve for Api {
                     (!cuts.is_empty()).then_some(shape),
                 );
                 let groups = std::sync::Arc::new(kept.groups().to_vec());
-                let fresh = shell.shelf.recorder.family(family).is_none();
-                if shell.arming {
-                    engine_gpu::kernel_profile::family_log(&format!(
-                        "family {family:?} held {} rung {}",
-                        !fresh,
-                        prepared.rung
-                    ));
-                }
                 enum Act {
                     Fill,
                     Record(std::sync::Arc<Vec<bool>>),
@@ -1128,11 +1078,6 @@ impl Serve for Api {
                 let uncut = cuts.is_empty();
                 let pending = match act {
                     _ if arming => {
-                        // Under PIE_VK_BAKE_TRAIL, what parts a new family
-                        // from the nearest held one.
-                        if fresh && crate::device::ctx::trailing() {
-                            nearest(shell, kept.trail(), prepared);
-                        }
                         if let Act::Record(varying) = act {
                             tracing::debug!(
                                 arm = prepared.arm,
@@ -1287,77 +1232,6 @@ impl Serve for Api {
     }
 }
 
-/// The kept frame of `family`, for a diagnostic.
-fn held_family_kept(shell: &Shell<Api>, family: crate::record::Key) -> Option<&crate::device::Kept> {
-    shell
-        .shelf
-        .recorder
-        .family(family)
-        .map(|held| &held.recording.kept)
-}
-
-/// Whether dispatch `at` of `kept` reads its group counts from the block.
-fn held_indirect(kept: &Option<&crate::device::Kept>, at: usize) -> bool {
-    kept.is_some_and(|kept| kept.indirect(at))
-}
-
-/// Says where a fill walk whose commands match no armed family parts from
-/// the nearest one (the most commands alike from the first): the command of
-/// each there, rendered (`PIE_VK_BAKE_TRAIL`).
-fn nearest(shell: &Shell<Api>, trail: &[String], prepared: &Prepared<'_, Api>) {
-    let best = shell
-        .shelf
-        .recorder
-        .families()
-        .map(|(_, recording)| {
-            let held = recording.kept.trail();
-            let alike = held.iter().zip(trail).take_while(|(a, b)| a == b).count();
-            // Among the families alike as far, the one whose next command is
-            // the walk's kind: the field that parts them is the telling one.
-            let kind = |list: &[String]| {
-                list.get(alike)
-                    .and_then(|entry| entry.split(',').next())
-                    .map(str::to_string)
-            };
-            let same_kind = kind(held) == kind(trail);
-            ((alike, same_kind), held)
-        })
-        .max_by_key(|(rank, _)| *rank)
-        .map(|((alike, _), held)| (alike, held));
-    let at = |list: &[String], i: usize| list.get(i).cloned().unwrap_or_else(|| "<end>".into());
-    match best {
-        Some((alike, held)) => eprintln!(
-            "[vk-bake] arm {} rung {} rows {:?}: the fill walk parts from the nearest armed family \
-             after {alike} of {} commands ({} held)\n  before: {}\n  walk: {}\n  held: {}",
-            prepared.arm,
-            prepared.rung,
-            prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>(),
-            trail.len(),
-            held.len(),
-            alike.checked_sub(1).map_or_else(|| "<start>".into(), |i| at(trail, i)),
-            at(trail, alike),
-            at(held, alike),
-        ),
-        None => eprintln!("[vk-bake] no family is armed"),
-    }
-    // Where the nearest family is as long, every command past the parting
-    // that differs, by kernel: what else parts them.
-    if let Some((alike, held)) = best
-        && held.len() == trail.len()
-    {
-        let mut kinds: Vec<&str> = trail
-            .iter()
-            .zip(held)
-            .skip(alike)
-            .filter(|(a, b)| a != b)
-            .map(|(a, _)| a.rsplit(' ').next().unwrap_or(""))
-            .collect();
-        kinds.sort_unstable();
-        kinds.dedup();
-        eprintln!("  also: {kinds:?}");
-    }
-}
-
 /// A family's key: what its walk's commands carry, hashed
 /// ([`crate::device::Frame::bake`]), on its arm; where an expert stage cut
 /// it, its shape too (the host steps between its segments are the shape's).
@@ -1382,13 +1256,6 @@ fn record_key(shell: &Shell<Api>, p: &Prepared<'_, Api>) -> crate::record::Key {
 }
 
 fn keyed(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
-    let t = std::time::Instant::now();
-    let key = keyed_inner(shell, p, reads);
-    engine_gpu::kernel_profile::phase_if(7, t);
-    key
-}
-
-fn keyed_inner(shell: &Shell<Api>, p: &Prepared<'_, Api>, reads: bool) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
     key.hashed(&reads);
     key.bytes(&p.descriptor.pack());

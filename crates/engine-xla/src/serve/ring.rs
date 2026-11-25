@@ -1,4 +1,4 @@
-//! A windowed lane's page table as ring + buffer (CONTRACT-BC 19, 21): the
+//! A windowed lane's page table as ring + buffer: the
 //! attention kernels read a window's rows by one page table, so each fire
 //! composes a lane's from three kinds of pages, every one laid as a
 //! window-buffer slot and named by a grain index of the window buffer's

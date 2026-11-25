@@ -278,6 +278,11 @@ impl Recorder {
         next
     }
 
+    /// Why it records nothing, where it refuses.
+    pub(crate) fn refused(&self) -> Option<&'static str> {
+        self.refused
+    }
+
     pub(crate) fn records(&self) -> bool {
         self.refused.is_none()
     }
@@ -291,14 +296,6 @@ impl Recorder {
     pub(crate) fn forget(&mut self) {
         self.families.by_key.clear();
         self.fills.by_key.clear();
-    }
-
-    /// Every family held: its key and recording.
-    pub(crate) fn families(&self) -> impl Iterator<Item = (&Key, &Recording)> {
-        self.families
-            .by_key
-            .iter()
-            .map(|(key, family)| (key, &family.recording))
     }
 
     /// Drops every family whose recording binds a pool segment where no

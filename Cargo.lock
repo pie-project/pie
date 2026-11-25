@@ -1855,7 +1855,6 @@ dependencies = [
  "pie-poem-exec",
  "pie-poem-ir",
  "pie-profile",
- "toml",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4192,6 +4191,8 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "tar",
  "tempfile",
  "tokenizer",

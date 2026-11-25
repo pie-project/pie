@@ -568,7 +568,6 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
     let mut full = true;
     let mut said_published = Vec::new();
     let mut said_disk: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut said_hints = Vec::new();
     let mut said_off: std::collections::HashMap<[u8; 32], bool> = Default::default();
     loop {
         // A controller dialed again has heard none of it.
@@ -580,7 +579,6 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
         let now = runtime::offload::directory::sealed_keys();
         let disk = runtime::offload::directory::persisted_keys();
         let off = runtime::offload::directory::off_device_keys();
-        let hints = runtime::offload::directory::persist_hints();
         let published: Vec<(String, String)> = runtime::policy::published()
             .into_iter()
             .map(|(name, value)| (name, value.to_string()))
@@ -631,7 +629,6 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
             } else {
                 said_disk.difference(&disk).copied().collect()
             },
-            persist_hints: (full || hints != said_hints).then(|| hints.clone()),
             disk_tier: full.then(runtime::offload::directory::disk_tier).flatten(),
             off_device: (full || off != said_off).then(|| {
                 off.iter()
@@ -652,7 +649,6 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
                 said_runs = runs;
                 said_published = published;
                 said_disk = disk;
-                said_hints = hints;
                 said_off = off;
                 full = false;
             }

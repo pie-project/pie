@@ -8,7 +8,9 @@ const PARALLEL_FILES: usize = 8;
 const ATTEMPTS: u32 = 4;
 
 pub trait Progress: Send + Sync {
-    fn start(&self, files: u64, bytes: u64);
+    /// `bytes` are still to fetch, in `files` files; `held` of the wanted
+    /// bytes are on disk already.
+    fn start(&self, files: u64, bytes: u64, held: u64);
     fn advance(&self, bytes: u64);
 }
 
@@ -17,6 +19,8 @@ struct Entry {
     path: String,
     size: u64,
     etag: String,
+    /// An LFS file, named by its SHA-256; any other is named by its git blob SHA-1.
+    lfs: bool,
 }
 
 fn endpoint() -> String {
@@ -150,6 +154,7 @@ async fn list_files(
                 path: path.to_string(),
                 size,
                 etag: etag.to_string(),
+                lfs: lfs.and_then(|l| l.get("oid")).is_some(),
             });
         }
 
@@ -217,14 +222,31 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
+/// Fetches `repo_id` at `revision` (a full commit sha), or at `main`'s head
+/// when none is named, into the Hugging Face cache, and returns its snapshot.
 pub async fn snapshot_download(
     repo_id: &str,
+    revision: Option<&str>,
     allow_patterns: &[String],
     progress: Arc<dyn Progress>,
 ) -> Result<PathBuf> {
     let client = client()?;
     let token = token();
-    let sha = revision_sha(&client, repo_id, "main", token.as_deref()).await?;
+    let sha = revision_sha(
+        &client,
+        repo_id,
+        revision.unwrap_or("main"),
+        token.as_deref(),
+    )
+    .await?;
+    if let Some(revision) = revision
+        && sha != revision
+    {
+        bail!(
+            "{repo_id}: the hub resolves revision {revision} to commit {sha}; refusing to \
+             import a commit other than the one asked for"
+        );
+    }
     let files = list_files(&client, repo_id, &sha, token.as_deref()).await?;
 
     let wanted: Vec<Entry> = files
@@ -239,6 +261,14 @@ pub async fn snapshot_download(
     if wanted.is_empty() {
         bail!("{repo_id}@{sha} has no files pie can use");
     }
+    if let Some(entry) = wanted.iter().find(|entry| !is_safe(entry)) {
+        bail!(
+            "{repo_id}@{sha} lists {:?} named {:?}, which is not a relative path of plain \
+             segments named by a lowercase hex object id; refusing the listing",
+            entry.path,
+            entry.etag
+        );
+    }
 
     let repo_dir =
         super::resolve_cache_dir().join(format!("models--{}", repo_id.replace('/', "--")));
@@ -251,17 +281,20 @@ pub async fn snapshot_download(
 
     let mut pending = Vec::new();
     let mut pending_bytes = 0u64;
+    let mut held = 0u64;
     for entry in wanted {
         if is_complete(&snapshot_dir, &blobs_dir, &entry) {
+            held += entry.size;
             continue;
         }
         let partial = std::fs::metadata(incomplete_path(&blobs_dir, &entry.etag))
             .map(|m| m.len())
             .unwrap_or(0);
+        held += partial.min(entry.size);
         pending_bytes += entry.size.saturating_sub(partial);
         pending.push(entry);
     }
-    progress.start(pending.len() as u64, pending_bytes);
+    progress.start(pending.len() as u64, pending_bytes, held);
 
     if !pending.is_empty() {
         let permits = Arc::new(tokio::sync::Semaphore::new(PARALLEL_FILES));
@@ -295,12 +328,289 @@ pub async fn snapshot_download(
         }
     }
 
+    // A pinned commit is no branch's head, so it names no ref.
     let refs_dir = repo_dir.join("refs");
-    if std::fs::create_dir_all(&refs_dir).is_ok() {
+    if revision.is_none() && std::fs::create_dir_all(&refs_dir).is_ok() {
         let _ = std::fs::write(refs_dir.join("main"), &sha);
     }
 
     Ok(snapshot_dir)
+}
+
+/// The files a check reads whole: what a checkpoint or an adapter states of itself.
+const STATED: [&str; 6] = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer_config.json",
+    "adapter_config.json",
+    "stanza.json",
+    "model.safetensors.index.json",
+];
+
+/// The files an adapter is made of, which `pie model fetch` fetches.
+pub const ADAPTER_FILES: [&str; 2] = ["*.json", "adapter*.safetensors"];
+
+/// The most bytes one of [`STATED`] may take.
+const STATED_CAP: u64 = 16 << 20;
+
+/// The most bytes a safetensors header may take.
+const HEADER_CAP: u64 = 64 << 20;
+
+/// A repository at one commit, as a check read it.
+pub struct Stated {
+    /// The commit.
+    pub sha: String,
+    /// The bytes an import fetches at that commit.
+    pub download_bytes: u64,
+    /// The bytes a fetch of it as an adapter takes ([`ADAPTER_FILES`]).
+    pub adapter_bytes: u64,
+    /// The bytes of its `model*.safetensors` files.
+    pub weights_bytes: u64,
+}
+
+/// The hub refused a file of a repository whose terms this machine has not accepted.
+#[derive(Debug)]
+pub struct Gated(pub String);
+
+impl std::fmt::Display for Gated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is gated: its files need an account that accepted its terms",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Gated {}
+
+/// Fetches what `repo_id` at `revision` (or `main`'s head) states of itself
+/// into `dir`, and never a weight: each of [`STATED`] it lists, hash-checked,
+/// and each top-level `model*.safetensors` as a sparse file of its listed
+/// size that holds only its header, read through two range requests.
+pub async fn stated_download(repo_id: &str, revision: Option<&str>, dir: &Path) -> Result<Stated> {
+    let client = client()?;
+    let token = token();
+    let sha = revision_sha(
+        &client,
+        repo_id,
+        revision.unwrap_or("main"),
+        token.as_deref(),
+    )
+    .await?;
+    if let Some(revision) = revision
+        && sha != revision
+    {
+        bail!("{repo_id}: the hub resolves revision {revision} to commit {sha}");
+    }
+    let files = list_files(&client, repo_id, &sha, token.as_deref()).await?;
+    // The hub masks the object ids of a gated repository's weights from an
+    // account that has not accepted its terms.
+    if files
+        .iter()
+        .any(|entry| !entry.etag.is_empty() && entry.etag.bytes().all(|b| b == b'*'))
+    {
+        return Err(Gated(repo_id.to_string()).into());
+    }
+    if let Some(entry) = files.iter().find(|entry| !is_safe(entry)) {
+        bail!(
+            "{repo_id}@{sha} lists {:?} named {:?}, which is not a relative path of plain \
+             segments named by a lowercase hex object id; refusing the listing",
+            entry.path,
+            entry.etag
+        );
+    }
+    let allow = super::runtime_snapshot_allow_patterns();
+    let wanted = |entry: &&Entry| allow.iter().any(|pattern| glob_match(pattern, &entry.path));
+    let weights = |entry: &&Entry| glob_match("model*.safetensors", &entry.path);
+    let adapter = |entry: &&Entry| {
+        ADAPTER_FILES
+            .iter()
+            .any(|pattern| glob_match(pattern, &entry.path))
+    };
+    let stated = Stated {
+        sha: sha.clone(),
+        download_bytes: files.iter().filter(wanted).map(|entry| entry.size).sum(),
+        adapter_bytes: files.iter().filter(adapter).map(|entry| entry.size).sum(),
+        weights_bytes: files.iter().filter(weights).map(|entry| entry.size).sum(),
+    };
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    for entry in &files {
+        let url = format!("{}/{repo_id}/resolve/{sha}/{}", endpoint(), entry.path);
+        let at = dir.join(&entry.path);
+        if STATED.contains(&entry.path.as_str()) {
+            if entry.size > STATED_CAP {
+                bail!(
+                    "{repo_id}: {} is {} bytes, over the {STATED_CAP} a check reads",
+                    entry.path,
+                    entry.size
+                );
+            }
+            let bytes = ranged(&client, repo_id, &url, None, token.as_deref()).await?;
+            if bytes.len() as u64 != entry.size {
+                bail!("{repo_id}: {} came short", entry.path);
+            }
+            let mut hash = Hash::of(entry);
+            hash.update(&bytes);
+            std::fs::write(&at, &bytes).with_context(|| format!("writing {}", at.display()))?;
+            hash.check(entry, &at)?;
+        } else if weights(&entry) {
+            let length = ranged(&client, repo_id, &url, Some((0, 8)), token.as_deref()).await?;
+            let length = u64::from_le_bytes(
+                length
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("{repo_id}: {} has no header length", entry.path))?,
+            );
+            if length > HEADER_CAP || 8 + length > entry.size {
+                bail!(
+                    "{repo_id}: {} states a {length}-byte header, which is not a safetensors \
+                     header a check reads",
+                    entry.path
+                );
+            }
+            let header =
+                ranged(&client, repo_id, &url, Some((8, length)), token.as_deref()).await?;
+            if header.len() as u64 != length
+                || serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&header)
+                    .is_err()
+            {
+                bail!("{repo_id}: {} has no safetensors header", entry.path);
+            }
+            let file =
+                std::fs::File::create(&at).with_context(|| format!("creating {}", at.display()))?;
+            use std::io::Write;
+            (&file)
+                .write_all(&length.to_le_bytes())
+                .and_then(|()| (&file).write_all(&header))
+                .and_then(|()| file.set_len(entry.size))
+                .with_context(|| format!("writing {}", at.display()))?;
+        }
+    }
+    Ok(stated)
+}
+
+/// The bytes of `url`, or the `range` (start, length) of them, refusing a
+/// reply longer than asked or, with no range, than [`STATED_CAP`].
+async fn ranged(
+    client: &reqwest::Client,
+    repo_id: &str,
+    url: &str,
+    range: Option<(u64, u64)>,
+    token: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut request = authorized(client.get(url), token);
+    if let Some((start, length)) = range {
+        request = request.header(
+            reqwest::header::RANGE,
+            format!("bytes={start}-{}", start + length - 1),
+        );
+    }
+    let mut response = request
+        .send()
+        .await
+        .with_context(|| format!("reading {url}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(Gated(repo_id.to_string()).into());
+    }
+    if !status.is_success() || (range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT) {
+        bail!("{repo_id}: the hub answered {status} for {url}");
+    }
+    let most = range.map_or(STATED_CAP, |(_, length)| length);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading response body")? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > most {
+            bail!("{repo_id}: the hub sent more than asked for {url}");
+        }
+    }
+    Ok(bytes)
+}
+
+/// A listed file pie may join onto its folders: a relative path of plain
+/// segments, named by an object id of its hash's length in lowercase hex.
+fn is_safe(entry: &Entry) -> bool {
+    let plain = !entry.path.contains('\\')
+        && entry
+            .path
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
+        && Path::new(&entry.path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    let hex = entry.etag.len() == if entry.lfs { 64 } else { 40 }
+        && entry
+            .etag
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    plain && hex
+}
+
+/// The hash a listing names a file by: an LFS file's SHA-256 of its bytes,
+/// or any other file's git blob SHA-1, which hashes a `blob <size>\0` header
+/// before them.
+enum Hash {
+    Lfs(sha2::Sha256),
+    Git(sha1::Sha1),
+}
+
+impl Hash {
+    fn of(entry: &Entry) -> Self {
+        use sha2::Digest;
+        if entry.lfs {
+            return Self::Lfs(sha2::Sha256::new());
+        }
+        let mut git = sha1::Sha1::new();
+        git.update(format!("blob {}\0", entry.size));
+        Self::Git(git)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest;
+        match self {
+            Self::Lfs(hash) => hash.update(bytes),
+            Self::Git(hash) => hash.update(bytes),
+        }
+    }
+
+    async fn read(&mut self, path: &Path) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("reading {}", path.display()))?;
+            if read == 0 {
+                return Ok(());
+            }
+            self.update(&buffer[..read]);
+        }
+    }
+
+    /// Deletes `file` and fails, naming the entry, unless the bytes hashed
+    /// are the ones the listing names.
+    fn check(self, entry: &Entry, file: &Path) -> Result<()> {
+        use sha2::Digest;
+        let got: String = match self {
+            Self::Lfs(hash) => hash.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+            Self::Git(hash) => hash.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+        };
+        if got == entry.etag {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(file);
+        bail!(
+            "{}: its bytes hash to {got}, not to the {} the listing names; the file is deleted",
+            entry.path,
+            entry.etag
+        )
+    }
 }
 
 fn incomplete_path(blobs_dir: &Path, etag: &str) -> PathBuf {
@@ -330,7 +640,11 @@ async fn fetch_file(
     progress: &dyn Progress,
 ) -> Result<()> {
     let blob = blobs_dir.join(&entry.etag);
-    if std::fs::metadata(&blob).map(|m| m.len()).ok() != Some(entry.size) {
+    if std::fs::metadata(&blob).map(|m| m.len()).ok() == Some(entry.size) {
+        let mut hash = Hash::of(entry);
+        hash.read(&blob).await?;
+        hash.check(entry, &blob)?;
+    } else {
         download_blob(
             client, repo_id, sha, entry, &blob, blobs_dir, token, progress,
         )
@@ -387,8 +701,10 @@ async fn download_blob(
             continue;
         }
         let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let mut hash = Hash::of(entry);
         if resuming {
             progress.advance(0);
+            hash.read(&temp).await?;
         }
 
         let mut file = tokio::fs::OpenOptions::new()
@@ -400,7 +716,7 @@ async fn download_blob(
             .await
             .with_context(|| format!("opening {}", temp.display()))?;
 
-        match stream_to_file(response, &mut file, progress).await {
+        match stream_to_file(response, &mut file, progress, &mut hash).await {
             Ok(()) => {
                 file.flush().await.ok();
                 drop(file);
@@ -409,6 +725,7 @@ async fn download_blob(
                     last_error = Some(anyhow!("short read: got {written} of {} bytes", entry.size));
                     continue;
                 }
+                hash.check(entry, &temp)?;
                 std::fs::rename(&temp, blob)
                     .with_context(|| format!("moving {} into place", temp.display()))?;
                 return Ok(());
@@ -428,11 +745,13 @@ async fn stream_to_file(
     mut response: reqwest::Response,
     file: &mut tokio::fs::File,
     progress: &dyn Progress,
+    hash: &mut Hash,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
     while let Some(chunk) = response.chunk().await.context("reading response body")? {
         file.write_all(&chunk).await.context("writing to cache")?;
+        hash.update(&chunk);
         progress.advance(chunk.len() as u64);
     }
     Ok(())

@@ -304,6 +304,8 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// How this load's lanes name their slots ([`Addressing`]).
+    addressing: Addressing,
     /// What the load weighed its rungs by, where its profile states rates:
     /// the rungs, the estimate and the live range (`--check-estimate`).
     weighed: Option<crate::top::Weighed>,
@@ -738,6 +740,7 @@ impl Shell {
             placed: None,
             ruled: None,
             ane_cache: None,
+            addressing: Addressing::Seats,
         })
     }
 }
@@ -752,7 +755,23 @@ struct Placed {
     weight_caches: Vec<crate::store::streamed::Cache>,
 }
 
-/// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
+/// How a load's lanes name their pool slots. Set by the constructor that
+/// places the load, never by its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Addressing {
+    /// The runtime's slot refs, and nothing else: the pool lays no seat runs
+    /// (every chunk past the null chunk and the tables is the runtime's to
+    /// name), and a seat-addressed lane is refused by name. A served load.
+    Refs,
+    /// The direct-firing harness ([`PreparedLoad::load`], [`Shell::load`]):
+    /// a caller with no runtime fires seat-addressed lanes, seat `s` taking
+    /// its own runs of list and fixed slots laid in the lowest chunks.
+    Seats,
+}
+
+/// A load compiled and not yet placed; [`PreparedLoad::load`] places it for
+/// the direct-firing harness, [`PreparedLoad::load_for_runtime`] for a
+/// runtime naming slot refs.
 pub struct PreparedLoad<'a> {
     boot: Boot<'a>,
     device: Context,
@@ -772,6 +791,379 @@ pub struct PreparedLoad<'a> {
     /// Where the Neural Engine keeps its compiled programs
     /// ([`DeviceBoot::cache`](crate::DeviceBoot::cache)).
     ane_cache: Option<std::path::PathBuf>,
+    addressing: Addressing,
+}
+
+/// The classes a load's compiled regions run masked, wide (a prompt that
+/// attends both ways) and LoRA-corrected.
+struct Classes {
+    masked: poem_ir::ClassSet,
+    wide: poem_ir::ClassSet,
+    corrected: poem_ir::ClassSet,
+}
+
+impl Classes {
+    fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Classes> {
+        // An arm applies the fire's masks where its attention reads them and
+        // its kernels read each row's word: the paged prefill, and the paged
+        // decode (its plain, split, mma and q8 kernels read the word once a
+        // row, and a key's bit only past the lane's boundary). A selection's
+        // or a bias's arm reads none.
+        let masked = classes_running(trace, compiled, |op| {
+            matches!(
+                op,
+                Operation::Attn(
+                    poem_ir::Attn::Prefill {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        ..
+                    } | poem_ir::Attn::Decode {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        selected: None,
+                        rel: None,
+                        ..
+                    }
+                )
+            )
+        });
+        let wide = classes_running(trace, compiled, |op| {
+            matches!(op, Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. }))
+        });
+        // Mask bits are staged per lane with causality baked in, unclipped
+        // for a wide class: a causal masked prefill there would see future
+        // keys.
+        let causal_masked = classes_running(trace, compiled, |op| {
+            matches!(
+                op,
+                Operation::Attn(poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    causal: true,
+                    ..
+                })
+            )
+        });
+        if let Some(class) = wide.iter().find(|&class| causal_masked.contains(class)) {
+            return Err(Fault::Recipe(format!(
+                "class {class} attends both ways under one mask"
+            )));
+        }
+        let corrected = classes_running(trace, compiled, |op| {
+            matches!(op, Operation::Linear(poem_ir::Linear::LoraCorrect { .. }))
+        });
+        Ok(Classes {
+            masked,
+            wide,
+            corrected,
+        })
+    }
+}
+
+/// The classes of every compiled region one of whose nodes `runs`.
+fn classes_running(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    runs: impl Fn(&Operation) -> bool,
+) -> poem_ir::ClassSet {
+    let mut classes = poem_ir::ClassSet::default();
+    for region in compiled.template() {
+        let any = region
+            .nodes
+            .clone()
+            .any(|node| trace.nodes.get(node as usize).is_some_and(|node| runs(&node.op)));
+        if any {
+            for class in region.mask.iter() {
+                classes.insert(class);
+            }
+        }
+    }
+    classes
+}
+
+/// The weights a load places once, whatever rung it lays: read, repacked
+/// for this chip, the Neural Engine's programs, the chunk recipe and the
+/// row caches of the weights streamed.
+fn place_weights(
+    device: &Context,
+    chip: &profile::Profile,
+    boot: &Boot<'_>,
+    budgets: &Budgets,
+    ane_cache: Option<&Path>,
+) -> Result<Placed> {
+    let handles = Handles::new();
+    let mut weights = Weights::resident(
+        device,
+        &handles,
+        &boot.trace,
+        boot.contract,
+        boot.checkpoint,
+        &boot.residency,
+    )?;
+    weights.decode_absorbed(device, &handles, &boot.trace)?;
+    weights.relabel_conv_weights(device, &handles, &boot.trace)?;
+    weights.repack_mpp(
+        device,
+        &handles,
+        &boot.trace,
+        *chip.get::<crate::chip::WeightsLayout>(),
+    )?;
+    let ane = crate::ane::load(
+        device,
+        &handles,
+        &boot.trace,
+        &weights,
+        chip,
+        ane_cache,
+    )
+        .unwrap_or_else(|why| {
+            tracing::info!("the Neural Engine stays out of this load: {why}");
+            None
+        });
+    // The compiler's on-device Metal recipe is the one layout source: the
+    // chunk, the list slot (its tokens are the kv page size), where
+    // every fixed row's pieces lie in a record, and the weight slots.
+    let recipe = crate::chunks::recipe_near(
+        &boot.trace,
+        budgets,
+        boot.residency.chunk_bytes(),
+    )?;
+    let weight_caches = if boot.residency.whole_weights() {
+        Vec::new()
+    } else {
+        Shell::weight_caches(
+            device,
+            &handles,
+            &mut weights,
+            &boot.trace,
+            &recipe,
+            boot.residency.rows_streamed(),
+        )?
+    };
+    // A weight kept apart that no cache takes is read whole, in place.
+    let claimed: std::collections::BTreeSet<usize> = weight_caches
+        .iter()
+        .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
+        .collect();
+    weights.open_unclaimed(device, &handles, &claimed)?;
+    handles.seal();
+    Ok(Placed {
+        handles,
+        weights,
+        ane,
+        recipe,
+        weight_caches,
+    })
+}
+
+/// Each rung's rs scratch: a fire of the rung's tokens and lanes replays its
+/// own rows and the rows its lanes carry in, which the contract holds to the
+/// rung's tokens summed over the lanes ([`engine::fire::rung_holds`]): its
+/// own rows and as many again. None without recurrent state.
+fn rs_rooms(
+    rungs: &[(u32, poem_compiler::ArenaMap)],
+    rs_layout: Option<&crate::rs::Layout>,
+    rows: &crate::store::Rows,
+    budget: &Budget,
+) -> Vec<u64> {
+    rungs
+        .iter()
+        .map(|(tokens, _)| match (rs_layout, &rows.rs) {
+            (Some(layout), Some(_)) => {
+                let lanes = (*tokens).min(budget.max_lanes).max(1);
+                let own = (*tokens).min(budget.max_tokens);
+                // Its own rows and, counted toward the rung, as many
+                // carried in: what every fire of it is checked against.
+                crate::rs::Seat::scratch_bytes(layout, crate::rs::scratch_rows(own, *tokens), lanes)
+            }
+            _ => 0,
+        })
+        .collect()
+}
+
+/// A windowed load's own-row pages (`store::windowed`): a fire's own rows
+/// past what its ring keeps for its queries lie in window-slot pages at the
+/// range's very top, whole chunks every rung's carve holds, so the page grid
+/// runs from each chunk's start. As many as the widest rung's rows take, two
+/// boundary pages a lane that takes any (only a lane of more than
+/// `R - W + 1` rows does), an arm each; and a chunk past them for the
+/// scratch page a fold-less lane names. None on a load without a ring.
+fn own_row_chunks(
+    rows: &crate::store::Rows,
+    rungs: &[(u32, poem_compiler::ArenaMap)],
+    max_lanes: u32,
+    arms: u64,
+) -> u32 {
+    match (&rows.ring, rows.windows.first()) {
+        (Some(_), Some(window)) if window.bytes > 0 => {
+            let page = window.tokens.max(1);
+            let per_chunk = (rows.chunk_bytes / window.bytes).max(1);
+            let widest = u64::from(rungs.last().map_or(0, |(tokens, _)| *tokens));
+            let ring = crate::chunks::MetalRing::rows(window.rows, page);
+            let past = u64::from(ring.saturating_sub(window.rows)) + 2;
+            let lanes = (widest / past).min(u64::from(max_lanes));
+            let pages = (widest.div_ceil(u64::from(page)) + 2 * lanes) * arms;
+            u32::try_from(pages.div_ceil(per_chunk) + 1).unwrap_or(u32::MAX)
+        }
+        _ => 0,
+    }
+}
+
+/// What sizes a load's chunk pool: the room it fills, the activation span
+/// and the engine's tables beside its state, and how many chunks one buffer
+/// of the device binds.
+struct PoolRoom<'r> {
+    rows: &'r crate::store::Rows,
+    /// Each rung's tokens and its activation chunks.
+    act: &'r [(u32, u32)],
+    page_size: u32,
+    context: u32,
+    slots: u32,
+    /// The bytes the pool may fill: the stated kv budget, else what the
+    /// accounting leaves. The row-streamed tables' blocks come out of this
+    /// room as the runtime names them; their own copies are counted in the
+    /// weights until a held set gives them back.
+    room: u64,
+    span: u32,
+    tables_chunks: u32,
+    part_chunks: u32,
+    part_cap: u64,
+    parts_bound: usize,
+    addressing: Addressing,
+    adapter_plane: u64,
+}
+
+impl PoolRoom<'_> {
+    fn paging(&self, pages: u64) -> Result<Paging> {
+        Ok(Paging::of(self.page_size, self.context, self.slots, pages)?)
+    }
+
+    /// One chunk pool holds every kv page and every record (the rs buffer's
+    /// rows inside it), in what the room holds of whole chunks, and the
+    /// activation span above them: its paging, the state's bytes and its
+    /// layout.
+    fn lay(&self) -> Result<(Paging, u64, Layout)> {
+        let (span, tables_chunks) = (self.span, self.tables_chunks);
+        let seated = self.paging(1)?;
+        let bytes = [self.rows.list_bytes, self.rows.fixed_bytes];
+        let chunk = self.rows.chunk_bytes;
+        // A seat's slots of each window list: its context in `T_w`-token
+        // slots; on a ring load, at least a ring's, which a seat-addressed
+        // lane takes as its ring (`Pools::window_seat_ring`).
+        let window_pages: Vec<u32> = self
+            .rows
+            .windows
+            .iter()
+            .map(|w| {
+                let context = seated.context().div_ceil(w.tokens.max(1)).max(1);
+                let ring = self.rows.ring.as_ref().map_or(0, |_| {
+                    crate::chunks::MetalRing::rows(w.rows, w.tokens.max(1)) / w.tokens.max(1)
+                });
+                context.max(ring)
+            })
+            .collect();
+        let window_chunks: u32 = self
+            .rows
+            .windows
+            .iter()
+            .zip(&window_pages)
+            .map(|(w, pages)| {
+                chunk.checked_div(w.bytes).map_or(0, |per| {
+                    pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
+                })
+            })
+            .sum();
+        let least = Layout::least_chunks(chunk, bytes, self.rows.pieces, seated.pages_per_slot)
+            + window_chunks;
+        let total = engine::chunk::fit(self.room, chunk, 0, least)
+            .map_err(Fault::FitShort)?
+            .saturating_add(span)
+            .saturating_add(tables_chunks);
+        // The range spans as many buffers as it takes, each as many
+        // whole segments as one buffer binds; the span lies in the last.
+        let per = self.part_chunks;
+        if per < span {
+            return Err(Fault::Residency(format!(
+                "one fire's activation takes {span} chunks of {chunk} bytes, and one \
+                 buffer of this device binds {per} ({} MiB): the activation lies in one",
+                self.part_cap >> 20
+            )));
+        }
+        let mut total = total;
+        // Each buffer maps whole tiles of its own length, past its share
+        // of the range where its chunks do not end on a tile: the room
+        // the range fills holds that too, so the range gives up as many
+        // chunks as it takes (fewer chunks map no more).
+        let slack = crate::store::pool::mapped_bytes(chunk, total, per)
+            .saturating_sub(chunk * u64::from(total));
+        total = total
+            .saturating_sub(u32::try_from(slack.div_ceil(chunk.max(1))).unwrap_or(u32::MAX));
+        if total < least.saturating_add(span).saturating_add(tables_chunks) {
+            return Err(Fault::Residency(format!(
+                "one working set takes {least} chunks of {chunk} bytes beside the \
+                 activation's {span} and the tables' {tables_chunks}, and the room holds \
+                 {total} once the buffers' whole tiles ({slack} bytes past the range) are \
+                 counted"
+            )));
+        }
+        // The last buffer holds the span: a leftover too small for it
+        // goes, at most one span and segment of state.
+        let left = total % per;
+        let seg = crate::store::pool::segment_chunks(chunk);
+        if total > per && left != 0 && left < span.saturating_add(seg) {
+            total -= left;
+        }
+        if total.div_ceil(per) as usize > self.parts_bound {
+            return Err(Fault::Residency(format!(
+                "the pool's {total} chunks of {chunk} bytes take {} buffers, and the \
+                 tables run was sized for {}",
+                self.parts_bound,
+                total.div_ceil(per)
+            )));
+        }
+        let mut layout = Layout::new(
+            chunk,
+            total,
+            crate::store::pool::segment_chunks(chunk),
+            self.page_size,
+            bytes,
+            self.rows.pieces,
+            match self.addressing {
+                Addressing::Refs => 0,
+                Addressing::Seats => self.slots,
+            },
+            seated.pages_per_slot,
+        )?
+        .with_tables(tables_chunks)
+        .with_adapter(self.adapter_plane)?;
+        for (window, pages) in self.rows.windows.iter().zip(&window_pages) {
+            layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
+        }
+        if let Some(ring) = &self.rows.ring {
+            layout = layout.with_ring(ring.pieces);
+        }
+        let layout = layout
+            .with_rs(
+                self.rows.rs.as_ref().map_or(0, |rs| rs.bytes),
+                self.rows.rs.as_ref().map_or(0, |rs| rs.tokens),
+                seated.pages_per_slot,
+            )?
+            .with_act(self.act)?;
+        let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
+        // The state's bytes: the span above them is the fire's, which
+        // the accounting already counts.
+        // Each buffer maps whole tiles of its own length: what the
+        // buffers map past the range's bytes is state memory the load
+        // admits as well.
+        let tiles = crate::store::pool::mapped_bytes(chunk, total, per)
+            .saturating_sub(chunk * u64::from(total));
+        Ok((
+            self.paging(pages)?,
+            chunk * u64::from(total - span - tables_chunks) + tiles,
+            layout,
+        ))
+    }
 }
 
 impl PreparedLoad<'_> {
@@ -793,6 +1185,15 @@ impl PreparedLoad<'_> {
         self.ane_cache = cache;
     }
 
+    /// Places the load for a runtime that names every slot by ref: no seat
+    /// runs, and a seat-addressed lane refused ([`Addressing::Refs`]).
+    pub fn load_for_runtime(mut self) -> Result<Shell> {
+        self.addressing = Addressing::Refs;
+        self.load()
+    }
+
+    /// Places the load for the direct-firing harness ([`Addressing::Seats`]),
+    /// or as [`Self::load_for_runtime`] set it.
     pub fn load(self) -> Result<Shell> {
         let PreparedLoad {
             boot,
@@ -807,103 +1208,18 @@ impl PreparedLoad<'_> {
             placed,
             ruled,
             ane_cache,
+            addressing,
         } = self;
         let mut boot = boot;
 
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
 
-        let mut masked = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            // An arm applies the fire's masks where its attention reads them
-            // and its kernels read each row's word: the paged prefill, and the
-            // paged decode (its plain, split, mma and q8 kernels read the word
-            // once a row, and a key's bit only past the lane's boundary). A
-            // selection's or a bias's arm reads none.
-            let runs_masked = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attn(
-                        poem_ir::Attn::Prefill {
-                            mask: Some(_),
-                            selection: None,
-                            bias: None,
-                            ..
-                        } | poem_ir::Attn::Decode {
-                            mask: Some(_),
-                            selection: None,
-                            bias: None,
-                            selected: None,
-                            rel: None,
-                            ..
-                        }
-                    ))
-                )
-            });
-            if runs_masked {
-                for class in region.mask.iter() {
-                    masked.insert(class);
-                }
-            }
-        }
-        let mut wide = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_wide = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
-                        causal: false,
-                        ..
-                    }))
-                )
-            });
-            if runs_wide {
-                for class in region.mask.iter() {
-                    wide.insert(class);
-                }
-            }
-        }
-        // Mask bits are staged per lane with causality baked in, unclipped for a wide class:
-        // a causal masked prefill there would see future keys.
-        let mut causal_masked = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_causal_masked = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
-                        mask: Some(_),
-                        causal: true,
-                        ..
-                    }))
-                )
-            });
-            if runs_causal_masked {
-                for class in region.mask.iter() {
-                    causal_masked.insert(class);
-                }
-            }
-        }
-        if let Some(class) = wide.iter().find(|&class| causal_masked.contains(class)) {
-            return Err(Fault::Recipe(format!(
-                "class {class} attends both ways under one mask"
-            )));
-        }
-        let mut corrected = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Linear(
-                        poem_ir::Linear::LoraCorrect { .. }
-                    ))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
+        let Classes {
+            masked,
+            wide,
+            corrected,
+        } = Classes::of(&boot.trace, &compiled)?;
 
         let Placed {
             handles,
@@ -913,71 +1229,7 @@ impl PreparedLoad<'_> {
             weight_caches,
         } = match placed {
             Some(placed) => placed,
-            None => {
-                let handles = Handles::new();
-                let mut weights = Weights::resident(
-                    &device,
-                    &handles,
-                    &boot.trace,
-                    boot.contract,
-                    boot.checkpoint,
-                    &boot.residency,
-                )?;
-                weights.decode_absorbed(&device, &handles, &boot.trace)?;
-                weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
-                weights.repack_mpp(
-                    &device,
-                    &handles,
-                    &boot.trace,
-                    *chip.get::<crate::chip::WeightsLayout>(),
-                )?;
-                let ane = crate::ane::load(
-                    &device,
-                    &handles,
-                    &boot.trace,
-                    &weights,
-                    &chip,
-                    ane_cache.as_deref(),
-                )
-                    .unwrap_or_else(|why| {
-                        tracing::info!("the Neural Engine stays out of this load: {why}");
-                        None
-                    });
-                // The compiler's on-device Metal recipe is the one layout source: the
-                // chunk, the list slot (its tokens are the kv page size), where
-                // every fixed row's pieces lie in a record, and the weight slots.
-                let recipe = crate::chunks::recipe_near(
-                    &boot.trace,
-                    &budgets,
-                    boot.residency.chunk_bytes(),
-                )?;
-                let weight_caches = if boot.residency.whole_weights() {
-                    Vec::new()
-                } else {
-                    Shell::weight_caches(
-                        &device,
-                        &handles,
-                        &mut weights,
-                        &boot.trace,
-                        &recipe,
-                        boot.residency.rows_streamed(),
-                    )?
-                };
-                // A weight kept apart that no cache takes is read whole, in place.
-                let claimed: std::collections::BTreeSet<usize> = weight_caches
-                    .iter()
-                    .flat_map(|cache| cache.shape.planes.iter().map(|plane| plane.param))
-                    .collect();
-                weights.open_unclaimed(&device, &handles, &claimed)?;
-                handles.seal();
-                Placed {
-                    handles,
-                    weights,
-                    ane,
-                    recipe,
-                    weight_caches,
-                }
-            }
+            None => place_weights(&device, &chip, &boot, &budgets, ane_cache.as_deref())?,
         };
 
         // The kv pool and the recurrent-state buffers beside it: both are
@@ -1265,27 +1517,7 @@ impl PreparedLoad<'_> {
         )
         .unwrap_or(u32::MAX);
         let model_bytes = weights.bytes() + ane_model + u64::from(tables_chunks) * rows.chunk_bytes;
-        // Each rung's rs scratch: a fire of the rung's tokens and lanes
-        // replays its own rows and the rows its lanes carry in, which the
-        // contract holds to the rung's tokens summed over the lanes
-        // ([`engine::fire::rung_holds`]): its own rows and as many again.
-        let rs_room: Vec<u64> = rungs
-            .iter()
-            .map(|(tokens, _)| match (&rs_layout, &rows.rs) {
-                (Some(layout), Some(_)) => {
-                    let lanes = (*tokens).min(boot.budget.max_lanes).max(1);
-                    let own = (*tokens).min(boot.budget.max_tokens);
-                    // Its own rows and, counted toward the rung, as many
-                    // carried in: what every fire of it is checked against.
-                    crate::rs::Seat::scratch_bytes(
-                        layout,
-                        crate::rs::scratch_rows(own, *tokens),
-                        lanes,
-                    )
-                }
-                _ => 0,
-            })
-            .collect();
+        let rs_room = rs_rooms(&rungs, rs_layout.as_deref(), &rows, &boot.budget);
         let fire_bytes = compiled.arena.bytes
             + crate::arena::room(rs_room.last().copied().unwrap_or(0))
             + scratch.bytes()
@@ -1313,28 +1545,7 @@ impl PreparedLoad<'_> {
             )
             .with_streamable(weights.filed_bytes())
         };
-        // A windowed load's own-row pages (`store::windowed`):
-        // a fire's own rows past what its ring keeps for its queries lie in
-        // window-slot pages at the range's very top, whole chunks every
-        // rung's carve holds, so the page grid runs from each chunk's start.
-        // As many as the widest rung's rows take, two boundary pages a lane
-        // that takes any (only a lane of more than `R - W + 1` rows does),
-        // an arm each.
-        let own_chunks: u32 = match (&rows.ring, rows.windows.first()) {
-            (Some(_), Some(window)) if window.bytes > 0 => {
-                let page = window.tokens.max(1);
-                let per_chunk = (rows.chunk_bytes / window.bytes).max(1);
-                let widest = u64::from(rungs.last().map_or(0, |(tokens, _)| *tokens));
-                let ring = crate::chunks::MetalRing::rows(window.rows, page);
-                let past = u64::from(ring.saturating_sub(window.rows)) + 2;
-                let lanes = (widest / past).min(u64::from(boot.budget.max_lanes));
-                let pages = (widest.div_ceil(u64::from(page)) + 2 * lanes) * arms as u64;
-                // Every arm's share, and a chunk past them for the scratch page
-                // a fold-less lane names.
-                u32::try_from(pages.div_ceil(per_chunk) + 1).unwrap_or(u32::MAX)
-            }
-            _ => 0,
-        };
+        let own_chunks = own_row_chunks(&rows, &rungs, boot.budget.max_lanes, arms as u64);
         if crate::diag::on().tier_trace && own_chunks > 0 {
             eprintln!("residency: windowed own-row pages take the range's top {own_chunks} chunks");
         }
@@ -1498,132 +1709,28 @@ impl PreparedLoad<'_> {
                     }),
                     ruled: Some(pick),
                     ane_cache,
+                    addressing,
                 }
                 .load();
             }
         }
         let span = act.last().map_or(0, |&(_, chunks)| chunks);
-        // One chunk pool holds every kv page and every record (the rs
-        // buffer's rows inside it), in what the room holds of whole chunks,
-        // and the activation span above them.
-        let (paging, pool_bytes, layout) = {
-            let seated = paging_at(1, boot.slots)?;
-            let bytes = [rows.list_bytes, rows.fixed_bytes];
-            let chunk = rows.chunk_bytes;
-            // A seat's slots of each window list: its context in `T_w`-token
-            // slots; on a ring load, at least a ring's, which a seat-addressed
-            // lane takes as its ring (`Pools::window_seat_ring`).
-            let window_pages: Vec<u32> = rows
-                .windows
-                .iter()
-                .map(|w| {
-                    let context = seated.context().div_ceil(w.tokens.max(1)).max(1);
-                    let ring = rows.ring.as_ref().map_or(0, |_| {
-                        crate::chunks::MetalRing::rows(w.rows, w.tokens.max(1)) / w.tokens.max(1)
-                    });
-                    context.max(ring)
-                })
-                .collect();
-            let window_chunks: u32 = rows
-                .windows
-                .iter()
-                .zip(&window_pages)
-                .map(|(w, pages)| {
-                    chunk.checked_div(w.bytes).map_or(0, |per| {
-                        pages.div_ceil(u32::try_from(per).unwrap_or(1).max(1))
-                    })
-                })
-                .sum();
-            let least = Layout::least_chunks(chunk, bytes, rows.pieces, seated.pages_per_slot)
-                + window_chunks;
-            // The row-streamed tables' blocks come out of this room as the
-            // runtime names them; their own copies are counted in the
-            // weights until a held set gives them back.
-            let room = boot.kv_budget.unwrap_or_else(|| accounting(0).pool);
-            let total = engine::chunk::fit(room, chunk, 0, least)
-                .map_err(Fault::FitShort)?
-                .saturating_add(span)
-                .saturating_add(tables_chunks);
-            // The range spans as many buffers as it takes, each as many
-            // whole segments as one buffer binds; the span lies in the last.
-            let per = part_chunks;
-            if per < span {
-                return Err(Fault::Residency(format!(
-                    "one fire's activation takes {span} chunks of {chunk} bytes, and one \
-                     buffer of this device binds {per} ({} MiB): the activation lies in one",
-                    part_cap >> 20
-                )));
-            }
-            let mut total = total;
-            // Each buffer maps whole tiles of its own length, past its share
-            // of the range where its chunks do not end on a tile: the room
-            // the range fills holds that too, so the range gives up as many
-            // chunks as it takes (fewer chunks map no more).
-            let slack = crate::store::pool::mapped_bytes(chunk, total, per)
-                .saturating_sub(chunk * u64::from(total));
-            total = total
-                .saturating_sub(u32::try_from(slack.div_ceil(chunk.max(1))).unwrap_or(u32::MAX));
-            if total < least.saturating_add(span).saturating_add(tables_chunks) {
-                return Err(Fault::Residency(format!(
-                    "one working set takes {least} chunks of {chunk} bytes beside the \
-                     activation's {span} and the tables' {tables_chunks}, and the room holds \
-                     {total} once the buffers' whole tiles ({slack} bytes past the range) are \
-                     counted"
-                )));
-            }
-            // The last buffer holds the span: a leftover too small for it
-            // goes, at most one span and segment of state.
-            let left = total % per;
-            let seg = crate::store::pool::segment_chunks(chunk);
-            if total > per && left != 0 && left < span.saturating_add(seg) {
-                total -= left;
-            }
-            if total.div_ceil(per) as usize > parts_bound {
-                return Err(Fault::Residency(format!(
-                    "the pool's {total} chunks of {chunk} bytes take {} buffers, and the \
-                     tables run was sized for {parts_bound}",
-                    total.div_ceil(per)
-                )));
-            }
-            let mut layout = Layout::new(
-                chunk,
-                total,
-                crate::store::pool::segment_chunks(chunk),
-                page_size,
-                bytes,
-                rows.pieces,
-                boot.slots,
-                seated.pages_per_slot,
-            )?
-            .with_tables(tables_chunks)
-            .with_adapter(weights.widest_bank_plane())?;
-            for (window, pages) in rows.windows.iter().zip(&window_pages) {
-                layout = layout.with_window(window.bytes, window.rows, window.tokens, *pages)?;
-            }
-            if let Some(ring) = &rows.ring {
-                layout = layout.with_ring(ring.pieces);
-            }
-            let layout = layout
-                .with_rs(
-                    rows.rs.as_ref().map_or(0, |rs| rs.bytes),
-                    rows.rs.as_ref().map_or(0, |rs| rs.tokens),
-                    seated.pages_per_slot,
-                )?
-                .with_act(&act)?;
-            let pages = u64::from(layout.list.map_or(0, |list| list.per_chunk)) * u64::from(total);
-            // The state's bytes: the span above them is the fire's, which
-            // the accounting already counts.
-            // Each buffer maps whole tiles of its own length: what the
-            // buffers map past the range's bytes is state memory the load
-            // admits as well.
-            let tiles = crate::store::pool::mapped_bytes(chunk, total, per)
-                .saturating_sub(chunk * u64::from(total));
-            (
-                paging_at(pages, boot.slots)?,
-                chunk * u64::from(total - span - tables_chunks) + tiles,
-                layout,
-            )
-        };
+        let (paging, pool_bytes, layout) = PoolRoom {
+            rows: &rows,
+            act: &act,
+            page_size,
+            context: boot.context,
+            slots: boot.slots,
+            room: boot.kv_budget.unwrap_or_else(|| accounting(0).pool),
+            span,
+            tables_chunks,
+            part_chunks,
+            part_cap,
+            parts_bound,
+            addressing,
+            adapter_plane: weights.widest_bank_plane(),
+        }
+        .lay()?;
 
         {
             let acct = accounting(pool_bytes);
@@ -1787,6 +1894,7 @@ impl PreparedLoad<'_> {
                 })
         });
         let shell = Shell {
+            addressing,
             weighed,
             measured_at_load: chip.tuned().timed.clone(),
             tuning,

@@ -3,9 +3,6 @@
 
 #![allow(dead_code)]
 
-use eta_ir::container::{PortBinding, PortSource};
-use eta_ir::registry::Port;
-use eta_ir::types::{Dtype as EtaDtype, Shape};
 
 pub(crate) fn bf16(v: f32) -> [u8; 2] {
     let bits = v.to_bits();
@@ -106,17 +103,6 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
         }
     } else {
         sign * (1.0 + f32::from(mant) / 1024.0) * 2f32.powi(i32::from(exp) - 15)
-    }
-}
-
-pub(crate) fn const_port(port: Port, words: &[u32]) -> PortBinding {
-    PortBinding {
-        port,
-        source: PortSource::Const {
-            dtype: EtaDtype::U32,
-            shape: Shape::vector(words.len() as u32),
-            data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        },
     }
 }
 
