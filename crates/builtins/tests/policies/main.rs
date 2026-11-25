@@ -2,4 +2,5 @@
 
 mod deadline;
 mod defaults;
+mod fair;
 mod rig;

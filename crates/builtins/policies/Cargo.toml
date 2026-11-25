@@ -12,6 +12,7 @@ members = [
     "deadline",
     "default",
     "default-cluster",
+    "fair",
     "noop",
     "test-pause",
     "test-route",
