@@ -20,7 +20,8 @@ from pathlib import Path
 from .mount import STANZAS
 
 TAPS = ("q", "k", "v", "o", "gate", "up", "down")
-"""The taps a dense model offers, in the order the table shows them."""
+"""The taps a dense model offers, in the order the table shows them; any
+other tap a stanza attaches at (a block's `attn`) follows them."""
 DTYPE_BYTES = {"bf16": 2, "f16": 2, "f32": 4}
 """Bytes per element of each bank dtype."""
 PROMPTS = ["The capital of France is", "Triage this ticket: my brakes failed on a descent.",
@@ -70,8 +71,9 @@ class Report:
     """The weight-check lines and whether each passed, when the checks ran."""
 
     def __str__(self) -> str:
-        head = ["stanza", "lines", *TAPS, "banks", "params/tenant", "bytes/tenant"]
-        body = [[r.name, str(r.lines), *(_cell(r.sites.get(t, []), self.layers) for t in TAPS),
+        taps = [*TAPS, *sorted({s for r in self.stanzas.values() for s in r.sites} - set(TAPS))]
+        head = ["stanza", "lines", *taps, "banks", "params/tenant", "bytes/tenant"]
+        body = [[r.name, str(r.lines), *(_cell(r.sites.get(t, []), self.layers) for t in taps),
                  str(r.banks), f"{r.params:,}", _size(r.bytes)] for r in self.stanzas.values()]
         widths = [max(len(row[i]) for row in [head, *body]) for i in range(len(head))]
         table = ["  ".join(c.ljust(w) if i == 0 else c.rjust(w) for i, (c, w) in enumerate(zip(row, widths)))
