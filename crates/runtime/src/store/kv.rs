@@ -1076,20 +1076,7 @@ impl KvStore {
             for at in 0..count {
                 let at = if last { walk[at] } else { at };
                 let (key, ids) = &order[at];
-                // Of the group, what no live set reads, at rest on the
-                // device now: the order kept says none of that.
-                let ids: Vec<u64> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| {
-                        self.cache.get(id).is_some_and(|entry| {
-                            let root = entry.path.terminal;
-                            self.table.unused_under(&reads, root)
-                                && !self.table.in_move_at(root)
-                                && self.table.holds_resident(root)
-                        })
-                    })
-                    .collect();
+                let ids = self.at_rest(ids, &reads);
                 if ids.is_empty() {
                     continue;
                 }
@@ -1185,6 +1172,22 @@ impl KvStore {
         self.split_at_steps(keys);
         self.split_persisted();
         self.order_of(keys, |_| true)
+    }
+
+    /// Of a kept order's group, what no live set reads, at rest on the
+    /// device now: the order says none of that.
+    fn at_rest(&self, ids: &[u64], reads: &page_table::LiveReads) -> Vec<u64> {
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                self.cache.get(id).is_some_and(|entry| {
+                    let root = entry.path.terminal;
+                    self.table.unused_under(reads, root)
+                        && !self.table.in_move_at(root)
+                        && self.table.holds_resident(root)
+                })
+            })
+            .collect()
     }
 
     /// Keeps what of `order` a reclaim left (its dropped entries taken out),
@@ -1352,15 +1355,8 @@ impl KvStore {
         }
     }
 
-    /// Lowest retention priority first, least recently used among equals;
-    /// one wholly below the device never. Groups that free no device page go last: the callers ask as
-    /// they go, so a reclaim that stops early asks only the groups it reaches.
-    fn reclaim_order(&self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
-        self.order_where(keys, KvPageTable::holds_resident)
-    }
-
-    /// [`Self::reclaim_order`] over the entries `held` says hold a page
-    /// on the tier wanted.
+    /// [`Self::order_of`] the entries no live set reads, at rest, that hold a
+    /// page on the tier `held` reads.
     fn order_where(
         &self,
         keys: &impl Keys,
@@ -1375,8 +1371,8 @@ impl KvStore {
         })
     }
 
-    /// The entries whose terminal `of` takes, in groups, the first to go
-    /// first.
+    /// The entries whose terminal `of` takes, in groups: the lowest retention
+    /// key first, least recently used among equals.
     fn order_of(
         &self,
         keys: &impl Keys,
@@ -1493,25 +1489,30 @@ impl KvStore {
         if room == 0 {
             return Ok(None);
         }
-        self.split_at_steps(&keys);
-        self.split_persisted();
-        let order = self.reclaim_order(&keys);
+        let order = self.kept_order(&keys);
+        let reads = self.table.live_reads();
         // The device holds the highest keys first: idle cache keyed lower
         // that may not move down is dropped (the caller's reclaim) before
         // anything keyed above it moves down. A sweep (`now`) moves what its
         // row keeps off the device whatever lies below.
-        let floor = (!now)
-            .then(|| {
-                order
-                    .iter()
-                    .filter(|(_, ids)| self.table.frees_device_pages(&self.roots(ids)))
-                    .find(|(_, ids)| {
-                        ids.iter().all(|&id| self.tiers_of(id, &keys) & retention::HOST == 0)
-                    })
-                    .map(|(key, _)| *key)
-            })
-            .flatten();
-        let mut groups: Vec<(i64, Vec<u64>)> = order
+        let mut floor = None;
+        let mut below = Vec::new();
+        for (key, ids) in &order {
+            let ids = self.at_rest(ids, &reads);
+            if ids.is_empty() {
+                continue;
+            }
+            if !now
+                && ids.iter().all(|&id| self.tiers_of(id, &keys) & retention::HOST == 0)
+                && self.table.frees_device_pages(&self.roots(&ids))
+            {
+                floor = Some(*key);
+                break;
+            }
+            below.push((*key, ids));
+        }
+        self.keep_order(order, &keys);
+        let mut groups: Vec<(i64, Vec<u64>)> = below
             .into_iter()
             .filter(|(key, _)| floor.is_none_or(|floor| *key < floor))
             .map(|(key, ids)| {
