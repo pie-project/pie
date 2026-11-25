@@ -1837,9 +1837,6 @@ impl ResidencyPlanner {
         let kv = held_page_count(pid, model, engine) + demand.kv_pages;
         let rs = super::holdings::held_rs_units(pid, model, engine).add(demand.rs);
         if let Some(proc) = self.lock_inner().procs.get_mut(&pid) {
-            if proc.peak.0 == 0 && proc.peak.1.is_zero() {
-                proc.first = (kv, rs);
-            }
             proc.peak = (
                 proc.peak.0.max(kv),
                 RsUnits {
@@ -2253,7 +2250,7 @@ impl ResidencyPlanner {
             if let Some(proc) = departed.as_ref().filter(|proc| {
                 proc.admitted && proc.state == Residency::Resident && !proc.respawn && proc.peak.0 > 0
             }) {
-                inner.to_end.learn(proc.peak, proc.first);
+                inner.to_end.learn(proc.peak);
             }
             if departed.as_ref().is_some_and(|proc| {
                 proc.admitted && !proc.holder && proc.state == Residency::Resident

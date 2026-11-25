@@ -56,8 +56,6 @@ pub(super) struct Proc {
     /// The most device kv pages and rs units it has held at a grant, for
     /// [`super::to_end::ToEnd`].
     pub(super) peak: (u32, crate::store::rs::RsUnits),
-    /// What it held at its first grant: its prompt.
-    pub(super) first: (u32, crate::store::rs::RsUnits),
     /// Its holds past its exit; see [`Departure`].
     pub(super) departure: Weak<Departure>,
     /// Admitted against the state pool: it counts for the fixed sets a
@@ -263,7 +261,6 @@ impl Proc {
             reseating: false,
             seated: false,
             peak: Default::default(),
-            first: Default::default(),
             departure: Weak::new(),
             charged: false,
             fires: 0,
