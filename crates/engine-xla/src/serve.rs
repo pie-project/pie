@@ -3060,9 +3060,12 @@ impl Shell {
         // or not, every row's flag off where none is: the mask is data of
         // the fire's shape, so a masked lane's mixed fire (a beam's rescore
         // beside other groups' decodes) is the program the warm ladder laid
-        // for the plain one.
-        let mixed = descriptor.lanes.iter().any(|l| l.rows > 1)
-            && descriptor.lanes.iter().any(|l| l.rows == 1);
+        // for the plain one. Its own lanes say so, not its padding: a
+        // padding lane of one row is no decode. A prompt alone stages it
+        // where a lane of it is masked (its program is the ladder's masked
+        // twin of the plain one).
+        let mixed = lanes.iter().any(|s| s.lane.tokens.len() > 1)
+            && lanes.iter().any(|s| s.lane.tokens.len() == 1);
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {
             Some(staged) => (staged.bytes.clone(), staged.enabled.clone(), staged.stride),
             None if mixed && !self.masked.is_empty() => (Vec::new(), Vec::new(), mask_width),

@@ -517,6 +517,9 @@ impl Shell {
                                 n as usize
                             ];
                             lanes[0].rows += b % n;
+                            // filling its rung, which takes no rest lane, and
+                            // a row short of it
+                            shapes.push(lanes.clone());
                             lanes[0].rows -= 1;
                             shapes.push(lanes);
                         }
@@ -571,6 +574,24 @@ impl Shell {
         if !gaps.unlaid.is_empty() {
             parts.push(("stated", shapes.len()));
             shapes.extend(gaps.unlaid.into_iter().map(|(_, shape)| shape));
+        }
+        // Every fire of prompts alone, beside its masked twin: a lane stating
+        // a mask (a beam's rescore, a guest's) stages the plane, a program of
+        // its own. A fire of prompts beside decodes stages it either way.
+        if masks {
+            let twins: Vec<Vec<Want>> = shapes
+                .iter()
+                .filter(|shape| {
+                    !shape.is_empty() && shape.iter().all(|w| w.rows > 1 && !w.masked)
+                })
+                .map(|shape| {
+                    let mut lanes = shape.clone();
+                    lanes[0].masked = true;
+                    lanes
+                })
+                .collect();
+            parts.push(("masked prompts", shapes.len()));
+            shapes.extend(twins);
         }
         Ok(Some((parts, shapes)))
     }
