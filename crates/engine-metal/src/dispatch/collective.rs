@@ -14,13 +14,13 @@ impl Run<'_> {
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_metal::Error> {
         match op {
             Collective::AllReduce { buf, buf_out: _ } => {
-                collective::all_reduce(self.ctx(), self.tensor(*buf))
+                collective::all_reduce(self.ctx(), self.tensor(*buf)?)
             }
             Collective::AllGather { x, y } => {
-                collective::all_gather(self.ctx(), self.tensor(*x), self.tensor(*y))
+                collective::all_gather(self.ctx(), self.tensor(*x)?, self.tensor(*y)?)
             }
             Collective::ReduceScatter { x, y } => {
-                collective::reduce_scatter(self.ctx(), self.tensor(*x), self.tensor(*y))
+                collective::reduce_scatter(self.ctx(), self.tensor(*x)?, self.tensor(*y)?)
             }
             Collective::Dispatch { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: "dispatch" })

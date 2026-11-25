@@ -108,7 +108,8 @@ pub const ADAPTER: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 2
 
 /// The pool's `Instance` slots (`SlotRole::Instance`): what a bound
 /// instance keeps on the device from its bind to its unbind (a beam group's
-/// state, `BEAM-PAGE-LISTS.md` §4), 1 KiB a slot as `CHANNEL`'s, an item one
+/// state: its page lists and the parents its fires wrote), 1 KiB a slot as
+/// `CHANNEL`'s, an item one
 /// run of them. Stated only in the load's facts, as `CHANNEL` is.
 pub const INSTANCE: engine::chunk::ShapeId = engine::chunk::ShapeId((1 << 17) + 3);
 
@@ -117,7 +118,7 @@ pub enum Kind {
     /// The kv list.
     Kv,
     /// The window list, its rows retaining `window` tokens: under the
-    /// windowed state (CONTRACT-BC 19, 21) the window buffer, its slots the
+    /// windowed state the window buffer, its slots the
     /// lane's unfolded windowed rows.
     Window { window: u32 },
     /// The windowed layers' rings, the lane's record (`SlotRole::State`,
@@ -219,7 +220,7 @@ pub struct Rows<'a> {
     pub compressor: Vec<(u32, u32)>,
     /// The rs layout's planes `(width, dtype)`.
     pub rs: Vec<(u32, Dtype)>,
-    /// Windowed rows served as ring + buffer (CONTRACT-BC 19, 21): the
+    /// Windowed rows served as ring + buffer: the
     /// window list is the window buffer and the record holds the rings
     /// ([`Kind::Ring`]).
     pub rings: bool,

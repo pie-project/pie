@@ -196,12 +196,12 @@ pub struct Seated<'a> {
     pub writes: Option<(&'a [u32], &'a [u32])>,
 
     /// The lane is a beam of a group whose head resolved its page entries
-    /// past `f0` and its write page this fire (`BEAM-PAGE-LISTS.md` §6.5).
+    /// past `f0` and its write page this fire.
     pub beam: Option<crate::beam::BeamLane>,
 
     pub first: Option<u32>,
 
-    /// The lane's window-buffer table (CONTRACT-BC 21): its slot refs in
+    /// The lane's window-buffer table: its slot refs in
     /// token order from [`Seated::window_fold`]'s `base`, every one a real
     /// slot; empty for a lane buffering none.
     pub window: &'a [u32],
@@ -256,7 +256,7 @@ impl<'a> Seated<'a> {
     }
 }
 
-/// Where a slot of the pool's shapes lies (CONTRACT-BC 22).
+/// Where a slot of the pool's shapes lies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Device,
@@ -383,7 +383,7 @@ pub struct Shell {
     sized_bucket: u32,
     /// What this load stages its fires' inputs in.
     staging_facts: StagingFacts,
-    /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
+    /// The host tier: chunks of the pool's size.
     host: crate::store::tier::Host,
     /// The slot file below it, kv list slots.
     disk: Option<crate::store::tier::Disk>,
@@ -428,7 +428,7 @@ pub struct Shell {
     /// set as the warm ladder starts; `None`: none kept or read.
     trace_scope: Option<String>,
     /// The step compositions the runtime's builder forms over this load
-    /// (`engine::StepShapes`, CONTRACT-BC 24), set before the warm ladder:
+    /// (`engine::StepShapes`), set before the warm ladder:
     /// it lays a fire's buffered treatment where the set states it.
     steps: Option<engine::StepShapes>,
     /// Whether this load's first record was checked against its trace (a
@@ -822,7 +822,7 @@ impl Shell {
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         // The chunk the compiler picks for this trace on a TPU, where it
         // packs one; the store lays its own runs around it.
-        // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): the recipe
+        // Windowed layers as ring + buffer: the recipe
         // asks the store's ring hook where the rings lie.
         let recipe = poem_compiler::chunk::plan_windowed(
             &boot.trace,
@@ -1394,7 +1394,7 @@ impl Shell {
     }
 
     /// Whether this load serves its windowed layers as ring + buffer
-    /// (`engine::Capabilities::windowed_state`, CONTRACT-BC 19, 21): it does
+    /// (`engine::Capabilities::windowed_state`): it does
     /// wherever it holds windowed layers.
     #[must_use]
     pub fn serves_windowed_state(&self) -> bool {
@@ -1459,7 +1459,7 @@ impl Shell {
     }
 
     /// The step set the runtime's `rules` form over this load's stated
-    /// facts (CONTRACT-BC 24): its activation rungs, the asked lanes and
+    /// facts: its activation rungs, the asked lanes and
     /// tokens, the rows a fire reads out, its attachments and the mixed
     /// steps it lays out at its lane rungs (`Shell::mixed_lanes`).
     #[must_use]
@@ -1654,7 +1654,7 @@ impl Shell {
     }
 
     /// Moves whole slots of shape `id` between the device, the host tier and
-    /// the slot file (CONTRACT-BC 22): `(src, dst)` refs of each side's own
+    /// the slot file: `(src, dst)` refs of each side's own
     /// space, in order.
     pub fn copy_tier(
         &mut self,
@@ -2490,7 +2490,7 @@ impl Shell {
         let mut replays: Vec<(u32, u32)> = Vec::with_capacity(lanes.len());
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-        // The windowed state (CONTRACT-BC 19, 21): each windowed lane's
+        // The windowed state: each windowed lane's
         // table composed of its ring, buffer and own-row pages, the pages
         // filled before the fire and folded into the rings after it.
         let ring_shape = self.pools.layout().ring().map(|s| s.id);

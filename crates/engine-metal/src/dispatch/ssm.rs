@@ -60,10 +60,10 @@ impl Run<'_> {
                 y,
             } => {
                 let m = ssm::Mamba2 {
-                    a_log: self.tensor(*a_log),
-                    dt_bias: self.tensor(*dt_bias),
-                    d: self.tensor(*d),
-                    norm: self.tensor(*norm),
+                    a_log: self.tensor(*a_log)?,
+                    dt_bias: self.tensor(*dt_bias)?,
+                    d: self.tensor(*d)?,
+                    norm: self.tensor(*norm)?,
                     eps: *eps,
                     heads: *heads,
                     groups: *groups,
@@ -72,25 +72,25 @@ impl Run<'_> {
                 if matches!(op, Ssm::Mamba2 { .. }) {
                     return ssm::mamba2(
                         self.ctx(),
-                        self.tensor(*xbc),
-                        dt,
-                        z,
+                        self.tensor(*xbc)?,
+                        dt?,
+                        z?,
                         m,
-                        &self.recurrent(*state),
+                        &self.recurrent(*state)?,
                         *state_dim,
-                        y,
+                        y?,
                     );
                 }
                 ssm::mamba2_chunked(
                     self.ctx(),
-                    self.ragged(*xbc),
-                    dt,
-                    z,
+                    self.ragged(*xbc)?,
+                    dt?,
+                    z?,
                     m,
-                    &self.recurrent(*state),
+                    &self.recurrent(*state)?,
                     *state_dim,
-                    y,
-                    self.rs_snapshots(*state),
+                    y?,
+                    self.rs_snapshots(*state)?,
                 )
             }
             Ssm::CausalConv1d {
@@ -114,7 +114,7 @@ impl Run<'_> {
                 let seat = self.rs_seat().expect("guarded");
                 let conv = crate::rs::Convolved {
                     x: *x,
-                    weight: self.tensor(*weight),
+                    weight: self.tensor(*weight)?,
                     state: *state,
                     conv_width: *conv_width,
                     dilation: *dilation,
@@ -128,7 +128,7 @@ impl Run<'_> {
                 gates,
             } if self.rs_seat().is_some() => {
                 let seat = self.rs_seat().expect("guarded");
-                let prep = (*ba, self.tensor(*dt_bias), self.tensor(*a_log));
+                let prep = (*ba, self.tensor(*dt_bias)?, self.tensor(*a_log)?);
                 // The scan that alone reads the gates derives them as it
                 // stages its rows, and lands the window's own.
                 if self.read_only_by_scan(*gates) {
@@ -168,7 +168,7 @@ impl Run<'_> {
                 {
                     let paged = seat.paged(self.handles(), ba);
                     let ba = match paged {
-                        Some(_) => self.tensor(ba),
+                        Some(_) => self.tensor(ba)?,
                         None => self.rs_extend(OP, &seat, ba)?,
                     };
                     // The corrected planes (keys, u) each own row lands:
@@ -215,41 +215,41 @@ impl Run<'_> {
                         ssm::gated_delta_group_fold(
                             self.ctx(),
                             folds,
-                            self.window_lanes(),
-                            self.rs_committed(&seat, *state).slots,
+                            self.window_lanes()?,
+                            self.rs_committed(&seat, *state)?.slots,
                             (a_log, dt_bias),
                             ba_paged,
                             corrected,
-                            &self.recurrent(*state),
+                            &self.recurrent(*state)?,
                             (*k_heads, *v_heads, *k_dim, *v_dim),
                         )?;
                     }
                     // A decode window (a row of its own every lane, few
                     // carried) reads its carried rows as a linear attention.
                     if let (Some(ba_paged), Some(corrected)) = (paged, corrected)
-                        && self.rs_snapshots(*state).is_none()
-                        && self.carried_window(&seat)
+                        && self.rs_snapshots(*state)?.is_none()
+                        && self.carried_window(&seat)?
                     {
                         return ssm::gated_delta_carried(
                             self.ctx(),
                             self.tuning(),
                             ext_qkv,
-                            self.qo_indptr(),
-                            &self.rs_committed(&seat, *state),
+                            self.qo_indptr()?,
+                            &self.rs_committed(&seat, *state)?,
                             &ssm::VerifyGates {
                                 ba,
                                 dt_bias,
                                 a_log,
-                                gates: self.tensor(*gates),
+                                gates: self.tensor(*gates)?,
                             },
                             ba_paged,
                             corrected,
-                            &self.recurrent(*state),
+                            &self.recurrent(*state)?,
                             *k_heads,
                             *v_heads,
                             *k_dim,
                             *v_dim,
-                            self.tensor(*y),
+                            self.tensor(*y)?,
                             self.dots_table(&seat, *k_heads)?,
                         );
                     }
@@ -257,23 +257,23 @@ impl Run<'_> {
                     let landed = ssm::gated_delta_verify(
                         self.ctx(),
                         ext_qkv,
-                        self.qo_indptr(),
-                        &self.rs_committed(&seat, *state),
+                        self.qo_indptr()?,
+                        &self.rs_committed(&seat, *state)?,
                         &ssm::VerifyGates {
                             ba,
                             dt_bias,
                             a_log,
-                            gates: self.tensor(*gates),
+                            gates: self.tensor(*gates)?,
                         },
                         paged,
                         corrected,
-                        &self.recurrent(*state),
+                        &self.recurrent(*state)?,
                         *k_heads,
                         *v_heads,
                         *k_dim,
                         *v_dim,
-                        self.tensor(*y),
-                        self.rs_snapshots(*state),
+                        self.tensor(*y)?,
+                        self.rs_snapshots(*state)?,
                     );
                     if let (Ok(()), Some(((kp, up), sp))) = (&landed, scattered) {
                         self.rs_scatter(OP, &seat, kp, seat.ext_in[kp])?;
@@ -291,22 +291,22 @@ impl Run<'_> {
                             self.ctx(),
                             self.tuning(),
                             ext_qkv,
-                            self.qo_indptr(),
-                            &self.rs_committed(&seat, *state),
+                            self.qo_indptr()?,
+                            &self.rs_committed(&seat, *state)?,
                             &ssm::VerifyGates {
                                 ba,
                                 dt_bias,
                                 a_log,
-                                gates: self.tensor(*gates),
+                                gates: self.tensor(*gates)?,
                             },
                             ba_paged,
                             corrected,
-                            &self.recurrent(*state),
+                            &self.recurrent(*state)?,
                             *k_heads,
                             *v_heads,
                             *k_dim,
                             *v_dim,
-                            self.tensor(*y),
+                            self.tensor(*y)?,
                             self.dots_table(&seat, *k_heads)?,
                         )?;
                     }
@@ -323,17 +323,17 @@ impl Run<'_> {
                     self.ctx(),
                     self.tuning(),
                     ext_qkv,
-                    self.qo_indptr(),
-                    &self.rs_committed(&seat, *state),
+                    self.qo_indptr()?,
+                    &self.rs_committed(&seat, *state)?,
                     ext_gates,
-                    &self.recurrent(*state),
+                    &self.recurrent(*state)?,
                     seat.work,
                     *k_heads,
                     *v_heads,
                     *k_dim,
                     *v_dim,
                     ext_y,
-                    self.rs_snapshots(*state),
+                    self.rs_snapshots(*state)?,
                 )?;
                 self.rs_land(OP, &seat, ext_y, *y)
             }
@@ -347,13 +347,13 @@ impl Run<'_> {
                 bias,
             } => ssm::causal_conv1d(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                bias.map(|b| self.tensor(b)),
-                &self.recurrent(*state),
+                self.tensor(*x)?,
+                self.tensor(*weight)?,
+                bias.map(|b| self.tensor(b)).transpose()?,
+                &self.recurrent(*state)?,
                 *conv_width,
                 *dilation,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Ssm::CausalConv1dChunked {
                 x,
@@ -365,14 +365,14 @@ impl Run<'_> {
                 bias,
             } => ssm::causal_conv1d_chunked_landing(
                 self.ctx(),
-                self.ragged(*x),
-                self.tensor(*weight),
-                bias.map(|b| self.tensor(b)),
-                &self.recurrent(*state),
+                self.ragged(*x)?,
+                self.tensor(*weight)?,
+                bias.map(|b| self.tensor(b)).transpose()?,
+                &self.recurrent(*state)?,
                 *conv_width,
                 *dilation,
-                self.tensor(*y),
-                self.rs_snapshots(*state),
+                self.tensor(*y)?,
+                self.rs_snapshots(*state)?,
             ),
             Ssm::ShortConv { .. } | Ssm::ShortConvChunked { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
@@ -394,28 +394,28 @@ impl Run<'_> {
                     self.tensor(*base),
                     self.tensor(*y),
                 );
-                match self.producer_table(*y) {
+                match self.producer_table(*y)? {
                     Some((table, counters)) => ssm::dyn_conv::block_dyn_conv_table(
                         self.ctx(),
-                        x,
-                        coeff,
-                        base,
+                        x?,
+                        coeff?,
+                        base?,
                         *side,
                         *taps,
                         *group,
-                        out,
+                        out?,
                         table,
                         counters,
                     ),
                     None => ssm::dyn_conv::block_dyn_conv(
                         self.ctx(),
-                        x,
-                        coeff,
-                        base,
+                        x?,
+                        coeff?,
+                        base?,
                         *side,
                         *taps,
                         *group,
-                        out,
+                        out?,
                     ),
                 }
             }
@@ -426,10 +426,10 @@ impl Run<'_> {
                 gates,
             } => ssm::gdn_prep(
                 self.ctx(),
-                self.tensor(*ba),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                self.tensor(*gates),
+                self.tensor(*ba)?,
+                self.tensor(*dt_bias)?,
+                self.tensor(*a_log)?,
+                self.tensor(*gates)?,
             ),
             Ssm::GatedDelta {
                 qkv,
@@ -444,15 +444,15 @@ impl Run<'_> {
             } => ssm::gated_delta(
                 self.ctx(),
                 self.tuning(),
-                self.tensor(*qkv),
-                self.tensor(*z),
-                self.tensor(*gates),
-                &self.recurrent(*state),
+                self.tensor(*qkv)?,
+                self.tensor(*z)?,
+                self.tensor(*gates)?,
+                &self.recurrent(*state)?,
                 *k_heads,
                 *v_heads,
                 *k_dim,
                 *v_dim,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Ssm::GatedDeltaChunked {
                 qkv,
@@ -467,16 +467,16 @@ impl Run<'_> {
             } => ssm::gated_delta_chunked_landing(
                 self.ctx(),
                 self.tuning(),
-                self.ragged(*qkv),
-                self.tensor(*z),
-                self.tensor(*gates),
-                &self.recurrent(*state),
+                self.ragged(*qkv)?,
+                self.tensor(*z)?,
+                self.tensor(*gates)?,
+                &self.recurrent(*state)?,
                 *k_heads,
                 *v_heads,
                 *k_dim,
                 *v_dim,
-                self.tensor(*y),
-                self.rs_snapshots(*state),
+                self.tensor(*y)?,
+                self.rs_snapshots(*state)?,
             ),
             Ssm::Kda {
                 mixed,
@@ -513,13 +513,13 @@ impl Run<'_> {
                 ssm::kda_committed(
                     self.ctx(),
                     ext_mixed,
-                    self.qo_indptr(),
-                    &self.rs_committed(&seat, *state),
+                    self.qo_indptr()?,
+                    &self.rs_committed(&seat, *state)?,
                     ext_f,
                     ext_b,
-                    self.tensor(*dt_bias),
-                    self.tensor(*a_log),
-                    &self.recurrent(*state),
+                    self.tensor(*dt_bias)?,
+                    self.tensor(*a_log)?,
+                    &self.recurrent(*state)?,
                     seat.work,
                     *heads,
                     *head_dim,
@@ -543,17 +543,17 @@ impl Run<'_> {
                 y,
             } => ssm::kda_step(
                 self.ctx(),
-                self.tensor(*mixed),
-                self.tensor(*f),
-                self.tensor(*b),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                &self.recurrent(*state),
+                self.tensor(*mixed)?,
+                self.tensor(*f)?,
+                self.tensor(*b)?,
+                self.tensor(*dt_bias)?,
+                self.tensor(*a_log)?,
+                &self.recurrent(*state)?,
                 *heads,
                 *head_dim,
                 *norm_eps,
                 *gate_floor,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Ssm::KdaChunked {
                 mixed,
@@ -569,17 +569,17 @@ impl Run<'_> {
                 y,
             } => ssm::kda_chunked(
                 self.ctx(),
-                self.ragged(*mixed),
-                self.tensor(*f),
-                self.tensor(*b),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                &self.recurrent(*state),
+                self.ragged(*mixed)?,
+                self.tensor(*f)?,
+                self.tensor(*b)?,
+                self.tensor(*dt_bias)?,
+                self.tensor(*a_log)?,
+                &self.recurrent(*state)?,
                 *heads,
                 *head_dim,
                 *norm_eps,
                 *gate_floor,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
         }
     }
@@ -606,8 +606,8 @@ impl crate::run::Run<'_> {
     /// scan): refused by name where the window's lanes carry more rows than
     /// it holds for each lane and key head.
     pub(crate) fn dots_table(&self, seat: &crate::rs::Seat, k_heads: u32) -> Result<ssm::DotsTable, kernels_metal::Error> {
-        let lane0 = self.window().span.lane_offset as usize;
-        let lanes = self.qo_indptr_host().len().saturating_sub(1);
+        let lane0 = self.window()?.span.lane_offset as usize;
+        let lanes = self.qo_indptr_host()?.len().saturating_sub(1);
         let max_rep = seat
             .lanes
             .iter()
@@ -632,7 +632,9 @@ impl crate::run::Run<'_> {
     /// Whether a lane of this window takes fewer extended rows than it
     /// carries: a compact fire's decode lane, which the carried scan reads.
     pub(crate) fn window_has_compact_decode(&self, seat: &crate::rs::Seat) -> bool {
-        let (lane0, lanes) = self.window_lanes();
+        let Ok((lane0, lanes)) = self.window_lanes() else {
+            return false;
+        };
         (lane0..lane0.saturating_add(lanes)).any(|lane| {
             let lane = lane as usize;
             match (seat.ext_replay.get(lane), seat.lanes.get(lane)) {
@@ -644,20 +646,20 @@ impl crate::run::Run<'_> {
 
     /// This window's first lane and its lane count: the lanes its
     /// recurrent ops run.
-    pub(crate) fn window_lanes(&self) -> (u32, u32) {
-        let lanes = self.qo_indptr_host().len().saturating_sub(1);
-        (
-            self.window().span.lane_offset,
+    pub(crate) fn window_lanes(&self) -> crate::run::Ran<(u32, u32)> {
+        let lanes = self.qo_indptr_host()?.len().saturating_sub(1);
+        Ok((
+            self.window()?.span.lane_offset,
             u32::try_from(lanes).unwrap_or(u32::MAX),
-        )
+        ))
     }
 
-    pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> bool {
-        let indptr = self.qo_indptr_host();
-        let lane0 = self.window().span.lane_offset as usize;
-        indptr
+    pub(crate) fn carried_window(&self, seat: &crate::rs::Seat) -> crate::run::Ran<bool> {
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset as usize;
+        Ok(indptr
             .windows(2)
             .enumerate()
-            .all(|(r, pair)| pair[1] - pair[0] == 1 && seat.lanes.get(lane0 + r).is_some())
+            .all(|(r, pair)| pair[1] - pair[0] == 1 && seat.lanes.get(lane0 + r).is_some()))
     }
 }

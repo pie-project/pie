@@ -707,7 +707,7 @@ impl Engine for Metal {
             prepared
                 .set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
             prepared.set_ane_cache(self.boot.cache.clone());
-            match prepared.load() {
+            match prepared.load_for_runtime() {
                 Ok(shell) => break shell,
                 Err(Fault::FitShort(short)) => {
                     let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);

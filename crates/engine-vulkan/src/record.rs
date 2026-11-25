@@ -278,6 +278,11 @@ impl Recorder {
         next
     }
 
+    /// Why it records nothing, where it refuses.
+    pub(crate) fn refused(&self) -> Option<&'static str> {
+        self.refused
+    }
+
     pub(crate) fn records(&self) -> bool {
         self.refused.is_none()
     }
