@@ -8391,7 +8391,8 @@ impl<B: Serve> Shell<B> {
         let bindings = FireBindings {
             rs_snaps,
             row_ring,
-            tokens_host: (!B::RECORDS).then(|| std::sync::Arc::from(tokens.as_slice())),
+            tokens_host: (!B::RECORDS && feeds.is_empty())
+                .then(|| std::sync::Arc::from(tokens.as_slice())),
             group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
