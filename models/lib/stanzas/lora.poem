@@ -1,0 +1,13 @@
+# LoRA: y + B A x at every tap. A zero slot is the base model.
+RANK = 16
+
+def banks(tap):
+    """A down bank `lora_a` and an up bank `lora_b` of rank `RANK`."""
+    return struct(
+        lora_a = weight([tap.slots, RANK, tap.fan_in]).registered(init = "kaiming"),
+        lora_b = weight([tap.slots, tap.fan_out, RANK]).registered(),
+    )
+
+def apply(tap, x, y, w, routes):
+    """`y` plus each row's adapter's B A x."""
+    return ops.linear.lora_correct(x, w.lora_a, w.lora_b, routes, y)

@@ -8,10 +8,10 @@
 # codes moved as they are.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/blocks.poem", "attention", "swiglu")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP")
+load("//lib/taps.poem", "dense_widths", "stanza_banks", "taps")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
@@ -71,8 +71,8 @@ DEPLOYMENTS = [
 # projections with per-head q and k norms, an RMS norm and a SwiGLU MLP; the
 # token embedding, which the 0.6B and 1.7B also read out through (tied), a
 # final norm.
-# Each layer also has the LoRA banks the host registers. A deployment's dtype
-# is its projections'; the embedding and head stay at its compute dtype, as
+# Each layer also has the banks its mounted stanzas keep (`//lib/taps.poem`),
+# which the host registers. A deployment's dtype is its projections'; the embedding and head stay at its compute dtype, as
 # an AWQ or GPTQ export keeps them.
 
 def dims(hidden, layers, q_heads, kv_heads, inter, tied, vocab = 151936):
@@ -114,9 +114,9 @@ def layout(id, deploy):
     hidden, hd = d.hidden, d.head_dim
     # A layer's keys and values, two planes of its kv heads a token.
     kv = lambda: state([tokens, 2, d.kv_heads, hd], deploy.kv)
+    widths = dense_widths(hidden, d.q_heads * hd, d.kv_heads * hd, d.inter)
 
     def layer(l):
-        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([d.q_heads * hd, hidden], proj),
@@ -130,8 +130,7 @@ def layout(id, deploy):
             up = weight([d.inter, hidden], proj),
             down = weight([hidden, d.inter], proj),
             kv = kv(),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, widths)
         )
 
     mtp = None
@@ -175,6 +174,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden]),
         head = None if d.tied else weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
+        widths = widths,
         final_norm = weight([hidden]),
         mtp = mtp,
         # A deployment drafting by itself keeps the rows a draft layer's
@@ -251,7 +251,7 @@ TRANSFORMERS = [
 
 # The forward of Qwen 3 (dense): pre-norm layers of full attention, its q and
 # k RMS-normed per head and rotated in full (neox halves), and a SwiGLU MLP.
-# A row with an adapter adds its LoRA correction to the attention's output.
+# A row with an adapter runs its stanzas at every tap of its layers.
 # A deployment stretched by YaRN turns its rotation at the scaled frequencies.
 
 def tap(mtp, layer, y, fused):
@@ -270,11 +270,12 @@ def forward(m, inputs):
 
     def block(l, w, carried):
         y, fused = carried
+        adapt = taps(w, l, len(m.layers), m.widths, routes)
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head")
-        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, qk_norm = "head", adapt = adapt)
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        y = ops.elemwise.residual_add(swiglu(x, w), y)
+        y = swiglu(x, w, adapt = adapt, residual = y)
         return (y, tap(m.mtp, l, y, fused))
 
     y, fused = inputs.fold_layers(m.layers, (y, None), block)

@@ -1,0 +1,7 @@
+# The stanzas a model is served and trained with, in the order they apply
+# at a shared tap. This default mounts LoRA alone; `stanza mount` rewrites
+# this file inside a PIE_HOME.
+load("//lib/stanzas/lora.poem", lora_banks = "banks", lora_apply = "apply")
+STANZAS = [
+    ("lora", struct(banks = lora_banks, apply = lora_apply)),
+]

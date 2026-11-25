@@ -6,8 +6,8 @@
 # model's checkpoint at its full width.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/blocks.poem", "attention", "swiglu")
+load("//lib/taps.poem", "dense_widths", "stanza_banks", "taps")
 
 LLAMA = template("llama")
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
@@ -53,7 +53,8 @@ DEPLOYMENTS = [
 # at the deployment's one dtype; the norms, the embedding and the head stay
 # bf16 under a release's FP8 or NVFP4 (modelopt leaves the head bf16), or take
 # the projections' u4 where the deployment quantizes a bf16 release. Each
-# layer also has the LoRA banks the host registers.
+# layer also has the banks its mounted stanzas keep (`//lib/taps.poem`), which
+# the host registers.
 
 def dims(hidden, layers, q_heads, inter):
     return struct(
@@ -93,9 +94,9 @@ def layout(id, deploy):
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
     # A layer's keys and values, two planes of its kv heads a token.
     kv = lambda: state([tokens, 2, d.kv_heads, hd], deploy.kv)
+    widths = dense_widths(hidden, q_width, kv_width, d.inter)
 
     def layer(l):
-        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),
@@ -107,8 +108,7 @@ def layout(id, deploy):
             up = weight([d.inter, hidden], proj),
             down = weight([hidden, d.inter], proj),
             kv = kv(),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, widths)
         )
 
     mtp = None
@@ -156,6 +156,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
+        widths = widths,
         final_norm = weight([hidden]),
         mtp = mtp,
         # A deployment drafting by itself keeps the rows a draft layer's
@@ -232,8 +233,8 @@ TRANSFORMERS = [
 
 # The forward of Llama 3.1 / 3.3: pre-norm layers of full grouped-query
 # attention, q and k rotated in full (neox halves) at llama3-scaled
-# frequencies, and a SwiGLU MLP. A row with an adapter adds its LoRA
-# correction to the attention's output.
+# frequencies, and a SwiGLU MLP. A row with an adapter runs its stanzas at
+# every tap of its layers.
 
 def tap(mtp, layer, y, fused):
     if mtp == None or layer not in mtp.taps:
@@ -257,11 +258,12 @@ def forward(m, inputs):
 
     def block(l, w, carried):
         y, fused = carried
+        adapt = taps(w, l, len(m.layers), m.widths, routes)
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, scaling = scaling)
-        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
+        o = attention(x, inputs, m, w, positions, scaling = scaling, adapt = adapt)
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        y = ops.elemwise.residual_add(swiglu(x, w), y)
+        y = swiglu(x, w, adapt = adapt, residual = y)
         return (y, tap(m.mtp, l, y, fused))
 
     y, fused = inputs.fold_layers(m.layers, (y, None), block)

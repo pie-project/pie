@@ -1,0 +1,83 @@
+# The tap harness: where a model's adapters attach. A tap is one projection
+# of one layer: q, k, v, o, gate, up or down in a dense decoder, or `attn`,
+# the whole attention block, in a model whose attention is its own.
+# `lib/form.poem` lists the mounted stanzas. Each says which registered banks
+# it keeps at a tap (`banks(tap)`) and how it changes that tap's output on
+# the rows that carry an adapter (`apply(tap, x, y, w, routes)`). Its banks
+# are named `layers.{l}.{stanza}.{site}.{bank}`, and an all-zero slot of any
+# stanza leaves the base model as it is.
+# q, k, v, gate, up and down run inside the adapted arm. `o` and `attn` run
+# outside it, so a stanza there must update `y` in place (`lora_correct`, or
+# `residual_add` into `y`).
+
+load("//lib/form.poem", "STANZAS")
+
+# Adapters resident at once: axis 0 of every bank.
+SLOTS = 8
+
+def attention_widths(hidden, q_width, kv_width):
+    """Each tap's (fan_in, fan_out) in a grouped-query attention."""
+    return {
+        "q": (hidden, q_width),
+        "k": (hidden, kv_width),
+        "v": (hidden, kv_width),
+        "o": (q_width, hidden),
+    }
+
+def dense_widths(hidden, q_width, kv_width, inter):
+    """Each tap's (fan_in, fan_out) in a dense decoder layer: its attention
+    and its gated MLP."""
+    widths = attention_widths(hidden, q_width, kv_width)
+    widths.update({
+        "gate": (hidden, inter),
+        "up": (hidden, inter),
+        "down": (inter, hidden),
+    })
+    return widths
+
+def block_widths(hidden):
+    """The one tap of a layer whose attention is its own: `attn`, from the
+    attention's normed input to its output, both `hidden` wide."""
+    return {"attn": (hidden, hidden)}
+
+def tap_of(site, layer, layers, widths):
+    """What a stanza knows of the tap at `site` of layer `layer` of `layers`:
+    those three, the widths of its `x` and `y`, and the slot count."""
+    fan_in, fan_out = widths[site]
+    return struct(site = site, layer = layer, layers = layers, fan_in = fan_in, fan_out = fan_out, slots = SLOTS)
+
+def stanza_banks(layer, layers, widths):
+    """Layer `layer`'s banks, a struct of sites for each mounted stanza that
+    keeps a bank at one of its taps."""
+    held = {}
+    for name, stanza in STANZAS:
+        sites = {}
+        for site in widths:
+            banks = stanza.banks(tap_of(site, layer, layers, widths))
+            if banks != None:
+                sites[site] = banks
+        if sites:
+            held[name] = struct(**sites)
+    return held
+
+def taps(w, layer, layers, widths, routes):
+    """The `adapt` a layer's blocks take: `correct(site, x, y)` applies every
+    mounted stanza with banks at that tap, in mount order, to the rows that
+    carry an adapter; `split(x, arm)` runs `arm` with it on those rows and
+    without it on the rest. `routes` are the adapter routes of the rows the
+    layer runs on: `adapter_routes()` of the inputs its attention reads."""
+    adapted = fact.has(fact.Adapter)
+
+    def correct(site, x, y):
+        tap = tap_of(site, layer, layers, widths)
+        for name, stanza in STANZAS:
+            banks = getattr(getattr(w, name, None), site, None)
+            if banks != None:
+                y = stanza.apply(tap, x.on(adapted), y.on(adapted), banks, routes.on(adapted))
+        return y
+
+    def split(x, arm):
+        within = lambda site, x, y: correct(site, x, y).on(adapted)
+        return branch(x, [(adapted, lambda x: arm(x, within))], otherwise = lambda x: arm(x, None))
+
+    return struct(correct = correct, split = split)

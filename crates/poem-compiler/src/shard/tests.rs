@@ -77,8 +77,8 @@ fn an_inferred_package_reduces_each_projection_once() {
         .trace(Platform::Cuda);
     assert_eq!(
         count("collective.all_reduce"),
-        2 * LLAMA_8B_LAYERS,
-        "one per attention and one per mlp"
+        3 * LLAMA_8B_LAYERS,
+        "one per attention and one per mlp, rows with an adapter and without"
     );
     assert_eq!(
         score_gathers(&trace),
@@ -92,7 +92,7 @@ fn an_inferred_package_reduces_each_projection_once() {
     );
     assert_eq!(
         trace.nodes.len(),
-        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1 + LLAMA_8B_LAYERS
+        whole.nodes.len() + 3 * LLAMA_8B_LAYERS + 1 + LLAMA_8B_LAYERS
     );
 }
 
