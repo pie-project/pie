@@ -344,7 +344,7 @@ impl Plane {
         let device = compile::CompileDevice::of(context);
         let threads = device.compile_wide(true);
         let sharing = compile::Sharing::over(threads);
-        let built = compile::in_parallel(threads, jobs.len(), |at| {
+        let built = compile::in_parallel(&sharing.threads, jobs.len(), |at| {
             let job = jobs[at].lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             job.map(|job| job.run_sharing(&sharing))
         });

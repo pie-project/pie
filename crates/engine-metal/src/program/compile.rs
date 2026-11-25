@@ -186,7 +186,7 @@ impl Module {
         source: &str,
         entry: &str,
         steps: usize,
-        threads: usize,
+        threads: &Threads,
     ) -> std::result::Result<Module, Failure> {
         let options = crate::device::ctx::compile_options();
         set_safe_math(&options);
@@ -258,30 +258,88 @@ unsafe impl<T> Send for Made<T> {}
 #[cfg(target_vendor = "apple")]
 unsafe impl<T> Sync for Made<T> {}
 
-/// `make` of every index below `count`, on up to `threads` threads, answered
-/// in index order whatever order they ran in.
+/// The threads a prewarm may still start. Nested fans ([`in_parallel`]) share
+/// it, so however they nest no more run than the device compiles at once.
+pub struct Threads {
+    spare: std::sync::atomic::AtomicUsize,
+}
+
+impl Threads {
+    /// `count` threads in all, the calling one among them.
+    #[must_use]
+    pub fn of(count: usize) -> Threads {
+        Threads {
+            spare: std::sync::atomic::AtomicUsize::new(count.saturating_sub(1)),
+        }
+    }
+
+    fn take(&self) -> bool {
+        use std::sync::atomic::Ordering::AcqRel;
+        self.spare
+            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    fn give(&self) {
+        self.spare.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// One fan's work: the next index, its answers and what makes them.
+struct Fan<'a, T, F> {
+    threads: &'a Threads,
+    next: std::sync::atomic::AtomicUsize,
+    slots: Vec<std::sync::Mutex<Option<T>>>,
+    make: F,
+}
+
+impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
+    /// Makes answers until none are left, starting another thread at each
+    /// while one is spare and work remains.
+    fn work<'s>(&'s self, scope: &'s std::thread::Scope<'s, '_>) {
+        loop {
+            let at = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(slot) = self.slots.get(at) else { break };
+            if at + 1 < self.slots.len() && self.threads.take() {
+                scope.spawn(move || {
+                    self.work(scope);
+                    self.threads.give();
+                });
+            }
+            let made = pooled(|| (self.make)(at));
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
+        }
+    }
+}
+
+/// `run` in an autorelease pool of its own: what Metal autoreleases goes
+/// when it returns, not when the thread ends.
+fn pooled<T>(run: impl FnOnce() -> T) -> T {
+    #[cfg(target_vendor = "apple")]
+    {
+        objc2::rc::autoreleasepool(|_| run())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        run()
+    }
+}
+
+/// `make` of every index below `count`, on the calling thread and those
+/// `threads` has spare, answered in index order whatever order they ran in.
 pub(crate) fn in_parallel<T: Send>(
-    threads: usize,
+    threads: &Threads,
     count: usize,
     make: impl Fn(usize) -> T + Sync,
 ) -> Vec<T> {
-    let threads = threads.min(count);
-    if threads < 2 {
-        return (0..count).map(make).collect();
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<T>>> = (0..count).map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| loop {
-                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(slot) = slots.get(at) else { break };
-                let made = make(at);
-                *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
-            });
-        }
-    });
-    slots
+    let fan = Fan {
+        threads,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        slots: (0..count).map(|_| std::sync::Mutex::new(None)).collect(),
+        make,
+    };
+    std::thread::scope(|scope| fan.work(scope));
+    fan.slots
         .into_iter()
         .filter_map(|slot| slot.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
         .collect()
@@ -289,11 +347,10 @@ pub(crate) fn in_parallel<T: Send>(
 
 /// The modules jobs run at once share, by text: each text is built by the
 /// first job to ask, and the others wait for it.
-#[derive(Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Sharing {
     modules: std::sync::Mutex<std::collections::HashMap<u64, SharedModule>>,
-    threads: usize,
+    pub(crate) threads: Threads,
 }
 
 type SharedModule = Arc<std::sync::OnceLock<std::result::Result<Arc<Module>, Failure>>>;
@@ -304,8 +361,8 @@ impl Sharing {
     #[must_use]
     pub fn over(threads: usize) -> Sharing {
         Sharing {
-            threads,
-            ..Sharing::default()
+            modules: std::sync::Mutex::default(),
+            threads: Threads::of(threads),
         }
     }
 
@@ -1048,7 +1105,7 @@ impl Builder<'_> {
         {
             let began = std::time::Instant::now();
             let (module, built) = self.sharing.module(key, || {
-                Module::build(&self.device.device, &expanded, entry, steps, self.sharing.threads)
+                Module::build(&self.device.device, &expanded, entry, steps, &self.sharing.threads)
                     .map(Arc::new)
             });
             let module = module?;
@@ -1159,14 +1216,14 @@ mod parallel {
     fn parallel_builds_answer_in_order_and_build_a_text_once() {
         for threads in [1, 2, 18] {
             let made = std::sync::atomic::AtomicUsize::new(0);
-            let out = in_parallel(threads, 40, |at| {
+            let out = in_parallel(&Threads::of(threads), 40, |at| {
                 made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 at
             });
             assert_eq!(out, (0..40).collect::<Vec<_>>());
             assert_eq!(made.into_inner(), 40);
             let sharing = Sharing::over(threads);
-            let asked = in_parallel(threads, 8, |_| {
+            let asked = in_parallel(&sharing.threads, 8, |_| {
                 sharing.module(7, || {
                     Err(Failure::Deterministic { reason: "`e`: refused".into() })
                 })
@@ -1176,6 +1233,30 @@ mod parallel {
                 let refused = Failure::Deterministic { reason: "`e`: refused".into() };
                 assert_eq!(module.map(|_| ()), Err(refused));
             }
+        }
+    }
+
+    /// Fans inside a fan run on no more threads than were stated, and give
+    /// back every one they took.
+    #[test]
+    fn nested_fans_share_their_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        for count in [1, 4, 18] {
+            let threads = Threads::of(count);
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let sums = in_parallel(&threads, 30, |outer| {
+                in_parallel(&threads, 20, |inner| {
+                    most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    now.fetch_sub(1, SeqCst);
+                    outer * inner
+                })
+                .into_iter()
+                .sum::<usize>()
+            });
+            assert_eq!(sums, (0..30).map(|outer| outer * 190).collect::<Vec<_>>());
+            assert!(most.into_inner() <= count);
+            assert_eq!(threads.spare.into_inner(), count - 1);
         }
     }
 }
