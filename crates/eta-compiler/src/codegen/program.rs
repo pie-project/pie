@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::codegen::error::{EmitError, EmitterKind};
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind};
@@ -27,7 +28,9 @@ pub struct EmittedKernel {
     pub stage_index: u32,
     pub region_index: u32,
     pub entry_name: String,
-    pub source: String,
+    /// The text, shared by every copy of the kernel (its program's, a
+    /// registration's, an engine's compile).
+    pub source: Arc<str>,
     pub error: String,
     #[serde(default)]
     pub steps: Vec<u32>,
@@ -41,13 +44,9 @@ impl EmittedKernel {
         entry_name: String,
         emitted: Result<String, EmitError>,
     ) -> Self {
-        let (source, error) = match emitted {
-            // Held for the program's life: the emitter's growth is not.
-            Ok(mut source) => {
-                source.shrink_to_fit();
-                (source, String::new())
-            }
-            Err(error) => (String::new(), error.to_string()),
+        let (source, error): (Arc<str>, String) = match emitted {
+            Ok(source) => (Arc::from(source), String::new()),
+            Err(error) => (Arc::default(), error.to_string()),
         };
         Self {
             kind,
@@ -353,6 +352,16 @@ mod tests {
             };
         }
         out
+    }
+
+    /// A kernel's copies share its text.
+    #[test]
+    fn a_kernels_copies_share_its_text() {
+        let kernel = EmittedKernel {
+            source: Arc::from("text"),
+            ..EmittedKernel::default()
+        };
+        assert!(Arc::ptr_eq(&kernel.source, &kernel.clone().source));
     }
 
     #[test]

@@ -36,7 +36,7 @@ fn fingerprint(backend: Backend) -> u64 {
         bytes.extend_from_slice(&(kernel.kind as u32).to_le_bytes());
         bytes.extend_from_slice(&kernel.stage_index.to_le_bytes());
         bytes.extend_from_slice(&kernel.region_index.to_le_bytes());
-        for text in [&kernel.entry_name, &kernel.source, &kernel.error] {
+        for text in [&*kernel.entry_name, &*kernel.source, &*kernel.error] {
             bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
             bytes.extend_from_slice(text.as_bytes());
         }
