@@ -32,6 +32,19 @@ def prompt(tokenizer, messages: list[dict]) -> list[int]:
     return tokenizer.encode(text, add_special_tokens=False)
 
 
+def ends(tokenizer) -> set[int]:
+    """The token ids that close a turn: the tokenizer's end of sequence and
+    the end ids of the checkpoint's generation config (Gemma 4 closes a turn
+    with `<turn|>`, not with its `<eos>`)."""
+    ids = {tokenizer.eos_token_id}
+    path = getattr(tokenizer, "name_or_path", "")
+    config = Path(path) / "generation_config.json"
+    if path and config.is_file():
+        eos = json.loads(config.read_text()).get("eos_token_id", [])
+        ids.update(eos if isinstance(eos, list) else [eos])
+    return ids
+
+
 def example(tokenizer, messages: list[dict], answer: str) -> tuple[list[int], list[float]]:
     """The token ids of `messages` answered by `answer`, ending with the token
     that closes the answer, and the loss weight of predicting each next token:
@@ -42,7 +55,8 @@ def example(tokenizer, messages: list[dict], answer: str) -> tuple[list[int], li
     tokens = tokenizer.encode(text, add_special_tokens=False)
     if tokens[: len(head)] != head:
         raise ValueError("the chat template renders the prompt differently once the answer follows it")
-    end = tokens.index(tokenizer.eos_token_id, len(head))
+    closing = ends(tokenizer)
+    end = next(i for i in range(len(head), len(tokens)) if tokens[i] in closing)
     tokens = tokens[: end + 1]
     weights = [0.0] * (len(head) - 1) + [1.0] * (end + 1 - len(head))
     return tokens, weights

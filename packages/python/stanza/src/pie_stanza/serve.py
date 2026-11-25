@@ -19,7 +19,7 @@ from pathlib import Path
 
 from pie_client import Event, PieClient
 
-from .data import prompt
+from .data import ends, prompt
 
 USER = "stanza"
 """The tenant the stanza programs are installed for."""
@@ -97,7 +97,7 @@ class Pie:
         """The greedy reply to each `(messages, adapter or None)`, launched
         together so the engine runs them in the same batches."""
         tok = self.model.tokenizer
-        launches = [("chat", {"tokens": prompt(tok, m), "max_tokens": max_tokens, "stop": [tok.eos_token_id]}, a)
+        launches = [("chat", {"tokens": prompt(tok, m), "max_tokens": max_tokens, "stop": sorted(ends(tok))}, a)
                     for m, a in requests]
         outs = asyncio.run(self._launch(launches))
         return [tok.decode(o["tokens"], skip_special_tokens=True).strip() for o in outs]
