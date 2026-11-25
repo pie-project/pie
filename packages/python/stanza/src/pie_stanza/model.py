@@ -52,10 +52,12 @@ class Model:
         return mount.mount(self, stanzas)
 
     def run_dir(self) -> Path:
-        """The run directory of the program as mounted now, traced on first use."""
+        """The run directory of the program as mounted now, traced on first use
+        (and again once there are weights to read the import against)."""
         mount.seed(self)
         out = self.home / "stanza" / "runs" / mount.mount_hash(self.models) / self.id
-        return out if (out / "trace.json").exists() else mount.trace(self, out)
+        traced = (out / "trace.json").exists() and (self.weights is None or (out / "import.json").exists())
+        return out if traced else mount.trace(self, out)
 
     def program(self):
         """The mounted program, as the trainer reads it."""

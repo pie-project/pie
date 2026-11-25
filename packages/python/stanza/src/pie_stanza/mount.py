@@ -75,8 +75,13 @@ def trace(model, out: Path) -> Path:
     part = out.with_name(out.name + ".part")
     shutil.rmtree(part, ignore_errors=True)
     part.parent.mkdir(parents=True, exist_ok=True)
-    model.pie("model", "trace", model.id, "--out", str(part), "--models-dir", str(model.models),
-              "--lowered", ",".join(PLATFORMS))
+    args = ["model", "trace", model.id, "--out", str(part), "--models-dir", str(model.models),
+            "--lowered", ",".join(PLATFORMS)]
+    if model.weights is not None:
+        # import.json, how the trainer reads the frozen weights, is written against the checkpoint.
+        args += ["--checkpoint", str(model.weights)]
+    model.pie(*args)
+    shutil.rmtree(out, ignore_errors=True)
     part.rename(out)
     return out
 
