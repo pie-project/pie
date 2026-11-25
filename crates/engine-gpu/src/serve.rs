@@ -3493,6 +3493,7 @@ impl<B: Serve> Shell<B> {
              next load of this key",
             left.len()
         );
+        self.say_unnamed(&left);
         self.behind = Some(Behind {
             lanes,
             of,
@@ -3602,6 +3603,27 @@ impl<B: Serve> Shell<B> {
         kernels
     }
 
+    /// Says each kernel the settle weighs behind serving at a tier the
+    /// naming walk did not reach: it is not built at load, so weighing it
+    /// would build it.
+    fn say_unnamed(&self, left: &std::collections::VecDeque<(u32, u32)>) {
+        use crate::backend::Tactics as _;
+        let widest = self.span.rungs().iter().map(|rung| rung.tokens).max();
+        let named = self.tuning.gemm_tactics(self.tier, widest.unwrap_or(1));
+        for &(bottom, top) in left {
+            for tactic in self.range_kernels(&self.dense, bottom, top) {
+                if !named.iter().any(|t| t.tier == tactic.tier) {
+                    tracing::warn!(
+                        "dense settle: {bottom}-{top} rows weighs {} at {:?}, a tier no rung of \
+                         this load names: it is not built at load",
+                        crate::dense::name(&tactic),
+                        tactic.tier
+                    );
+                }
+            }
+        }
+    }
+
     /// The settle left behind serving ends here: its next point runs longer
     /// than one decode step, which behind serving never runs. What it
     /// decided stays stored; its other ranges serve the fallback picks
@@ -3676,6 +3698,12 @@ impl<B: Serve> Shell<B> {
         })
     }
 
+    /// The dense matmul's tactic at each rung.
+    #[must_use]
+    pub fn dense_picks(&self) -> &crate::dense::Dense {
+        &self.dense
+    }
+
     /// Whether a dense settle is left to weigh behind serving
     /// ([`Shell::measure_behind`]).
     #[must_use]
@@ -3739,6 +3767,7 @@ impl<B: Serve> Shell<B> {
         behind.slices += 1;
         behind.longest = behind.longest.max(began.elapsed());
         let built = B::compiled(&self.pipelines).saturating_sub(built_before);
+        debug_assert_eq!(built, 0, "a settle slice behind serving built pipelines");
         let more = match slice {
             Ok(more) => more,
             // A settle fire the shell refuses as a program's (a class

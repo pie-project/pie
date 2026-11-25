@@ -46,8 +46,10 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
     let shell = first.engine.loaded_mut().expect("loaded");
     let rows: Vec<u32> = shell.settled().iter().map(|r| r.top).chain([1, 2, 4]).collect();
     let served: Vec<_> = rows.iter().map(|&r| shell.dense_tactics_at(r)).collect();
+    let built = shell.compiled();
     assert!(measure_behind(&mut first.engine) > 0, "the settle ran behind serving");
     let shell = first.engine.loaded_mut().expect("loaded");
+    assert_eq!(shell.compiled(), built, "a trial builds nothing: the load built what it weighs");
     assert!(
         shell.settled().iter().any(|range| range.checked),
         "the settle weighed its ranges behind serving"
