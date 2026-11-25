@@ -6136,9 +6136,11 @@ impl<B: Serve> Shell<B> {
         let staged = crate::beam::Staged {
             room,
             tables,
-            // No load keeps window lists now (its windowed layers are
-            // ring + buffer, CONTRACT-BC 19): no staged table is one.
-            windowed: false,
+            windowed: self
+                .pools
+                .tables()
+                .iter()
+                .any(|&paged| paged != crate::store::Paged::List),
             page: self.pools.paging().page_size,
             planes,
             unit,
