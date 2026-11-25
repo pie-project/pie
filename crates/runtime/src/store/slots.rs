@@ -142,8 +142,8 @@ const WORD: u32 = u64::BITS;
 pub enum ShapeKind {
     /// Whole-sequence state (recurrent, conv, rs buffer, snapshot ids).
     Fixed,
-    /// Per-token state, in token order: the kv list, a window list (its
-    /// slots behind the window trimmed), the rs list.
+    /// Per-token state, in token order: the kv list, the rs list, the
+    /// window buffer.
     List,
 }
 

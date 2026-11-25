@@ -65,13 +65,6 @@ impl RsPreparedWrite {
     pub fn buffer_targets(&self) -> &[RsBufferTarget] {
         &self.buffers
     }
-
-    pub fn buffer_copy_plan(&self) -> impl Iterator<Item = (RsSlotId, RsSlotId)> + '_ {
-        self.buffers.iter().filter_map(|t| match *t {
-            RsBufferTarget::Cow { src, dst, .. } => Some((src, dst)),
-            _ => None,
-        })
-    }
 }
 
 #[derive(Debug, Default)]

@@ -130,8 +130,8 @@ pub(crate) enum TierKind {
     /// A shared pool's kv list slots of this shape (CONTRACT-BC 22): moved
     /// by `copy_slots`, the slots the tier's slot refs.
     KvSlots(::engine::chunk::ShapeId),
-    /// A shared pool's recurrent slots of this shape: record pieces, rs
-    /// list or window list slots, moved by `copy_slots`.
+    /// A shared pool's recurrent slots of this shape: record pieces or rs
+    /// list slots, moved by `copy_slots`.
     RsSlots(::engine::chunk::ShapeId),
     /// A shared pool's instance or channel slots of this shape
     /// ([`crate::store::roles`]): parked with their process, moved by
