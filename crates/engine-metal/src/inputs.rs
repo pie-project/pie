@@ -358,11 +358,16 @@ impl Region {
     /// is left, so nothing writes the heaps another rung lays there.
     pub fn rehost(&mut self, host: Vec<(u64, u64, std::ptr::NonNull<u8>)>) -> Result<()> {
         let hosted = !host.is_empty();
-        self.host = host;
+        self.host_at(host);
         if hosted {
             self.zero_span(0, self.bytes)?;
         }
         Ok(())
+    }
+
+    /// As [`Region::rehost`], its bytes left as they are.
+    pub fn host_at(&mut self, host: Vec<(u64, u64, std::ptr::NonNull<u8>)>) {
+        self.host = host;
     }
 
     /// Where the region lies in its view, and its bytes.
