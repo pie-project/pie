@@ -1098,7 +1098,10 @@ impl ResidencyPlanner {
                     // fleet that keeps decoding never stalls, and the bind
                     // waited behind it for good). Idle cache its tiers let
                     // below the device moves down before any is dropped.
-                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                    if self.demote_idle_for(
+                        self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        self.chunks_short(run.saturating_mul(pieces).saturating_add(singles)),
+                    ) {
                         self.plan_stopped("short of runs: idle cache moves down");
                         return false;
                     }
@@ -1197,7 +1200,12 @@ impl ResidencyPlanner {
                         room_stood = Some(key);
                         continue;
                     }
-                    if self.demote_idle(self.port.chunks_as_pages(need.run.saturating_mul(need.pieces))) {
+                    if self.demote_idle_for(
+                        self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
+                        self.chunks_short(
+                            need.run.saturating_mul(need.pieces).saturating_add(need.singles),
+                        ),
+                    ) {
                         self.plan_stopped("bind short of runs: idle cache moves down");
                         return false;
                     }
@@ -1346,7 +1354,10 @@ impl ResidencyPlanner {
                     // the device moves down, else one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
-                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                    if self.demote_idle_for(
+                        self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        self.chunks_short(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
+                    ) {
                         self.plan_stopped("restore short of runs: idle cache moves down");
                         return false;
                     }

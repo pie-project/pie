@@ -436,6 +436,14 @@ struct KeptEntry {
     last_use: Instant,
 }
 
+/// A device chunk idle cache alone holds: its pages, and the entries they
+/// are of ([`KvStore::idle_chunks`]).
+#[derive(Debug, Default)]
+struct IdleChunk {
+    pages: Vec<(TriePageLocation, PhysicalKvPageId)>,
+    by: HashSet<u64>,
+}
+
 /// The reclaim order ([`KvStore::kept_order`]) a reclaim left, and the
 /// revisions it was read under: the entries' and the keys', and the
 /// table's where the disk tier keeps copies.
@@ -1142,29 +1150,77 @@ impl KvStore {
     }
 
     /// Opens `want` whole device chunks from idle cache, as
-    /// [`Self::reclaim_cache`] frees pages: the lowest retention key first,
-    /// as far as the keys let it, and of one key's chunks the one whose
-    /// newest entry was used longest ago. A chunk opens once every page in
-    /// it goes, so what holds its pages goes together; dropped an entry at
-    /// a time, each a page of many chunks, nearly a key's whole cache goes
-    /// before one opens. Answers the device pages freed: 0 where no chunk is
-    /// idle cache's whole.
+    /// [`Self::reclaim_cache`] frees pages ([`Self::idle_chunks`]): what
+    /// holds a chunk's pages goes together; dropped an entry at a time, each
+    /// a page of many chunks, nearly a key's whole cache goes before one
+    /// opens. Answers the device pages freed: 0 where no chunk is idle
+    /// cache's whole.
     pub fn reclaim_chunks(&mut self, want: u32, keys: impl Keys) -> usize {
+        let mut freed = 0;
+        for chunk in self.idle_chunks(want, &keys) {
+            freed += self.drop_entries(
+                chunk.by.into_iter().filter(|id| self.cache.contains_key(id)).collect(),
+                By::Host,
+            );
+        }
+        tracing::debug!(target: "pie::kv", want, freed, "reclaimed whole chunks");
+        freed
+    }
+
+    /// Moves the pages of `want` whole device chunks of idle cache below the
+    /// device ([`Self::idle_chunks`]), as [`Self::prepare_demote`] moves a
+    /// group's: those chunks' pages alone, where every row of what holds
+    /// them lets it on the host and the tiers below have the room.
+    pub fn prepare_demote_chunks(
+        &mut self,
+        want: u32,
+        keys: impl Keys,
+    ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        let mut pages = Vec::new();
+        let mut disk = self.disk_pool.available();
+        for chunk in self.idle_chunks(want, &keys) {
+            let tiers = chunk
+                .by
+                .iter()
+                .fold(retention::ALL_TIERS, |tiers, &id| tiers & self.tiers_of(id, &keys));
+            if tiers & retention::HOST == 0 {
+                return Ok(None);
+            }
+            if tiers & retention::DISK == 0 {
+                disk = 0;
+            }
+            pages.extend(chunk.pages);
+        }
+        let host = self.host_pool.available();
+        if pages.is_empty() || host + disk < pages.len() {
+            return Ok(None);
+        }
+        let on_host = host.min(pages.len());
+        self.prepare_move_out_split(&HashSet::new(), pages, on_host)
+            .map(Some)
+    }
+
+    /// The device chunks to open for `want` from idle cache, each held by
+    /// nothing else: the lowest retention key first, as far as the keys let
+    /// it, and of one key's chunks the one whose newest entry was used
+    /// longest ago. None while the disk tier keeps copies (a page settles
+    /// there at no cost, whatever its chunk).
+    fn idle_chunks(&mut self, want: u32, keys: &impl Keys) -> Vec<IdleChunk> {
         if want == 0 || self.persisted.as_ref().is_some_and(|p| !p.by_key.is_empty()) {
-            return 0;
+            return Vec::new();
         }
         let Some((shared, shape)) = self.pool.shared_shape() else {
-            return 0;
+            return Vec::new();
         };
         let (spc, chunks) = shared.lock().unwrap().single_chunks(shape);
         if spc == 0 {
-            return 0;
+            return Vec::new();
         }
-        let order = self.kept_order(&keys);
+        let order = self.kept_order(keys);
         let reads = self.table.live_reads();
         let base = self.pool.base();
         let mut ids: Vec<u64> = Vec::new();
-        let mut opens: Vec<(Instant, HashSet<u64>)> = Vec::new();
+        let mut opens: Vec<(Instant, IdleChunk)> = Vec::new();
         for level in order.chunk_by(|a, b| a.0 == b.0) {
             for (_, group) in level {
                 ids.extend(self.at_rest(group, &reads));
@@ -1178,37 +1234,32 @@ impl KvStore {
                     holders.entry(at).or_default().push(id);
                 }
             }
-            let mut held: HashMap<u32, (u32, HashSet<u64>)> = HashMap::new();
-            let above = self.above(level[0].0, &keys);
+            let mut held: HashMap<u32, IdleChunk> = HashMap::new();
+            let above = self.above(level[0].0, keys);
             for (at, page) in self.table.cache_only_pages(&self.roots(&ids), &above) {
-                let (pages, by) = held.entry(page.0.saturating_sub(base) / spc).or_default();
-                *pages += 1;
-                by.extend(holders.get(&at).into_iter().flatten());
+                let chunk = held.entry(page.0.saturating_sub(base) / spc).or_default();
+                chunk.pages.push((at, page));
+                chunk.by.extend(holders.get(&at).into_iter().flatten());
             }
             opens = chunks
                 .iter()
                 .filter(|chunk| chunk.settled && chunk.used > 0)
                 .filter_map(|chunk| {
-                    let (_, by) = held.remove(&chunk.logical).filter(|(pages, _)| *pages == chunk.used)?;
-                    let newest = by.iter().map(|id| self.cache[id].last_use).max()?;
-                    Some((newest, by))
+                    let idle = held
+                        .remove(&chunk.logical)
+                        .filter(|idle| idle.pages.len() == chunk.used as usize)?;
+                    let newest = idle.by.iter().map(|id| self.cache[id].last_use).max()?;
+                    Some((newest, idle))
                 })
                 .collect();
             if opens.len() >= want as usize {
                 break;
             }
         }
-        self.keep_order(order, &keys);
+        self.keep_order(order, keys);
         opens.sort_by_key(|(newest, _)| *newest);
-        let mut freed = 0;
-        for (_, by) in opens.into_iter().take(want as usize) {
-            freed += self.drop_entries(
-                by.into_iter().filter(|id| self.cache.contains_key(id)).collect(),
-                By::Host,
-            );
-        }
-        tracing::debug!(target: "pie::kv", want, freed, "reclaimed whole chunks");
-        freed
+        opens.truncate(want as usize);
+        opens.into_iter().map(|(_, chunk)| chunk).collect()
     }
 
     /// Whether anything is cached here.

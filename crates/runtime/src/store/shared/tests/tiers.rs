@@ -610,11 +610,15 @@ fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
 fn a_whole_chunk_opens_from_what_holds_its_pages_alone() {
     use crate::store::chunks::ShapePool;
     use crate::store::kv::hash::{Hash256, chain_slots, page_hash};
-    let facts = fixed_facts();
+    let mut facts = fixed_facts();
+    facts.host_chunks = HOST_CHUNKS;
     let seed: Hash256 = [9; 32];
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let list = shared.lock().unwrap().list().unwrap();
     let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, seed);
+    let tiers = Tiers::of(&facts).unwrap();
+    let host = tiers.host.as_ref().map(|host| ShapePool::shared(host, list));
+    kv.set_tiers(list.id, host, tiers.disk_slots);
     kv.set_page_size(16);
     kv.set_keeps(true);
     let per_chunk = list.slots_per_chunk as usize;
@@ -653,7 +657,17 @@ fn a_whole_chunk_opens_from_what_holds_its_pages_alone() {
     assert_eq!(kv.reclaim_chunks(1, |_| 0), 2 * per_chunk, "the two that share its chunk");
     kv.retire_idle();
     assert_eq!(free(), left + 2, "and both their chunks open");
+    for (entry, keys) in &keys_of {
+        assert_eq!(!kv.cached_run(keys).is_empty(), *entry >= 2, "entry {entry}");
+    }
+    // Moved down a tier instead, one chunk's pages alone: the rest stay.
+    let txn = kv.prepare_demote_chunks(1, |_| 0).unwrap().expect("the host has room");
+    assert_eq!(txn.page_count(), per_chunk);
+    assert_eq!(kv.commit_suspend(txn).unwrap(), per_chunk);
+    kv.retire_idle();
+    assert_eq!(free(), left + 3);
     for (entry, keys) in keys_of {
-        assert_eq!(!kv.cached_run(&keys).is_empty(), entry >= 2, "entry {entry}");
+        let kept = kv.cached_run_any_tier(&keys).len();
+        assert_eq!(kept, if entry >= 2 { per_chunk } else { 0 }, "entry {entry}");
     }
 }

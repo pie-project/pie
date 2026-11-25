@@ -905,6 +905,12 @@ impl ResidencyPlanner {
     /// short of one prompt's pages waited behind the copy of every idle page
     /// on the device.
     pub(super) fn demote_idle(self: &Arc<Self>, wanted: u32) -> bool {
+        self.demote_idle_for(wanted, 0)
+    }
+
+    /// [`Self::demote_idle`] for a head short of `chunks` whole chunks: the
+    /// pages that open them move first, where idle cache holds any whole.
+    pub(super) fn demote_idle_for(self: &Arc<Self>, wanted: u32, chunks: u32) -> bool {
         if !self.port.suspend_capable() {
             return false;
         }
@@ -933,7 +939,10 @@ impl ResidencyPlanner {
         // Short of free slots below, the store makes the room from idle cache
         // the host holds keyed below what moves down (each tier holds the
         // highest keys first), or moves nothing.
-        let txn = self.port.prepare_demote(wanted.max(1) as usize);
+        let txn = (chunks > 0)
+            .then(|| self.port.prepare_demote_chunks(chunks))
+            .flatten()
+            .or_else(|| self.port.prepare_demote(wanted.max(1) as usize));
         let Some(txn) = txn else {
             self.demoting.store(false, Ordering::Release);
             return false;

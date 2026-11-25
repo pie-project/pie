@@ -1125,6 +1125,13 @@ pub trait PoolPort: Send + Sync + 'static {
         wanted: usize,
     ) -> Option<crate::store::kv::KvResidencyTxn>;
     fn prepare_demote(&self, room: usize) -> Option<crate::store::kv::KvResidencyTxn>;
+    /// [`Self::prepare_demote`] of what opens whole chunks, the pages of
+    /// `chunks` of them
+    /// ([`crate::store::kv::KvStore::prepare_demote_chunks`]).
+    fn prepare_demote_chunks(&self, chunks: u32) -> Option<crate::store::kv::KvResidencyTxn> {
+        let _ = chunks;
+        None
+    }
     /// Idle cache a `retention/tiers` row keeps off the device, to move
     /// down now.
     fn prepare_demote_now(&self) -> Option<crate::store::kv::KvResidencyTxn>;
@@ -2269,6 +2276,18 @@ impl PoolPort for RegistryPool {
         }
         self.with_kv_tagged("planner-demote", |kv| {
             kv.prepare_demote(room, crate::policy::retention::Installed)
+        })
+        .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
+        .ok()
+        .flatten()
+    }
+
+    fn prepare_demote_chunks(&self, chunks: u32) -> Option<crate::store::kv::KvResidencyTxn> {
+        if !self.suspend_capable {
+            return None;
+        }
+        self.with_kv_tagged("planner-demote", |kv| {
+            kv.prepare_demote_chunks(chunks, crate::policy::retention::Installed)
         })
         .inspect_err(|error| tracing::warn!(%error, "planner: demote prepare failed"))
         .ok()
