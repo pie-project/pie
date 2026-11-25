@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// How [`Shell::walk`] encodes a forward.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Form {
+    /// To run, sharing with the Neural Engine what this load splits.
+    Fire,
+    /// For its pipelines alone, split as [`Form::Fire`] splits it.
+    DryShared,
+    /// For its pipelines alone, the GPU taking all of it, as after the
+    /// split is retired.
+    DryAlone,
+}
+
 impl Shell {
 
     #[must_use]
@@ -2201,14 +2213,16 @@ impl Shell {
     }
 
     pub(super) fn walk_once(&self, p: &Prepared<'_>) -> Result<Walked> {
-        self.walk(p, false)
+        self.walk(p, Form::Fire)
     }
 
-    /// The forward encoded; `dry`, for a frame that is dropped uncommitted
-    /// (the load's pipeline walk): no early head is flushed to run and no
-    /// Neural Engine hand-off is armed, so nothing of it reaches a queue.
+    /// The forward encoded; a dry one for a frame that is dropped uncommitted
+    /// (the load's pipeline walk): no early head is flushed to run, and a
+    /// split's fences and Neural Engine requests are left out, so nothing of
+    /// it reaches a queue.
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
-    pub(super) fn walk(&self, p: &Prepared<'_>, dry: bool) -> Result<Walked> {
+    pub(super) fn walk(&self, p: &Prepared<'_>, form: Form) -> Result<Walked> {
+        let dry = form != Form::Fire;
         let place = At::new();
         let mut frame = self.device.frame()?;
         if let Some(plane) = self.nan_flags.as_ref() {
@@ -2288,6 +2302,7 @@ impl Shell {
                         .filter(|_| !dry)
                         .map(crate::ane::Ane::handoff),
                 )
+                .dry(dry)
                 .flushing_after(if dry {
                     0
                 } else {
@@ -2307,7 +2322,7 @@ impl Shell {
                 &self.scratch,
                 &self.tuning,
             )
-            .with_ane(self.ane.as_ref())
+            .with_ane(self.ane.as_ref().filter(|_| form != Form::DryAlone), dry)
             .with_regions(self.compiled.template());
             walk(
                 &self.trace,

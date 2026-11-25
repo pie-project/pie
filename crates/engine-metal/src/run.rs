@@ -219,6 +219,8 @@ pub struct Run<'c> {
     /// The Neural Engine's share of this load, when a live encode may hand
     /// it work.
     ane: Option<&'c crate::ane::Ane>,
+    /// The encode's frame is dropped: its splits hand nothing over.
+    dry: bool,
 
     /// The chip profile and model facts this load's kernels run under.
     tuning: &'c kernels_metal::Tuning,
@@ -395,6 +397,7 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             scratch,
             ane: None,
+            dry: false,
             tuning,
             chain: std::cell::Cell::new(None),
             tiles: std::cell::Cell::new(None),
@@ -1229,8 +1232,9 @@ impl<'c> Run<'c> {
     }
 
     #[must_use]
-    pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>) -> Self {
+    pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>, dry: bool) -> Self {
         self.ane = ane;
+        self.dry = dry;
         self
     }
 
@@ -1252,6 +1256,10 @@ impl<'c> Run<'c> {
 
     pub(crate) fn ane(&self) -> Option<&'c crate::ane::Ane> {
         self.ane
+    }
+
+    pub(crate) fn dry(&self) -> bool {
+        self.dry
     }
 
     pub(crate) fn window(&self) -> Ran<&'c Window> {

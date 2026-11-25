@@ -34,6 +34,8 @@ pub struct Plan {
     layer: u32,
     at: Allotment,
     evaluation: usize,
+    /// Encoded for its pipelines alone, in a frame that is dropped.
+    dry: bool,
 }
 
 /// One projection about to run split by output column: the GPU's view of
@@ -47,6 +49,8 @@ pub struct Columns {
     layer: u32,
     at: Allotment,
     evaluation: usize,
+    /// Encoded for its pipelines alone, in a frame that is dropped.
+    dry: bool,
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -63,7 +67,13 @@ impl Ane {
     pub fn head_rows(&self, _: u32) -> u32 {
         match *self {}
     }
-    pub fn plan(&self, _: poem_ir::ValueId, _: u32) -> Option<Plan> {
+    pub fn with_tail(&self, _: u32) -> Option<u32> {
+        match *self {}
+    }
+    pub fn shares(&self, _: u32) -> bool {
+        match *self {}
+    }
+    pub fn plan(&self, _: poem_ir::ValueId, _: u32, _: bool) -> Option<Plan> {
         match *self {}
     }
     pub fn before(&self, _: &Ctx<'_>, _: &Plan, _: Tensor) -> std::result::Result<(), Error> {
@@ -72,7 +82,7 @@ impl Ane {
     pub fn after(&self, _: &Ctx<'_>, _: &Plan, _: Tensor) -> std::result::Result<(), Error> {
         match *self {}
     }
-    pub fn plan_columns(&self, _: poem_ir::ValueId, _: u32) -> Option<Columns> {
+    pub fn plan_columns(&self, _: poem_ir::ValueId, _: u32, _: bool) -> Option<Columns> {
         match *self {}
     }
     pub fn before_columns(

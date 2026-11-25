@@ -345,6 +345,10 @@ impl Profiles {
         let _ = std::fs::remove_dir_all(&dir);
         Profiles(dir)
     }
+
+    pub(super) fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
 }
 
 impl Drop for Profiles {
