@@ -143,6 +143,10 @@ pub fn open_group(boots: Vec<DeviceBoot>, contract_for: ContractFor) -> Result<G
         return Err(why);
     }
     let devices: Vec<i32> = boots.iter().map(|boot| boot.ordinal).collect();
+    let quiet = crate::ep::Quiet::new(size32);
+    for comm in comms.iter_mut().flatten() {
+        comm.set_quiet(quiet);
+    }
     if let Some(peers) = crate::comm::open_peers(&devices) {
         for (comm, peers) in comms.iter_mut().flatten().zip(peers) {
             comm.set_peers(peers);
