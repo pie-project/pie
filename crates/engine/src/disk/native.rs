@@ -318,11 +318,14 @@ fn laid_whole_for_nothing(_file: &File, _dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-/// The bytes a kept slot file `dir/<name>` already takes: room a
-/// persistent tier counts as its own when it sizes itself again.
+/// The bytes a kept slot file `dir/<name>` already takes on its disk: room
+/// a persistent tier counts as its own when it sizes itself again. Not its
+/// length, whose holes are still in the free space.
 #[must_use]
 pub fn kept_bytes(dir: &Path, name: &str) -> u64 {
-    std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len())
+    File::open(dir.join(name))
+        .and_then(|file| allocated(&file))
+        .unwrap_or(0)
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -534,7 +537,6 @@ mod tests {
                 "two servers share one file"
             );
         }
-        assert_eq!(kept_bytes(&dir, "r0.kv"), 4 * 8192);
         {
             let file = SlotFile::open_kept(&dir, "r0.kv", 8192, 4 * 8192, "a")
                 .unwrap()
@@ -590,6 +592,36 @@ mod tests {
                 .all(|name| !name.to_string_lossy().starts_with(".pie-holes")),
             "{left:?}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// What a kept file holds leaves the free space and comes back as
+    /// `kept_bytes`, so the next run sizes the tier as the last one did and
+    /// its slots are kept.
+    #[test]
+    fn a_kept_file_sizes_the_next_run_as_the_run_that_wrote_it() {
+        let dir = std::env::temp_dir().join(format!("pie-slot-resize-{}", std::process::id()));
+        let slot = 1u64 << 20;
+        let free = 16 * slot;
+        let need = super::super::derived_need(0, 0, 64, slot, 0);
+        let budget = |free: u64| need.min(free + kept_bytes(&dir, "r0.kv"));
+        assert_eq!(kept_bytes(&dir, "r0.kv"), 0, "no file yet");
+        let first = SlotFile::open_kept(&dir, "r0.kv", slot, budget(free), "a")
+            .unwrap()
+            .unwrap();
+        let mut stage = Aligned::zeroed(first.stride());
+        stage.as_mut_slice().fill(7);
+        first.write(9, stage.as_slice()).unwrap();
+        first.file.sync_all().unwrap();
+        let slots = first.slots();
+        drop(first);
+        assert_eq!(kept_bytes(&dir, "r0.kv"), slot, "the one slot written");
+        let again = SlotFile::open_kept(&dir, "r0.kv", slot, budget(free - slot), "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.slots(), slots);
+        assert!(again.kept());
+        drop(again);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
