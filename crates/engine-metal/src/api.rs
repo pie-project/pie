@@ -297,8 +297,6 @@ fn told_within(budgets: &mut LoadBudgets, served: &Budget) {
     }
 }
 
-/// The load's budgets: its logit readouts sized to what `trace` reads, not a
-/// general figure, so a vocab-wide head carves only the rows a fire can read.
 /// The tokens a kv page of this engine holds.
 pub const PAGE_SIZE: u32 = 32;
 
@@ -362,6 +360,8 @@ pub(crate) fn sequence_demand(
     Ok(crate::store::PoolDemand::of(trace, paging, None)?.bytes(u64::from(paging.pages_per_slot)))
 }
 
+/// The load's budgets: its logit readouts sized to what `trace` reads, not a
+/// general figure, so a vocab-wide head carves only the rows a fire can read.
 fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
