@@ -19,6 +19,9 @@ pub struct Sink<'a> {
     /// load hands work to the Neural Engine.
     #[cfg(target_vendor = "apple")]
     handoff: Option<&'a kernels_metal::ane::Handoff>,
+    /// The frame is dropped uncommitted: a hand-off's fences are left out.
+    #[cfg(target_vendor = "apple")]
+    dry: bool,
     /// Launches left before the borrowed frame commits its head and goes on
     /// in a fresh buffer; zero never.
     flush_in: std::cell::Cell<u32>,
@@ -42,6 +45,8 @@ impl<'a> Sink<'a> {
             handles,
             #[cfg(target_vendor = "apple")]
             handoff: None,
+            #[cfg(target_vendor = "apple")]
+            dry: false,
             flush_in: std::cell::Cell::new(0),
             groups: std::cell::Cell::new(0),
         }
@@ -236,6 +241,15 @@ impl<'a> Sink<'a> {
         self
     }
 
+    /// Leaves a hand-off's fences out, for a frame that is dropped
+    /// uncommitted.
+    #[cfg(target_vendor = "apple")]
+    #[must_use]
+    pub fn dry(mut self, dry: bool) -> Self {
+        self.dry = dry;
+        self
+    }
+
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn fence(&self, stamp: u64, signal: bool) -> Result<(), Error> {
         let op = if signal {
@@ -245,6 +259,9 @@ impl<'a> Sink<'a> {
         };
         #[cfg(target_vendor = "apple")]
         {
+            if self.dry {
+                return Ok(());
+            }
             let handoff = self.handoff.ok_or(Error::Backend {
                 op,
                 detail: "no Neural Engine hand-off is armed for this encode".to_string(),

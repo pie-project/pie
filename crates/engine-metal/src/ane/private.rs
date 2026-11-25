@@ -607,11 +607,27 @@ impl Private {
         (MIN_ROWS.max(self.min_rows)..=MAX_ROWS).contains(&rows) && !self.handoff.retired()
     }
 
+    /// The fire one procedure's rows and a GPU tail of `tail` rows make, where
+    /// the tail is one the GPU runs alone ([`Private::head_rows`]).
+    #[must_use]
+    pub fn with_tail(&self, tail: u32) -> Option<u32> {
+        (1..=GPU_TAIL)
+            .contains(&tail)
+            .then(|| MIN_ROWS.max(self.min_rows) + tail)
+    }
+
+    /// Whether a fire of `rows` rows can hand the Neural Engine any of them.
+    #[must_use]
+    pub fn shares(&self, rows: u32) -> bool {
+        self.rows_fit(self.head_rows(rows))
+    }
+
     /// A split for the MLP whose gate-up weight is `gate_up`, over `rows`,
     /// if the Neural Engine can take it: the rows fit a procedure, the
     /// program is compiled, the layer is one of the split ones, and nothing
-    /// has retired the hand-off.
-    pub fn plan(&self, gate_up: poem_ir::ValueId, rows: u32) -> Option<Plan> {
+    /// has retired the hand-off. A `dry` one is encoded for its pipelines
+    /// alone: it hands nothing over and marks nothing staged.
+    pub fn plan(&self, gate_up: poem_ir::ValueId, rows: u32, dry: bool) -> Option<Plan> {
         let Some(Key::Mlp(layer)) = self.keys.get(&gate_up.0).copied() else {
             return None;
         };
@@ -633,12 +649,13 @@ impl Private {
             layer,
             at: self.handoff.allot(),
             evaluation,
+            dry,
         })
     }
 
     /// A column split for the projection whose weight is `w`, over `rows`,
     /// on the same terms.
-    pub fn plan_columns(&self, w: poem_ir::ValueId, rows: u32) -> Option<Columns> {
+    pub fn plan_columns(&self, w: poem_ir::ValueId, rows: u32, dry: bool) -> Option<Columns> {
         let Some(Key::Projection(index, layer)) = self.keys.get(&w.0).copied() else {
             return None;
         };
@@ -656,6 +673,7 @@ impl Private {
             layer,
             at: self.handoff.allot(),
             evaluation,
+            dry,
         })
     }
 
@@ -664,13 +682,16 @@ impl Private {
         ctx: &Ctx<'_>,
         site: &MlpSite,
         layer: u32,
+        dry: bool,
     ) -> std::result::Result<(), Error> {
         let Some(source) = site.layers.get(&layer) else {
             return Ok(());
         };
         let set = &site.sets[(layer & 1) as usize];
         kernels::stage(ctx, &site.shape, &source.source, site.shared.signs, set)?;
-        site.staged.store(layer, Ordering::Release);
+        if !dry {
+            site.staged.store(layer, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -679,15 +700,15 @@ impl Private {
     /// behind the signal.
     pub fn before(&self, ctx: &Ctx<'_>, plan: &Plan, x: Tensor) -> std::result::Result<(), Error> {
         let site = self.mlp.as_ref().expect("a plan names a site");
-        if site.staged.load(Ordering::Acquire) != plan.layer {
-            self.stage_mlp(ctx, site, plan.layer)?;
+        if plan.dry || site.staged.load(Ordering::Acquire) != plan.layer {
+            self.stage_mlp(ctx, site, plan.layer, plan.dry)?;
         }
         let rotated = Tensor {
             rows: plan.rows,
             ..site.rotated
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
-        if let Some(Ok(ffn)) = site.ffn.get() {
+        if let Some(Ok(ffn)) = site.ffn.get().filter(|_| !plan.dry) {
             let binding = &ffn.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff.start(ctx, &ffn.program, binding, plan.at)?;
             self.splits.fetch_add(1, Ordering::AcqRel);
@@ -699,7 +720,7 @@ impl Private {
     /// the other set while the Neural Engine runs, then wait on it and join.
     pub fn after(&self, ctx: &Ctx<'_>, plan: &Plan, out: Tensor) -> std::result::Result<(), Error> {
         let site = self.mlp.as_ref().expect("a plan names a site");
-        self.stage_mlp(ctx, site, plan.layer + 1)?;
+        self.stage_mlp(ctx, site, plan.layer + 1, plan.dry)?;
         kernels::join(ctx, &site.shared, out, plan.at.done)
     }
 
@@ -708,13 +729,16 @@ impl Private {
         ctx: &Ctx<'_>,
         site: &ProjectionSite,
         layer: u32,
+        dry: bool,
     ) -> std::result::Result<(), Error> {
         let Some(source) = site.layers.get(&layer) else {
             return Ok(());
         };
         let set = &site.sets[(layer & 1) as usize];
         kernels::stage_projection(ctx, &source.projection, site.shared.signs, set)?;
-        site.staged.store(layer, Ordering::Release);
+        if !dry {
+            site.staged.store(layer, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -726,15 +750,15 @@ impl Private {
         x: Tensor,
     ) -> std::result::Result<(), Error> {
         let site = &self.projections[plan.site];
-        if site.staged.load(Ordering::Acquire) != plan.layer {
-            self.stage_projection(ctx, site, plan.layer)?;
+        if plan.dry || site.staged.load(Ordering::Acquire) != plan.layer {
+            self.stage_projection(ctx, site, plan.layer, plan.dry)?;
         }
         let rotated = Tensor {
             rows: plan.rows,
             ..site.rotated
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
-        if let Some(Ok(program)) = site.program.get() {
+        if let Some(Ok(program)) = site.program.get().filter(|_| !plan.dry) {
             let binding = &program.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
                 .start(ctx, &program.program, binding, plan.at)?;
@@ -751,7 +775,7 @@ impl Private {
         out: Tensor,
     ) -> std::result::Result<(), Error> {
         let site = &self.projections[plan.site];
-        self.stage_projection(ctx, site, plan.layer + 1)?;
+        self.stage_projection(ctx, site, plan.layer + 1, plan.dry)?;
         kernels::join_columns(ctx, &site.shared, out, plan.keep, plan.at.done)
     }
 

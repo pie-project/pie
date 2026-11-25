@@ -33,7 +33,7 @@ impl Run<'_> {
                 .ane()
                 .and_then(|ane| {
                     let head = ane.head_rows(self.tensor(*act).ok()?.rows);
-                    Some((ane, ane.plan(*gate_up, head)?))
+                    Some((ane, ane.plan(*gate_up, head, self.dry())?))
                 })
                 .filter(|(_, plan)| self.split_fits(plan, *act, *h, *y))
             {
@@ -128,7 +128,7 @@ impl Run<'_> {
         let x = self.tensor(act)?;
         if self
             .ane()
-            .is_some_and(|ane| ane.plan_columns(gate_up, x.rows).is_some())
+            .is_some_and(|ane| ane.plan_columns(gate_up, x.rows, self.dry()).is_some())
         {
             return Ok(false);
         }
@@ -428,7 +428,7 @@ impl Run<'_> {
             } else {
                 self.register_counters(act, w, out.width).is_some()
             }) && out.rows == m
-                && self.ane().and_then(|ane| ane.plan_columns(w, m)).is_none();
+                && self.ane().and_then(|ane| ane.plan_columns(w, m, self.dry())).is_none();
             let Some(bank) = self.banked(w)?.filter(|b| fits && b.ld % 256 == 0) else {
                 return Ok(false);
             };
@@ -625,7 +625,7 @@ impl Run<'_> {
                     }
                     if let Some((ane, plan)) = self
                         .ane()
-                        .and_then(|ane| Some((ane, ane.plan_columns(*w, x.rows)?)))
+                        .and_then(|ane| Some((ane, ane.plan_columns(*w, x.rows, self.dry())?)))
                         .filter(|(_, plan)| self.columns_fit(plan, *act, *y))
                     {
                         return self.matmul_split(ane, &plan, *act, *y);
