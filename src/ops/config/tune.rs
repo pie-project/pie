@@ -149,7 +149,7 @@ impl From<Knobs> for KnobSet {
         Self {
             frame_size: k.frame_size,
             dispatch_depth: k.dispatch_depth,
-            submit_depth: k.submit_depth(),
+            submit_depth: k.submit_depth(runtime::scheduler::host_cover()),
         }
     }
 }

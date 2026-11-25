@@ -16,9 +16,10 @@ impl Knobs {
         worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).staging_depth()
     }
 
-    pub fn submit_depth(&self) -> usize {
-        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8)
-            .submit_depth(runtime::scheduler::host_cover())
+    /// The frames a lane may keep submitted on a load whose host cover is
+    /// `cover` (`runtime::scheduler::host_cover`).
+    pub fn submit_depth(&self, cover: usize) -> usize {
+        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth(cover)
     }
 
     pub fn admissible(&self) -> bool {
@@ -33,10 +34,8 @@ impl std::fmt::Display for Knobs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "k={} dispatch={} (submit={})",
-            self.frame_size,
-            self.dispatch_depth,
-            self.submit_depth()
+            "k={} dispatch={}",
+            self.frame_size, self.dispatch_depth
         )
     }
 }
@@ -279,7 +278,10 @@ mod tests {
         assert!(!candidates.is_empty());
         for knobs in &candidates {
             assert!(knobs.admissible(), "{knobs} is a shape the runtime refuses");
-            assert!(knobs.submit_depth() >= 2, "{knobs} leaves nothing queued");
+            assert!(
+                knobs.submit_depth(1) >= 2,
+                "{knobs} leaves nothing queued under a host cover of 1"
+            );
         }
     }
 
