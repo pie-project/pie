@@ -42,6 +42,8 @@ impl std::fmt::Display for Knobs {
 
 pub struct Round {
     pub knobs: Knobs,
+    /// The host cover of the load the round was timed on.
+    pub cover: usize,
     pub throughput_tok_s: f64,
     pub throughput_rel_sigma: f64,
     pub lane_p95_us: u128,
@@ -51,6 +53,10 @@ pub struct Round {
 }
 
 impl Round {
+    pub fn submit_depth(&self) -> usize {
+        self.knobs.submit_depth(self.cover)
+    }
+
     pub fn is_measurement(&self) -> bool {
         self.failed_lanes == 0
     }
@@ -172,10 +178,11 @@ pub async fn measure(
     program: &str,
     inputs: &[String],
     knobs: Knobs,
+    cover: usize,
     repeats: usize,
 ) -> Result<Round> {
     Ok(
-        sweep_all(addr, program, inputs, &[knobs], repeats, |_, _| {})
+        sweep_all(addr, program, inputs, &[knobs], cover, repeats, |_, _| {})
             .await?
             .pop()
             .expect("one candidate in, one round out"),
@@ -187,6 +194,7 @@ pub async fn sweep_all(
     program: &str,
     inputs: &[String],
     candidates: &[Knobs],
+    cover: usize,
     repeats: usize,
     mut on_pass: impl FnMut(usize, usize),
 ) -> Result<Vec<Round>> {
@@ -226,6 +234,7 @@ pub async fn sweep_all(
             let (lane_p95, lane_p95_rel_sigma) = median_and_rel_sigma(&p95s[index]);
             Round {
                 knobs: *knobs,
+                cover,
                 throughput_tok_s,
                 throughput_rel_sigma,
                 lane_p95_us: lane_p95 as u128,
@@ -288,6 +297,7 @@ mod tests {
     fn round(knobs: Knobs, tok_s: f64, rel_sigma: f64, failed: usize) -> Round {
         Round {
             knobs,
+            cover: 1,
             throughput_tok_s: tok_s,
             throughput_rel_sigma: rel_sigma,
             lane_p95_us: 1_000,

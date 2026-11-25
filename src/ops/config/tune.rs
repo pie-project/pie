@@ -144,12 +144,23 @@ struct KnobSet {
     submit_depth: usize,
 }
 
-impl From<Knobs> for KnobSet {
-    fn from(k: Knobs) -> Self {
+impl KnobSet {
+    /// The set as its row of the report prints it.
+    fn cells(&self) -> [String; 3] {
+        [
+            format!("k={}", self.frame_size),
+            format!("dispatch={}", self.dispatch_depth),
+            format!("submit={}", self.submit_depth),
+        ]
+    }
+}
+
+impl From<&sweep::Round> for KnobSet {
+    fn from(round: &sweep::Round) -> Self {
         Self {
-            frame_size: k.frame_size,
-            dispatch_depth: k.dispatch_depth,
-            submit_depth: k.submit_depth(runtime::scheduler::host_cover()),
+            frame_size: round.knobs.frame_size,
+            dispatch_depth: round.knobs.dispatch_depth,
+            submit_depth: round.submit_depth(),
         }
     }
 }
@@ -192,7 +203,7 @@ pub fn build_report(
         candidates: rounds
             .iter()
             .map(|round| Candidate {
-                knobs: round.knobs.into(),
+                knobs: round.into(),
                 throughput_tok_s: round.throughput_tok_s,
                 lane_p95_ms: round.lane_p95_us as f64 / 1_000.0,
                 rel_sigma: metric.sigma(round),
@@ -201,7 +212,7 @@ pub fn build_report(
             })
             .collect(),
         fleet,
-        winner: best.map(|b| b.knobs.into()),
+        winner: best.map(KnobSet::from),
         gain_percent: gain,
         wrote,
         not_measured: skipped,
@@ -238,6 +249,7 @@ impl crate::ui::Report for TuneReport {
                     format!("{:.0} tok/s", candidate.throughput_tok_s),
                 )
             };
+            let [frame_size, dispatch, submit] = candidate.knobs.cells();
             table.push(Row::new(
                 if candidate.winner {
                     Mark::Chosen
@@ -245,9 +257,9 @@ impl crate::ui::Report for TuneReport {
                     Mark::Plain
                 },
                 [
-                    format!("k={}", candidate.knobs.frame_size),
-                    format!("dispatch={}", candidate.knobs.dispatch_depth),
-                    format!("submit={}", candidate.knobs.submit_depth),
+                    frame_size,
+                    dispatch,
+                    submit,
                     ranked,
                     format!("+/-{:.1}%", candidate.rel_sigma * 100.0),
                     if candidate.current {
@@ -408,6 +420,8 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
         )
         .await
         .context("boot the engine (is something already serving on this port?)")?;
+        // This load's own: the next depth's load measures another.
+        let cover = runtime::scheduler::host_cover();
         let addr = pie.listen_addr.to_string();
         let swept = async {
             sweep::warmup(&addr, &args.program, &inputs)
@@ -423,6 +437,7 @@ pub async fn run(global: &crate::args::GlobalArgs, args: TuneArgs) -> Result<cra
                 &args.program,
                 &inputs,
                 &at_depth,
+                cover,
                 workload.repeats,
                 |pass, total| {
                     println!(
@@ -468,6 +483,42 @@ mod tests {
     fn tune_every_case() {
         the_winner_is_written_through_the_schema();
         a_combination_the_engine_would_refuse_is_never_written();
+        a_row_prints_the_submit_depth_of_its_own_load();
+    }
+
+    fn a_row_prints_the_submit_depth_of_its_own_load() {
+        let round = |dispatch_depth, cover| sweep::Round {
+            knobs: Knobs {
+                frame_size: 2,
+                dispatch_depth,
+            },
+            cover,
+            throughput_tok_s: 1.0,
+            throughput_rel_sigma: 0.0,
+            lane_p95_us: 1,
+            lane_p95_rel_sigma: 0.0,
+            failed_lanes: 0,
+            repeats: 1,
+        };
+        let rounds = [round(1, 3), round(2, 1)];
+        let report = build_report(
+            &rounds,
+            &rounds[0].knobs,
+            None,
+            sweep::Metric::Throughput,
+            0,
+            false,
+            1,
+        );
+        let printed: Vec<String> = report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.knobs.cells().join(" "))
+            .collect();
+        assert_eq!(
+            printed,
+            ["k=2 dispatch=1 submit=4", "k=2 dispatch=2 submit=3"]
+        );
     }
 
     fn the_winner_is_written_through_the_schema() {
