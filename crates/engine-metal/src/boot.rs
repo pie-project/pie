@@ -7,7 +7,6 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
     let profiles = dir(&doc, "profiles")?;
     let cache = dir(&doc, "cache")?;
-    no_adapter_dir(&doc)?;
     crate::diag::publish(&diagnostics(&doc)?);
     Ok(Metal::new(
         DeviceBoot {
@@ -18,27 +17,6 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         },
         contract_for,
     ))
-}
-
-/// An operator's adapter directory (`[model] adapter_dir`) is refused by
-/// name, not ignored: an adapter reaches Metal only through a program's
-/// `lora` sink at bind.
-fn no_adapter_dir(doc: &toml::Table) -> Result<(), String> {
-    let stated = doc
-        .get("model")
-        .and_then(toml::Value::as_table)
-        .and_then(|model| model.get("adapter_dir"))
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty());
-    match stated {
-        Some(dir) => Err(format!(
-            "[model] adapter_dir ({dir}) on Metal: no backend reads operator adapter \
-             directories; an adapter arrives through a program's `lora` sink at bind. Remove \
-             adapter_dir from [model]"
-        )),
-        None => Ok(()),
-    }
 }
 
 fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
@@ -100,7 +78,6 @@ mod tests {
         a_boot_document_that_says_nothing_about_this_engine_still_opens();
         a_boot_document_that_is_not_toml_is_refused_at_the_door();
         the_diagnostics_word_list_is_read_or_refused_by_name();
-        an_adapter_directory_is_refused_and_an_empty_one_is_off();
         the_profiles_directory_is_read_or_refused_by_name();
     }
 
@@ -129,14 +106,6 @@ mod tests {
         let why = of("[metal]\ndiagnostics = 3\n").expect_err("a number is not a word list");
         assert!(why.contains("word list"), "{why}");
         assert!(open(b"[metal]\ndiagnostics = \"teir-trace\"\n", nothing).is_err());
-    }
-
-    fn an_adapter_directory_is_refused_and_an_empty_one_is_off() {
-        let read = |text: &str| no_adapter_dir(&text.parse::<toml::Table>().expect("valid TOML"));
-        let why = read("[model]\nadapter_dir = \"/srv/pie/shared\"").expect_err("refused");
-        assert!(why.contains("adapter_dir"), "{why}");
-        assert_eq!(read("[model]\nadapter_dir = \"  \""), Ok(()), "empty is off");
-        assert_eq!(read(""), Ok(()), "and so is absent");
     }
 
     fn the_profiles_directory_is_read_or_refused_by_name() {
