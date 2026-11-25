@@ -70,9 +70,9 @@ pub struct Session {
     /// A decode envelope's device-computed mask is packed into the staged
     /// mask on the device and never read on the host ([`Self::resolve_on`]).
     mask_on_device: bool,
-    /// The channels that are only a `lora` sink's planes: the bank is landed
-    /// from their seeds at bind, so a fire never pulls their cells again.
-    sink_planes: Vec<usize>,
+    /// The channel that is only an adapter bundle: the banks are landed from
+    /// its seed at bind, so a fire never pulls its cell again.
+    bundle: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -126,16 +126,10 @@ impl Session {
             shadow,
             device: PortMask::NONE,
             mask_on_device: false,
-            sink_planes: crate::adapter::sink_of(&plan.package)
+            bundle: engine::bundle::channel_of(&plan.package)
                 .ok()
                 .flatten()
-                .map(|sink| {
-                    sink.planes
-                        .iter()
-                        .map(|&(_, channel)| channel as usize)
-                        .collect()
-                })
-                .unwrap_or_default(),
+                .map(|bundle| bundle as usize),
         };
         for (channel, wire) in seeds {
             if shadow
@@ -659,7 +653,7 @@ impl Session {
             }
             let takes = plan.takes_channel(slot, at);
             let puts = plan.puts_channel(slot, at);
-            if !takes && !puts && self.sink_planes.contains(&channel) {
+            if !takes && !puts && self.bundle == Some(channel) {
                 continue;
             }
             let addresses_head = takes || plan.reads_channel(slot, at);

@@ -603,8 +603,6 @@ pub struct Shell<B: Serve> {
 
     adapters: crate::adapter::Slots,
 
-    blobs: crate::blob::Store,
-
     held: Vec<u32>,
 
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
@@ -709,22 +707,7 @@ impl<B: Serve> Shell<B> {
             }
         }
 
-        let mut corrected = poem_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Linear(
-                        poem_ir::Linear::LoraCorrect { .. }
-                    ))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
+        let corrected = poem_exec::feeds::adapted_classes(&boot.trace, &compiled);
 
         let handles = Handles::new();
 
@@ -1206,7 +1189,6 @@ impl<B: Serve> Shell<B> {
             adapter_fact,
             adapters: adapter_slots,
 
-            blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             rs_layout,
             snaps: None,
@@ -1859,52 +1841,45 @@ impl<B: Serve> Shell<B> {
         self.weights.banks()
     }
 
+    /// Binds `bundle` to a slot: the slot that holds or keeps these bytes,
+    /// or one it then writes, the banks the bundle does not name zeroed.
     pub fn bind_adapter(
         &mut self,
-        source: crate::adapter::Source<'_>,
+        bundle: &engine::bundle::Bundle<'_>,
     ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
-        let grant = self.adapters.acquire(key.clone())?;
+        let key = crate::adapter::Key(bundle.key());
+        let grant = self.adapters.acquire(key)?;
         if !grant.fresh {
             return Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: false,
                 key,
             });
         }
-
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights.register_adapter(grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.bank_seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(grant.slot, &planes)
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
+        let seats = self.weights.bank_seats();
+        let landed = bundle
+            .planes(&crate::adapter::banks(&seats), engine::bundle::Rank::WHOLE)
+            .map_err(Fault::from)
+            .and_then(|built| {
+                let planes: Vec<crate::weights::AdapterPlane<'_>> = built
+                    .iter()
+                    .map(|(bank, bytes)| crate::weights::AdapterPlane {
+                        bank: bank.as_str(),
+                        bytes,
+                    })
+                    .collect();
+                self.weights.register_adapter(grant.slot, &planes)?;
+                tracing::info!(
+                    slot = grant.slot,
+                    named = planes.len(),
+                    zeroed = seats.len() - planes.len(),
+                    "an adapter bundle was written into its slot"
+                );
+                Ok(())
+            });
         match landed {
             Ok(()) => Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: true,
                 key,
             }),
@@ -1913,10 +1888,6 @@ impl<B: Serve> Shell<B> {
                 Err(why)
             }
         }
-    }
-
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.blobs.mount(root);
     }
 
     #[must_use]

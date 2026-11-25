@@ -709,17 +709,15 @@ impl Shell {
         self.weights.seats()
     }
 
-    pub fn program_adapter_sink(
-        &self,
-        program_id: engine::ProgramId,
-    ) -> Result<Option<crate::adapter::Sink>> {
+    /// The channel whose seed is the bundle `program_id` attaches, if it does.
+    pub fn program_adapter_bundle(&self, program_id: engine::ProgramId) -> Result<Option<u32>> {
         let program = self.programs.program(program_id).ok_or_else(|| {
             Fault::program(
                 "serve::shell",
-                format!("no program {program_id} to read an adapter sink off"),
+                format!("no program {program_id} to read an adapter bundle off"),
             )
         })?;
-        crate::adapter::sink_of(&program.plan.package)
+        Ok(engine::bundle::channel_of(&program.plan.package)?)
     }
 
     #[must_use]

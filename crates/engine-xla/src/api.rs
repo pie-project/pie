@@ -199,8 +199,7 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Unaffine { .. }
         | Fault::Unstructured { .. }
         | Fault::Straddled { .. }
-        | Fault::Adapter { .. }
-        | Fault::Blob { .. } => Error::Load(fault.to_string()),
+        | Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
@@ -280,43 +279,24 @@ fn patch_bytes(
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
-    instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
 ) -> EngineResult<Option<crate::adapter::Binding>> {
-    let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
+    let Some(channel) = engine::bundle::channel_of(package).map_err(|why| fault(why.into()))?
+    else {
         return Ok(None);
     };
-    let seats = shell.bank_seats();
-    let site = sink.site().map_err(fault)?;
-    let mut built: Vec<(String, Vec<u8>)> = Vec::new();
-    for (role, channel) in &sink.planes {
-        let wire = seeds
-            .iter()
-            .find(|(seeded, _)| seeded == channel)
-            .map(|(_, bytes)| bytes.as_slice())
-            .ok_or_else(|| {
-                Error::Load(format!(
-                    "this program's `lora` sink reads its `{}` plane out of channel \
-                     {channel} and this bind seeded nothing into it",
-                    role.bank()
-                ))
-            })?;
-        built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
-    }
-    let planes: Vec<crate::weights::AdapterPlane<'_>> = built
+    let wire = seeds
         .iter()
-        .map(|(bank, bytes)| crate::weights::AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
-    shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
-        .map(Some)
-        .map_err(fault)
+        .find(|(seeded, _)| *seeded == channel)
+        .map(|(_, bytes)| bytes.as_slice())
+        .ok_or_else(|| {
+            Error::Load(format!(
+                "this program's `adapter` sink reads its bundle out of channel \
+                 {channel} and this bind seeded nothing into it"
+            ))
+        })?;
+    let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
+    shell.bind_adapter(&bundle).map(Some).map_err(fault)
 }
 
 impl Engine for Xla {
@@ -578,7 +558,7 @@ impl Programs for Xla {
             .collect();
         let package = self.programs.package(binding.program).cloned();
         let landed = match (package, self.shell.as_mut()) {
-            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
+            (Some(package), Some(shell)) => adapter_of(shell, &package, &seeds),
             _ => Ok(None),
         };
         match landed {

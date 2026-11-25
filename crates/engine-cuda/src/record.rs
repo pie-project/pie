@@ -238,14 +238,48 @@ fn forks_by(compiled: &CompiledModel, bucket: u32, island: impl Fn(usize) -> boo
     !(0..n).any(|at| island(at) && (open[at] || open.get(at + 1) == Some(&true)))
 }
 
-/// [`forks_by`] for a fire whose islands are [`BodyKey::islands`] bits.
+/// [`forks_by`] for a fire whose islands are [`BodyKey::islands`] bits and
+/// whose work spans more than one stream ([`spreads`]).
 #[must_use]
-pub fn forks(compiled: &CompiledModel, bucket: u32, islands: &[u8]) -> bool {
-    forks_by(compiled, bucket, |at| {
-        islands
-            .get(at / 8)
-            .is_some_and(|bits| bits >> (at % 8) & 1 == 1)
-    })
+pub fn forks(compiled: &CompiledModel, bucket: u32, islands: &[u8], classes: &WindowTable) -> bool {
+    spreads(compiled, classes)
+        && forks_by(compiled, bucket, |at| {
+            islands
+                .get(at / 8)
+                .is_some_and(|bits| bits >> (at % 8) & 1 == 1)
+        })
+}
+
+/// Whether a fire's work spans more than one stream: a captured region works
+/// where a class of its mask has rows (a collective, a region off the token
+/// axis and an expert-parallel load are taken to). A fire whose work is all
+/// on one stream gains nothing from the side streams, and walked across them
+/// it still records each idle region's waits and forks: an idle side stream
+/// gathers every fork point it waits on, and each join hands them all to the
+/// next launch on the main stream. The classes are the key's, so every fire
+/// of a key walks and carves the same way.
+fn spreads(compiled: &CompiledModel, classes: &WindowTable) -> bool {
+    if !compiled.expert.is_empty() {
+        return true;
+    }
+    let mut working = compiled
+        .template()
+        .iter()
+        .enumerate()
+        .filter(|(at, region)| {
+            region.phase == poem_compiler::Phase::Capture
+                && (region.collective
+                    || compiled.axis_of(*at) != poem_ir::RowAxis::Tokens
+                    || region
+                        .mask
+                        .iter()
+                        .any(|class| classes.class(class).rows > 0))
+        })
+        .map(|(_, region)| region.stream);
+    let Some(first) = working.next() else {
+        return false;
+    };
+    working.any(|stream| stream != first)
 }
 
 fn fork_open(compiled: &CompiledModel, bucket: u32, table: &[Admit]) -> Vec<bool> {

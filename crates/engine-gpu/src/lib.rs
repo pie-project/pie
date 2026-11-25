@@ -6,7 +6,6 @@ pub mod adapter;
 pub mod api;
 pub mod arena;
 pub mod backend;
-pub mod blob;
 pub mod chunks;
 pub mod decoded;
 mod dispatch;

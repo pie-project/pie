@@ -15,7 +15,7 @@ use checkpoint::file::zt;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
-use poem_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Shard, Trace};
 
 use crate::chip::{Engine, Mxfp4Prescale};
 use crate::device::Device;
@@ -50,6 +50,10 @@ pub struct BankSeat {
 
     pub cols: u64,
     pub elem: u64,
+    /// The element type the bank holds.
+    pub dtype: Dtype,
+    /// How the ranks cut the bank.
+    pub shard: Shard,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +64,8 @@ struct AdapterBank {
     rows: u64,
     cols: u64,
     elem: u64,
+    dtype: Dtype,
+    shard: Shard,
     /// The whole bank on the host; a registration rewrites one slot of it
     /// and lands the bank again.
     host: Vec<u8>,
@@ -331,6 +337,8 @@ impl Weights {
                     rows,
                     cols,
                     elem,
+                    dtype: param.dtype,
+                    shard: param.shard.clone(),
                     host,
                 },
             );
@@ -438,6 +446,10 @@ impl Weights {
         self.bytes
     }
 
+    /// Writes slot `id` of every bank: each plane into the bank it names, and
+    /// zeros into the banks no plane names, so a slot never keeps what an
+    /// earlier adapter wrote into it. A bank no plane names lands again only
+    /// when its slot held something.
     pub fn register_adapter(
         &mut self,
         device: &Device,
@@ -472,10 +484,16 @@ impl Weights {
                 });
             }
         }
-        for plane in planes {
-            let bank = self.banks.get_mut(plane.bank).expect("checked above");
+        for (name, bank) in &mut self.banks {
             let at = (u64::from(id) * bank.slot) as usize;
-            bank.host[at..at + plane.bytes.len()].copy_from_slice(plane.bytes);
+            let span = at..at + bank.slot as usize;
+            match planes.iter().find(|plane| plane.bank == name) {
+                Some(plane) => bank.host[span].copy_from_slice(plane.bytes),
+                None => match bank.host.get_mut(span) {
+                    Some(stale) if stale.iter().any(|byte| *byte != 0) => stale.fill(0),
+                    _ => continue,
+                },
+            }
             let param = &trace.params[bank.param];
             let (r, w) = rectangle(&param.shape);
             self.buffers[bank.param] = Some(device.upload(
@@ -507,6 +525,8 @@ impl Weights {
                 rows: bank.rows,
                 cols: bank.cols,
                 elem: bank.elem,
+                dtype: bank.dtype,
+                shard: bank.shard.clone(),
             })
             .collect()
     }
@@ -1282,6 +1302,8 @@ impl Weights {
                         rows,
                         cols,
                         elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
+                        dtype: param.dtype,
+                        shard: param.shard.clone(),
                         host: Vec::new(),
                     },
                 );

@@ -6,8 +6,8 @@ use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
-    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
-    media_classes, one_direction_per_mask, plain_of, read_only_by_decoders, regions_lane_shifting,
+    Exports, Feeds, decoding_of, landing_requests, masked_classes, media_classes,
+    one_direction_per_mask, plain_of, read_only_by_decoders, regions_lane_shifting,
     regions_launching_schedules, regions_shifting, schedule_streams, wide_classes,
 };
 use crate::inputs::Inputs;
@@ -974,7 +974,7 @@ impl Shell {
         one_direction_per_mask(&boot.trace, &compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
         let wide = wide_classes(&boot.trace, &compiled);
-        let corrected = corrected_classes(&boot.trace, &compiled);
+        let corrected = poem_exec::feeds::adapted_classes(&boot.trace, &compiled);
         let landing = landing_requests(&boot.trace.facts, &compiled.classes);
         let decoding = decoding_of(&landing);
         // A schedule only decoding classes read sees a row a lane: its
