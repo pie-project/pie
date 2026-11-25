@@ -252,6 +252,13 @@ pub fn load_gather_kernels() -> Result<(), Error> {
     Ok(())
 }
 
+/// Loads the kernel a windowed fire moves its ring's rows with (its pages'
+/// fills, its snapshots and its fold, [`copy_runs`]) on the current device
+/// now: no fire's body holds it, and nothing builds after ready.
+pub fn load_ring_kernels() -> Result<(), Error> {
+    kernel(FILE, "::pie::runtime::channel::copy_runs").load()
+}
+
 pub fn pull_validate(
     ctx: &Ctx,
     tickets: DevicePtr,
