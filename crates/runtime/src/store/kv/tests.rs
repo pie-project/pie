@@ -1937,11 +1937,32 @@ fn a_kept_disk_tier_takes_back_the_pages_its_journal_names() {
     assert_eq!(store_for().keep_disk(&path, false).unwrap(), 0);
 }
 
+/// Moves idle cache down under `key`, as far as it goes, and brings the run
+/// `keys` back up: its pages are on the device, with their copies on disk.
+fn demoted_and_back(store: &mut KvStore, keys: &[Hash256], key: i64) {
+    let txn = store.prepare_demote(8, |_| key).unwrap().expect("pages to move");
+    let pages = txn.page_count();
+    assert_eq!(store.commit_suspend(txn).unwrap(), pages);
+    store.retire_idle();
+    let run = store.cached_run_any_tier(keys);
+    assert_eq!(store.below_device(&run), pages);
+    promoted(store, &run);
+}
+
+fn promoted(store: &mut KvStore, run: &[super::TriePageLocation]) {
+    let mut granted = store.reserve_device_pages(store.below_device(run)).unwrap();
+    let txn = store
+        .prepare_promote(run, &mut granted)
+        .unwrap()
+        .expect("a promotion");
+    let pin = store.commit_promote(txn).unwrap();
+    store.release_reader(pin);
+}
+
 #[test]
-/// A run persisted from the device keeps its pages there; when the device
-/// wants their room they settle on their copies with nothing copied, a hit
-/// brings them back with the copies kept, a restart finds them, and swap
-/// takes their slots when it must.
+/// A run a hit brought back from disk is on the device with its copies kept;
+/// when the device wants their room its pages settle on them with nothing
+/// copied, a restart finds them, and swap takes their slots when it must.
 fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
     use super::hash::{chain_slots, page_hash};
     let seed = h(52);
@@ -1971,19 +1992,27 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
     ));
 
     let txn = store
-        .prepare_persist(&keys, 0)
+        .prepare_demote(8, |_| 0)
+        .unwrap()
         .expect("three pages to copy");
-    assert_eq!(txn.pages.len(), 3);
+    assert_eq!(txn.page_count(), 3);
     assert!(
-        store.prepare_persist(&keys, 0).is_none(),
+        store.prepare_demote(8, |_| 0).unwrap().is_none(),
         "pages in a copy are copied once"
     );
-    assert_eq!(store.commit_persist(txn), 3);
+    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
+    store.retire_idle();
     assert_eq!(store.persisted_pages(), 3);
     assert_eq!(store.disk_pool.available(), 5);
-    assert!(store.prepare_persist(&keys, 0).is_none(), "copied already");
     let run = store.cached_run_any_tier(&keys);
-    assert_eq!(store.below_device(&run), 0, "the pages stay on the device");
+    promoted(&mut store, &run);
+    assert_eq!(store.persisted_pages(), 3, "a hit keeps the copies");
+    assert!(
+        store.prepare_demote(8, |_| 0).unwrap().is_none(),
+        "copied already"
+    );
+    let run = store.cached_run_any_tier(&keys);
+    assert_eq!(store.below_device(&run), 0, "the pages are on the device");
 
     let epoch = store.current_epoch();
     assert_eq!(
@@ -2002,13 +2031,7 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
         "what is on disk alone frees no device page"
     );
 
-    let mut granted = store.pool.try_alloc_n(3).unwrap();
-    let txn = store
-        .prepare_promote(&run, &mut granted)
-        .unwrap()
-        .expect("a promotion");
-    let pin = store.commit_promote(txn).unwrap();
-    store.release_reader(pin);
+    promoted(&mut store, &run);
     let run = store.cached_run_any_tier(&keys);
     assert_eq!(store.below_device(&run), 0, "a hit brings it back");
     assert_eq!(store.persisted_pages(), 3, "and keeps its copies");
@@ -2028,7 +2051,8 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
 }
 
 #[test]
-/// A prefix persisted is a run of its own, and its copies go with its pages.
+/// A prefix the disk keeps is a run of its own, and its copies go with its
+/// pages.
 fn a_persisted_prefix_is_a_run() {
     use super::hash::{chain_slots, page_hash};
     let seed = h(53);
@@ -2039,7 +2063,7 @@ fn a_persisted_prefix_is_a_run() {
             .collect();
     let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
     let dir = tempfile::tempdir().unwrap();
-    let mut store = KvStore::new_with_swap(8, 0, 8, seed);
+    let mut store = KvStore::new_with_swap(8, 0, 2, seed);
     store.set_page_size(4);
     store.set_keeps(true);
     store
@@ -2053,9 +2077,15 @@ fn a_persisted_prefix_is_a_run() {
         gpu.into_iter().map(KvPageBacking::Resident).collect(),
     ));
     let txn = store
-        .prepare_persist(&keys[..2], 0)
-        .expect("two pages to copy");
-    assert_eq!(store.commit_persist(txn), 2);
+        .prepare_demote(8, |_| 0)
+        .unwrap()
+        .expect("the disk takes two");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    store.retire_idle();
+    assert!(
+        store.prepare_demote(8, |_| 0).unwrap().is_none(),
+        "the disk is full"
+    );
     let mut runs = store.cached_runs();
     runs.sort_by_key(Vec::len);
     assert_eq!(
@@ -2080,9 +2110,9 @@ fn a_persisted_prefix_is_a_run() {
 }
 
 #[test]
-/// Swap takes the copies kept under the lowest cluster retention key first;
-/// a run asked again under a higher key keeps it, across a restart too.
-fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
+/// Swap takes the copies kept under the lowest retention key first; the key
+/// a run was demoted under is kept across a restart.
+fn swap_takes_the_lowest_retention_key_first_and_a_restart_keeps_the_keys() {
     use super::hash::{chain_slots, page_hash};
     let seed = h(54);
     let run_of = |first: u32| {
@@ -2113,8 +2143,7 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
             keys.clone(),
             gpu.into_iter().map(KvPageBacking::Resident).collect(),
         ));
-        let txn = store.prepare_persist(keys, key).expect("two pages");
-        assert_eq!(store.commit_persist(txn), 2);
+        demoted_and_back(&mut store, keys, key);
     }
     assert_eq!(store.disk_pool.available(), 0);
     assert_eq!(store.make_swap_room(2, &floor), 2);
@@ -2125,14 +2154,8 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
         "the higher key's copies stay"
     );
 
-    // Asked again under a higher key, the low run keeps it: persisted anew
-    // where its copies went, and raised where they stayed.
-    let txn = store.prepare_persist(&low.1, 20).expect("its copies went");
-    assert_eq!(store.commit_persist(txn), 2);
-    assert!(
-        store.prepare_persist(&high.1, 30).is_none(),
-        "copied already"
-    );
+    // The low run goes down again, under a higher key.
+    demoted_and_back(&mut store, &low.1, 20);
     drop(store);
 
     let mut store = store_for();
@@ -2144,7 +2167,7 @@ fn swap_takes_the_lowest_retention_key_first_and_a_raised_key_is_kept() {
             .collect::<Vec<_>>()
     };
     assert_eq!(retention(&low.1), [20, 20]);
-    assert_eq!(retention(&high.1), [30, 30], "raised in the journal");
+    assert_eq!(retention(&high.1), [0, 0]);
 }
 
 /// A peer's eviction moves pages under a parked set, and a peer's restore puts
@@ -2543,8 +2566,7 @@ fn a_suspend_gives_up_disk_copies_lowest_key_first_and_no_more_than_it_wants() {
             keys.clone(),
             gpu.into_iter().map(KvPageBacking::Resident).collect(),
         ));
-        let txn = store.prepare_persist(keys, key).expect("two pages");
-        assert_eq!(store.commit_persist(txn), 2);
+        demoted_and_back(&mut store, keys, key);
     }
     assert_eq!(store.disk_pool.available(), 0);
     assert_eq!(store.disk_swap_available(floor), 4, "every copy is room");
