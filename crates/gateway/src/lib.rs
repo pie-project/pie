@@ -202,6 +202,10 @@ impl TurnRouter for RouteBackend {
         self.workers.connected_watch()
     }
 
+    fn eligible(&self) -> Vec<WorkerId> {
+        self.routing.select_worker()
+    }
+
     fn launched(&self, req: ReqId, process: &str, worker: WorkerId) {
         let mut located = self.located.lock().unwrap();
         located.workers.insert(process.to_string(), worker);
