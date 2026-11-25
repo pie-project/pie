@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::proc::{PendingBind, Proc, Residency};
+use super::proc::{Proc, Residency};
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind};
 

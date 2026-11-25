@@ -1,7 +1,6 @@
 use super::*;
 use crate::inferlet::host::working_set::Cursor;
-use crate::store::kv::KvStoreError;
-use crate::store::kv::page_table::{KvTableError, WorkingSetId};
+use crate::store::kv::page_table::WorkingSetId;
 use crate::store::registry::Stores;
 
 fn cursor(reserved: u32) -> CursorCell {
@@ -943,4 +942,3 @@ async fn a_fire_that_ran_and_reported_no_fold_fails_its_set_by_name() -> Anyhow<
 // arrived. A fire behind one that folds by a count the device computes
 // is therefore staged before that count exists.
 
-use crate::scheduler::frame::{FramePlan, FramePolicy, FrameStamp, QueuedFireIds};

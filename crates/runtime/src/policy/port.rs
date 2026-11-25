@@ -845,6 +845,13 @@ pub(crate) mod testing {
         pub step_ns: Option<u64>,
     }
 
+    /// Runs `component` (as `name`) over `events`, the port's own record
+    /// told the host after each, then enacts what its calls committed into
+    /// the installed tables. Returns once every event was heard.
+    pub(crate) fn enact(name: &str, component: &[u8], events: Vec<Event>) {
+        enact_on(name, component, &Worker::default(), events);
+    }
+
     /// [`enact`] on a worker with a device tier and `worker`'s attrs, put
     /// before the first event.
     pub(crate) fn enact_on(name: &str, component: &[u8], worker: &Worker, events: Vec<Event>) {

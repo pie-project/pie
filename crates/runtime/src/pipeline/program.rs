@@ -891,13 +891,11 @@ mod register_tests {
 
 #[cfg(test)]
 mod row_extent_tests {
-    use super::Registry;
-    use eta_ir::container::{
-        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
-    };
-    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, Stage};
-    use eta_ir::types::{Dtype, Shape};
-    use eta_ir::validate::Budget;
+    
+    
+    
+    
+    
     
 
 }
