@@ -271,14 +271,16 @@ pub(super) fn loaded_bound(
 
 /// What `engine`'s load left to measure behind serving (the dense settle's
 /// ranges, a stale rate), run to its end as the runtime's idle lane runs
-/// it: one slice a call, no other lane submitting. The slices it ran.
+/// it: one slice a call, no other lane submitting, on a served step no point
+/// outlasts (else a range whose point runs longer ends the settle, undecided).
+/// The slices it ran.
 pub(super) fn measure_behind(engine: &mut impl ::engine::Engine) -> usize {
     let mut slices = 0;
     let behind = ::engine::BehindServing {
         others: &|| 0,
         arrived: &|| false,
         seats: None,
-        step: None,
+        step: Some(std::time::Duration::from_secs(60)),
     };
     while engine
         .measure_behind(&behind)
