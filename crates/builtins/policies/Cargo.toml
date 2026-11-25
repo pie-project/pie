@@ -8,6 +8,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "cluster-defaults",
     "default",
     "default-cluster",
     "noop",
@@ -15,6 +16,7 @@ members = [
     "test-route",
     "test-share",
     "test-trap",
+    "worker-defaults",
 ]
 
 [profile.release]
