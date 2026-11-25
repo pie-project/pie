@@ -1989,6 +1989,73 @@ fn idle_cache_comes_back_past_the_fires_that_read_it() {
     assert_eq!(store.available_pages(), 7, "all but the page it still holds");
 }
 
+/// What a fire may read goes back once it retires, each way a page is left
+/// under one: a pin let go, a copy into it on its way, and an owner's pages
+/// that go as the entry below it does (a longer prompt's, its selections
+/// alone left).
+#[test]
+fn idle_cache_read_under_a_fire_waits_for_it() {
+    use super::hash::{chain_slots, page_hash};
+    let owner = ProcessId::from_u128(47);
+
+    let mut store = KvStore::new(8, h(61));
+    let tokens = kept_and_gone(&mut store, 30, 3, owner);
+    let probe = store.create_shared_working_set();
+    let keys = keys_ahead(&store, probe, 0, &tokens);
+    let run = store.cached_run(&keys);
+    let (pin, _) = store.pin_resident(&run[..3]).expect("on the device");
+    let fire = store.begin_fire();
+    store.release_reader(pin);
+    assert_eq!(store.reclaim_cache(3, |_| 0), 3);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 5, "the pin's pages wait");
+    store.settle(fire);
+    assert_eq!(store.available_pages(), 8);
+
+    let seed = h(62);
+    let mut store = KvStore::new(8, seed);
+    let hashes: Vec<Vec<Option<Hash256>>> = chain_slots(&seed, None, 0, &(0..3).collect::<Vec<_>>())
+        .into_iter()
+        .map(|hash| vec![Some(hash)])
+        .collect();
+    let keys = hashes.iter().map(|page| page_hash(page)).collect();
+    let pages = store.reserve_device_pages(3).unwrap();
+    assert!(store.import_cached_at(
+        &[],
+        hashes,
+        keys,
+        pages.into_iter().map(KvPageBacking::Resident).collect(),
+    ));
+    assert_eq!(store.reclaim_cache(3, |_| 0), 3);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 5, "the copy into them is handed out next");
+    let copy = store.begin_fire();
+    store.settle(copy);
+    assert_eq!(store.available_pages(), 8);
+
+    let mut table = KvPageTable::new();
+    let (short, long, reader) = (
+        table.create_working_set(),
+        table.create_working_set(),
+        table.create_working_set(),
+    );
+    publish(&mut table, long, 0..3);
+    let shared = table.terminal(long).unwrap().unwrap();
+    table.attach(reader, shared, 2).unwrap();
+    table.attach(short, shared, 0).unwrap();
+    publish(&mut table, long, 3..5);
+    let end = table.terminal(long).unwrap().unwrap();
+    assert_ne!(end, shared, "below what the reader reads");
+    table.lease_cache_root(end);
+    table.release_working_set(long);
+    table.epochs(1, 0);
+    // The reader leaves under fire 1; the short set keeps page 0 alone.
+    table.stamp_path(shared, None, 1);
+    table.release_working_set(reader);
+    assert_eq!(table.read_through(end), 1, "the owner's pages go with the entry below it");
+    assert_eq!(table.release_cache_root(end).len(), 4, "all but page 0");
+}
+
 /// A process waiting for admission is told when its prompt's prefix joins
 /// the store's cache, and again when it is evicted; a change on a path its
 /// prompt does not need looks it up not at all.

@@ -1293,26 +1293,23 @@ impl KvPageTable {
     }
 
     /// The epoch through which a fire may read the pages that go with the
-    /// one anchor at `terminal`: 0 where none may. A node another anchor
-    /// holds stays, and the fires that read it are no fires of these pages.
+    /// one anchor at `terminal`: 0 where none may. Above the first node
+    /// another anchor holds nothing goes, and the fires that read there are
+    /// no fires of these pages.
     pub fn read_through(&self, terminal: NodeId) -> u64 {
         let mut through = 0;
         let mut cursor = Some(terminal);
-        let mut below_selection = false;
         while let Some(node) = cursor {
             let Some(entry) = self.nodes.get(node) else {
                 break;
             };
             let goes = entry.path_anchors <= 1;
-            // A selection that goes lets its owner's other pages go too
-            // ([`Self::compact_owner`]).
-            if goes || below_selection || node == terminal {
-                through = through.max(self.node_read_through(node));
-            }
+            // The first that stays too: its child gone, the pages no
+            // selection takes of it may go ([`Self::compact_owner`]).
+            through = through.max(self.node_read_through(node));
             if !goes {
                 break;
             }
-            below_selection = matches!(entry.pages, Pages::ParentSelection { .. });
             cursor = entry.parent;
         }
         through
