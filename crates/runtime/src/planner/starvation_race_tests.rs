@@ -1891,14 +1891,10 @@ fn reached_eviction(planner: &ResidencyPlanner, key: EntryKey) -> bool {
         || planner.short.lock().is_short(key.1)
 }
 
-/// Mac's over-demand stall reworked (Metal, M1, Qwen3-0.6B, 64 single-lane
-/// requests, 0 of 539 pages free): the prefix whole and a lowered rung
-/// lending span no segment backs. Span lending: the head waits on the
-/// walk backing the lent span (a grow the walk makes, its next move), not
-/// on evictions; the grow promised is the walk's own step. Before, a live
-/// waiter's grow never backed the span, and the head was funded by
-/// evicting residents while the span's chunks stood idle (Mac Pro at
-/// 2 GiB on 5120cbc3c: 126 chunks lent, committable_one_chunk=0).
+/// The prefix is whole and a lowered rung lends span no segment backs: the
+/// head waits on the walk backing the lent span (a grow the walk makes, its
+/// next move), not on evictions; the grow promised is the walk's own step. No
+/// resident is evicted for it while the span's chunks stand idle.
 #[tokio::test(flavor = "current_thread")]
 async fn a_head_short_beside_an_unbacked_lent_span_waits_on_lending_it() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -1959,13 +1955,10 @@ async fn a_grow_the_walk_does_not_make_wakes_the_plan_into_eviction() {
     assert!(reached_eviction(&planner, key), "it went on to eviction");
 }
 
-/// A head short of room the governor's target holds back (the pool at
-/// its target, no grow to promise) plans again when the target rises past
-/// what the pool maps, and waits on the grow it can now be promised: the
-/// rise is the only event that can serve it, and nothing else plans then
-/// (Mac's verified beam + greedy mix beside another suite: the target swung
-/// 693 to 779 MiB for 25 minutes, processes parked as "plan: resident
-/// again" and nothing planned).
+/// A head short of room the governor's target holds back (the pool at its
+/// target, no grow to promise) plans again when the target rises past what the
+/// pool maps, and waits on the grow it can now be promised: the rise is the
+/// only event that can serve it, and nothing else plans then.
 #[tokio::test(flavor = "current_thread")]
 async fn a_target_risen_past_what_is_mapped_plans_the_waiting_head_into_a_grow() {
     use crate::governor::PoolTarget;
@@ -2683,13 +2676,11 @@ async fn a_raise_short_of_room_among_waiting_binds_is_funded_and_all_are_served(
     );
 }
 
-/// The over-demand stall on the RTX PRO 4500 (Qwen3-0.6B, 6 GiB, 256 x
-/// 1536 top-p): every live process waited in the queue, the head a bind
-/// short of guest-state room, and no resident had made progress since it
-/// came back, so the victim choice found none fresh. The last-resort pick
-/// counted only the head's missing kv, none for a bind, and picked nobody:
-/// nothing moved for 20 minutes. It counts the pages that free the bind's
-/// runs as the victim set does, and a younger resident is parked for it.
+/// Every live process waits in the queue, the head a bind short of guest-state
+/// room, and no resident has made progress since it came back, so the victim
+/// choice finds none fresh. The last-resort pick counts the pages that free
+/// the bind's runs, as the victim set does (a bind lacks no kv), and a younger
+/// resident is parked for it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -2758,11 +2749,10 @@ async fn a_bind_room_head_with_no_fresh_victim_gets_a_last_resort_pick() {
 }
 
 /// A span walk funding a bind asks the planner for pages; its process
-/// suspended meanwhile, the planner answers at once (`Yield`). The ask is
-/// made again only once the process is resident again: asked again at once,
-/// the walk spun on its tokio worker with no await between asks, and the
-/// planner's own task, woken on that worker, never ran again (the L40S
-/// over-demand livelock: every waiter parked with pages free).
+/// suspended meanwhile, the planner answers at once (`Yield`). The ask is made
+/// again only once the process is resident again: asked again at once, the
+/// walk would spin on its worker with no await between asks, and the planner's
+/// own task, woken on that worker, would never run.
 #[tokio::test(flavor = "current_thread")]
 async fn a_suspended_process_funding_a_span_waits_to_be_resident_before_asking_again() {
     use futures::FutureExt;
@@ -2802,13 +2792,11 @@ async fn a_suspended_process_funding_a_span_waits_to_be_resident_before_asking_a
     assert_eq!(asked.await, Ok(false), "resident again, it asks again");
 }
 
-/// AMD's 500-concurrent wedge, run 2: the planner's head the kv
-/// allocation of a prompt not yet seated, the device full, and every other
-/// process waiting at a bind for room. Seated first, only an idle or held
-/// process yields to such a prompt, and a process waiting at a bind was
-/// neither, so the head found no victim and nothing moved. Waiting at a
-/// bind it makes no progress until room comes, so it yields as an idle one
-/// does; past its wait it no longer does.
+/// The planner's head is the kv allocation of a prompt not yet seated, the
+/// device full, and every other process waits at a bind for room. Seated
+/// first, only an idle or held process yields to such a prompt; one waiting at
+/// a bind makes no progress until room comes, so it yields as an idle one
+/// does, and past its wait it no longer does.
 #[test]
 fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -2848,12 +2836,10 @@ fn a_process_waiting_at_a_bind_yields_to_a_prompt_not_yet_seated() {
     assert!(members(&planner).is_empty(), "past its wait, it no longer does");
 }
 
-/// AMD's 500-concurrent wedge: a bind short of room waited for the fleet
-/// to stall before the planner moved anyone for it, as a restore does, and
-/// with the other processes decoding it never stalled: no eviction was
-/// planned for the bind, ever. A bind is new demand: with a process still
-/// decoding (the fleet not stalled), the planner evicts the occupants of
-/// the chunks the bind could take, here the idle process holding them.
+/// A bind is new demand: short of room with a process still decoding (the
+/// fleet not stalled), it waits for no stall as a restore does: the planner
+/// evicts the occupants of the chunks the bind could take, here the idle
+/// process holding them.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -2885,11 +2871,9 @@ async fn a_bind_short_of_room_is_funded_while_the_fleet_decodes() {
     waited.abort();
 }
 
-/// AMD's wedge, its second half: once the rung was lowered (its segments
-/// given back) no bind was quoted again for two minutes, the room there
-/// and the head waiting on its own serve. Room that moves now has the
-/// planner quote the waiting head again: a rung change alone, nothing told
-/// the planner, serves the bind in the room it left.
+/// Room that moves has the planner quote the waiting head again: a rung change
+/// alone (its segments given back), nothing told the planner, serves the bind
+/// in the room it left.
 #[tokio::test(flavor = "current_thread")]
 async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -2917,11 +2901,9 @@ async fn a_waiting_bind_is_quoted_again_when_the_rung_moves() {
     waited.await.expect("the wait ends").expect("served");
 }
 
-/// AMD's wedge on c75d39a0b: the chunk branch chose the same process on
-/// every quote, an older one waiting at a bind of its own, and nothing
-/// moved: the victim set took a bind waiter as a victim, but the start of
-/// the moves declined it (ranked ahead of the head, neither idle nor
-/// held). A bind waiter the victim set chose now starts its move.
+/// A bind waiter the victim set chose starts its move, though it ranks ahead
+/// of the head and is neither idle nor held: the choice and the start of the
+/// moves agree on who may move.
 #[tokio::test(flavor = "current_thread")]
 async fn an_older_process_waiting_at_a_bind_is_moved_for_the_head_s_chunks() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3124,15 +3106,11 @@ async fn a_set_registered_mid_eviction_prefills_only_after_the_restore() {
     assert!(planner.grant_now(pid, Demand::default()).is_some());
 }
 
-/// AMD's stall on adc4c1506 (7+ minutes, `head_kind=restore`,
-/// `restore_roles_short` climbing, 143 processes at a bind): the head
-/// restore had its kv pages and was short only of an Instance run, and it
-/// waited for the fleet to stall, which a fleet of processes waiting at a
-/// bind never did (they were neither idle nor parked in the planner). A
-/// bind waiter makes no progress: such a fleet is stalled, and the restore's
-/// runs are funded as a bind's are, the chunks' occupant (younger, at a
-/// bind) moved for it. (Funding a restore while the fleet decodes thrashed:
-/// 3x the wall on the M1's beam stress, 15,578 role waits.)
+/// A head restore has its kv pages and is short only of an Instance run. A
+/// bind waiter makes no progress, so a fleet of processes waiting at binds is
+/// stalled, though they are neither idle nor parked in the planner: the
+/// restore's runs are funded as a bind's are, the chunks' occupant (younger,
+/// at a bind) moved for it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_at_binds() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3181,15 +3159,11 @@ async fn a_restore_short_only_of_an_instance_run_is_funded_once_the_fleet_waits_
     );
 }
 
-/// Mac Pro's M5 livelock (7929eb792, 500 at once): nothing resident, the
-/// head restore short of role slots, and free runs of its need standing,
-/// so the planner sent it again, its unpark came back short (the need
-/// understated what the unpark takes), and so on 20 million times, never
-/// reclaiming the idle cache that held the device. A restore refused while
-/// runs of its need stood (the refusal's own view) marks it understated;
-/// one refused with too few standing is a plain short head (the
-/// 500-at-once census: refused with free_runs 0, then held behind room
-/// given back on a quiescent pool).
+/// Nothing is resident, and a head restore short of role slots is refused
+/// while free runs of its need stand (the refusal's own view): its need
+/// understates what its unpark takes, so it is marked understated, or it would
+/// be sent on those runs forever, the idle cache holding the device never
+/// reclaimed. One refused with too few standing is a plain short head.
 #[test]
 fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -3231,14 +3205,13 @@ fn a_restore_short_again_on_free_runs_of_its_need_marks_the_need_understated() {
     assert_eq!(planner.with_inner(|inner| inner.procs[&pid].roles_free_retry), None);
 }
 
-/// Mac Pro's M5 stall (sc/np-stack-restore-5, 500 at once), shape C: the
-/// host full (its kv the parked processes'), every process evicted, the
-/// device nearly free but no run of the head restore's need standing: the
-/// role slots parked processes left on the device (no host room at their
-/// park) sit between the free chunks, and nothing moved them, nor was
-/// anyone resident to evict. Parked state on the device is room a move
-/// makes: host kv goes on down to disk to make host room, the parked role
-/// slots go to the host, and the restore lands in the run that leaves.
+/// The host is full (its kv the parked processes'), every process evicted, the
+/// device nearly free but no run of the head restore's need standing: the role
+/// slots parked processes left on the device (no host room at their park) sit
+/// between the free chunks, and no one is resident to evict. Parked state on
+/// the device is room a move makes: host kv goes on down to disk to make host
+/// room, the parked role slots go to the host, and the restore lands in the
+/// run that leaves.
 #[tokio::test(flavor = "current_thread")]
 async fn parked_state_on_the_device_moves_down_for_the_head_restore_s_run() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3301,13 +3274,11 @@ async fn parked_state_on_the_device_moves_down_for_the_head_restore_s_run() {
     );
 }
 
-/// The M1 stress (unified memory: no host tier): evictions moved only kv
-/// to disk, so every Instance chunk stayed held by parked processes' role
-/// slots, and the bind-suspended head needing two runs of three chunks
-/// found no victim, as no occupant was resident; nothing was in flight and
-/// the fleet stopped. The parked role chunks are movable room: they go
-/// down to disk at once (no host tier to go through), and the head is
-/// restored into the runs that leaves.
+/// With no host tier an eviction moves kv to disk, and parked processes' role
+/// slots hold the Instance chunks: the bind-suspended head needing two runs of
+/// three chunks finds no occupant resident. The parked role chunks are movable
+/// room: they go down to disk at once (no host tier to go through), and the
+/// head is restored into the runs that leaves.
 #[tokio::test(flavor = "current_thread")]
 async fn with_no_host_tier_parked_role_chunks_go_to_disk_for_a_bind_suspended_head() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3361,14 +3332,13 @@ async fn with_no_host_tier_parked_role_chunks_go_to_disk_for_a_bind_suspended_he
     );
 }
 
-/// The M1 beam-stress freeze: a bind short of room suspended its own
-/// process, whose restore was served straight back into the room its park
-/// gave back, retook its items, and the bind came up short again: suspend,
-/// restore, short, 750 times a second. Runs standing free only by what its
-/// own restore retakes are no room for its bind: it waits, reclaiming idle
-/// cache meanwhile; runs beside its own are, read from the pool as it is
-/// (not from room given back since its park, which never comes once the
-/// fleet waits on it), and it is sent.
+/// A bind short of room suspends its own process, whose restore must not be
+/// served straight back into the room its park gave back, or it retakes its
+/// items and the bind is short again, in a loop. Runs standing free only by
+/// what its own restore retakes are no room for its bind: it waits, reclaiming
+/// idle cache meanwhile; runs beside its own are, read from the pool as it is
+/// (not from room given back since its park, which never comes once the fleet
+/// waits on it), and it is sent.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_park() {
     for moved in [false, true] {
@@ -3415,12 +3385,11 @@ async fn a_restore_suspended_for_a_bind_waits_for_room_given_back_past_its_own_p
     }
 }
 
-/// The M1 stress on restore-4: ten processes suspended for their binds were
-/// restored together, each took its items back, and every bind came up
-/// short against the others' (suspend, restore, short, 190 times each).
-/// One such restore at a time: with two waiting and room for either, the
-/// planner serves one; the other waits until the first fires (its bind went
-/// through), is parked again, or leaves.
+/// Processes suspended for their binds are restored one at a time: restored
+/// together, each takes its items back and every bind comes up short against
+/// the others'. With two waiting and room for either, the planner serves one;
+/// the other waits until the first fires (its bind went through), is parked
+/// again, or leaves.
 #[tokio::test(flavor = "current_thread")]
 async fn bind_suspended_restores_come_back_one_at_a_time() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3488,10 +3457,9 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
 }
 
 /// A short restore that gives up parks its process out of the queue and
-/// answers the wait with the error; the process lives on. The M1 / M5
-/// stress: its next wait to be resident found it parked, queued nothing,
-/// and never ended once the rest drained (evicted = evictions - restores,
-/// queue empty). A process waiting to be resident asks for its restore again.
+/// answers the wait with the error; the process lives on. Waiting to be
+/// resident again, it asks for its restore again, or nothing would queue it
+/// and the wait would never end.
 #[tokio::test(flavor = "current_thread")]
 async fn a_parked_process_waiting_to_be_resident_is_restored() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3517,11 +3485,10 @@ async fn a_parked_process_waiting_to_be_resident_is_restored() {
     );
 }
 
-/// Mac Pro's M5 shape C: a restore short of role room left the queue with
-/// its need marked understated, was queued again as its process waited to
-/// be resident, and, the mark still set, skipped the free runs that stood
-/// once every resident had gone. A restore short of room that fits waits on
-/// (no answer of nothing refuses it); one past the whole device pool is
+/// A restore short of role room that leaves the queue forgets its need was
+/// understated: queued again with the mark, it would skip the free runs that
+/// stand once every resident has gone. A restore short of room that fits waits
+/// on (no answer of nothing refuses it); one past the whole device pool is
 /// refused and parked with what it learned of the room cleared.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_refused_past_the_pool_forgets_what_it_learned_of_the_room() {
@@ -3568,13 +3535,9 @@ async fn a_restore_refused_past_the_pool_forgets_what_it_learned_of_the_room() {
     });
 }
 
-/// Mac Pro's beam mix (no refusals): the head restore was short of two
-/// runs of four chunks for its roles, 440 such runs stood free, and the
-/// serves went flat for 191 s with every thread parked: while the fleet
-/// decoded the restore waited for a completion, never looking at the runs
-/// that stood free, and no event came to look again. Free runs of its need
-/// send it again whatever the fleet does: one plan serves it, with no
-/// further event.
+/// Free runs of a restore's need send it again whatever the fleet does: while
+/// the fleet decodes it waits for no completion, and one plan serves it, with
+/// no further event.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_short_of_runs_goes_again_on_free_runs_while_the_fleet_decodes() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3628,12 +3591,10 @@ async fn a_restore_short_of_runs_goes_again_on_free_runs_while_the_fleet_decodes
     );
 }
 
-/// Mac Pro's beam mix, stall 1: a bind-suspended process was restored
-/// (the one bind-suspended restore at a time), and its bind came up short
-/// again and waited for room. The next bind-suspended restore, the queue's
-/// head, waited on that one's turn, which waited on a bind behind the
-/// head: flat, every thread parked. A restored process whose bind waits
-/// again ends its turn, and the head goes.
+/// A bind-suspended process is restored (the one bind-suspended restore at a
+/// time), and its bind comes up short again and waits for room. Waiting again
+/// ends its turn, and the next bind-suspended restore, the queue's head, goes:
+/// held for that turn, the head would wait on a bind behind it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restored_bind_that_waits_again_lets_the_next_bind_suspended_restore_go() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3669,12 +3630,10 @@ async fn a_restored_bind_that_waits_again_lets_the_next_bind_suspended_restore_g
     );
 }
 
-/// Mac Pro's beam mix (two of two): a bind short of room suspended its own
-/// process, the eviction completed, and the serves went flat with every
-/// thread parked: the restore waited for room given back since its park,
-/// and with the fleet waiting on it as the head nothing gave any, though
-/// runs stood free beside what it retakes. The runs beside its own, read as
-/// the pool stands, send it with no further event.
+/// A bind short of room suspended its own process and the eviction completed.
+/// Its restore waits for no room given back since its park (with the fleet
+/// waiting on it as the head nothing gives any): the runs beside its own, read
+/// as the pool stands, send it with no further event.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_suspended_restore_goes_on_runs_beside_its_own_with_no_room_given_since() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3724,11 +3683,9 @@ async fn a_bind_suspended_restore_goes_on_runs_beside_its_own_with_no_room_given
 /// A wedged fleet, a restore short of room and the policy freeing nothing:
 /// over-demand is served, slower, never failed. While another process holds
 /// room that can move, the restore keeps waiting and the planner moves a
-/// resident for it (the M1 stress: refused at the first wedge, a beam
-/// failed with room the next eviction gave it). With nothing else on the
-/// device to move it still waits (room given back, an arrival's completion
-/// or the policy may come); only a need past the whole pool is refused, by
-/// name.
+/// resident for it. With nothing else on the device to move it still waits
+/// (room given back, an arrival's completion or the policy may come); only a
+/// need past the whole pool is refused, by name.
 #[tokio::test(flavor = "current_thread")]
 async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_past_the_pool() {
     // Alone: it raises the policy's global answer, which wakes other tests'
@@ -3799,11 +3756,10 @@ async fn a_short_restore_on_a_wedged_fleet_is_funded_and_refused_only_past_the_p
     assert!(refused.to_string().contains("past the whole 8-page device pool"), "{refused}");
 }
 
-/// The M1 stress on the funding commit: a restore head held while another
-/// process restored for its bind had not fired, and that process's bind
-/// waited behind the head for good (and the planner, funding the head,
-/// moved every resident for a restore it would not serve). The restored
-/// one's bind goes first.
+/// A restore head is held while another process restored for its bind has not
+/// fired. That process's bind goes ahead of the head: behind it, the two would
+/// wait on each other for good, the planner moving every resident for a
+/// restore it would not serve.
 #[tokio::test(flavor = "current_thread")]
 async fn the_bind_of_the_one_restored_for_it_goes_ahead_of_the_held_restore() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -3908,11 +3864,10 @@ async fn a_short_head_beside_movable_parked_state_waits_and_is_refused_only_past
     );
 }
 
-/// Twelve requests whose first frames together ask three times the pool,
-/// all at once, beside a policy that answers every shortfall with nothing
-/// freed (Mac's budgeted mix). Those with no room now are refused at
-/// admission by name (the user's ruling) and retried once one ahead of
-/// them leaves; every one is served in the end.
+/// Twelve requests whose first frames together ask three times the pool, all
+/// at once, beside a policy that answers every shortfall with nothing freed.
+/// Those with no room now are refused at admission by name and retried once
+/// one ahead of them leaves; every one is served in the end.
 #[tokio::test(flavor = "current_thread")]
 async fn requests_past_the_pool_together_are_all_served_none_refused() {
     // Alone: it raises the policy's global answer.
@@ -4065,14 +4020,12 @@ async fn a_need_past_the_whole_pool_is_refused_by_name_at_once() {
     );
 }
 
-/// Mac Pro's M5 soak on f9afad90a (4 of 5 over-demand runs stalled,
-/// evicting=1 for good, pool free 0): a process restored into room that
-/// just fit its parked state binds a program that needs more, its bind
-/// waits in the planner, and the planner, short, evicts that process. Its
-/// eviction waited for its fires' leases, whose finalizer was its guest,
-/// in the bind; the bind waited on the eviction. Now the bind settles its
-/// process's fires before it waits, and its own eviction withdraws its
-/// wait for room: it waits for its restore instead, nothing funded for it
+/// A process restored into room that just fits its parked state binds a
+/// program that needs more; its bind waits in the planner, and the planner,
+/// short, evicts that process. The eviction waits for the process's fires'
+/// leases, whose finalizer is its guest, in the bind: so the bind settles its
+/// process's fires before it waits, and its own eviction withdraws its wait
+/// for room. It waits for its restore instead, nothing funded for it
 /// meanwhile, and binds once restored (no wake lost that way either).
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_waiting_for_room_yields_to_its_own_eviction_and_binds_after_the_restore() {
@@ -4250,15 +4203,12 @@ async fn a_roles_short_restore_is_funded_beside_a_steady_decoder_once_a_bind_wai
 
 
 
-/// Mac Pro's disk-only home on 45cf89b8c (500 at once, stalled in
-/// seconds): the head a restore with no kv to ask (head_pages=0) and a
-/// roles need of a run of 3, 70 free runs of 3 standing (the map's
-/// cheapest cost 0), every resident waiting on a grant, nothing firing.
-/// The census showed it refused with free_runs 0: a plain short head,
-/// sent at once now its runs stand, with no wait on room given back (a
-/// quiescent pool gives none). One truly understated (refused while as
-/// many runs stood) is not sent again on the same runs (the 20M-round
-/// livelock), but is once the pool holds more of them than it saw.
+/// The head is a restore with no kv to ask and a roles need of a run of 3,
+/// free runs of 3 standing, every resident waiting on a grant, nothing firing.
+/// Refused with free_runs 0 it is a plain short head, sent at once now its
+/// runs stand, with no wait on room given back (a quiescent pool gives none).
+/// One truly understated (refused while as many runs stood) is not sent again
+/// on the same runs, but is once the pool holds more of them than it saw.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_head_whose_run_stands_is_sent_and_an_understated_one_once_room_is_given() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -4419,9 +4369,9 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
         });
         planner.requeue_restore_roles(head, (3, 1), refused);
     };
-    // Refused with its own view short (free_runs 0) while the map shows 2:
-    // a room the map does not read. Its need is not grown on it (Mac Pro on
-    // 3b45462d4: (7, 6) to (7, 22)); the census names the mismatch.
+    // Refused with its own view short (free_runs 0) while the map shows 2: a
+    // room the map does not read. Its need is not grown on it; the census
+    // names the mismatch.
     refuse(&planner, Some(0));
     let (understated, need, mismatch) = planner.with_inner(|inner| {
         let proc = &inner.procs[&head];
@@ -4494,11 +4444,11 @@ async fn a_restore_refused_against_the_map_goes_again_at_most_once_per_map_chang
     assert!(retried(&planner), "a run come free: sent");
 }
 
-/// mx-2's cycle at the planner: a process suspended for its bind's room is
-/// restored only once that room stands (the map shows its run beside its
-/// own), not on room for its kv alone; while no run of its need stands it
-/// stays parked, no one moved and no restore sent, however often the plan
-/// runs; the run appears and it is restored, once.
+/// A process suspended for its bind's room is restored only once that room
+/// stands (the map shows its run beside its own), not on room for its kv
+/// alone; while no run of its need stands it stays parked, no one moved and no
+/// restore sent, however often the plan runs; the run appears and it is
+/// restored, once.
 #[tokio::test(flavor = "current_thread")]
 async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_stands() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -4553,13 +4503,13 @@ async fn a_process_suspended_for_its_bind_s_room_is_restored_only_once_the_room_
     assert_eq!(planner.stats.restores.load(Ordering::Relaxed), 1, "its room stands: restored once");
 }
 
-/// mx-7's state (a restore waiting for room for its roles, recorded
-/// bind_room (3,1) beside a refused roles_short (4,1), free 4-runs standing
-/// in the map, every other chunk emptiable by residents, and nothing ever
-/// moved, evictions frozen): the refusal's need becomes the head's need
-/// beside the bind's, each length apart, and, refused while runs of it
-/// stood, one run more than stood; the planner plans against that and
-/// moves the occupants of the cheapest such runs. No wait for a map change that never comes.
+/// A restore waits for room for its roles, recorded bind_room (3,1) beside a
+/// refused roles_short (4,1), free 4-runs standing in the map and every other
+/// chunk emptiable by residents. The refusal's need becomes the head's need
+/// beside the bind's, each length apart, and, refused while runs of it stood,
+/// one run more than stood; the planner plans against that and moves the
+/// occupants of the cheapest such runs. No wait for a map change that never
+/// comes.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_restore_s_need_is_its_refusal_s_and_the_planner_moves_for_it() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -4950,12 +4900,12 @@ async fn parked_state_of_a_process_gone_while_parked_moves_down_for_the_head() {
     assert_eq!(*pool.moved.lock(), vec!["disk"]);
 }
 
-/// A swap tier nearly full (a tight disk budget) defers the eviction rung
-/// only while something in flight can bring the head its pages. With no
-/// fire, move or kill under way, and residents neither firing nor parked
-/// in the queue (blocked elsewhere: on another process, a sibling lane),
-/// the rung goes on: before, the fleet read as not stalled by its waiters'
-/// kinds and the head was deferred for good (the disk-only M1 hang).
+/// A swap tier nearly full (a tight disk budget) defers the eviction rung only
+/// while something in flight can bring the head its pages. With no fire, move
+/// or kill under way, and residents neither firing nor parked in the queue
+/// (blocked elsewhere: on another process, a sibling lane), the rung goes on:
+/// a fleet read as not stalled by its waiters' kinds would defer the head for
+/// good.
 #[tokio::test(flavor = "current_thread")]
 async fn a_nearly_full_swap_defers_eviction_only_while_something_is_in_flight() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5159,14 +5109,11 @@ async fn a_head_no_eviction_can_fund_asks_a_compaction() {
     bind.abort();
 }
 
-/// The anti-thrash rule, on the L40S loop (a process evicted for one head,
-/// restored ~43 ms later, re-evicted ~4 ms after that, every ~65 ms, the
-/// head never served; one pid evicted 443 times). A victim evicted for
-/// head H is not restored while H waits unserved: its restore, ranked
-/// ahead of H, is passed over and H is the head the planner funds. Once H
-/// is served the victim's restore goes; restored for a waiting head, it is
-/// no eviction candidate for the next head until it has fired once, and is
-/// one again after.
+/// The anti-thrash rule. A victim evicted for head H is not restored while H
+/// waits unserved: its restore, ranked ahead of H, is passed over and H is the
+/// head the planner funds. Once H is served the victim's restore goes;
+/// restored for a waiting head, it is no eviction candidate for the next head
+/// until it has fired once, and is one again after.
 #[test]
 fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
@@ -5233,10 +5180,9 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
         !members(&planner).contains(&victim),
         "restored for a waiting head and able to run: not moved back before it runs"
     );
-    // Queued for its first fire's room while something is in flight: the
-    // ask is part of that fire, so the mark still holds it (else it went
-    // back down before it ran: the L40S at 3 GiB, evictions 4017, restores
-    // 4012).
+    // Queued for its first fire's room while something is in flight: the ask
+    // is part of that fire, so the mark still holds it (else it goes back down
+    // before it runs).
     let own = planner.with_inner(|inner| inner.enqueue(victim, allocation(demand)));
     assert!(
         planner.with_inner(|inner| inner.unfired_protects(victim)),
@@ -5273,13 +5219,12 @@ fn a_victim_is_not_restored_before_its_head_nor_evicted_again_before_it_fires() 
     drop(running);
 }
 
-/// Mac Pro's restore heads (need (9, 2), five free runs, nothing issued):
-/// a restore refused short of its roles names the part it came up short
-/// on, and its whole unpark takes more. Its need is the whole unpark: here
-/// one run of two recorded, its own parts two such runs, one free run
-/// standing, refused on this very map. Asked the recorded run, the map saw
-/// it free, moved no one, and the restore never went again; asked the
-/// whole, the resident holding a run beside it is moved.
+/// A restore refused short of its roles names the part it came up short on,
+/// and its whole unpark takes more. Its need is the whole unpark: here one run
+/// of two recorded, its own parts two such runs, one free run standing,
+/// refused on this very map. Asked the recorded run, the map saw it free,
+/// moved no one, and the restore never went again; asked the whole, the
+/// resident holding a run beside it is moved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_roles_short_restore_is_funded_for_its_whole_unpark() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5332,11 +5277,10 @@ async fn a_roles_short_restore_is_funded_for_its_whole_unpark() {
     );
 }
 
-/// The M1's disk-only stall (a plan in the map, nothing issued, no evict,
-/// restore or compaction line): with the swap tiers full of parked kv, a
-/// head short of chunk runs is still funded, its occupant moved, for the
-/// chunks empty as guest scratch is given back and state moves, which a
-/// full swap does not stop. Only kv the head itself lacks waits on swap.
+/// With the swap tiers full of parked kv, a head short of chunk runs is still
+/// funded, its occupant moved, for the chunks empty as guest scratch is given
+/// back and state moves, which a full swap does not stop. Only kv the head
+/// itself lacks waits on swap.
 #[tokio::test(flavor = "current_thread")]
 async fn a_head_short_of_runs_is_funded_with_the_swap_full() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5367,9 +5311,8 @@ async fn a_head_short_of_runs_is_funded_with_the_swap_full() {
     bind.abort();
 }
 
-/// The M1's first stall (a restore with no recorded need, free room,
-/// nothing issued) and the L40S's guest-only restore (kv 0, rs 0): a
-/// restore asking nothing past what stands is served from it at once.
+/// A restore asking nothing past what stands (no recorded need, or a
+/// guest-only one: kv 0, rs 0) is served from it at once.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_asking_nothing_is_served_from_free_room() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5402,10 +5345,9 @@ async fn a_restore_asking_nothing_is_served_from_free_room() {
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "served at once");
 }
 
-/// The M1's self-eviction (a bind short of room picked its own process
-/// first, evicted it, and did again on its return, three times over): a
-/// head's own process is never among its victims, though waiting at its
-/// bind it yields as its victims do.
+/// A head's own process is never among its victims, though waiting at its bind
+/// it yields as its victims do: evicted first, it would be evicted again on
+/// its return.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_never_picks_its_own_process() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5431,11 +5373,10 @@ async fn a_bind_never_picks_its_own_process() {
     bind.abort();
 }
 
-/// The M1's 4-run restore that never found a window (3,710 passes, picks
-/// empty, a map of two stuck chunks): with nothing in flight, residents
-/// that made no progress since their last move are candidates too, nothing
-/// coming to move them on. Read as the fresh alone, the map held none of
-/// their chunks and the head waited with 371 of them emptiable.
+/// With nothing in flight, residents that made no progress since their last
+/// move are candidates too, nothing coming to move them on. Read as the fresh
+/// alone, the map holds none of their chunks and the head waits with them
+/// emptiable.
 #[tokio::test(flavor = "current_thread")]
 async fn with_nothing_in_flight_a_head_is_funded_by_residents_that_made_no_progress() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5470,12 +5411,11 @@ async fn with_nothing_in_flight_a_head_is_funded_by_residents_that_made_no_progr
     bind.abort();
 }
 
-/// Room that comes back by any path wakes a parked waiter it serves within
-/// a turn: the pool's room signal, told wherever device slots come free (a
-/// sequence ending, a fire's epoch retiring, an eviction's pages let go),
-/// with no pages_freed and no timer. Without it the head slept until an
-/// unrelated event (the L40S at 4 GiB: silent waits to 793 ms once the
-/// 100 ms re-plan was gone). With the drain task armed and without.
+/// Room that comes back by any path wakes a parked waiter it serves within a
+/// turn: the pool's room signal, told wherever device slots come free (a
+/// sequence ending, a fire's epoch retiring, an eviction's pages let go), with
+/// no pages_freed and no timer. Without it the head sleeps until an unrelated
+/// event. With the drain task armed and without.
 #[tokio::test(flavor = "current_thread")]
 async fn room_that_comes_free_on_any_path_wakes_the_waiter_it_serves() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5540,14 +5480,12 @@ async fn room_that_comes_free_on_any_path_wakes_the_waiter_it_serves() {
 }
 
 
-/// The M1 hang (head d293aade: 398 chunks held, two of them the map's, its
-/// own 126 instances' tables and its channels parked in place on the
-/// device): an evicted head's own parked state is moved down a tier for
-/// its runs. Nothing runs on it, and its restore lays it back compactly.
-/// Left out of the map and of park-down ("never its own state"), it held
-/// the chunks between the free ones, no run of its bind's length stood,
-/// and nothing moved it. Here its own state lies at 1, 3, 5 and 7 between
-/// free chunks; it goes to disk, a run stands, and the restore is served.
+/// An evicted head's own parked state is moved down a tier for its runs.
+/// Nothing runs on it, and its restore lays it back compactly. Left out of the
+/// map and of park-down it would hold the chunks between the free ones, no run
+/// of its bind's length standing, and nothing would move it. Here its own
+/// state lies at 1, 3, 5 and 7 between free chunks; it goes to disk, a run
+/// stands, and the restore is served.
 #[tokio::test(flavor = "current_thread")]
 async fn an_evicted_head_s_own_parked_state_moves_down_for_its_runs() {
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
@@ -5596,11 +5534,10 @@ async fn an_evicted_head_s_own_parked_state_moves_down_for_its_runs() {
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the restore is served");
 }
 
-/// The L40S livelock on 3d177c213 (one victim evicted 5,894 times for one
-/// restore head, the head never served): a restore head leaves the queue
-/// while its restore runs and is queued again when its unpark comes up
-/// short. Its victim's restore is held through that gap too: the head is
-/// served only once it is resident, not once its waiter has left.
+/// A restore head leaves the queue while its restore runs and is queued again
+/// when its unpark comes up short. Its victim's restore is held through that
+/// gap too: the head is served only once it is resident, not once its waiter
+/// has left.
 #[test]
 fn a_victim_s_restore_is_held_while_its_restore_head_is_away_from_the_queue() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
@@ -5645,12 +5582,11 @@ fn a_victim_s_restore_is_held_while_its_restore_head_is_away_from_the_queue() {
     assert_eq!(unmet(&planner), Some(victim), "its head served, it goes");
 }
 
-/// Mac Pro's "free" stalls (a restore of (3, 3) and 41 kv pages, 8 runs
-/// open): a restore's step gathers its kv pages, then lays its runs, both
-/// from the same free chunks. Its need is both: here one run of two and
-/// two kv pages, one run and one more chunk standing. Asked the run alone,
-/// it stood, no one moved, and gathering the pages broke it; asked both,
-/// the resident holding a chunk beside them is moved.
+/// A restore's step gathers its kv pages, then lays its runs, both from the
+/// same free chunks. Its need is both: here one run of two and two kv pages,
+/// one run and one more chunk standing. Asked the run alone, it stood, no one
+/// moved, and gathering the pages broke it; asked both, the resident holding a
+/// chunk beside them is moved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_is_funded_for_its_runs_and_its_kv_pages_together() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5702,11 +5638,10 @@ async fn a_restore_is_funded_for_its_runs_and_its_kv_pages_together() {
     );
 }
 
-/// The L40S at 4 GiB on 3d177c213 (+23%: rows per dispatch 14 to 10.67):
-/// woken on every free, the planner admitted what fit at that instant and
-/// split fires into smaller batches. Room coming free wakes it only once
-/// what the head lacks is met: frees trickling in short of the head's need
-/// plan nothing; the one that meets it wakes the planner within a turn.
+/// Room coming free wakes a waiting head only once what the head lacks is met:
+/// woken on every free, the planner would admit what fits at that instant and
+/// split fires into smaller batches. Frees trickling in short of the head's
+/// need plan nothing; the one that meets it wakes the planner within a turn.
 #[tokio::test(flavor = "current_thread")]
 async fn trickling_frees_short_of_the_head_s_need_plan_nothing() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5779,13 +5714,11 @@ async fn trickling_frees_short_of_the_head_s_need_plan_nothing() {
     assert!(matches!(task.await.unwrap(), Ok(super::acquire::Acquired::Granted(_))));
 }
 
-/// Mac Pro's 5 GiB stall (a restore needing runs of four, 19 open runs in
-/// the map, the unpark refused with no free chunk and nothing committable):
-/// the state budget's headroom was spent, so no free chunk could be opened
-/// however many stood open. A head short of runs there is funded by
-/// emptying chunks elsewhere, giving budget back, not by the open runs.
-/// Here two runs of four stand free, the headroom is none, and a resident
-/// holds four chunks elsewhere: it is moved.
+/// With the state budget's headroom spent no free chunk can be opened, however
+/// many stand open. A head short of runs there is funded by emptying chunks
+/// elsewhere, giving budget back, not by the open runs. Here two runs of four
+/// stand free, the headroom is none, and a resident holds four chunks
+/// elsewhere: it is moved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_head_short_of_runs_with_no_headroom_frees_budget_elsewhere() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5816,11 +5749,9 @@ async fn a_head_short_of_runs_with_no_headroom_frees_budget_elsewhere() {
     bind.abort();
 }
 
-/// The L40S on 81aa5f879 (8 of 9 opened chunks held by no candidate and
-/// nothing parked, the head a restore of no kv, nothing in flight): pages
-/// gathered for another head stay gathered while a restore that needs none
-/// of them waits, holding the chunks (and the state budget) its runs need.
-/// They go back: here four of eight chunks gathered, a restore of no kv
+/// Pages gathered for another head go back for a restore that needs none of
+/// them: gathered while it waits, they hold the chunks (and the state budget)
+/// its runs need. Here four of eight chunks gathered, a restore of no kv
 /// needing six single chunks; released, its runs stand and it is served.
 #[tokio::test(flavor = "current_thread")]
 async fn pages_gathered_for_another_head_go_back_for_a_restore_that_needs_none() {
@@ -5866,11 +5797,10 @@ async fn pages_gathered_for_another_head_go_back_for_a_restore_that_needs_none()
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the restore is served");
 }
 
-/// Mac Pro's no-step restores with no refusal on record: one bind-suspended
-/// restore at a time, the next waiting until the first fires. A first that
-/// cannot fire (nothing in flight) held every other for good, their runs
-/// standing. By state, the gate lets the next go: here the first never
-/// fires, and the second, its room standing, is restored.
+/// One bind-suspended restore at a time, the next waiting until the first
+/// fires. A first that cannot fire (nothing in flight) would hold every other
+/// for good, their runs standing: by state, the gate lets the next go: here
+/// the first never fires, and the second, its room standing, is restored.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_suspended_restore_that_cannot_fire_holds_the_next_no_longer() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5915,12 +5845,11 @@ async fn a_bind_suspended_restore_that_cannot_fire_holds_the_next_no_longer() {
     assert!(planner.stats.restores.load(Ordering::Relaxed) > 0, "the second is restored");
 }
 
-/// Mac Pro's 2 GiB spin and the L40S's (139,315 and 132,792 refusals, the
-/// free room no different): refused restores sent one another again, each
-/// refusal's own return of what its unpark took counted as room moved. A
-/// refused restore goes again on runs only once more runs of its need's
-/// length stand than its refusal saw: give-backs that leave those runs as
-/// they were send no one; a run come free does.
+/// A refused restore goes again on runs only once more runs of its need's
+/// length stand than its refusal saw: counted as room moved, each refusal's
+/// own return of what its unpark took would send the others again, forever.
+/// Give-backs that leave those runs as they were send no one; a run come free
+/// does.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_restore_goes_again_only_on_more_usable_runs() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -5974,10 +5903,9 @@ async fn a_refused_restore_goes_again_only_on_more_usable_runs() {
     assert!(sent(&planner), "a run come free: sent again");
 }
 
-/// Mac Pro's g2 spin (56,671 no-step lines, ~199 s of map passes in one
-/// run): a stuck head re-ran every pass on every wake. Edge-triggered, a
-/// stuck state is said once and costs no pass until an event moves the
-/// generation; its wakes are counted, and the next event plans again.
+/// Passes are edge-triggered: a stuck state is said once and costs no pass
+/// until an event moves the generation; its wakes are counted, and the next
+/// event plans again.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stuck_state_is_said_once_and_costs_no_pass_until_an_event() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -6022,10 +5950,9 @@ async fn a_stuck_state_is_said_once_and_costs_no_pass_until_an_event() {
     assert_eq!(planner.stats.plan_passes.load(Ordering::Relaxed), passes + 1, "planned on the event");
 }
 
-/// The M1's allocation head with 38 free runs not granted: only the seated
-/// lanes whose next step needs room now are held back for. A seated lane
-/// waiting in the queue (blocked, asking for its room there) holds back
-/// nothing, and with nothing in flight no lane grows before the claim.
+/// Only the seated lanes whose next step needs room now are held back for. A
+/// seated lane waiting in the queue (blocked, asking for its room there) holds
+/// back nothing, and with nothing in flight no lane grows before the claim.
 #[test]
 fn the_seated_lanes_reserve_counts_only_lanes_that_grow_now() {
     let planner = Arc::new(
@@ -6056,7 +5983,7 @@ fn the_seated_lanes_reserve_counts_only_lanes_that_grow_now() {
         }
         let reserve = inner.seating_reserve(claimant, units(2), units(3), units(64));
         assert_eq!(reserve, units(4), "the waiting lanes hold back nothing: {reserve:?}");
-        // The M1: 38 free, a claim of 3, the waiting lanes' growth not kept.
+        // 38 free, a claim of 3, the waiting lanes' growth not kept.
         assert!(units(38).covers(units(3).add(reserve)), "the claim is granted");
     });
     drop(decoding);
@@ -6078,12 +6005,11 @@ fn units_demand(pages: u32) -> Demand {
     }
 }
 
-/// Mac Pro's 5 GiB mx-3 spin (85,319 no-step lines, ~470 a second, nothing
-/// in flight): a refused restore head short of a run while chunks enough
-/// stood free. Its want of room was its need's chunk count, which the free
-/// chunks already met, so every chunk given back anywhere (a resident's,
-/// or the pass's own) woke a pass that found no step. Room coming free
-/// wakes such a head only past what stood free when its pass ended.
+/// A refused restore head is short of a run while chunks enough stand free.
+/// Its want of room is not its need's chunk count, which the free chunks
+/// already meet: every chunk given back anywhere (a resident's, or the pass's
+/// own) would wake a pass that finds no step. Room coming free wakes such a
+/// head only past what stood free when its pass ended.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_restore_head_short_of_a_run_is_not_woken_by_chunks_it_already_had() {
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
@@ -6136,11 +6062,9 @@ async fn a_refused_restore_head_short_of_a_run_is_not_woken_by_chunks_it_already
     assert!(more <= 2, "a hundred give-backs of chunks it had planned {more} passes");
 }
 
-/// Mac Pro's 2 GiB stall: a restore head left unfunded while a fire was in
-/// flight, then the fleet went quiet with no store telling the planner (one
-/// stall line in three minutes, no eviction issued, no pass after). The
-/// beat plans a quiet unserved head once on the room it finds, and never
-/// again on the same room.
+/// A restore head is left unfunded while a fire is in flight, then the fleet
+/// goes quiet with no store telling the planner. The beat plans a quiet
+/// unserved head once on the room it finds, and never again on the same room.
 #[tokio::test(flavor = "current_thread")]
 async fn the_fleet_going_quiet_plans_an_unserved_head_once() {
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
@@ -6200,11 +6124,9 @@ async fn the_fleet_going_quiet_plans_an_unserved_head_once() {
     drop(held);
 }
 
-/// Mac Pro's 2 GiB mix on c27717c48: a restore head suspended for a bind,
-/// its need [(7, 1), (4, 1)] standing (open stretches of 19 and 11), 33 kv
-/// pages to gather, never refused (why=None), and never attempted while a
-/// fleet of 248 decoded. A head that arrives with its room standing is
-/// attempted in its first pass, fires in flight or none.
+/// A restore head suspended for a bind, its need standing beside many kv pages
+/// to gather, is attempted in its first pass, fires in flight or none: a
+/// decoding fleet does not put it off.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_head_whose_need_stands_is_attempted_in_its_first_pass() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -6261,11 +6183,9 @@ async fn a_restore_head_whose_need_stands_is_attempted_in_its_first_pass() {
     }
 }
 
-/// Mac Pro's 2 GiB mix on 0d96fb179: an allocation head, 0 chunks free,
-/// one stall line, then silence while chunks came free (35 later). A
-/// quiet unserved head is planned by the beat on the room it finds, and
-/// again whenever the free counts differ from its last plan: room come
-/// free with no one told serves it on the next beat.
+/// An allocation head with no chunk free is planned by the beat on the room it
+/// finds, the fleet quiet, and again whenever the free counts differ from its
+/// last plan: room come free with no one told serves it on the next beat.
 #[test]
 fn a_quiet_allocation_head_is_planned_again_when_room_comes_free() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -6328,11 +6248,10 @@ fn a_quiet_allocation_head_is_planned_again_when_room_comes_free() {
     );
 }
 
-/// The M1 on 3b45462d4: 138 processes queued, 364 opened chunks, none held
-/// by a candidate. A prompt not yet seated takes only idle or held
-/// processes' room, and an older process waits ahead of it untouched; but
-/// with nothing in flight a process waiting in the queue runs nothing, and
-/// its resident slots are a victim's like any other's.
+/// A prompt not yet seated takes only idle or held processes' room, and an
+/// older process waits ahead of it untouched; but with nothing in flight a
+/// process waiting in the queue runs nothing, and its resident slots are a
+/// victim's like any other's.
 #[test]
 fn with_nothing_in_flight_a_queued_process_s_slots_are_a_victim_s() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -6397,13 +6316,11 @@ fn with_nothing_in_flight_a_queued_process_s_slots_are_a_victim_s() {
     drop(held);
 }
 
-/// Mac Pro's 2 GiB on 3b45462d4: a restore refused a run of four (no chunk
-/// free in its unpark's room) while the map showed its need standing,
-/// spinning ~350 lines a second, its need growing. Its need counts the
-/// state its serve opens chunks for first (records, rs list slots); it is
-/// not grown on runs only the map shows; and it goes again only once more
-/// chunks stand free than its refusal left, not on chunks given back and
-/// taken again.
+/// A restore is refused a run of four (no chunk free in its unpark's room)
+/// while the map shows its need standing. Its need counts the state its serve
+/// opens chunks for first (records, rs list slots); it is not grown on runs
+/// only the map shows; and it goes again only once more chunks stand free than
+/// its refusal left, not on chunks given back and taken again.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -6451,9 +6368,8 @@ async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
         Some((4, 1)),
         "not grown on runs only the map shows"
     );
-    // Its state's chunks are single chunks beside its run, not runs of
-    // four (asked so, a restore with much to gather asked runs no pool
-    // held: Mac Pro at 2 GiB on c10d7de5d).
+    // Its state's chunks are single chunks beside its run, not runs of four
+    // (asked so, a restore with much to gather asks runs no pool holds).
     let mut need = super::pool::RunNeed::one(4, 1);
     need.add(1, 8);
     assert_eq!(
@@ -6504,9 +6420,9 @@ async fn a_restore_refused_in_its_unpark_s_room_goes_again_only_on_more_room() {
 }
 
 /// A victim whose move found nothing to move (its state still settling) is
-/// blocked until the pool moves on; a fire landing (state settled) is such
-/// a move too, so a stall with no room given back keeps it out for good no
-/// longer (the L40S on 22b0a3e83: a queued process's chunk, no candidate).
+/// blocked until the pool moves on; a fire landing (state settled) is such a
+/// move too, so a stall with no room given back keeps it out for good no
+/// longer.
 #[test]
 fn a_victim_that_found_nothing_is_a_candidate_again_once_a_fire_lands() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -6560,10 +6476,9 @@ fn a_victim_that_found_nothing_is_a_candidate_again_once_a_fire_lands() {
     drop(grant);
 }
 
-/// Mac Pro on 22b0a3e83: a restore refused a run of nine whose need read
-/// [(7, 8), (4, 1)]. A re-send cleared its refusal, and its need fell back
-/// to its bind's runs and its own. The refused run stays in its need
-/// across a re-send, until a restore serves it.
+/// A refused run stays in its restore's need across a re-send, until a restore
+/// serves it: cleared by the re-send, the need would fall back to its bind's
+/// runs and its own.
 #[test]
 fn a_refused_run_stays_in_the_need_across_a_re_send() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -6596,11 +6511,10 @@ fn a_refused_run_stays_in_the_need_across_a_re_send() {
     assert!(has_nine(&planner), "re-sent: its need still asks the run of nine");
 }
 
-/// The L40S on 3b45462d4: a restore whose guest state (1,058 slots, about
-/// sixteen chunks) and runs past what the state limit leaves, waiting with
-/// nothing evictable. A head whose whole step takes more chunks than state
-/// may ever take is refused by name as never fitting alone; one that fits
-/// waits.
+/// A restore whose guest state and runs pass what the state limit leaves,
+/// waiting with nothing evictable: a head whose whole step takes more chunks
+/// than state may ever take is refused by name as never fitting alone; one
+/// that fits waits.
 #[test]
 fn a_restore_past_every_state_chunk_is_refused_as_never_fitting_alone() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
@@ -6627,10 +6541,8 @@ fn a_restore_past_every_state_chunk_is_refused_as_never_fitting_alone() {
     );
 }
 
-/// Mac Pro on 22b0a3e83: a refused restore head re-planned by every fire
-/// landing (838 no-step lines a second at peak, nothing in its room
-/// moved). A fire landing plans no pass for a head refused on room that
-/// has not moved since; room that moves does.
+/// A fire landing plans no pass for a refused restore head whose room has not
+/// moved since its refusal; room that moves does.
 #[tokio::test(flavor = "current_thread")]
 async fn fire_landings_plan_no_pass_for_a_head_refused_on_room_unmoved() {
     let _schedule = crate::policy::schedule::TEST_LOCK.write().await;
@@ -6685,12 +6597,9 @@ async fn fire_landings_plan_no_pass_for_a_head_refused_on_room_unmoved() {
     );
 }
 
-/// The L40S on 46296784b: four binds queued (seq 10 to 13), the youngest
-/// evicted while it waited, restored for its own bind while the binds of 11
-/// and 12 ahead of it still waited, and evicted for them again 1,730 times
-/// (rs disk churn: 256,939 copies out). A process evicted while it waited
-/// in the queue is restored only once no process ahead of it has an entry
-/// there.
+/// A process evicted while it waited in the queue is restored only once no
+/// process ahead of it has an entry there: restored for its own bind before
+/// theirs, it is evicted for them again.
 #[test]
 fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
@@ -6753,13 +6662,11 @@ fn a_process_evicted_while_queued_is_restored_only_behind_the_queue_ahead_of_it(
     assert_eq!(head_pid(&planner), Some(youngest), "nothing ahead of it: restored");
 }
 
-/// Mac Pro's M5 at 2 GiB on 5120cbc3c, stuck at 77 serves: a bind head
-/// short of a run of chunks (need [(9, 1)]), one queued resident's chunk
-/// in the cheapest window (need_moves Some(Some(1))), 300 more queued
-/// behind, nothing in flight, and no eviction ever issued. Here: a run of
-/// three over chunks 0..3, chunk 1 a queued resident's, the disk with no
-/// slot free, and more one-page allocations queued than chunks stand
-/// free. The one move is issued.
+/// A bind head is short of a run of chunks with nothing in flight, one queued
+/// resident's chunk in the cheapest window and more queued behind. Here: a run
+/// of three over chunks 0..3, chunk 1 a queued resident's, the disk with no
+/// slot free, and more one-page allocations queued than chunks stand free. The
+/// one move is issued.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_head_one_queued_resident_away_is_funded_with_nothing_in_flight() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -6803,12 +6710,10 @@ async fn a_bind_head_one_queued_resident_away_is_funded_with_nothing_in_flight()
     );
 }
 
-/// The L40S at 3 GiB disk-only on 5120cbc3c: the last six beams waited
-/// silently, every one evicted and queued for its restore, none resident,
-/// nothing in flight, and no head chosen (head_kind=-): each restore was
-/// held for the head it had been evicted for, itself an evicted restore
-/// held the same way. With nothing else to serve, the oldest such restore
-/// heads the queue.
+/// Every waiter is evicted and queued for its restore, none resident, nothing
+/// in flight, each restore held for the head it was evicted for, itself an
+/// evicted restore held the same way. With nothing else to serve, the oldest
+/// such restore heads the queue.
 #[test]
 fn with_every_waiter_an_evicted_restore_held_for_another_one_heads_the_queue() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
@@ -6840,11 +6745,10 @@ fn with_every_waiter_an_evicted_restore_held_for_another_one_heads_the_queue() {
     );
 }
 
-/// The L40S at 3 GiB disk-only on 5120cbc3c, its last six beams: every
-/// waiter an evicted restore held for another's, no one resident, nothing
-/// in flight, and the device still held by their state (17 chunks, 150
-/// pages). The oldest heads the queue, and the state the others left on
-/// the device moves down for its runs, nobody resident.
+/// Every waiter is an evicted restore held for another's, no one resident,
+/// nothing in flight, and the device still held by their state. The oldest
+/// heads the queue, and the state the others left on the device moves down for
+/// its runs, nobody resident.
 #[tokio::test(flavor = "current_thread")]
 async fn with_no_one_resident_evicted_state_moves_down_for_a_held_restore() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -6889,13 +6793,11 @@ async fn with_no_one_resident_evicted_state_moves_down_for_a_held_restore() {
     assert_eq!(*pool.moved.lock(), vec!["state"], "the second's state moves down for the first");
 }
 
-/// The L40S at 6 GiB on 5120cbc3c: restore waits served by pokes, up to
-/// 16.5 s, a few by the room signal. A restore refused in an earlier
-/// unpark and short of its state slots now: its step is the state slots
-/// (read ahead of its runs), but its want was the refusal's (more free
-/// chunks than stood), which state given back inside open chunks never
-/// moves. Any room given back wakes it, as for one never refused; its
-/// wait says what it lacked.
+/// A restore refused in an earlier unpark and short of its state slots now:
+/// its step is the state slots (read ahead of its runs), while its refusal's
+/// want is more free chunks than stood, which state given back inside open
+/// chunks never moves. Any room given back wakes it, as for one never refused;
+/// its wait says what it lacked.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -6958,12 +6860,11 @@ async fn a_refused_restore_short_of_state_is_served_by_the_room_signal() {
     );
 }
 
-/// A policy's hold (the test-pause policy of sc/amd-beam-pages
-/// holds a process for a while, then lifts it): a process held
-/// and parked stays parked while room stands free and its
-/// own lanes wait to be resident, and, taking sets that are off the
-/// device, owes them parked; its restore is queued once the policy lifts
-/// it, never before.
+/// A policy's hold (the test-pause policy holds a process for a while, then
+/// lifts it): a process held and parked stays parked while room stands free
+/// and its own lanes wait to be resident, and, taking sets that are off the
+/// device, owes them parked; its restore is queued once the policy lifts it,
+/// never before.
 #[tokio::test(flavor = "current_thread")]
 async fn a_process_held_below_the_floor_stays_parked_until_the_policy_lifts_it() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -7203,16 +7104,12 @@ async fn the_test_pause_policy_parks_a_set_in_its_window_and_resumes_it_after() 
     crate::policy::schedule::install(None);
 }
 
-/// Mac Pro at 2 GiB disk-only on 1e87ab171, stalled at 86 serves: a
-/// process suspended for its bind (two runs of nine Instance chunks
-/// short), evicted to disk, restored ~95 ms later, then waiting on
-/// "its instances' rebinds" (InstanceId(5)) until teardown, Restoring the
-/// whole while; the queue's head, a restore, held behind it as a move in
-/// flight, no stall dump, nothing evicted or compacted. Its state back
-/// and committed, a restore waiting on its rebinds moves nothing: it is
-/// no move in flight, the bind-suspended restore it was no longer holds
-/// the next, the stall dump names what it waits on, and its restore
-/// landing (or failing) clears it.
+/// A process suspended for its bind is evicted, restored, and waits on its
+/// instances' rebinds. Its state back and committed, a restore waiting on its
+/// rebinds moves nothing: it is no move in flight (the queue's head is not
+/// held behind it), the bind-suspended restore it was no longer holds the
+/// next, the stall dump names what it waits on, and its restore landing (or
+/// failing) clears it.
 #[test]
 fn a_restore_waiting_on_its_rebinds_is_nothing_in_flight() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
@@ -7307,13 +7204,11 @@ async fn four_scattered_free_chunks_and_a_run_of_four_asked_issue_a_plan() {
     );
 }
 
-/// Mac Pro at 2 GiB on 4cef0c7d3: a bind-short eviction suspended
-/// 236c3046 and waited on its set's fires, one of them in a complete frame
-/// wider than the rung in hand (capped), which goes only once raised. Its
-/// eviction withdrew that raise's wait, and the eviction waited for good.
-/// A rung raise for a capped frame is queued for an owner being evicted,
-/// stays queued through its eviction, and is served once room frees: the
-/// frame goes, and the eviction's wait on it ends.
+/// A bind-short eviction waits on its set's fires, one of them in a complete
+/// frame wider than the rung in hand (capped), which goes only once raised. A
+/// rung raise for a capped frame is queued for an owner being evicted, stays
+/// queued through its eviction, and is served once room frees: the frame goes,
+/// and the eviction's wait on it ends.
 #[tokio::test(flavor = "current_thread")]
 async fn a_capped_frame_s_raise_waits_through_its_owner_s_eviction_and_is_served() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -7362,14 +7257,10 @@ async fn a_capped_frame_s_raise_waits_through_its_owner_s_eviction_and_is_served
     assert_eq!(taken.expect("not refused"), Some("raised"), "served: the frame goes");
 }
 
-/// The L40S at 3 GiB on 4cef0c7d3: 613 evictions within 200 ms of their
-/// process's restore, about one eviction a serve. A victim was restored as
-/// soon as the head it was evicted for was served, took the room back
-/// before the head ran on it, and the head's next ask evicted it again.
-/// Restored once the head had fired, it was evicted again for the head's
-/// next page (the field mix: a lane evicted for the same head with no
-/// restore of the head between). A victim's restore waits until its head
-/// is done with its request (here, waits on its client).
+/// A victim's restore waits until its head is done with its request (here,
+/// waits on its client): restored as soon as the head is served, or once it
+/// has fired, it takes back the room the head's next ask then evicts it for
+/// again.
 #[test]
 fn a_victim_is_restored_only_once_its_head_is_done_with_its_request() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
@@ -7411,10 +7302,9 @@ fn a_victim_is_restored_only_once_its_head_is_done_with_its_request() {
     drop(fire);
 }
 
-/// Mac Pro at 5 GiB on 5aa45805b: an eviction's copy refused untouched by
-/// the engine (state the runtime placed inside its carve) failed the
-/// process: a beam lost. A copy refused untouched takes the eviction back
-/// and keeps the process, no victim again until the pool moves.
+/// An eviction's copy refused untouched by the engine (state the runtime
+/// placed inside its carve) takes the eviction back and keeps the process, no
+/// victim again until the pool moves.
 #[test]
 fn an_eviction_copy_refused_untouched_keeps_its_process() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::with_swap(8, 64))));
@@ -7462,13 +7352,10 @@ fn an_eviction_to_a_full_tier_is_taken_back_and_its_process_kept() {
     });
 }
 
-/// Mac Pro at 2 GiB on 7e75af541: a 52k-line no-step spin, head dc373c1e
-/// a bind-suspended restore, free runs (7, 3) beside its need, refused each
-/// time by its own check (PendingBindShort, free runs after its own unpark
-/// 1). The pass read the bind's runs beside its dead parts alone and sent
-/// it; the restore, after its unpark took the rest, refused. The pass now
-/// reads the one placement the restore is checked by, and where that does
-/// not stand it is not sent: room is made for it instead.
+/// A bind-suspended restore is sent only where the one placement it is checked
+/// by stands: free runs beside its need but not beside what its own unpark
+/// takes would be refused by its own check on every send. Where the placement
+/// does not stand, room is made for it instead.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_suspended_restore_is_sent_only_where_its_whole_placement_stands() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -7535,13 +7422,11 @@ async fn a_bind_suspended_restore_is_sent_only_where_its_whole_placement_stands(
     );
 }
 
-/// The M1 on 7e75af541 hung 9 s after ready: a bind head short of two runs
-/// of nine, 342 processes resident between fires holding 356 chunks, and
-/// the map's candidates 0, "no pick: the policy is asked", nothing in
-/// flight. Those processes had bound (their guest state on the device)
-/// and waited for an execution seat: not admitted, they were never
-/// victims. With nothing in flight such a process runs nothing: it is a
-/// victim like any other; with something in flight it is still spared.
+/// A bind head is short of runs, nothing in flight, and the chunks are held by
+/// processes that have bound (their guest state on the device) and wait for an
+/// execution seat. With nothing in flight a process not yet admitted runs
+/// nothing: it is a victim like any other; with something in flight it is
+/// spared.
 #[test]
 fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RacePool::new(8))));
@@ -7581,11 +7466,8 @@ fn with_nothing_in_flight_a_process_not_yet_admitted_is_a_victim() {
     assert!(members(&planner).contains(&seated_later), "nothing in flight: a candidate");
 }
 
-/// Mac Pro at 2 GiB on dc1414ae8: "an eviction waits for its sets' fires
-/// pid=8d961f69 ... capped=rows=112 owner=Some(8d961f69)": the owner of
-/// a frame cut wider than the cap was evicted, and its eviction waited on
-/// that frame, which goes only once raised. Such a process is no victim
-/// while its frame waits.
+/// The owner of a frame cut wider than the cap is no victim while that frame
+/// waits: its eviction would wait on the frame, which goes only once raised.
 #[test]
 fn the_owner_of_a_capped_frame_is_no_victim() {
     let _schedule = crate::policy::schedule::TEST_LOCK.blocking_write();
@@ -7624,10 +7506,10 @@ fn the_owner_of_a_capped_frame_is_no_victim() {
     assert!(with_capped.contains(&other));
 }
 
-/// The L40S at 3 GiB on f623134fc: a restore head needing 13 single chunks
-/// with 12 free, one chunk holding residents whose state can park. No
-/// chunk-level compaction makes a free chunk; the eviction of that chunk's
-/// occupants does, and it is made, never a quiet wait.
+/// A restore head needs 13 single chunks with 12 free, one chunk holding
+/// residents whose state can park. No chunk-level compaction makes a free
+/// chunk; the eviction of that chunk's occupants does, and it is made, never a
+/// quiet wait.
 #[tokio::test(flavor = "current_thread")]
 async fn one_chunk_short_of_singles_evicts_its_parkable_occupants() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -7672,10 +7554,9 @@ async fn one_chunk_short_of_singles_evicts_its_parkable_occupants() {
     assert_eq!(planner.stats.quiet_waits.load(Ordering::Relaxed), 0);
 }
 
-/// Mac Pro at 2 GiB on c10d7de5d: a restore with a bind's run of 7 and
-/// many kv pages to gather asked them as runs of 7 ((7, 1) grew to (7,
-/// 31), past the 30 free runs on a device 310 of 365 pages free), and the
-/// pass ended "no pick". Its pages are single chunks beside its run.
+/// A restore with a bind's run of 7 and many kv pages to gather asks its pages
+/// as single chunks beside its run, never as runs of 7 past what the pool
+/// holds.
 #[test]
 fn a_restore_s_pages_to_gather_are_single_chunks_beside_its_runs() {
     let pool = Arc::new(BindRoomPool::new(64, 0..0, 64));
@@ -7708,14 +7589,12 @@ fn a_restore_s_pages_to_gather_are_single_chunks_beside_its_runs() {
 }
 
 
-/// Mac Pro at 2 GiB (g2): free runs of three at 0-2 and 4-6, the
-/// restore's own take opening chunk 0, its pending bind asking two runs of
-/// three. Read as a mirror of the takes, the map laid the bind in both
-/// free runs, need_moves 0, while the restore's own take left one
-/// (PendingBindShort { run: 3, pieces: 2, free_runs_after_own_unpark: 1 }),
-/// and the head spun. Its own take placed first by the one placement, the
-/// map's need is the bind beside it: one move (the resident on chunk 3),
-/// and the move is issued.
+/// Free runs of three at 0-2 and 4-6, the restore's own take opening chunk 0,
+/// its pending bind asking two runs of three: read as a mirror of the takes
+/// the map would lay the bind in both free runs, while the restore's own take
+/// leaves one. Its own take placed first by the one placement, the map's need
+/// is the bind beside it: one move (the resident on chunk 3), and the move is
+/// issued.
 #[tokio::test(flavor = "current_thread")]
 async fn a_restore_s_own_take_consumes_a_run_and_its_move_is_issued() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -7774,14 +7653,13 @@ async fn a_restore_s_own_take_consumes_a_run_and_its_move_is_issued() {
     );
 }
 
-/// The L40S at 3 GiB on c201812ea: a restore refused (PendingBindShort)
-/// while others' takes raced it, its placement standing in the room its
-/// refusal left, held "until more chunks stand free" with nothing in
-/// flight: 186 s, no pass, nothing to free a chunk. With nothing in flight
-/// no race comes again: it is sent. Refused with nothing else in flight,
-/// a placement standing there is the placement's own mismatch: said as a
-/// planner bug, and the head never waits on it: its need is planned as if
-/// the placement did not stand, and the resident the map names is moved.
+/// A restore refused (PendingBindShort) while others' takes raced it, its
+/// placement standing in the room its refusal left. With nothing in flight no
+/// race comes again: it is sent, not held for more free chunks nothing would
+/// give. Refused with nothing else in flight, a placement standing there is
+/// the placement's own mismatch: said as a planner bug, and the head never
+/// waits on it: its need is planned as if the placement did not stand, and the
+/// resident the map names is moved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_raced_refusal_standing_with_nothing_in_flight_is_sent_again() {
     for quiet in [false, true] {
@@ -8021,11 +7899,10 @@ async fn replay(snap: &StallSnapshot) -> Result<(), String> {
     })
 }
 
-/// The L40S at 3 GiB disk-only on d41e15f24 (serve-Y3_3s-1): a prompt-prefix
-/// page seven evicted forks shared stayed on the device (chunk 4, one slot,
-/// two refs each), the restore head among them short of a thirteenth
-/// single chunk with twelve free. The map named the forks for the chunk,
-/// none a candidate; the policy was asked with nothing in flight.
+/// A prompt-prefix page seven evicted forks share stays on the device (chunk
+/// 4, one slot, two refs each), the restore head among them short of a
+/// thirteenth single chunk with twelve free, the forks no candidates and
+/// nothing in flight.
 fn stall_d41e15f24() -> StallSnapshot {
     let mut procs = vec![SnapProc::evicted_restore(); 7];
     procs[0].refused = Some((1, 1));
@@ -8045,13 +7922,10 @@ fn stall_d41e15f24() -> StallSnapshot {
     }
 }
 
-/// The L40S at 3 GiB disk-only on c201812ea (serve-Z3_3s-1): the restore
-/// head (26e5834e) refused PendingBindShort (run 1) while others' takes raced
-/// it, one free run left and its placement standing in that room; held
-/// "until more chunks stand free than its refusal left" with nothing in
-/// flight, no event coming to end it. Beside it a resident candidate
-/// (37b23987) holding slots across fifteen chunks, ten processes' prompt
-/// prefix sharing chunk 1.
+/// The restore head refused PendingBindShort (run 1) while others' takes raced
+/// it, one free run left and its placement standing in that room, nothing in
+/// flight and no event coming. Beside it a resident candidate holding slots
+/// across fifteen chunks, ten processes' prompt prefix sharing chunk 1.
 fn stall_c201812ea() -> StallSnapshot {
     // 0: 37b23987 (resident, the candidate); 1: 26e5834e (the head);
     // 2: 66751556; 3..=9: the prefix's other sharers.
@@ -8108,9 +7982,9 @@ async fn replay_c201812ea_head_beside_a_resident_candidate() {
     replay(&stall_c201812ea()).await.unwrap();
 }
 
-/// The store as it was on d41e15f24 (a move down of evicted processes'
-/// state left their kv on the device): the same state settles with the head
-/// waiting and nothing in flight, which the invariant names.
+/// A store whose move down of evicted processes' state leaves their kv on the
+/// device: the same state settles with the head waiting and nothing in flight,
+/// which the invariant names.
 #[tokio::test(flavor = "current_thread")]
 async fn replay_names_a_head_left_waiting_when_shared_kv_is_not_swept() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
@@ -8155,10 +8029,7 @@ async fn a_forced_pass_never_restores_or_reserves_for_a_held_process() {
     );
 }
 
-/// The L40S at 3 GiB on c8077be0f (scratchpad
-/// stalls/l40s-c807-forced.txt, lines 1 and 2): forced passes said with
-/// evictions and a restore in flight, and after "kv on its way". A force
-/// spans the one pass after its stall: something in flight by then is
+/// A force spans the one pass after its stall: something in flight by then is
 /// progress, the pass plans as any other, and the force is gone after it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_force_with_something_in_flight_is_no_forced_pass_and_lasts_one_pass() {
@@ -8196,17 +8067,14 @@ async fn a_force_with_something_in_flight_is_no_forced_pass_and_lasts_one_pass()
     );
 }
 
-/// Mac Pro at 2 GiB (g2) on c201812ea, serves 10,594 (scratchpad
-/// stalls/macpro-c2018-g2.txt): a restore head, need [(7, 2), (2, 2)], its
-/// own takes opening four chunks (its two runs of two), the placement
-/// standing two runs of seven after them while its refusal found one
-/// (PendingBindShort { run: 7, pieces: 2, free_runs_after_own_unpark: 1 }),
-/// held "until more chunks stand free" with nothing in flight; eighteen
-/// residents' chunks emptiable around. The line carries no per-chunk
-/// layout: three free runs of seven, the head's own four in the first, the
-/// rest held whole by residents. `quiet`: refused with nothing else in
-/// flight (the placement's own mismatch) or raced (another head's take
-/// between its serve and its unpark, which the reservation now prevents).
+/// A restore head, need [(7, 2), (2, 2)], its own takes opening four chunks
+/// (its two runs of two), the placement standing two runs of seven after them
+/// while its refusal found one (PendingBindShort { run: 7, pieces: 2,
+/// free_runs_after_own_unpark: 1 }), nothing in flight, eighteen residents'
+/// chunks emptiable around: three free runs of seven, the head's own four in
+/// the first, the rest held whole by residents. `quiet`: refused with nothing
+/// else in flight (the placement's own mismatch) or raced (another head's take
+/// between its serve and its unpark, which the reservation prevents).
 fn stall_macpro_c2018_g2(quiet: bool) -> StallSnapshot {
     let residents = 18usize;
     let mut procs = vec![SnapProc {
@@ -8249,13 +8117,11 @@ async fn replay_macpro_c2018_g2_quiet_mismatch() {
     replay(&stall_macpro_c2018_g2(true)).await.unwrap();
 }
 
-/// Mac Pro at 5 GiB (mx) on c201812ea, serves 1,307 (scratchpad
-/// stalls/macpro-c2018-mx.txt): a restore head, need [(3, 1), (2, 2)], its
-/// own two runs of two in the lowest two-stretches (segments 2 and 4), the
-/// two runs of three (a four-stretch, a three-stretch) left standing, and
-/// its refusal's PendingBindShort { run: 3, pieces: 1, free_runs: 0 } taken
-/// on another pool (refused_on_this_pool=false): held with nothing in
-/// flight. As the line lays it out, scaled to sixty chunks.
+/// A restore head, need [(3, 1), (2, 2)], its own two runs of two in the
+/// lowest two-stretches (segments 2 and 4), the two runs of three (a
+/// four-stretch, a three-stretch) left standing, and its refusal's
+/// PendingBindShort { run: 3, pieces: 1, free_runs: 0 } taken on another pool,
+/// nothing in flight. Sixty chunks.
 fn stall_macpro_c2018_mx(quiet: bool) -> StallSnapshot {
     let residents = 12usize;
     let mut procs = vec![SnapProc {
@@ -8298,13 +8164,11 @@ async fn replay_macpro_c2018_mx_quiet_mismatch() {
     replay(&stall_macpro_c2018_mx(true)).await.unwrap();
 }
 
-/// Mac Pro g2 on bd4f4ffe7 (scratchpad stalls/macpro-bd4f-g2.txt): a restore
-/// refused (PendingBindShort) on every serve with the room unchanged, its
-/// own re-send moving the generation, so no pass settled: 394k passes, no
-/// forced pass, no strict failure. The same refusal again on the same room
-/// is a settled stall: a strict test fails by name; in service it is read
-/// as the placement's mismatch, not sent again until the room moves, its
-/// need planned on chunks only moves empty.
+/// A restore is refused (PendingBindShort) on every serve with the room
+/// unchanged, its own re-send moving the generation, so no pass would settle.
+/// The same refusal again on the same room is a settled stall: a strict test
+/// fails by name; in service it is read as the placement's mismatch, not sent
+/// again until the room moves, its need planned on chunks only moves empty.
 #[test]
 fn a_restore_refused_again_on_the_same_room_is_a_settled_stall() {
     let pool = Arc::new(BindRoomPool::new(16, 0..0, 64));
@@ -8347,11 +8211,9 @@ fn a_fire_held_at_its_bind_is_not_in_flight() {
     assert!(planner.with_inner(|inner| inner.nothing_in_flight()), "one held at its bind is not");
 }
 
-/// The L40S at 3 GiB disk-only on bd4f4ffe7 (serve-B4_3s-1, 998 lines of
-/// it): a restore head (6ae0bc15) refused PendingBindShort (run 1) with
-/// nothing else in flight, one free run left, its placement standing in the
-/// same room ("a planner bug: the placement and the takes differ"): held,
-/// with nothing in flight.
+/// A restore head refused PendingBindShort (run 1) with nothing else in
+/// flight, one free run left, its placement standing in the same room (the
+/// placement and the takes differ).
 fn stall_bd4f4ffe7_quiet_mismatch() -> StallSnapshot {
     StallSnapshot {
         name: "bd4f4ffe7 serve-B4_3s-1",

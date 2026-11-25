@@ -975,11 +975,10 @@ fn waiting_bind<'a>(
     )
 }
 
-/// GPU's 500-concurrent wedge: the device full at the governor's target, a
-/// guest head short of runs, other guest binds queued behind it. The
-/// planner is asked; its serve (a resident parked) frees the runs; the head
-/// binds; the bind behind it follows. Before, the head waited on a commit
-/// that could not come and no one asked the planner.
+/// The device is full at the governor's target, a guest head short of runs,
+/// other guest binds queued behind it. The planner is asked (the head waits on
+/// no commit that cannot come); its serve (a resident parked) frees the runs;
+/// the head binds; the bind behind it follows.
 #[tokio::test(flavor = "current_thread")]
 async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_next_bind_follows() {
     const ENGINE: usize = 67;
@@ -1045,8 +1044,7 @@ async fn a_guest_head_waiting_on_a_commit_that_does_not_come_is_served_by_the_pl
     assert_eq!(device.lock().unwrap().pool().prefix_segments(), prefix, "no commit came");
 }
 
-/// The pools of `facts` with no host tier below the device (AMD's repro:
-/// budget_host a few MiB, no host chunks).
+/// The pools of `facts` with no host tier below the device.
 fn pools_no_host(facts: ChunkFacts) -> Pools {
     let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let roles = Roles::new(&device, None).expect("the pool states an Instance shape");
@@ -1056,13 +1054,11 @@ fn pools_no_host(facts: ChunkFacts) -> Pools {
     }
 }
 
-/// AMD's freeze, its root: with no host tier a park moved nothing, so a
-/// parked process kept its guest scratch on the device and Instance chunks
-/// filled with idle scratch no kv eviction could free. Scratch is dead
-/// between fires: a park now gives it back whatever lies below (the live
-/// tables stay where they lie), a new bind lands in the room it left, and
-/// the restore takes fresh scratch in its class and is rebound to it
-/// before its next fire.
+/// With no host tier a park gives its guest scratch back whatever lies below
+/// (scratch is dead between fires; the live tables stay where they lie): kept,
+/// it would fill Instance chunks no kv eviction can free. A new bind lands in
+/// the room it left, and the restore takes fresh scratch in its class and is
+/// rebound to it before its next fire.
 #[test]
 fn with_no_host_tier_a_park_gives_guest_scratch_back_and_a_restore_takes_it_fresh() {
     let Pools { device, roles } = pools_no_host(facts_in(64, 8));
@@ -1680,11 +1676,10 @@ fn rebinds_never_name_an_emptied_guest_part_over_random_park_and_restore_schedul
     assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
 }
 
-/// mx-2's cycle: a bind short of room suspended its process, the process
-/// was restored, the bind was short again and suspended it again, every
-/// ~25 ms. Suspended once for its bind's room and restored, a bind short
-/// again waits parked in the planner for the room, and binds once served;
-/// its process is suspended once only.
+/// Suspended once for its bind's room and restored, a process whose bind is
+/// short again waits parked in the planner for the room, and binds once
+/// served; it is suspended once only, never in a cycle of suspend, restore and
+/// short.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
     use std::cell::Cell;
@@ -1914,16 +1909,15 @@ fn fires_on(engine: &GuestEngine, id: InstanceId) -> (ScratchPlace, ScratchPlace
     (scratch, pair)
 }
 
-/// A mock engine's view of the disk-only soak's failure: two processes
-/// share a pair on a pool with no host tier, both park where they lie
-/// (scratch and the pair's state given back), and a third binds into the
-/// room they gave back. Their restores run at once. Whenever a process is
-/// fit to fire (no instance of its unbound, `Roles::unbound`, what its
-/// restore waits on), the engine fires each of its instances on the place
-/// it was rebound to: the roles' current place, apart from every other
-/// live instance's. The second restore waits for the pair the first brings
-/// back, and until its rebind lands it is not fit to fire: the place its
-/// engine binding still names was given back at its park.
+/// A mock engine's view: two processes share a pair on a pool with no host
+/// tier, both park where they lie (scratch and the pair's state given back),
+/// and a third binds into the room they gave back. Their restores run at once.
+/// Whenever a process is fit to fire (no instance of its unbound,
+/// `Roles::unbound`, what its restore waits on), the engine fires each of its
+/// instances on the place it was rebound to: the roles' current place, apart
+/// from every other live instance's. The second restore waits for the pair the
+/// first brings back, and until its rebind lands it is not fit to fire: the
+/// place its engine binding still names was given back at its park.
 #[test]
 fn with_no_host_tier_a_restored_instance_fires_on_its_rebound_place() {
     let Pools { roles, .. } = pools_no_host(facts_in(64, 8));

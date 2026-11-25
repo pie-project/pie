@@ -244,14 +244,12 @@ fn joiners_waiting_on_a_claimant_s_prefix_hold_no_frame() {
     }
 }
 
-/// The disk-only soaks' self-cycle: a process whose guest went into a
-/// bind had a complete front frame queued, a continuing lane mid
-/// boundary, and the boundary stayed open on lanes whose owners waited
-/// on the planner's grants. Its frame was never sealed, so its fire
-/// never ran, its lease never went back, and its eviction waited on it
-/// for good. Parked (suspended, or waiting at its bind), an owner is
-/// waited on by no frame; with the other owner blocked on its grant too,
-/// no lane is expected and the frame goes.
+/// A process whose guest went into a bind has a complete front frame queued, a
+/// continuing lane mid boundary, and the boundary open on lanes whose owners
+/// wait on the planner's grants. Unsealed, its fire would never run, its lease
+/// never go back, and its eviction wait on it for good. Parked (suspended, or
+/// waiting at its bind), an owner is waited on by no frame; with the other
+/// owner blocked on its grant too, no lane is expected and the frame goes.
 fn a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary() {
     for suspend in [true, false] {
         let mut policy = FramePolicy::new(1, 64, 4096, None);
@@ -292,16 +290,14 @@ fn a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary() {
     }
 }
 
-/// od-1's census, held for good ("frame k=2 lanes=44 awaited=10
-/// sealed=0 suspended=11 blocked=40", gate "missing=0 candidate=true
-/// in_flight=0"): 10 lanes expected and complete; 13 blocked owners'
+/// A census of 44 lanes: 10 lanes expected and complete; 13 blocked owners'
 /// lanes with a complete frame; 10 blocked owners' lanes with none; 10
-/// suspended and blocked owners' lanes with none; 1 suspended owner's
-/// lane with a complete frame. Every expected lane is in, so the frame
-/// seals at once, the 14 parked owners' complete frames riding it: 24
-/// lanes' fires in one seal, nothing left behind. Run with the parked
-/// owners' frames submitted before their park and after it (a straggler),
-/// and at k=2 with each frame two slots.
+/// suspended and blocked owners' lanes with none; 1 suspended owner's lane
+/// with a complete frame. Every expected lane is in, so the frame seals at
+/// once, the 14 parked owners' complete frames riding it: 24 lanes' fires in
+/// one seal, nothing left behind. Run with the parked owners' frames submitted
+/// before their park and after it (a straggler), and at k=2 with each frame
+/// two slots.
 #[test]
 fn od_1_census_seals_with_every_expected_lane_in() {
     for straggle in [false, true] {
@@ -370,12 +366,11 @@ fn od_1_census_seals_with_every_expected_lane_in() {
     }
 }
 
-/// The soak's held frame: k=2, 75 lanes, 18 of them expected, the cap
-/// lowered to 128 under prompts cut at 512 before it came down, nothing
-/// executing. The decodes go; the prompts are held out whole and named
-/// to the cap's owner as owed (`cut_owed`: 512), which is the wake the
-/// hold waits on; once the walk raises the cap to it, they seal. Never
-/// a hold on a raise nothing asked for.
+/// A held frame: k=2, 75 lanes, 18 of them expected, the cap lowered to 128
+/// under prompts cut at 512 before it came down, nothing executing. The
+/// decodes go; the prompts are held out whole and named to the cap's owner as
+/// owed (`cut_owed`: 512), which is the wake the hold waits on; once the walk
+/// raises the cap to it, they seal. Never a hold on a raise nothing asked for.
 #[test]
 fn frames_held_under_a_lowered_cap_are_owed_a_raise_and_seal_once_it_comes() {
     // Planned past any join hold: a frame goes, or what holds it.
@@ -450,12 +445,10 @@ fn frames_held_under_a_lowered_cap_are_owed_a_raise_and_seal_once_it_comes() {
     assert_eq!(policy.cut_owed(), 0);
 }
 
-/// Mac's verified beam mix under pressure: frames cut at a rung of 64
-/// queued, then the cap lowered to 16 while the engine still held 64.
-/// Capped at 16 they sat unsealed on a raise the pressure could not
-/// fund, nothing submitted for 25 minutes. They seal under the rung the
-/// engine holds; once they are gone the cap is granted, and from then
-/// nothing wider seals.
+/// Frames cut at a rung of 64 are queued, then the cap lowers to 16 while the
+/// engine still holds 64. Capped at 16 they would sit unsealed on a raise the
+/// pressure cannot fund. They seal under the rung the engine holds; once they
+/// are gone the cap is granted, and from then nothing wider seals.
 #[test]
 fn frames_queued_at_a_rung_the_cap_came_down_under_seal_under_the_rung_held() {
     use crate::scheduler::worker::seal_rows;
@@ -511,15 +504,13 @@ fn a_held_frame_whose_raise_is_refused_leaves_with_its_fires() {
     assert!(policy.refuse_held(lane).is_empty(), "nothing held for it after");
 }
 
-/// The soak's stall as the scheduler's turns meet the walk: the cap
-/// lowered 512 -> 256 -> 128 fast, a prompt cut at 512 queued; a turn
-/// reads 128 and holds the prompt out, and before its report of the
-/// hold lands (`owe_cut_rows`) the walk raises the rung back and the
-/// cap with it, so the raise had no hold to nudge for and the report
-/// found the cap already up. The turn reads the cap again after its
-/// report (`cap_moved`): the next turn seals the prompt under the
-/// current cap at once, nothing in flight, never parked on the 128 it
-/// cached.
+/// The scheduler's turns meet the walk: the cap lowered 512 -> 256 -> 128
+/// fast, a prompt cut at 512 queued; a turn reads 128 and holds the prompt
+/// out, and before its report of the hold lands (`owe_cut_rows`) the walk
+/// raises the rung back and the cap with it, so the raise has no hold to nudge
+/// for and the report finds the cap already up. The turn reads the cap again
+/// after its report (`cap_moved`): the next turn seals the prompt under the
+/// current cap at once, nothing in flight, never parked on the 128 it cached.
 #[test]
 fn a_cap_raised_back_before_the_hold_is_told_seals_on_the_next_turn() {
     const ENGINE: usize = 9401;
@@ -611,8 +602,8 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
         let mut rng = Rng(seed);
         // One frame or two in flight per lane (the dumps' k=2).
         let k = 1 + rng.below(2) as usize;
-        // At k=2, frames of one slot or two (a blocked owner's complete
-        // next frame two fires, as od-1's were).
+        // At k=2, frames of one slot or two (a blocked owner's complete next
+        // frame two fires).
         let slots = 1 + rng.below(k as u64) as u32;
         let mut policy = FramePolicy::new(k, 64, 4096, None);
         let lanes: Vec<ProcessId> = (0..2 + rng.below(4)).map(|_| pid()).collect();

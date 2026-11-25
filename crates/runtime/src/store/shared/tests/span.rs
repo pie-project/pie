@@ -170,11 +170,10 @@ fn a_refused_raise_is_taken_back() {
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
 }
 
-/// The 8B c256 hang (decodes cut at a low cap, waiting on a raise nobody
-/// funds) cannot come back: the walk never lowers the rung under the
-/// decode fire the live lanes take, however long the pool idles, so a
-/// decode batch of every live lane is never held for a raise; and a batch
-/// past it is raised at once where nothing moves.
+/// The walk never lowers the rung under the decode fire the live lanes take,
+/// however long the pool idles, so a decode batch of every live lane is never
+/// held for a raise nobody funds; and a batch past it is raised at once where
+/// nothing moves.
 #[tokio::test(flavor = "current_thread")]
 async fn the_walk_never_lowers_under_the_live_lanes_decode() {
     const ENGINE: usize = 53;

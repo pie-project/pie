@@ -1049,15 +1049,15 @@ mod tests {
         assert!(grow.can_grow(), "held back no more: it grows");
     }
 
-    /// Mac, yield 1, after a burst, every prompt finished: a pool full of
-    /// idle cache, the system's pressure bringing the target under what it
-    /// maps, and no fire at all. The walk evacuates the top segment into
-    /// the room below; the engine takes the copy and waits it out itself,
-    /// so the segment goes with no fire to retire, and while it does the
-    /// pool answers Moving, asking nothing of the policy. The next segment
-    /// has no room to evacuate into: NoRoom, tier pressure, and once the
-    /// policy shed the idle cache the pool stands at its target. No answer
-    /// is ever Reached past the target.
+    /// A pool at yield 1, every prompt finished: a pool full of idle cache,
+    /// the system's pressure bringing the target under what it maps, and no
+    /// fire at all. The walk evacuates the top segment into the room below;
+    /// the engine takes the copy and waits it out itself, so the segment goes
+    /// with no fire to retire, and while it does the pool answers Moving,
+    /// asking nothing of the policy. The next segment has no room to evacuate
+    /// into: NoRoom, tier pressure, and once the policy shed the idle cache
+    /// the pool stands at its target. No answer is ever Reached past the
+    /// target.
     #[tokio::test(flavor = "current_thread")]
     async fn a_target_under_what_idle_cache_holds_is_given_back_with_no_fire() {
         use crate::governor::run::Steer;
@@ -1157,12 +1157,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The soak's stall: the walk lowered the rung 512 -> 128 under
-    /// prompts cut at 512 (the scheduler holds them out, owed), then a
-    /// process demand waits for room and nothing is in flight. The walk
-    /// raises the rung back to what is owed (512, nothing moved) and the
-    /// fire cap rises with it in the same walk: the held frame seals at
-    /// once under the new cap, never on a later wake that does not come.
+    /// The walk lowered the rung 512 -> 128 under prompts cut at 512 (the
+    /// scheduler holds them out, owed), then a process demand waits for room
+    /// and nothing is in flight. The walk raises the rung back to what is owed
+    /// (512, nothing moved) and the fire cap rises with it in the same walk:
+    /// the held frame seals at once under the new cap, never on a later wake
+    /// that does not come.
     #[tokio::test(flavor = "current_thread")]
     async fn a_raise_back_to_frames_held_under_a_lowered_cap_lifts_the_cap_at_once() {
         for (at, on_demand) in [false, true].into_iter().enumerate() {
@@ -1260,12 +1260,11 @@ mod tests {
         }
     }
 
-    /// Mac's spin (Metal, the grow-time check refusing a prefix commit,
-    /// about 1,000 asks a minute): a refused commit is asked again on no
-    /// wake that cannot change what the device backs (room freed inside the
-    /// pool, a governor tick, a retarget to the target it was refused at)
-    /// and on no clock, its own walk loop running: only once the governor's
-    /// target moves, or device memory the engine gave back lands.
+    /// A refused commit is asked again on no wake that cannot change what the
+    /// device backs (room freed inside the pool, a governor tick, a retarget
+    /// to the target it was refused at) and on no clock, its own walk loop
+    /// running: only once the governor's target moves, or device memory the
+    /// engine gave back lands.
     #[tokio::test(flavor = "current_thread")]
     async fn a_refused_commit_is_asked_again_only_on_an_event_of_the_device_s() {
         const ENGINE: usize = 9402;

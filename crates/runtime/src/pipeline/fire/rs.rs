@@ -713,11 +713,11 @@ mod tests {
             .collect()
     }
 
-    /// Mac's w10 lane, as the runtime states it from the verb it sends: a
-    /// decode lane of a group sharing its set, folded through 34, its row
-    /// at 38, its mask admitting the one buffered slot 34 (a parent's): one
-    /// row replayed, not one stretch ending at its row (Metal lays such a
-    /// fire wide). Alone on its set it replays all four, one stretch.
+    /// A lane as the runtime states it from the verb it sends: a decode lane
+    /// of a group sharing its set, folded through 34, its row at 38, its mask
+    /// admitting the one buffered slot 34 (a parent's): one row replayed, not
+    /// one stretch ending at its row (Metal lays such a fire wide). Alone on
+    /// its set it replays all four, one stretch.
     #[test]
     fn a_lane_states_its_replay_from_its_verb() {
         let verb = |lineage| RsVerb::Buffer {

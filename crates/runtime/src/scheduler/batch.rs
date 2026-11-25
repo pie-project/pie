@@ -805,9 +805,8 @@ mod tests {
         }
     }
 
-    /// Qwen3.5-0.8B's rs scratch on Metal at rung 256 (Mac's measurements):
-    /// eight scratch slots of 45,376 bytes a row together, 1 MiB a lane,
-    /// 291,667,968 bytes reserved.
+    /// Qwen3.5-0.8B's rs scratch on Metal at rung 256: eight scratch slots of
+    /// 45,376 bytes a row together, 1 MiB a lane, 291,667,968 bytes reserved.
     fn qwen3_5_rung_256() -> ::engine::RungReplay {
         ::engine::RungReplay {
             own_max: Some(256),
@@ -821,12 +820,12 @@ mod tests {
         }
     }
 
-    /// w10: sixteen processes' replay fires of ten decode lanes each, every
-    /// lane replaying 37 rows, laid non-compact, each asking rung 256 alone
-    /// (380 scratch rows over 10 lanes fit it). Composed into one step of
-    /// 160 lanes they would take 443,658,240 bytes, past the rung's
-    /// 291,667,968: the step takes no more of them than the rung holds
-    /// together, the rest going in later steps.
+    /// Sixteen processes' replay fires of ten decode lanes each, every lane
+    /// replaying 37 rows, laid non-compact, each asking rung 256 alone (380
+    /// scratch rows over 10 lanes fit it). Composed into one step of 160 lanes
+    /// they would take 443,658,240 bytes, past the rung's 291,667,968: the
+    /// step takes no more of them than the rung holds together, the rest going
+    /// in later steps.
     #[test]
     fn a_step_takes_no_more_replay_than_its_rung_s_scratch_holds() {
         let rung = qwen3_5_rung_256();

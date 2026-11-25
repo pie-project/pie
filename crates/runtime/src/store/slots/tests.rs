@@ -567,13 +567,11 @@ fn the_pools_moves_leave_the_table_the_engines_apply_does() {
     assert!(applied > 100, "moves applied: {applied}");
 }
 
-/// AMD's 500-concurrent shape: single slots scattered beside guest
-/// state's runs left no chunk holding a run of 483 free, though slots
-/// were free in plenty. Single slots now never take a run chunk's
-/// tail: with every other chunk filled by single slots and holes
-/// scattered among them, the next run of 483 still lies in its own
-/// class's chunk. Before, the single slots filled the fullest chunk
-/// first, the run's, and the run was short.
+/// Single slots never take a run chunk's tail, or single slots scattered
+/// beside guest state's runs leave no chunk holding a run free though slots
+/// are free in plenty: with every other chunk filled by single slots and holes
+/// scattered among them, the next run of 483 still lies in its own class's
+/// chunk.
 #[test]
 fn single_slots_never_fill_a_run_chunk_s_tail() {
     let mut pool = run_pool();

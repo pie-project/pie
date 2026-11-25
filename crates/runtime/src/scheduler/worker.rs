@@ -1250,15 +1250,13 @@ impl BatchScheduler {
                 granted_cap = None;
             }
             let mut stepped = limits;
-            // Frames queued before the cap came down were cut at the rung
-            // the engine still holds: they seal under it, and the rung
-            // comes down once they have gone (the grant below waits on
-            // them). Capped there, a complete frame sat unsealed on a raise
-            // the pressure that lowered the cap could not fund (Mac's beam
-            // mix: the rung raised to 64, the cap lowered to 16 under frames
-            // cut at 64, nothing submitted for 25 minutes). Past the grant
-            // (none wider queued then), nothing wider seals: the rung may
-            // be coming down.
+            // Frames queued before the cap came down were cut at the rung the
+            // engine still holds: they seal under it, and the rung comes down
+            // once they have gone (the grant below waits on them). Capped
+            // there, a complete frame would sit unsealed on a raise the
+            // pressure that lowered the cap cannot fund. Past the grant (none
+            // wider queued then), nothing wider seals: the rung may be coming
+            // down.
             let seal = seal_rows(
                 cap,
                 crate::store::shared::engine_rows(engine_id),

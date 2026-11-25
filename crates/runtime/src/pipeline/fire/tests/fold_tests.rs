@@ -1076,22 +1076,19 @@ pub(crate) async fn ending(dropped: bool) -> Anyhow<Ending> {
     })
 }
 
-/// The in-pass fork: the guest forks a set between its own pipelined
-/// fires. The host fork runs the pipeline's fires to their end
-/// ([`drain_pipeline_fires`], which only its own task can); a handle's
-/// fork, a save and the planner's suspend wait on the store and on the
-/// fire's lease. None ends before the fire settles, and each then reads
-/// the folded length the device's count left, one length in both
-/// stores.
-/// A soak's stall: a process fires, then binds a
-/// program short of room, and the planner evicts it while its bind
-/// waits. The fire's lease goes back only as the fire is finalized,
-/// and its finalizer is the guest, in the bind; the eviction's drain
-/// finalizes only fires settled as it starts, and none of a pass whose
-/// geometry the device keeps, so the eviction would wait on the lease
-/// for good.
-/// A bind about to wait settles its process's fires first: the lease
-/// goes back as the fire lands, and the eviction's wait ends.
+/// The in-pass fork: the guest forks a set between its own pipelined fires.
+/// The host fork runs the pipeline's fires to their end
+/// ([`drain_pipeline_fires`], which only its own task can); a handle's fork, a
+/// save and the planner's suspend wait on the store and on the fire's lease.
+/// None ends before the fire settles, and each then reads the folded length
+/// the device's count left, one length in both stores. A process fires, then
+/// binds a program short of room, and the planner evicts it while its bind
+/// waits. The fire's lease goes back only as the fire is finalized, and its
+/// finalizer is the guest, in the bind; the eviction's drain finalizes only
+/// fires settled as it starts, and none of a pass whose geometry the device
+/// keeps, so the eviction would wait on the lease for good. A bind about to
+/// wait settles its process's fires first: the lease goes back as the fire
+/// lands, and the eviction's wait ends.
 #[tokio::test(flavor = "current_thread")]
 async fn a_bind_about_to_wait_settles_its_fires_and_an_eviction_s_wait_for_their_leases_ends()
 -> Anyhow<()> {

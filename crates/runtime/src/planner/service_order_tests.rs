@@ -64,13 +64,12 @@ fn planner_every_case() {
     a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled();
 }
 
-/// A restore whose role slots found no room is queued again, a waiter: it
-/// is not served on spare pages alone (the room it lacks is not pages),
-/// goes again on a completion's credit, waits while the fleet decodes (a
-/// completion frees room soon; funding it then thrashed, 3x the wall on the
-/// M1's beam stress), and has room made for its runs (`Evict`, its need
-/// named) once the fleet is stalled, a fleet of processes waiting at binds
-/// included (AMD's 7-minute stall).
+/// A restore whose role slots found no room is queued again, a waiter: it is
+/// not served on spare pages alone (the room it lacks is not pages), goes
+/// again on a completion's credit, waits while the fleet decodes (a completion
+/// frees room soon; funding it then would thrash), and has room made for its
+/// runs (`Evict`, its need named) once the fleet is stalled, a fleet of
+/// processes waiting at binds included.
 fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     let (mut inner, pids) = fleet(&[
         (1, Residency::Evicted, true),
@@ -128,12 +127,10 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
     );
 }
 
-/// Mac Pro's M5 ramp (500 at once): processes evicted in the first minute
-/// waited behind every later arrival and were restored only at the end, or
-/// never. An older restore heads ahead of a younger admission (a prompt
-/// not yet seated), the fleet decoding or not; a seated process's own
-/// growth keeps its turn, or the decoders whose completions free the
-/// restore's room would wait on it.
+/// An older restore heads ahead of a younger admission (a prompt not yet
+/// seated), the fleet decoding or not; a seated process's own growth keeps its
+/// turn, or the decoders whose completions free the restore's room would wait
+/// on it.
 fn an_early_evictee_is_restored_before_a_later_arrival_is_admitted() {
     let (mut inner, pids) = fleet(&[
         (1, Residency::Evicted, true),
