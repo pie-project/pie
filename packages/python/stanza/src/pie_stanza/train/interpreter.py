@@ -7,18 +7,39 @@ word per run and takes every arm whose guard holds, as
 causal prefill: each batch row is one lane at positions 0..T-1 with an empty
 cache. Adapted is on when the stanzas apply and off for the plain arm; Masked,
 SingleToken, Scores and Drafts are off. Paged-KV ops collapse to "keep this
-step's k and v". Every adapted row reads slot 0, so the trainer hands over
-one-slot banks.
+step's k and v". Every row is a readout row, so a layer that reads its keys
+as one token's (Gemma's KV-shared layers) reads each row's keys up to its own
+position. Every adapted row reads slot 0, so the trainer hands over one-slot
+banks. A node whose operand no holding arm computes is dead in this word
+(it feeds only other arms) and is skipped.
 
-The run stops at the logits matmul and returns its operands, so the head can
-be computed in chunks. Any op the interpreter does not know raises and names
-the op.
+The run stops at the logits matmul and returns its operands, and the softcap
+the trace puts on the logits, if any, so the head can be computed in chunks.
+Any op the interpreter does not know raises and names the op.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
-import torch.nn.functional as F
+
+from . import experts, forwards, recurrence
+
+_OPS = forwards.FORWARDS | recurrence.FORWARDS | experts.FORWARDS
+
+
+@dataclass(frozen=True)
+class Readout:
+    """What the logits are made of: `logits = cap * tanh(rows @ head.T / cap)`,
+    or `rows @ head.T` with no cap."""
+
+    rows: torch.Tensor
+    """The readout rows [B, T, D]."""
+    head: torch.Tensor
+    """The head weight [V, D]."""
+    cap: float | None
+    """The softcap the trace puts on the logits (Gemma's), or None."""
 
 
 class Interpreter:
@@ -58,21 +79,39 @@ class Interpreter:
             raise ValueError("this trace has no Adapted fact, so no stanza can attach")
         return 1 << self.facts["Adapted"]
 
-    def hidden(self, params: dict, tokens: torch.Tensor, *, adapted: bool, dtype: torch.dtype
-               ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Replay the trace over `tokens` [B, T] and return the logits matmul's
-        operands: the readout rows [B, T, D] and the head weight [V, D]."""
+    def hidden(self, params: dict, tokens: torch.Tensor, *, adapted: bool, dtype: torch.dtype) -> Readout:
+        """Replay the trace over `tokens` [B, T] up to the logits matmul and
+        return what the logits are made of."""
         run = _Run(self, params, self.word(adapted), dtype, tokens)
-        for name, op, a, guard in self.nodes:
+        for at, (name, op, a, guard) in enumerate(self.nodes):
             if not _holds(guard, run.word):
                 run.skip(a)
                 continue
             if name == "Linear.Matmul" and a["logits"]:
-                return run.get(a["act"]), run.get(a["w"])
+                return Readout(run.get(a["act"]), run.get(a["w"]), self._cap(at + 1, a["y"], run.word))
             if op is None:
                 raise NotImplementedError(f"the trainer has no torch forward for `{name}`")
-            op(run, a)
+            try:
+                op(run, a)
+            except Undefined:
+                run.skip(a)
         raise ValueError("the trace has no logits matmul")
+
+    def _cap(self, start: int, logits: int, word: int) -> float | None:
+        """The softcap the ops after the logits matmul put on `logits`;
+        refuses any other op that reads them."""
+        cap = None
+        for name, _, a, guard in self.nodes[start:]:
+            if not _holds(guard, word) or logits not in _reads(a):
+                continue
+            if name != "Elemwise.Softcap" or cap is not None:
+                raise NotImplementedError(f"the trainer reads logits through `{name}`, which it has no head for")
+            cap, logits = a["cap"], a["x_out"]
+        return cap
+
+
+class Undefined(KeyError):
+    """A value no arm that holds in the replay's word computes."""
 
 
 class _Run:
@@ -111,6 +150,8 @@ class _Run:
                 continue
             if isinstance(d, dict) and "Weight" in d:
                 return self.params[self.interp.trace["params"][d["Weight"]]["name"]]
+            if vid not in self.vals:
+                raise Undefined(f"%{vid} is computed by no arm that holds in this word")
             return self.vals[vid]
 
     def put(self, vid, x):
@@ -129,8 +170,19 @@ class _Run:
             if isinstance(vid, int) and src is not None:
                 try:
                     self.vals[vid] = self.get(src)
-                except KeyError:
+                except Undefined:
                     pass
+
+
+def _reads(a: dict) -> list[int]:
+    """The value ids an op's arguments name (outputs included)."""
+    out = []
+    for v in a.values():
+        if isinstance(v, int) and not isinstance(v, bool):
+            out.append(v)
+        elif isinstance(v, list):
+            out += [x for x in v if isinstance(x, int) and not isinstance(x, bool)]
+    return out
 
 
 def _holds(g, word: int) -> bool:
@@ -146,172 +198,3 @@ def _holds(g, word: int) -> bool:
     if kind == "Or":
         return _holds(arg[0], word) or _holds(arg[1], word)
     raise ValueError(f"guard {g}")
-
-
-def _need(holds: bool, what: str):
-    if not holds:
-        raise NotImplementedError(f"the trainer has no torch forward for {what}")
-
-
-def _embed(run, a):
-    _need(a["weights"] is None and a["scales"] is None and not a["concat"], "a weighted or concatenated embed")
-    run.put(a["y"], F.embedding(run.get(a["ids"]), run.get(a["table"])).to(run.dtype))
-
-
-def _rmsnorm(run, a):
-    weight = None
-    if a["weight"] != "None":
-        (kind, wid), = a["weight"].items()
-        weight = (run.get(wid), 1.0 if kind == "PlusOne" else 0.0)
-    run.put(a["y"], rmsnorm(run.get(a["x"]), weight, a["axis"], a["eps"]))
-
-
-def _matmul(run, a):
-    _need(a["quant"] is None and a["scales"] is None and a["input_scales"] is None, "a quantized matmul")
-    run.put(a["y"], F.linear(run.get(a["act"]), run.get(a["w"])))
-
-
-def _lora_correct(run, a):
-    # y += B[0] (A[0] x), the waist (A x) held at f32 as the Metal kernel holds it.
-    x, A, B, y = run.get(a["x"]), run.get(a["bank_a"]), run.get(a["bank_b"]), run.get(a["y"])
-    waist = F.linear(x.float(), A[0].float())
-    run.put(a["y_out"], (y.float() + F.linear(waist, B[0].float())).to(y.dtype))
-
-
-def _rope(run, a):
-    pos = run.get(a["positions"])
-    run.put(a["q_out"], rope(run.get(a["q"]), pos, a["head_dim"], a["theta"], a["turn"], a["freqs"]))
-    if a["k"] is not None:
-        run.put(a["k_out"], rope(run.get(a["k"]), pos, a["head_dim"], a["theta"], a["turn"], a["freqs"]))
-
-
-def _kv_append(run, a):
-    cache = run.interp.values[a["cache"]]["def"]["Cache"]
-    run.kv[cache] = (run.get(a["k"]), run.get(a["v"]) if a["v"] is not None else run.get(a["k"]))
-
-
-def _plan(run, a):
-    run.vals[a["plan"]] = None
-
-
-def _prefill(run, a):
-    for key in ("selection", "bias", "floor", "window", "selected", "rel"):
-        _need(a.get(key) is None, f"a prefill with `{key}`")
-    _need(a["mask"] is None and a["causal"], "a masked or non-causal prefill")
-    k, v = run.kv[run.interp.values[a["cache"]]["def"]["Cache"]]
-    q, hd = run.get(a["q"]), a["head_dim"]
-    B, T = run.shape
-    qh = q.reshape(B, T, -1, hd).transpose(1, 2)
-    kh = k.reshape(B, T, -1, hd).transpose(1, 2)
-    vh = v.reshape(B, T, -1, hd).transpose(1, 2)
-    o = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, scale=a["sm_scale"], enable_gqa=True)
-    run.put(a["o"], o.transpose(1, 2).reshape(B, T, -1))
-
-
-def _residual_add(run, a):
-    _need(a["gate"] is None, "a gated residual add")
-    run.put(a["y_out"], run.get(a["x"]) + run.get(a["y"]))
-
-
-def _binary(run, a):
-    x, y = run.get(a["x"]), run.get(a["y"])
-    ops = {"Add": torch.add, "Mul": torch.mul, "Div": torch.div}
-    _need(a["op"] in ops, f"binary `{a['op']}`")
-    run.put(a["z"], ops[a["op"]](x.float(), y.float()).to(x.dtype))
-
-
-def _add_bias(run, a):
-    run.put(a["out_out"], run.get(a["out"]) + run.get(a["bias"]))
-
-
-def _glu(run, a):
-    _need(a["weights"] is None and a["limit"] is None, "a weighted or limited glu")
-    if a["packed"] is not None:
-        p = run.get(a["packed"])
-        gate, up = p[..., : a["intermediate"]], p[..., a["intermediate"] :]
-    else:
-        gate, up = run.get(a["gate"]), run.get(a["up"])
-    acts = {"Swiglu": F.silu, "GegluTanh": lambda g: F.gelu(g, approximate="tanh")}
-    _need(a["act"] in acts, f"glu `{a['act']}`")
-    run.put(a["y"], (acts[a["act"]](gate.float()) * up.float()).to(gate.dtype))
-
-
-def _gelu_tanh(run, a):
-    x = run.get(a["x"])
-    run.put(a["y"], F.gelu(x.float(), approximate="tanh").to(x.dtype))
-
-
-def _rows(run, a):
-    rows, x = run.get(a["rows"]), run.get(a["x"])
-    run.put(a["y"], x if rows is None else x.reshape(-1, x.shape[-1])[rows])
-
-
-_OPS = {
-    "Gather.Embed": _embed,
-    "Elemwise.Rmsnorm": _rmsnorm,
-    "Linear.Matmul": _matmul,
-    "Linear.LoraCorrect": _lora_correct,
-    "Elemwise.Rope": _rope,
-    "Attn.KvAppend": _kv_append,
-    "Attn.PlanPrefill": _plan,
-    "Attn.PlanDecode": _plan,
-    "Attn.Prefill": _prefill,
-    "Elemwise.ResidualAdd": _residual_add,
-    "Elemwise.Binary": _binary,
-    "Elemwise.AddBias": _add_bias,
-    "Linear.Glu": _glu,
-    "Linear.GeluTanh": _gelu_tanh,
-    "Gather.Rows": _rows,
-}
-
-
-def rope(x, pos, head_dim, theta, turn, freqs):
-    """Rotate each head of x [..., T, H*hd] at positions pos [..., T]."""
-    *lead, w = x.shape
-    xs = x.float().reshape(*lead, w // head_dim, head_dim)
-    (kind, cfg), = turn.items()
-    if kind == "Full":
-        pairs, span, inter = head_dim // 2, head_dim // 2, cfg["interleaved"]
-    elif kind == "Partial":
-        pairs, span, inter = cfg["rotary_dim"] // 2, cfg["span"], False
-    else:
-        raise NotImplementedError(f"the trainer has no torch forward for rope turn `{kind}`")
-    if freqs is not None:
-        inv = torch.tensor(freqs["inv_freq"], dtype=torch.float32, device=x.device)[:pairs]
-        mscale = freqs["mscale"]
-    else:
-        inv = theta ** (-torch.arange(pairs, dtype=torch.float32, device=x.device) / span)
-        mscale = 1.0
-    ang = pos.float()[..., None] * inv
-    cos = (ang.cos() * mscale)[..., None, :]
-    sin = (ang.sin() * mscale)[..., None, :]
-    out = xs.clone()
-    if inter:
-        a, b = xs[..., 0 : 2 * pairs : 2], xs[..., 1 : 2 * pairs : 2]
-        out[..., 0 : 2 * pairs : 2] = a * cos - b * sin
-        out[..., 1 : 2 * pairs : 2] = b * cos + a * sin
-    else:
-        a, b = xs[..., :pairs], xs[..., span : span + pairs]
-        out[..., :pairs] = a * cos - b * sin
-        out[..., span : span + pairs] = b * cos + a * sin
-    return out.reshape(*lead, w).to(x.dtype)
-
-
-def rmsnorm(x, weight, axis, eps):
-    """`x / sqrt(mean(x^2) + eps) * (w + plus)` over each row, or over each
-    head of width d when `axis` is `{"Head": d}`."""
-    xf = x.float()
-    shape = None
-    if axis != "Row":
-        (kind, d), = axis.items()
-        if kind != "Head":
-            raise NotImplementedError(f"the trainer has no torch forward for rmsnorm axis {axis}")
-        shape = xf.shape
-        xf = xf.reshape(*shape[:-1], shape[-1] // d, d)
-    y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    if weight is not None:
-        w, plus = weight
-        y = y * (w.float() + plus)
-    if shape is not None:
-        y = y.reshape(shape)
-    return y.to(x.dtype)

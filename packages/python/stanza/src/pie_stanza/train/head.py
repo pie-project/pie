@@ -5,6 +5,7 @@ The full logits of a batch, `[rows*T, 151936]` in f32, would not fit in
 memory for long batches. `logp` keeps only one chunk of logits alive at a
 time, in the forward and again in the backward, where it recomputes them.
 Logits are rounded to the head weight's dtype first, as the trace types them,
+softcapped where the trace caps them (`cap * tanh(logits / cap)`, Gemma's),
 and then normalized in f32.
 """
 
@@ -16,19 +17,20 @@ import torch.nn.functional as F
 CHUNK = 256
 
 
-def logp(h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def logp(h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor, cap: float | None = None) -> torch.Tensor:
     """log p(targets[i] | row i) for readout rows h [N, D] through the head
-    w [V, D]; differentiable in h and in w."""
-    return _Logp.apply(h, w, targets)
+    w [V, D], logits softcapped at `cap` when given; differentiable in h and in w."""
+    return _Logp.apply(h, w, targets, cap)
 
 
 @torch.no_grad()
-def readout(h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def readout(h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor, cap: float | None = None
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """For each row: the target's log-prob, the argmax token, and the gap
     between the top two log-probs."""
     lps, tops, gaps = [], [], []
     for i in range(0, h.shape[0], CHUNK):
-        logits = _logits(h[i : i + CHUNK], w)
+        logits = _logits(h[i : i + CHUNK], w, cap)
         lps.append(_target(logits, targets[i : i + CHUNK]))
         top = logits.topk(2, dim=-1)
         tops.append(top.indices[:, 0])
@@ -36,8 +38,9 @@ def readout(h: torch.Tensor, w: torch.Tensor, targets: torch.Tensor) -> tuple[to
     return torch.cat(lps), torch.cat(tops), torch.cat(gaps)
 
 
-def _logits(h, w):
-    return F.linear(h, w).float()
+def _logits(h, w, cap=None):
+    logits = F.linear(h, w).float()
+    return logits if cap is None else cap * torch.tanh(logits / cap)
 
 
 def _target(logits, targets):
@@ -48,11 +51,12 @@ def _target(logits, targets):
 
 class _Logp(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, h, w, targets):
+    def forward(ctx, h, w, targets, cap):
         ctx.save_for_backward(h, w, targets)
+        ctx.cap = cap
         out = []
         for i in range(0, h.shape[0], CHUNK):
-            logits = _logits(h[i : i + CHUNK], w)
+            logits = _logits(h[i : i + CHUNK], w, cap)
             out.append(_target(logits, targets[i : i + CHUNK]))
         return torch.cat(out) if out else h.new_zeros(0, dtype=torch.float32)
 
@@ -63,12 +67,16 @@ class _Logp(torch.autograd.Function):
         dw = torch.zeros_like(w, dtype=torch.float32) if ctx.needs_input_grad[1] else None
         for i in range(0, h.shape[0], CHUNK):
             hc, tc = h[i : i + CHUNK], targets[i : i + CHUNK]
-            # d logp[t] / d logits = onehot(t) - softmax(logits)
-            dlogits = -_logits(hc, w).softmax(-1)
+            # d logp[t] / d logits = onehot(t) - softmax(logits), and through
+            # a cap, d capped / d logits = 1 - (capped / cap)^2.
+            logits = _logits(hc, w, ctx.cap)
+            dlogits = -logits.softmax(-1)
             dlogits.scatter_add_(-1, tc[:, None], torch.ones_like(tc[:, None], dtype=dlogits.dtype))
             dlogits *= grad[i : i + CHUNK, None]
+            if ctx.cap is not None:
+                dlogits *= 1 - (logits / ctx.cap).square()
             if dh is not None:
                 dh[i : i + CHUNK] = (dlogits.to(w.dtype) @ w).to(h.dtype)
             if dw is not None:
                 dw += dlogits.T @ hc.float()
-        return dh, None if dw is None else dw.to(w.dtype), None
+        return dh, None if dw is None else dw.to(w.dtype), None, None

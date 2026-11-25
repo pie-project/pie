@@ -6,6 +6,8 @@ trainer replays. `banks.json` lists every registered bank, the weights stanzas
 train. `import.json` says which checkpoint tensor fills each frozen param.
 `mount.json` records which stanzas were mounted and the sha256 of every Poem
 file that was read. `Program.load` reads all four and checks that they agree.
+A bank whose name is not `layers.{l}.{stanza}.{site}.{bank}` belongs to no
+stanza: it stays zero, and no trainer trains it.
 """
 
 from __future__ import annotations
@@ -31,12 +33,12 @@ class Bank:
     """The bank's shape; axis 0 is the slot."""
     dtype: str
     """The dtype pie serves the bank at, such as `bf16`."""
-    stanza: str
-    """The stanza that declares the bank."""
-    site: str
-    """The tap it attaches at: q, k, v, o, gate, up or down."""
-    layer: int
-    """The layer index."""
+    stanza: str | None
+    """The stanza that declares the bank, or None for a bank no stanza names."""
+    site: str | None
+    """The tap it attaches at, such as q, k, v, o, gate, up or down."""
+    layer: int | None
+    """The layer index, or None for a bank outside the layers."""
     init: str
     """How the trainer starts it: zeros, kaiming or normal."""
 
@@ -97,11 +99,12 @@ class Program:
             shape = tuple(b["shape"])
             if shape[0] != listed["slots"] or list(shape) != registered[b["name"]]["shape"]:
                 raise ValueError(f"bank `{b['name']}`: shape {list(shape)} does not match the trace or {listed['slots']} slots")
-            banks.append(Bank(b["name"], shape, b["dtype"], b["stanza"], b["site"], int(b["layer"]), init))
+            layer = None if b.get("layer") is None else int(b["layer"])
+            banks.append(Bank(b["name"], shape, b["dtype"], b.get("stanza"), b.get("site"), layer, init))
 
-        stanzas = list(mount.get("stanzas") or dict.fromkeys(b.stanza for b in banks))
+        stanzas = list(mount.get("stanzas") or dict.fromkeys(b.stanza for b in banks if b.stanza is not None))
         for b in banks:
-            if b.stanza not in stanzas:
+            if b.stanza is not None and b.stanza not in stanzas:
                 raise ValueError(f"bank `{b.name}` belongs to stanza `{b.stanza}`, which mount.json does not mount")
         return Program(
             model=listed["model"],

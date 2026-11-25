@@ -130,8 +130,8 @@ class Trainer:
         run = DTYPES[dtype or self.dtype]
         with torch.no_grad():
             ids, real = pad(tokens, self.device)
-            h, w = self._interp.hidden(self._params(run), ids, adapted=adapted, dtype=run)
-            lp, top, gap = head.readout(h[:, :-1][real], w, ids[:, 1:][real])
+            out = self._interp.hidden(self._params(run), ids, adapted=adapted, dtype=run)
+            lp, top, gap = head.readout(out.rows[:, :-1][real], out.head, ids[:, 1:][real], out.cap)
         counts = [len(row) - 1 for row in tokens]
         return tuple([t.tolist() for t in x.cpu().split(counts)] for x in (lp, top, gap))
 
@@ -171,8 +171,8 @@ class Trainer:
         return params
 
     def _logp(self, ids: torch.Tensor, real: torch.Tensor, *, adapted: bool) -> torch.Tensor:
-        h, w = self._interp.hidden(self._params(self._dtype), ids, adapted=adapted, dtype=self._dtype)
-        lp = head.logp(h[:, :-1][real], w, ids[:, 1:][real])
+        out = self._interp.hidden(self._params(self._dtype), ids, adapted=adapted, dtype=self._dtype)
+        lp = head.logp(out.rows[:, :-1][real], out.head, ids[:, 1:][real], out.cap)
         return torch.zeros(real.shape, dtype=torch.float32, device=ids.device).masked_scatter(real, lp)
 
 
