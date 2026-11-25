@@ -123,6 +123,17 @@ impl Drop for Ring {
 }
 
 /// The host's page.
+#[cfg(windows)]
+fn page_bytes() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    let mut info = SYSTEM_INFO::default();
+    // SAFETY: `info` is a `SYSTEM_INFO` to fill; the call cannot fail.
+    unsafe { GetSystemInfo(&raw mut info) };
+    info.dwPageSize as usize
+}
+
+/// The host's page.
+#[cfg(not(windows))]
 fn page_bytes() -> usize {
     // SAFETY: a query of a constant of the system.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
