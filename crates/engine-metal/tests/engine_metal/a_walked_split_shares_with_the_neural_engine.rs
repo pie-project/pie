@@ -6,6 +6,7 @@
 #![cfg(target_vendor = "apple")]
 
 use poem_compiler::Budget;
+use engine_metal::chip::{AneMlp, AneProjections};
 use engine_metal::{Lane, Seated, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{Fixture, Load, Profiles, deployed_fixture, word};
@@ -49,11 +50,21 @@ fn a_split_load(model: &str, mlp: bool, rows: &[u32]) {
     };
     let unwalked: Vec<Vec<f32>> = {
         let mut shell = load();
+        let chip = shell.tuning().profile();
+        let gpu = if mlp {
+            matches!(chip.get::<AneMlp>(), AneMlp::Gpu)
+        } else {
+            matches!(chip.get::<AneProjections>(), AneProjections::Gpu)
+        };
+        if gpu {
+            eprintln!("{model} not asked: this device's profile splits nothing");
+            return;
+        }
         shell.open(0).expect("a slot opens");
         rows.iter().map(|&n| fire(&mut shell, &fixture, n)).collect()
     };
     let mut shell = load();
-    assert!(shell.neural_engine().is_some(), "{model} splits by the device profile");
+    assert!(shell.neural_engine().is_some(), "{model} splits as the device profile states");
     shell.warm_pipelines().expect("the walk runs");
     shell.seal_pipelines().expect("the pipelines seal");
     let splits = |shell: &Shell| shell.neural_engine().expect("the split").splits();
