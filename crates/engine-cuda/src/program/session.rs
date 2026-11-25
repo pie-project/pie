@@ -1243,6 +1243,28 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    /// A seat inside the score rows moves with them; one elsewhere (an
+    /// arena plane, bound again by its fire) stays.
+    #[test]
+    fn seats_in_the_score_rows_move_with_them() {
+        let seat = |base| super::Output {
+            base,
+            storage: 0,
+            width: 8,
+            row_stride: 8,
+            row_offset: 0,
+            rows: 1,
+        };
+        let mut outputs = vec![
+            (("scores".to_string(), 0), seat(1000)),
+            (("score_pages".to_string(), 0), seat(1064)),
+            (("logits".to_string(), 0), seat(9000)),
+        ];
+        super::move_seats(&mut outputs, 1000, 128, 5000);
+        let bases: Vec<u64> = outputs.iter().map(|(_, output)| output.base).collect();
+        assert_eq!(bases, [5000, 5064, 9000]);
+    }
+
 
     #[test]
     fn a_launching_stage_paired_with_the_wrong_plan_is_refused() {

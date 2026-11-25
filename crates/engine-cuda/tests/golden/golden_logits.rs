@@ -532,6 +532,107 @@ pub(super) fn load_under(
     .inspect(|shell| record_picks(cache, shell))
 }
 
+/// A load of `fixture` under `allowance` at the model's declared context
+/// `declared`: the load serves it as long as its room holds.
+fn load_declared(
+    fixture: &Fixture,
+    cache: &Path,
+    allowance: engine::Allowance,
+    declared: u32,
+) -> Result<Shell, String> {
+    Shell::load(Boot {
+        kv_budget: None,
+        allowance,
+        context_declared: true,
+        knobs: knobs(),
+        cache_dir: Some(cache),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            declared,
+            1,
+        )
+    })
+    .map_err(|why| why.to_string())
+}
+
+/// A declared context is cut to the room the load's own room line leaves,
+/// past this process's context and modules: under budgets from where the
+/// modules leave no sequence a room to where they leave a long one (counted
+/// past the modules' charge the engine states), a load
+/// serves the declared context cut to what it seats, or refuses the card by
+/// name, never faulting on residency.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn a_declared_context_is_cut_to_the_room_past_the_modules() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const DECLARED: u32 = 1 << 24;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    // An unbounded load first: where the profile states no roofline rates
+    // (a committed profile not taken for this build) it measures them and
+    // keeps them in the probe's profiles, so the budgets below are weighed
+    // on their room alone, not on room to measure.
+    drop(
+        load_declared(&fixture, &cache, engine::Allowance::WHOLE, DECLARED)
+            .unwrap_or_else(|why| panic!("{model}: an unbounded load serves: {why}")),
+    );
+    // The engine states what this process's context and modules charge the
+    // budget in its room line ("N MiB of it this process's context and
+    // modules"): read off a load under a budget nothing fits, the range below
+    // starts past it, so it spans the same rooms on any backend (ROCm's
+    // modules take ~1.5 GiB, CUDA's far less).
+    let charged = match load_declared(
+        &fixture,
+        &cache,
+        engine::Allowance {
+            budget: Some(1 << 20),
+        },
+        DECLARED,
+    ) {
+        Ok(_) => panic!("a 1 MiB budget served the declared context"),
+        Err(why) => why
+            .split(" MiB of it this process's context and modules")
+            .next()
+            .filter(|head| head.len() < why.len())
+            .and_then(|head| head.rsplit(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("the refusal states no context and modules charge: {why}")),
+    };
+    println!("this process's context and modules: {charged} MiB of the budget");
+    let mut served = 0;
+    for mib in (charged + 512..=charged + 2048).step_by(128) {
+        let allowance = engine::Allowance {
+            budget: Some(mib << 20),
+        };
+        match load_declared(&fixture, &cache, allowance, DECLARED) {
+            Ok(shell) => {
+                let context = shell.paging().context();
+                println!("budget {mib} MiB: serves {context} of {DECLARED} tokens");
+                assert!(context <= DECLARED);
+                served += 1;
+            }
+            Err(why) => {
+                println!("budget {mib} MiB: refused: {why}");
+                assert!(
+                    !why.starts_with("weight residency"),
+                    "under {mib} MiB the declared context faulted on residency: {why}"
+                );
+            }
+        }
+    }
+    assert!(
+        served > 0,
+        "no budget served the declared context cut to its room"
+    );
+}
+
 /// The load's knobs: `PIE_GOLDEN_CHUNK` (bytes) sets the chunk size the
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.
@@ -1519,7 +1620,7 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
 }
 
 /// Every shape a parked set carries comes back bit for bit through the
-/// tiers below the device: the kv list, the ring and the window buffer
+/// tiers below the device: the kv list, the window lists
 /// (Gemma's miniature), the hybrid's rs-list rows and records (Qwen3.5's),
 /// and the guests' instance and channel slots, device -> disk -> device
 /// and host -> disk -> host (and on up to the device), into other slots,
@@ -1544,15 +1645,7 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
         }
     }
     println!("parked shapes: {roles:?}");
-    for want in [
-        "kv",
-        "Ring",
-        "WindowBuffer",
-        "record",
-        "RsBuffer",
-        "Instance",
-        "Channel",
-    ] {
+    for want in ["kv", "window", "record", "RsBuffer", "Instance", "Channel"] {
         assert!(roles.contains(want), "a {want} shape parked: {roles:?}");
     }
     assert!(unaligned, "a slot off the 4 KiB boundary parked");
@@ -1922,6 +2015,130 @@ fn golden_buffered() {
     }
 }
 
+/// The rows the carrying probe's lane leaves unfolded before one decode
+/// replays them all: more than a page of the rs buffer, and than the
+/// decode's own bucket.
+const CARRIED: u32 = 40;
+
+/// A prefill folded as it lands, then `CARRIED + 1` decodes of a fixed
+/// script: with `buffer` each buffers its row past the state and folds
+/// nothing, until the last replays the `CARRIED` rows before it and folds
+/// them all; without, each folds as it lands. Each step's logits, and the
+/// bodies the last decode replayed and the fires it walked with none.
+fn served_carrying(fixture: &Fixture, cache: &Path, buffer: bool) -> (Vec<Vec<f32>>, u64, u64) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        kv_budget: None,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = Vec::new();
+    let mut step = |shell: &mut Shell, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        let seated = engine_cuda::Seated {
+            rs,
+            ..engine_cuda::Seated::of(Lane {
+                slot: 0,
+                word,
+                tokens,
+            })
+        };
+        let mut rows = shell
+            .fire_media(&[seated], &[], &[])
+            .expect("the step fires");
+        steps.push(rows.swap_remove(0));
+    };
+    let prompt: Vec<u32> = (0..37).map(|t| (t * 7 + 11) % 1000).collect();
+    let folded = prompt.len() as u32;
+    step(&mut shell, &prompt, RsVerb::Fold);
+    let base = folded / page * page;
+    let mut before = shell.body_stats().tally;
+    for at in 0..=CARRIED {
+        let end = folded + at + 1;
+        before = shell.body_stats().tally;
+        let rs = if buffer {
+            RsVerb::Buffer {
+                pages: (base / page..end.div_ceil(page)).collect(),
+                base,
+                folded,
+                fold: FoldLen::Host(if at == CARRIED { CARRIED + 1 } else { 0 }),
+                lineage: engine::fire::Lineage::Set,
+            }
+        } else {
+            RsVerb::Fold
+        };
+        step(&mut shell, &[((folded + at) * 7 + 11) % 1000], rs);
+    }
+    let after = shell.body_stats().tally;
+    (
+        steps,
+        after.hits - before.hits,
+        after.eager_unbodied - before.eager_unbodied,
+    )
+}
+
+/// One lane replaying `CARRIED` buffered rows ahead of its one row is
+/// served by a body, and every step answers what the same rows folded as
+/// they land answer, to the tolerance of the two kernels that run them.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_buffered_carrying() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _, _) = served_carrying(&fixture, &cache, false);
+    let (buffered, hits, unbodied) = served_carrying(&fixture, &cache, true);
+    assert_eq!(buffered.len(), folded.len());
+    let mut worst = 0f32;
+    for (buffered, folded) in buffered.iter().zip(&folded) {
+        let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+        let apart = buffered
+            .iter()
+            .zip(folded)
+            .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+        worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+    }
+    println!(
+        "golden {model}-buffered-carrying: {} steps, logits apart by {worst:e} of their scale, \
+         the last decode replayed {hits} body(ies) and walked {unbodied}",
+        buffered.len()
+    );
+    // A replay's extended tensors state the whole run's rows
+    // (`store::rs::Buffers::rows_ext`), past `ssm_gdn_scan_until`, so its
+    // gated-delta recurrence is the chunked kernel; a fold of one row takes
+    // the scan. The two sum in other orders: on this miniature the logits
+    // lie 0.013 to 0.035 of their scale apart at every carried count from 1
+    // to 40 (0 where nothing is replayed). Past 0.05 is another cause.
+    assert!(
+        worst < 0.05,
+        "the buffered lane's logits lie {worst:e} of their scale from the folded lane's"
+    );
+    assert!(
+        hits > 0 && unbodied == 0,
+        "the decode replaying {CARRIED} buffered rows replayed {hits} body(ies) and walked \
+         {unbodied} fire(s) with none"
+    );
+}
+
 /// Decode steps a lagged lane takes: a fold behind its rows by the lag.
 const LAGGED_STEPS: u32 = 30;
 
@@ -2103,6 +2320,55 @@ fn golden_lagged() {
         );
         assert_eq!(unbodied, 0, "a lagged decode walked with no body");
     }
+}
+
+/// A lane alone on its set carrying more rows unfolded than nine of its
+/// fires' widths (the most a per-fire page table held) answers what the
+/// folding lane answers, to the tolerance of [`golden_lagged`]: its rows
+/// resolve through its own pages on the device, whatever it carries.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_lagged_past_the_fire() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const FIRE: u32 = 64;
+    const STEPS: u32 = 9 * FIRE + 40;
+    let cache = cache_dir();
+    let model = buffered_model();
+    let fixture = fixture(&model, &cache);
+    let (folded, _) = served_lagged_over(&fixture, &cache, 0, FIRE, STEPS);
+    let (lagged, unbodied) = served_lagged_over(&fixture, &cache, STEPS + 8, FIRE, STEPS);
+    assert_eq!(lagged.len(), folded.len());
+    let mut worst = 0f32;
+    let mut flips = 0usize;
+    for (lagged, folded) in lagged.iter().zip(&folded) {
+        let scale = folded.iter().fold(0f32, |most, v| most.max(v.abs()));
+        let apart = lagged
+            .iter()
+            .zip(folded)
+            .fold(0f32, |most, (a, b)| most.max((a - b).abs()));
+        worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
+        if argmax(lagged) != argmax(folded) {
+            let mut sorted = folded.clone();
+            sorted.sort_by(|x, y| y.total_cmp(x));
+            if (sorted[0] - sorted[1]) / scale.max(f32::MIN_POSITIVE) > 0.02 {
+                flips += 1;
+            }
+        }
+    }
+    println!(
+        "golden {model}-lagged past the fire: {} steps carrying up to {} rows on {FIRE}-row \
+         fires, logits apart by {worst:e} of their scale, {flips} flipped, {unbodied} unbodied",
+        lagged.len(),
+        STEPS + 4
+    );
+    assert!(
+        worst < 0.05 && flips == 0,
+        "carrying past the fire the lane's logits lie {worst:e} of their scale from the folded \
+         lane's, {flips} greedy token(s) flipped"
+    );
 }
 
 /// Two lanes of two seats that buffer their rows past the state in one fire
@@ -3335,6 +3601,385 @@ fn golden_eager_resume() {
             "{model}: eager against recorded"
         );
         small_pool_arms(&fixture, &cache);
+    }
+}
+
+/// One lane's state after a fire of `tokens` that buffers them all past a
+/// fresh state, then a fire of `next` that replays the first `keep` of them
+/// and folds those (`RsVerb::Buffer` with `fold`), against slots that fold
+/// `tokens` whole and its first `keep` alone. Returns the three states.
+fn served_partial_fold(
+    fixture: &Fixture,
+    cache: &Path,
+    tokens: &[u32],
+    next: &[u32],
+    keep: u32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use engine::fire::{FoldLen, RsVerb};
+    let mut shell = Shell::load(Boot {
+        kv_budget: None,
+        knobs: buffering(knobs()),
+        cache_dir: Some(cache),
+        ..crate::common::boot(
+            fixture.trace.clone(),
+            &fixture.contract,
+            &fixture.container,
+            Budget::new(1, TOKENS),
+            CONTEXT,
+            4,
+        )
+    })
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model));
+    shell.back_whole().expect("the fitted pool is backed whole");
+    let page = rs_page(&mut shell);
+    let fire = |shell: &mut Shell, slot: u32, tokens: &[u32], rs: RsVerb| {
+        let word = fixture.trace.facts.word(&Request::new(
+            u32::try_from(tokens.len()).expect("a count"),
+            false,
+        ));
+        shell
+            .fire_media(
+                &[Seated {
+                    rs,
+                    ..Seated::of(Lane { slot, word, tokens })
+                }],
+                &[],
+                &[],
+            )
+            .expect("the fire runs");
+    };
+    let held = u32::try_from(tokens.len()).expect("a count");
+    let end = held + u32::try_from(next.len()).expect("a count");
+    let pages: Vec<u32> = (0..end.div_ceil(page)).collect();
+    for slot in 0..3 {
+        shell.open(slot).expect("the slot opens");
+    }
+    fire(&mut shell, 0, tokens, RsVerb::Fold);
+    let whole = shell.state_bytes(0).expect("slot 0 reads back");
+    fire(&mut shell, 1, &tokens[..keep as usize], RsVerb::Fold);
+    let kept = shell.state_bytes(1).expect("slot 1 reads back");
+    let buffer = |fold: u32| RsVerb::Buffer {
+        pages: pages.clone(),
+        base: 0,
+        folded: 0,
+        fold: FoldLen::Host(fold),
+        lineage: engine::fire::Lineage::Set,
+    };
+    fire(&mut shell, 2, tokens, buffer(0));
+    fire(&mut shell, 2, next, buffer(keep));
+    let partial = shell.state_bytes(2).expect("slot 2 reads back");
+    (whole, kept, partial)
+}
+
+/// How far apart `a` and `b` lie, read as bf16 words (the state pool's
+/// element): the root of the summed squared differences of the finite ones.
+fn bf16_apart(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len(), "two slots of one pool");
+    let value = |w: &[u8]| {
+        f64::from(f32::from_bits(
+            u32::from(u16::from_le_bytes([w[0], w[1]])) << 16,
+        ))
+    };
+    a.chunks_exact(2)
+        .zip(b.chunks_exact(2))
+        .map(|(x, y)| (value(x), value(y)))
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// A fire that buffers a window's rows and a later fire that folds only the
+/// first `keep` of them (a speculative verify keeping fewer than its drafts)
+/// leave the state a fold of those `keep` rows leaves, to rounding — not one
+/// that also took the rows it did not keep. On a model whose PLE conv
+/// (Qwen4, Qwen3.8-Flash-Next) commits as it runs, the partial state holds
+/// that conv's row as the whole window left it, and so stands nearer the
+/// whole fold than the kept one. `PIE_GOLDEN_PARTIAL` names the model
+/// (`qwen38-flash-next-micro` by default; `qwen35-tiny` for GDN alone).
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_partial_fold_keeps_its_rows() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let model = std::env::var("PIE_GOLDEN_PARTIAL")
+        .unwrap_or_else(|_| "qwen38-flash-next-micro".to_string());
+    let fixture = fixture(&model, &cache);
+    let tokens: Vec<u32> = (0..6).map(|t| (t * 7 + 11) % 1000).collect();
+    let next: Vec<u32> = (6..9).map(|t| (t * 7 + 11) % 1000).collect();
+    let keep = 3;
+    let (whole, kept, partial) = served_partial_fold(&fixture, &cache, &tokens, &next, keep);
+    let to_kept = bf16_apart(&partial, &kept);
+    let to_whole = bf16_apart(&partial, &whole);
+    let kept_whole = bf16_apart(&kept, &whole);
+    println!(
+        "golden {model}-partial-fold: the partial state lies {to_kept:.4} from the kept fold and \
+         {to_whole:.4} from the whole one (the two folds {kept_whole:.4} apart)"
+    );
+    assert!(
+        kept_whole > 0.0,
+        "folding {keep} rows and folding 6 leave one state"
+    );
+    // Rounding moves the state a little (the chunked and the step scans sum
+    // in other orders); a row the fold did not keep moves it by about the
+    // distance between the two folds.
+    assert!(
+        to_kept < 0.1 * kept_whole,
+        "a partial fold of {keep} rows left a state {to_kept:.4} from a fold of {keep}, against \
+         {kept_whole:.4} between the two folds — the rows it did not keep moved it ({to_whole:.4} \
+         from the whole fold)"
+    );
+}
+
+/// The steps [`golden_staged_experts`] fires: a prefill, then decodes.
+const STAGED_SCRIPT: &[Step] = &[
+    Step::Prefill(37),
+    Step::Decode,
+    Step::Decode,
+    Step::Prefill(90),
+    Step::Decode,
+];
+
+/// The least budget (bytes, in `lo..=hi`, `lo` refused and `hi` served)
+/// under which `fixture` loads and serves every fire of [`STAGED_SCRIPT`],
+/// its banks staged where `untabled`, and the load's refusal a byte under
+/// it. No budget between loads and then fails a fire: a load is refused,
+/// or serves.
+fn least_budget(
+    fixture: &Fixture,
+    cache: &Path,
+    untabled: bool,
+    mut lo: u64,
+    mut hi: u64,
+) -> (u64, String) {
+    let knobs = || {
+        let mut knobs = knobs();
+        if untabled {
+            knobs.weights = engine_cuda::WeightPin::UntabledExperts;
+        }
+        knobs
+    };
+    let serves = |budget: u64| -> Result<(), String> {
+        let allowance = engine::Allowance {
+            budget: Some(budget),
+        };
+        let mut shell = load_under(fixture, cache, knobs(), allowance)?;
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            staged_steps(&mut shell, &fixture.trace).len()
+        }));
+        assert!(
+            fired.is_ok(),
+            "{} under {budget} bytes: a fire failed after the load was ready",
+            fixture.model
+        );
+        Ok(())
+    };
+    assert!(serves(hi).is_ok(), "{}: serves under {hi}", fixture.model);
+    assert!(serves(lo).is_err(), "{}: refused under {lo}", fixture.model);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match serves(mid) {
+            Ok(()) => hi = mid,
+            Err(_) => lo = mid,
+        }
+    }
+    (hi, serves(hi - 1).expect_err("a byte under it refuses"))
+}
+
+/// `shell` fired over [`STAGED_SCRIPT`] from a fresh slot: each step's logits.
+/// A prefill longer than the rows one fire carries under the load's budget
+/// goes in fires of at most that many, the last one's logits the step's.
+fn staged_steps(shell: &mut Shell, trace: &Trace) -> Vec<Vec<f32>> {
+    shell.open(0).expect("slot 0 opens");
+    let most = usize::try_from(shell.budget().max_tokens.max(1)).expect("a count");
+    let mut fed = 0u32;
+    let mut last = None;
+    let mut steps = Vec::with_capacity(STAGED_SCRIPT.len());
+    for step in STAGED_SCRIPT {
+        let tokens: Vec<u32> = match *step {
+            Step::Prefill(rows) => (fed..fed + rows).map(|t| (t * 7 + 11) % 1000).collect(),
+            Step::Decode => vec![last.expect("a decode follows a step")],
+        };
+        fed += u32::try_from(tokens.len()).expect("a count");
+        let logits = tokens
+            .chunks(most)
+            .map(|chunk| fire(shell, trace, chunk))
+            .last()
+            .expect("a step fires some rows");
+        last = Some(argmax(&logits));
+        steps.push(logits);
+    }
+    steps
+}
+
+/// The staged-experts probe: `PIE_GOLDEN_MODELS` (quantized MoE miniatures;
+/// DeepSeek-V4-Flash's u4g64 one by default) loaded with its routed banks on
+/// the host tier and no table of the weight cache reading them
+/// (`WeightPin::UntabledExperts`), so each fire stages the experts it routes to into
+/// the run the load laid. The staging is the bound times its streams, the
+/// steps serve the device-resident banks' logits, a fire past the first
+/// round takes no device memory, the ledger enters it, no budget loads it
+/// and then fails a fire, and a budget a byte short of the least it serves
+/// at is refused by the fit, by the staging's name.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_staged_experts() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
+        |_| vec!["dsv4-flash-mini-u4g64-u2g64-kv-bf16".to_string()],
+        |_| models(),
+    );
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        let trace = &fixture.trace;
+        // The banks on the device, as the base engine seats them.
+        let mut resident = load(&fixture, &cache);
+        assert_eq!(
+            resident.expert_staging().bytes(),
+            0,
+            "{model}: a load with its banks on the device stages nothing"
+        );
+        let want = staged_steps(&mut resident, trace);
+        drop(resident);
+
+        let staged = || {
+            let mut knobs = knobs();
+            knobs.weights = engine_cuda::WeightPin::UntabledExperts;
+            knobs
+        };
+        let mut shell = load_with(&fixture, &cache, staged());
+        let staging = shell.expert_staging().clone();
+        assert_eq!(
+            shell
+                .ledger()
+                .of(engine::memory::Class::Fire, "staged experts"),
+            staging.bytes(),
+            "{model}: the ledger enters the staging as a fire's"
+        );
+        let fact = staging
+            .fact()
+            .unwrap_or_else(|| panic!("{model}: no bank is staged"));
+        println!("staged {model}: {fact}");
+        // The bound, from the trace: each staged bank's codes hold the most
+        // experts one fire routes to, the routes one fire's.
+        let classes = poem_ir::residency::residency(trace);
+        let bytes = engine_cuda::weights::plane_bytes(trace).expect("sized");
+        let rows = u64::from(staging.rows());
+        let (mut codes, mut routes) = (0u64, 0u64);
+        for bank in staging.banks() {
+            let at = trace
+                .params
+                .iter()
+                .position(|param| &param.name == bank)
+                .unwrap_or_else(|| panic!("the trace declares `{bank}`"));
+            let poem_ir::residency::Residency::Expert(atom) = classes[at] else {
+                panic!("`{bank}` is staged and routes no expert");
+            };
+            let experts = u64::from(atom.experts);
+            let slots = experts.min(rows * u64::from(atom.top_k));
+            codes = codes.max(slots * (bytes[at] / experts));
+            routes = routes.max(rows * u64::from(atom.top_k) * 4);
+        }
+        let runs = staging.runs();
+        assert_eq!(runs[0], codes, "{model}: the codes' run is the bound");
+        assert_eq!(runs[3], routes, "{model}: the routes' run is one fire's");
+        let lane: u64 = runs.iter().map(|run| run.next_multiple_of(256)).sum();
+        assert!(!staging.streams().is_empty());
+        assert_eq!(
+            staging.bytes(),
+            lane * staging.streams().len() as u64,
+            "{model}: a lane a stream"
+        );
+        println!(
+            "staged {model}: {} bank(s), runs {runs:?}, {} stream(s), {} bytes for {rows} rows",
+            staging.banks().len(),
+            staging.streams().len(),
+            staging.bytes(),
+        );
+
+        // The first round builds what a fire builds; the second takes
+        // nothing more of the device.
+        let first = staged_steps(&mut shell, trace);
+        let free = engine_cuda::device::free_bytes();
+        let heaps = engine_cuda::device::held::heap_bytes();
+        let second = staged_steps(&mut shell, trace);
+        assert_eq!(
+            engine_cuda::device::free_bytes(),
+            free,
+            "{model}: a staged fire took device memory"
+        );
+        assert_eq!(
+            engine_cuda::device::held::heap_bytes(),
+            heaps,
+            "{model}: a staged fire grew a heap"
+        );
+        assert_eq!(second, first, "{model}: the second round is the first's");
+        for (at, (got, want)) in first.iter().zip(&want).enumerate() {
+            let most = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            println!(
+                "staged {model} {at}: most |diff| {most:e} from resident, tops {} {}",
+                argmax(got),
+                argmax(want)
+            );
+            assert_eq!(
+                argmax(got),
+                argmax(want),
+                "{model} step {at}: the staged top token"
+            );
+            assert!(most < 0.25, "{model} step {at}: |diff| {most:e}");
+        }
+
+        drop(shell);
+        // The staging is a term of the fit: under the least budget the
+        // load serves at, less a byte, the fit refuses it, naming the banks
+        // and the staging's bytes.
+        let (least, said) = least_budget(&fixture, &cache, true, 1 << 30, 16 << 30);
+        println!("staged {model}: least budget {least}; a byte under it: {said}");
+        assert!(
+            staging
+                .banks()
+                .iter()
+                .all(|bank| said.contains(&format!("`{bank}`"))),
+            "{model}: the refusal names the banks: {said}"
+        );
+        // The bytes the refusal names are its own fit's: under a budget that
+        // tight the fit may serve fewer rows a fire than the unbounded load
+        // (on ROCm the context's modules take ~1.5 GiB of it), and the
+        // staging holds one fire's routes. The load at the least budget
+        // stages what the fit a byte under it weighed.
+        let at_least = load_under(
+            &fixture,
+            &cache,
+            staged(),
+            engine::Allowance {
+                budget: Some(least),
+            },
+        )
+        .unwrap_or_else(|why| panic!("{model}: serves under its least budget {least}: {why}"));
+        let least_staging = at_least.expert_staging().clone();
+        drop(at_least);
+        assert_eq!(
+            least_staging.banks(),
+            staging.banks(),
+            "{model}: the same banks stage under the least budget"
+        );
+        assert!(
+            said.contains(&format!("{} bytes of staged experts", least_staging.bytes())),
+            "{model}: and the bytes ({} for {} rows under the least budget): {said}",
+            least_staging.bytes(),
+            least_staging.rows()
+        );
     }
 }
 

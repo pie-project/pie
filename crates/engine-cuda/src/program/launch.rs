@@ -2206,6 +2206,285 @@ mod tests {
         );
     }
 
+    /// Guest programs as inferlets ship them, traced here: the scratch
+    /// they are laid is read off these.
+    mod shipped {
+        use eta_compiler::codegen::launch::LaunchPackage;
+        use eta_compiler::plan::{CompiledStage, compile_bound};
+        use eta_dsl::Traced;
+        use eta_dsl::prelude::*;
+        use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
+
+        pub const QWEN_VOCAB: u32 = 151_936;
+
+        fn leak(channel: Channel) -> &'static Channel {
+            Box::leak(Box::new(channel))
+        }
+
+        fn logits(vocab: u32) -> Vec<Vec<OutputDecl>> {
+            vec![vec![OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
+                width: vocab,
+                dtype: eta_ir::Dtype::F32,
+                layers: 0,
+                readout: true,
+            }]]
+        }
+
+        fn builder(vocab: u32) -> (Builder<'static>, &'static Channel) {
+            let tok_in = leak(Channel::from([42i32]));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            b.bind_port(Port::EmbedTokens, tok_in);
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from([0u32, 1])));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            (b, tok_in)
+        }
+
+        /// `text-completion-bench`'s decode epilogue: a temperature-scaled
+        /// top-p Gumbel-max draw.
+        pub fn top_p(vocab: u32) -> Traced {
+            let (temperature, top_p) = (0.6f32, 0.95f32);
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = intrinsics::output(0, "logits");
+                let scaled = logits / temperature;
+                let probs = softmax(&scaled);
+                let keep = pivot_threshold(probs, cummass_le(top_p));
+                let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
+                let masked = select(&keep, &scaled, &neg_inf);
+                let r = rng.take();
+                let g = gumbel(&r, [vocab]);
+                let r_next = &r + iota(2);
+                rng.put(&r_next);
+                let t = reshape(reduce_argmax(masked + g), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the top-p epilogue traces")
+        }
+
+        /// The `compat` generate step's sampler with a top-k and a top-p
+        /// cut: both pivots, their `and`, the mask and a Gumbel-max draw.
+        pub fn top_k_top_p(vocab: u32) -> Traced {
+            let temperature = 0.8f32;
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let scaled = &logits / temperature;
+                let probs = softmax(&scaled);
+                let ranked = pivot_threshold(&probs, rank_le(40u32));
+                let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
+                let keep = and(&ranked, &nucleus);
+                let token = reshape(gumbel_max(mask_apply(&scaled, keep), &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the top-k top-p epilogue traces")
+        }
+
+        /// A temperature Gumbel-max draw with no cut.
+        pub fn gumbel_max_only(vocab: u32) -> Traced {
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let scaled = intrinsics::output(0, "logits") / 0.7f32;
+                let token = reshape(gumbel_max(scaled, &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the gumbel-max epilogue traces")
+        }
+
+        /// The greedy decode epilogue.
+        pub fn greedy(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the greedy epilogue traces")
+        }
+
+        /// A greedy step that lands its top logprobs: a top-k region.
+        pub fn top_logprobs(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let values_out = leak(Channel::new([5], dtype::f32).capacity(8));
+            let ids_out = leak(Channel::new([5], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (values, ids) = top_k(log_softmax(&logits), 5);
+                values_out.put(&values);
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            values_out.note_host_take();
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the top-logprobs epilogue traces")
+        }
+
+        /// A greedy step that lands the whole row in order: a sort region.
+        pub fn sorted(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let ids_out = leak(Channel::new([vocab], dtype::i32).capacity(2));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (_, ids) = sort_desc(softmax(&logits));
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the sorted epilogue traces")
+        }
+
+        /// Every program here, by name.
+        pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
+            vec![
+                ("top-p", top_p(vocab)),
+                ("top-k + top-p", top_k_top_p(vocab)),
+                ("gumbel-max", gumbel_max_only(vocab)),
+                ("greedy", greedy(vocab)),
+                ("top logprobs", top_logprobs(vocab)),
+                ("sorted", sorted(vocab)),
+            ]
+        }
+
+        /// The program's stages as compiled, and the package built of them.
+        pub fn compiled(traced: &Traced, vocab: u32) -> (Vec<CompiledStage>, LaunchPackage) {
+            let caps = EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            };
+            let bound = eta_ir::validate::bind(traced.container().clone(), logits(vocab), caps)
+                .expect("the program binds");
+            let stages = compile_bound(&bound);
+            let package = eta_compiler::codegen::launch::build(&bound, &stages);
+            (stages, package)
+        }
+    }
+
+    /// No generated kernel of the programs inferlets ship names the bytes
+    /// of a value its stage states to take none (a generated kernel
+    /// addresses a value as `offsets[<its id>]` and no other way), and no
+    /// such value is one a region is handed, hands on or puts. A greedy or
+    /// a Gumbel-max lane, whose one argmax scans the model's row, holds no
+    /// row of the vocabulary at all.
+    #[test]
+    fn no_kernel_names_a_value_that_takes_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let mut unwritten_rows = Vec::new();
+        for (name, traced) in shipped::all(vocab) {
+            let (stages, package) = shipped::compiled(&traced, vocab);
+            let ([stage], [plan]) = (&stages[..], &package.plans[..]) else {
+                panic!("{name}: one stage");
+            };
+            let descriptors = describe_values(plan, Extents::default()).expect("static shapes");
+            let laid = lay_out(plan, &descriptors).expect("fits");
+            let hollow: Vec<u32> = plan
+                .fused
+                .iter()
+                .flat_map(|region| region.spent.iter().copied())
+                .collect();
+            for &value in &hollow {
+                assert_eq!(laid.values[value as usize], 0, "{name}: value {value}");
+                for region in &plan.fused {
+                    assert!(
+                        !region.inputs.contains(&value)
+                            && !region.outputs.contains(&value)
+                            && region.sinks.iter().all(|sink| sink.value != value),
+                        "{name}: value {value} takes no bytes and a region holds it"
+                    );
+                }
+            }
+            for (index, (region, lowered)) in
+                stage.fused.regions.iter().zip(&plan.fused).enumerate()
+            {
+                if lowered.kind != RegionKind::Generated {
+                    continue;
+                }
+                let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
+                    .unwrap_or_else(|why| panic!("{name}: region {index}: {why:?}"))
+                    .replace("intrinsic_offsets[", "");
+                for &value in &hollow {
+                    assert!(
+                        !source.contains(&format!("offsets[{value}]")),
+                        "{name}: region {index} names value {value}, which takes no bytes"
+                    );
+                }
+            }
+            let rows = descriptors
+                .iter()
+                .zip(&laid.values)
+                .filter(|(descriptor, at)| descriptor.last == vocab && **at != 0)
+                .count();
+            if rows == 0 {
+                unwritten_rows.push(name);
+            }
+        }
+        assert_eq!(unwritten_rows, ["gumbel-max", "greedy"]);
+    }
+
+    /// The kernel steps a block's arena and a lane's span as the launcher
+    /// lays the lane arenas, and they hold every lane a launch runs, its
+    /// gather buffers with it however few blocks it runs on.
+    #[test]
+    fn the_lane_arenas_hold_every_launch_s_lanes() {
+        let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
+        let stage = &stage[0];
+        let region = stage
+            .fused
+            .regions
+            .iter()
+            .find(|region| lane_sampler(region.kind))
+            .expect("top-p has a sampler");
+        let source = eta_compiler::codegen::cuda::emit_region("kernel", stage, region)
+            .expect("the sampler emits");
+        assert!(source.contains("g.stride = M1_LANE_ARENA_STRIDE;"));
+        assert!(source.contains("M1_LANE_SPAN(lane_blocks)"));
+        assert_eq!(
+            lane_arena_stride(),
+            (64 + 2 * 24_576 + 255) & !255,
+            "the kernel's M1_LANE_ARENA_STRIDE"
+        );
+        assert_eq!(
+            LANE_SAMPLER_GATHERS,
+            16 * 2 * 512 * 8,
+            "the kernel's M1_LANE_GATHERS"
+        );
+        for (units, flight) in [(142, 128), (304, 256), (1, 1), (8, 4), (20, 32)] {
+            for filled in 1..=flight {
+                assert!(
+                    u64::from(filled) * lane_span(lane_blocks(units, filled))
+                        <= Arenas::bytes_for(flight, units)
+                );
+            }
+        }
+    }
+
     #[test]
     fn only_bool_is_packed_and_the_round_trip_is_lossless() {
         for (dtype, numel) in [

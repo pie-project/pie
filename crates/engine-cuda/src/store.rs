@@ -2565,6 +2565,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_bodies_are_held_ahead_of_the_kv_fill_and_refused_by_name_past_the_floor() {
+        const MIB: u64 = 1 << 20;
+        // Qwen3.5-0.8B's check load on the L40S: 39602 MiB live past the
+        // weights and the span, one 32768-token sequence's 512 MiB claimed.
+        let (live, claim) = (39_602 * MIB, 512 * MIB);
+        let room = |(bodies, programs): (u64, u64)| live - bodies - programs;
+
+        // Still to arm: every byte past the claim is the bodies', and the kv
+        // pool is fitted to the claim alone until they are captured.
+        let measuring = holds(claim, live, MEASURING, 0).expect("one sequence fits");
+        assert_eq!(measuring, (live - claim, 0));
+        assert_eq!(
+            room(measuring),
+            claim,
+            "the kv fill takes nothing of their room"
+        );
+
+        // Measured: what they took is held before the kv pool fills the rest.
+        let measured = holds(claim, live, 1010 * MIB, 0).expect("they fit");
+        assert_eq!(measured, (1010 * MIB, 0));
+        assert_eq!(room(measured), live - 1010 * MIB);
+        assert_eq!(
+            holds(claim, live, live - claim, 0),
+            Ok((live - claim, 0)),
+            "a figure that exactly fits is held"
+        );
+
+        // Weights, span, bodies and the kv floor past the card: refused,
+        // with what the card has past the claim, never held down.
+        assert_eq!(holds(claim, live, live - claim + 1, 0), Err(live - claim));
+        assert_eq!(
+            holds(live + MIB, live, 1, 0),
+            Err(0),
+            "a floor past the card leaves the bodies nothing"
+        );
+        assert_eq!(
+            holds(live + MIB, live, MEASURING, 0),
+            Ok((0, 0)),
+            "and still to arm, the fit's own floor check refuses it ([`Pools::fit`])"
+        );
+
+        // The guests' programs come after the bodies.
+        assert_eq!(
+            holds(claim, live, 100 * MIB, live),
+            Ok((100 * MIB, live - claim - 100 * MIB))
+        );
+    }
+
+    #[test]
     fn store_every_case() {
         a_seat_past_the_slot_count_is_a_row_only_a_slab_can_refuse();
         a_slot_copy_names_the_guest_shapes();

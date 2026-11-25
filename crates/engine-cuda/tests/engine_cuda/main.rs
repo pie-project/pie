@@ -26,6 +26,8 @@ mod a_beam_step_answers_what_the_interpreter_answers;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 #[cfg(feature = "rocm")]
 mod blocks_that_meet_run_on_a_few_units;
+mod a_bound_guest_holds_its_scratch_as_state;
+mod a_served_models_lanes_answer_as_each_lane_alone;
 mod a_buffer_frees_after_another_context_closes;
 mod a_closed_contexts_kept_memory_serves_the_next;
 #[cfg(feature = "cuda")]

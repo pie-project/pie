@@ -3089,3 +3089,22 @@ fn window_tables<'a>(
             .ok_or_else(|| short("kv_len", kv_len.len(), first + lanes))?,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    /// A window's lanes the fire's kv tables do not hold fail by name; the
+    /// whole table from lane 0 is never planned in their place.
+    #[test]
+    fn a_window_past_the_fires_kv_tables_is_refused_not_planned_on_lane_0() {
+        let indptr = [0, 4, 9, 12];
+        let len = [4, 5, 3];
+        let (ip, kl) = super::window_tables(&indptr, &len, 1, 2).unwrap();
+        assert_eq!((ip, kl), (&indptr[1..4], &len[1..3]));
+        for (first, lanes) in [(2, 2), (3, 1), (0, 4)] {
+            let why = super::window_tables(&indptr, &len, first, lanes)
+                .unwrap_err()
+                .to_string();
+            assert!(why.contains("the fire's table holds"), "{why}");
+        }
+    }
+}

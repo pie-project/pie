@@ -2266,3 +2266,79 @@ fn u32_bytes_of(values: &[u32]) -> &[u8] {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }
 }
+
+#[cfg(test)]
+mod rows_fit_tests {
+    use super::{Fire, Geometry, rows_fit};
+
+    fn fire<'a>(tokens: &'a [i32], tables: &'a [Geometry]) -> Fire<'a> {
+        Fire {
+            tokens,
+            positions: &[],
+            windows: &[],
+            qo_absolute: &[],
+            live: &[],
+            slot_ids: &[],
+            state_ids: &[],
+            adapter_routes: None,
+            readout_rows: &[],
+            readout_live: 0,
+            page_tables: tables,
+            mask: None,
+            live_rows: 0,
+            lane_of_row: &[],
+            lane_reach: 0,
+            group_of_lane: &[],
+            packings: &[],
+            rs: None,
+        }
+    }
+
+    /// A fire past its regions' rows, in its tokens or in a kv write table,
+    /// is refused by name; one within them passes.
+    #[test]
+    fn token_rows_past_the_regions_are_refused_by_name() {
+        let tables = [Geometry {
+            write_page: vec![0; 4],
+            write_offset: vec![0; 4],
+            ..Geometry::default()
+        }];
+        assert!(rows_fit(4, 4, &fire(&[0; 4], &tables)).is_ok());
+        let wide = rows_fit(4, 5, &fire(&[0; 5], &tables)).unwrap_err();
+        assert!(
+            wide.to_string()
+                .contains("token rows a fire stages exceed its rung's regions"),
+            "{wide}"
+        );
+        let long = [Geometry {
+            write_page: vec![0; 5],
+            ..Geometry::default()
+        }];
+        assert!(rows_fit(4, 4, &fire(&[0; 4], &long)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::Free;
+    use std::time::{Duration, Instant};
+
+    /// Every slot held by the claimant's own steps, none landing: no slot
+    /// can come back until the claimant lands one, so the claim is refused
+    /// by name at once, never after a timer.
+    #[test]
+    fn a_claim_deeper_than_the_set_is_refused_at_once_by_name() {
+        let free = Free::of(2);
+        let held = [
+            free.claim("slots").expect("a free slot"),
+            free.claim("slots").expect("a free slot"),
+        ];
+        let began = Instant::now();
+        let refused = free
+            .claim("staging slots (the caller runs deeper than its frames in flight)")
+            .expect_err("a third slot of two, none landing");
+        assert!(began.elapsed() < Duration::from_millis(100), "refused at once");
+        assert!(refused.to_string().contains("staging slots"), "{refused}");
+        drop(held);
+    }
+}

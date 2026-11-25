@@ -2739,7 +2739,16 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_held, readout_extent};
+    use super::{fold_cell, fold_held, readout_extent};
+
+    #[test]
+    fn a_fold_cell_states_every_lanes_fold_or_a_fold_a_lane() {
+        assert_eq!(fold_cell(&[3], 0), Some(3));
+        assert_eq!(fold_cell(&[3], 5), Some(3));
+        assert_eq!(fold_cell(&[3, 4], 1), Some(4));
+        assert_eq!(fold_cell(&[3, 4], 2), None);
+        assert_eq!(fold_cell(&[], 0), None);
+    }
 
     #[test]
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {

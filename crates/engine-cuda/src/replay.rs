@@ -148,7 +148,7 @@ impl Replay {
 #[cfg(test)]
 mod tests {
     use super::{LIST, Replay};
-    use engine::fire::{KvDelta, Lane, Readout, RsReset, Step};
+    use engine::fire::{KvDelta, Lane, ListKind, Readout, RsReset, Step};
 
     fn prompt(slot: u32, rows: u32, held: u32) -> Lane {
         Lane {
@@ -222,6 +222,21 @@ mod tests {
         read.readout = Readout::Rows(vec![100, 299]);
         let step = Step {
             lanes: vec![read],
+            ..Step::default()
+        };
+        assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());
+    }
+
+    #[test]
+    fn a_lane_whose_list_is_a_translation_is_left_whole() {
+        let replay = Replay {
+            bit: 0b100,
+            window: 128,
+        };
+        let mut placed = prompt(3, 300, 0);
+        placed.list = ListKind::Translation;
+        let step = Step {
+            lanes: vec![placed],
             ..Step::default()
         };
         assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());

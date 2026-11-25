@@ -172,6 +172,17 @@ mod tests {
     }
 
     #[test]
+    fn a_fire_whose_masks_pass_a_32_bit_offset_keeps_its_offsets() {
+        assert_eq!(super::mask_offset(0, 0).unwrap(), 0);
+        let past = i32::MAX as usize + 1;
+        assert_eq!(
+            super::mask_offset(past, 3).unwrap(),
+            i64::from(i32::MAX) + 1
+        );
+        assert_eq!(super::mask_offset(5 << 30, 3).unwrap(), 5 << 30);
+    }
+
+    #[test]
     fn mask_every_case() {
         the_runs_and_the_causal_bound_intersect();
         a_windowed_prefill_expands_row_by_row();

@@ -1405,3 +1405,81 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     }
     a.max(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: u64 = 2 << 20;
+
+    /// The bytes of the host tier slot ref `slot` of `shape` takes.
+    fn place(shape: &SlotShape, slot: u32) -> std::ops::Range<u64> {
+        let (chunk, offset) = shape.tier_place(slot);
+        let at = u64::from(chunk) * CHUNK + offset;
+        at..at + shape.slot_bytes
+    }
+
+    /// Host refs handed out as the runtime's host tier hands them
+    /// (`SharedPool::tier`): one chunk id space, a chunk opened for one
+    /// shape, a ref its chunk times the shape's slots a chunk plus its
+    /// index.
+    struct HostRefs {
+        next: u32,
+        open: Vec<(ShapeId, u32, u32)>,
+    }
+
+    impl HostRefs {
+        fn take(&mut self, shape: &SlotShape) -> u32 {
+            let at = match self.open.iter().position(|&(id, ..)| id == shape.id) {
+                Some(at) if self.open[at].2 < shape.per_chunk => at,
+                found => {
+                    self.next += 1;
+                    let fresh = (shape.id, self.next - 1, 0);
+                    match found {
+                        Some(at) => self.open[at] = fresh,
+                        None => self.open.push(fresh),
+                    }
+                    found.unwrap_or(self.open.len() - 1)
+                }
+            };
+            self.open[at].2 += 1;
+            self.open[at].1 * shape.per_chunk + self.open[at].2 - 1
+        }
+    }
+
+    /// The host tier has no place a shape: a ref lies at its chunk and its
+    /// index in it, so ref `r` of two shapes may be the same bytes, and
+    /// what keeps two shapes apart is that each takes refs of its own
+    /// chunks, as the runtime hands them out.
+    #[test]
+    fn two_shapes_host_refs_of_their_own_chunks_never_meet() {
+        // A kv list, a record and an rs list of slot sizes that divide no
+        // chunk evenly, beside the two guest shapes.
+        let shapes = [
+            SlotShape::guest(LIST, 24_576 + 48, CHUNK),
+            SlotShape::guest(FIXED, 1_000, CHUNK),
+            SlotShape::guest(RS, 6_144, CHUNK),
+            SlotShape::guest(INSTANCE, INSTANCE_SLOT, CHUNK),
+            SlotShape::guest(CHANNEL, CHANNEL_SLOT, CHUNK),
+        ];
+        let mut host = HostRefs {
+            next: 0,
+            open: Vec::new(),
+        };
+        // Shape after shape in turn, past a chunk of each.
+        let mut held: Vec<std::ops::Range<u64>> = Vec::new();
+        for round in 0..2_500 {
+            for shape in &shapes {
+                if round < 2 * shape.per_chunk + 3 {
+                    held.push(place(shape, host.take(shape)));
+                }
+            }
+        }
+        held.sort_by_key(|place| place.start);
+        assert!(held.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        // The control: refs counted from 0 a shape, as if each shape had a
+        // tier of its own, are the same bytes.
+        let (instance, channel) = (&shapes[3], &shapes[4]);
+        assert_eq!(place(instance, 0).start, place(channel, 0).start);
+    }
+}
