@@ -9350,7 +9350,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 split: false,
             }
         } else if self.armed && !self.arming && B::RECORDS && self.eager_kind(&prepared) {
-            // A fire of a kind the load stated eager walks eagerly.
+            // A fire of a kind the load stated eager walks eagerly, laying its
+            // block in its arm's as any fire does: a frame opened with none
+            // reserves one of its own.
+            B::ready_fill(self, &prepared);
             self.eager_next = true;
             Plan::Walk {
                 keep: None,

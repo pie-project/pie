@@ -302,7 +302,14 @@ fn words_hash(chunks: &[Vec<u8>]) -> u64 {
 pub(crate) struct FireBlock {
     place: Place,
     image: Image,
+    /// Past an arm's block, where a walk run once lays the rest of what it
+    /// lays ([`FireBlock::lay`]): chunks the frame owns, each with the bytes
+    /// laid in it.
+    past: Vec<(Buffer, u64)>,
 }
+
+/// Fires whose walk laid past their arm's block.
+static PAST_THE_ARMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Default for FireBlock {
     fn default() -> FireBlock {
@@ -315,6 +322,7 @@ impl FireBlock {
         FireBlock {
             place: Place::Own(Vec::new()),
             image: Image::default(),
+            past: Vec::new(),
         }
     }
 
@@ -322,6 +330,7 @@ impl FireBlock {
         FireBlock {
             place: Place::Arm(arm),
             image: Image::default(),
+            past: Vec::new(),
         }
     }
 
@@ -334,18 +343,24 @@ impl FireBlock {
 
     /// Lays `bytes` at the next offset in the block a multiple of `align`
     /// and answers the slab it lies in, its place among the chunks, and the
-    /// offset.
+    /// offset. Past an arm's block (laid at load for the naming walk's
+    /// widest fire) a walk run once (`once`) lays in chunks of its frame's
+    /// own, warned of by name and counted; a kept or a fill walk is refused.
     pub(crate) fn lay(
         &mut self,
         core: &Arc<Core>,
         bytes: &[u8],
         align: u64,
         kept: usize,
+        once: bool,
     ) -> Result<(Slab, usize, u64)> {
         let len = bytes.len() as u64;
         match &mut self.place {
             Place::Arm(arm) => {
                 let at = self.image.extent.next_multiple_of(align);
+                if (at + len > arm.bytes() || !self.past.is_empty()) && once {
+                    return past(&mut self.past, core, arm.bytes(), bytes, align);
+                }
                 if at + len > arm.bytes() {
                     return Err(Fault::Ceiling {
                         what: "bytes of an arm's fire block (laid at load for the load's widest fire)",
@@ -392,6 +407,11 @@ impl FireBlock {
         }
     }
 
+    /// Whether `buffer` is the arm's block, which outlives the frame.
+    pub(crate) fn is_arms(&self, buffer: ash::vk::Buffer) -> bool {
+        self.arm().is_some_and(|arm| arm.block.slab().buffer == buffer)
+    }
+
     /// The image laid so far, taken from the block.
     pub(crate) fn take_image(&mut self) -> Image {
         std::mem::take(&mut self.image)
@@ -408,6 +428,48 @@ impl FireBlock {
             Place::Own(_) => 0,
         }
     }
+}
+
+/// Lays `bytes` past an arm's block of `arm` bytes, in `chunks`.
+fn past(
+    chunks: &mut Vec<(Buffer, u64)>,
+    core: &Arc<Core>,
+    arm: u64,
+    bytes: &[u8],
+    align: u64,
+) -> Result<(Slab, usize, u64)> {
+    let len = bytes.len() as u64;
+    let fits = chunks
+        .last()
+        .is_some_and(|(chunk, used)| used.next_multiple_of(align) + len <= chunk.bytes());
+    if !fits {
+        let size = chunks
+            .last()
+            .map_or(FIRST_CHUNK, |(last, _)| last.bytes() * 2)
+            .max(len.next_multiple_of(align));
+        if chunks.is_empty() {
+            let fires = PAST_THE_ARMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::warn!(
+                arm,
+                fires,
+                "a fire that walked eagerly laid past its arm's fire block (laid at load for the \
+                 naming walk's widest fire): the rest lies in a reservation of the fire's own"
+            );
+        }
+        let chunk = Buffer::on(
+            core,
+            size,
+            Memory::Host,
+            engine_gpu::books::owners::UNIFORMS,
+        )?;
+        chunks.push((chunk, 0));
+    }
+    let at = chunks.len();
+    let (chunk, used) = chunks.last_mut().expect("a chunk with room was just made");
+    let from = used.next_multiple_of(align);
+    chunk.write_shared(from, bytes)?;
+    *used = from + len;
+    Ok((Arc::clone(chunk.slab()), at, from))
 }
 
 #[cfg(test)]
