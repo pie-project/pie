@@ -19,6 +19,7 @@ members = [
     "pin",
     "priority",
     "rebalance",
+    "replicate",
     "test-pause",
     "test-route",
     "test-share",
