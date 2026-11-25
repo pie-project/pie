@@ -30,7 +30,7 @@ from . import checkpoint, head
 from .batch import Batch, pad, padded
 from .bundle import write_bundle
 from .interpreter import Interpreter
-from .loss import FUNCTIONS
+from .loss import FUNCTIONS, REFERENCED
 from .program import Bank, Program
 
 DTYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
@@ -91,14 +91,15 @@ class Trainer:
 
     def forward_backward(self, batch: Batch, loss: str | Callable = "cross_entropy", *, reference: bool = False) -> float:
         """Add the gradient of `loss` on `batch` to the masters; return the loss.
-        `reference=True` first fills `batch.ref_logp` with plain-arm log-probs."""
+        `reference=True`, or a loss that reads one (`dpo`), first fills
+        `batch.ref_logp` with plain-arm log-probs."""
         fn = loss if callable(loss) else FUNCTIONS.get(loss)
         if fn is None:
             raise ValueError(f"loss {loss!r} is not one of {sorted(FUNCTIONS)} or a function")
         if self._since is None:
             self._since = time.perf_counter()
         view, real = padded(batch, self.device)
-        if reference:
+        if reference or loss in REFERENCED:
             with torch.no_grad():
                 batch.ref_logp = view.ref_logp = self._logp(view.tokens, real, adapted=False)
         value = fn(self._logp(view.tokens, real, adapted=True), view)

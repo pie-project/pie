@@ -4,7 +4,8 @@ Every subcommand takes `--pie-home` (default `$PIE_HOME`, else
 `~/.pie-stanza`), `--model` (default `qwen3-0.6b`) and `--weights`, the
 Hugging Face checkpoint (default `$STANZA_WEIGHTS`). `stanza check` runs its
 weight checks only when `--weights` is given. `stanza train` streams one JSON
-line per optimizer step to stdout. `eval` and `skew` talk to a server that
+line per optimizer step to stdout; with `--loss dpo` it reads preference
+pairs (OpenAI's preference JSONL) and trains against the plain arm. `eval` and `skew` talk to a server that
 `stanza serve` started, and take the model from the adapter's `stanza.json`.
 """
 
@@ -19,7 +20,7 @@ import threading
 from pathlib import Path
 
 from .adapter import Adapter
-from .data import chat
+from .data import chat, pairs
 from .evaluate import evaluate, json_exact
 from .model import Model
 from .serve import Pie
@@ -40,8 +41,9 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("mount", parents=[common], help="mount stanzas on the model program")
     p.add_argument("stanzas", nargs="*", help="standard-library names or .poem files, in order")
     sub.add_parser("check", parents=[common], help="print where each mounted stanza attaches")
-    p = sub.add_parser("train", parents=[common], help="train one mounted stanza on chat JSONL")
+    p = sub.add_parser("train", parents=[common], help="train one mounted stanza on chat or preference JSONL")
     p.add_argument("--stanza", required=True)
+    p.add_argument("--loss", choices=["cross_entropy", "dpo"], default="cross_entropy")
     p.add_argument("--data", required=True)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, required=True)
@@ -75,8 +77,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report.ok else 1
         elif args.cmd == "train":
             trainer = model.trainer(args.stanza)
-            for batch in chat(args.data, model).batches(rows=ROWS, epochs=args.epochs, seed=0):
-                trainer.forward_backward(batch)
+            data = (pairs if args.loss == "dpo" else chat)(args.data, model)
+            for batch in data.batches(rows=ROWS, epochs=args.epochs, seed=0):
+                trainer.forward_backward(batch, args.loss)
                 trainer.optim_step(lr=args.lr)
                 print(json.dumps(trainer.log[-1]), flush=True)
             saved = trainer.save(args.out, name=Path(args.out).name)

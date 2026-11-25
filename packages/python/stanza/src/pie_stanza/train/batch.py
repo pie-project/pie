@@ -21,8 +21,9 @@ class Batch:
     """len(row) - 1 per row: the loss weight of predicting tokens[i+1]."""
     ref_logp: torch.Tensor | None = None
     """[rows, T-1] plain-arm log-probs, filled by `forward_backward(..., reference=True)`."""
-    sampler_logp: torch.Tensor | None = None
-    """[rows, T-1] log-probs the samples were drawn at, for importance_sampling and ppo."""
+    sampler_logp: list[list[float]] | None = None
+    """len(row) - 1 per row: the log-prob the sampler drew each next token at,
+    for importance_sampling and ppo (pie's, or `Trainer.logprobs`'s)."""
 
 
 def pad(tokens: list[list[int]], device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -40,12 +41,22 @@ def pad(tokens: list[list[int]], device) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def padded(batch: Batch, device) -> tuple[Batch, torch.Tensor]:
-    """The batch as a loss sees it, with tokens [rows, T] and weights [rows, T-1]
-    as tensors on `device` (pads weigh 0), and the mask of real predictions."""
+    """The batch as a loss sees it, with tokens [rows, T], and weights and
+    sampler_logp [rows, T-1], as tensors on `device` (pads weigh 0), and the
+    mask of real predictions."""
     ids, real = pad(batch.tokens, device)
-    weights = torch.zeros(real.shape, dtype=torch.float32)
-    for i, (row, w) in enumerate(zip(batch.tokens, batch.weights, strict=True)):
-        if len(w) != len(row) - 1:
-            raise ValueError(f"row {i}: {len(w)} weights for {len(row)} tokens; a row of n tokens has n - 1")
-        weights[i, : len(w)] = torch.tensor(w, dtype=torch.float32)
-    return replace(batch, tokens=ids, weights=weights.to(device)), real
+    weights = _rows(batch.tokens, batch.weights, real.shape, "weights").to(device)
+    sampled = None
+    if batch.sampler_logp is not None:
+        sampled = _rows(batch.tokens, batch.sampler_logp, real.shape, "sampler_logp").to(device)
+    return replace(batch, tokens=ids, weights=weights, sampler_logp=sampled), real
+
+
+def _rows(tokens: list[list[int]], values: list[list[float]], shape, what: str) -> torch.Tensor:
+    """Per-prediction values, one list a row, as one [rows, T-1] tensor padded with 0."""
+    out = torch.zeros(shape, dtype=torch.float32)
+    for i, (row, v) in enumerate(zip(tokens, values, strict=True)):
+        if len(v) != len(row) - 1:
+            raise ValueError(f"row {i}: {len(v)} {what} for {len(row)} tokens; a row of n tokens has n - 1")
+        out[i, : len(v)] = torch.tensor(v, dtype=torch.float32)
+    return out

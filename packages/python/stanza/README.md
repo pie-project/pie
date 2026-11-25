@@ -56,6 +56,9 @@ stanza eval  --adapter adapters/NAME --data TEST.jsonl [--port 18431]
 stanza skew  --adapter adapters/NAME --data TEST.jsonl --n 32 [--port 18431]
 ```
 
+`stanza train --loss dpo --data PREFS.jsonl` trains on OpenAI preference
+JSONL with DPO, whose reference is the plain arm of the same program.
+
 Every subcommand takes `--pie-home` (default `$PIE_HOME`, else
 `~/.pie-stanza`), `--model` (default `qwen3-0.6b`) and `--weights` (default
 `$STANZA_WEIGHTS`). `check` runs its four weight checks only when `--weights`
