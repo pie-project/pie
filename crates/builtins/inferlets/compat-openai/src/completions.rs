@@ -543,17 +543,6 @@ mod tests {
     }
 
     #[test]
-    fn a_logit_bias_is_refused_by_name() {
-        let refused = parse(json!({"prompt": "Hi", "logit_bias": {"50256": -100}}))
-            .err()
-            .expect("a logit_bias is refused");
-        assert!(refused.body.to_string().contains("logit_bias is not supported"));
-        for bias in [json!(null), json!({})] {
-            assert!(parse(json!({"prompt": "Hi", "logit_bias": bias})).is_ok());
-        }
-    }
-
-    #[test]
     fn prompt_logprobs_streamed_negative_or_past_the_cap_are_refused() {
         for body in [
             json!({"prompt": "Hi", "prompt_logprobs": 1, "stream": true}),

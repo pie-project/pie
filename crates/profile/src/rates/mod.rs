@@ -618,137 +618,7 @@ impl Tuned {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_upper_layer_replaces_key_by_key() {
-        let mut low = Tuned {
-            rates: Rates {
-                gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
-                hbm_gbps: Some(2.0),
-                cached_gbps: None,
-                ..Rates::default()
-            },
-            measured_this_load: false,
-            saved_to: None,
-            frame_cut: false,
-            refused: None,
-            ..Tuned::default()
-        };
-        let up = Tuned {
-            rates: Rates {
-                hbm_gbps: Some(3.0),
-                cached_gbps: None,
-                launch_ns: Some(7),
-                ..Rates::default()
-            },
-            measured_this_load: false,
-            saved_to: None,
-            frame_cut: false,
-            refused: None,
-            ..Tuned::default()
-        };
-        low.lay(&up);
-        assert_eq!(
-            low.rates,
-            Rates {
-                gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 1.0)])]),
-                hbm_gbps: Some(3.0),
-                cached_gbps: None,
-                launch_ns: Some(7),
-                ..Rates::default()
-            }
-        );
-        assert!(!low.rates.complete(&KEYS));
-    }
-
-    #[test]
-    fn the_block_is_a_few_lines() {
-        let rates = Rates {
-            stale: None,
-            landing: None,
-            launch_ns: Some(904),
-            gemm_tflops_by_rows: Some(vec![
-                (1024, vec![(256, 40.0), (8192, 150.0)]),
-                (4096, vec![(256, 90.5), (8192, 210.0)]),
-            ]),
-            attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
-            hbm_gbps: Some(654.4),
-            cached_gbps: Some(28800.0),
-            elementwise_gbps: Some(450.0),
-            scan_gelems: Some(2684.3),
-            few_row_tflops: Some(4.2),
-            workgroups_per_core: Some(3.3),
-            submit_worst_ratio: None,
-            load_width: None,
-            resident_workgroups: None,
-            attn_tflops_by_rows_keys: None,
-            product_ns: None,
-            kernel_curves: Some(vec![KernelCurve {
-                kind: KernelCurve::VECTOR,
-                key: 4,
-                n: 1024,
-                k: 2048,
-                curve: vec![(1, 0.5)],
-                stop: Some((512, KernelCurve::BOUND)),
-                spread: Vec::new(),
-                by: MeasuredBy {
-                    method: 1,
-                    kernels: vec![("linear_gemm_gemv_v_bf16".into(), 7)],
-                },
-            }]),
-            dense_settled: vec![DenseSettled {
-                method: 1,
-                of: 77,
-                code: 9,
-                ranges: vec![[3, 4, 1, 4, 0, 1]],
-                planes: vec![(1024, 2048)],
-            }],
-            measured_on: Some("vk 10de:2c31 driver 1".into()),
-            measured_by: Some(vec![(
-                "launch_ns".into(),
-                MeasuredBy {
-                    method: 2,
-                    kernels: vec![("linear_gemm_tiled_bf16".into(), 5)],
-                },
-            )]),
-        };
-        assert!(rates.complete(&KEYS));
-        assert_eq!(
-            rates.only(&KEYS[..6]).missing(&KEYS),
-            ["scan_gelems", "few_row_tflops", "workgroups_per_core",]
-        );
-        assert_eq!(
-            rates.toml(),
-            "[rates]\nlaunch_ns = 904\ngemm_tflops_by_rows = [\n  [1024, [[256, 40.0], [8192, \
-             150.0]]],\n  [4096, [[256, 90.5], [8192, 210.0]]],\n]\n\
-             attn_tflops_by_keys = [[512, 60.0], [8192, 400.0]]\nhbm_gbps = 654.4\n\
-             cached_gbps = 28800.0\nelementwise_gbps = 450.0\nscan_gelems = 2684.3\nfew_row_tflops = 4.2\n\
-             workgroups_per_core = 3.3\nkernel_curves = [\n  [1, 4, 1024, 2048, 512, 1, 1, \
-             [[\"linear_gemm_gemv_v_bf16\", 7]], [[1, 0.5]], []],\n]\n\
-             dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]], [[1024, 2048]]],\n]\n\
-             measured_on = \"vk 10de:2c31 driver 1\"\n\
-             measured_by = [\n  [\"launch_ns\", 2, [[\"linear_gemm_tiled_bf16\", 5]]],\n]\n"
-        );
-        // It reads back.
-        let registry = crate::Registry::new("test", &[], &[]);
-        let read = registry
-            .parse(
-                &format!("api = 1\n{}", rates.toml()),
-                "user",
-                crate::registry::Strict::User,
-            )
-            .unwrap();
-        assert_eq!(read.tuned.rates, rates);
-        // A checked-in file states no keys: its rates are decisions.
-        let refused = registry
-            .parse(
-                &format!("api = 1\n{}", rates.toml()),
-                "checked in",
-                crate::registry::Strict::CheckedIn,
-            )
-            .unwrap_err();
-        assert!(refused.to_string().contains("measured_on"), "{refused}");
-    }
+    use crate::registry::Strict;
 
     /// This build on a device, as a test states it: each kernel's code and
     /// each method's version a table.
@@ -834,289 +704,45 @@ mod tests {
         }
     }
 
-    /// Each model's settle is its own entry, by its key: a second model's
-    /// joins the first's (a save lays the new over the stored), one of the
-    /// same key replaces it, and the list writes and reads back whole.
+    /// Every form a `[rates]` value takes reads back as written in a user's
+    /// file; a checked-in file states no measurements and refuses them.
     #[test]
-    fn each_models_settle_is_kept_beside_the_others() {
-        let settle = |of: u32, replaced: u32| DenseSettled {
-            method: 1,
-            of,
-            code: 6,
-            ranges: vec![[1, 1, replaced, 0, 0, 0]],
-            planes: vec![(1024, 1024)],
+    fn every_form_reads_back_as_written() {
+        let rates = Rates {
+            attn_tflops_by_keys: Some(vec![(512, 60.0), (8192, 400.0)]),
+            cached_gbps: Some(28800.0),
+            elementwise_gbps: Some(450.0),
+            scan_gelems: Some(2684.3),
+            few_row_tflops: Some(4.2),
+            workgroups_per_core: Some(3.3),
+            submit_worst_ratio: Some(1.83),
+            load_width: Some(4),
+            resident_workgroups: Some(10.5),
+            attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
+            product_ns: Some(vec![ProductTime {
+                kind: 3,
+                rows: 6144,
+                k: 1024,
+                m: 4,
+                kernel: 1,
+                ns: 6100.0,
+                spread: 40.0,
+            }]),
+            landing: Some(Landing::of([
+                7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5,
+            ])),
+            ..stored(&build())
         };
-        let first = Rates {
-            dense_settled: vec![settle(7, 0)],
-            ..Rates::default()
-        };
-        let second = Rates {
-            dense_settled: vec![settle(3, 0)],
-            ..Rates::default()
-        };
-        let both = second.over(first.clone());
-        assert_eq!(both.dense_settled, vec![settle(3, 0), settle(7, 0)]);
-        let again = Rates {
-            dense_settled: vec![settle(7, 1)],
-            ..Rates::default()
-        }
-        .over(both.clone());
-        assert_eq!(again.dense_settled, vec![settle(3, 0), settle(7, 1)]);
+        assert!(rates.complete(&KEYS));
         let registry = crate::Registry::new("test", &[], &[]);
-        let read = registry
-            .load_user(&format!("api = 1\n{}", both.toml()), "two models")
-            .expect("both settles read back");
-        assert_eq!(read.rates().dense_settled, both.dense_settled);
-        let twice =
-            "api = 1\n[rates]\ndense_settled_keyed = [[1, 7, 6, [], []], [1, 7, 6, [], []]]\n";
-        // A key stated twice: the second entry is skipped, by name (the
-        // first and the rest read); a committed file carrying one fails the
-        // build's check of committed profiles (`skipped_rates`).
-        let file = registry
-            .parse(twice, "twice.toml", crate::Strict::User)
-            .expect("the rest reads");
-        assert_eq!(file.tuned.rates.dense_settled.len(), 1, "the first is read");
-        assert!(
-            file.skipped_rates
-                .iter()
-                .any(|s| s.contains("stated twice")),
-            "{:?}",
-            file.skipped_rates
-        );
-    }
-
-    /// A re-export of a home that took its rates from a committed profile
-    /// and measured one model's curves keeps every committed entry still
-    /// keyed for this build (carried) beside the home's (measured), each
-    /// said; a committed rate whose key no longer matches and that the home
-    /// did not measure again refuses the export by name.
-    #[test]
-    fn a_re_export_keeps_the_committed_entries_and_says_each() {
-        let now = build();
-        let committed = stored(&now);
-        let measured = Rates {
-            kernel_curves: committed.kernel_curves.clone().map(|curves| {
-                curves
-                    .into_iter()
-                    .take(1)
-                    .map(|mut c| {
-                        c.n = 777;
-                        c
-                    })
-                    .collect()
-            }),
-            measured_on: Some(now.on()),
-            ..Rates::default()
-        };
-        let (merged, report) =
-            crate::merge_committed(measured, Some(committed.clone()), Some(&now)).unwrap();
-        assert_eq!(
-            merged.launch_ns, committed.launch_ns,
-            "the committed rate is carried"
-        );
-        assert_eq!(merged.hbm_gbps, committed.hbm_gbps);
-        assert_eq!(
-            merged.kernel_curves.as_ref().map(Vec::len),
-            Some(committed.kernel_curves.as_ref().map_or(0, Vec::len) + 1),
-            "the committed curves and the home's"
-        );
-        assert_eq!(merged.dense_settled, committed.dense_settled);
-        assert!(
-            report
-                .iter()
-                .any(|l| l == "`launch_ns`: carried from the committed profile"),
-            "{report:#?}"
-        );
-        assert!(
-            report.iter().any(|l| l.contains("1 measured")),
-            "{report:#?}"
-        );
-        // A kernel whose code moved: its committed rates no longer match.
-        let mut moved = build();
-        moved.code = vec![("tiled", 11), ("coopmat", 23), ("gemv", 33)];
-        let refused =
-            crate::merge_committed(Rates::default(), Some(committed), Some(&moved)).unwrap_err();
-        assert!(refused.contains("gemm_tflops_by_rows"), "{refused}");
-    }
-
-    /// An export never writes a stale entry. A committed rate or curve
-    /// whose key no longer matches this build is written only as the home
-    /// measured it again under this build (its figure, never the committed
-    /// one); where the home holds no current measurement, the export
-    /// refuses, naming each stale rate and curve. A home entry stored under
-    /// a stale key is dropped too.
-    #[test]
-    fn an_export_writes_a_stale_committed_key_only_as_the_home_re_timed_it() {
-        let exported = build();
-        let committed = stored(&exported);
-        let mut moved = build();
-        moved.code = vec![("tiled", 11), ("coopmat", 23), ("gemv", 33)];
-        // The home re-timed every rate and curve under the moved build.
-        let mut home = stored(&moved);
-        home.launch_ns = committed.launch_ns.map(|ns| ns + 1);
-        home.gemm_tflops_by_rows = Some(vec![(4096, vec![(256, 7.5)])]);
-        let (merged, report) =
-            crate::merge_committed(home.clone(), Some(committed.clone()), Some(&moved)).unwrap();
-        assert_eq!(
-            merged.gemm_tflops_by_rows, home.gemm_tflops_by_rows,
-            "re-timed, not copied"
-        );
-        assert_ne!(merged.gemm_tflops_by_rows, committed.gemm_tflops_by_rows);
-        assert!(
-            report
-                .iter()
-                .any(|l| l == "`gemm_tflops_by_rows`: measured"),
-            "{report:#?}"
-        );
-        // The home holds nothing current: refused by name, never copied.
-        let refused =
-            crate::merge_committed(Rates::default(), Some(committed.clone()), Some(&moved))
-                .unwrap_err();
-        assert!(refused.contains("`gemm_tflops_by_rows`"), "{refused}");
-        assert!(
-            refused.contains("curve "),
-            "the stale curves are named: {refused}"
-        );
-        // A home entry stored under the old build is dropped, not written:
-        // the committed one (current under the old build) stands for it.
-        let (merged, report) =
-            crate::merge_committed(stored(&moved), Some(committed), Some(&exported)).unwrap();
-        assert_eq!(
-            merged.gemm_tflops_by_rows,
-            stored(&exported).gemm_tflops_by_rows
-        );
-        assert!(
-            report.iter().any(|l| l.starts_with("dropped: stored")),
-            "{report:#?}"
-        );
-    }
-
-    /// An export says each model's settle with the curves a boot of it
-    /// reads, and leaves out one whose planes carry no curve.
-    #[test]
-    fn an_export_carries_a_models_settle_only_with_its_curves() {
-        let curve = |n: u32, k: u32| KernelCurve {
-            kind: KernelCurve::VECTOR,
-            key: 1,
-            n,
-            k,
-            curve: vec![(1, 0.5)],
-            stop: None,
-            spread: Vec::new(),
-            by: MeasuredBy::default(),
-        };
-        let settle = |of: u32, planes: Vec<(u32, u32)>| DenseSettled {
-            method: 1,
-            of,
-            code: 2,
-            ranges: vec![[1, 1, 0, 0, 0, 0]],
-            planes,
-        };
-        let mut rates = Rates {
-            kernel_curves: Some(vec![curve(1024, 2048), curve(3072, 1024)]),
-            dense_settled: vec![
-                settle(7, vec![(1024, 2048), (3072, 1024)]),
-                settle(9, vec![(1024, 2048), (5120, 1024)]),
-            ],
-            ..Rates::default()
-        };
-        let report = crate::settles_carried(&mut rates);
-        assert_eq!(rates.dense_settled.len(), 1);
-        assert_eq!(rates.dense_settled[0].of, 7);
-        assert!(
-            report[0].contains("carried") && report[0].contains("3072x1024: 1 curve"),
-            "{report:?}"
-        );
-        assert!(
-            report[1].starts_with("WARN") && report[1].contains("5120x1024"),
-            "{report:?}"
-        );
-    }
-
-    /// A committed (or user) file with one settle entry in an older form
-    /// beside valid rates: the rates are read, the other entries too, and
-    /// that entry alone is skipped, named, to be settled again.
-    #[test]
-    fn an_old_form_list_entry_is_skipped_alone() {
-        let registry = crate::Registry::new("test", &[], &[]);
-        let text = "api = 1\n[rates]\nlaunch_ns = 900\n\
-                    dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n  \
-                    [1, 78, 9, [[1, 1, 0, 0, 0, 0]], [[1024, 2048]]],\n]\n";
-        for strict in [crate::Strict::User, crate::Strict::Measured] {
-            let file = registry.parse(text, "home.toml", strict);
-            let file = match (strict, file) {
-                (_, Ok(file)) => file,
-                (crate::Strict::Measured, Err(e)) if e.to_string().contains("keys every entry") => {
-                    // A committed file keys each rate: read past that here.
-                    continue;
-                }
-                (_, Err(e)) => panic!("{strict:?}: {e}"),
-            };
-            assert_eq!(file.tuned.rates.launch_ns, Some(900), "{strict:?}");
-            assert_eq!(file.tuned.rates.dense_settled.len(), 1, "{strict:?}");
-            assert_eq!(file.tuned.rates.dense_settled[0].of, 78);
-            assert!(
-                file.skipped_rates
-                    .iter()
-                    .any(|s| s.starts_with("dense_settled_keyed[0]")),
-                "{strict:?}: {:?}",
-                file.skipped_rates
-            );
-        }
-    }
-
-    /// A user file one entry of which another pie wrote in another form
-    /// (the settle as one entry, not a list): that entry alone is skipped,
-    /// named, and the rest of the file read.
-    #[test]
-    fn a_user_files_unreadable_entry_is_skipped_alone() {
-        let registry = crate::Registry::new("test", &[], &[]);
-        let text = "api = 1\n[rates]\nlaunch_ns = 900\nhbm_gbps = 700.0\n\
-                    dense_settled_keyed = [1, 77, 9, [[3, 4, 1, 4, 0, 1]]]\n";
-        let file = registry
-            .parse(text, "old.toml", crate::Strict::User)
-            .expect("the rest of the file reads");
-        assert_eq!(file.tuned.rates.launch_ns, Some(900));
-        assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
-        assert!(file.tuned.rates.dense_settled.is_empty());
-        assert!(!file.skipped_rates.is_empty(), "{:?}", file.skipped_rates);
-        assert!(
-            file.skipped_rates
-                .iter()
-                .all(|s| s.starts_with(DENSE_SETTLED)),
-            "{:?}",
-            file.skipped_rates
-        );
-        // A committed profile is the build's: refused whole, by name.
+        let text = format!("api = 1\n{}", rates.toml());
+        let read = registry.parse(&text, "user", Strict::User).unwrap();
+        assert_eq!(read.tuned.rates, rates, "{text}");
+        assert!(read.skipped_rates.is_empty(), "{:?}", read.skipped_rates);
         assert!(
             registry
-                .parse(text, "c.measured.toml", crate::Strict::Measured)
+                .parse(&text, "checked in", Strict::CheckedIn)
                 .is_err()
-        );
-    }
-
-    /// The same file read by another build of the same kernels (a version
-    /// bump, a new commit, another day) keeps every measurement: nothing
-    /// is measured again.
-    #[test]
-    fn a_build_bump_keeps_every_measurement() {
-        let now = build();
-        let mut rates = stored(&now);
-        let said = rates.sift(&now);
-        assert_eq!(rates, stored(&now), "{said:#?}");
-        assert!(said.is_empty(), "nothing is dropped: {said:#?}");
-        // Each entry taken is said by the layer deciding it, with its key.
-        let whence = rates.whence(&rates, "user.toml", "no committed profile");
-        assert!(
-            whence
-                .iter()
-                .any(|l| l.starts_with("`launch_ns`: stored (user.toml), its key matches")),
-            "{whence:#?}"
-        );
-        assert_eq!(
-            whence.iter().filter(|l| l.starts_with("curve ")).count(),
-            2,
-            "{whence:#?}"
         );
     }
 
@@ -1154,106 +780,48 @@ mod tests {
             rates.missing(&["gemm_tflops_by_rows", "launch_ns"]),
             ["gemm_tflops_by_rows"]
         );
-        // A method's version bumped drops what it measured alone.
-        let mut now = build();
-        now.methods[0].1 = 2;
-        let mut rates = stored(&now);
-        let said = rates.sift(&now);
-        assert_eq!(rates.launch_ns, None);
-        assert_eq!(rates.hbm_gbps, Some(700.0));
-        assert!(
-            said.iter()
-                .any(|l| l.contains("version 2 now, 1 when stored")),
-            "{said:#?}"
-        );
     }
 
-    /// Another device (or driver) measures every one again; a rate stored
-    /// without a key too.
+    /// An export never writes a stale entry: a committed rate whose key no
+    /// longer matches is written only as the home re-timed it, and refuses
+    /// the export, by name, where the home holds nothing current.
     #[test]
-    fn another_device_drops_every_measurement() {
-        let now = build();
-        let mut rates = stored(&now);
-        let other = Build {
-            on: "vulkan 10de:2c32 driver 0x91c40000",
-            ..build()
-        };
-        let said = rates.sift(&other);
-        assert_eq!(rates, Rates::default());
-        assert!(said[0].contains("none is taken"), "{said:#?}");
-        let mut unkeyed = Rates {
-            measured_by: None,
-            ..stored(&now)
-        };
-        let said = unkeyed.sift(&now);
-        assert_eq!(unkeyed.launch_ns, None);
-        assert!(
-            said.iter().any(|l| l.contains("stored without a key")),
-            "{said:#?}"
-        );
+    fn an_export_writes_a_stale_committed_key_only_as_the_home_re_timed_it() {
+        let committed = stored(&build());
+        let mut moved = build();
+        moved.code = vec![("tiled", 11), ("coopmat", 23), ("gemv", 33)];
+        let mut home = stored(&moved);
+        home.gemm_tflops_by_rows = Some(vec![(4096, vec![(256, 7.5)])]);
+        let (merged, _) =
+            crate::merge_committed(home.clone(), Some(committed.clone()), Some(&moved)).unwrap();
+        assert_eq!(merged.gemm_tflops_by_rows, home.gemm_tflops_by_rows);
+        let refused =
+            crate::merge_committed(Rates::default(), Some(committed), Some(&moved)).unwrap_err();
+        assert!(refused.contains("`gemm_tflops_by_rows`"), "{refused}");
     }
 
-    /// A user file an older pie wrote, stating rates this pie no longer
-    /// reads, is read for the rest (those left unread, named); a checked-in
-    /// file stating one is refused by it.
+    /// A user's file one entry of which does not read (an older form, a key
+    /// stated twice, a landing of the wrong length) skips that entry alone,
+    /// by name, and reads the rest; a checked-in file is refused.
     #[test]
-    fn a_user_files_obsolete_rates_are_left_unread_and_the_rest_read() {
-        let text = "api = 1\n[rates]\nlaunch_ns = 904\nhbm_gbps = 650.0\n\
-                    vector_tflops_by_rows = [[1, [[1, 0.5]]]]\nkernel_stops = []\n";
+    fn an_unreadable_entry_is_skipped_alone() {
         let registry = crate::Registry::new("test", &[], &[]);
-        let file = registry
-            .parse(text, "user", crate::registry::Strict::User)
-            .unwrap();
-        assert_eq!(file.tuned.rates.launch_ns, Some(904));
-        assert_eq!(file.tuned.rates.hbm_gbps, Some(650.0));
-        assert_eq!(
-            file.ignored_rates,
-            ["vector_tflops_by_rows", "kernel_stops"]
-        );
-        let read = registry.load_user(text, "user").unwrap().rates();
-        assert_eq!(read.launch_ns, Some(904));
-        let refused = registry
-            .parse(text, "checked in", crate::registry::Strict::CheckedIn)
-            .unwrap_err();
-        assert_eq!(
-            refused.stale_rates,
-            ["vector_tflops_by_rows", "kernel_stops"]
-        );
-        // A save drops them.
-        let (kept, dropped) = registry.prune(text);
-        assert!(!kept.contains("vector_tflops_by_rows"), "{kept}");
-        assert_eq!(dropped.len(), 2, "{dropped:?}");
-    }
-
-    /// The margin a load measures under a stated submit bound is saved with
-    /// the rates and read back: a boot on saved rates holds its steps at it.
-    #[test]
-    fn the_submit_rates_are_saved_and_read_back_with_the_rates() {
-        let measured = Rates {
-            launch_ns: Some(904),
-            submit_worst_ratio: Some(1.83),
-            load_width: None,
-            resident_workgroups: None,
-            attn_tflops_by_rows_keys: Some(vec![(512, vec![(1024, 0.35), (4096, 0.3)])]),
-            ..Rates::default()
-        };
-        let text = format!("api = 1\n{}", measured.toml());
-        assert!(text.contains("submit_worst_ratio = 1.83\n"), "{text}");
-        let registry = crate::Registry::new("test", &[], &[]);
-        let read = registry.load_user(&text, "test").unwrap().rates();
-        assert_eq!(read.submit_worst_ratio, Some(1.83));
-        assert_eq!(
-            read.attn_tflops_by_rows_keys,
-            measured.attn_tflops_by_rows_keys
-        );
-        assert!(read.missing(&[SUBMIT_WORST_RATIO]).is_empty());
-        assert_eq!(
-            Rates::default().missing(&[SUBMIT_WORST_RATIO]),
-            [SUBMIT_WORST_RATIO]
-        );
-        assert_eq!(
-            measured.only(&[SUBMIT_WORST_RATIO]).submit_worst_ratio,
-            Some(1.83)
-        );
+        let text = "api = 1\n[rates]\nlaunch_ns = 900\nlanding = [1.0, 2.0]\n\
+                    dense_settled_keyed = [\n  [1, 77, 9, [[3, 4, 1, 4, 0, 1]]],\n  \
+                    [1, 78, 9, [[1, 1, 0, 0, 0, 0]], [[1024, 2048]]],\n  \
+                    [1, 78, 9, [[1, 1, 0, 0, 0, 0]], [[1024, 2048]]],\n]\n";
+        let file = registry.parse(text, "home.toml", Strict::User).unwrap();
+        assert_eq!(file.tuned.rates.launch_ns, Some(900));
+        assert_eq!(file.tuned.rates.landing, None);
+        assert_eq!(file.tuned.rates.dense_settled.len(), 1);
+        assert_eq!(file.tuned.rates.dense_settled[0].of, 78);
+        for said in ["dense_settled_keyed[0]", "stated twice", "rates.landing"] {
+            assert!(
+                file.skipped_rates.iter().any(|s| s.contains(said)),
+                "{said}: {:?}",
+                file.skipped_rates
+            );
+        }
+        assert!(registry.parse(text, "c.toml", Strict::CheckedIn).is_err());
     }
 }

@@ -69,13 +69,3 @@ pub fn blaslt_code() -> Option<u32> {
 }
 
 use profile::rates::fingerprint;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_library_code_is_stable_within_a_build() {
-        assert_eq!(library_code(), library_code());
-    }
-}

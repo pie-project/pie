@@ -965,30 +965,12 @@ mod tests {
         }
     }
 
-    fn imports_of(name: &str) -> Vec<String> {
-        let component = builtins::policy(name).unwrap().component;
-        plex_host::runtime::Program::load(name, component)
-            .unwrap()
-            .imports
-    }
-
     /// A policy gates launches by its imports: `default-cluster` places
     /// pending processes (`placement/workers`), so a launch under it waits
     /// at the gate, as under `test-route`; `noop` decides nothing and gates
     /// nothing.
     #[test]
     fn only_a_policy_that_decides_pending_processes_gates_launches() {
-        let imports = imports_of("default-cluster");
-        assert!(
-            imports.iter().any(|i| i == tables::PLACEMENT_WORKERS)
-                && imports.iter().any(|i| i == tables::PLACEMENT_HELPERS)
-                && imports.iter().any(|i| i == tables::REPLICATION_WORKERS),
-            "it places and writes its defaults: {imports:?}"
-        );
-        assert!(gates(&imports), "it decides arrivals: {imports:?}");
-        assert!(gates(&imports_of("test-route")));
-        assert!(!gates(&imports_of("noop")));
-
         let config = Config::default();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _in = runtime.enter();

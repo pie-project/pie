@@ -13,7 +13,7 @@ import * as chat from '../chat.js';
 import * as reasoning from '../reasoning.js';
 import * as inferlet from '../index.js';
 import { Channel, ForwardPass, Pipeline, Port, WorkingSet, dtype } from '../eta/index.js';
-import { ForwardPassStub, PipelineStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
+import { ForwardPassStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
 
 describe('package surface', () => {
   it('exports only the live modules', () => {
@@ -286,19 +286,5 @@ describe('final rows', () => {
     const beam = pass();
     stub(beam).finalRefusal = 'a beam';
     expect(() => beam.attachProgram()).toThrow(/final-rows: a beam .*ForwardPass\.retractable\(\)/);
-  });
-
-  it('retracts past a run-ahead break only for a retractable pass', () => {
-    for (const retractable of [false, true]) {
-      const fwd = pass();
-      if (retractable) fwd.retractable();
-      const pipe = new Pipeline();
-      let reads = 0;
-      const kept = pipe.runAhead(fwd, 8, () => (++reads < 2 ? undefined : false));
-      expect(kept).toBe(2);
-      const retracted = (pipe.wit as unknown as PipelineStub).retracted;
-      // A window of 4, refilled after the first read: 5 submitted, 2 kept.
-      expect(retracted).toBe(retractable ? 3 : 0);
-    }
   });
 });

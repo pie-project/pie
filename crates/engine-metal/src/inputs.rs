@@ -512,6 +512,9 @@ pub struct Inputs {
     /// A fire's beam groups' head step: its records and
     /// arrays, and its fault words read at settle.
     beam: BeamAt,
+    /// A capturing fire's two tables of its lanes' score row starts (key
+    /// rows, then page rows), one u64 a lane each.
+    captures: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -644,6 +647,37 @@ impl Inputs {
             rs_copies: bind(b.rs_copies, records.rs_copies.len(), std::mem::size_of::<RsCopyRun>())?,
             rs_copy_count: records.rs_copies.len() as u32,
         }))
+    }
+
+    /// A capturing fire's score row starts, `keys` and `pages` (one GPU
+    /// address a lane each), written and bound: the two tables its score
+    /// kernels read.
+    pub fn stage_captures(
+        &mut self,
+        handles: &crate::device::Handles,
+        keys: &[u64],
+        pages: &[u64],
+    ) -> Result<(Tensor, Tensor)> {
+        let lanes = keys.len().max(pages.len());
+        if lanes as u64 > u64::from(self.lanes.max(1)) {
+            return Err(Fault::Ceiling {
+                what: "lanes of a fire's capture tables",
+                need: lanes as u64,
+                have: u64::from(self.lanes.max(1)),
+            });
+        }
+        let at = [self.captures, self.captures + u64::from(self.lanes.max(1)) * 8];
+        let words = |words: &[u64]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        };
+        self.store.write(at[0], &words(keys))?;
+        self.store.write(at[1], &words(pages))?;
+        let view = self.store.view();
+        let bind = |offset: u64, count: usize| -> Result<Tensor> {
+            let handle = handles.bind(view, self.store.at(offset), count.max(1) as u64 * 8)?;
+            Ok(Tensor::new(handle, count.max(1) as u32, 1, Dtype::U64))
+        };
+        Ok((bind(at[0], keys.len())?, bind(at[1], pages.len())?))
     }
 
     /// A reader of the fire's `lanes` beam fault words, for its completion
@@ -828,6 +862,7 @@ impl Inputs {
                 rs_entries_cap,
             }
         };
+        let captures = take(lanes * 16);
         let total = at;
 
         // Laid in the activation span with the fire's other staged regions
@@ -875,6 +910,7 @@ impl Inputs {
             rs_page_ints,
             group_masks,
             beam,
+            captures,
         })
     }
 
