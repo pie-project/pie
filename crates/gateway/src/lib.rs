@@ -25,7 +25,7 @@ use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};
 use crate::policy::By;
 use crate::route::RoutingHandle;
-use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
+use crate::session::{AdmitReject, DispatchFail, Facts, Sessions, TurnRouter};
 use crate::worker::WorkerRegistry;
 use controller_api::Outcome;
 
@@ -111,9 +111,9 @@ fn addressed(req: &Request) -> Option<&str> {
 
 #[async_trait::async_trait]
 impl TurnRouter for RouteBackend {
-    async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
+    async fn admit(&self, req: &Request, facts: Facts) -> std::result::Result<(), AdmitReject> {
         if let Some(router) = self.router_for(req) {
-            return router.admit(req, &self.routing).await;
+            return router.admit(req, facts, &self.routing).await;
         }
         match self.routing.admit(req) {
             AdmissionDecision::Admit => Ok(()),

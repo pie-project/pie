@@ -610,8 +610,15 @@ impl Port {
                 session,
                 props,
                 prompt,
+                connection,
             } => {
                 let id = pid(gateway, req);
+                // Facts of the launch, read with its arrival: stated first.
+                host.attr(
+                    Subject::Process(id.clone()),
+                    "pie/connection",
+                    connection.map(|n| Value::Text(format!("{}.{n}", gateway.0))),
+                );
                 // Tokens a text block makes, guessed from its bytes: the
                 // prompt reaches the controller as blocks, not tokens.
                 let per_block = TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64;
@@ -1001,6 +1008,7 @@ mod tests {
                 .map(|(name, json)| (name.to_string(), json.to_string()))
                 .collect(),
             prompt: prompt.map(client_api::props::prompt_blocks).map(Into::into),
+            connection: None,
         }
     }
 

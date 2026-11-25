@@ -250,6 +250,9 @@ pub enum ProcessEvent {
         session: Option<String>,
         props: JsonProps,
         prompt: Option<Vec<u64>>,
+        /// The client connection it came on, by the gateway's own count:
+        /// none for one that came alone (an HTTP request).
+        connection: Option<u64>,
     },
     Dispatched {
         req: u64,

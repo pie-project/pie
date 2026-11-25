@@ -113,9 +113,17 @@ pub enum AdmitReject {
 #[derive(Debug, Clone)]
 pub struct DispatchFail;
 
+/// What the gateway knows of a turn beyond what its client sent, for the
+/// cluster policies.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Facts {
+    /// The client connection it came on.
+    pub connection: Option<SessionId>,
+}
+
 #[async_trait::async_trait]
 pub trait TurnRouter: Send + Sync + 'static {
-    async fn admit(&self, req: &Request) -> Result<(), AdmitReject>;
+    async fn admit(&self, req: &Request, facts: Facts) -> Result<(), AdmitReject>;
 
     async fn dispatch(
         &self,
@@ -207,6 +215,7 @@ impl Inner {
         tenant: &TenantId,
         user: &str,
         mut input: TurnInput,
+        connection: Option<SessionId>,
         pinned: Option<WorkerId>,
         open: &Arc<AtomicBool>,
     ) -> Result<(ReqId, TokenRx, WorkerId), SessionError> {
@@ -227,7 +236,7 @@ impl Inner {
             executors: Vec::new(),
         };
 
-        if let Err(refusal) = self.router.admit(&request).await {
+        if let Err(refusal) = self.router.admit(&request, Facts { connection }).await {
             let r = match refusal {
                 AdmitReject::Refused(why) => return Err(SessionError::Refused(why)),
                 AdmitReject::Full(why) => why,
@@ -374,10 +383,29 @@ impl Sessions {
         Self { inner }
     }
 
+    /// A session of one request. [`Self::connect`] is a connection's.
     pub async fn create(
         &self,
         ident: Identity,
         first: TurnInput,
+    ) -> Result<(SessionHandle, TokenRx), SessionError> {
+        self.open(ident, first, false).await
+    }
+
+    /// A client connection's session: its turns are known as one client's.
+    pub async fn connect(
+        &self,
+        ident: Identity,
+        first: TurnInput,
+    ) -> Result<(SessionHandle, TokenRx), SessionError> {
+        self.open(ident, first, true).await
+    }
+
+    async fn open(
+        &self,
+        ident: Identity,
+        first: TurnInput,
+        connection: bool,
     ) -> Result<(SessionHandle, TokenRx), SessionError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionError::Draining);
@@ -391,6 +419,7 @@ impl Sessions {
             session,
             tenant: ident.tenant,
             user: ident.user,
+            connection: connection.then_some(session),
             current: Mutex::new(Vec::new()),
             open: Arc::new(AtomicBool::new(true)),
             holds_handles: Mutex::new(None),
@@ -637,6 +666,7 @@ pub struct SessionHandle {
     session: SessionId,
     tenant: TenantId,
     user: String,
+    connection: Option<SessionId>,
     current: Mutex<Vec<ReqId>>,
     open: Arc<AtomicBool>,
     /// Where this session's handles are, from its first frame that names one.
@@ -658,6 +688,7 @@ impl SessionHandle {
                 &self.tenant,
                 &self.user,
                 next,
+                self.connection,
                 pinned,
                 &self.open,
             )
@@ -838,7 +869,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TurnRouter for MockRouter {
-        async fn admit(&self, _req: &Request) -> Result<(), AdmitReject> {
+        async fn admit(&self, _req: &Request, _facts: Facts) -> Result<(), AdmitReject> {
             if self.admit_ok.load(Ordering::Acquire) {
                 Ok(())
             } else {
