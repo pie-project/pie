@@ -159,7 +159,7 @@ async fn serve(socket: WebSocket, state: GatewayState, ident: Identity) {
         Err(None) => return,
     };
     let corr = first.message.corr_id();
-    let (handle, first_rx) = match state.sessions.create(ident, first).await {
+    let (handle, first_rx) = match state.sessions.connect(ident, first).await {
         Ok(pair) => pair,
         Err(e) => return end(&mut tx, corr, &e.to_string()).await,
     };
