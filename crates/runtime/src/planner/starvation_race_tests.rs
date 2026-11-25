@@ -11,7 +11,7 @@ use crate::store::rs::RsUnits;
 
 use super::proc::Residency;
 use super::reclaim::Reclaim;
-use super::wait::{EntryKey, WaitKind};
+use super::wait::WaitKind;
 
 use crate::planner::grant::Demand;
 use crate::store::kv::page_table::PhysicalKvPageId;

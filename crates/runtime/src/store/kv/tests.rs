@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use super::KvStore;
 use super::hash::Hash256;
 use super::page_table::{
-    KvPageBacking, KvPageTable, PhysicalKvPageId, PublishedPage, ReclaimQuote,
+    KvPageBacking, KvPageTable, PhysicalKvPageId, PublishedPage,
     WorkingSetId,
 };
 use super::write::{KvPreparedWrite, PageCommit};
@@ -130,82 +130,6 @@ fn new_weights_find_no_page_the_old_ones_sealed() {
     assert!(store.cached_run(&old).is_empty());
 }
 
-/// Pages that came from another worker, whose keys this worker computes from
-/// the same tokens under the same domain, are found where a pass looks, below
-/// the device, and come back when their entry is dropped.
-fn pages_another_worker_sealed_are_found_in_the_host_tier() {
-    use super::hash::{chain_slots, page_hash};
-    let domain = h(7);
-    let mut store = KvStore::new_with_swap(8, 4, 0, domain);
-    store.set_page_size(4);
-    let tokens: Vec<u32> = (100..112).collect();
-    let slots = chain_slots(&domain, None, 0, &tokens);
-    let token_hashes: Vec<Vec<Option<Hash256>>> = slots
-        .chunks(4)
-        .map(|page| page.iter().map(|h| Some(*h)).collect())
-        .collect();
-    let keys: Vec<Hash256> = token_hashes.iter().map(|page| page_hash(page)).collect();
-
-    let host = store.alloc_host_slots(3).expect("three host slots");
-    assert!(store.alloc_host_slots(2).is_none(), "one slot is left");
-    assert!(store.import_cached(&[], token_hashes, keys.clone(), host));
-
-    let run = store.cached_run_any_tier(&keys);
-    assert_eq!(run.len(), 3, "the whole run is found");
-    assert_eq!(store.below_device(&run), 3, "all of it in the host tier");
-    assert!(
-        store.cached_run(&keys).is_empty(),
-        "none of it on the device"
-    );
-    // A node is found by its first page: a run that starts past it, as no
-    // pass's does, finds nothing.
-    assert!(store.cached_run_any_tier(&keys[1..]).is_empty());
-
-    // More pages extend the first import, grafted below its last page.
-    let mut store = KvStore::new_with_swap(8, 4, 0, domain);
-    store.set_page_size(4);
-    let tokens: Vec<u32> = (100..116).collect();
-    let slots = chain_slots(&domain, None, 0, &tokens);
-    let token_hashes: Vec<Vec<Option<Hash256>>> = slots
-        .chunks(4)
-        .map(|page| page.iter().map(|h| Some(*h)).collect())
-        .collect();
-    let keys: Vec<Hash256> = token_hashes.iter().map(|page| page_hash(page)).collect();
-    let head = store.alloc_host_slots(2).unwrap();
-    assert!(store.import_cached(&[], token_hashes[..2].to_vec(), keys[..2].to_vec(), head));
-    let lost = store.alloc_host_slots(1).unwrap();
-    assert!(
-        !store.import_cached(
-            &keys[2..3],
-            token_hashes[3..].to_vec(),
-            keys[3..].to_vec(),
-            lost
-        ),
-        "a prefix not held here refuses the import"
-    );
-    let tail = store
-        .alloc_host_slots(2)
-        .expect("the refused import gave its slot back");
-    assert!(store.import_cached(
-        &keys[..2],
-        token_hashes[2..].to_vec(),
-        keys[2..].to_vec(),
-        tail
-    ));
-    assert_eq!(
-        store.cached_run_any_tier(&keys).len(),
-        4,
-        "one run across both"
-    );
-    let mut runs = store.cached_runs();
-    runs.sort_by_key(Vec::len);
-    assert_eq!(
-        runs,
-        vec![keys[..2].to_vec(), keys.clone()],
-        "each entry from token 0"
-    );
-}
-
 /// Retention entries as `(owner, upto, key)`; a position no entry covers is 0.
 #[derive(Clone, Default)]
 struct Steps {
@@ -328,74 +252,12 @@ fn kept_and_gone(store: &mut KvStore, seed: u32, pages: u64, owner: ProcessId) -
     tokens
 }
 
-fn reader(store: &mut KvStore, tokens: &[u32], pages: u64) -> WorkingSetId {
-    let ws = store.create_shared_working_set();
-    let keys = keys_ahead(store, ws, 0, tokens);
-    let run = store.cached_run(&keys);
-    assert_eq!(store.attach_run(ws, &run, pages).unwrap(), pages);
-    ws
-}
-
 fn on_device(store: &mut KvStore, tokens: &[u32]) -> usize {
     let probe = store.create_shared_working_set();
     let keys = keys_ahead(store, probe, 0, tokens);
     store.release_working_set(probe, store.current_epoch());
     let run = store.cached_run(&keys);
     store.table.resident_run(&run)
-}
-
-fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
-    let mut store = KvStore::new(8, h(9));
-    let (running, idle) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
-    let tokens = prompt(5, 4);
-    let ws = store.create_shared_working_set();
-    sealed(&mut store, ws, &tokens);
-    for k in 1..=4 {
-        store.keep_checkpoint(ws, k, Some(running));
-    }
-    commit_fresh(&mut store, ws, 1, 1); // decoding goes on past the prompt
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    kept_and_gone(&mut store, 6, 2, idle);
-    assert_eq!(store.available_pages(), 1);
-    let rank = |_: Option<ProcessId>| 0;
-    let entries = |store: &KvStore, owner| {
-        store
-            .cached_working_sets()
-            .into_iter()
-            .find(|set| set.owner == owner)
-            .map_or(0, |set| set.entries)
-    };
-
-    // The running process's entries are the older, but freeing pages
-    // means taking the idle one, and only it.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
-    assert!(store.owns_cache(running) && !store.owns_cache(idle));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
-    assert_eq!(entries(&store, running), 4);
-
-    // Once it ends they are the cache's alone, and go.
-    store.release_working_set(ws, store.current_epoch());
-    store.retire_idle();
-    assert_eq!(store.available_pages(), 4);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 4);
-    assert!(store.cached_working_sets().is_empty());
-
-    // A reader of a shorter prefix spares only what it reads: the longer
-    // entries go, and the pages only they held with them.
-    let tokens = prompt(7, 4);
-    let ws = store.create_shared_working_set();
-    sealed(&mut store, ws, &tokens);
-    for k in 1..=4 {
-        store.keep_checkpoint(ws, k, Some(idle));
-    }
-    store.release_working_set(ws, store.current_epoch());
-    let reader = reader(&mut store, &tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
-    assert_eq!(entries(&store, idle), 2);
-    assert_eq!(on_device(&mut store, &tokens), 2);
-    store.release_working_set(reader, store.current_epoch());
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
-    assert_eq!(store.available_pages(), 8);
 }
 
 fn seal(store: &mut KvStore, ws: WorkingSetId, start: u64, tokens: &[u32]) -> u32 {
