@@ -116,8 +116,10 @@ const CEREBRAS_FRAMES: &str = r#"frame_size               = 4     # the most: ea
 "#;
 
 const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's fire lanes
-# worker_policy            = "default"  # a PLEX worker policy: built-in name or
-#                                       # .wasm path; "noop" writes no rows
+# worker_policy            = "default"  # a PLEX worker policy, one: a .wasm path, or
+#                                       # built-in "deadline", "fair", "priority" or
+#                                       # "keep-session", each over what "default" does;
+#                                       # "noop" writes no rows
 # snapshot_budget          = "64GiB"  # what handle snapshots may take on disk
 
 [sandbox]
@@ -133,9 +135,10 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # warm_slots      = 100
 
 # [cluster]
-# cluster_policies = ["default-cluster"]  # built-in names or .wasm paths; [] runs none;
-#                              # no two granted the same write (`publish`
-#                              # excepted: each writes under its own name).
+# cluster_policies = ["default-cluster"]  # .wasm paths, or built-in "pin",
+#                              # "drain-migrate", "rebalance" or "replicate", each
+#                              # over what "default-cluster" does; [] runs none.
+#                              # No two write one column, so no two of these.
 #                              # SIGHUP reloads this and `[runtime] worker_policy`.
 #                              # Single-node only: a distributed controller
 #                              # states its own.

@@ -15,16 +15,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "default"
+name = "cluster-defaults"
 version = "0.1.0"
 dependencies = [
  "plex",
 ]
 
 [[package]]
+name = "deadline"
+version = "0.1.0"
+dependencies = [
+ "plex",
+ "worker-defaults",
+]
+
+[[package]]
+name = "default"
+version = "0.1.0"
+dependencies = [
+ "plex",
+ "worker-defaults",
+]
+
+[[package]]
 name = "default-cluster"
 version = "0.1.0"
 dependencies = [
+ "cluster-defaults",
+ "plex",
+]
+
+[[package]]
+name = "drain-migrate"
+version = "0.1.0"
+dependencies = [
+ "cluster-defaults",
  "plex",
 ]
 
@@ -33,6 +58,14 @@ name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "fair"
+version = "0.1.0"
+dependencies = [
+ "plex",
+ "worker-defaults",
+]
 
 [[package]]
 name = "foldhash"
@@ -80,6 +113,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
+name = "keep-session"
+version = "0.1.0"
+dependencies = [
+ "plex",
+ "worker-defaults",
+]
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,6 +146,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin"
+version = "0.1.0"
+dependencies = [
+ "cluster-defaults",
+ "plex",
+]
+
+[[package]]
 name = "plex"
 version = "1.1.0"
 dependencies = [
@@ -119,6 +168,14 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "priority"
+version = "0.1.0"
+dependencies = [
+ "plex",
+ "worker-defaults",
 ]
 
 [[package]]
@@ -137,6 +194,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rebalance"
+version = "0.1.0"
+dependencies = [
+ "cluster-defaults",
+ "plex",
+]
+
+[[package]]
+name = "replicate"
+version = "0.1.0"
+dependencies = [
+ "cluster-defaults",
+ "plex",
 ]
 
 [[package]]
@@ -384,6 +457,13 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "worker-defaults"
+version = "0.1.0"
+dependencies = [
+ "plex",
 ]
 
 [[package]]

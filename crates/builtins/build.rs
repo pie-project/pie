@@ -34,7 +34,7 @@ fn main() {
     for dep in ["compat", "Cargo.toml", "Cargo.lock"] {
         println!("cargo:rerun-if-changed={}", inferlets.join(dep).display());
     }
-    for dep in ["Cargo.toml", "Cargo.lock"] {
+    for dep in ["cluster-defaults", "worker-defaults", "Cargo.toml", "Cargo.lock"] {
         println!("cargo:rerun-if-changed={}", policies.join(dep).display());
     }
     for dep in [
