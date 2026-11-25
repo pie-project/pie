@@ -618,11 +618,13 @@ impl Shell {
                 let fired_part = warm_part(&parts, at);
                 let r = self.warm_fire(shape);
                 // each program it traced, in the order serving meets them:
-                // decode first, by lanes, then drafts, mixed and prompts
-                let use_order = (use_rank(fired_part), shape.len() as u32);
+                // decode first, by lanes, then drafts, mixed and prompts, and
+                // a masked fire's after every plain one's
+                let masked = shape.iter().any(|w| w.masked);
+                let use_order = (masked, use_rank(fired_part), shape.len() as u32);
                 if let Some(deferred) = self.deferred.as_mut() {
                     for d in deferred.iter_mut().skip(before) {
-                        d.order = (use_order.0, use_order.1, d.rows);
+                        d.order = (use_order.0, use_order.1, use_order.2, d.rows);
                     }
                 }
                 if pass == 0 {
@@ -770,6 +772,7 @@ impl Shell {
                 let room = HostRoom::new(stated, floor);
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 let loaded = std::sync::atomic::AtomicUsize::new(0);
+                let loaded_masked = std::sync::atomic::AtomicUsize::new(0);
                 let full = std::sync::atomic::AtomicBool::new(false);
                 // One program's load: its text's bytes, `None` past the queue's
                 // end or with the host full or the loader stopped.
@@ -777,7 +780,7 @@ impl Shell {
                     if stop.load(SeqCst) || full.load(SeqCst) {
                         return None;
                     }
-                    let (key, code, sig, _) = queue.get(next.fetch_add(1, SeqCst))?;
+                    let (key, code, sig, (masked, ..)) = queue.get(next.fetch_add(1, SeqCst))?;
                     // no load beside a guest stage compile measuring its need
                     let _beside = crate::guest::run::load_beside();
                     let Some(reserved) = room.take(code.len()) else {
@@ -789,6 +792,7 @@ impl Shell {
                     match program {
                         Ok(Some(_)) => {
                             loaded.fetch_add(1, SeqCst);
+                            loaded_masked.fetch_add(usize::from(*masked), SeqCst);
                         }
                         Ok(None) => {
                             if let (Some(scope), crate::device::Code::Cached { name, .. }) =
@@ -879,9 +883,13 @@ impl Shell {
                 while batch(knee).is_some() {}
                 let loaded = loaded.load(SeqCst);
                 let left = queue.len().saturating_sub(loaded);
+                let masked = queue.iter().filter(|q| q.3.0).count();
+                let loaded_masked = loaded_masked.load(SeqCst);
                 tracing::info!(
                     loaded,
                     of = queue.len(),
+                    plain_left = (queue.len() - masked).saturating_sub(loaded - loaded_masked),
+                    masked_left = masked.saturating_sub(loaded_masked),
                     s = started.elapsed().as_secs_f64(),
                     stopped = stop.load(SeqCst),
                     host_full = full.load(SeqCst),

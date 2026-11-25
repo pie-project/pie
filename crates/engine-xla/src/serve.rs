@@ -277,9 +277,10 @@ pub(crate) struct Parked {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
-    /// Where it loads behind serving: (its ladder part's rank, the fire's
-    /// lanes, its rows), ascending (`warm::use_rank`).
-    order: (u8, u32, u32),
+    /// Where it loads behind serving: (a masked fire's program, its ladder
+    /// part's rank, the fire's lanes, its rows), ascending (`warm::use_rank`):
+    /// the programs only masked fires run after every plain one.
+    order: (bool, u8, u32, u32),
 }
 
 pub(crate) struct Deferred {
@@ -290,7 +291,7 @@ pub(crate) struct Deferred {
     probed: Vec<ValueId>,
     rows: u32,
     /// Set by the ladder as it traces the fire (`Parked::order`).
-    order: (u8, u32, u32),
+    order: (bool, u8, u32, u32),
 }
 
 /// The width a load's cached programs load behind serving at
@@ -3668,7 +3669,7 @@ impl Shell {
                     sig,
                     probed,
                     rows: descriptor.rows,
-                    order: (u8::MAX, 0, descriptor.rows),
+                    order: (true, u8::MAX, 0, descriptor.rows),
                 });
             }
             // A fire returning the readout entries: its row count's readout
