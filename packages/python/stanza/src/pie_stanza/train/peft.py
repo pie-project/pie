@@ -3,10 +3,12 @@ stanzas' banks, and bundles of those stanzas written back as PEFT adapters.
 
 Two stanzas have a PEFT form. `lora` holds PEFT LoRA with the scale folded
 into B (`alpha/r`, or `alpha/sqrt(r)` for rsLoRA) and the rank zero-padded to
-the bank's, as `crates/inferlet/src/eta/peft.rs` reads it. `ia3` holds PEFT
-IA3 on output rows as `l = l_peft - 1`, so a zero bank is the identity. The
-module each site corrects comes from `import.json`: the checkpoint tensor of
-param `layers.{l}.{site}`, without its `.weight`.
+the bank's. `ia3` holds PEFT IA3 on output rows as `l = l_peft - 1`, so a zero
+bank is the identity. PEFT's feedforward IA3, which scales the input of the
+MLP's down projection, reads into the `up` bank: down's input is
+`act(gate) * up`, so scaling it is scaling up's output. The module each site
+corrects comes from `import.json`: the checkpoint tensor of param
+`layers.{l}.{site}`, without its `.weight`.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from .bundle import read_bundle
 from .program import Bank, Program
 
 PREFIX = "base_model.model."
+TAPS = ("q", "k", "v", "o", "gate", "up", "down")
+"""The projections a dense layer's stanzas attach at."""
 
 
 def from_peft(peft_dir: str | os.PathLike, program: Program, *, stanza: str = "lora") -> dict[str, torch.Tensor]:
@@ -56,16 +60,28 @@ def from_peft(peft_dir: str | os.PathLike, program: Program, *, stanza: str = "l
                 planes[bank.name][:, :r] = t.float() * scale
     elif (stanza, kind) == ("ia3", "IA3"):
         feedforward = set(config.get("feedforward_modules") or [])
+        scaled = set()
         for name, t in tensors.items():
             if not name.endswith(".ia3_l"):
                 continue
             mod = _module(name, ".ia3_l")
-            bank = at.get((*module.get(mod, (None, None)), None))
+            layer, site = module.get(mod, (None, None))
+            if mod.rsplit(".", 1)[-1] in feedforward:
+                if site != "down" or t.shape[0] != 1:
+                    raise ValueError(f"adapter tensor `{name}` scales the input of a projection other than the "
+                                     "MLP's down; stanza `ia3` scales outputs")
+                site, l = "up", t.float()[0] - 1
+            elif t.shape[-1] == 1:
+                l = t.float()[:, 0] - 1
+            else:
+                raise ValueError(f"adapter tensor `{name}` is {list(t.shape)}, neither a row nor a column of scales")
+            bank = at.get((layer, site, None))
             if bank is None:
                 raise ValueError(f"adapter tensor `{name}` scales no projection stanza `ia3` adapts")
-            if mod.rsplit(".", 1)[-1] in feedforward or t.shape[-1] != 1:
-                raise ValueError(f"adapter tensor `{name}` scales its module's input; stanza `ia3` scales outputs")
-            planes[bank.name][:] = t.float()[:, 0] - 1
+            if bank.name in scaled:
+                raise ValueError(f"adapter tensor `{name}` scales bank `{bank.name}`, which another tensor scaled")
+            scaled.add(bank.name)
+            planes[bank.name][:] = l
     else:
         raise ValueError(f"from_peft reads PEFT LORA into stanza `lora` and IA3 into `ia3`, not {kind} into `{stanza}`")
     return planes
@@ -99,12 +115,11 @@ def to_peft(bundle_dir: str | os.PathLike, out_dir: str | os.PathLike, program: 
 
 
 def _modules(program: Program) -> dict[str, tuple[int, str]]:
-    """The checkpoint module of each adapted (layer, site), by module path."""
-    sites = {(b.layer, b.site) for b in program.banks}
+    """The checkpoint module of each tap's (layer, site), by module path."""
     out = {}
     for entry in program.imports:
         parts = entry["name"].split(".")
-        if len(parts) == 3 and parts[0] == "layers" and (int(parts[1]), parts[2]) in sites:
+        if len(parts) == 3 and parts[0] == "layers" and parts[2] in TAPS:
             out[entry["checkpoint"][0].removesuffix(".weight")] = (int(parts[1]), parts[2])
     return out
 
