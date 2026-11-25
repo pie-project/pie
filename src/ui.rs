@@ -405,6 +405,42 @@ impl Bar {
     }
 }
 
+/// Progress for a program reading the global `--json`: one line on stdout
+/// per update, `{"progress": phase, "done": D, "total": T}`, at most four a
+/// second and always the one that reaches the total. Human lines are printed
+/// beside it as before, and the answer is still printed last.
+pub struct JsonProgress {
+    phase: &'static str,
+    /// When the last line was printed, and the `done` it said.
+    last: std::sync::Mutex<Option<(std::time::Instant, u64)>>,
+}
+
+impl JsonProgress {
+    pub fn new(phase: &'static str) -> Self {
+        Self {
+            phase,
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn emit(&self, done: u64, total: u64) {
+        let done = done.min(total);
+        let now = std::time::Instant::now();
+        let mut last = self.last.lock().expect("progress clock poisoned");
+        if let Some((at, said)) = *last
+            && (done == said
+                || (done < total && now.duration_since(at) < std::time::Duration::from_millis(250)))
+        {
+            return;
+        }
+        *last = Some((now, done));
+        println!(
+            "{}",
+            serde_json::json!({ "progress": self.phase, "done": done, "total": total })
+        );
+    }
+}
+
 pub fn emit_json(value: &serde_json::Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())

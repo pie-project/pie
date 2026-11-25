@@ -911,10 +911,7 @@ fn adapter_of<B: Host>(
         })
         .collect();
     shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
+        .bind_adapter(instance, &planes)
         .map(Some)
         .map_err(fault)
 }
@@ -1247,7 +1244,12 @@ where
                 "the load's bodies armed before ready, on every arm, smallest first"
             );
         }
-        if B::RECORDS {
+        if let Some(why) = <B as crate::serve::Serve>::records_none(&shell.shelf).filter(|_| B::RECORDS) {
+            tracing::info!(
+                engine = B::KIND,
+                "{why}: every fire runs eager, stated at load, and none is recorded"
+            );
+        } else if B::RECORDS {
             tracing::info!(
                 engine = B::KIND,
                 "stated eager at load, each fire walked and never recorded: a fire past the \

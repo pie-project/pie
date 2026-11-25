@@ -47,7 +47,7 @@ struct Instance {
     inst: InterpInstance,
     geometry: GeometryClass,
     /// Its beam group's state on the device, where its program states each
-    /// beam's parent (`BEAM-PAGE-LISTS.md`).
+    /// beam's parent.
     beam: Option<crate::beam::Seat>,
 
     channels: Vec<ChannelId>,
@@ -187,8 +187,8 @@ impl Latch {
         faults.fault_lanes(lane..lane + 1, Some(instance), why);
     }
 
-    /// Beam group `instance`'s common slot as the step's head step left it
-    /// (`BEAM-PAGE-LISTS.md` §11.3): told with its landing.
+    /// Beam group `instance`'s common slot as the step's head step left it:
+    /// told with its landing.
     pub(crate) fn beam_common(&self, instance: InstanceId, slot: u32) {
         self.lane_faults
             .lock()

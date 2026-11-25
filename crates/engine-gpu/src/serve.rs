@@ -391,6 +391,20 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
+    /// Every recording dropped and none made again, `why`: each fire from
+    /// here walks eagerly, as its plan states (a backend that records).
+    fn refuse_recording(shelf: &mut Self::Shelf, why: &'static str) {
+        let _ = why;
+        Self::forget(shelf);
+    }
+
+    /// Why this load records no fire at all, where it records none (its
+    /// weights stream): every fire runs eager, stated at load.
+    fn records_none(shelf: &Self::Shelf) -> Option<&'static str> {
+        let _ = shelf;
+        None
+    }
+
     /// The pool's segments were backed or given back: a backend whose kept
     /// steps bind them by place rebinds each to what stands there now; one
     /// whose kept steps hold the segments' buffers forgets them. Called with
@@ -1437,7 +1451,6 @@ pub struct Shell<B: Serve> {
 
     adapters: crate::adapter::Slots,
 
-    blobs: crate::blob::Store,
 
     held: Vec<u32>,
 
@@ -3250,7 +3263,6 @@ impl<B: Serve> Shell<B> {
             adapters: adapter_slots,
 
             beam_appended: std::sync::Mutex::new(std::collections::HashMap::new()),
-            blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             bound: 0,
             rs_layout,
@@ -4938,8 +4950,20 @@ impl<B: Serve> Shell<B> {
         // stage; a routed expert's between a recording's segments, one cut a
         // layer with an expert in no slot, so a recording stands only while
         // those layers do (and the stage they bind with them).
+        // Only the load's arm walk records: once armed, recordings dropped
+        // are made again by none, so every fire from here runs eager, stated
+        // here by name.
         if self.expert_caches.staged_layers() != staged {
-            B::forget(&mut self.shelf);
+            if self.armed && B::RECORDS {
+                const WHY: &str = "a weight residency change staged a routed expert layer";
+                tracing::warn!(
+                    "{WHY}: every recording is dropped and every fire from here runs eager \
+                     (counted eager)"
+                );
+                B::refuse_recording(&mut self.shelf, WHY);
+            } else {
+                B::forget(&mut self.shelf);
+            }
         }
         Ok(())
     }
@@ -5899,52 +5923,26 @@ impl<B: Serve> Shell<B> {
         self.weights.banks()
     }
 
+    /// Binds instance `instance`'s adapter, `planes` its program's lora
+    /// sink laid at bind: a slot of its own, its planes registered there
+    /// the first time it is taken.
     pub fn bind_adapter(
         &mut self,
-        source: crate::adapter::Source<'_>,
+        instance: engine::program::InstanceId,
+        planes: &[crate::weights::AdapterPlane<'_>],
     ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
+        let key = crate::adapter::Key::Instance(instance);
         let grant = self.adapters.acquire(key.clone())?;
         if !grant.fresh {
             return Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: false,
                 key,
             });
         }
-
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights.register_adapter(grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.bank_seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(grant.slot, &planes)
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
-        match landed {
+        match self.weights.register_adapter(grant.slot, planes) {
             Ok(()) => Ok(crate::adapter::Binding {
                 slot: grant.slot,
-                shared,
                 landed: true,
                 key,
             }),
@@ -5953,10 +5951,6 @@ impl<B: Serve> Shell<B> {
                 Err(why)
             }
         }
-    }
-
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.blobs.mount(root);
     }
 
     #[must_use]

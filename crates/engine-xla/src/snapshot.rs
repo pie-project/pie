@@ -1,4 +1,4 @@
-//! Snapshots inside a pass (CONTRACT-BC 16): a lane's recurrent state as of
+//! Snapshots inside a pass: a lane's recurrent state as of
 //! interior rows, each landed in a record of its own.
 //!
 //! The scans on this backend (the gated delta's chunked HLO and Mosaic

@@ -9,7 +9,6 @@ pub mod arena;
 pub mod armed;
 pub mod backend;
 pub mod beam;
-pub mod blob;
 pub mod books;
 pub mod chunks;
 pub mod clock;

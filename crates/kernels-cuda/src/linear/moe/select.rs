@@ -195,7 +195,8 @@ pub fn matmul_select_on(
 }
 
 /// The leg [`matmul_select`] takes: of [`legs`], the one [`price`] puts
-/// lowest on this device's roofline, a tie to the first.
+/// lowest on this device's roofline, a tie to the first; the first where the
+/// load states no roofline.
 #[cfg(feature = "cuda")]
 pub fn cheapest(
     ctx: &Ctx,
@@ -207,13 +208,20 @@ pub fn cheapest(
 ) -> Result<Leg, Error> {
     const OP: &str = "linear.moe_select";
     let fan = selected(OP, x, routes, y)?;
-    let roof = ctx.tuning().roof.rates().ok_or_else(|| {
+    let legs = legs(x, bank, y, experts);
+    let none = || {
         refuse(
             OP,
-            "the routed select prices its legs on the device's roofline, and this load's \
-             profile states no `[rates]`",
+            format!(
+                "no leg takes a {:?} select over a {:?} bank at K {}",
+                x.dtype, bank.dtype, x.width
+            ),
         )
-    })?;
+    };
+    // No roofline: a load that skips measuring on a card no layer rates.
+    let Some(roof) = ctx.tuning().roof.rates() else {
+        return legs.first().copied().ok_or_else(none);
+    };
     let cores = Cores::of(ctx, experts).ok_or_else(|| {
         refuse(
             OP,
@@ -227,15 +235,7 @@ pub fn cheapest(
         n: y.width,
         k: x.width,
     };
-    pick(&legs(x, bank, y, experts), shape, cores, roof).ok_or_else(|| {
-        refuse(
-            OP,
-            format!(
-                "no leg takes a {:?} select over a {:?} bank at K {}",
-                x.dtype, bank.dtype, x.width
-            ),
-        )
-    })
+    pick(&legs, shape, cores, roof).ok_or_else(none)
 }
 
 /// Of `legs`, the one [`price`] puts lowest, a tie to the first; `None` for

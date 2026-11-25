@@ -29,14 +29,14 @@ impl Run<'_> {
 
     /// The committed scan's tables for the state `state`: its band's lane
     /// table of record piece ids.
-    pub(crate) fn rs_committed(&self, seat: &Seat, state: poem_ir::ValueId) -> Committed {
-        Committed {
+    pub(crate) fn rs_committed(&self, seat: &Seat, state: poem_ir::ValueId) -> crate::run::Ran<Committed> {
+        Ok(Committed {
             replay: seat.replay,
             commit: seat.commit,
             slots: self.lane_slots(state).unwrap_or(seat.slots),
-            lane0: self.window().span.lane_offset,
+            lane0: self.window()?.span.lane_offset,
             ext_replay: seat.ext_replay_table,
-        }
+        })
     }
 
     /// Queues one copy of `bytes` from `src` to `dst` on `copies`.
@@ -124,10 +124,10 @@ impl Run<'_> {
             ),
         })?;
         let ext = seat.ext_in[plane];
-        let own = self.tensor(value);
+        let own = self.tensor(value)?;
         let row_bytes = seat.layout.planes[plane].row_bytes;
-        let indptr = self.qo_indptr_host();
-        let lane0 = self.window().span.lane_offset;
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset;
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
@@ -181,8 +181,8 @@ impl Run<'_> {
         plane: usize,
         own: Tensor,
     ) -> Result<(), Error> {
-        let indptr = self.qo_indptr_host();
-        let lane0 = self.window().span.lane_offset;
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset;
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
@@ -243,7 +243,7 @@ impl Run<'_> {
         ext: Tensor,
         dest: ValueId,
     ) -> Result<(), Error> {
-        let target = self.tensor(dest);
+        let target = self.tensor(dest)?;
         if crate::diag::on().rs_trace {
             eprintln!(
                 "rs_land {op}: ext buf {} rows {} width {} {:?} -> target buf {} rows {} width {} {:?}; window {:?}",
@@ -263,8 +263,8 @@ impl Run<'_> {
                 op,
                 detail: format!("{:?} has no element size", ext.dtype),
             })?;
-        let indptr = self.qo_indptr_host();
-        let lane0 = self.window().span.lane_offset;
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset;
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
@@ -335,10 +335,10 @@ impl Run<'_> {
             ssm::causal_conv1d_group_fold(
                 self.ctx(),
                 folds,
-                self.window_lanes(),
-                self.rs_committed(seat, conv.state).slots,
+                self.window_lanes()?,
+                self.rs_committed(seat, conv.state)?.slots,
                 paged,
-                &self.recurrent(conv.state),
+                &self.recurrent(conv.state)?,
                 ext_y.width,
                 conv.conv_width,
                 conv.dilation,
@@ -346,22 +346,22 @@ impl Run<'_> {
         }
         if fits {
             let source = match paged {
-                Some(_) => self.tensor(conv.x),
+                Some(_) => self.tensor(conv.x)?,
                 None => self.rs_extend(OP, seat, conv.x)?,
             };
             ssm::causal_conv1d_verify(
                 self.ctx(),
                 source,
                 paged,
-                self.qo_indptr(),
-                &self.rs_committed(seat, conv.state),
+                self.qo_indptr()?,
+                &self.rs_committed(seat, conv.state)?,
                 conv.weight,
-                &self.recurrent(conv.state),
+                &self.recurrent(conv.state)?,
                 conv.conv_width,
                 conv.dilation,
                 ext_y,
-                self.tensor(y),
-                self.rs_snapshots(conv.state),
+                self.tensor(y)?,
+                self.rs_snapshots(conv.state)?,
                 // The carried scan (a decode window over the corrected
                 // planes, through a page table) reads its own row alone.
                 paged.is_some()
@@ -370,8 +370,8 @@ impl Run<'_> {
                         .in_of
                         .get(&y.0)
                         .is_some_and(|&plane| seat.layout.planes[plane].role == crate::rs::Role::Keys)
-                    && self.rs_snapshots(conv.state).is_none()
-                    && self.carried_window(seat),
+                    && self.rs_snapshots(conv.state)?.is_none()
+                    && self.carried_window(seat)?,
             )?;
             return Ok(ext_y);
         }
@@ -379,14 +379,14 @@ impl Run<'_> {
         ssm::causal_conv1d_committed_landing(
             self.ctx(),
             ext_x,
-            self.qo_indptr(),
-            &self.rs_committed(seat, conv.state),
+            self.qo_indptr()?,
+            &self.rs_committed(seat, conv.state)?,
             conv.weight,
-            &self.recurrent(conv.state),
+            &self.recurrent(conv.state)?,
             conv.conv_width,
             conv.dilation,
             ext_y,
-            self.rs_snapshots(conv.state),
+            self.rs_snapshots(conv.state)?,
         )?;
         self.rs_land(OP, seat, ext_y, y)?;
         Ok(ext_y)

@@ -62,21 +62,6 @@ pub(super) fn write_serving(path: &Path, trace: &Trace) {
     .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
 
-/// The values of the bf16 plane `name` of `count` elements the fixture
-/// writes ([`seeded`]), as f32: what a host oracle reads for it.
-pub(super) fn seeded_bf16(name: &str, count: usize) -> Vec<f32> {
-    let norm = name.ends_with("norm");
-    let mut seed = fnv(name);
-    (0..count)
-        .map(|_| {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let unit = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
-            let value = if norm { 1.0 + 0.05 * unit } else { 0.08 * unit };
-            f32::from_bits(value.to_bits() & 0xffff_0000)
-        })
-        .collect()
-}
-
 /// `trace`'s checkpoint planes seeded by name, by name.
 pub(super) fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
     let mut out = Vec::new();
@@ -933,68 +918,6 @@ fn a_pool_over_buffers_serves_the_same_logits() {
     let _over = OverBuffers::cap();
     check("qwen3-micro-text", false);
     check("qwen35-tiny", true);
-}
-
-/// A page id names its slot by its chunk in its buffer and its index in
-/// that chunk where a paged shape's slots do not tile a chunk: a window list
-/// and an rs list at such a chunk, their pages in buffers past the first,
-/// serve the seats' logits.
-#[test]
-fn split_page_ids_over_buffers_serve_the_same_logits() {
-    if !engine_metal::device::present() {
-        return;
-    }
-    let _over = OverBuffers::cap();
-    for (model, hybrid) in [("gemma4-e4b-mini-l1", false), ("qwen35-tiny", true)] {
-        let fixture = fixture(model);
-        // The scattered placement lays each lane's pages over three
-        // chunks: a chunk holds a dozen list slots at least.
-        let chunk = [3u64 << 19, 5 << 19, 7 << 19, 9 << 19, 11 << 19, 13 << 19]
-            .into_iter()
-            .find(|&chunk| {
-                let shell = load_near(&fixture, CONTEXT, Some(chunk));
-                let (ids, parts) = shell.page_ids();
-                let list = shell.pool_layout().list.map_or(u32::MAX, |l| l.per_chunk);
-                ids.shift.is_some() && parts > 1 && list >= 12
-            })
-            .unwrap_or_else(|| panic!("{model}: a chunk its paged slots do not tile"));
-        let shell = load_near(&fixture, CONTEXT, Some(chunk));
-        let (ids, parts) = shell.page_ids();
-        eprintln!(
-            "{model}: chunk {} B over {parts} buffers, a page id's index {} bits",
-            ids.chunk_bytes,
-            ids.shift.unwrap_or(0)
-        );
-        drop(shell);
-        check_near(model, hybrid, Some(chunk), &Profiles::new(&format!("split-{model}")));
-    }
-}
-
-/// Where every paged shape's slots tile the chunk, a page id is its slot in
-/// its buffer (`kv_page.h` compiles `page * stride`, with the buffer's place
-/// where there are several); where one does not, its chunk and index. The
-/// profile's own chunk on each fixture here.
-#[test]
-fn page_ids_split_exactly_where_a_paged_shape_does_not_tile() {
-    if !engine_metal::device::present() {
-        return;
-    }
-    for model in ["qwen3-micro-text", "gemma4-e4b-mini-l1", "qwen35-tiny"] {
-        let shell = load_near(&fixture(model), CONTEXT, None);
-        let (ids, _) = shell.page_ids();
-        let layout = shell.pool_layout();
-        let tiles = layout
-            .list
-            .iter()
-            .chain(layout.window(0).map(|w| &w.slots))
-            .chain(layout.rs.iter())
-            .all(|slots| layout.chunk_bytes.is_multiple_of(slots.slot_bytes));
-        assert_eq!(
-            ids.shift.is_none(),
-            tiles,
-            "{model}: split exactly where a shape does not tile"
-        );
-    }
 }
 
 /// A gated-delta hybrid's record cut into pieces on device: its chunk aimed

@@ -1,5 +1,5 @@
-//! A beam group's head program (`new-memory/designs/BEAM-PAGE-LISTS.md`
-//! §5–6), run in stream order before the fire whose beams it resolves: the
+//! A beam group's head program, run in stream order before the fire whose
+//! beams it resolves: the
 //! group's step over its state in its `Instance` run and the parents its
 //! last epilogue wrote (both read from the pool, never from the host), the
 //! forks' tail copies over every kv plane, and each beam's resolved page
