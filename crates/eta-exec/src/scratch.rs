@@ -331,16 +331,6 @@ impl ChunkLayout {
         u64::from(self.run).saturating_mul(self.chunk)
     }
 
-    /// The bytes an instance holds for it: the one piece's bytes where it
-    /// takes one inside a chunk (a run of slots), else whole runs of
-    /// chunks, one a piece.
-    #[must_use]
-    pub fn held_bytes(&self) -> u64 {
-        match self.ends[..] {
-            [only] if only <= self.chunk => only,
-            _ => u64::from(self.pieces()).saturating_mul(self.piece_bytes()),
-        }
-    }
 }
 
 /// Whether value `later`'s bytes may lie over value `earlier`'s, given the
