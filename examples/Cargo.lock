@@ -614,6 +614,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "stanza-chat"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "stanza-score"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

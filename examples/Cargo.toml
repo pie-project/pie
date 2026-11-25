@@ -32,6 +32,8 @@ members = [
     "qwen3-tts",
     "context-aware-decoding",
     "snapkv-eviction",
+    "stanza-chat",
+    "stanza-score",
     "tail-free-sampling",
     "text-completion",
     "text-completion-bench",
