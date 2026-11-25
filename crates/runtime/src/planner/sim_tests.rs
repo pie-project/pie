@@ -3106,6 +3106,21 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
             format!("{} in_flight={}", inner.plan_fields(key).0, !inner.nothing_in_flight())
         })
     });
+    // Beside a reader a stuck head waits for its end, but not at a rung that
+    // holds room.
+    if let Some(shared) = &ctx.stores.shared
+        && ctx.walks
+        && !ctx.pinned.lock().unwrap().is_empty()
+        && planner.stuck_head().is_some()
+    {
+        let (rung, lowest) = {
+            let shared = shared.lock().unwrap();
+            (shared.rung(), shared.rungs().first().copied().unwrap_or(0))
+        };
+        if rung > lowest {
+            return Err(fail("rung", format!("a head is stuck at rung {rung}: {}", planner.debug_queue())));
+        }
+    }
     super::plan::PROGRESS_STRICT.with(|strict| strict.set(true));
     let passed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| planner.plan()));
     super::plan::PROGRESS_STRICT.with(|strict| strict.set(false));
@@ -3674,12 +3689,13 @@ fn the_simulated_fleet_settles_every_step_on_its_seeds() {
 
 /// The same with idle cache beside the fleet: no waiter is left to cache a
 /// reader pins, to filed pages no fire comes after, to a rung held for cache
-/// that gives nothing, or to a tier full of cache ([`Workload::with_idle_cache`]).
+/// that gives nothing, or to a tier full of cache, and none is failed for
+/// room a reader gives back (seed 4) ([`Workload::with_idle_cache`]).
 #[test]
 fn the_simulated_fleet_settles_beside_idle_cache_on_its_seeds() {
     let mut failures = Vec::new();
     let mut coverage = Coverage::default();
-    for seed in SEEDS {
+    for seed in SEEDS.into_iter().chain([4]) {
         let (found, covered) = run(&Workload::with_idle_cache(seed), None);
         coverage.add(&covered);
         failures.extend(found.into_iter().map(|failure| (seed, failure)));

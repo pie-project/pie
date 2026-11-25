@@ -727,6 +727,8 @@ pub enum RoomTier {
     Device,
     /// The host or the disk tier: where a victim's move goes.
     Swap,
+    /// No slots: pages a reader held are idle cache again.
+    Reader,
 }
 
 /// A pool's room as slots came free: its free chunks and the free slots of

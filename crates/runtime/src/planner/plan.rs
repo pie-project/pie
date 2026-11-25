@@ -116,6 +116,10 @@ impl ResidencyPlanner {
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
+        // What a reader held is idle cache again.
+        if self.returns.take_reader_ended() {
+            self.re_arm_idle_reclaim();
+        }
         // Edge-triggered: a wake on the generation the last no-step pass
         // ended on reads what that pass read, and plans nothing new. A
         // stuck head is said once and costs no pass until an event.
@@ -178,7 +182,6 @@ impl ResidencyPlanner {
         let mut on_grow = on_grow;
         let mut passed = false;
         while !on_grow && let Some(stuck) = self.stuck_head() {
-            self.idle_stuck();
             self.with_inner(|inner| inner.passed.push(stuck));
             passed = true;
             on_grow = self.plan_once();
@@ -617,6 +620,10 @@ impl ResidencyPlanner {
         else {
             return;
         };
+        // A reader's end gives room back and plans again: a wait on it.
+        if self.port.readers_hold() {
+            return;
+        }
         // Every tier full with nothing runnable: no step can come, and the
         // lowest in the policy's order fails by name so the others proceed
         // ([`Self::fail_tiers_full`]): never read as a planner bug. Short
@@ -820,7 +827,7 @@ impl ResidencyPlanner {
     /// that free pages would serve, nothing in flight). Read once a pass
     /// where the stall dump read its head before: a firing fleet's pass
     /// pays nothing more.
-    fn stuck_head(&self) -> Option<(EntryKey, ProcessId)> {
+    pub(super) fn stuck_head(&self) -> Option<(EntryKey, ProcessId)> {
         let stuck = self.with_inner(|inner| {
             let Some((key, waiter)) = inner.unmet_head() else {
                 // No head at all (none passed over): none to say again.

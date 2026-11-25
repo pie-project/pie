@@ -531,15 +531,6 @@ pub fn planner_idle_gives(model: usize, engine: usize) -> bool {
     crate::planner::planner_for(model, engine).is_some_and(|planner| planner.idle_gives())
 }
 
-/// Idle cache of `engine`'s is asked for `chunks` whole chunks for a bind
-/// outside the planner's queue
-/// ([`crate::planner::ResidencyPlanner::ask_idle_for`]).
-pub fn ask_idle_for(model: usize, engine: usize, chunks: u32) {
-    if let Some(planner) = crate::planner::planner_for(model, engine) {
-        planner.ask_idle_for(chunks);
-    }
-}
-
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where
 /// none asks.
 #[must_use]

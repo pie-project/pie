@@ -924,6 +924,7 @@ impl ResidencyPlanner {
             // the tiers below and nothing is in flight that frees any.
             let tier_full = (host_short || !unhostable.is_empty() || blocked)
                 && self.with_inner(|inner| inner.truly_wedged())
+                && !self.port.readers_hold()
                 && !self.waits_on_policy();
             // Before anyone fails, the device's room after a compaction:
             // where moving chunks stands the head's runs, a compaction is

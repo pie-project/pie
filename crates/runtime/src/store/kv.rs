@@ -283,6 +283,9 @@ pub struct KvStore {
     owners: HashMap<ProcessId, usize>,
     /// Not on a model with recurrent state, whose KV alone resumes nothing.
     keeps: bool,
+    /// The readers outside the fleet, and who is told as one ends.
+    readers: usize,
+    reader_signal: Option<super::slots::RoomSignal>,
     kept: u64,
     page_size: u32,
     log_seq: u64,
@@ -427,6 +430,9 @@ fn runs(
 #[must_use]
 pub struct ReaderPin {
     nodes: Vec<NodeId>,
+    /// Read outside the fleet ([`KvStore::readers_hold`]); else by a fire
+    /// on its way.
+    outside: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -549,6 +555,8 @@ impl KvStore {
             splits: HashSet::new(),
             owners: HashMap::new(),
             keeps: false,
+            readers: 0,
+            reader_signal: None,
             kept: 0,
             page_size: 0,
             log_seq: 0,
@@ -588,13 +596,14 @@ impl KvStore {
         self.disk_pool = Pool::new(disk_slots);
     }
 
-    /// Calls `signal` each time host or disk slots come free: room a
-    /// waiter blocked on swap room (a victim's move with no slot below)
-    /// waits on.
+    /// Calls `signal` each time a reader outside the fleet ends, or host or
+    /// disk slots come free: room a waiter blocked on swap room (a victim's
+    /// move with no slot below) waits on.
     pub fn set_room_signal(&mut self, signal: super::slots::RoomSignal) {
         self.host_pool
             .set_room_signal(signal.clone(), super::slots::RoomTier::Swap);
-        self.disk_pool.set_room_signal(signal);
+        self.disk_pool.set_room_signal(signal.clone());
+        self.reader_signal = Some(signal);
     }
 
     pub fn set_domain(&mut self, domain: Hash256) {
@@ -2449,9 +2458,9 @@ impl KvStore {
     pub fn commit_promote(&mut self, mut txn: KvResidencyTxn) -> Result<ReaderPin, KvStoreError> {
         let pinned = std::mem::take(&mut txn.pinned);
         match self.commit_restore(txn) {
-            Ok(_) => Ok(ReaderPin { nodes: pinned }),
+            Ok(_) => Ok(ReaderPin { nodes: pinned, outside: false }),
             Err(error) => {
-                self.release_reader(ReaderPin { nodes: pinned });
+                self.release_reader(ReaderPin { nodes: pinned, outside: false });
                 Err(error)
             }
         }
@@ -2648,9 +2657,11 @@ impl KvStore {
             }
         }
         self.table.pin(last.node);
+        self.readers += 1;
         Some((
             ReaderPin {
                 nodes: vec![last.node],
+                outside: true,
             },
             ids,
         ))
@@ -2665,7 +2676,8 @@ impl KvStore {
     ) -> Result<(ReaderPin, page_table::ExportedSet), KvStoreError> {
         let set = self.table.exported(ws)?;
         let nodes = self.table.pin_working_sets(&HashSet::from([ws]))?;
-        Ok((ReaderPin { nodes }, set))
+        self.readers += 1;
+        Ok((ReaderPin { nodes, outside: true }, set))
     }
 
     /// A working set of its own from what `slots` hold.
@@ -2688,6 +2700,22 @@ impl KvStore {
         let epoch = self.current_epoch();
         self.recycle_backings(freed, epoch);
         self.retire_idle();
+        if pin.outside {
+            self.readers -= 1;
+            if let Some(signal) = &self.reader_signal {
+                (signal.0)(super::slots::RoomCount {
+                    tier: super::slots::RoomTier::Reader,
+                    chunks: 0,
+                    slots: 0,
+                });
+            }
+        }
+    }
+
+    /// Whether a reader outside the fleet holds pages here
+    /// ([`Self::pin_resident`], [`Self::export`]).
+    pub fn readers_hold(&self) -> bool {
+        self.readers > 0
     }
 
     /// Told when pages may have joined the cache (a fire's pages settle, a
