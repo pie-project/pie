@@ -183,7 +183,6 @@ fn device_boot(
         comm: None,
         knobs,
         cache_dir: Some(cache_dir.to_path_buf()),
-        adapter_dir: None,
     })
 }
 
