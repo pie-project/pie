@@ -8,7 +8,7 @@ use eta_compiler::codegen::wgsl::{WGSL_STEP_EMITTER_VERSION, step_calls, step_mo
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 91, 0x74b3_421c_412c_2832),
     ("hip", 51, 0x8893_b738_f804_fae0),
-    ("metal", 81, 0x4c31_90cd_f0f6_09e0),
+    ("metal", 82, 0xefbc_e74f_7bf6_be5c),
 ];
 
 /// The stepwise WGSL emitter's version and the fingerprint of what it
@@ -36,7 +36,7 @@ fn fingerprint(backend: Backend) -> u64 {
         bytes.extend_from_slice(&(kernel.kind as u32).to_le_bytes());
         bytes.extend_from_slice(&kernel.stage_index.to_le_bytes());
         bytes.extend_from_slice(&kernel.region_index.to_le_bytes());
-        for text in [&kernel.entry_name, &kernel.source, &kernel.error] {
+        for text in [&*kernel.entry_name, &*kernel.source, &*kernel.error] {
             bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
             bytes.extend_from_slice(text.as_bytes());
         }
