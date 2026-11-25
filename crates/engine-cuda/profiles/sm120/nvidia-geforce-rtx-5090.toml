@@ -66,6 +66,7 @@ dag_streams_until = 256
 prefill_lattice_from = 384  # 2.9% faster end to end
 working_set_percent = 75  # 4.9% faster end to end
 walk_fire_rows = 1024
+# copied from the PRO 6000 (#1325), not measured on this card
 fire_rows = 5120
 # one recurrent-state slot a lane, as the RTX PRO 4500 (the PRO 6000 asks two): on 32 GB the doubled KDA slab seated
 # Kimi-K3 mini4 229 sequences, c256 8.22k -> 9.09k tok/s, Qwen3.8-27B mini20 c128 3.48k -> 4.16k; unstated, a fixed

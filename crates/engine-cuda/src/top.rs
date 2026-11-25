@@ -135,6 +135,27 @@ pub fn narrowest(rungs: &[RungFacts], lanes: u32) -> Result<u32> {
         })
 }
 
+/// The fire top a device's profile states (`engine.fire_rows`, from a
+/// measured sweep): the widest feasible rung at or under `stated`, the
+/// estimate not weighed. What the room leaves only lowers it, as it lowers
+/// any top (`serve::load::room`). Refused, with the widest rung's reason,
+/// where none is feasible.
+pub fn stated(rungs: &[RungFacts], stated: u32) -> Result<u32> {
+    rungs
+        .iter()
+        .filter(|r| r.infeasible.is_none() && r.tokens <= stated)
+        .map(|r| r.tokens)
+        .max()
+        .ok_or_else(|| {
+            let why = rungs.last().and_then(|r| r.infeasible);
+            Fault::Card(format!(
+                "no rung at or under the stated fire top of {stated} rows \
+                 (`engine.fire_rows`) is feasible: {}",
+                why.unwrap_or("the load offers none")
+            ))
+        })
+}
+
 /// The rows of the tile each dense bf16 product of `m x n x k` computes
 /// under `chip`, as `kernels_cuda::linear::gemm` selects its kernel: few
 /// rows a streaming skeleton covers (up to the rows skeleton's 16) stream
@@ -231,4 +252,45 @@ pub fn choose(
     counts: &Counts,
 ) -> std::result::Result<(TopRung, engine::load::FireEstimate), engine::load::Refused> {
     engine::load::choose_shaped(rungs, live, context, rates, device, counts, shape)
+}
+
+#[cfg(test)]
+mod stated_tests {
+    use super::*;
+
+    fn rung(tokens: u32, infeasible: Option<&'static str>) -> RungFacts {
+        RungFacts {
+            tokens,
+            lanes: tokens.min(256),
+            keys: tokens,
+            launches: 1,
+            padded_rows: tokens,
+            span_bytes: u64::from(tokens),
+            infeasible,
+            fire_lanes: 256,
+        }
+    }
+
+    /// A stated fire top is the widest feasible rung at or under it, never
+    /// a wider one, and a rung past the room is passed over for the next.
+    #[test]
+    fn a_stated_fire_top_is_the_widest_feasible_rung_under_it() {
+        let rungs = [
+            rung(2048, None),
+            rung(4096, None),
+            rung(4871, None),
+            rung(5312, None),
+        ];
+        assert_eq!(stated(&rungs, 5120).unwrap(), 4871);
+        assert_eq!(stated(&rungs, 4096).unwrap(), 4096);
+        let short = [
+            rung(2048, None),
+            rung(4096, Some("no room")),
+            rung(4871, Some("no room")),
+        ];
+        assert_eq!(stated(&short, 5120).unwrap(), 2048);
+        let none = [rung(4096, Some("no room"))];
+        let why = stated(&none, 4096).unwrap_err().to_string();
+        assert!(why.contains("engine.fire_rows"), "{why}");
+    }
 }
