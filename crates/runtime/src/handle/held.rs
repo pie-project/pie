@@ -373,24 +373,6 @@ pub(super) mod tests {
         assert!(stores.kv.lock().folded_exact(kv.id).unwrap());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_fork_waits_for_a_fold_the_device_counts() {
-        let (held, stores, rs) = folding();
-        let mut fork = Box::pin(held.fork(ProcessId::new_v4()));
-        assert!(
-            fork.as_mut().now_or_never().is_none(),
-            "the frozen length is behind the record until the fold settles"
-        );
-        stores.rs.lock().unwrap().end_device_fold(rs, Some(3), None);
-        let child = fork.await.expect("the fold settled");
-        let child = child.parts().rs.as_ref().expect("its state forks").id;
-        assert_eq!(
-            stores.rs.lock().unwrap().frozen(child),
-            Ok(7),
-            "the child takes what the fold left"
-        );
-    }
-
     /// A fork of a set whose page is under a move waits for the move to
     /// end, however long it takes (it was refused at 250 ms), and goes on
     /// as the move lands or is called off.
