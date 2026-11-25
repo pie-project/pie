@@ -1,0 +1,16 @@
+# Steer: a learned vector written into the residual stream at 1/4, 1/2 and 3/4 depth,
+# plus a rank-4 edit of what the MLP writes there. A zero slot is the base model.
+RANK = 4
+
+def banks(tap):
+    if tap.site == "down" and tap.layer in (tap.layers // 4, tap.layers // 2, 3 * tap.layers // 4):
+        return struct(
+            c = weight([tap.slots, tap.fan_out]).registered(),
+            a = weight([tap.slots, RANK, tap.fan_in]).registered(init = "kaiming"),
+            b = weight([tap.slots, tap.fan_out, RANK]).registered(),
+        )
+    return None
+
+def apply(tap, x, y, w, routes):
+    y = ops.linear.lora_correct(x, w.a, w.b, routes, y)                    # + B A x
+    return ops.elemwise.add(y, ops.gather.embed(routes, w.c, tap.slots))   # + c
