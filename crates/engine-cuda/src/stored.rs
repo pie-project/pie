@@ -46,6 +46,16 @@ impl Keys {
         Keys { on, codes }
     }
 
+    /// The keys of a device stated as `on`, for a test with no device.
+    #[cfg(test)]
+    pub(crate) fn stated(on: &str) -> Keys {
+        use kernels_cuda::stored::{BLASLT, LIBRARY_KERNELS};
+        Keys {
+            on: on.to_string(),
+            codes: vec![(LIBRARY_KERNELS, 1), (BLASLT, 2)],
+        }
+    }
+
     /// Every kernel library's code, as one line.
     #[must_use]
     pub fn codes_said(&self) -> String {
