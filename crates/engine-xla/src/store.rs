@@ -141,7 +141,7 @@ enum Seat {
 }
 
 pub struct Pools {
-    /// The windowed layers whose rings the record holds (CONTRACT-BC 21),
+    /// The windowed layers whose rings the record holds,
     /// as the load states them ([`Pools::set_windowed`]).
     windowed: Vec<engine::chunk::WindowedLayer>,
     /// The pool; `None` while a program holds it (or on a dry device).
@@ -558,7 +558,7 @@ impl Pools {
         // the slab at its start, so one slab is every fire's; the frames in
         // flight hold their copies in the host ring.
         let chunk_rows = layout.chunk_bytes / ROW_BYTES;
-        // The own-row pages of the windowed state (CONTRACT-BC 19): a fire's
+        // The own-row pages of the windowed state: a fire's
         // rows past its window buffer the ring cannot take whole while the
         // fire reads them, each laid as a window-buffer slot, after the
         // staged inputs at a page's grain.
@@ -1015,7 +1015,7 @@ impl Pools {
                         rate: 1,
                         window: None,
                     },
-                    // the window buffer (CONTRACT-BC 19, 21)
+                    // the window buffer
                     Kind::Window { .. } => SlotKind::List {
                         tokens: shape.tokens,
                         rate: 1,

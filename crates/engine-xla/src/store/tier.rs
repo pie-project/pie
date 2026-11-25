@@ -1,4 +1,5 @@
-//! The host and disk tiers of the shared pool (CONTRACT-BC 22): host chunks
+//! The host and disk tiers of the shared pool (a chunk's slots kept below the
+//! device, laid as on it, moved back whole when a lane needs them): host chunks
 //! of the device's chunk size in host memory, every state shape laid in them
 //! exactly as on the device (`SlotShape::tier_offset`); and the slot file,
 //! kv list slots only, slot `r` at `r · S`.
