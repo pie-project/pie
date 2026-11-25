@@ -40,6 +40,13 @@ const SUPPORTED: &[&str] = &[
     tables::SHARE_GROUPS,
 ];
 
+/// The time one call of a policy may take, and so what one that decides
+/// arrivals adds to the gate's bound: the PLEX host's own.
+#[must_use]
+pub fn call_deadline() -> Duration {
+    Duration::from_millis(Config::default().deadline_ms)
+}
+
 /// How often the policies hear what the directory and the routing table
 /// hold.
 const STATE_TICK: Duration = Duration::from_secs(1);
@@ -187,14 +194,16 @@ fn gate_ms(config: &Config, gating: usize) -> u64 {
 impl Host {
     /// Starts the cluster policies `policies` names, (spec, component), in
     /// one PLEX host: each writes only the columns it imports, which no
-    /// other may.
+    /// other may, and each call of one takes `deadline` at most.
     pub fn start(
         policies: Vec<(String, Vec<u8>)>,
+        deadline: Duration,
         mut routing: watch::Receiver<RoutingTable>,
         mut directory: watch::Receiver<DirectoryView>,
     ) -> Result<Arc<Self>, LoadError> {
         let config = Config {
             supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             ..Config::default()
         };
         let mut host = PlexHost::new(config.clone());
@@ -228,20 +237,27 @@ impl Host {
                 move || run(host, config, loaded, rx, shared)
             })
             .map_err(|e| LoadError(format!("spawning the cluster port: {e}")))?;
-        // The workers as the policies first run, again whenever the routing
-        // table changes (a row naming a worker the host does not know is
-        // ignored), and the directory every tick.
+        // The workers before any process (a row naming a worker the host
+        // does not know is ignored), again whenever the routing table
+        // changes, and the directory every tick.
+        let mut state = move || {
+            let view = Arc::new(directory.borrow_and_update().clone());
+            let table = Arc::new(routing.borrow_and_update().clone());
+            (Event::State(view, table), routing.clone())
+        };
+        let (first, mut changes) = state();
+        let _ = events.send(first);
         let ticks = events.clone();
         tokio::spawn(async move {
             loop {
-                let view = Arc::new(directory.borrow_and_update().clone());
-                let table = Arc::new(routing.borrow_and_update().clone());
-                if ticks.send(Event::State(view, table)).is_err() {
-                    return;
-                }
                 tokio::select! {
                     _ = tokio::time::sleep(STATE_TICK) => {}
-                    changed = routing.changed() => if changed.is_err() { return },
+                    changed = changes.changed() => if changed.is_err() { return },
+                }
+                let (now, next) = state();
+                changes = next;
+                if ticks.send(now).is_err() {
+                    return;
                 }
             }
         });
@@ -976,6 +992,9 @@ mod tests {
         }
     }
 
+    /// What a call of a policy may take here: no load reaches it.
+    const CALL: Duration = Duration::from_secs(60 * 60);
+
     fn component(name: &str) -> Vec<u8> {
         builtins::policy(name).unwrap().component.to_vec()
     }
@@ -985,6 +1004,7 @@ mod tests {
         let config = Config {
             supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
             manual: true,
+            deadline_ms: CALL.as_millis() as u64,
             ..Config::default()
         };
         let host = PlexHost::new(config.clone());
@@ -1079,6 +1099,40 @@ mod tests {
         assert_eq!((copies(true), copies(false)), (1, 0));
     }
 
+    /// A process that arrives as the policies start is placed: they know the
+    /// workers before any process. The runtime's thread is kept from every
+    /// other task until the policies have heard.
+    #[tokio::test]
+    async fn a_process_that_arrives_first_is_placed() {
+        let table = RoutingTable {
+            epoch: 1,
+            author: None,
+            workers: vec![controller_api::RoutableWorker {
+                id: WorkerId(1),
+                addr: String::new(),
+                role: Role::Decode,
+                model: "m".into(),
+                engine: String::new(),
+                health: Health::Healthy,
+                coarse_load: Default::default(),
+            }],
+        };
+        let host = Host::start(
+            vec![("test-route".into(), component("test-route"))],
+            CALL,
+            watch::channel(table).1,
+            watch::channel(DirectoryView::default()).1,
+        )
+        .unwrap();
+        let decisions = host.decisions(GatewayId(0));
+        host.events(GatewayId(0), vec![arrived(7, &[("to", "\"1\"")], None)]);
+        while decisions.borrow().heard < 1 {
+            std::thread::yield_now();
+        }
+        let view = decisions.borrow().clone();
+        assert_eq!(view.placements[0].1.workers, Some(vec![WorkerId(1)]));
+    }
+
     /// A worker's policy writes columns no cluster enacts: it does not load
     /// here.
     #[test]
@@ -1096,6 +1150,7 @@ mod tests {
     fn an_exited_process_is_read_by_the_call_about_its_exit() {
         let host = PlexHost::new(Config {
             manual: true,
+            deadline_ms: CALL.as_millis() as u64,
             ..Config::default()
         });
         host.load("default", &component("default")).unwrap();
@@ -1180,6 +1235,7 @@ mod tests {
                 .collect();
             let host = Host::start(
                 programs,
+                call_deadline(),
                 watch::channel(RoutingTable {
                     epoch: 0,
                     workers: Vec::new(),
