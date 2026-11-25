@@ -18,6 +18,7 @@ members = [
     "noop",
     "pin",
     "priority",
+    "rebalance",
     "test-pause",
     "test-route",
     "test-share",

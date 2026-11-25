@@ -7,4 +7,5 @@ mod fair;
 mod keep_session;
 mod pin;
 mod priority;
+mod rebalance;
 mod rig;
