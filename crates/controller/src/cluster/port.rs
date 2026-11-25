@@ -965,6 +965,188 @@ mod tests {
         }
     }
 
+    fn component(name: &str) -> Vec<u8> {
+        builtins::policy(name).unwrap().component.to_vec()
+    }
+
+    /// A port over a host whose rounds the test runs, `policy` loaded.
+    fn port(policy: &str) -> Port {
+        let config = Config {
+            supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            manual: true,
+            ..Config::default()
+        };
+        let host = PlexHost::new(config.clone());
+        host.load(policy, &component(policy)).unwrap();
+        Port {
+            host,
+            config,
+            shared: Arc::new(shared(Tables::default(), DirectoryView::default())),
+            loaded: Vec::new(),
+            unheard: Vec::new(),
+            workers: HashSet::new(),
+            sets: HashMap::new(),
+            version: 0,
+        }
+    }
+
+    fn arrived(req: u64, props: &[(&str, &str)], prompt: Option<&str>) -> ProcessEvent {
+        ProcessEvent::Arrived {
+            req,
+            seq: 1,
+            tenant: "t".into(),
+            session: None,
+            props: props
+                .iter()
+                .map(|(name, json)| (name.to_string(), json.to_string()))
+                .collect(),
+            prompt: prompt.map(client_api::props::prompt_blocks).map(Into::into),
+        }
+    }
+
+    /// Two gateways number their requests alike: each reads the placement,
+    /// the termination and the arrivals heard of its own request alone, the
+    /// courier alone carries copies, and an exit ends its termination.
+    #[test]
+    fn each_gateway_reads_the_decisions_about_its_own_processes() {
+        let (one, two) = (GatewayId(1), GatewayId(2));
+        let mut port = port("test-route");
+        for id in ["1", "2"] {
+            port.host
+                .put_worker(id, false, vec![(Tier::Device, None, 0)], 0, 0, None);
+        }
+        port.apply(one, arrived(7, &[("to", "\"1\"")], None));
+        port.apply(two, arrived(7, &[("refuse", "\"not today\"")], None));
+        port.host.run(true);
+        let heard = port.host.heard();
+        let delta = port.host.poll_delta();
+        port.enact(delta);
+        port.hear(heard);
+
+        let first = decisions_of(&port.shared, one, false);
+        assert_eq!(first.heard, 1);
+        assert_eq!(first.placements.len(), 1);
+        assert_eq!(first.placements[0].0, 7);
+        assert_eq!(first.placements[0].1.workers, Some(vec![WorkerId(1)]));
+        assert!(first.terminated.is_empty());
+        let second = decisions_of(&port.shared, two, false);
+        assert_eq!(second.heard, 1);
+        assert!(second.placements.is_empty());
+        assert_eq!(second.terminated, [(7, "not today".to_string())]);
+        assert_eq!(
+            decisions_of(&port.shared, GatewayId(3), false).heard,
+            0,
+            "none of its arrivals"
+        );
+
+        let exited = ProcessEvent::Exited {
+            req: 7,
+            outcome: controller_api::Outcome::Cancelled,
+        };
+        port.apply(one, exited.clone());
+        assert_eq!(decisions_of(&port.shared, two, false).terminated.len(), 1);
+        port.apply(two, exited);
+        assert!(decisions_of(&port.shared, two, false).terminated.is_empty());
+
+        *port.shared.directory.write().unwrap() = Arc::new(DirectoryView {
+            groups: vec![(
+                [1; 32],
+                GroupView {
+                    keys: vec![[1; 32]],
+                    sites: vec![WorkerId(1)],
+                    site_tiers: Vec::new(),
+                    disk_sites: Vec::new(),
+                    persist_tokens: None,
+                },
+            )],
+            peers: vec![(WorkerId(1), "w1".into())],
+            ..DirectoryView::default()
+        });
+        port.shared.tables.write().unwrap().replicas_default = Some(vec![WorkerId(2)]);
+        let copies = |courier| decisions_of(&port.shared, two, courier).replicate.len();
+        assert_eq!((copies(true), copies(false)), (1, 0));
+    }
+
+    /// A worker's policy writes columns no cluster enacts: it does not load
+    /// here.
+    #[test]
+    fn a_worker_policy_does_not_load_in_the_cluster() {
+        let refused = port("noop")
+            .host
+            .load("default", &component("default"))
+            .unwrap_err();
+        assert!(refused.contains("cannot enact"), "{refused}");
+    }
+
+    /// A policy reads a process in the call that delivers its exit:
+    /// `default` learns there how much of what is retained was prompt.
+    #[test]
+    fn an_exited_process_is_read_by_the_call_about_its_exit() {
+        let host = PlexHost::new(Config {
+            manual: true,
+            ..Config::default()
+        });
+        host.load("default", &component("default")).unwrap();
+        host.put_worker("1", false, vec![(Tier::Device, None, 0)], 0, 0, None);
+        host.arrived(
+            "p",
+            None,
+            None,
+            Some("1".into()),
+            Some(100),
+            None,
+            Vec::new(),
+            0,
+        );
+        host.started("p");
+        host.run(true);
+        host.put_working_set(
+            "p",
+            None,
+            None,
+            None,
+            300,
+            0,
+            vec![("1".into(), Tier::Device, 300)],
+        );
+        host.exited("p", "completed", None, None, 0);
+        host.retained("p", "1");
+        host.run(true);
+        let rows = host.poll_delta().retention_priority.rows;
+        let mut keys: Vec<(Option<u32>, Option<i64>)> =
+            rows.into_iter().map(|(at, key)| (at.1, key)).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [(None, Some(-1)), (Some(100), Some(0))],
+            "its prompt above its tail"
+        );
+    }
+
+    /// A pending process is sized from its prompt's text, the tokens its
+    /// blocks are guessed at.
+    #[test]
+    fn a_pending_process_is_sized_from_its_prompt_text() {
+        let mut port = port("test-route");
+        let text = "x".repeat(640);
+        port.apply(GatewayId(0), arrived(1, &[], Some(&text)));
+        // `test-route` notes the prompt tokens of a process with a working
+        // set (`<prompt>/<set>:<copies>`).
+        port.host
+            .put_working_set("0.1", None, None, None, 0, 0, Vec::new());
+        port.host.run(true);
+        let seen = port
+            .host
+            .poll_delta()
+            .notes
+            .into_iter()
+            .find(|(_, _, name, _)| name == "seen");
+        let Some((_, _, _, Some(Value::Text(seen)))) = seen else {
+            panic!("no note: {seen:?}");
+        };
+        assert!(seen.starts_with("160/"), "{seen}");
+    }
+
     /// A policy gates launches by its imports: `default-cluster` places
     /// pending processes (`placement/workers`), so a launch under it waits
     /// at the gate, as under `test-route`; `noop` decides nothing and gates

@@ -934,13 +934,18 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(60)).await;
         }
         assert!(order.lock().unwrap().is_empty(), "every worker is full");
+        // One whose client went leaves the queue: it holds up none behind it.
+        waits.remove(0).abort();
         let mut room = table(0);
         room.epoch = 2;
         rig.table.send_replace(room);
         for wait in waits {
-            wait.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), wait)
+                .await
+                .expect("let through")
+                .unwrap();
         }
-        assert_eq!(*order.lock().unwrap(), [1, 2, 3]);
+        assert_eq!(*order.lock().unwrap(), [2, 3]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -967,6 +972,19 @@ mod tests {
             .unwrap()
             .unwrap();
         until_placed(&rig, &placed, None).await;
+    }
+
+    /// Policies that write different columns run beside each other, in
+    /// either order, each one's rows in force.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_policy_beside_another_places_what_it_places() {
+        for names in [["test-share", "test-route"], ["test-route", "test-share"]] {
+            let rig = rig_of(0, &names).await;
+            let placed = launch(1, serde_json::json!({"to": "1"}));
+            rig.router.admit(&placed, &rig.routing).await.unwrap();
+            until_placed(&rig, &placed, Some(vec![WorkerId(1)])).await;
+            assert!(!rig.host.decisions(GatewayId(0)).borrow().share.groups.is_empty());
+        }
     }
 
     /// The share grants a cluster policy writes (`pie:plex-ext/share-groups`)
