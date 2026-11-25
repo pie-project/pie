@@ -23,7 +23,7 @@
 use poem_ir::Request;
 
 use super::{Lane, Seated, Shell};
-use crate::device::{Admission, HostRoom, available_memory};
+use crate::device::{CompileGate, HostRoom};
 use crate::error::Result;
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
@@ -951,7 +951,7 @@ impl Shell {
         }
     }
 
-    /// Compiles what the ladder traced, a thread a core up to 8, and seats
+    /// Compiles what the ladder traced, a thread a core, and seats
     /// each program under its keys; answers how many programs it left out.
     /// A program a record names is parked, loaded behind serving
     /// (`Shell::load_behind`).
@@ -973,26 +973,12 @@ impl Shell {
             });
             index.push(at);
         }
-        // A compile's scratch is ~0.55 GiB a MiB of its text (v5e, Qwen3.6-
-        // 35B-A3B's 9 MiB pf256 programs: 5 GB each; eight v6e ones 108 GB
-        // at once): one is admitted while the host's free memory holds 0.75
-        // GiB a MiB for it and for every compile still running (one that
-        // started may not have taken its memory yet), each at its own text,
-        // not the ladder's longest (at that a v5e host ran Qwen3.6-35B-A3B's
-        // 168-program ladder one compile at a time, 73 compile-minutes past
-        // the hour a round has). A v5e host's 47 GB stopped answering at four
-        // started together.
+        // The room the programs held in host memory leave compiles.
         let need = texts
             .iter()
             .filter(|(c, _)| c.text().is_some())
             .map(|(c, _)| c.need())
             .max()
-            .unwrap_or(0);
-        let least = texts
-            .iter()
-            .filter(|(c, _)| c.text().is_some())
-            .map(|(c, _)| c.need())
-            .min()
             .unwrap_or(0);
         // A compiled program held in host memory takes what its load is
         // measured to take ([`HostRoom`]), and libtpu's allocator keeps what
@@ -1012,19 +998,12 @@ impl Shell {
         let stated = self.host_programs;
         let host_room = HostRoom::new(stated, 2 * need);
         let parked = std::sync::atomic::AtomicUsize::new(0);
-        // The compiles' room, fixed here: two compiles', or what a stated
-        // programs' room leaves of the free memory. A compile starts once
-        // its own need and every running one's fit in it, woken by a compile
-        // that ends (no poll of the free memory).
-        let admission = Admission::new(match stated {
-            Some(stated) => available_memory().map_or(u64::MAX, |b| b.saturating_sub(stated)),
-            None => 2 * need,
-        });
-        let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
+        // The compiles running, by what the ones before them grew the process
+        // by (`CompileGate`): as many as the cores, the free memory waiting
+        // for a compile to end where it would not hold another.
+        let admission = CompileGate::default();
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .min(8)
-            .min(room)
             .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
@@ -1063,7 +1042,7 @@ impl Shell {
                         }
                         let program = {
                             // a cached program loads, never compiled
-                            let _admitted = text.text().map(|t| admission.admit(t));
+                            let _admitted = text.text().map(|_| admission.admit());
                             device.prepare_code(text, (*sig).clone())
                         };
                         if let Some(r) = reserved {

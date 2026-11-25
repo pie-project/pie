@@ -1474,6 +1474,67 @@ pub(crate) fn compile_need(text: &str) -> u64 {
     ((hold_bytes(text) >> 6) * 3) << 8
 }
 
+/// Admits compiles by what those before them grew the process by: one starts
+/// once none runs, or while the host's free memory, read as it starts, holds
+/// the most a compile was measured to grow the process by (its resident
+/// growth over its run, over the most that ran beside it) for every compile
+/// running and itself, and no more than twice as many as have ended run (the
+/// first ones measure what the next admit on). A compile that does not fit
+/// waits for one to end.
+#[derive(Default)]
+pub(crate) struct CompileGate {
+    state: Mutex<GateState>,
+    ended: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    running: u64,
+    ended: u64,
+    largest: u64,
+}
+
+/// A compile the gate let in: its resident start and the most that ran
+/// beside it; its growth is measured as it ends.
+pub(crate) struct Gated<'a> {
+    by: &'a CompileGate,
+    resident: u64,
+}
+
+impl CompileGate {
+    /// Waits until a compile fits.
+    pub(crate) fn admit(&self) -> Gated<'_> {
+        let mut st = self.state.lock().expect("the compile gate's lock poisoned");
+        loop {
+            let fits = st.running == 0
+                || (st.running < 2 * st.ended
+                    && available_memory().is_none_or(|free| {
+                        free >= st.largest.saturating_mul(st.running + 1)
+                    }));
+            if fits {
+                break;
+            }
+            st = self.ended.wait(st).expect("the compile gate's lock poisoned");
+        }
+        st.running += 1;
+        Gated {
+            by: self,
+            resident: resident_bytes().unwrap_or(0),
+        }
+    }
+}
+
+impl Drop for Gated<'_> {
+    fn drop(&mut self) {
+        let mut st = self.by.state.lock().expect("the compile gate's lock poisoned");
+        let grew = resident_bytes().unwrap_or(0).saturating_sub(self.resident);
+        st.largest = st.largest.max(grew / st.running.max(1));
+        st.running -= 1;
+        st.ended += 1;
+        self.by.ended.notify_all();
+    }
+}
+
 /// Admits compiles into a host memory room fixed when it is made: one
 /// starts once its own need and every running one's fit (or none runs),
 /// woken by one that ends, never by a poll of the free memory. A compile
