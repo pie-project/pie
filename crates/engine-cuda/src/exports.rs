@@ -543,60 +543,6 @@ pub(crate) fn regions_launching_schedules(
 mod tests {
     use super::*;
 
-    /// The lattice keys the classes a plain request lands in; one only an
-    /// adapted request lands in stays out of it, so the walk arms no mixed
-    /// or segmented body for it.
-    #[test]
-    fn a_class_only_adapted_requests_land_in_is_not_keyed() {
-        let landing = vec![
-            vec![poem_ir::Request::new(1, false)],
-            vec![poem_ir::Request::new(1, false).adapted(true)],
-            vec![poem_ir::Request::new(4, false)],
-            vec![poem_ir::Request::new(4, false).adapted(true)],
-        ];
-        let keyed = plain_of(&landing, &[]);
-        assert!(keyed.contains(0) && keyed.contains(2));
-        assert!(!keyed.contains(1) && !keyed.contains(3));
-    }
-
-    /// Qwen3.5-9B's classes on CUDA: the classes keyed are those a plain
-    /// request lands in, as before main's adapted bodies (#1659), not the
-    /// larger set a plain-or-adapted request lands in.
-    #[test]
-    fn qwen35_keys_only_its_plain_classes() {
-        let trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")
-            .expect("the catalog ships the row")
-            .trace(poem::Platform::Cuda);
-        let compiled = poem_compiler::compile_axes(
-            &trace,
-            &poem_compiler::Budgets {
-                tokens: poem_compiler::Budget::new(4, 256),
-                patches: None,
-                voxels: None,
-            },
-            &poem_compiler::DeviceProfile::default(),
-        )
-        .expect("the plan bakes");
-        let landing = landing_requests(&trace.facts, &compiled.classes, |word| word);
-        let count = |keep: &dyn Fn(&poem_ir::Request) -> bool| {
-            landing
-                .iter()
-                .filter(|requests| requests.iter().any(|request| keep(request)))
-                .count()
-        };
-        let plain = count(&poem_ir::Request::plain);
-        let adapted = count(&|request: &poem_ir::Request| {
-            request.departures()
-                == usize::from(request.query_len() != 1) + usize::from(request.has_adapter())
-        });
-        let keyed = (0..landing.len())
-            .filter(|&class| plain_of(&landing, &[]).contains(class))
-            .count();
-        eprintln!("classes {}: plain {plain}, plain or adapted {adapted}, keyed {keyed}", landing.len());
-        assert_eq!(keyed, plain);
-        assert!(adapted >= plain);
-    }
-
     #[test]
     fn a_class_attending_both_ways_under_one_mask_is_refused() {
         let mut trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")

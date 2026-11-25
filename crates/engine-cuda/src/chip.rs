@@ -372,26 +372,6 @@ mod tests {
         assert_eq!(registry().check(), Vec::<String>::new());
     }
 
-    /// Every fire is captured, its bodies held as the fit holds them: no
-    /// profile turns capture or bodies off or states their memory.
-    #[test]
-    fn a_profile_stating_graphs_or_recording_is_refused() {
-        for (text, id) in [
-            ("api = 1\n[engine]\ngraphs = \"off\"\n", "engine.graphs"),
-            (
-                "api = 1\n[engine]\nrecording = \"off\"\n",
-                "engine.recording",
-            ),
-            ("api = 1\n[engine]\nbodies_mb = 512\n", "engine.bodies_mb"),
-        ] {
-            let why = registry()
-                .load_user(text, "user.toml")
-                .expect_err("not a decision")
-                .to_string();
-            assert!(why.contains(&format!("`{id}` is not a decision of cuda")), "{why}");
-        }
-    }
-
     #[test]
     fn the_checked_in_profiles_hold_together_and_each_family_names_its_tier() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");

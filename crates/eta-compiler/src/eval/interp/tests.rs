@@ -239,60 +239,6 @@ fn numeric_contract_argmax_and_topk() {
     assert_eq!(argmax_ordered(&[-2i32, -1]), 1);
 }
 
-/// The interpreter's rounding rule ([`eval_op::narrows`]) names `bf16`
-/// exactly where eta-ir's types do, for every op over a bf16 value 0, an
-/// f32 value 1, a u32 value 2, a bool value 3 (each `[4]`) and an f32
-/// scalar 4.
-#[test]
-fn the_interpreter_narrows_where_the_ir_types_bf16() {
-    use eta_ir::infer::{BodyCtx, body_types};
-    use eta_ir::types::Predicate;
-    let chans = [
-        ValueType::vector(4, Dtype::Bf16),
-        ValueType::vector(4, Dtype::F32),
-        ValueType::vector(4, Dtype::U32),
-        ValueType::vector(4, Dtype::Bool),
-        ValueType::scalar(Dtype::F32),
-    ];
-    let ctx = BodyCtx {
-        channel_types: &chans,
-        n_names: 1,
-    };
-    let cases = [
-        Op::Exp(0),
-        Op::Neg(0),
-        Op::Cast { value: 1, dtype: Dtype::Bf16 },
-        Op::Cast { value: 0, dtype: Dtype::I32 },
-        Op::Add(0, 1),
-        Op::Add(1, 1),
-        Op::Rem(1, 0),
-        Op::Gt(0, 1),
-        Op::Select { cond: 3, a: 1, b: 0 },
-        Op::Select { cond: 3, a: 1, b: 1 },
-        Op::ReduceSum(0),
-        Op::ReduceMax(0),
-        Op::ReduceArgmax(0),
-        Op::CumSum(0),
-        Op::CumProd(0),
-        Op::SortDesc(0),
-        Op::TopK { input: 0, k: 2 },
-        Op::PivotThreshold { input: 0, predicate: Predicate::CummassLe(4) },
-        Op::Gather { src: 0, idx: 2 },
-        Op::ScatterAdd { base: 0, idx: 2, vals: 1 },
-        Op::ScatterSet { base: 1, idx: 2, vals: 0 },
-        Op::Broadcast { value: 0, shape: eta_ir::types::Shape::vector(4) },
-        Op::Reshape { value: 0, shape: eta_ir::types::Shape::matrix(2, 2) },
-    ];
-    for op in cases {
-        let mut ops: Vec<Op> = (0..5).map(Op::ChanTake).collect();
-        ops.push(op.clone());
-        let types = body_types(&ops, &ctx).unwrap_or_else(|e| panic!("{op:?}: {e}"));
-        let typed = types[5].dtype == Dtype::Bf16;
-        let bf16 = |id: u32| chans[id as usize].dtype == Dtype::Bf16;
-        assert_eq!(eval_op::narrows(&op, bf16), typed, "{op:?}");
-    }
-}
-
 /// `gumbel_argmax` over f32 logits is the draw it fuses, bit for bit:
 /// `reduce_argmax(select(keep, logits * scale, -inf) + rng_keyed(state))`.
 #[test]

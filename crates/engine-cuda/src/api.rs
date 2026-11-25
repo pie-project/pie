@@ -823,10 +823,9 @@ impl Engine for Cuda {
         }
 
         let mut chunk_facts = shell.chunk_facts().map_err(fault)?;
-        chunk_facts.record_bytes = shell.record_bytes();
-        chunk_facts.windowed = shell.windowed_layers();
         let windowed_state = !chunk_facts.windowed.is_empty();
         chunk_facts.disk_persistent = residency.disk_kv_persistent && chunk_facts.disk_chunks > 0;
+        chunk_facts.validate()?;
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes) = shell.elastic();

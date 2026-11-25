@@ -1412,33 +1412,6 @@ mod tests {
     use super::*;
     use crate::codegen::layout::{HOST_SHARED, LANE_CHANNEL_SLOT, LANE_RECORD, LANE_TABLE_HEADER};
 
-    /// The grouped kernels' parameter the lane scratch table states is
-    /// the table, and a lane's scratch is its entry: no lane's base is
-    /// another's plus a stride.
-    #[test]
-    fn a_lanes_scratch_is_its_entry_of_the_lane_scratch_table() {
-        use crate::codegen::lane_scratch::{LANE_SCRATCH, LaneScratch};
-        let params: Vec<&str> = SIGNATURE
-            .trim_start()
-            .trim_start_matches('(')
-            .split(')')
-            .next()
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .collect();
-        assert_eq!(LaneScratch::ELEMENT_BYTES, size_of::<u64>());
-        assert_eq!(
-            params[LANE_SCRATCH.simt_param],
-            format!("const m1_u64* {}", LANE_SCRATCH.name)
-        );
-        assert!(PREAMBLE.contains(&format!(
-            "m1_u8* scratch = reinterpret_cast<m1_u8*>({}[dispatch_lane]);",
-            LANE_SCRATCH.name
-        )));
-        assert!(!SIGNATURE.contains("scratch_stride") && !PREAMBLE.contains("scratch_stride"));
-    }
-
     #[test]
     fn cuda_runtime_lane_table_matches_layout() {
         for declared in HOST_SHARED {

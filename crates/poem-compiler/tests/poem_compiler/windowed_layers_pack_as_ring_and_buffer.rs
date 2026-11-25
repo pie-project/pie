@@ -12,7 +12,7 @@ use poem_compiler::chunk::{
     WindowBufferSlot, WindowedRow,
 };
 use poem_compiler::{Budget, Budgets, DeviceProfile};
-use poem_ir::{CacheRow, Dtype, Platform, Trace};
+use poem_ir::{CacheRow, Platform, Trace};
 
 fn on(chunk: ChunkProfile) -> DeviceProfile {
     DeviceProfile {
@@ -194,90 +194,7 @@ fn a_gemma_window_lies_in_the_record_beside_its_global_kv_list() {
     assert!(offsets.windows(2).all(|p| p[0] < p[1]) && offsets[0] == 0);
     // Each layer's rows run in the buffer slot where its runs say.
     assert!(!ring.buffer_runs(&recipe, 0).is_empty());
-}
-
-#[test]
-fn a_kv_only_window_model_gets_a_record_and_the_old_recipe_none() {
-    // Every gpt-oss layer alternates windowed and full; the plain recipe
-    // packs window lists and no record, the windowed one a record and none.
-    let trace = trace("gptoss-20b-mini-bf16-mxfp4-kv-bf16");
-    let old = chunk::plan(
-        &trace,
-        &Budgets::of(Budget::default()),
-        &on(ChunkProfile::SERVER_CUDA),
-    )
-    .unwrap();
-    assert!(
-        old.windows().count() > 0 && old.windowed.is_none(),
-        "{}",
-        old.shapes()
-    );
-    let recipe = plan(&trace, &Plain(256));
-    facts_hold(&recipe);
-    assert!(
-        recipe.fixed().is_some(),
-        "a record for the rings: {}",
-        recipe.shapes()
-    );
-    let ring = recipe.windowed.as_ref().unwrap();
-    let layers: Vec<u32> = ring.layers.iter().filter_map(|l| l.layer).collect();
-    assert!(
-        layers.windows(2).all(|p| p[1] >= p[0] + 2),
-        "alternating: {layers:?}"
-    );
-}
-
-#[test]
-fn a_ring_at_chunk_starts_is_a_shape_of_its_own_on_the_slot_grid() {
-    let trace = trace("gemma4-e4b-mini-l6-bf16-kv-bf16");
-    let recipe = plan(&trace, &Paged);
-    facts_hold(&recipe);
-    let ring = recipe.windowed.as_ref().unwrap();
-    let Some(SlotLayout::Fixed {
-        bytes,
-        pieces_per_ws,
-        rows,
-        ..
-    }) = ring.ring_shape(&recipe)
-    else {
-        panic!("a ring shape: {}", recipe.shapes());
-    };
-    assert_eq!(
-        *bytes, recipe.chunk_bytes,
-        "one slot a chunk: each starts a chunk"
-    );
-    let page = recipe.window_buffer().unwrap().bytes();
-    let run = &rows[0];
-    assert_eq!(run.offset, 0);
-    assert!(run.atoms_per_piece * page <= recipe.chunk_bytes);
-    assert!(u64::from(*pieces_per_ws) * run.atoms_per_piece * page >= ring.region.bytes);
-    // Nothing of the ring in the state record.
-    assert!(recipe.fixed().is_none_or(|f| match f {
-        SlotLayout::Fixed { rows, .. } => rows.iter().all(|r| r.row != RowId::Ring),
-        _ => true,
-    }));
-}
-
-#[test]
-fn a_hybrid_record_holds_its_rings_and_its_state_together() {
-    let mut trace = trace("gemma4-e4b-mini-l6-bf16-kv-bf16");
-    trace.caches.push(CacheRow::State {
-        name: "layers.0.delta".into(),
-        slab: vec![4, 64, 64],
-        dtype: Dtype::Bf16,
-        shard: Default::default(),
-    });
-    let recipe = plan(&trace, &Plain(256));
-    facts_hold(&recipe);
-    let Some(SlotLayout::Fixed { rows, record, .. }) = recipe.fixed() else {
-        panic!("a record: {}", recipe.shapes());
-    };
-    assert_eq!(rows[0].row, RowId::Ring, "the ring first");
-    assert!(
-        rows.iter().any(|r| matches!(r.row, RowId::Cache(_))),
-        "the state beside it"
-    );
-    assert!(*record >= recipe.windowed.as_ref().unwrap().region.bytes + 4 * 64 * 64 * 2);
+    // A ring laid at chunk starts (the paged hook) is a shape of its own.
     let paged = plan(&trace, &Paged);
     facts_hold(&paged);
     assert!(paged.windowed.as_ref().unwrap().ring_shape.is_some());

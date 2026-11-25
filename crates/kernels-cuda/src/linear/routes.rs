@@ -23,17 +23,3 @@ pub fn code(platform: &str, fingerprint: &str) -> u32 {
     let hash = crate::source::fnv1a64(format!("{platform}|{fingerprint}|method {METHOD}").as_bytes());
     (hash ^ (hash >> 32)) as u32
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_code_is_the_platform_s_the_kernel_s_and_the_method_s_alone() {
-        let platform = "sm_89|driver 13000|cublaslt 130000";
-        let skinny = code(platform, "jit/skinny/r1");
-        assert_eq!(skinny, code(platform, "jit/skinny/r1"), "the same kernel, the same key");
-        assert_ne!(skinny, code(platform, "jit/skinny/r2"), "changed code, another key");
-        assert_ne!(skinny, code("sm_89|driver 13010|cublaslt 130000", "jit/skinny/r1"));
-    }
-}

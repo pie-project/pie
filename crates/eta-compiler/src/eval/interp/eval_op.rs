@@ -961,7 +961,8 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{nucleus_prefix, sort_desc_order};
+    use super::{nucleus_prefix, rng_lanes, sort_desc_order};
+    use eta_ir::RngKind;
 
     /// The full sort's nucleus walk, the fast prefix's reference.
     fn walk(row: &[f32], p: f32) -> Vec<bool> {
@@ -1014,5 +1015,29 @@ mod tests {
         negative[3] = -0.5;
         let mut keep = vec![false; 100];
         assert!(!nucleus_prefix(&negative, 0.0, &mut keep));
+    }
+
+    /// A long draw's threads make the lanes one thread would.
+    #[test]
+    fn a_split_draw_is_the_serial_draw() {
+        let serial = |seed: u64, n: usize, kind: RngKind| -> Vec<f32> {
+            (0..n)
+                .map(|j| match kind {
+                    RngKind::Uniform => eta_ir::rng::hash_uniform(seed, j as u32),
+                    RngKind::Gumbel => -(-eta_ir::rng::hash_uniform(seed, j as u32).ln()).ln(),
+                    RngKind::Normal => eta_ir::rng::hash_normal(seed, j as u32),
+                })
+                .collect()
+        };
+        for &n in &[1usize, 1 << 15, (1 << 15) + 1, 100_003, 262_144] {
+            for kind in [RngKind::Uniform, RngKind::Gumbel, RngKind::Normal] {
+                let want = serial(0x9E37_79B9_7F4A_7C15, n, kind);
+                let got = rng_lanes(0x9E37_79B9_7F4A_7C15, n, kind);
+                assert_eq!(got.len(), want.len(), "length at n={n}");
+                for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.to_bits(), w.to_bits(), "lane {j} of {n} ({kind:?})");
+                }
+            }
+        }
     }
 }

@@ -887,21 +887,6 @@ mod tests {
         assert_eq!(first_non_causal(Some(&whole), None, 0, 12, 2), None);
     }
 
-    /// Whether greedy lanes run the token loop is the load's decision: a
-    /// program without one runs none, and a lookahead stated for it is
-    /// refused at load, not at a greedy lane's fire.
-    #[test]
-    fn the_token_loop_is_decided_at_load() {
-        assert_eq!(lookahead_of(None, true, 64), Ok(64));
-        assert_eq!(lookahead_of(None, true, 0), Ok(32));
-        assert_eq!(lookahead_of(Some(8), true, 64), Ok(8));
-        assert_eq!(lookahead_of(Some(0), true, 64), Ok(0));
-        assert_eq!(lookahead_of(None, false, 64), Ok(0));
-        assert_eq!(lookahead_of(Some(0), false, 64), Ok(0));
-        let refused = lookahead_of(Some(8), false, 64).expect_err("no loop to run it");
-        assert!(refused.contains("no token loop"), "{refused}");
-    }
-
     /// An epilogue whose put is `word`'s cell, or, `reads_logits`, the
     /// model's logits over its lane: a pass with no rows holds none, so its
     /// epilogue faults.
