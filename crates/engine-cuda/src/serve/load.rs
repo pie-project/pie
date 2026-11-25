@@ -550,6 +550,21 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             Some(super::EveryRung::To(_)) => widest,
         }
     };
+    // Every rank of a tensor-parallel group fires one sequence of steps over
+    // one lattice: ranks that each measured their own device can choose
+    // different tops, so all take the least.
+    // SAFETY: the boot's communicator is held by the engine for the life of
+    // the shell it loads.
+    let tokens = match unsafe { boot.comm.as_ref() }.and_then(crate::comm::Comm::quiet) {
+        Some(quiet) => {
+            let agreed = quiet.least(tokens)?;
+            if agreed != tokens {
+                tracing::info!("the group's ranks agree on a fire top of {agreed}: this rank's own was {tokens}");
+            }
+            agreed
+        }
+        None => tokens,
+    };
     // The derived voxel rung's room is still the configured share of the
     // card past the weights (`engine.working_set_percent`).
     let share = after_weights / 100 * u64::from(engine.working_set_percent);
