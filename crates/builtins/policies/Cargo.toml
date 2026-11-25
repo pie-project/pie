@@ -1,7 +1,9 @@
 # The PLEX 1.1 policies built into the pie binary, one cargo workspace
 # targeting wasm32-unknown-unknown, each a component (crates/plex-sdk).
 # `default` and `default-cluster` are what a worker and a cluster run when
-# the configuration names none; `noop` writes no rows. `test-*` policies
+# the configuration names none, and the rest are built on the same two libs
+# (`worker-defaults`, `cluster-defaults`; README.md says what each does);
+# `noop` writes no rows. `test-*` policies
 # misbehave on purpose; they are embedded only with the `test-policies`
 # feature, for the hosts' own tests. Other policies are the PLEX corpus
 # (plex `policies-1.1`), loaded by `.wasm` path.
