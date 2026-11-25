@@ -113,16 +113,16 @@ pub async fn run_ahead(
 
 /// What [`run_ahead`] drives: frames of `r` fires, no more than
 /// `window_frames` frames unread, `budget` fires in all.
-pub(super) struct Driver<S, C, R> {
-    pub(super) r: usize,
-    pub(super) window_frames: usize,
-    pub(super) budget: usize,
-    pub(super) submit: S,
-    pub(super) close: C,
-    pub(super) retract: R,
+struct Driver<S, C, R> {
+    r: usize,
+    window_frames: usize,
+    budget: usize,
+    submit: S,
+    close: C,
+    retract: R,
 }
 
-pub(super) async fn run_ahead_driven<S, C, R>(
+async fn run_ahead_driven<S, C, R>(
     mut d: Driver<S, C, R>,
     mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
 ) -> Result<usize, String>
