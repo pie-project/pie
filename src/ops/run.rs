@@ -526,6 +526,20 @@ mod tests {
 
     #[test]
     fn run_every_case() {
+        // `curated_in` looks for builds under CARGO_TARGET_DIR where it is
+        // set: the cases lay their builds in a tree's own target, so they
+        // run in a process without it.
+        if std::env::var_os("CARGO_TARGET_DIR").is_some() {
+            let ran = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["ops::run::tests::run_every_case", "--exact"])
+                .env_remove("CARGO_TARGET_DIR")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&ran.stdout);
+            assert!(ran.status.success(), "{said}");
+            assert!(said.contains("1 passed"), "{said}");
+            return;
+        }
         a_curated_name_resolves_to_the_build_of_its_crate();
         an_unbuilt_curated_directory_is_found_without_a_wasm();
         a_script_twin_is_its_source_and_needs_no_build();
