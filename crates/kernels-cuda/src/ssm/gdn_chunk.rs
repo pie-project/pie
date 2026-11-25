@@ -691,3 +691,18 @@ pub fn gated_delta_chunked(
         ],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A B200 or H100 block opts into 227 KiB, an A100 into 163 KiB; an
+    /// RTX 30/40/50 or a DGX Spark into 99 KiB, short of the scan.
+    #[test]
+    fn the_scan_fits_a_datacenter_block_and_not_a_99_kib_one() {
+        assert!(scan_smem_at(128, SCAN_BV) <= 232_448);
+        assert!(scan_smem_at(128, SCAN_BV) <= 166_912);
+        assert!(scan_smem_at(128, SCAN_BV) > 101_376);
+        assert!(scan_smem_at(128, SCAN_BV_NARROW) <= 101_376);
+    }
+}

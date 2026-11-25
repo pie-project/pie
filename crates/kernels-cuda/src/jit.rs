@@ -23,6 +23,8 @@ pub(crate) mod device {
         crate::sizing::Footprint::default()
     }
 }
+#[cfg(all(test, feature = "cuda"))]
+mod launches;
 #[cfg(feature = "cuda")]
 pub mod nvrtc;
 mod root;

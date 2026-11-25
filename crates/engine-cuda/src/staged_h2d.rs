@@ -231,3 +231,15 @@ impl Drop for Lanes {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    #[cfg(not(feature = "device"))]
+    fn a_runtimeless_build_opens_no_lanes() {
+        assert!(matches!(Lanes::standard(), Err(Fault::Runtimeless)));
+    }
+}

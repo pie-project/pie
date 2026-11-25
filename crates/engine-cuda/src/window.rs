@@ -1291,3 +1291,208 @@ impl Sink for Cursor<'_> {
         self.event(event, false);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use poem_ir::ClassSet;
+
+    fn conditional() -> Region {
+        Region {
+            nodes: 0..26,
+            mask: ClassSet::of([0]),
+            phase: poem_compiler::Phase::Capture,
+            lowering: Lowering::If,
+            stream: 0,
+            wait: Vec::new(),
+            open: None,
+            close: None,
+            axis: None,
+            collective: false,
+        }
+    }
+
+    #[test]
+    fn window_every_case() {
+        a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it();
+        the_live_seat_is_every_windows_own_rows_and_offset_at_a_fixed_stride();
+        two_masks_share_a_slot_in_every_fire_of_a_key_or_in_none_of_them();
+    }
+
+    fn a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it() {
+        let cell = At::new();
+        let mut eager = Cursor::new(&cell);
+        let region = conditional();
+        eager.region_begin(&region);
+        eager.cond_begin(&region.lowering);
+        eager.cond_end();
+        eager.region_end(&region);
+        eager.settle().expect("an eager walk ignores the bracket");
+
+        let cell = At::new();
+        let mut recording = Cursor::new(&cell).writing();
+        recording.region_begin(&region);
+        recording.cond_begin(&region.lowering);
+        let fault = recording
+            .settle()
+            .expect_err("a capture may not record a body outside its node");
+        assert!(
+            matches!(fault, Fault::Unlowered { region: 0, .. }),
+            "{fault}"
+        );
+        assert!(fault.to_string().contains("nowhere"), "{fault}");
+    }
+
+    fn plain(row_offset: u32, rows: u32) -> Window {
+        Window {
+            spans: poem_ir::PerAxis::new([
+                MaskSpan {
+                    row_offset,
+                    rows,
+                    lane_offset: 0,
+                    lanes: 1,
+                },
+                MaskSpan::default(),
+                MaskSpan::default(),
+            ]),
+            indptr_host: Vec::new(),
+            indptr: Tensor::new(0, 0, 1, Dtype::I32),
+            segments_host: Vec::new(),
+            segments: Tensor::new(0, 0, 2, Dtype::I32),
+            segment_cap: 0,
+            gathered: None,
+        }
+    }
+
+    fn windows(spans: &[Vec<Window>]) -> Windows {
+        let mut table = Windows {
+            windows: Vec::new(),
+            runs: Vec::new(),
+            of_region: Vec::new(),
+            axes: Vec::new(),
+            slots: Slots::new(2, 8, 1, 1, 64, 1, 32, false),
+            live_words: Vec::new(),
+            seat: Seat::default(),
+            live_base: 0,
+            qo_absolute_host: Vec::new(),
+            qo_absolute_base: 0,
+            qo_absolute_lanes: 0,
+        };
+        for region in spans {
+            let start = table.runs.len() as u32;
+            for window in region {
+                table.runs.push(table.windows.len() as u32);
+                table.windows.push(window.clone());
+            }
+            table.of_region.push((start, region.len() as u32));
+            table.axes.push(poem_ir::RowAxis::Tokens);
+        }
+        table.fill_live();
+        table
+    }
+
+    fn the_live_seat_is_every_windows_own_rows_and_offset_at_a_fixed_stride() {
+        let table = windows(&[
+            vec![plain(0, 13)],
+            vec![plain(0, 10), plain(10, 3)],
+            vec![plain(3, 5)],
+        ]);
+        let stride = table.max_runs() as usize;
+        assert_eq!(stride, 2, "the widest region cuts two runs");
+        assert_eq!(
+            table.live().len(),
+            table.of_region.len() * stride * 4,
+            "regions x max_runs x 4, and no run's words are missing",
+        );
+        for region in 0..table.of_region.len() as u32 {
+            for run in 0..table.runs(region) {
+                let seat = 4 * (region as usize * stride + run as usize);
+                let span = table.at(region, run).span();
+                assert_eq!(table.live()[seat], span.rows, "row count first");
+                assert_eq!(table.live()[seat + 1], span.row_offset, "row start second");
+                assert_eq!(table.live()[seat + 2], span.lanes, "lane count third");
+                assert_eq!(
+                    table.live()[seat + 3],
+                    span.lane_offset,
+                    "lane start fourth",
+                );
+            }
+        }
+        assert_eq!(&table.live()[4..8], &[0, 0, 0, 0]);
+    }
+
+    fn bounded(span: MaskSpan) -> Window {
+        Window {
+            spans: poem_ir::PerAxis::new([span, MaskSpan::default(), MaskSpan::default()]),
+            indptr_host: (0..=span.lanes as i32).collect(),
+            ..plain(0, 0)
+        }
+    }
+
+    fn resolved(a: (u32, u32), b: (u32, u32)) -> [MaskSpan; 3] {
+        let one = |(rows, lanes): (u32, u32), row_offset, lane_offset| MaskSpan {
+            row_offset,
+            rows,
+            lane_offset,
+            lanes,
+        };
+        let first = if a.0 == 0 {
+            MaskSpan::default()
+        } else {
+            one(a, 0, 0)
+        };
+        let second = if b.0 == 0 {
+            MaskSpan::default()
+        } else {
+            one(b, a.0, a.1)
+        };
+        let both = match (a.0 == 0, b.0 == 0) {
+            (false, false) => one((a.0 + b.0, a.1 + b.1), 0, 0),
+            (false, true) => first,
+            (true, false) => second,
+            (true, true) => MaskSpan::default(),
+        };
+        [first, both, second]
+    }
+
+    fn two_masks_share_a_slot_in_every_fire_of_a_key_or_in_none_of_them() {
+        let seated = |a, b| {
+            let [first, both, second] = resolved(a, b);
+            let mut held: Vec<Window> = Vec::new();
+            let map: Vec<u32> = [first, both, first, second]
+                .into_iter()
+                .map(|span| insert(&mut held, bounded(span)))
+                .collect();
+            (map, held.len())
+        };
+
+        let wide = seated((10, 2), (3, 3));
+        assert_eq!(
+            wide.0,
+            vec![0, 1, 0, 2],
+            "three distinct masks, three slots"
+        );
+        assert_eq!(
+            seated((4, 1), (6, 6)),
+            wide,
+            "the lane split moved every span and no slot",
+        );
+        assert_eq!(
+            seated((1, 1), (1, 1)),
+            wide,
+            "nor does the row split, down to one row a class",
+        );
+
+        let absent = seated((10, 2), (0, 0));
+        assert_eq!(
+            absent.0,
+            vec![0, 0, 0, 1],
+            "the both-classes mask is the A mask when B has no rows",
+        );
+        assert_ne!(
+            absent.0, wide.0,
+            "and that is a different key, so a different body"
+        );
+    }
+}

@@ -920,3 +920,60 @@ impl WeightCache for Group {
             }))
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// A rank's refusal must reach the runtime even when aborting the
+    /// communicators never returns (a shell whose armed bodies hold the graphs
+    /// NCCL's teardown waits for): the cause is recorded at once, the next
+    /// verb reads it, and the abort is asked of each communicator exactly once.
+    #[test]
+    fn a_poison_whose_abort_never_returns_still_answers() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let (release, parked) = mpsc::channel::<()>();
+        let parked = Mutex::new(parked);
+        let poison = Poison {
+            why: Mutex::new(None),
+            aborts: vec![Arc::new({
+                let aborts = Arc::clone(&aborts);
+                move || {
+                    aborts.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(parked) = parked.lock() {
+                        let _ = parked.recv();
+                    }
+                }
+            })],
+        };
+        assert_eq!(poison.why(), None);
+
+        let began = Instant::now();
+        poison.set("rank 0 refused: load failed: this plan names a verb the shell does not bind");
+        poison.set("rank 1 refused: later, and not the cause");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "poisoning waited on the abort"
+        );
+        assert_eq!(
+            poison.why().as_deref(),
+            Some("rank 0 refused: load failed: this plan names a verb the shell does not bind")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while aborts.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            1,
+            "the abort was not asked once"
+        );
+        drop(release);
+    }
+}

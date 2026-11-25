@@ -437,3 +437,19 @@ pub fn mega(
     )?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_block_width_fits_a_ring() {
+        for bn in [32, 64] {
+            let stages = stages_for(bn);
+            assert!(stages >= 4, "{bn}: {stages}");
+            assert!(smem_bytes(bn, stages) <= SMEM_CAP);
+        }
+        assert_eq!(pool_rows(blocks_for(6, 256, 32)), 384);
+        assert_eq!(blocks_for(1536, 256, 32), 48 + 256);
+    }
+}

@@ -707,3 +707,22 @@ pub fn attention_prefill_selected(
         lse,
     )
 }
+
+#[cfg(feature = "cuda")]
+#[cfg(test)]
+mod tests {
+    use super::decode::fa2::{ARMS, BLOCK, arm_index};
+    use crate::attn::plan::Device;
+
+    #[test]
+    fn the_ada_ceiling_takes_the_sixteen_row_arm_and_it_fits_one_block() {
+        let arm = arm_index(Device::L40S.max_smem_per_sm).expect("an arm fits the L40S");
+        assert_eq!(ARMS[arm].cta_tile_kv, 16);
+        assert!(ARMS[arm].smem <= Device::L40S.max_smem_per_block_optin);
+        assert_eq!(
+            BLOCK,
+            [32, 4, 2],
+            "a lane, a warp in its warpgroup, a warpgroup"
+        );
+    }
+}

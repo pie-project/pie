@@ -129,3 +129,30 @@ pub fn reads(op: &str) -> Reads {
         .find(|entry| entry.name == op)
         .map_or(Reads::Nothing, |entry| entry.reads)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seat_every_case() {
+        names_are_unique();
+        lookup_reads_the_table();
+    }
+
+    fn names_are_unique() {
+        for (i, a) in ENTRIES.iter().enumerate() {
+            assert!(
+                ENTRIES[i + 1..].iter().all(|b| b.name != a.name),
+                "`{}` is declared twice",
+                a.name
+            );
+        }
+    }
+
+    fn lookup_reads_the_table() {
+        assert_eq!(reads("ssm.kda_chunked"), Reads::RowsAndLanes);
+        assert_eq!(reads("elemwise.rmsnorm"), Reads::Rows);
+        assert_eq!(reads("linear.matmul"), Reads::Nothing);
+    }
+}

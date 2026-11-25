@@ -442,3 +442,59 @@ pub fn plan(
         float_bytes: laid.float_bytes,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_partials_hold_every_row_the_split_writes() {
+        for (q_heads, kv_heads, head_dim) in [(16, 2, 512), (16, 8, 256), (32, 8, 128), (8, 8, 64)]
+        {
+            for qo in [vec![1u32; 64], vec![1, 7, 300, 1, 33], vec![2048]] {
+                for graph in [true, false] {
+                    let qo_indptr: Vec<i32> = std::iter::once(0)
+                        .chain(qo.iter().scan(0, |at, len| {
+                            *at += *len as i32;
+                            Some(*at)
+                        }))
+                        .collect();
+                    let kv_indptr: Vec<i32> =
+                        (0..=qo.len() as i32).map(|lane| lane * 384).collect();
+                    let rows = *qo_indptr.last().unwrap() as u32;
+                    let req = Request {
+                        qo_indptr: &qo_indptr,
+                        kv_indptr: &kv_indptr,
+                        total_num_rows: rows,
+                        batch_size: qo.len() as u32,
+                        lane_offset: 0,
+                        live: Live {
+                            requests: qo.len() as u32,
+                            lane_offset: 0,
+                            row_offset: 0,
+                            rows,
+                        },
+                        num_qo_heads: q_heads,
+                        num_kv_heads: kv_heads,
+                        head_dim,
+                        page_size: 16,
+                        enable_cuda_graph: graph,
+                        window_left: None,
+                        ctas_per_sm: 2,
+                    };
+                    let sched = schedule("test", &req, &Device::L40S).unwrap();
+                    let laid = layout("test", &req, &sched, usize::MAX, usize::MAX).unwrap();
+                    let (Some(v), Some(s)) = (laid.info.v_offset, laid.info.s_offset) else {
+                        continue;
+                    };
+                    let written = u64::from(*sched.o_indptr.last().unwrap() as u32)
+                        * u64::from(q_heads)
+                        * u64::from(head_dim)
+                        * 4;
+                    assert!(written <= u64::from(s - v), "{q_heads}/{kv_heads} {qo:?}");
+                }
+            }
+        }
+    }
+
+}

@@ -257,3 +257,61 @@ pub(crate) fn guarded<T>(fire: impl FnOnce() -> T) -> T {
     }
     fired
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diag_every_case() {
+        an_empty_list_turns_nothing_on();
+        a_word_list_names_each_knob();
+        an_unknown_word_refuses_by_name();
+        a_valued_word_with_no_value_refuses();
+        the_words_round_trip();
+    }
+
+    fn an_empty_list_turns_nothing_on() {
+        let diag: Diagnostics = "".parse().expect("silence parses");
+        assert_eq!(diag, Diagnostics::default());
+        assert!(!diag.any());
+        assert_eq!(diag.words(), None);
+    }
+
+    fn a_word_list_names_each_knob() {
+        let diag: Diagnostics = "golden-probe, ptr-trace=decode:c0 ,fuse-chains=off"
+            .parse()
+            .expect("the three words parse");
+        assert!(diag.golden_probe);
+        assert_eq!(diag.ptr_trace.as_deref(), Some("decode:c0"));
+        assert!(!diag.fuse_chains);
+        assert_eq!(diag.sync_guard, None);
+        let guarded: Diagnostics = "sync-guard".parse().expect("the guard parses");
+        assert_eq!(guarded.sync_guard, Some(SyncGuard::Report));
+    }
+
+    fn an_unknown_word_refuses_by_name() {
+        let why = "golden-probes".parse::<Diagnostics>().expect_err("refused");
+        assert!(why.contains("golden-probes"), "{why}");
+        assert!(
+            why.contains("golden-probe`"),
+            "and lists the vocabulary: {why}"
+        );
+    }
+
+    fn a_valued_word_with_no_value_refuses() {
+        assert!("ptr-trace".parse::<Diagnostics>().is_err());
+        assert!("graph-dot=".parse::<Diagnostics>().is_err());
+    }
+
+    fn the_words_round_trip() {
+        let list = "arm-trace,capture-serial,plan-trace=all,fuse-chains=off,sync-guard=panic";
+        let diag: Diagnostics = list.parse().expect("parses");
+        let again: Diagnostics = diag
+            .words()
+            .expect("something is on")
+            .parse()
+            .expect("its own spelling parses");
+        assert_eq!(diag, again);
+    }
+}

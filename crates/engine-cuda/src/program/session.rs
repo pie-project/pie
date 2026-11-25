@@ -1240,3 +1240,20 @@ impl Drop for Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn a_launching_stage_paired_with_the_wrong_plan_is_refused() {
+        let refusal =
+            super::stage_plans_are_parallel(&[(0xa11, true), (0xb22, true)], &[0xa11, 0xdead])
+                .expect_err("stage 1 is not what plan 1 describes");
+        let text = format!("{refusal}");
+        assert!(text.contains("stage 1"), "names which: {text}");
+        assert!(
+            text.contains("scratch") || text.contains("descriptors"),
+            "and what would go wrong: {text}"
+        );
+    }
+}

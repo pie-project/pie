@@ -224,3 +224,23 @@ impl Rebalancer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_boundary_drops_what_arming_left_and_every_period_rebalances_after() {
+        let mut rebalancer = Rebalancer::new(Rebalance {
+            every: 2,
+            window: 2,
+            limits: Limits::DEFAULT,
+        });
+        let dues: Vec<_> = (0..6).map(|_| rebalancer.due()).collect();
+        let rebalance = Some(Due::Rebalance);
+        assert_eq!(
+            dues,
+            [Some(Due::Drop), None, rebalance, None, rebalance, None]
+        );
+    }
+}

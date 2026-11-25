@@ -2730,3 +2730,35 @@ impl Shell {
         Ok(staged)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{fold_held, readout_extent};
+
+    #[test]
+    fn a_readout_as_tall_as_the_fire_holds_the_bucket() {
+        assert_eq!(readout_extent(133, 256, 133), 256);
+        assert_eq!(readout_extent(133, 256, 5), 5);
+        assert_eq!(readout_extent(133, 133, 133), 133);
+        assert_eq!(readout_extent(0, 64, 0), 0);
+    }
+
+    /// A device-counted fold left record 3's state at slot 92; the record
+    /// then went to a new working set, whose prefill folds its own rows. Its
+    /// buffered fires read the state where they state it, not at 92.
+    #[test]
+    fn a_folding_lane_forgets_the_fold_a_record_was_left_ahead_at() {
+        let mut ahead = std::collections::HashMap::from([(3u32, 92u32), (5, 40)]);
+        // The working set the fold was counted for still reads it ahead.
+        assert_eq!(fold_held(&mut ahead, 3, Some(60), false), 92);
+        // A new working set's prefill on the record.
+        fold_held(&mut ahead, 3, None, false);
+        assert_eq!(fold_held(&mut ahead, 3, Some(28), false), 28);
+        // A fresh buffered lane forgets it too, and a settled fold is past it.
+        assert_eq!(fold_held(&mut ahead, 5, Some(12), true), 12);
+        assert!(ahead.is_empty());
+        ahead.insert(7, 40);
+        assert_eq!(fold_held(&mut ahead, 7, Some(48), false), 48);
+        assert!(ahead.is_empty());
+    }
+}

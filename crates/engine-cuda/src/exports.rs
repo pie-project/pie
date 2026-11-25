@@ -518,3 +518,86 @@ pub(crate) fn regions_launching_schedules(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_class_attending_both_ways_under_one_mask_is_refused() {
+        let mut trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")
+            .expect("the catalog ships the drafter row")
+            .trace(poem::Platform::Cuda);
+        let compile = |trace: &Trace| {
+            poem_compiler::compile_axes(
+                trace,
+                &poem_compiler::Budgets {
+                    tokens: poem_compiler::Budget::new(4, 256),
+                    patches: None,
+                    voxels: None,
+                },
+                &poem_compiler::DeviceProfile::default(),
+            )
+            .expect("the plan bakes")
+        };
+        one_direction_per_mask(&trace, &compile(&trace)).expect("the row loads");
+        let causal = trace
+            .nodes
+            .iter_mut()
+            .find_map(|node| match &mut node.op {
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    causal,
+                    ..
+                }) if *causal => Some(causal),
+                _ => None,
+            })
+            .expect("the trunk runs a causal masked prefill");
+        *causal = false;
+        let refusal = one_direction_per_mask(&trace, &compile(&trace))
+            .expect_err("one class now attends both ways under one mask");
+        assert!(
+            refusal
+                .to_string()
+                .ends_with("attends both ways under one mask"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn every_switch_a_request_carries_lands_in_its_class() {
+        let mut facts = poem_ir::Facts::default();
+        facts.declare("mode", &["plain", "wide"]).unwrap();
+        for builtin in [
+            poem_ir::Builtin::Drafts,
+            poem_ir::Builtin::Scores,
+            poem_ir::Builtin::Encode,
+        ] {
+            let _ = facts.builtin(builtin);
+        }
+        let _ = facts.switch("mode", "wide");
+        let bits = facts.table.len();
+        let classes = poem_ir::ClassTable {
+            classes: (0..bits)
+                .map(|bit| poem_ir::Class {
+                    words: vec![1 << bit],
+                    live: Vec::new(),
+                })
+                .collect(),
+            node_mask: Vec::new(),
+            merges: Vec::new(),
+            merge_arm: Vec::new(),
+            mask: (1 << bits) - 1,
+            dead: Vec::new(),
+        };
+        let landing = landing_requests(&facts, &classes);
+        for (class, requests) in landing.iter().enumerate() {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| facts.word(request) == 1 << class),
+                "no request lands in class {class}"
+            );
+        }
+    }
+}

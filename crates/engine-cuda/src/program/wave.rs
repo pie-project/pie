@@ -234,3 +234,60 @@ impl Wave {
         (lane as u64, (9 * ALIGN) as u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Wave;
+    use kernels_cuda::runtime::channel::{BumpLane, PublishLane, PullLane, SettleLane, Ticket};
+
+    fn ticket(slot: u32) -> Ticket {
+        Ticket {
+            slot,
+            ..Ticket::default()
+        }
+    }
+
+    #[test]
+    fn each_lane_names_its_own_window_of_the_wave_s_ticket_table() {
+        let mut wave = Wave::default();
+        let first = wave.stage(
+            &[ticket(0), ticket(1)],
+            &[0],
+            &[1],
+            PullLane::default(),
+            BumpLane::default(),
+            PublishLane::default(),
+            SettleLane::default(),
+        );
+        let second = wave.stage(
+            &[ticket(7)],
+            &[],
+            &[7],
+            PullLane::default(),
+            BumpLane::default(),
+            PublishLane::default(),
+            SettleLane::default(),
+        );
+        assert_eq!((first, second), (0, 1));
+        assert_eq!(
+            (wave.pull[0].ticket_offset, wave.pull[0].ticket_count),
+            (0, 2)
+        );
+        assert_eq!(
+            (wave.pull[1].ticket_offset, wave.pull[1].ticket_count),
+            (2, 1)
+        );
+        assert_eq!(
+            (wave.publish[1].ticket_offset, wave.publish[1].ticket_count),
+            (2, 1)
+        );
+        assert_eq!(
+            (wave.settle[1].ticket_offset, wave.settle[1].ticket_count),
+            (2, 1)
+        );
+        assert_eq!(
+            wave.tickets.iter().map(|t| t.slot).collect::<Vec<_>>(),
+            vec![0, 1, 7]
+        );
+    }
+}

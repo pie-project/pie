@@ -194,3 +194,120 @@ pub fn rewrite_with(mut trace: Trace, from: u32, lse: bool, lse_window: bool, ga
     }
     trace
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn census(trace: &Trace) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for node in &trace.nodes {
+            let op = match &node.op {
+                Operation::Attn(op) => op,
+                Operation::Fused(Fused::LseSink { attn, .. }) => &**attn,
+                _ => continue,
+            };
+            match op {
+                Attn::Decode {
+                    window: None,
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                } => counts.0 += 1,
+                Attn::Decode {
+                    window: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                } => counts.1 += 1,
+                // The fire's masks are an operand of either arm (per-lane
+                // data, not a class), so a rewritten decode carries them.
+                Attn::Prefill {
+                    selection: None,
+                    bias: None,
+                    lse: Some(_),
+                    ..
+                } => counts.2 += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    /// gpt-oss's full-attention layers read single-token rows through the prefill
+    /// kernel when log-sum-exp decodes are on; sliding layers keep the decode
+    /// kernel. With its sinks fused onto the attentions, and without.
+    #[test]
+    fn a_sinked_decode_without_a_window_takes_the_prefill_where_the_profile_says() {
+        let row = poem_compiler::catalog::deployment("gptoss-120b-bf16-mxfp4-kv-bf16")
+            .expect("gpt-oss is in the catalog");
+        let plain = row.trace(poem::Platform::Cuda);
+        let fused = poem_compiler::fuse::fuse(
+            plain.clone(),
+            &poem_compiler::fuse::rules::forming(&["fused.lse_sink"]),
+        );
+        assert!(
+            fused
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, Operation::Fused(Fused::LseSink { .. }))),
+            "gpt-oss's sinks fuse onto its attentions"
+        );
+        for trace in [plain, fused] {
+            regroups(&trace);
+        }
+    }
+
+    /// Nemotron-3 Ultra's 32 query heads a KV head are past the decode
+    /// kernel's stamps: its attention reads as a prefill with the profile
+    /// silent, and Super's 16 stays a decode.
+    #[test]
+    fn a_group_the_decode_kernel_is_not_stamped_at_takes_the_prefill() {
+        let plans = |id: &str| {
+            let trace = poem_compiler::catalog::deployment(id)
+                .expect("nemotron is in the catalog")
+                .trace(poem::Platform::Cuda);
+            let rewritten = rewrite(trace, 0);
+            poem_ir::check(&rewritten).expect("the rewritten trace types");
+            rewritten
+                .nodes
+                .iter()
+                .fold((0, 0), |(decodes, prefills), node| match &node.op {
+                    Operation::Attn(Attn::PlanDecode { .. }) => (decodes + 1, prefills),
+                    Operation::Attn(Attn::PlanPrefill { .. }) => (decodes, prefills + 1),
+                    _ => (decodes, prefills),
+                })
+        };
+        let (decodes, _) = plans("nemotron3-ultra-mini-bf16-kv-bf16");
+        assert_eq!(decodes, 0, "no group-32 plan stays a decode");
+        let (decodes, _) = plans("nemotron3-super-mini-bf16-nvfp4a4-e4m3tile128a8-kv-bf16");
+        assert!(decodes > 0, "Super's group of 16 stays a decode");
+    }
+
+    fn regroups(trace: &Trace) {
+        let trace = trace.clone();
+        let (full, sliding, prefills) = census(&trace);
+        assert!(
+            full > 0 && sliding > 0,
+            "gpt-oss decodes both kinds of layer"
+        );
+        let off = Gate::default();
+        assert_eq!(rewrite_with(trace.clone(), 4, false, false, off), trace);
+        assert_eq!(rewrite_with(trace.clone(), 0, true, false, off), trace);
+        let rewritten = rewrite_with(trace.clone(), 4, true, false, off);
+        assert_eq!(census(&rewritten), (0, sliding, prefills + full));
+        // Rows the tensor-core decode reads across a cluster stay decodes.
+        let clustered = Gate {
+            on: true,
+            cluster: 8,
+            ..off
+        };
+        assert_eq!(
+            rewrite_with(trace.clone(), 4, true, false, clustered),
+            trace
+        );
+        poem_ir::check(&rewritten).expect("the rewritten trace types");
+    }
+}

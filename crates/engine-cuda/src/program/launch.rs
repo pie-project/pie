@@ -2140,3 +2140,103 @@ pub fn launch(
         Err(Fault::Runtimeless)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eta_ir::types::MAX_RANK;
+
+    /// A take its region runs after a constant cannot hand the constant its
+    /// slot: the scratch is laid out in the order the emitter runs the ops,
+    /// not the order the stage states them.
+    #[test]
+    fn a_region_lays_its_scratch_out_in_the_order_it_runs() {
+        let op =
+            |tag, result_count, args: Vec<u32>, channel| eta_compiler::codegen::launch::LaunchOp {
+                tag,
+                result_count,
+                args,
+                channel,
+                ..Default::default()
+            };
+        let mut plan = LaunchStagePlan {
+            ops: vec![
+                op(tags::CHAN_TAKE, 1, vec![], Some(1)),
+                op(tags::CONST, 1, vec![], None),
+                op(tags::CHAN_PUT, 0, vec![1], Some(0)),
+            ],
+            value_types: vec![
+                eta_compiler::codegen::launch::LaunchPlanValue {
+                    dtype: Dtype::U32,
+                    axes: vec![eta_compiler::plan::Dimension::Static(1)],
+                };
+                2
+            ],
+            fused: vec![LaunchRegion {
+                kind: RegionKind::Generated,
+                nodes: vec![0, 1, 2],
+                order: vec![1, 0, 2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let one = ValueDesc {
+            len: 1,
+            rows: 1,
+            last: 1,
+            rank: 1,
+            dtype: 0,
+            dims: [0; MAX_RANK],
+        };
+        let offsets = |plan: &LaunchStagePlan| {
+            eta_exec::lay_out(plan, &[one, one], &launches(plan, &[1], 0))
+                .expect("fits")
+                .values
+        };
+        let laid = offsets(&plan);
+        assert_ne!(
+            laid[0], laid[1],
+            "the take lands over the constant the put reads after it"
+        );
+        plan.fused[0].order.clear();
+        let stated = offsets(&plan);
+        assert_eq!(
+            stated[0], stated[1],
+            "in the stated order the constant may reuse the dead take's slot"
+        );
+    }
+
+    #[test]
+    fn only_bool_is_packed_and_the_round_trip_is_lossless() {
+        for (dtype, numel) in [
+            (Dtype::F32, 3),
+            (Dtype::I32, 5),
+            (Dtype::U32, 1),
+            (Dtype::Bool, 11),
+        ] {
+            let native = native_cell_bytes(dtype, numel);
+            let wire = eta_exec::wire_cell_bytes(dtype, numel);
+            if dtype == Dtype::Bool {
+                assert_eq!(native, numel, "a byte per lane on the device");
+                assert_eq!(wire, numel.div_ceil(8), "a bit per lane on the wire");
+            } else {
+                assert_eq!(native, wire, "four bytes either way");
+            }
+            let bytes: Vec<u8> = (0..wire).map(|i| (i as u8).wrapping_mul(37) | 1).collect();
+            let there = wire_to_native(dtype, numel, &bytes).expect("one wire cell");
+            assert_eq!(there.len(), native);
+            let back = native_to_wire(dtype, numel, &there).expect("one native cell");
+            if dtype == Dtype::Bool {
+                for lane in 0..numel {
+                    assert_eq!(
+                        back[lane / 8] >> (lane % 8) & 1,
+                        bytes[lane / 8] >> (lane % 8) & 1,
+                        "lane {lane} did not survive the round trip"
+                    );
+                }
+            } else {
+                assert_eq!(back, bytes);
+            }
+        }
+    }
+}

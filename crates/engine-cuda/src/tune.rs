@@ -477,3 +477,47 @@ pub fn run(
         seconds,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "rocm"))]
+    const GPU: (&str, u32, u32, u32, &str) = ("NVIDIA L40S", 8, 9, 142, "fuse.moe_experts");
+    #[cfg(feature = "rocm")]
+    const GPU: (&str, u32, u32, u32, &str) = (
+        "AMD Instinct MI300X",
+        9,
+        4,
+        304,
+        "fuse.residual_add_rmsnorm",
+    );
+
+    #[test]
+    fn every_search_candidate_reads_against_the_registry() {
+        let (gpu, major, minor, sms, fused) = GPU;
+        let facts = crate::chip::facts(major, minor, sms);
+        let (base, _) = crate::chip::resolve(gpu, &facts, None);
+        let registry = crate::chip::registry();
+        let knobs = search::knobs(&base, SEARCH_SKIPS, "");
+        let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
+        for want in ["kernel.moe.mxfp4_grouped", fused] {
+            assert!(ids.contains(&want), "{want} not searched: {ids:?}");
+        }
+        for k in &knobs {
+            for (label, _) in &k.candidates {
+                let entries = vec![(k.id.to_string(), label.clone())];
+                search::assemble(
+                    registry,
+                    &base,
+                    gpu,
+                    &facts,
+                    &search::render_overrides(&entries),
+                    &[],
+                    &[crate::chip::ARCH],
+                )
+                .unwrap_or_else(|e| panic!("{} = {label}: {e}", k.id));
+            }
+        }
+    }
+}

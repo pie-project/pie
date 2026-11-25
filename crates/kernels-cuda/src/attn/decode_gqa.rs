@@ -310,3 +310,59 @@ pub fn decode(
         ],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each stamp fits a B200 block, the 64-wide an sm_86 one too, and only
+    /// the stamped widths, groups of at most eight and, at 64 wide, batches of
+    /// `gqa_from_64` requests take the kernel.
+    #[test]
+    fn each_stamp_states_what_its_block_holds() {
+        assert!(Stamp::of(64).expect("stamped").smem() <= 101_376);
+        assert!(Stamp::of(256).expect("stamped").smem() <= 232_448);
+        assert_eq!(Stamp::of(512), None);
+        let gate = Gate {
+            on: true,
+            from_64: 16,
+            whole_window: 128,
+            cluster: 8,
+            deep_64: false,
+            min_group: 1,
+        };
+        assert!(gate.takes(256, 2, 1) && gate.takes(64, 8, 16));
+        assert!(!gate.takes(64, 8, 15) && !gate.takes(256, 16, 64) && !gate.takes(512, 8, 64));
+        // A window of up to 128 keys reads whole at any batch; a wider one,
+        // a full row or an unstamped head does not.
+        assert!(gate.whole(64, 8, 127) && gate.whole(256, 2, 0));
+        assert!(!gate.whole(64, 8, 128) && !gate.whole(64, 8, -1) && !gate.whole(512, 8, 0));
+        // A row a cluster reads takes as many blocks as fill the grid, at
+        // most eight; a 64-wide one under a long window too (Muse Spark's
+        // 2048); a whole-read window, Gemma's 256-wide sliding row, or any
+        // where it is off, none.
+        assert_eq!(gate.ranks(64, 8, 8, 8, -1, 740), 4);
+        assert_eq!(gate.ranks(64, 8, 16, 8, -1, 740), 4);
+        assert_eq!(gate.ranks(64, 8, 64, 8, -1, 740), 1);
+        assert_eq!(gate.ranks(64, 8, 8, 8, 127, 740), 0);
+        assert_eq!(gate.ranks(64, 8, 8, 16, 2047, 740), 4);
+        assert_eq!(gate.ranks(256, 2, 1, 16, 1023, 740), 0);
+        assert_eq!(gate.ranks(64, 8, 1, 8, -1, 740), 8);
+        assert_eq!(Gate { cluster: 0, ..gate }.ranks(64, 8, 8, 8, -1, 740), 0);
+        assert!(gate.stamps(64, 8));
+        assert!(!Gate::default().stamps(256, 2));
+        // The deep 64-wide stamp: four blocks still share a B200 SM, a bf16
+        // pool's alone; off, or past 64 wide, the stamps as they were.
+        let deep = Gate {
+            deep_64: true,
+            ..gate
+        };
+        let stamp = deep.stamp(64, false).expect("stamped");
+        assert_eq!(stamp, Stamp::DEEP_64);
+        assert!(4 * (stamp.smem() + (8 * 64 + 8) * 4 + 1024) <= 233_472);
+        let e4m3 = Stamp::of(64).map(|s| Stamp { stages: 4, ..s });
+        assert_eq!(deep.stamp(64, true), e4m3);
+        assert_eq!(deep.stamp(256, false), Stamp::of(256));
+        assert_eq!(gate.stamp(64, false), Stamp::of(64));
+    }
+}
