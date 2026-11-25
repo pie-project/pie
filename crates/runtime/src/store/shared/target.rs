@@ -185,6 +185,9 @@ impl SharedGrow {
             // What a raise taken below owes the engine, and whether the
             // rung stood under it ([`SharedPool::raise_applied`]).
             let mut owed = (None, false);
+            // The chunks a guest bind lacks that idle cache is asked for
+            // before the rung comes down for it.
+            let mut idle_ask = None;
             let (step, goal) = {
                 let mut pool = self.shared.lock().unwrap();
                 pool.pool_mut().retire_through(retired);
@@ -227,6 +230,12 @@ impl SharedGrow {
                 // demand waits for room.
                 let forced = cap > pool.fit_cap() || pool.told_unfit() || (waits && past && !idle_gives);
                 let waited = forced || !past || needed;
+                if past && !waited && idle_gives {
+                    idle_ask = pool
+                        .guest_head()
+                        .filter(|&(run, pieces)| pool.pool().free_chunk_runs(run) < pieces)
+                        .map(|(run, pieces)| run.saturating_mul(pieces));
+                }
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
                     goal,
@@ -284,6 +293,9 @@ impl SharedGrow {
                 };
                 (step, goal)
             };
+            if let Some(chunks) = idle_ask {
+                super::ask_idle_for(self.model, self.engine, chunks);
+            }
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {

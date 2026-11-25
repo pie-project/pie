@@ -2597,9 +2597,6 @@ impl KvStore {
             .table
             .insert_cached(after, backings, token_hashes, page_hashes);
         self.table.lease_cache_root(node);
-        // The copy filling its pages is handed out with the fires after now.
-        let now = self.current_epoch().saturating_add(1);
-        self.table.stamp_path(node, None, now);
         // An entry's pages are its path's, from token 0: the prefix it was
         // grafted below as well as its own.
         let pages = self.table.path_len(node);

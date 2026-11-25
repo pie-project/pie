@@ -73,6 +73,9 @@ pub struct ResidencyPlanner {
     /// One reclaim at a time: one under way on another thread is not idle
     /// cache found out.
     idle_reclaim: parking_lot::Mutex<()>,
+    /// A pass ended with its head stuck, whatever idle cache holds: it gives
+    /// that head nothing until room moves.
+    idle_stuck: std::sync::atomic::AtomicBool,
     pub(super) sweeping: AtomicBool,
     sweep_exhausted: AtomicBool,
     pub(super) demoting: AtomicBool,
@@ -164,6 +167,7 @@ impl ResidencyPlanner {
             runtime: tokio::runtime::Handle::try_current().ok(),
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             idle_reclaim: parking_lot::Mutex::new(()),
+            idle_stuck: std::sync::atomic::AtomicBool::new(false),
             sweeping: AtomicBool::new(false),
             sweep_exhausted: AtomicBool::new(false),
             demoting: AtomicBool::new(false),
@@ -858,7 +862,39 @@ impl ResidencyPlanner {
     /// reclaim found it out since room last moved. The activation rung is
     /// not lowered for the waiter before that.
     pub fn idle_gives(&self) -> bool {
-        !self.idle_reclaim_exhausted.load(Ordering::Acquire) && self.port.holds_idle()
+        !self.idle_reclaim_exhausted.load(Ordering::Acquire)
+            && !self.idle_stuck.load(Ordering::Acquire)
+            && self.port.holds_idle()
+    }
+
+    /// A pass found its head stuck: what comes after idle cache is looked at
+    /// now, the pass having ended short of asking it or found it no help.
+    pub(super) fn idle_stuck(&self) {
+        if !self.idle_stuck.swap(true, Ordering::AcqRel) {
+            self.port.idle_out();
+        }
+    }
+
+    /// A bind short of `chunks` whole chunks that waits outside the planner's
+    /// queue (on a segment's commit, or on its way into the queue) has idle
+    /// cache asked for it here: room freed, or idle cache found out, wakes
+    /// the walk. One in the queue is asked for by the plan.
+    pub fn ask_idle_for(self: &Arc<Self>, chunks: u32) {
+        if self.returns.waiters.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let pages = self.port.chunks_as_pages(chunks);
+        if self.demote_idle_for(pages, chunks) {
+            return;
+        }
+        let short = super::pool::IdleShort {
+            kv_pages: pages,
+            rs: true,
+            chunks,
+        };
+        if self.reclaim_idle_once(short) == IdleOutcome::Freed {
+            self.pages_freed();
+        }
     }
 
     /// Makes room for an ask of `pages` from idle cache at once, in the
@@ -1410,6 +1446,7 @@ impl ResidencyPlanner {
     pub(super) fn re_arm_idle_reclaim(&self) {
         self.idle_reclaim_exhausted.store(false, Ordering::Release);
         self.sweep_exhausted.store(false, Ordering::Release);
+        self.idle_stuck.store(false, Ordering::Release);
     }
 
     /// Not what the head and restores under way read: they would bring it

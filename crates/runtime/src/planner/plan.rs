@@ -178,6 +178,7 @@ impl ResidencyPlanner {
         let mut on_grow = on_grow;
         let mut passed = false;
         while !on_grow && let Some(stuck) = self.stuck_head() {
+            self.idle_stuck();
             self.with_inner(|inner| inner.passed.push(stuck));
             passed = true;
             on_grow = self.plan_once();

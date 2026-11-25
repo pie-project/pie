@@ -253,17 +253,19 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
     let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
         .with_live_lanes(|| 1);
     // Idle cache, every page there is; a waiter is short of two.
-    crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+    let list = shared.lock().unwrap().list().expect("a kv list").pool;
+    let keys = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
         let pages = kv.reserve_device_pages(kv.available_pages()).unwrap();
         let rows: Vec<u32> = (0..pages.len() as u32 * 16).collect();
         let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&[3; 32], None, 0, &rows)
             .chunks(16)
             .map(|page| page.iter().map(|hash| Some(*hash)).collect())
             .collect();
-        let keys = tokens.iter().map(|page| page_hash(page)).collect();
+        let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
         let backings = pages.into_iter().map(KvPageBacking::Resident).collect();
-        assert!(kv.import_cached_at(&[], tokens, keys, backings));
+        assert!(kv.import_cached_at(&[], tokens, keys.clone(), backings));
         kv.note_short(2);
+        keys
     });
     grow.walk_rung().await;
     assert_eq!(
@@ -271,6 +273,35 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
         u32::MAX,
         "idle cache is asked first"
     );
+    // One bind short of a run outside the planner's queue, idle cache
+    // pinned: it is asked, has none to give, and the rung comes down with
+    // nobody in the queue.
+    let pin = crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kv.clear_short();
+        let run = kv.cached_run(&keys);
+        kv.pin_resident(&run).expect("on the device").0
+    });
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.pool_mut().wait(crate::store::roles::GUEST_WAITER, list, 2);
+        pool.set_guest_head(Some((2, 1)));
+    }
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    assert_eq!(crate::store::shared::fire_cap(ENGINE), 1, "pinned: the rung comes down");
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.pool_mut().unwait(crate::store::roles::GUEST_WAITER);
+        pool.set_guest_head(None);
+    }
+    crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+    crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kv.release_reader(pin);
+        kv.note_short(2);
+    });
+    planner.pages_freed();
+    grow.walk_rung().await;
+    assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX, "asked first again");
     // The planner asks it, all of it, and finds no more.
     planner.yield_idle(64);
     planner.yield_idle(64);
