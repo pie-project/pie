@@ -63,6 +63,21 @@ impl Channel {
         context::release_channel_state(gid)
     }
 
+    /// What `trace` answers, every channel this thread made in it released
+    /// as it ends, an error or a panic included: a trace's container holds
+    /// no channel, so a host that keeps the container keeps no seed.
+    pub fn released<R>(trace: impl FnOnce() -> R) -> R {
+        struct Scope(u64);
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                context::release_channels_from(self.0);
+            }
+        }
+        // A gid only grows, so this thread's made from here are past it.
+        let _scope = Scope(NEXT_GID.load(Ordering::Relaxed));
+        trace()
+    }
+
     pub fn is_seeded(&self) -> bool {
         self.state.borrow().seeded
     }
