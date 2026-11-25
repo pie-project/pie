@@ -175,3 +175,62 @@ fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{LaneMask, stage};
+
+    /// A wide lane that states no mask stages no plane: its non-causal ops
+    /// read to the plan's `kv_len`, its causal ops stay causal.
+    #[test]
+    fn a_wide_lane_with_no_mask_stages_nothing() {
+        let lane = |wide| LaneMask {
+            mask: None,
+            have: 40,
+            folded: 0,
+            rows: 600,
+            wide,
+        };
+        assert_eq!(
+            stage(&[lane(true), lane(false), lane(true)], 1024).unwrap(),
+            None
+        );
+    }
+
+    /// A lane's mask speaks of its keys from its set's committed boundary
+    /// on: with 4 keys held, 2 committed, and 2 rows, its 4 columns are keys
+    /// 2..6 (the buffer 2, 3, then its rows 4, 5). The committed keys are read
+    /// under the causal bound, no bit; column 0 hidden hides key 2; the own
+    /// rows are bound by row order. A mask short of the 4 columns is refused
+    /// with that extent.
+    #[test]
+    fn a_mask_reads_its_columns_from_the_committed_boundary() {
+        use engine::fire::{Mask, Masking};
+        let hide_first = Masking::Extent(Mask { runs: vec![1, 3], total: 4 });
+        let lane = LaneMask {
+            mask: Some(&hide_first),
+            have: 4,
+            folded: 2,
+            rows: 2,
+            wide: false,
+        };
+        let staged = stage(&[lane], 256).unwrap().expect("a plane");
+        let stride = staged.stride as usize;
+        let row = |q: usize| &staged.bytes[q * stride..q * stride + 6];
+        assert_eq!(row(0), &[1, 1, 0, 1, 1, 0], "row 0: committed, buffer, itself");
+        assert_eq!(row(1), &[1, 1, 0, 1, 1, 1], "row 1: and row 0, itself");
+        assert_eq!(staged.enabled, vec![1, 1]);
+        let short = Masking::Extent(Mask { runs: vec![0, 3], total: 3 });
+        let refused = stage(
+            &[LaneMask {
+                mask: Some(&short),
+                ..lane
+            }],
+            256,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refused, crate::error::Fault::Mask { extent: 4, .. }),
+            "refused with the buffer's extent: {refused:?}"
+        );
+    }
+}
