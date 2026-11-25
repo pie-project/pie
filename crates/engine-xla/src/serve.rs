@@ -700,15 +700,15 @@ impl Shell {
         let mut budget = boot.budget.clone();
         if budget.buckets.is_empty() {
             budget.buckets = pad.ladder(budget.max_tokens);
-            // One rung past the fire limit, for the padding lanes that
-            // bring a full prefill fire's lane counts to their rungs
-            // (`fire_inner`); the runtime still sends at most `max_tokens`.
-            // (on every load: without it, prompts filling the top rung have
-            // no rows for their padding lanes, and no layout)
-            if pad.room > 0 {
-                budget.max_tokens += pad.room;
-                budget.buckets.push(budget.max_tokens);
-            }
+        }
+        // One rung past the fire limit, for the padding lanes that bring a
+        // full prefill fire's lane counts to their rungs (`fire_inner`); the
+        // runtime still sends at most `max_tokens`. Stated rungs take it too:
+        // without it, prompts filling the top rung have no rows for their
+        // padding lanes, and no layout.
+        if pad.room > 0 {
+            budget.max_tokens += pad.room;
+            budget.buckets.push(budget.max_tokens);
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
         // prefill beside a decode's up to the mixed fire's host rung; never
