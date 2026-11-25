@@ -28,32 +28,6 @@ fn user_file(profiles: Option<&Path>, device: &str) -> Option<String> {
     Some(crate::chip::registry().prune(&text).0)
 }
 
-/// The tuned decisions `file` with the keyed measurements `existing` (the
-/// user's file it replaces) stores in place of its own unkeyed rates: a
-/// tune times decisions, and what loads measured of the device still stands.
-fn keeping_stored(file: String, existing: Option<&str>) -> String {
-    let Some(stored) = existing.and_then(|text| {
-        crate::chip::registry()
-            .parse(text, "the user's file", profile::Strict::User)
-            .ok()
-    }) else {
-        return file;
-    };
-    let rates = stored.tuned.rates;
-    if rates.measured_on.is_none() {
-        return file;
-    }
-    let how = stored
-        .provenance
-        .into_iter()
-        .find(|(key, _)| key == "rates")
-        .map_or_else(
-            || "\"stored by loads, kept by pie tune\"".to_string(),
-            |(_, how)| how,
-        );
-    engine::rates::saved_text(Some(&file), &rates, &("rates", how))
-}
-
 /// `pie tune cuda --rates`: GPU 0's roofline constants measured at
 /// `engine::rates`' shapes ([`crate::rates::measure`]), keyed and saved over
 /// the user's file as a load saves what it measures
@@ -495,7 +469,7 @@ pub fn run(
         &provenance,
         &[crate::chip::ARCH],
     )?;
-    let file = keeping_stored(file, user_file(profiles, &name).as_deref());
+    let file = engine::rates::keeping_stored(crate::chip::registry(), file, user_file(profiles, &name).as_deref());
     Ok(Outcome {
         device: name,
         file,
@@ -612,7 +586,7 @@ mod tests {
             &[crate::chip::ARCH],
         )
         .expect("the tuned file");
-        let kept = keeping_stored(tuned, user_file(Some(home.path()), gpu).as_deref());
+        let kept = engine::rates::keeping_stored(crate::chip::registry(), tuned, user_file(Some(home.path()), gpu).as_deref());
         std::fs::write(&path, kept).unwrap();
         assert!(takes(4321, 7.5, "a tune"), "the tuned decision is there");
 
