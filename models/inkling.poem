@@ -1,7 +1,7 @@
 # Inkling and Inkling-Small, each with its miniature of seven layers and
 # eight experts, which reads a prefix of the whole model's checkpoint.
 
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 load("//lib/reads.poem", "flattened")
 
 INKLING = template("inkling")
@@ -97,7 +97,6 @@ def layout(id, deploy):
 
     def layer(l):
         vec = lambda s, length: weight([length])
-        lora_a, lora_b = banks(hidden)
         if (l + 1) % d.global_every == 0:
             reading, kv_heads, extent = GLOBAL, d.global_kv_heads, d.global_extent
         else:
@@ -157,8 +156,7 @@ def layout(id, deploy):
             mlp_state = state([kw, hidden], dtype.bf16),
             mlp_norm = vec("mlp_norm", hidden),
             mlp = mlp,
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     return struct(
@@ -301,7 +299,7 @@ def forward(m, inputs):
             ),
         ])
         o = ops.linear.matmul(a, w.o_proj)
-        o = corrected(x, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", x, o)
         o = conv(o, w.attn_conv, w.attn_state, inputs, m)
         y = ops.elemwise.residual_add(o, y)
 

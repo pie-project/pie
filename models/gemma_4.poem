@@ -4,7 +4,7 @@
 # as a block-diffusion text model.
 
 load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_head = "head", dflash_declare = "declare")
 load("//lib/media.poem", "budget_resize")
 load("//lib/reads.poem", "flattened")
@@ -273,7 +273,6 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, length: weight([length])
-        lora_a, lora_b = banks(hidden)
         reading = GLOBAL if full_at(l) else SLIDING
         head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
         q_w = d.q_heads * head_dim
@@ -334,9 +333,8 @@ def layout(id, deploy):
             inter = iw,
             down = weight([hidden, iw], mlp_at),
             scalar = weight([1]) if d.ple_dim == None else None,
-            lora_a = lora_a,
-            lora_b = lora_b,
             moe = moe,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     tower = None
@@ -899,7 +897,7 @@ def forward(m, inputs):
         proj = ops.linear.matmul(y, ple.model_proj) * f32(1.0 / root)
         relay = ops.elemwise.rmsnorm_per_head(proj, ple.model_norm, ple.dim, ple.model_norm_eps)
 
-    routes = inputs.adapter_routes()
+    routes = trunk_inputs.adapter_routes()
 
     # The shared tail writes no kv, so past its first layer only the rows a
     # lane reads out still matter: a lane that masks its attention or
@@ -937,7 +935,7 @@ def forward(m, inputs):
         causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
         a = ops.attn.attend(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
                             causal = causal, mask = True, scores = at.reading != SLIDING)
-        return normed, a, routes
+        return normed, a, lanes.adapter_routes()
 
     def attend_readouts(l, w, y):
         """A shared layer over readout rows: each attends as the token it
@@ -955,7 +953,7 @@ def forward(m, inputs):
         else:
             normed, a, layer_routes = attend(l, w, y, all_rows)
         o = ops.linear.matmul(a, w.o_proj)
-        o = corrected(normed, o, w, layer_routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), layer_routes).correct("attn", normed, o)
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)

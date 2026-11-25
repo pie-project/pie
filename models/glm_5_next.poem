@@ -2,7 +2,7 @@
 # without, and its eight-layer, 32-expert miniature.
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", read_weight = "weight", landed = "land")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 load("//lib/hyper.poem", "hyper", "mix", "gate", "predict_route")
 load("//lib/kda.poem", "kda", "kda_qkv", "kda_conv", "kda_gate", "run_kda")
 load("//lib/media.poem", "smart_resize")
@@ -241,7 +241,6 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight([width])
-        lora_a, lora_b = banks(hidden)
         if (l + 1) % d.full_attn_every == 0:
             mixer = mla_at("layer.{}".format(l), latent(), index_keys())
             mixer_kind = "mla"
@@ -279,8 +278,7 @@ def layout(id, deploy):
             mlp_norm = norm("mlp_norm", hidden),
             mlp_norm_eps = d.norm_eps,
             mlp = mlp,
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     mtp = None
@@ -690,7 +688,7 @@ def forward(m, inputs):
             o = mla_mixer(x, inputs, positions, m.act, w.mixer)
         else:
             o = run_kda(x, inputs, w.mixer)
-        o = corrected(x, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", x, o)
         streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
         x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)

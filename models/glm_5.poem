@@ -4,7 +4,7 @@
 # and its seven-layer miniature.
 
 load("//pie/codec.poem", "bank", "dequantized", "kept", "land", read_weight = "weight")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 load("//lib/mla.poem", "attend")
 load("//lib/mtp.poem", "draft")
 
@@ -282,7 +282,6 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, width: weight([width], w)
-        lora_a, lora_b = banks(hidden)
         keys = index_keys() if ranks(d, l) else None
         attn = mla_at("layer.{}".format(l), latent(), keys)
         if l < d.dense_layers:
@@ -303,8 +302,7 @@ def layout(id, deploy):
             mlp_norm = norm("mlp_norm", hidden),
             mlp_norm_eps = d.norm_eps,
             mlp = mlp,
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     head = None
@@ -501,7 +499,7 @@ def forward(m, inputs):
             ranked = selection
             select = lambda q_a: ranked
         o, selection = run_attention(x, inputs, a, positions = positions, select = select)
-        o = corrected(x, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", x, o)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)

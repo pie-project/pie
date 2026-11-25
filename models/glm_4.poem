@@ -10,8 +10,8 @@
 # `--deployment glm46-…`.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/blocks.poem", "attention", "swiglu")
+load("//lib/taps.poem", "attention_widths", "stanza_banks", "taps")
 
 GLM45 = template("glm45")
 GLM47 = template("glm47")
@@ -69,7 +69,8 @@ DEPLOYMENTS = (
 # deployment's first dtype stores the projections and the shared and dense
 # MLPs, its second (or the first) the routed banks; the norms, biases, router,
 # embedding and head stay bf16 under the FP8 release. Each layer also has the
-# LoRA banks the host registers.
+# banks its mounted stanzas keep at its attention (`//lib/taps.poem`), which
+# the host registers.
 
 def dims(hidden, layers, experts, inter, dense_layers, dense_inter, qk_norm, scaling, max_position):
     return struct(
@@ -132,6 +133,7 @@ def layout(id, deploy):
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+    widths = attention_widths(hidden, q_width, kv_width)
 
     def mlp(l):
         if l < d.dense_layers:
@@ -167,7 +169,6 @@ def layout(id, deploy):
         )
 
     def layer(l):
-        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),
@@ -183,8 +184,7 @@ def layout(id, deploy):
             mlp = mlp(l),
             # Its keys and values, two planes of its kv heads a token.
             kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, widths)
         )
 
     return struct(
@@ -203,6 +203,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
+        widths = widths,
         final_norm = weight([hidden]),
     )
 
@@ -272,8 +273,7 @@ TRANSFORMERS = [
 # has the norms, and the first half of each head rotated (neox halves); then
 # a SwiGLU MLP on the first layers, and on the rest the shared expert plus
 # the routed experts a biased sigmoid picks, their weights renormalized and
-# scaled. A row with an adapter adds its LoRA correction to the attention's
-# output.
+# scaled. A row with an adapter runs its stanzas at its attention's taps.
 
 def forward(m, inputs):
     positions = inputs.positions()
@@ -283,8 +283,9 @@ def forward(m, inputs):
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
         qk_norm = None if w.q_norm == None else "head"
-        o = attention(x, inputs, m, w, positions, rotary_dim = m.rotary_dim, qk_norm = qk_norm, biased = True)
-        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
+        adapt = taps(w, l, len(m.layers), m.widths, routes)
+        o = attention(x, inputs, m, w, positions, rotary_dim = m.rotary_dim, qk_norm = qk_norm, biased = True, adapt = adapt)
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(mlp(x, w.mlp), y)
 
