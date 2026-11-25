@@ -709,6 +709,13 @@ impl Shell {
         if pad.room > 0 {
             budget.max_tokens += pad.room;
             budget.buckets.push(budget.max_tokens);
+            if !asked.buckets.is_empty() {
+                tracing::info!(
+                    stated = ?asked.buckets,
+                    laid = budget.max_tokens,
+                    "xla row rungs: the stated ones and one past them, for the padding lanes of a fire filling the top one"
+                );
+            }
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
         // prefill beside a decode's up to the mixed fire's host rung; never
