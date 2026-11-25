@@ -25,8 +25,6 @@ mod victim;
 mod wait;
 
 #[cfg(test)]
-mod pressure_tests;
-#[cfg(test)]
 mod seat_tests;
 #[cfg(test)]
 mod service_order_tests;

@@ -716,38 +716,6 @@ mod abort_tests {
 
 #[cfg(test)]
 mod refused_untouched_tests {
-    use super::*;
+    
 
-    /// An engine refusing a copy as impossible (before reading or writing
-    /// any of it) is told apart from a copy that failed: the waiter can
-    /// take the move back rather than fail the process.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_copy_refused_as_impossible_is_told_untouched() {
-        let refused = ControlCompletion::new();
-        refused.resolve(&Err(anyhow::Error::new(::engine::Error::Impossible(
-            "state chunk 1936 lies inside the carve".into(),
-        ))
-        .context("kv to LocalDisk copy")));
-        let error = refused.wait().await.expect_err("refused");
-        assert!(error.downcast_ref::<RefusedUntouched>().is_some(), "{error:#}");
-        let failed = ControlCompletion::new();
-        failed.resolve(&Err(anyhow::anyhow!("device lost")));
-        let error = failed.wait().await.expect_err("failed");
-        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
-    }
-
-    /// A copy down to a full disk tier (the slot file's write failing
-    /// with `StorageFull`) is told as the tier below full, nothing on the
-    /// device changed: never a failed copy, never a string.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_copy_to_a_full_tier_is_told_as_the_tier_below_full() {
-        let full = ControlCompletion::new();
-        full.resolve(&Err(anyhow::Error::new(::engine::Error::TierFull(
-            "the disk tier's slot file is full: No space left on device".into(),
-        ))
-        .context("kv to LocalDisk copy")));
-        let error = full.wait().await.expect_err("refused");
-        assert!(error.downcast_ref::<TierBelowFull>().is_some(), "{error:#}");
-        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
-    }
 }

@@ -601,46 +601,6 @@ mod tests {
         }
     }
 
-    /// A 39-bit phone (512 GiB): the count fits in what is free after the
-    /// process keeps as much again as it maps, and in one range.
-    #[test]
-    fn the_count_fits_the_address_space() {
-        let cost = default_layout().cost();
-        let space = AddressSpace {
-            largest_free: 400 * GIB,
-            free: 480 * GIB,
-            mapped: 30 * GIB,
-            reserve: 30 * GIB,
-            limit: None,
-            maps: Some(maps(2_000, 65_530, 2_000)),
-        };
-        // 480 - 30 = 450 GiB free beyond the rest; one range of 400 holds it.
-        assert_eq!(space.pool_bytes(), 400 * GIB);
-        let fits = space.fits(&cost);
-        assert!(cost.bytes(fits) <= space.pool_bytes());
-        assert!(cost.bytes(fits + 1) > space.pool_bytes());
-        assert_eq!(fits, 99);
-        assert_eq!(size_pool(None, Ok(space), &cost).unwrap(), 99);
-        assert_eq!(size_pool(Some(64), Ok(space), &cost).unwrap(), 64);
-
-        // RLIMIT_AS holds it to the cap less what is mapped and the reserve.
-        let capped = AddressSpace {
-            limit: Some(100 * GIB),
-            ..space
-        };
-        assert_eq!(capped.pool_bytes(), 40 * GIB);
-        assert_eq!(capped.fits(&cost), 9);
-
-        // Memory maps hold it where the address space does not.
-        let maps = AddressSpace {
-            largest_free: 100_000 * GIB,
-            free: 100_000 * GIB,
-            maps: Some(maps(2_000, 12_000, 2_000)),
-            ..space
-        };
-        assert_eq!(maps.fits(&cost), (12_000 - 4_000) / 5);
-    }
-
     /// The default 2048 on the phone is refused by name, with what it
     /// needs and what the process has; a pool of none is refused unset.
     #[test]

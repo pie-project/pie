@@ -1583,18 +1583,6 @@ impl KvPageTable {
         self.device_pages_freed(&self.unused_cache_roots())
     }
 
-    #[cfg(test)]
-    pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
-        self.rev += 1;
-        let dropped = self.unused_cache_roots();
-        let mut freed = Vec::new();
-        for node in &dropped {
-            self.cache_roots.remove(node);
-            freed.extend(self.remove_anchor(*node));
-        }
-        (dropped.len(), freed)
-    }
-
     pub fn reclaim_quotes(
         &self,
         groups: &[HashSet<WorkingSetId>],

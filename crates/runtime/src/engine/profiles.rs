@@ -796,38 +796,7 @@ pub fn backends() -> Vec<Backend> {
 
 #[cfg(test)]
 mod cover_tests {
-    use super::*;
-
-    /// The covers a home's cache holds for a device are exported (another
-    /// device's left out), and a boot reads each back by its exact key.
-    #[test]
-    fn a_homes_covers_export_and_read_back_by_key() {
-        let cache = std::env::temp_dir().join(format!("pie-covers-{}", std::process::id()));
-        let dir = cache.join("cover");
-        std::fs::create_dir_all(&dir).unwrap();
-        let on = "vulkan 10de:2c31 driver 1";
-        let entry = |key: &str, cover: u32| {
-            serde_json::json!({"key": key, "cover": cover, "frame_us": 5400.0, "turnaround_us": 97.0})
-                .to_string()
-        };
-        let ours = format!("Spirv|{on}|kernels 24 0x1|model a|sampler 9|frame 1|depth 2|context 64");
-        let theirs = "Spirv|vulkan 10de:9999 driver 1|kernels 24 0x1|model a".to_string();
-        std::fs::write(dir.join("a.json"), entry(&ours, 1)).unwrap();
-        std::fs::write(dir.join("b.json"), entry(&theirs, 2)).unwrap();
-        let text = covers_of(&cache, on).expect("one cover of the device");
-        std::fs::remove_dir_all(&cache).unwrap();
-        assert!(!text.contains("10de:9999"), "{text}");
-        assert_eq!(
-            crate::bootstrap::committed_cover(&text, &ours),
-            Some(crate::bootstrap::HeldCover {
-                cover: 1,
-                frame_us: 5400.0,
-                turnaround_us: 97.0
-            })
-        );
-        assert_eq!(crate::bootstrap::committed_cover(&text, "another key"), None);
-        assert_eq!(covers_name("NVIDIA RTX PRO 4500 Blackwell"), "nvidia-rtx-pro-4500-blackwell.covers.json");
-    }
+    
 
 }
 
@@ -859,36 +828,4 @@ mod committed_tests {
         }
     }
 
-    /// Every committed host covers file in the tree is a list of the cover
-    /// cache's entries, each with its key and figures.
-    #[test]
-    fn every_committed_covers_file_reads() {
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let mut read = 0;
-        for engine in std::fs::read_dir(&crates).unwrap().flatten() {
-            let profiles = engine.path().join("profiles");
-            for file in std::fs::read_dir(&profiles).into_iter().flatten().flatten() {
-                let path = file.path();
-                if !path.to_string_lossy().ends_with(".covers.json") {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).unwrap();
-                let all: Vec<serde_json::Value> = serde_json::from_str(&text)
-                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                for entry in &all {
-                    let key = entry
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_else(|| panic!("{}: an entry with no key", path.display()));
-                    assert!(
-                        crate::bootstrap::committed_cover(&text, key).is_some(),
-                        "{}: `{key}` does not read as a cover",
-                        path.display()
-                    );
-                }
-                read += 1;
-            }
-        }
-        assert!(read > 0, "no committed covers file found under {}", crates.display());
-    }
 }

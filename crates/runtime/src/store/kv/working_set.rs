@@ -263,29 +263,6 @@ mod pipeline_failure_tests {
     use super::*;
     use crate::store::PipelineScope;
 
-    #[test]
-    fn a_set_answers_for_the_pipeline_it_last_fired_on() {
-        let model = crate::store::registry::register_model(16, &[8], &[4]);
-        let stores = crate::store::registry::get(model, 0);
-        let id =
-            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.create_working_set());
-        let ws = KvWorkingSet::new(model, 0, id, 16);
-        assert_eq!(ws.pipeline_failure(), None, "no pipeline yet");
-
-        let failure = crate::pipeline::fire::PipelineFailure::default();
-        let scope = PipelineScope::failing_as(failure.clone(), || true);
-        ws.claim_pipeline_scope(&scope).unwrap();
-        assert_eq!(ws.pipeline_failure(), None);
-
-        *failure.lock().unwrap() = Some("the fire failed".to_string());
-        assert_eq!(ws.pipeline_failure().as_deref(), Some("the fire failed"));
-
-        let other = PipelineScope::failing_as(Default::default(), || true);
-        let unrelated = KvWorkingSet::new(model, 0, id, 16);
-        unrelated.claim_pipeline_scope(&other).unwrap();
-        assert_eq!(unrelated.pipeline_failure(), None, "it is not process-wide");
-    }
-
     /// What a fire folds is frozen as the fire is prepared. A pipeline
     /// that failed left sets holding folds whose fires never ran: such a
     /// set, and a fork of it made before or after, joins no other

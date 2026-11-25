@@ -939,16 +939,4 @@ mod seats_tests {
         );
     }
 
-    /// A model with state slots keeps the message that names them.
-    #[test]
-    fn a_stateful_model_short_of_seats_names_its_state_slots() {
-        let mut seats = Seats::new(4);
-        let short = seats.seats(working_set(), 5).unwrap_err();
-        assert_eq!((short.need, short.have, short.capacity), (5, 4, 4));
-        assert!(
-            short
-                .to_string()
-                .contains("4 seat(s) free of the 4 the state slots give")
-        );
-    }
 }

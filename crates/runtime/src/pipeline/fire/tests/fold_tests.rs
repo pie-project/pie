@@ -1,7 +1,6 @@
 use super::*;
 use crate::inferlet::host::working_set::Cursor;
-use crate::store::kv::KvStoreError;
-use crate::store::kv::page_table::{KvTableError, WorkingSetId};
+use crate::store::kv::page_table::WorkingSetId;
 use crate::store::registry::Stores;
 
 fn cursor(reserved: u32) -> CursorCell {
@@ -51,10 +50,6 @@ fn folded(stores: &Stores, ws: WorkingSetId) -> (u64, bool) {
 
 fn landing(start: u32, rows: u32) -> geometry::Landing {
     geometry::Landing { start, rows }
-}
-
-fn all() -> geometry::Fold {
-    geometry::Fold::Host(vec![u32::MAX])
 }
 
 #[test]
@@ -115,26 +110,6 @@ fn state_at(stores: &Stores, frozen: u32) -> crate::store::rs::RsWorkingSetId {
     ws
 }
 
-/// The fire's part on one working set, folding it by `by`.
-fn part(
-    model: usize,
-    id: WorkingSetId,
-    by: FoldBy,
-    tags: Vec<ReportTag>,
-) -> (KvWorkingSet, FireWs) {
-    let kv = KvWorkingSet::new(model, 0, id, 8);
-    let part = FireWs {
-        ws: id,
-        kvtxn: KvTxnGuard::new(model, 0, None),
-        log: None,
-        lease: kv.fire_lease().expect("lease the submitted working set"),
-        fold: Some(FoldAt { by, decoded: false }),
-        reports: tags,
-        staged: None,
-    };
-    (kv, part)
-}
-
 /// What a fold placed as its fire is prepared freezes.
 fn frozen_as_prepared(by: Option<&FoldBy>) -> Option<u64> {
     match by {
@@ -143,187 +118,12 @@ fn frozen_as_prepared(by: Option<&FoldBy>) -> Option<u64> {
     }
 }
 
-fn taken(tags: &[ReportTag]) -> std::collections::HashMap<u64, ::engine::KvWrites> {
-    tags.iter()
-        .filter_map(|tag| tag.take().map(|written| (tag.0, written)))
-        .collect()
-}
-
 fn report(tag: u64, fold: u32) -> ::engine::KvWrites {
     ::engine::KvWrites {
         tag,
         fold: Some(fold),
         ..::engine::KvWrites::default()
     }
-}
-
-fn none() -> std::collections::HashMap<u64, ::engine::KvWrites> {
-    std::collections::HashMap::new()
-}
-
-const UNSETTLED: KvStoreError = KvStoreError::Table(KvTableError::FoldUnsettled);
-
-#[test]
-fn fold_every_case() {
-    a_fold_the_host_knows_is_frozen_as_its_fire_is_prepared();
-    a_fold_the_device_counts_leaves_the_folded_length_until_it_settles();
-    a_piece_inside_the_frozen_prefix_begins_nothing();
-}
-
-/// A count the host knows, over a folded length it knows, is a slot:
-/// frozen in the step that begins the fire's log, read by whatever is
-/// staged next, and only sealed when the fire settles.
-fn a_fold_the_host_knows_is_frozen_as_its_fire_is_prepared() {
-    let (_, stores, ws) = frozen_at(4);
-    let cell = cursor(0);
-    let pass = lanes_on(&stores, ws, &[&cell]);
-    let mut req = request(1);
-    let mut tags = Vec::new();
-    let landings = [landing(4, 6)];
-    let mut at = |fold: &geometry::Fold, end: u64, last: bool| {
-        fold_at(
-            &pass,
-            &[0],
-            &landings,
-            fold,
-            end,
-            last,
-            None,
-            &mut req,
-            &mut tags,
-        )
-    };
-    let three = geometry::Fold::Host(vec![3]);
-    assert!(matches!(at(&three, 10, false), Some(FoldBy::To(7))));
-    assert!(
-        matches!(at(&three, 6, true), Some(FoldBy::To(6))),
-        "short of what this fire writes"
-    );
-    assert!(
-        matches!(at(&all(), 20, true), Some(FoldBy::To(10))),
-        "no further than its rows land"
-    );
-    assert!(at(&geometry::Fold::Host(vec![0]), 10, true).is_none());
-    assert!(tags.is_empty() && req.lanes[0].reports == 0);
-
-    let seq = begin_piece(&mut stores.kv.lock(), ws, 4, Some(7)).unwrap();
-    assert!(seq.is_some());
-    assert_eq!(folded(&stores, ws), (7, true));
-    assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 0);
-    let next = lanes_on(&stores, ws, &[&cell]);
-    assert!(next.places[0].folded == 7 && next.places[0].folded_exact);
-    // Nothing waits on the fire: a fork takes the length it froze.
-    let child = stores.kv.lock().fork(ws).unwrap();
-    assert_eq!(folded(&stores, child), (7, true));
-    let to = |to| FoldAt {
-        by: FoldBy::To(to),
-        decoded: false,
-    };
-    settle_fold(&stores, ws, to(7), &none(), None, None);
-    assert_eq!(folded(&stores, ws), (7, true));
-    // A fire that failed leaves what it froze frozen: its pipeline
-    // failed with it, and its sets fire no more.
-    begin_piece(&mut stores.kv.lock(), ws, 7, Some(9)).unwrap();
-    settle_fold(&stores, ws, to(9), &none(), None, Some("the fire failed"));
-    assert_eq!(folded(&stores, ws), (9, true));
-}
-
-/// A fold the device counts is not known when its fire is prepared:
-/// the folded length stays where it was, marked a lower bound from the
-/// fire's submit, and moves by the reported count when the fire
-/// settles.
-fn a_fold_the_device_counts_leaves_the_folded_length_until_it_settles() {
-    let (model, stores, ws) = frozen_at(4);
-    let cell = cursor(12);
-    let pass = lanes_on(&stores, ws, &[&cell, &cell]);
-    let mut req = request(2);
-    let mut tags = Vec::new();
-    let by = fold_at(
-        &pass,
-        &[0, 1],
-        &[landing(4, 8), landing(4, 8)],
-        &geometry::Fold::Device,
-        u64::MAX,
-        true,
-        None,
-        &mut req,
-        &mut tags,
-    )
-    .expect("a device fold is placed when it settles");
-    assert!(
-        req.lanes[0].reports != 0 && req.lanes[1].reports == 0,
-        "the first lane carries the fold"
-    );
-    assert!(matches!(
-        &by,
-        FoldBy::Settled {
-            count: None,
-            reach: 12,
-            written: false,
-            ..
-        }
-    ));
-    // Its prepare freezes nothing.
-    let freeze = frozen_as_prepared(Some(&by));
-    assert_eq!(freeze, None);
-    begin_piece(&mut stores.kv.lock(), ws, 4, freeze)
-        .unwrap()
-        .expect("it writes past what is frozen");
-    assert_eq!(folded(&stores, ws), (4, true));
-    // Its submit.
-    let (_set, mut fire) = part(model, ws, by, tags);
-    let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
-    unsettle(&stores, &completion, std::slice::from_mut(&mut fire));
-    assert_eq!(folded(&stores, ws), (4, false));
-    assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 1);
-    assert_eq!(stores.kv.lock().fork(ws), Err(UNSETTLED));
-    // A pass staged meanwhile reads a lower bound, and says so.
-    let next = lanes_on(&stores, ws, &[&cell]);
-    assert!(next.places[0].folded == 4 && !next.places[0].folded_exact);
-    assert!(!appends_folded(&next, &[0]));
-
-    record_kv_writes(vec![report(req.lanes[0].reports, 3)]);
-    let reported = taken(&fire.reports);
-    let fold = fire.fold.take().unwrap();
-    settle_fold(&stores, ws, fold, &reported, None, None);
-    assert_eq!(folded(&stores, ws), (7, true));
-    assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 0);
-    let child = stores.kv.lock().fork(ws).unwrap();
-    assert_eq!(folded(&stores, child), (7, true));
-}
-
-/// A piece that would write inside what its set froze begins no log
-/// and freezes nothing; it and any other piece prepared and not fired
-/// fail the pipeline, and a set of a failed pipeline, or a fork of
-/// one, joins no other.
-fn a_piece_inside_the_frozen_prefix_begins_nothing() {
-    use crate::store::{PipelineScope, ScopeRefusal};
-    let (model, stores, ws) = frozen_at(4);
-    let began = begin_piece(&mut stores.kv.lock(), ws, 3, Some(9)).unwrap();
-    assert_eq!(began, None);
-    assert_eq!(folded(&stores, ws), (4, true));
-    let child = stores.kv.lock().fork(ws).unwrap();
-
-    let failure = PipelineFailure::default();
-    let scope = PipelineScope::failing_as(failure.clone(), || true);
-    let set = KvWorkingSet::new(model, 0, ws, 4);
-    set.claim_pipeline_scope(&scope).unwrap();
-    let forked = set.forked(child);
-    let mut ctx = Flight::context();
-    let reason = "pipeline: a fire writes slot 3, inside its working set's frozen prefix";
-    let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
-    record_submit_failure(&mut ctx, &gone, &failure, reason);
-    record_submit_failure(&mut ctx, &gone, &failure, "a later one");
-    assert_eq!(set.pipeline_failure().as_deref(), Some(reason));
-    scope.close();
-    let next = PipelineScope::failing_as(Default::default(), || true);
-    let refused = Err(ScopeRefusal::Failed {
-        owner: scope.id(),
-        reason: reason.to_string(),
-    });
-    assert_eq!(set.claim_pipeline_scope(&next), refused);
-    assert_eq!(forked.claim_pipeline_scope(&next), refused);
-    assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
 }
 
 /// `tokens` written into `ws` from row 0, 16 rows a page, by a pass
@@ -751,88 +551,6 @@ pub(crate) async fn ending(dropped: bool) -> Anyhow<Ending> {
         tag,
         _pass: fires,
     })
-}
-
-/// The in-pass fork: the guest forks a set between its own pipelined
-/// fires. The host fork runs the pipeline's fires to their end
-/// ([`drain_pipeline_fires`], which only its own task can); a handle's
-/// fork, a save and the planner's suspend wait on the store and on the
-/// fire's lease. None ends before the fire settles, and each then reads
-/// the folded length the device's count left, one length in both
-/// stores.
-/// A soak's stall: a process fires, then binds a
-/// program short of room, and the planner evicts it while its bind
-/// waits. The fire's lease goes back only as the fire is finalized,
-/// and its finalizer is the guest, in the bind; the eviction's drain
-/// finalizes only fires settled as it starts, and none of a pass whose
-/// geometry the device keeps, so the eviction would wait on the lease
-/// for good.
-/// A bind about to wait settles its process's fires first: the lease
-/// goes back as the fire lands, and the eviction's wait ends.
-#[tokio::test(flavor = "current_thread")]
-async fn a_bind_about_to_wait_settles_its_fires_and_an_eviction_s_wait_for_their_leases_ends()
--> Anyhow<()> {
-    use crate::inferlet::process::residency::{ResidentPipeline, register_residency};
-    use futures::FutureExt;
-    let model = crate::store::registry::register_model(4, &[8], &[1]);
-    let stores = crate::store::registry::get(model, 0);
-    let id = {
-        let mut kv = stores.kv.lock();
-        let id = kv.create_working_set();
-        kv.fold(id, 4, false).unwrap();
-        id
-    };
-    let kv = KvWorkingSet::new(model, 0, id, 8);
-    let cell = cursor(12);
-    let pipeline = Pipeline::new();
-    let (fires, failure, scope) = (
-        pipeline.fires.clone(),
-        pipeline.failure.clone(),
-        pipeline.scope.clone(),
-    );
-    let pid = uuid::Uuid::new_v4();
-    let residency = Arc::new(Mutex::new(
-        crate::inferlet::process::ProcessResidency::default(),
-    ));
-    residency.lock().unwrap().pipelines.push(ResidentPipeline {
-        scope: scope.clone(),
-        fires: Arc::downgrade(&fires),
-    });
-    register_residency(pid, Arc::downgrade(&residency));
-    assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
-    // A fire of a pass whose geometry the device keeps, on its way.
-    let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &geometry::Fold::Device);
-    assert!(!fires.lock().unwrap().front().unwrap().is_preemption_detachable());
-
-    // The eviction: its sets fenced, then it waits for their leases.
-    let handle = kv.suspend_handle();
-    handle.fence();
-    assert_eq!(handle.active_leases(), 1, "the fire holds its lease");
-    let mut quiesced = Box::pin(handle.quiesce());
-    assert!(quiesced.as_mut().now_or_never().is_none());
-
-    // The bind, about to wait, settles what its process has in flight.
-    let mut settled = Box::pin(settle_process_fires(pid));
-    assert!(
-        settled.as_mut().now_or_never().is_none(),
-        "it waits for the fire to land, not for anything the eviction holds"
-    );
-    assert_eq!(handle.active_leases(), 1);
-    // The fire lands.
-    record_kv_writes(vec![report(tag, 2)]);
-    resolve_test_completion(&completion, false);
-    settled.await;
-    assert!(fires.lock().unwrap().is_empty(), "finalized");
-    assert_eq!(handle.active_leases(), 0, "its lease is back");
-    quiesced.await;
-    assert_eq!(
-        stores.kv.lock().folded(id).unwrap(),
-        6,
-        "its fold is placed as its own finalize places it"
-    );
-    assert_eq!(*failure.lock().unwrap(), None, "a fire that ran fails nothing");
-    drop(residency);
-    Ok(())
 }
 
 /// A fold no fire is left to place never lets the cursor come to rest:

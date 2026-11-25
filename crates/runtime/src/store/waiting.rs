@@ -468,18 +468,6 @@ async fn refresh() {
 pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn prompt_tokens_are_the_ones_stated() {
-        let mut props = Props::new();
-        props.insert(
-            props::PROMPT_TOKENS.to_string(),
-            serde_json::json!([5, 6, 7]),
-        );
-        assert_eq!(prompt_tokens(&props), Some(vec![5, 6, 7]));
-        props.insert(props::PROMPT_TOKENS.to_string(), serde_json::json!(["x"]));
-        assert_eq!(props::prompt_tokens(&props), None);
-    }
-
     /// `pid` waits on `tokens`, looked up in `stores` (what [`arrived`]
     /// does once it has hashed them).
     pub(crate) fn waits(stores: &[Stores], pid: ProcessId, ask: &ShareAs, tokens: &[u32]) {

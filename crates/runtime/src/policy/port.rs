@@ -837,13 +837,6 @@ pub(crate) mod testing {
         resident: |_| None,
     };
 
-    /// Runs `component` (as `name`) over `events`, the port's own record
-    /// told the host after each, then enacts what its calls committed into
-    /// the installed tables. Returns once every event was heard.
-    pub(crate) fn enact(name: &str, component: &[u8], events: Vec<Event>) {
-        enact_on(name, component, &Worker::default(), events);
-    }
-
     /// The worker as a test puts it to the host: its attrs, and its time
     /// per step.
     #[derive(Default)]

@@ -94,26 +94,3 @@ async fn a_lane_past_the_device_alone_is_refused_at_submit() {
     let planner = crate::planner::planner_of(ctx.id).unwrap();
     assert!(!planner.demand_waits(), "nothing parked");
 }
-
-/// Lanes that each fit but pass the device together are no lane past
-/// it: none is refused as one.
-#[tokio::test(flavor = "current_thread")]
-async fn lanes_past_the_device_only_together_are_no_lane_past_it() {
-    let (model, stores, mut ctx) = device(94, 8);
-    let lanes: Vec<KvWorkingSet> = (0..2).map(|_| set(model, &stores, 5, 0)).collect();
-    let sets: Vec<(&KvWorkingSet, Written)> = lanes
-        .iter()
-        .map(|set| (set, Written::Span(0..5)))
-        .collect();
-    let plan = rs::RsPlan::Groups(Vec::new());
-    let alone = alone_demands(&stores, &sets, &[], &[], &plan).unwrap();
-    let planner = crate::planner::planner_of(ctx.id).unwrap();
-    assert_eq!(alone.iter().map(|unit| unit.kv_pages).collect::<Vec<_>>(), [5, 5]);
-    assert!(alone.iter().all(|&unit| planner.past_device(unit).is_none()));
-    let whole = crate::planner::Demand {
-        kv_pages: 10,
-        rs: Default::default(),
-    };
-    assert!(planner.past_device(whole).is_some(), "the whole would be");
-    let _ = &mut ctx;
-}

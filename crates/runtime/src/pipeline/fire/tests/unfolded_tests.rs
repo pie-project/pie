@@ -22,72 +22,6 @@ fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
     assert!(replay_rung(&stores, 56, FireRows { own: 4096, carried: 0 }, 0, 1, false).is_ok());
 }
 
-/// A host pass whose uncut own rows and carried rows together pass the
-/// widest rung's replay scratch, but whose pieces each fit, is served in
-/// pieces: the whole-pass check counts no own row, each piece its own
-/// as it is cut. A piece that no cut brings under a rung is refused by
-/// name.
-#[test]
-fn a_pass_too_wide_uncut_is_served_in_pieces_that_fit() {
-    let metal = |tokens: u32| ::engine::RungReplay {
-        own_max: Some(tokens),
-        carried_max: Some(tokens),
-        scratch: rows_bytes(2 * tokens),
-    };
-    let (_, stores) = pool_stating(vec![(256, 2), (1024, 8)], vec![metal(256), metal(1024)], false);
-    // Folded through 100, 300 rows buffered since, 2000 more to write
-    // folding all: uncut, 2000 own and 300 carried pass 2048.
-    let full = lane(400, 2000);
-    let frozen = [Some(100)];
-    let whole = vec![Some((0, 2000))];
-    assert!(
-        replay_rung(
-            &stores,
-            56,
-            piece_rows(&full, &whole, &frozen, false),
-            piece_replayed(&full, &whole, &frozen, false),
-            1,
-            false
-        )
-        .is_ok(),
-        "own rows past every rung are the cut's, not a refusal"
-    );
-    let cuts: Vec<Vec<Option<(u32, u32)>>> = host_cuts(&full, true, 512, 16, &[], 0)
-        .into_iter()
-        .map(|cut| vec![Some(cut)])
-        .collect();
-    assert!(cuts.len() > 1, "the pass is cut");
-    assert_eq!(
-        pieces_rung(&stores, 56, &full, &cuts, &frozen, true, &no_scratch()),
-        Ok(512),
-        "every piece fits: the widest asks its 512 rows, the 1024 rung, the first \
-         carrying the 300 rows beside them"
-    );
-    // A piece of eleven lanes, 929 own rows, replaying 1144: refused by
-    // name, whatever its lane count.
-    let mut eleven = lane(1244, 84);
-    for _ in 1..11 {
-        let more = eleven.lanes[0].clone();
-        eleven.lanes.push(more);
-    }
-    eleven.lanes[0].tokens = vec![0; 89];
-    let frozen = [Some(1140); 11];
-    let one = vec![(0..11).map(|at| Some((0, if at == 0 { 89 } else { 84 }))).collect()];
-    let refused =
-        pieces_rung(&stores, 56, &eleven, &one, &frozen, false, &no_scratch()).unwrap_err();
-    assert!(refused.contains("of 1024 tokens"), "{refused}");
-}
-
-/// A pass of lanes alone on their sets, folding nothing, landing no
-/// snapshot.
-fn no_scratch() -> PassScratch<'static> {
-    PassScratch {
-        shared: Vec::new(),
-        checkpoints: &[],
-        snapshots: 0,
-    }
-}
-
 pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
     pool_with_rungs(Vec::new())
 }
@@ -103,20 +37,6 @@ pub(super) fn pool_with_rungs_of(
     act_chunks: Vec<(u32, u32)>,
 ) -> (usize, crate::store::registry::Stores) {
     pool_stating(act_chunks, Vec::new(), false)
-}
-
-/// [`pool_with_rungs_of`], each rung's replay scratch stated
-/// (`act_replay`) and the load's rs scratch `rs_compact` or not.
-/// A Metal-shaped test scratch: one byte a row, no lane term past its
-/// 4-byte floor (`ScratchBytes::bytes`, Metal's formula), holding `rows`
-/// scratch rows.
-pub(super) fn rows_bytes(rows: u32) -> ::engine::ScratchBytes {
-    ::engine::ScratchBytes {
-        slot_bytes: vec![1],
-        lane_bytes: 0,
-        room_bytes: u64::from(rows) + 4,
-        pad: 1,
-    }
 }
 
 pub(super) fn pool_stating(

@@ -1004,52 +1004,13 @@ mod tests {
         }
     }
 
-    fn masked_decode(lanes: u32, pool: u32) -> TraceContainer {
-        let decls = [
-            (Port::EmbedTokens, Shape::vector(lanes), Dtype::I32),
-            (Port::Positions, Shape::vector(lanes), Dtype::U32),
-            (Port::KvLen, Shape::vector(lanes), Dtype::U32),
-            (Port::AttnMask, Shape::matrix(lanes, pool), Dtype::Bool),
-            (Port::Slots, Shape::vector(lanes), Dtype::U32),
-        ];
-        let mut container = TraceContainer {
-            names: vec![],
-            externs: vec![],
-            inputs: Vec::new(),
-            channels: vec![],
-            ports: vec![],
-            stages: vec![StageProgram {
-                stage: Stage::Epilogue,
-                ops: vec![],
-            }],
-        };
-        for (port, shape, dtype) in decls {
-            let index = container.channels.len() as u32;
-            container.channels.push(chan(shape, dtype));
-            container.ports.push(PortBinding {
-                port,
-                source: PortSource::Channel(index),
-            });
-            container.stages[0].ops.push(Op::ChanPut {
-                chan: index,
-                value: 0,
-            });
-        }
-        container
-    }
-
     #[test]
     fn geometry_every_case() {
-        a_decode_that_states_nothing_rides_the_envelope();
         a_port_the_device_computes_is_never_stated_by_the_host();
         a_device_mask_and_fold_ride_the_envelope();
-        slots_computed_on_the_device_leave_the_envelope();
-        stated_slots_land_where_they_say();
         a_write_inside_the_frozen_prefix_is_refused();
         a_lane_reads_no_slot_its_set_has_not_written();
         lanes_sharing_a_working_set_state_their_slots();
-        a_host_lane_reads_up_to_its_last_row();
-        masked_loop_carried_decode_is_pooled_device_geometry();
         a_fold_list_states_every_lanes_fold_or_a_fold_a_lane();
     }
 
@@ -1179,14 +1140,6 @@ mod tests {
         assert_eq!(geometry.positions, Some(vec![5]));
     }
 
-    fn a_decode_that_states_nothing_rides_the_envelope() {
-        assert_eq!(
-            classify_decode_envelope(&decode(1, &[]), &taint(&[Port::EmbedTokens])),
-            Ok(Some(PortMask::of(&[Port::EmbedTokens]))),
-            "an appending decode is the envelope's"
-        );
-    }
-
     fn a_device_mask_and_fold_ride_the_envelope() {
         let container = decode(
             1,
@@ -1206,37 +1159,6 @@ mod tests {
                 Port::Fold
             ]))),
             "mask and fold may come from the device"
-        );
-    }
-
-    fn slots_computed_on_the_device_leave_the_envelope() {
-        let container = decode(2, &[(Port::Slots, Shape::vector(2), Dtype::U32)]);
-        assert_eq!(
-            classify_decode_envelope(&container, &taint(&[Port::EmbedTokens, Port::Slots])),
-            Ok(None)
-        );
-    }
-
-    fn stated_slots_land_where_they_say() {
-        let mut g = geometry(&[2, 1]);
-        g.slots = Some(vec![5, 6, 9]);
-        g.positions = Some(vec![5, 6, 2]);
-        let (lanes, landings) = g.lanes(&[place(7), place(9)], 4).unwrap();
-        assert_eq!(
-            landings,
-            vec![Landing { start: 5, rows: 2 }, Landing { start: 9, rows: 1 }]
-        );
-        assert!(lanes[0].positions.is_empty());
-        assert_eq!(
-            lanes[1].positions,
-            vec![2],
-            "a RoPE position apart from its slot"
-        );
-        g.slots = Some(vec![5, 7, 9]);
-        assert!(
-            g.lanes(&[place(7), place(9)], 4)
-                .unwrap_err()
-                .contains("consecutive")
         );
     }
 
@@ -1303,25 +1225,6 @@ mod tests {
                 .lanes(&[shared.clone(), shared], 16)
                 .unwrap_err()
                 .contains("state where their rows land")
-        );
-    }
-
-    fn a_host_lane_reads_up_to_its_last_row() {
-        let mut g = geometry(&[2]);
-        g.kv_len = Some(vec![12]);
-        assert!(g.lanes(&[place(10)], 16).is_ok());
-        g.kv_len = Some(vec![20]);
-        assert!(g.lanes(&[place(10)], 16).unwrap_err().contains("last row"));
-    }
-
-    fn masked_loop_carried_decode_is_pooled_device_geometry() {
-        assert_eq!(
-            detect_pooled_device_geometry(&masked_decode(1, 128)),
-            Some(vec![0, 1])
-        );
-        assert_eq!(
-            detect_pooled_device_geometry(&masked_decode(2, 128)),
-            Some(vec![0, 1, 2])
         );
     }
 

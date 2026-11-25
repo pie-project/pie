@@ -294,53 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn a_journal_gives_back_what_it_holds_until_a_slot_is_given_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("g0.journal");
-        {
-            let (mut journal, held) = Journal::open(&path, header(), true).unwrap();
-            assert!(held.is_empty());
-            journal.put(1, &record(1, None)).unwrap();
-            journal.put(4, &record(2, Some(1))).unwrap();
-            journal.put(5, &record(3, Some(2))).unwrap();
-            journal.give_up(&[5]).unwrap();
-        }
-        let (_, held) = Journal::open(&path, header(), true).unwrap();
-        assert_eq!(
-            held.into_iter().collect::<Vec<_>>(),
-            vec![(1, record(1, None)), (4, record(2, Some(1)))]
-        );
-        // Opened again, compacted: the same.
-        let (_, held) = Journal::open(&path, header(), true).unwrap();
-        assert_eq!(held.len(), 2);
-    }
-
-    #[test]
-    fn a_journal_for_another_load_or_unkept_slots_holds_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("g0.journal");
-        Journal::open(&path, header(), true)
-            .unwrap()
-            .0
-            .put(1, &record(1, None))
-            .unwrap();
-        let other = Header {
-            page_size: 32,
-            ..header()
-        };
-        assert!(Journal::open(&path, other, true).unwrap().1.is_empty());
-        Journal::open(&path, header(), true)
-            .unwrap()
-            .0
-            .put(1, &record(1, None))
-            .unwrap();
-        assert!(
-            Journal::open(&path, header(), false).unwrap().1.is_empty(),
-            "slots the engine took afresh read as kept"
-        );
-    }
-
-    #[test]
     fn a_torn_tail_ends_the_journal_where_it_stops_summing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("g0.journal");

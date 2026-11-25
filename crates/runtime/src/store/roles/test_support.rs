@@ -29,15 +29,6 @@ impl Roles {
         out
     }
 
-    /// The chunks held for `holder`'s served restore.
-    #[must_use]
-    pub fn claimed(&self, holder: Holder) -> Vec<u32> {
-        self.claims
-            .get(&holder)
-            .map(|&ticket| self.device.lock().unwrap().pool().reserved(ticket))
-            .unwrap_or_default()
-    }
-
     /// Every device slot the items hold in slots of their shape (tables,
     /// rings, channels, adapters: not guest runs of chunks), checked
     /// against the pool and each other: each held by one item, and handed
@@ -124,12 +115,6 @@ impl Roles {
         out
     }
 
-    /// The slots `owner` holds now, in binding order; none where it holds
-    /// none.
-    #[must_use]
-    pub fn slots(&self, owner: Owner) -> Vec<u32> {
-        self.items.get(&owner).map_or_else(Vec::new, Item::refs)
-    }
 }
 
 /// Registers channel `plan` by `register`, over the `Channel` slots

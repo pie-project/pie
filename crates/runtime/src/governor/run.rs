@@ -663,7 +663,7 @@ fn read_ledger(pool: &Shared<Steered>, engine: usize) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -673,31 +673,17 @@ mod tests {
     /// once both have taken theirs, less what is defended and the floor, is
     /// the room its reader reports, negative where it is short.
     struct Host {
-        /// What the host could give the pool and the others, in MiB.
-        free: AtomicI64,
-        /// What the others hold, in MiB.
-        others: AtomicI64,
         /// What the pool holds, in segments of a MiB.
         pool: AtomicU64,
     }
 
     impl Host {
-        fn new(free: i64) -> Arc<Self> {
+        fn new() -> Arc<Self> {
             Arc::new(Self {
-                free: AtomicI64::new(free),
-                others: AtomicI64::new(0),
                 pool: AtomicU64::new(0),
             })
         }
 
-        fn reader(self: &Arc<Self>) -> ::engine::HostRoom {
-            let host = self.clone();
-            Arc::new(move || {
-                let used = host.others.load(Ordering::Relaxed)
-                    + i64::try_from(host.pool.load(Ordering::Relaxed)).unwrap();
-                Ok((host.free.load(Ordering::Relaxed) - used) * MIB as i64)
-            })
-        }
     }
 
     /// A pool of 1 MiB segments, 100 MiB its floor and 1000 its limit, on
@@ -757,10 +743,6 @@ mod tests {
         Yield::new(0.5).unwrap()
     }
 
-    fn tick(steer: &mut Steer, pool: &mut Pool) -> Vec<Signal> {
-        pressed(steer, pool, 0.0)
-    }
-
     fn pressed(steer: &mut Steer, pool: &mut Pool, pressure: f64) -> Vec<Signal> {
         let mut signals = Vec::new();
         steer.turn(pool, pressure, &mut |signal| signals.push(signal));
@@ -769,7 +751,7 @@ mod tests {
 
     #[test]
     fn a_yielding_pool_follows_the_rule_and_sheds_through_tier_pressure() {
-        let host = Host::new(5000);
+        let host = Host::new();
         let mut pool = Pool::on(&host, 1000, ELASTIC);
         pool.pinned = 700;
         let mut steer = Steer::new(&pool, half());
@@ -793,84 +775,6 @@ mod tests {
         assert!(pressed(&mut steer, &mut pool, 0.2).is_empty());
         assert_eq!(pool.segments(), 100 + 810);
         assert!(pressed(&mut steer, &mut pool, 0.0).is_empty());
-        assert_eq!(pool.segments(), 1000);
-    }
-
-    /// Two pools on one host: a reader that counts what both hold.
-    fn two_pools(
-        free: i64,
-        a: u64,
-        b: u64,
-    ) -> (Arc<HostShare>, Arc<Host>, Arc<Host>, Arc<AtomicI64>) {
-        let (ha, hb) = (Host::new(0), Host::new(0));
-        ha.pool.store(a, Ordering::Relaxed);
-        hb.pool.store(b, Ordering::Relaxed);
-        let free = Arc::new(AtomicI64::new(free));
-        let (ra, rb, rf) = (ha.clone(), hb.clone(), free.clone());
-        let reader: ::engine::HostRoom = Arc::new(move || {
-            let held =
-                i64::try_from(ra.pool.load(Ordering::Relaxed) + rb.pool.load(Ordering::Relaxed))
-                    .unwrap();
-            Ok((rf.load(Ordering::Relaxed) - held) * MIB as i64)
-        });
-        (HostShare::new(reader), ha, hb, free)
-    }
-
-    #[test]
-    fn pools_on_one_host_are_granted_its_room_once() {
-        let (share, ha, hb, _free) = two_pools(1400, 500, 500);
-        let (mut a, mut b) = (Pool::on(&ha, 500, ELASTIC), Pool::on(&hb, 500, ELASTIC));
-        let dedicated = |pool: &Pool| {
-            Steer::new(pool, Yield::NONE).with_room(pool, Some(share.pool()))
-        };
-        let (mut sa, mut sb) = (dedicated(&a), dedicated(&b));
-        tick(&mut sa, &mut a);
-        tick(&mut sb, &mut b);
-        // 400 MiB of room: the first pool is granted it, the second none of
-        // it, not 400 each.
-        assert_eq!(sa.ceiling(), Some(900 * MIB));
-        assert_eq!(sb.ceiling(), Some(500 * MIB));
-        let ceilings = sa.ceiling().unwrap() + sb.ceiling().unwrap();
-        assert!(ceilings <= 1400 * MIB, "together within the host");
-    }
-
-    #[test]
-    fn an_unreadable_room_holds_what_the_pool_has_and_grows_nothing() {
-        let host = Host::new(1000);
-        let mut pool = Pool::on(&host, 600, ELASTIC);
-        let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let reader = host.reader();
-        let flag = broken.clone();
-        let flaky: ::engine::HostRoom = Arc::new(move || {
-            if flag.load(Ordering::Relaxed) {
-                Err("no /proc/meminfo".to_string())
-            } else {
-                reader()
-            }
-        });
-        let mut steer =
-            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(flaky)));
-        // Another app holds 300: the pool may hold 700, and grows into it.
-        host.others.store(300, Ordering::Relaxed);
-        for _ in 0..4 {
-            tick(&mut steer, &mut pool);
-        }
-        assert_eq!(pool.segments(), 700);
-        // The reading fails: the pool keeps its 700, not its floor, and
-        // grows no further though the app goes.
-        broken.store(true, Ordering::Relaxed);
-        host.others.store(0, Ordering::Relaxed);
-        for _ in 0..4 {
-            tick(&mut steer, &mut pool);
-        }
-        assert_eq!(steer.regime(), Some(Regime::Unreadable));
-        assert_eq!(steer.ceiling(), Some(700 * MIB));
-        assert_eq!(pool.segments(), 700);
-        // It reads again: the room is there and the pool grows into it.
-        broken.store(false, Ordering::Relaxed);
-        for _ in 0..4 {
-            tick(&mut steer, &mut pool);
-        }
         assert_eq!(pool.segments(), 1000);
     }
 

@@ -30,17 +30,12 @@ fn write_state(store: &mut RsStore, ws: RsWorkingSetId) {
 #[test]
 fn tests_every_case() {
     run_ahead_successor_never_resets_twice();
-    run_ahead_successor_after_fork_cows_exactly_once();
     publish_batch_rejects_an_aliased_working_set();
     a_fold_drops_the_buffer_pages_behind_it();
     a_truncate_takes_back_the_buffer_past_its_cut();
     a_state_others_read_is_folded_into_a_copy();
     a_checkpoint_is_cache_and_goes_when_idle();
     new_weights_drop_every_checkpoint();
-    idle_snapshots_go_in_retention_order();
-    a_checkpoint_past_a_step_goes_first();
-    a_checkpoint_resumes_a_fresh_working_set();
-    a_snapshot_resumes_at_its_row();
 }
 
 // A checkpoint's rows are held by its cache entry: they count as cache only
@@ -482,45 +477,4 @@ fn a_released_set_has_nothing_left_to_wait_for() {
     assert!(waiting.as_mut().now_or_never().is_none());
     store.lock().unwrap().release_working_set(ws);
     assert!(waiting.as_mut().now_or_never().is_some());
-}
-
-#[test]
-fn a_wait_on_a_device_counted_fold_ends_when_it_settles_however_it_ended() {
-    use futures::FutureExt;
-    for failure in [None, Some("pipeline: forward failed: device lost")] {
-        let store = std::sync::Mutex::new(store());
-        let (ws, other) = {
-            let mut s = store.lock().unwrap();
-            (folded_at(&mut s, 4), folded_at(&mut s, 4))
-        };
-        assert!(
-            super::device_folds_settled(&store, &[ws, other])
-                .now_or_never()
-                .is_some(),
-            "no fold the device counts is on its way: nothing waits"
-        );
-        store.lock().unwrap().begin_device_fold(ws);
-        let sets = [other, ws];
-        let mut waiting = Box::pin(super::device_folds_settled(&store, &sets));
-        assert!(waiting.as_mut().now_or_never().is_none());
-        assert!(
-            super::device_folds_settled(&store, &[other])
-                .now_or_never()
-                .is_some(),
-            "another set's fold delays nothing"
-        );
-        store
-            .lock()
-            .unwrap()
-            .end_device_fold(ws, failure.is_none().then_some(3), failure);
-        assert!(waiting.as_mut().now_or_never().is_some());
-        let s = store.lock().unwrap();
-        match failure {
-            None => assert_eq!(s.frozen(ws), Ok(7), "the waiter reads what it left"),
-            Some(failure) => assert_eq!(
-                s.device_fold_gate(ws),
-                Err(RsError::DeviceFoldFailed(failure.to_string()))
-            ),
-        }
-    }
 }

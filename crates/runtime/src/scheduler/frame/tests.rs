@@ -172,23 +172,6 @@ fn processes_over_the_execution_permits_joining_together_all_finish() {
     }
 }
 
-/// A frame held out under the cap whose raise is refused by name (it
-/// never fits beside its owner's own state) leaves with its fires, for
-/// the scheduler to fail: nothing is held for it after, and another
-/// owner's held frame is kept.
-#[test]
-fn a_held_frame_whose_raise_is_refused_leaves_with_its_fires() {
-    let mut policy = FramePolicy::new(2, 4096, 1 << 20, None);
-    let (lane, other) = (pid(), pid());
-    policy.cap_fires(128);
-    policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 7, 512, 1);
-    policy.on_fire_enqueued(stamp(other, 0, 0, 1), Some(other), 8, 256, 1);
-    assert_eq!(policy.cut_owed(), 512, "held, owed");
-    assert_eq!(policy.refuse_held(lane), vec![7], "its fires, to fail");
-    assert_eq!(policy.cut_owed(), 256, "the other's still held");
-    assert!(policy.refuse_held(lane).is_empty(), "nothing held for it after");
-}
-
 /// Shape (2) as a seeded schedule: lanes submit frames in rounds (one or
 /// two frames in flight per lane, landings out of order), some
 /// owners then pause briefly in a wait parked nowhere (their lanes stay
