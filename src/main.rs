@@ -117,8 +117,21 @@ fn report(error: &anyhow::Error) {
     }
 }
 
+fn main() -> ExitCode {
+    // A region's compile, asked of this program by itself: before anything
+    // else, and no subcommand of the command line.
+    #[cfg(feature = "rocm")]
+    {
+        if let Some(code) = runtime::engine::region_compiler::main_if_asked() {
+            return code;
+        }
+        runtime::engine::region_compiler::register();
+    }
+    command()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn command() -> ExitCode {
     die_quietly_on_closed_pipe();
     match run().await {
         Ok(code) => code,
