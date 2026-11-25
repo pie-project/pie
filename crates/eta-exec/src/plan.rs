@@ -111,6 +111,16 @@ impl ExecPlan {
                         .any(|p| !p.is_const && p.channel == c && !port_consumes(p.port))))
     }
 
+    /// Whether an op of any stage takes or reads channel `c`: one that only
+    /// ports and inputs name has no reader among the program's kernels.
+    #[must_use]
+    pub fn ops_read_channel(&self, c: u32) -> bool {
+        self.package
+            .stages
+            .iter()
+            .any(|s| s.takes.contains(&c) || s.reads.contains(&c))
+    }
+
     #[must_use]
     pub fn puts_channel(&self, c: u32, at: Stage) -> bool {
         self.stages_at(at)

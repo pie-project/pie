@@ -32,6 +32,7 @@ mod a_buffer_frees_after_another_context_closes;
 mod a_closed_contexts_kept_memory_serves_the_next;
 #[cfg(feature = "cuda")]
 mod a_capture_survives_a_load_on_another_thread;
+mod a_cell_no_op_reads_is_taken_and_not_copied;
 mod a_cell_table_reads_each_rows_patch_and_group;
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
 mod a_context_input_merged_into_the_stream_lands_its_rows;

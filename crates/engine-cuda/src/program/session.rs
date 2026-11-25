@@ -1002,6 +1002,16 @@ impl Session {
                     | Ticket::ADVANCE_HEAD
                     | Ticket::ADVANCE_TAIL);
             }
+            // A host writer's cell is pulled for the program's kernels alone:
+            // a port it serves is stated on the lanes or read off the mirror
+            // ([`Self::port_device_source`]), and an input off the mirror
+            // ([`Self::feed_cell`]). With no op reading it nothing is pulled,
+            // and the ticket takes the cell as any other.
+            let native_bytes = if flags & Ticket::HOST_WRITER != 0 && !plan.ops_read_channel(slot) {
+                0
+            } else {
+                u32::try_from(shape.cell_bytes()).unwrap_or(u32::MAX)
+            };
             let cells = self
                 .rings
                 .cell_address(channel, 0)
@@ -1024,7 +1034,7 @@ impl Session {
                 cells,
                 cap1: endpoint.cap1(),
                 wire_bytes: endpoint.wire_bytes(),
-                native_bytes: u32::try_from(shape.cell_bytes()).unwrap_or(u32::MAX),
+                native_bytes,
             });
         }
 
