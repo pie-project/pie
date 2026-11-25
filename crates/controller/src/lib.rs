@@ -201,8 +201,8 @@ impl ControllerHandle {
             && report.published.is_none()
             && report.disk_added.is_empty()
             && report.disk_removed.is_empty()
-            && report.persist_hints.is_none()
             && report.disk_tier.is_none()
+            && report.off_device.is_none()
             && report.link.is_none();
         self.directory.report_state(worker, report);
         if !quiet {
@@ -437,7 +437,7 @@ fn start_cluster(
     routing: watch::Receiver<RoutingTable>,
     directory: watch::Receiver<DirectoryView>,
 ) -> Result<Arc<cluster::Host>> {
-    cluster::Host::start(programs, routing, directory).context("load the cluster policies")
+    cluster::Host::start(programs, cluster::call_deadline(), routing, directory).context("load the cluster policies")
 }
 
 /// Publishes the directory whenever a report changed it, at most every
@@ -520,14 +520,14 @@ mod tests {
             listen = "127.0.0.1:9000"
             heartbeat_timeout = "12s"
             tick_interval = "500ms"
-            cluster_policies = ["persist-prefix"]
+            cluster_policies = ["my-policy"]
             "#,
         )
         .expect("valid config parses");
         assert_eq!(cfg.listen, "127.0.0.1:9000");
         assert_eq!(cfg.heartbeat_timeout, Duration::from_secs(12));
         assert_eq!(cfg.tick_interval, Duration::from_millis(500));
-        assert_eq!(cfg.cluster_policies, ["persist-prefix"]);
+        assert_eq!(cfg.cluster_policies, ["my-policy"]);
         assert!(
             Config::parse("heartbeat_timeout = 12").is_err(),
             "a duration is written with its unit"
@@ -568,6 +568,22 @@ mod tests {
                 .await
                 .is_err(),
             "a quiet report publishes nothing"
+        );
+        // A copy that moved off the device is a change of its own.
+        handle.report_state(
+            WorkerId(4),
+            StateReport {
+                off_device: Some(vec![([1; 32], controller_api::OffDevice::Host)]),
+                ..StateReport::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), views.changed())
+            .await
+            .expect("published")
+            .unwrap();
+        assert_eq!(
+            views.borrow_and_update().groups[0].1.site_tiers,
+            [(WorkerId(4), controller_api::OffDevice::Host)]
         );
         handle.forget_state(WorkerId(4));
         tokio::time::timeout(Duration::from_secs(2), views.changed())
