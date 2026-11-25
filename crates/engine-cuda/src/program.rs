@@ -1,6 +1,8 @@
 pub mod compile;
 pub mod endpoint;
 pub mod fan;
+#[cfg(feature = "rocm")]
+pub mod helper;
 pub mod launch;
 pub mod ports;
 pub mod session;

@@ -974,33 +974,10 @@ impl Cache {
             })
             .collect();
         let architecture = target.architecture();
-        let compiled: Vec<(usize, std::result::Result<Vec<u8>, Failure>)> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = cubins
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, cubin)| cubin.is_none())
-                    .map(|(at, _)| {
-                        let source = &wanted[at].1;
-                        let architecture = &architecture;
-                        (at, scope.spawn(move || compile(source, architecture)))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|(at, handle)| {
-                        let built = handle.join().unwrap_or_else(|_| {
-                            Err(Failure::Retryable {
-                                reason: "a region's compile panicked".into(),
-                            })
-                        });
-                        (at, built)
-                    })
-                    .collect()
-            });
-        for (at, cubin) in compiled {
+        let missing: Vec<usize> = (0..wanted.len()).filter(|&at| cubins[at].is_none()).collect();
+        let compiled = ahead(&wanted, &missing, &architecture)?;
+        for (at, cubin) in missing.into_iter().zip(compiled) {
             let (key, _, region_index) = &wanted[at];
-            let cubin = cubin?;
             self.stats.compilations += 1;
             late_memory(&cubin).map_err(|why| Failure::Deterministic {
                 reason: format!("region {region_index}: {why}"),
@@ -1334,6 +1311,32 @@ impl Build {
         }
         Ok(())
     }
+}
+
+/// The regions of `wanted` `(key, source, index)` at `missing`, compiled
+/// before ready, in `missing`'s order: on ROCm a process each where the host
+/// program answers ([`super::helper`]), else [`side_by_side`].
+fn ahead(
+    wanted: &[(String, String, u32)],
+    missing: &[usize],
+    architecture: &str,
+) -> std::result::Result<Vec<Vec<u8>>, Failure> {
+    #[cfg(feature = "rocm")]
+    if super::helper::registered() {
+        let jobs: Vec<(u32, &str)> = missing
+            .iter()
+            .map(|&at| (wanted[at].2, wanted[at].1.as_str()))
+            .collect();
+        return super::helper::compile_all(&jobs, architecture);
+    }
+    let compiles: Vec<(String, String, u32, String)> = missing
+        .iter()
+        .map(|&at| {
+            let (key, source, index) = &wanted[at];
+            (key.clone(), source.clone(), *index, String::new())
+        })
+        .collect();
+    side_by_side(&compiles, architecture).into_iter().collect()
 }
 
 /// HIP's runtime compiler runs one compile at a time; elsewhere a build

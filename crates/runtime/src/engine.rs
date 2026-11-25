@@ -5,6 +5,11 @@ pub mod fire;
 pub mod instance;
 pub mod load;
 pub mod profiles;
+/// Guest regions compiled in processes of their own: a host program of ROCm
+/// answers [`region_compiler::main_if_asked`] first in its `main` and calls
+/// [`region_compiler::register`].
+#[cfg(feature = "rocm")]
+pub use engine_cuda::program::helper as region_compiler;
 
 pub use waker;
 
