@@ -16,16 +16,12 @@ pub struct Prompt {
     /// Each picture, in the order its span sits in `tokens`.
     pub images: Vec<media::Image>,
     pub ends: Vec<u32>,
-    /// The tokens the opening system turn takes, when the template wrote
-    /// one.
-    pub system: Option<u32>,
 }
 
 pub fn build(req: &Request) -> Result<Prompt, String> {
     let mut tokens = Vec::new();
     let mut images = Vec::new();
     let mut ends = Vec::new();
-    let mut system_tokens = None;
     if let Some(ids) = &req.prompt_tokens {
         tokens.extend_from_slice(ids);
         ends.push(tokens.len() as u32);
@@ -52,7 +48,6 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         tokens.extend(chat::open(system.as_deref(), &req.tools, effort(req)));
         if !tokens.is_empty() {
             ends.push(tokens.len() as u32);
-            system_tokens = Some(tokens.len() as u32);
         }
         for m in messages.iter().take(lead).skip(1) {
             tokens.extend(chat::system(&m.content));
@@ -124,7 +119,6 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         tokens,
         images,
         ends,
-        system: system_tokens,
     })
 }
 

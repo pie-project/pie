@@ -40,12 +40,10 @@ pub async fn request_device(
 }
 
 fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
-    let doc: toml::Table = std::str::from_utf8(config_bytes)
+    std::str::from_utf8(config_bytes)
         .map_err(|error| format!("the wgpu boot config is not utf-8: {error}"))?
         .parse()
-        .map_err(|error| format!("the wgpu boot config is not TOML: {error}"))?;
-    engine_gpu::adapter::refuse_adapter_dir(&doc, "wgpu")?;
-    Ok(doc)
+        .map_err(|error| format!("the wgpu boot config is not TOML: {error}"))
 }
 
 fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {

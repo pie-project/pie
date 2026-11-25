@@ -5,4 +5,4 @@
 
 mod port;
 
-pub use port::{Host, LoadError};
+pub use port::{Host, LoadError, call_deadline};

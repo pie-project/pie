@@ -33,18 +33,14 @@ impl WorkerControl for NoTurns {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
-        retention: i64,
-        // A pool keeps what it takes in its own store, on disk or not, as
-        // its configuration says.
-        _disk: bool,
     ) -> Result<u32, String> {
         let pages = transport::tcp::fetch(&from, &keys, 0).await?;
         let count = pages.count as u32;
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || pool.put_run(&keys, 0, pages, retention))
+        tokio::task::spawn_blocking(move || pool.put_run(&keys, 0, pages))
             .await
             .map_err(|e| e.to_string())??;
-        tracing::info!(pages = count, %from, retention, "took a run");
+        tracing::info!(pages = count, %from, "took a run");
         Ok(count)
     }
 

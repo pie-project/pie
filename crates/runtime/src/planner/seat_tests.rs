@@ -92,10 +92,9 @@ async fn a_fork_the_pool_can_never_copy_is_refused_by_name() {
 }
 
 /// A device-only pool (no host tier, no disk tier) serves: a process is
-/// seated and given pages. Persisting a run there is refused by name: there
-/// is no disk tier for a copy to outlive the run in.
+/// seated and given pages.
 #[tokio::test(flavor = "current_thread")]
-async fn a_pool_with_no_tier_below_the_device_serves_and_refuses_persisting_by_name() {
+async fn a_pool_with_no_tier_below_the_device_serves() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let model = crate::store::registry::register_model(16, &[8], &[2]);
     let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(
@@ -113,8 +112,4 @@ async fn a_pool_with_no_tier_below_the_device_serves_and_refuses_persisting_by_n
         .expect("pages stand free")
         .expect("served");
     assert!(matches!(acquired, super::Acquired::Granted(_)), "granted on the device alone");
-    let refused = super::exec::persist(model, 0, Vec::new(), 1)
-        .await
-        .expect_err("no disk tier");
-    assert!(refused.contains("no disk tier"), "{refused}");
 }

@@ -71,6 +71,13 @@ pub struct DeviceBoot {
     /// profile reaches it.
     #[cfg(feature = "test-limits")]
     pub whole_pool: bool,
+
+    /// A test's load that holds every fill a lay-only pass lays, and every
+    /// fill an arm derives from the first's, byte for byte to the fire's own
+    /// walk, which then fills it ([`crate::serve::Shelf::verified`]). Test
+    /// builds only (`test-limits`): no config or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub verify_fills: bool,
 }
 
 pub type Vulkan = engine_gpu::api::Gpu<Api>;

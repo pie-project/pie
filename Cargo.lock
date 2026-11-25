@@ -1855,7 +1855,6 @@ dependencies = [
  "pie-poem-exec",
  "pie-poem-ir",
  "pie-profile",
- "toml",
  "tracing",
  "windows-sys 0.61.2",
 ]

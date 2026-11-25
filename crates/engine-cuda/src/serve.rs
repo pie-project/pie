@@ -145,6 +145,10 @@ pub struct Shell {
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
     adapter_fact: Option<u32>,
+    /// The adapter fact's bit where the load folds adapters into every
+    /// lane's class word (`exports::class_word`): it seats adapters and one
+    /// fact decides the correction.
+    adapter_fold: Option<u32>,
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
@@ -886,10 +890,6 @@ impl Shell {
         Ok(written)
     }
 
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.adapters.mount(root);
-    }
-
     pub fn bind_adapter(
         &mut self,
         source: crate::blob::Source<'_>,
@@ -930,6 +930,12 @@ impl Shell {
         self.compiled
             .classes
             .adapted_word(&self.corrected, bit, word)
+    }
+
+    /// The word a lane of `word` is classed by (`exports::class_word`).
+    #[must_use]
+    pub(crate) fn class_word(&self, word: u64) -> u64 {
+        crate::exports::class_word(&self.compiled.classes, &self.corrected, self.adapter_fold, word)
     }
 
     #[must_use]

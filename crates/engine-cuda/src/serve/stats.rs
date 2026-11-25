@@ -142,6 +142,12 @@ impl Shell {
         self.cache.body_stats()
     }
 
+    /// The serving fires counted as `tally` since load (`engine::live`).
+    #[must_use]
+    pub fn tallied(&self, tally: engine::live::Tally) -> u64 {
+        self.live.tallied(tally)
+    }
+
     /// The key of the body the last fire replayed (`None` till one has).
     #[must_use]
     pub fn replayed_body(&self) -> Option<&record::BodyKey> {

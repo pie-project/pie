@@ -40,6 +40,13 @@ const SUPPORTED: &[&str] = &[
     tables::SHARE_GROUPS,
 ];
 
+/// The time one call of a policy may take, and so what one that decides
+/// arrivals adds to the gate's bound: the PLEX host's own.
+#[must_use]
+pub fn call_deadline() -> Duration {
+    Duration::from_millis(Config::default().deadline_ms)
+}
+
 /// How often the policies hear what the directory and the routing table
 /// hold.
 const STATE_TICK: Duration = Duration::from_secs(1);
@@ -187,14 +194,16 @@ fn gate_ms(config: &Config, gating: usize) -> u64 {
 impl Host {
     /// Starts the cluster policies `policies` names, (spec, component), in
     /// one PLEX host: each writes only the columns it imports, which no
-    /// other may.
+    /// other may, and each call of one takes `deadline` at most.
     pub fn start(
         policies: Vec<(String, Vec<u8>)>,
+        deadline: Duration,
         mut routing: watch::Receiver<RoutingTable>,
         mut directory: watch::Receiver<DirectoryView>,
     ) -> Result<Arc<Self>, LoadError> {
         let config = Config {
             supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             ..Config::default()
         };
         let mut host = PlexHost::new(config.clone());
@@ -228,20 +237,27 @@ impl Host {
                 move || run(host, config, loaded, rx, shared)
             })
             .map_err(|e| LoadError(format!("spawning the cluster port: {e}")))?;
-        // The workers as the policies first run, again whenever the routing
-        // table changes (a row naming a worker the host does not know is
-        // ignored), and the directory every tick.
+        // The workers before any process (a row naming a worker the host
+        // does not know is ignored), again whenever the routing table
+        // changes, and the directory every tick.
+        let mut state = move || {
+            let view = Arc::new(directory.borrow_and_update().clone());
+            let table = Arc::new(routing.borrow_and_update().clone());
+            (Event::State(view, table), routing.clone())
+        };
+        let (first, mut changes) = state();
+        let _ = events.send(first);
         let ticks = events.clone();
         tokio::spawn(async move {
             loop {
-                let view = Arc::new(directory.borrow_and_update().clone());
-                let table = Arc::new(routing.borrow_and_update().clone());
-                if ticks.send(Event::State(view, table)).is_err() {
-                    return;
-                }
                 tokio::select! {
                     _ = tokio::time::sleep(STATE_TICK) => {}
-                    changed = routing.changed() => if changed.is_err() { return },
+                    changed = changes.changed() => if changed.is_err() { return },
+                }
+                let (now, next) = state();
+                changes = next;
+                if ticks.send(now).is_err() {
+                    return;
                 }
             }
         });
@@ -394,8 +410,8 @@ fn decisions_of(shared: &Shared, gateway: GatewayId, courier: bool) -> GatewayDe
 /// Each gateway's view, sent where it changed.
 /// For each working set `replication/workers` names, a copy for each named
 /// worker the directory does not show holding it, from a worker that does.
-/// A copy is kept at retention 0: the worker's own retention decides how
-/// long, not a key the cluster sets. A pool keeps it in host memory.
+/// The worker's own retention decides how long a copy is kept. A pool
+/// keeps it in host memory.
 fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
     let tables = shared.tables.read().unwrap();
     if tables.replicas.is_empty() && tables.replicas_default.is_none() {
@@ -466,8 +482,6 @@ fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
                 worker,
                 keys: group.keys[..pages].to_vec(),
                 from,
-                retention: 0,
-                disk: false,
                 table: tables::REPLICATION_WORKERS.to_string(),
             })
         })
@@ -610,8 +624,21 @@ impl Port {
                 session,
                 props,
                 prompt,
+                connection,
+                tied,
             } => {
                 let id = pid(gateway, req);
+                // Facts of the launch, read with its arrival: stated first.
+                host.attr(
+                    Subject::Process(id.clone()),
+                    "pie/connection",
+                    connection.map(|n| Value::Text(format!("{}.{n}", gateway.0))),
+                );
+                host.attr(
+                    Subject::Process(id.clone()),
+                    "pie/tied",
+                    tied.map(|worker| Value::Text(worker.0.to_string())),
+                );
                 // Tokens a text block makes, guessed from its bytes: the
                 // prompt reaches the controller as blocks, not tokens.
                 let per_block = TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64;
@@ -965,6 +992,228 @@ mod tests {
         }
     }
 
+    /// What a call of a policy may take here: no load reaches it.
+    const CALL: Duration = Duration::from_secs(60 * 60);
+
+    fn component(name: &str) -> Vec<u8> {
+        builtins::policy(name).unwrap().component.to_vec()
+    }
+
+    /// A port over a host whose rounds the test runs, `policy` loaded.
+    fn port(policy: &str) -> Port {
+        let config = Config {
+            supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            manual: true,
+            deadline_ms: CALL.as_millis() as u64,
+            ..Config::default()
+        };
+        let host = PlexHost::new(config.clone());
+        host.load(policy, &component(policy)).unwrap();
+        Port {
+            host,
+            config,
+            shared: Arc::new(shared(Tables::default(), DirectoryView::default())),
+            loaded: Vec::new(),
+            unheard: Vec::new(),
+            workers: HashSet::new(),
+            sets: HashMap::new(),
+            version: 0,
+        }
+    }
+
+    fn arrived(req: u64, props: &[(&str, &str)], prompt: Option<&str>) -> ProcessEvent {
+        ProcessEvent::Arrived {
+            req,
+            seq: 1,
+            tenant: "t".into(),
+            session: None,
+            props: props
+                .iter()
+                .map(|(name, json)| (name.to_string(), json.to_string()))
+                .collect(),
+            prompt: prompt.map(client_api::props::prompt_blocks).map(Into::into),
+            connection: None,
+            tied: None,
+        }
+    }
+
+    /// Two gateways number their requests alike: each reads the placement,
+    /// the termination and the arrivals heard of its own request alone, the
+    /// courier alone carries copies, and an exit ends its termination.
+    #[test]
+    fn each_gateway_reads_the_decisions_about_its_own_processes() {
+        let (one, two) = (GatewayId(1), GatewayId(2));
+        let mut port = port("test-route");
+        for id in ["1", "2"] {
+            port.host
+                .put_worker(id, false, vec![(Tier::Device, None, 0)], 0, 0, None);
+        }
+        port.apply(one, arrived(7, &[("to", "\"1\"")], None));
+        port.apply(two, arrived(7, &[("refuse", "\"not today\"")], None));
+        port.host.run(true);
+        let heard = port.host.heard();
+        let delta = port.host.poll_delta();
+        port.enact(delta);
+        port.hear(heard);
+
+        let first = decisions_of(&port.shared, one, false);
+        assert_eq!(first.heard, 1);
+        assert_eq!(first.placements.len(), 1);
+        assert_eq!(first.placements[0].0, 7);
+        assert_eq!(first.placements[0].1.workers, Some(vec![WorkerId(1)]));
+        assert!(first.terminated.is_empty());
+        let second = decisions_of(&port.shared, two, false);
+        assert_eq!(second.heard, 1);
+        assert!(second.placements.is_empty());
+        assert_eq!(second.terminated, [(7, "not today".to_string())]);
+        assert_eq!(
+            decisions_of(&port.shared, GatewayId(3), false).heard,
+            0,
+            "none of its arrivals"
+        );
+
+        let exited = ProcessEvent::Exited {
+            req: 7,
+            outcome: controller_api::Outcome::Cancelled,
+        };
+        port.apply(one, exited.clone());
+        assert_eq!(decisions_of(&port.shared, two, false).terminated.len(), 1);
+        port.apply(two, exited);
+        assert!(decisions_of(&port.shared, two, false).terminated.is_empty());
+
+        *port.shared.directory.write().unwrap() = Arc::new(DirectoryView {
+            groups: vec![(
+                [1; 32],
+                GroupView {
+                    keys: vec![[1; 32]],
+                    sites: vec![WorkerId(1)],
+                    site_tiers: Vec::new(),
+                    disk_sites: Vec::new(),
+                },
+            )],
+            peers: vec![(WorkerId(1), "w1".into())],
+            ..DirectoryView::default()
+        });
+        port.shared.tables.write().unwrap().replicas_default = Some(vec![WorkerId(2)]);
+        let copies = |courier| decisions_of(&port.shared, two, courier).replicate.len();
+        assert_eq!((copies(true), copies(false)), (1, 0));
+    }
+
+    /// A process that arrives as the policies start is placed: they know the
+    /// workers before any process. The runtime's thread is kept from every
+    /// other task until the policies have heard.
+    #[tokio::test]
+    async fn a_process_that_arrives_first_is_placed() {
+        let table = RoutingTable {
+            epoch: 1,
+            author: None,
+            workers: vec![controller_api::RoutableWorker {
+                id: WorkerId(1),
+                addr: String::new(),
+                role: Role::Decode,
+                model: "m".into(),
+                engine: String::new(),
+                health: Health::Healthy,
+                coarse_load: Default::default(),
+            }],
+        };
+        let host = Host::start(
+            vec![("test-route".into(), component("test-route"))],
+            CALL,
+            watch::channel(table).1,
+            watch::channel(DirectoryView::default()).1,
+        )
+        .unwrap();
+        let decisions = host.decisions(GatewayId(0));
+        host.events(GatewayId(0), vec![arrived(7, &[("to", "\"1\"")], None)]);
+        while decisions.borrow().heard < 1 {
+            std::thread::yield_now();
+        }
+        let view = decisions.borrow().clone();
+        assert_eq!(view.placements[0].1.workers, Some(vec![WorkerId(1)]));
+    }
+
+    /// A worker's policy writes columns no cluster enacts: it does not load
+    /// here.
+    #[test]
+    fn a_worker_policy_does_not_load_in_the_cluster() {
+        let refused = port("noop")
+            .host
+            .load("default", &component("default"))
+            .unwrap_err();
+        assert!(refused.contains("cannot enact"), "{refused}");
+    }
+
+    /// A policy reads a process in the call that delivers its exit:
+    /// `default` learns there how much of what is retained was prompt.
+    #[test]
+    fn an_exited_process_is_read_by_the_call_about_its_exit() {
+        let host = PlexHost::new(Config {
+            manual: true,
+            deadline_ms: CALL.as_millis() as u64,
+            ..Config::default()
+        });
+        host.load("default", &component("default")).unwrap();
+        host.put_worker("1", false, vec![(Tier::Device, None, 0)], 0, 0, None);
+        host.arrived(
+            "p",
+            None,
+            None,
+            Some("1".into()),
+            Some(100),
+            None,
+            Vec::new(),
+            0,
+        );
+        host.started("p");
+        host.run(true);
+        host.put_working_set(
+            "p",
+            None,
+            None,
+            None,
+            300,
+            0,
+            vec![("1".into(), Tier::Device, 300)],
+        );
+        host.exited("p", "completed", None, None, 0);
+        host.retained("p", "1");
+        host.run(true);
+        let rows = host.poll_delta().retention_priority.rows;
+        let mut keys: Vec<(Option<u32>, Option<i64>)> =
+            rows.into_iter().map(|(at, key)| (at.1, key)).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [(None, Some(-1)), (Some(100), Some(0))],
+            "its prompt above its tail"
+        );
+    }
+
+    /// A pending process is sized from its prompt's text, the tokens its
+    /// blocks are guessed at.
+    #[test]
+    fn a_pending_process_is_sized_from_its_prompt_text() {
+        let mut port = port("test-route");
+        let text = "x".repeat(640);
+        port.apply(GatewayId(0), arrived(1, &[], Some(&text)));
+        // `test-route` notes the prompt tokens of a process with a working
+        // set (`<prompt>/<set>:<copies>`).
+        port.host
+            .put_working_set("0.1", None, None, None, 0, 0, Vec::new());
+        port.host.run(true);
+        let seen = port
+            .host
+            .poll_delta()
+            .notes
+            .into_iter()
+            .find(|(_, _, name, _)| name == "seen");
+        let Some((_, _, _, Some(Value::Text(seen)))) = seen else {
+            panic!("no note: {seen:?}");
+        };
+        assert!(seen.starts_with("160/"), "{seen}");
+    }
+
     /// A policy gates launches by its imports: `default-cluster` places
     /// pending processes (`placement/workers`), so a launch under it waits
     /// at the gate, as under `test-route`; `noop` decides nothing and gates
@@ -986,6 +1235,7 @@ mod tests {
                 .collect();
             let host = Host::start(
                 programs,
+                call_deadline(),
                 watch::channel(RoutingTable {
                     epoch: 0,
                     workers: Vec::new(),
@@ -1009,7 +1259,6 @@ mod tests {
             sites: vec![WorkerId(0)],
             site_tiers: Vec::new(),
             disk_sites: Vec::new(),
-            persist_tokens: None,
         };
         let id = hex(&[3; 32]);
         let directory = DirectoryView {
@@ -1030,10 +1279,10 @@ mod tests {
             .insert((id.clone(), None), vec![WorkerId(9)]);
         let mut orders = orders(&shared(tables, directory));
         orders.sort_by_key(|o| o.worker.0);
-        let asked: Vec<(u64, usize, &str, i64)> = orders
+        let asked: Vec<(u64, usize, &str)> = orders
             .iter()
-            .map(|o| (o.worker.0, o.keys.len(), o.from.as_str(), o.retention))
+            .map(|o| (o.worker.0, o.keys.len(), o.from.as_str()))
             .collect();
-        assert_eq!(asked, [(1, 2, "w0", 0), (9, 3, "w0", 0)]);
+        assert_eq!(asked, [(1, 2, "w0"), (9, 3, "w0")]);
     }
 }
