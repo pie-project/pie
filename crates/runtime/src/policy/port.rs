@@ -172,7 +172,8 @@ fn hints(props: &Props) -> Vec<(String, Value)> {
 #[derive(Clone, Copy)]
 struct Cache {
     owns: fn(ProcessId) -> bool,
-    list: fn() -> (Vec<CachedWorkingSet>, u32),
+    list: fn() -> Vec<CachedWorkingSet>,
+    page: fn() -> u32,
     /// Pages: device capacity and free; host capacity and free; disk
     /// capacity and free.
     rooms: fn() -> [(u64, u64); 3],
@@ -187,7 +188,6 @@ const STORES: Cache = Cache {
     },
     list: || {
         let stores = store_registry::all_for_model(0);
-        let page_size = stores.first().map_or(1, |s| s.kv_page_size);
         let mut sets: HashMap<ProcessId, CachedWorkingSet> = HashMap::new();
         for stores in &stores {
             let listed = store_registry::with_kv_lock(&stores.kv, "plex-cache", |kv| {
@@ -199,14 +199,13 @@ const STORES: Cache = Cache {
                         merged.entries += set.entries;
                         merged.pages = merged.pages.max(set.pages);
                         merged.last_use = merged.last_use.max(set.last_use);
-                        merged.on_device |= set.on_device;
-                        merged.on_host |= set.on_host;
                     })
                     .or_insert(set);
             }
         }
-        (sets.into_values().collect(), page_size)
+        sets.into_values().collect()
     },
+    page: || store_registry::all_for_model(0).first().map_or(1, |s| s.kv_page_size),
     rooms: || {
         let mut rooms = [(0u64, 0u64); 3];
         for stores in store_registry::all_for_model(0) {
@@ -657,7 +656,7 @@ impl Port {
 
     /// The worker's rooms and load, as the host's `worker` record has them.
     fn put_worker(&self) {
-        let page = u64::from((self.cache.list)().1.max(1));
+        let page = u64::from((self.cache.page)().max(1));
         let [device, host, disk] = (self.cache.rooms)();
         let mut tiers = vec![(
             WitTier::Device,
@@ -708,8 +707,8 @@ impl Port {
     /// Every working set the stores hold, cached or resting, as the host's
     /// tree has them; one gone without a report is evicted now.
     fn put_working_sets(&mut self) {
-        let (sets, page) = (self.cache.list)();
-        let page = u64::from(page.max(1));
+        let sets = (self.cache.list)();
+        let page = u64::from((self.cache.page)().max(1));
         let mut now: HashSet<ProcessId> = HashSet::new();
         for set in sets {
             let id = set.owner;
@@ -859,7 +858,8 @@ pub(crate) mod testing {
     const NO_STORES: Cache = Cache {
         // What an exited process leaves is held: it is retained.
         owns: |_| true,
-        list: || (Vec::new(), 1),
+        list: Vec::new,
+        page: || 1,
         rooms: || [(0, 0); 3],
         resident: |_| None,
     };
@@ -937,7 +937,8 @@ mod tests {
 
     const NO_CACHE: Cache = Cache {
         owns: |_| false,
-        list: || (Vec::new(), 16),
+        list: Vec::new,
+        page: || 16,
         rooms: || [(100, 40), (400, 300), (0, 0)],
         resident: |_| None,
     };
@@ -1198,12 +1199,11 @@ mod tests {
                     entries: pages as usize,
                     pages,
                     last_use: now,
-                    on_device: true,
-                    on_host: false,
                 })
                 .collect();
-            (sets, 16)
+            sets
         },
+        page: || 16,
         rooms: || [(100, 40), (400, 300), (0, 0)],
         resident: |_| None,
     };

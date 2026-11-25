@@ -38,6 +38,10 @@ pub struct Table {
     tiers_default: Option<u8>,
     /// The tiers rows that keep KV off the device.
     off_device: usize,
+    /// The owners each install named, oldest first, the last at the table's
+    /// revision: no more of them than there are rows, past which all the
+    /// owners are read again for no more.
+    changes: std::collections::VecDeque<(u64, ProcessId)>,
 }
 
 impl Table {
@@ -60,6 +64,24 @@ impl Table {
         self.tiers = tiers;
         self.tiers_default = default;
         self
+    }
+
+    /// The owners named after `revision`, where all of them are still held.
+    fn changed_since(&self, revision: u64) -> Option<Vec<ProcessId>> {
+        let after = self.changes.partition_point(|&(at, _)| at <= revision);
+        (after > 0).then(|| self.changes.range(after..).map(|&(_, owner)| owner).collect())
+    }
+
+    /// Install `revision` named `owners`; all of them, where a default moved.
+    fn note_changes(&mut self, revision: u64, owners: &std::collections::HashSet<ProcessId>, all: bool) {
+        if all {
+            self.changes.clear();
+        }
+        self.changes.extend(owners.iter().map(|&owner| (revision, owner)));
+        let most = self.steps.len() + self.tiers.len() + owners.len();
+        while self.changes.len() > most {
+            self.changes.pop_front();
+        }
     }
 
     /// The tiers `owner`'s KV at token `at` may sit on: every row covering
@@ -105,6 +127,12 @@ pub trait Keys {
     /// next. `None`: the keys say nothing of when they change, and nothing
     /// read under them may be kept.
     fn revision(&self) -> Option<u64> {
+        None
+    }
+
+    /// The owners whose rows changed since `revision`, where they say; `None`:
+    /// any may have.
+    fn changed_since(&self, _revision: u64) -> Option<Vec<ProcessId>> {
         None
     }
 
@@ -171,6 +199,14 @@ impl Keys for Installed {
 
     fn revision(&self) -> Option<u64> {
         Some(REVISION.load(Ordering::Acquire))
+    }
+
+    fn changed_since(&self, revision: u64) -> Option<Vec<ProcessId>> {
+        let current = CURRENT.read();
+        if REVISION.load(Ordering::Acquire) == revision {
+            return Some(Vec::new());
+        }
+        current.as_ref()?.changed_since(revision)
     }
 }
 
@@ -278,7 +314,8 @@ pub(crate) fn apply(change: Change) {
         if let Some(default) = change.tiers_default {
             table.tiers_default = default;
         }
-        REVISION.fetch_add(1, Ordering::AcqRel);
+        let revision = REVISION.fetch_add(1, Ordering::AcqRel) + 1;
+        table.note_changes(revision, &touched, all);
     }
     crate::planner::rekey_holders((!all).then_some(&touched));
     if tiered {
@@ -429,7 +466,9 @@ mod tests {
             tiers: vec![((b, None), None)],
             tiers_default: Some(None),
         });
-        assert_eq!(*CURRENT.read(), Some(Table::default()));
+        let mut left = CURRENT.read().clone().expect("a table");
+        left.changes.clear();
+        assert_eq!(left, Table::default());
         install(None);
     }
 }
