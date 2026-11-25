@@ -172,4 +172,92 @@ impl Windows {
         }
         Ok(())
     }
+
+    /// The rows `from..to` a record's rings hold, each layer's in turn
+    /// (`None` where a place was never folded).
+    #[cfg(test)]
+    fn ring_rows(&self, record: u32, layer: usize, rows: std::ops::Range<u32>) -> Vec<Option<u32>> {
+        let w = self.windows[layer];
+        rows.map(|row| {
+            self.rings
+                .get(&record)
+                .and_then(|rings| rings[layer][(row % w) as usize])
+        })
+        .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use engine::fire::{KvDelta, Lineage, WindowFold};
+
+    use super::*;
+
+    fn lane(
+        folded: u32,
+        held: u32,
+        base: u32,
+        fold: u32,
+        table: Vec<u32>,
+        record: [u32; 2],
+    ) -> Lane {
+        Lane {
+            kv: KvDelta {
+                folded,
+                held,
+                ..KvDelta::default()
+            },
+            tables: vec![(BUFFER, table)],
+            record: LaneRecord::Pieces(vec![(RECORD, vec![record])]),
+            window: Some(WindowFold {
+                base,
+                fold: FoldLen::Host(fold),
+                lineage: Lineage::Set,
+            }),
+            ..Lane::default()
+        }
+    }
+
+    /// Past the window, a ring holds the last W folded rows and the buffer
+    /// the unfolded ones: a prompt of 6 rows folds 4 and buffers 2, the
+    /// next fire folds those from the buffer with its own, and a fork's
+    /// copy-on-write leaves the first record as it stood.
+    #[test]
+    fn a_fold_moves_the_buffered_rows_into_the_rings_past_the_window() {
+        let mut w = Windows::new(vec![4, 8], 4);
+        let prompt: Vec<u32> = (100..106).collect();
+        w.fold(&lane(0, 0, 4, 4, vec![7], [9, 9]), 0, &prompt)
+            .unwrap();
+        assert_eq!(
+            w.ring_rows(9, 0, 0..4),
+            [Some(100), Some(101), Some(102), Some(103)]
+        );
+        // Rows 6..9 decoded; rows 4, 5 from the buffer, 6..9 its own: 8 folded.
+        w.fold(&lane(4, 6, 4, 4, vec![7, 8], [9, 9]), 6, &[106, 107, 108])
+            .unwrap();
+        assert_eq!(
+            w.ring_rows(9, 0, 4..8),
+            [Some(104), Some(105), Some(106), Some(107)]
+        );
+        assert_eq!(
+            w.ring_rows(9, 1, 0..8),
+            (100..108).map(Some).collect::<Vec<_>>()
+        );
+        // Row 8 stays buffered; a fork folds it and two of its own into record 10.
+        w.fold(&lane(8, 9, 8, 3, vec![8], [9, 10]), 9, &[200, 201])
+            .unwrap();
+        assert_eq!(
+            w.ring_rows(10, 0, 7..11),
+            [Some(107), Some(108), Some(200), Some(201)]
+        );
+        assert_eq!(
+            w.ring_rows(9, 0, 4..8),
+            [Some(104), Some(105), Some(106), Some(107)]
+        );
+        // A buffered row with no slot in the table is refused, nothing written.
+        assert!(
+            w.fold(&lane(8, 9, 12, 1, vec![], [10, 10]), 9, &[300])
+                .is_err()
+        );
+    }
 }

@@ -144,3 +144,48 @@ impl Config {
         self.debug.clone().unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn of(text: &str) -> Result<Config, String> {
+        Config::parse(text.as_bytes())
+    }
+
+    #[test]
+    fn defaults_and_round_trip() {
+        let c = of("").unwrap();
+        assert_eq!(c, Config::default());
+        let c = of(
+            "[cerebras]\ncmaddr = \"10.0.0.1:9000\"\nlookahead = 32\nasync = true\n\
+                    [cerebras.wafer]\nbuild = \"never\"\n\
+                    [cerebras.toolchain]\ncompile_timeout = 600\n\
+                    [cerebras.debug]\nset = \"G2=8\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.lookahead, Some(32));
+        assert_eq!(c.wafer.build, Build::Never);
+        assert_eq!(c.debug().set, "G2=8");
+        assert_eq!(c.toolchain.compile_timeout, Some(600));
+        assert_eq!(Config::parse(c.render().unwrap().as_bytes()).unwrap(), c);
+    }
+
+    #[test]
+    fn unknown_keys_and_bad_values_are_refused() {
+        assert!(of("[cerebras]\nprogram = \"p\"\n").is_err());
+        assert!(of("[cerebras.wafer]\nbuild = \"sometimes\"\n").is_err());
+        assert!(of("[cerebras.debug]\nposted_loop = 4\n").is_err());
+        // No serving switch: a token loop is posted, bounded by the lane's
+        // pages and as long as the program's plan states.
+        for gone in [
+            "[cerebras]\nposted_loop = 4\n",
+            "[cerebras.debug]\nforce_prompt = true\n",
+            "[cerebras.debug]\nposted = false\n",
+            "[cerebras.debug]\nloop_room = false\n",
+        ] {
+            assert!(of(gone).is_err(), "{gone}");
+        }
+        assert!(of("[cerebras]\nlookahead = \"8\"\n").is_err());
+    }
+}

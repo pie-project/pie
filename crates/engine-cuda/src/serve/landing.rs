@@ -94,3 +94,41 @@ fn tell_after(ordinal: i32, settle: Settle, told: Told) -> Result<()> {
         what: "the landing waiter is gone".to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A move whose wait faulted is told failed with its fault, never
+    /// landed; one whose wait settled is told landed; both in order.
+    #[test]
+    fn a_move_whose_event_faulted_is_told_failed_not_landed() {
+        let (tx, rx) = mpsc::channel();
+        let faulted = tx.clone();
+        tell_after(
+            -7,
+            Box::new(|| {
+                Err(Fault::Device {
+                    call: "cudaEventSynchronize",
+                    code: 700,
+                })
+            }),
+            Box::new(move |landing| faulted.send((1, landing)).unwrap()),
+        )
+        .unwrap();
+        tell_after(
+            -7,
+            Box::new(|| Ok(())),
+            Box::new(move |landing| tx.send((2, landing)).unwrap()),
+        )
+        .unwrap();
+        let first = rx.recv().unwrap();
+        let second = rx.recv().unwrap();
+        assert_eq!(first.0, 1);
+        match first.1 {
+            Landing::Failed(why) => assert!(why.contains("cudaEventSynchronize"), "{why}"),
+            Landing::Landed => panic!("a faulted move was told landed"),
+        }
+        assert_eq!(second, (2, Landing::Landed));
+    }
+}

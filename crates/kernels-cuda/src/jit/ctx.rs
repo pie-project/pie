@@ -680,7 +680,7 @@ impl Ctx {
 
 /// Why `args` cannot fill a kernel whose parameters are `params` bytes each,
 /// or `None` when each argument is exactly its parameter's width.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn mismatch(params: &[usize], args: &[ArgValue]) -> Option<String> {
     if params.len() != args.len() {
         return Some(format!(
@@ -744,4 +744,74 @@ fn unfireable(op: &'static str, kernel: &Kernel, why: &crate::jit::Fault) -> Err
 fn trace_fires() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PIE_CUDA_TRACE_FIRES").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bare() -> Ctx {
+        // SAFETY: no method called here fires, so the null stream is never
+        // handed to the runtime.
+        unsafe { Ctx::on(core::ptr::null_mut()) }
+    }
+
+    #[test]
+    fn ctx_every_case() {
+        an_unarmed_context_quantizes_nothing();
+        the_full_fires_extent_rounds_up_to_the_bucket();
+        disarming_puts_the_extent_back_the_way_the_fire_found_it();
+    }
+
+    fn an_unarmed_context_quantizes_nothing() {
+        let ctx = bare();
+        for rows in [0, 1, 3, 9, 4096] {
+            assert_eq!(
+                ctx.opaque_rows(rows),
+                rows,
+                "a context no fire armed hands back the extent it was given"
+            );
+        }
+    }
+
+    fn the_full_fires_extent_rounds_up_to_the_bucket() {
+        let ctx = bare();
+        ctx.arm(Pad {
+            rows: 9,
+            bucket: 16,
+        });
+        assert_eq!(
+            ctx.opaque_rows(9),
+            16,
+            "an Always launch is handed the fire's rows and computes the bucket's"
+        );
+    }
+
+    fn disarming_puts_the_extent_back_the_way_the_fire_found_it() {
+        let ctx = bare();
+        ctx.arm(Pad {
+            rows: 9,
+            bucket: 16,
+        });
+        ctx.disarm();
+        assert_eq!(
+            ctx.opaque_rows(9),
+            9,
+            "the pad is the fire's, and the stream outlives the fire"
+        );
+    }
+
+    #[test]
+    fn a_fire_is_held_to_its_kernels_parameters() {
+        let args = [ArgValue::F32(2.0), ArgValue::Ptr(0), ArgValue::I32(3)];
+        assert_eq!(mismatch(&[4, 8, 4], &args), None, "every width matches");
+        assert!(
+            mismatch(&[4, 8, 4, 8], &args).is_some_and(|why| why.contains("takes 4")),
+            "a missing argument would have the driver read past the slots"
+        );
+        assert!(
+            mismatch(&[4, 8, 8], &args).is_some_and(|why| why.contains("parameter 2")),
+            "an i32 into an 8-byte parameter is refused"
+        );
+    }
 }

@@ -848,3 +848,23 @@ fn fault_lane(outcome: &mut StepOutcome, step: &engine::fire::Step, at: usize, w
         fault_pass(outcome, attachment, "forward", why);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lane_asks_for_the_logits_its_readers_read() {
+        assert_eq!(logits_wanted(&[], 4), wafer::Logits::None);
+        assert_eq!(logits_wanted(&[3], 4), wafer::Logits::Last);
+        assert_eq!(logits_wanted(&[1], 4), wafer::Logits::All);
+        assert_eq!(logits_wanted(&[2, 3], 4), wafer::Logits::All);
+    }
+
+    #[test]
+    fn an_answered_row_is_a_one_hot_of_its_argmax() {
+        assert_eq!(one_hot(4, Some(2)), [0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(one_hot(3, Some(7)), [0.0; 3]);
+        assert_eq!(one_hot(2, None), [0.0; 2]);
+    }
+}

@@ -147,15 +147,19 @@ pub fn registry() -> &'static Registry {
 }
 
 /// The checked-in profiles, CUDA's and AMD's side by side in `profiles/`:
-/// a build seeds its own.
+/// a build seeds its own, and the other's are the files beside them.
 macro_rules! shelved {
     (cuda: [$($cuda:literal),* $(,)?], rocm: [$($rocm:literal),* $(,)?] $(,)?) => {
         #[cfg(not(feature = "rocm"))]
         pub const SEEDED: &[(&str, &str)] =
             &[$(($cuda, include_str!(concat!("../profiles/", $cuda)))),*];
+        #[cfg(all(test, not(feature = "rocm")))]
+        const BESIDE: &[&str] = &[$($rocm),*];
         #[cfg(feature = "rocm")]
         pub const SEEDED: &[(&str, &str)] =
             &[$(($rocm, include_str!(concat!("../profiles/", $rocm)))),*];
+        #[cfg(all(test, feature = "rocm"))]
+        const BESIDE: &[&str] = &[$($cuda),*];
     };
 }
 
@@ -357,4 +361,179 @@ pub fn resolve_keyed(
         tracing::info!("{line}");
     }
     (profile, report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_registry_holds_together() {
+        assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_checked_in_profiles_hold_together_and_each_family_names_its_tier() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        SHELF
+            .check_beside(registry(), &dir, BESIDE)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let family = |n: &str| !n.contains('/') && !n.ends_with(".measured.toml");
+        for (name, text) in SEEDED.iter().filter(|(n, _)| family(n)) {
+            let file = registry()
+                .parse(text, name, profile::Strict::CheckedIn)
+                .expect("checked above");
+            let cc = file
+                .target
+                .assumes
+                .iter()
+                .find(|(i, _)| FACTS[*i].name == ARCH)
+                .map(|(_, cc)| *cc)
+                .expect("a family file assumes its compute capability");
+            let tier = if cfg!(feature = "rocm") {
+                format!("gfx{cc}")
+            } else {
+                format!("sm_{cc}")
+            };
+            assert_eq!(
+                file.target.tier.as_deref(),
+                Some(tier.as_str()),
+                "{name}: the tier is the capability it assumes"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "rocm"))]
+    #[test]
+    fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
+        SHELF
+            .check_dumps(registry())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+#[cfg(all(test, feature = "rocm"))]
+mod hip {
+    use super::*;
+
+    #[test]
+    fn a_cdna3_gpu_takes_its_family() {
+        // The MI300X (the card and a cloud VF of it) reads its rates from its
+        // device file; the MI325X has none yet. The VF also carries its
+        // committed measured profile, under the device files.
+        for (gpu, device, committed) in [
+            ("AMD Instinct MI300X", true, false),
+            ("AMD Instinct MI300X VF", true, true),
+            ("AMD Instinct MI325X", false, false),
+        ] {
+            let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
+            let mut layers = vec![profile::Source::Seeded("gfx94.toml".into())];
+            if device {
+                layers.push(profile::Source::Seeded(
+                    "gfx94/amd-instinct-mi300x.toml".into(),
+                ));
+            }
+            if committed {
+                layers.push(profile::Source::Committed(
+                    "amd-instinct-mi300x-vf.measured.toml".into(),
+                ));
+            }
+            assert_eq!(report.layers, layers, "{gpu}");
+            assert!(report.untuned(), "{gpu}");
+            assert_eq!(
+                Engine::of(&profile),
+                Engine {
+                    prefill_lattice_from: 2048,
+                    prefill_lattice_steps: 8,
+                    ..Engine::of(&registry().defaults())
+                }
+            );
+            // The defaults, but for the paths the family measured.
+            let mut want = kernels_cuda::tuning::Tuning::of(&registry().defaults());
+            want.mla_absorb_q_until = 2048;
+            want.mla_absorb_out_from = 33;
+            want.mla_absorb_out_until = 1536;
+            want.fp8_decode_until = 32;
+            want.fp8_narrow_until = 128;
+            want.moe_lt_grouped = true;
+            want.moe_lt_mlp_from = 128;
+            want.moe_lt_tile_deep = 256_192_064;
+            want.moe_lt_tile_shallow = 128_288_032;
+            want.moe_lt_deep_k = 2048;
+            want.moe_ordered_from = 128;
+            want.gemm_live_from = 129;
+            want.gemm_turn_from = 3;
+            want.gemm_turn_wide_until = 32;
+            want.ssm_gdn_wide_from = 512;
+            // The MI300X's own file measured one prefill block a CU; the
+            // MI325X, with none, keeps the default.
+            if device {
+                want.prefill_ctas_per_sm = 1;
+            }
+            // The rates are the device's own file's (the norm fold's pricing
+            // reads them), not the family's: not what this checks.
+            let got = kernels_cuda::tuning::Tuning::of(&profile);
+            want.launch_ns = got.launch_ns;
+            want.hbm_gbps = got.hbm_gbps;
+            want.cached_gbps = got.cached_gbps;
+            assert_eq!(got, want, "{gpu}");
+        }
+    }
+
+    #[test]
+    fn a_gfx_version_with_no_family_runs_the_defaults_untuned() {
+        let (profile, report) = resolve("AMD Instinct Next", &facts(9, 6, 256), None);
+        assert_eq!(report.used, profile::Source::Defaults);
+        assert!(report.layers.is_empty());
+        assert!(report.untuned());
+        assert_eq!(
+            kernels_cuda::tuning::Tuning::of(&profile),
+            kernels_cuda::tuning::Tuning::of(&registry().defaults())
+        );
+    }
+
+    #[test]
+    fn the_defaults_price_conditionals_past_any_launch() {
+        // HIP graphs have no conditional node: one is priced past any launch
+        // it could skip, so the compiler lowers every region to AlwaysLaunch.
+        // Chains fold into generated row kernels; no contraction skeleton yet.
+        assert_eq!(
+            poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
+            poem_compiler::DeviceProfile {
+                cond_fixed_us: 1_000_000.0,
+                synth_regions: true,
+                ..poem_compiler::DeviceProfile::default()
+            }
+        );
+        let on = poem_compiler::fuse::flags::on(&registry().defaults(), &crate::FUSIONS);
+        assert_eq!(
+            on.len(),
+            crate::FUSIONS.len(),
+            "every fusion is on by default"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "device"))]
+mod device {
+    #[test]
+    fn the_probe_reads_the_gpu_it_names() {
+        let Some((name, facts)) = super::probe(0) else {
+            eprintln!("not asked: no device answers");
+            return;
+        };
+        assert!(!name.is_empty(), "the driver names the GPU");
+        let cc = facts.get(super::ARCH).expect("probed");
+        #[cfg(not(feature = "rocm"))]
+        assert!(
+            cc >= 80,
+            "{name} is sm_{cc}: the CUDA engine serves sm_80 and newer"
+        );
+        #[cfg(feature = "rocm")]
+        assert!(
+            (90..100).contains(&cc),
+            "{name} is gfx{cc}: the ROCm engine serves CDNA (gfx9)"
+        );
+        assert!(facts.get("sms").is_some_and(|n| n > 0));
+    }
 }

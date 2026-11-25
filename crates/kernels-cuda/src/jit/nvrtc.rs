@@ -288,3 +288,237 @@ impl Drop for Program {
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut self.0) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jit::{Features, Root, Toolchain};
+
+    /// The units that include the fp8 shim directly, each named with a kernel
+    /// that converts fp8 and one that does not. The bf16 one is the point:
+    /// NVRTC lowers the whole unit, so a shim that refuses an architecture
+    /// takes every kernel in the unit with it, not only the fp8 ones.
+    const FP8_UNITS: &[(&str, &[&str])] = &[
+        (
+            "attn/kv_append.cu",
+            &[
+                "::pie::attn::kv_append_explicit<::pie::true_type::value>",
+                "::pie::attn::kv_append_fp8_per_tensor",
+                "::pie::attn::kv_append_per_token_head<::pie::true_type::value>",
+            ],
+        ),
+        (
+            "attn/kv_dequant.cu",
+            &[
+                "::pie::attn::dequant_fp8_pages_active",
+                "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
+            ],
+        ),
+        (
+            "linear/act_quant.cu",
+            &["::pie::linear::quant_act_fp8_per_group"],
+        ),
+    ];
+
+    fn lowers(file: &'static str, arch: &str, extra: &[&str]) -> Result<(), String> {
+        let (_, wanted) = FP8_UNITS
+            .iter()
+            .find(|(name, _)| *name == file)
+            .expect("listed above");
+        let root = Root::of(file).expect("a carried unit");
+        let mut options: Vec<&str> = root.options.to_vec();
+        options.extend_from_slice(extra);
+        let wanted: Vec<String> = wanted.iter().map(|&w| w.to_owned()).collect();
+        compile_text(&Job {
+            name: root.name,
+            source: root.text.to_owned(),
+            arch,
+            options: &options,
+            headers: root.header_set(),
+            floor: Toolchain::ANY,
+            wanted: &wanted,
+        })
+        .map(|_| ())
+        .map_err(|why| why.to_string())
+    }
+
+    fn nvrtc_is_here() -> bool {
+        // SAFETY: probing for the library only tries to load it; no symbol
+        // from it is called.
+        let present = unsafe { nvrtc::is_culib_present() };
+        if !present {
+            eprintln!("skipped: libnvrtc is not loadable on this box");
+        }
+        present
+    }
+
+    #[test]
+    fn the_arch_specific_and_family_targets_are_real_and_a_virtual_one_is_not() {
+        for real in [
+            "sm_80", "sm_100", "sm_100a", "sm_103a", "sm_120a", "sm_100f",
+        ] {
+            assert!(options(real, &[]).is_ok(), "{real} emits SASS");
+        }
+        for not in ["compute_100a", "sm_", "sm_a", "sm_100b", "sm_10x"] {
+            assert!(options(not, &[]).is_err(), "{not} is no target");
+        }
+    }
+
+    /// Every tcgen05 wrapper, issued once: what the arch-specific target
+    /// must take and the plain one must refuse.
+    const TCGEN05_PROBE: &str = r#"
+#include "prim/mma_sm100.cuh"
+namespace pie {
+__global__ void tc5_probe(const __grid_constant__ tc5::TmaMap map, const void* src, unsigned* out) {
+    using namespace tc5;
+    __shared__ alignas(1024) unsigned char tile[1024];
+    __shared__ u64 bar;
+    __shared__ u32 slot;
+    if (threadIdx.x == 0) {
+        bar_init(&bar, 1);
+        bar_init_fence();
+        bar_arrive_expect_tx(&bar, 1024);
+        tma_load_2d(tile, &bar, &map, 0, 0);
+        bulk_load(tile, src, 512, &bar);
+        bar_wait(&bar, 0);
+    }
+    tmem_alloc(&slot, 32);
+    tmem_relinquish();
+    tc_fence_before();
+    __syncthreads();
+    tc_fence_after();
+    const u32 t = slot;
+    const u64 d = sdesc_sw128(smem_addr(tile));
+    if (threadIdx.x == 0) {
+        tc_cp_sf_atom(t, sdesc_sf(smem_addr(tile)));
+        mma_f16(t, d, d, idesc_dense(kF16Bf16, kF16Bf16, 128, 32), false);
+        mma_f8f6f4(t, d, d, idesc_dense(kE4M3, kE4M3, 128, 32), true);
+        mma_mxf8f6f4(t, d, d, idesc_scaled(kE4M3, kE2M1, 128, 32, true), true, t, t);
+        mma_nvf4(t, d, d, idesc_scaled(kNvE2M1, kNvE2M1, 128, 32, false), true, t, t);
+        tc_commit(&bar);
+    }
+    u32 v[32];
+    tmem_ld32(t, v);
+    tmem_wait_ld();
+    out[threadIdx.x] = v[threadIdx.x % 32];
+    tmem_dealloc(t, 32);
+}
+}
+"#;
+
+    /// tcgen05 exists at the arch-specific target alone: the wrappers lower
+    /// at sm_100a and sm_103a, and the plain sm_100 refuses their PTX.
+    #[test]
+    fn the_tcgen05_wrappers_lower_at_the_arch_specific_targets_only() {
+        if !nvrtc_is_here() || !Features::NVRTC.met_by(version().unwrap_or(Toolchain::ANY)) {
+            return;
+        }
+        let wanted = vec!["::pie::tc5_probe".to_owned()];
+        let job = |arch| Job {
+            name: "tc5_probe",
+            source: TCGEN05_PROBE.to_owned(),
+            arch,
+            options: &[],
+            headers: crate::source::DEVICE_HEADERS,
+            floor: Features::NVRTC,
+            wanted: &wanted,
+        };
+        for arch in ["sm_100a", "sm_103a"] {
+            if let Err(why) = compile_text(&job(arch)) {
+                panic!("the tcgen05 unit would not lower at {arch}: {why}");
+            }
+        }
+        assert!(
+            compile_text(&job("sm_100")).is_err(),
+            "the plain target took tcgen05"
+        );
+    }
+
+    /// sm_80 has no fp8 cvt and takes the portable path; sm_89 is where the
+    /// instruction arrives; sm_120 is the box this crate is developed on.
+    /// Needs libnvrtc, not a device: the compile targets an architecture.
+    #[test]
+    fn the_fp8_shim_lowers_below_sm_89() {
+        if !nvrtc_is_here() {
+            return;
+        }
+        for arch in ["sm_80", "sm_89", "sm_120"] {
+            for (file, _) in FP8_UNITS {
+                if let Err(why) = lowers(file, arch, &[]) {
+                    panic!("`{file}` would not lower at {arch}: {why}");
+                }
+            }
+        }
+    }
+
+    /// The portable path is what sm_80 runs, so it has to lower on the
+    /// architecture that has the hardware cvt too: that is how it is held
+    /// against the instruction on a box that has one.
+    #[test]
+    fn the_portable_fp8_path_lowers_where_the_hardware_one_does() {
+        if !nvrtc_is_here() {
+            return;
+        }
+        for (file, _) in FP8_UNITS {
+            if let Err(why) = lowers(file, "sm_89", &["-DPIE_HALFTYPE_FORCE_PORTABLE"]) {
+                panic!("`{file}` would not lower portably at sm_89: {why}");
+            }
+        }
+    }
+
+    /// The affine-u4 arms are chosen by shape, never by capability, so
+    /// sm_90 keeps every arm sm_89 has: no `__CUDA_ARCH__` gate in those
+    /// units, the prim headers or the shims may admit 890 and refuse 900 (#680).
+    #[test]
+    fn no_arch_gate_on_the_affine_u4_path_refuses_sm_90() {
+        use crate::source::{LIBRARY, SHIM};
+
+        let admits = |op: &str, bound: u32, arch: u32| match op {
+            ">=" => arch >= bound,
+            "<=" => arch <= bound,
+            "==" => arch == bound,
+            "!=" => arch != bound,
+            ">" => arch > bound,
+            _ => arch < bound,
+        };
+        let units = [
+            "linear/affine.cu",
+            "linear/dequant.cu",
+            "linear/quant.cuh",
+            "linear/codec.cuh",
+        ]
+        .map(|file| Root::of(file).expect("a carried unit"));
+        let scanned = units.iter().map(|root| (root.name, root.text)).chain(
+            SHIM.iter()
+                .chain(LIBRARY.iter().filter(|h| h.name.starts_with("prim/")))
+                .map(|h| (h.name, h.text)),
+        );
+        let mut gates = 0;
+        for (name, text) in scanned {
+            for (at, _) in text.match_indices("__CUDA_ARCH__") {
+                let rest = text[at + "__CUDA_ARCH__".len()..].trim_start();
+                let Some(op) = [">=", "<=", "==", "!=", ">", "<"]
+                    .into_iter()
+                    .find(|op| rest.starts_with(op))
+                else {
+                    continue;
+                };
+                let digits: String = rest[op.len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                let Ok(bound) = digits.parse::<u32>() else {
+                    continue;
+                };
+                gates += 1;
+                assert!(
+                    !admits(op, bound, 890) || admits(op, bound, 900),
+                    "`{name}` gates on `__CUDA_ARCH__ {op} {bound}`, which admits sm_89 and \
+                     refuses sm_90"
+                );
+            }
+        }
+        assert!(gates > 0, "the scan read no `__CUDA_ARCH__` gate at all");
+    }
+}

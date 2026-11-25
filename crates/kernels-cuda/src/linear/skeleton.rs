@@ -1393,3 +1393,103 @@ impl RowLeg {
 
 /// The most rows the few-rows skeleton holds.
 pub const ROWS_M: u32 = 16;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use kernels_ir::{Binary, Op};
+
+    fn ruled(layout: Layout, region: Region, inputs: Vec<Input>) -> &'static Epilogue {
+        Epilogue::interned(&Anchored {
+            epilogue: Some(Pointwise { region, inputs }),
+            ..Anchored::plain(rule(layout))
+        })
+        .expect("a hand rule's epilogue is one the skeletons take")
+    }
+
+    #[test]
+    fn the_plain_store_is_an_epilogue_the_skeletons_take() {
+        let store = Epilogue::store();
+        assert_eq!(
+            (store.parts(), store.inputs(), store.results()),
+            (1, &[][..], 1)
+        );
+        assert!(std::ptr::eq(
+            Epilogue::interned(&Anchored::plain(rule(Layout::Dense))).expect("the store"),
+            store
+        ));
+        // The plain store copies each product through its store.
+        assert!(
+            store.body.source.contains("f.st(0, e, f.ld(0, e))"),
+            "{}",
+            store.body.source
+        );
+    }
+
+    #[test]
+    fn a_prologue_or_another_dtype_is_refused_by_name() {
+        let mut anchored = Anchored::plain(rule(Layout::Dense));
+        anchored.contraction.acc = Some(Dtype::F16);
+        let why = Epilogue::of(&anchored).expect_err("refused").to_string();
+        assert!(why.contains("round to F16"), "{why}");
+        let mut anchored = Anchored::plain(rule(Layout::Dense));
+        anchored.contraction.quant = Quant::Plain(Dtype::F32);
+        let why = Epilogue::of(&anchored).expect_err("refused").to_string();
+        assert!(why.contains("stored Plain(F32)"), "{why}");
+    }
+
+    #[test]
+    fn planes_not_of_the_epilogues_kinds_are_refused() {
+        let bias = ruled(
+            Layout::Dense,
+            Region {
+                width: RULE_WIDTH,
+                params: vec![Shape::Row, Shape::Row],
+                ops: vec![Op::Binary(Binary::Add, 0, 1)],
+                results: vec![2],
+                rounds: vec![(2, Dtype::Bf16)],
+            },
+            vec![Input::Column],
+        );
+        assert!(bias.planes(&[In::row(64)], &[128], 8, None).is_err());
+        assert!(bias.planes(&[], &[128], 8, None).is_err());
+        let words = bias
+            .planes(&[In::column(64)], &[128], 8, None)
+            .expect("a bias");
+        // One input (its base, strides, dtype and period), one unread, one
+        // result, its row's stride, then its store: no cache row, its
+        // window's columns 0..8, a unit scale.
+        assert_eq!(
+            words,
+            vec![
+                64,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                128,
+                8,
+                0,
+                0,
+                0,
+                8 << 32,
+                0,
+                0x3f80_0000,
+                0
+            ]
+        );
+        // A head's weight and a row's i32 position, each of its kind.
+        assert_eq!(In::head(64, 32).kind(), Input::Head(32));
+        assert_eq!(In::row(64).i32().dtype(), Dtype::I32);
+        assert!(
+            bias.planes(&[In::column(64).i32()], &[128], 8, None)
+                .is_err()
+        );
+    }
+}

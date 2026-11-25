@@ -1883,3 +1883,163 @@ impl Denoise {
         Ok((inputs[li].1.clone(), vs))
     }
 }
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+
+    /// A paged program of 2 lane slots, 3 pages of 64 a column, its recurrences 2 slots.
+    fn paged() -> Reading {
+        let mut r = Reading::host_only("m", "decode", &[]);
+        r.paging = Some(Paging {
+            size: 64,
+            pages: 3,
+            lanes: 2,
+        });
+        r.slots = Some(2);
+        r
+    }
+
+    #[test]
+    fn a_step_s_host_words_past_the_program_s_range_are_refused_by_name() {
+        let r = paged();
+        assert!(r.rows_held(&[(0, 0, 0), (1, 1, 191)]).is_ok());
+        let e = |x: R<()>| x.expect_err("refused");
+        assert!(e(r.rows_held(&[(2, 0, 0)])).contains("lane slot 2 past the program's 2"));
+        assert!(e(r.rows_held(&[(0, 2, 0)])).contains("state slot 2 past the 2"));
+        assert!(e(r.rows_held(&[(0, 0, 192)])).contains("position 192 past the 192"));
+        assert!(r.pages_held(&[0, 1, 2, 2, 2, 2]).is_ok());
+        assert!(e(r.pages_held(&[0, 1, 2])).contains("3 entries for 2 lane slots of 3 pages"));
+        assert!(e(r.pages_held(&[0, 1, 2, 2, 3, 2])).contains("page 3 (lane slot 1, entry 1)"));
+        assert!(e(r.position_held(500)).contains("position 500"));
+    }
+
+    #[test]
+    fn a_bands_backs_read_as_one_rectangle_cut_as_each_alone() {
+        // a 128² denoise's backs: 1 x 64 strips every third column in four bands, a lone 3 x 2 back
+        let back = |x: i32, y: i32, w: i32, h: i32, len: usize| Back {
+            sym: "hout".into(),
+            x,
+            y,
+            w,
+            h,
+            len,
+            rows: Vec::new(),
+            parts: Vec::new(),
+        };
+        let mut d2h: Vec<Back> = Vec::new();
+        for x in (2..384).step_by(3) {
+            for y in [64, 192, 320, 448] {
+                d2h.push(back(x, y, 1, 64, 1));
+            }
+        }
+        d2h.push(back(5, 600, 3, 2, 2));
+        let reads = packs(&d2h);
+        assert_eq!(reads.len(), 5);
+        let mut seen = vec![0; d2h.len()];
+        // each PE's word k: its place and k, as a read of the rectangle returns them
+        let word = |x: i32, y: i32, k: usize| (y as u32) << 16 | (x as u32) << 4 | k as u32;
+        for (rect, members) in &reads {
+            let len = d2h[members[0]].len;
+            let mut out = Vec::new();
+            for y in rect.y..rect.y + rect.h {
+                for x in rect.x..rect.x + rect.w {
+                    out.extend((0..len).map(|k| word(x, y, k)));
+                }
+            }
+            for &i in members {
+                let b = &d2h[i];
+                let mut alone = Vec::new();
+                for y in b.y..b.y + b.h {
+                    for x in b.x..b.x + b.w {
+                        alone.extend((0..b.len).map(|k| word(x, y, k)));
+                    }
+                }
+                assert_eq!(cut(&out, *rect, b), alone);
+                seen[i] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&n| n == 1));
+    }
+
+    #[test]
+    fn a_kept_arrays_write_is_its_changed_columns_words() {
+        // a 1024² latent band: word 0 at columns 1 and 2 of each three, words 1-8 at column 2; then
+        // a step's change
+        let (w, h, len) = (12, 3, 9);
+        let mut old = vec![0u32; w * h * len];
+        let mut new = old.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * w + x) * len;
+                if x % 3 != 0 {
+                    old[at] = 1;
+                    new[at] = 2;
+                }
+                if x % 3 == 2 {
+                    for i in 1..len {
+                        old[at + i] = 10;
+                        new[at + i] = 20 + i as u32;
+                    }
+                }
+            }
+        }
+        let plan = kept_writes(&old, &new, w, h, len).expect("a plan");
+        let kw = |x, w, n| KeptWrite { x, w, n };
+        assert_eq!(plan, vec![kw(1, 10, 1), kw(2, 10, 9)]);
+        // the words it sends make `old` `new`
+        let mut dev = old.clone();
+        for k in &plan {
+            for y in 0..h {
+                for x in k.x..k.x + k.w {
+                    let at = (y * w + x) * len;
+                    dev[at..at + k.n].copy_from_slice(&new[at..at + k.n]);
+                }
+            }
+        }
+        assert_eq!(dev, new);
+        // nothing changed: no writes; everything: the whole rectangle's
+        assert_eq!(kept_writes(&new, &new, w, h, len), Some(Vec::new()));
+        let all: Vec<u32> = new.iter().map(|x| x + 1).collect();
+        assert_eq!(kept_writes(&new, &all, w, h, len), None);
+    }
+
+    #[test]
+    fn a_new_requests_context_mid_load_sends_its_columns_alone() {
+        // two batch slots of 4 rows, 8 words a PE on 12 columns; the second slot's context changes
+        // on columns 3-6, the timestep (word 0) on every column
+        let (w, h, len) = (12, 8, 9);
+        let mut old = vec![0u32; w * h * len];
+        for (i, v) in old.iter_mut().enumerate() {
+            *v = i as u32;
+        }
+        let mut new = old.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * w + x) * len;
+                new[at] += 1_000_000;
+                if y >= 4 && (3..7).contains(&x) {
+                    for i in 1..len {
+                        new[at + i] += 2_000_000;
+                    }
+                }
+            }
+        }
+        let plan = kept_writes(&old, &new, w, h, len).expect("a plan");
+        let kw = |x, w, n| KeptWrite { x, w, n };
+        assert_eq!(plan, vec![kw(0, 12, 1), kw(3, 4, 9)]);
+        let sent: usize = plan.iter().map(|k| k.w * k.n * h).sum();
+        assert!(sent < w * h * len / 2, "{sent} words");
+        // the device after the writes holds what a whole write leaves
+        let mut dev = old.clone();
+        for k in &plan {
+            for y in 0..h {
+                for x in k.x..k.x + k.w {
+                    let at = (y * w + x) * len;
+                    dev[at..at + k.n].copy_from_slice(&new[at..at + k.n]);
+                }
+            }
+        }
+        assert_eq!(dev, new);
+    }
+}
