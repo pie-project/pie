@@ -391,6 +391,20 @@ pub trait Serve: Backend {
     /// What a kept step binds moved: a layer's stage.
     fn forget(shelf: &mut Self::Shelf);
 
+    /// Every recording dropped and none made again, `why`: each fire from
+    /// here walks eagerly, as its plan states (a backend that records).
+    fn refuse_recording(shelf: &mut Self::Shelf, why: &'static str) {
+        let _ = why;
+        Self::forget(shelf);
+    }
+
+    /// Why this load records no fire at all, where it records none (its
+    /// weights stream): every fire runs eager, stated at load.
+    fn records_none(shelf: &Self::Shelf) -> Option<&'static str> {
+        let _ = shelf;
+        None
+    }
+
     /// The pool's segments were backed or given back: a backend whose kept
     /// steps bind them by place rebinds each to what stands there now; one
     /// whose kept steps hold the segments' buffers forgets them. Called with
@@ -4938,8 +4952,20 @@ impl<B: Serve> Shell<B> {
         // stage; a routed expert's between a recording's segments, one cut a
         // layer with an expert in no slot, so a recording stands only while
         // those layers do (and the stage they bind with them).
+        // Only the load's arm walk records: once armed, recordings dropped
+        // are made again by none, so every fire from here runs eager, stated
+        // here by name.
         if self.expert_caches.staged_layers() != staged {
-            B::forget(&mut self.shelf);
+            if self.armed && B::RECORDS {
+                const WHY: &str = "a weight residency change staged a routed expert layer";
+                tracing::warn!(
+                    "{WHY}: every recording is dropped and every fire from here runs eager \
+                     (counted eager)"
+                );
+                B::refuse_recording(&mut self.shelf, WHY);
+            } else {
+                B::forget(&mut self.shelf);
+            }
         }
         Ok(())
     }
