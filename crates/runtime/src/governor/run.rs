@@ -138,6 +138,7 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
         let mut system: Box<dyn System> = super::system();
         loop {
             interval.tick().await;
+            steer.governor.tolerance = super::configured_tolerance();
             let read = Some(system.read());
             steer.turn(&mut pool, read, &mut |signal| {
                 steered::signal(engine, signal);

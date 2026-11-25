@@ -726,6 +726,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for grow in &shared_grows {
         grow.start();
     }
+    crate::governor::init(memory_tolerance);
     for steered in governed {
         crate::governor::run::start(steered, memory_tolerance);
     }
