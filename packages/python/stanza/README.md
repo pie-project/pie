@@ -1,6 +1,6 @@
 # pie-stanza
 
-Stanza by pie: any model, any adapter, one program.
+Stanza by pie: Poem-programmable post-training.
 
 A stanza is a few lines of Poem that say what is trainable in a model and
 where it attaches. `pie-stanza` mounts stanzas on a pie model program, trains
