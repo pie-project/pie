@@ -1136,9 +1136,10 @@ impl Plane {
     }
 
     /// What an instance of `id` holds in `Instance` and `Channel` slots of
-    /// `instance_slot` and `channel_slot` bytes. Tables past a slot leave the
-    /// instance's tables the engine's (no instance slots); a ring whose cell
-    /// is past a slot is the engine's and not listed.
+    /// `instance_slot` and `channel_slot` bytes: tables past a slot take a
+    /// run of instance slots, refused past a chunk; a ring whose cell is
+    /// past a slot takes a run of channel slots, and a ring larger than a
+    /// chunk is not listed (its bind is refused, `held::Cells`).
     pub fn facts(&self, id: ProgramId, pools: &Pools) -> Result<engine::ProgramFacts> {
         use crate::store::layout::{CHANNEL, INSTANCE};
         let instance_slot = pools.slot_bytes(INSTANCE)?;

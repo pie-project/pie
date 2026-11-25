@@ -1262,7 +1262,7 @@ mod tests {
     /// Committed bottom chunks past the top's heap seam lie in the top's
     /// lowest heap, which the bottom never maps itself: that heap stays
     /// mapped for them through any unmap of the top (a lowered rung, a
-    /// released span), so their bytes still read back, as the host tier's
+    /// released span), so their bytes still read back, as a slot file's
     /// copy reads them, and a chunk newly committed there reads zeros. An
     /// unmap gave that heap back before, under live state: the copy was
     /// refused ("mapped bytes of an elastic buffer's top") and a fire
