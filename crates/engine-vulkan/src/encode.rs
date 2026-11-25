@@ -329,15 +329,12 @@ impl Sink<'_> {
                 format!("not instantiated at the {} tier", fire.tier.name()),
             )
         })?;
-        let groups = match fire.launched() {
-            Some(none) => none,
-            None => engine_gpu::workgroups(
-                key,
-                fire.groups,
-                self.device.core.limits.max_compute_work_group_count,
-            )
-            .map_err(|fault| Sink::refuse(fire, fault))?,
-        };
+        let groups = engine_gpu::workgroups(
+            key,
+            fire.groups,
+            self.device.core.limits.max_compute_work_group_count,
+        )
+        .map_err(|fault| Sink::refuse(fire, fault))?;
         let pipeline = self
             .pipelines
             .get(self.device, fire.file, key)
@@ -379,28 +376,12 @@ impl Sink<'_> {
                         writes_at.push(false);
                         extents.push(0);
                         segments.push(None);
-                        // A score room's binding with no room (a fire none of
-                        // whose lanes capture, its kernels launching none) is
-                        // the room's all the same, at its first byte: the
-                        // commands of a fire whose lanes capture.
-                        let at = infos.len() - 1;
-                        rooms.push((at < 64 && pipeline.rooms & (1 << at) != 0).then_some(0));
+                        rooms.push(None);
                         continue;
                     }
                     // A lay-only walk binds nothing: what a buffer argument
                     // is matters to the commands, not to the block.
-                    // A score room's binding is the fire's data all the same:
-                    // where in the room its rows lie.
                     if self.frame.lay_only() {
-                        let at = infos.len();
-                        let room = (at < 64 && pipeline.rooms & (1 << at) != 0)
-                            .then_some(self.frame.room)
-                            .flatten()
-                            .and_then(|(room, base)| {
-                                let binding = self.handles.get(handle)?;
-                                (binding.buffer().slab().buffer == room)
-                                    .then(|| binding.offset().saturating_sub(base))
-                            });
                         infos.push(
                             vk::DescriptorBufferInfo::default()
                                 .buffer(dummy.buffer)
@@ -410,7 +391,7 @@ impl Sink<'_> {
                         writes_at.push(false);
                         extents.push(0);
                         segments.push(None);
-                        rooms.push(room);
+                        rooms.push(None);
                         continue;
                     }
                     let binding = self.handles.get(handle).ok_or_else(|| {
@@ -599,10 +580,6 @@ impl Sink<'_> {
         // The kernel, in the frame's picks; a lay-only walk lays no more.
         self.frame.pick(&key);
         if self.frame.lay_only() {
-            // Where in the room each room binding lies, the fire's data.
-            for past in scratch.rooms.iter().take(declared).flatten() {
-                self.frame.room_past(*past);
-            }
             self.frame.dispatches.set(self.frame.dispatches.get() + 1);
             return Ok(());
         }

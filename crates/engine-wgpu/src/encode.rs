@@ -291,15 +291,12 @@ impl Sink<'_> {
             .map_err(|fault| Sink::refuse(fire, fault))?;
         let core = self.device.core();
         let limits = &core.limits;
-        let groups = match fire.launched() {
-            Some(none) => none,
-            None => engine_gpu::workgroups(
-                name,
-                fire.groups,
-                [limits.max_compute_workgroups_per_dimension; 3],
-            )
-            .map_err(|fault| Sink::refuse(fire, fault))?,
-        };
+        let groups = engine_gpu::workgroups(
+            name,
+            fire.groups,
+            [limits.max_compute_workgroups_per_dimension; 3],
+        )
+        .map_err(|fault| Sink::refuse(fire, fault))?;
         let storage_align = u64::from(limits.min_storage_buffer_offset_alignment);
         let max_binding = limits.max_storage_buffer_binding_size;
 
