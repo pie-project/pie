@@ -2056,6 +2056,212 @@ fn idle_cache_read_under_a_fire_waits_for_it() {
     assert_eq!(table.release_cache_root(end).len(), 4, "all but page 0");
 }
 
+/// Sets fork, attach, grow, rewrite, are cut back and let go under fires in
+/// flight, cache is kept, pinned, imported and reclaimed, at random: no page
+/// is free while a fire that reads it is in flight (the model keeps each
+/// fire's pages as it was handed out), and all of it comes back.
+#[test]
+fn no_page_is_free_while_a_fire_that_reads_it_is_in_flight() {
+    const POOL: usize = 64;
+    struct Kept;
+    impl Keys for Kept {
+        fn key_at(&self, _owner: Option<ProcessId>, at: u64) -> i64 {
+            i64::from(at < 32)
+        }
+        // Keys that never change: the order is kept between reclaims.
+        fn revision(&self) -> Option<u64> {
+            Some(1)
+        }
+    }
+    struct Fire {
+        epoch: u64,
+        reads: HashSet<PhysicalKvPageId>,
+        pin: Option<super::ReaderPin>,
+    }
+    let mut did = [0u32; 11];
+    for seed in 1..=8u64 {
+        let mut at = seed;
+        let mut below = move |n: usize| {
+            at = at.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (at >> 33) as usize % n
+        };
+        let mut store = KvStore::new(POOL as u32, h(70 + seed as u32));
+        store.set_page_size(16);
+        store.set_keeps(true);
+        // Each set and the tokens of its pages, along one of three prompts.
+        let mut sets: Vec<(WorkingSetId, Vec<u32>)> = Vec::new();
+        let mut fires: Vec<Fire> = Vec::new();
+        let mut fresh = 0u32;
+        for step in 0..1500 {
+            let op = below(did.len());
+            let pick = below(sets.len().max(1));
+            let room = store.available_pages();
+            match op {
+                // A new set on what is cached of a prompt.
+                0 if sets.len() < 6 => {
+                    let tokens = prompt(below(3) as u32, 6);
+                    let ws = store.create_shared_working_set();
+                    let keys = keys_ahead(&store, ws, 0, &tokens);
+                    let run = store.cached_run(&keys);
+                    let limit = 1 + below(6) as u64;
+                    let held = store.attach_run(ws, &run, limit).unwrap() as usize;
+                    sets.push((ws, tokens[..held * 16].to_vec()));
+                }
+                // Grows by a page or two along its prompt, or past it.
+                1 if pick < sets.len() && room >= 2 && sets[pick].1.len() < 8 * 16 => {
+                    let (ws, tokens) = &mut sets[pick];
+                    let start = tokens.len();
+                    let n = 1 + below(2);
+                    let of = tokens.first().map_or_else(|| below(3) as u32, |t| t / 10_000);
+                    for page in start / 16..start / 16 + n {
+                        let along = prompt(of, 6);
+                        if below(4) > 0 && along.get(..start) == Some(&tokens[..start]) && page < 6 {
+                            tokens.extend(&along[page * 16..(page + 1) * 16]);
+                        } else {
+                            fresh += 1;
+                            tokens.extend((0..16).map(|t| 1_000_000 + fresh * 16 + t));
+                        }
+                    }
+                    let first = start as u64 / 16;
+                    let reserved = store.page_len(*ws).unwrap();
+                    store
+                        .reserve(*ws, (first + n as u64).saturating_sub(reserved))
+                        .unwrap();
+                    let indexes: Vec<u64> = (first..first + n as u64).collect();
+                    let prepared = prepare_write(&mut store, *ws, &indexes);
+                    let commits: Vec<PageCommit> = indexes
+                        .iter()
+                        .map(|_| PageCommit {
+                            token_hashes: Vec::new(),
+                            page_hash: None,
+                        })
+                        .collect();
+                    publish_prepared(&mut store, prepared, &commits);
+                    if below(4) > 0 {
+                        seal(&mut store, *ws, start as u64, &tokens[start..]);
+                    }
+                }
+                2 if sets.len() > 1 && fires.len() < 4 => {
+                    let mut reads = HashSet::new();
+                    for (ws, _) in &sets {
+                        if below(2) == 0 {
+                            reads.extend(store.flat_table(*ws).unwrap().iter().copied());
+                        }
+                    }
+                    let epoch = store.begin_fire();
+                    fires.push(Fire { epoch, reads, pin: None });
+                }
+                3 if !fires.is_empty() => {
+                    let fire = fires.swap_remove(below(fires.len()));
+                    if let Some(pin) = fire.pin {
+                        store.release_reader(pin);
+                    }
+                    store.settle(fire.epoch);
+                }
+                4 if pick < sets.len() && sets.len() < 6 => {
+                    let (ws, tokens) = sets[pick].clone();
+                    sets.push((store.fork(ws).unwrap(), tokens));
+                }
+                5 if pick < sets.len() && !sets[pick].1.is_empty() => {
+                    let (ws, tokens) = &mut sets[pick];
+                    tokens.truncate(below(tokens.len() / 16) * 16);
+                    let freed = store.table.truncate(*ws, tokens.len() as u64, 16).unwrap();
+                    store.recycle_backings(freed, store.current_epoch());
+                    store.refresh_flat(*ws);
+                }
+                6 if pick < sets.len() => {
+                    let (ws, _) = sets.swap_remove(pick);
+                    store.release_working_set(ws, store.current_epoch());
+                }
+                // A prefix of it kept, a selection of its pages.
+                7 if pick < sets.len() && !sets[pick].1.is_empty() => {
+                    let (ws, tokens) = &sets[pick];
+                    let pages = 1 + below(tokens.len() / 16) as u64;
+                    store.keep_checkpoint(*ws, pages, Some(ProcessId::from_u128(below(3) as u128)));
+                }
+                8 => {
+                    store.reclaim_cache(1 + below(12), Kept);
+                    store.retire_idle();
+                }
+                // A fire reads a pinned run, let go as it is in flight.
+                9 if fires.len() < 4 => {
+                    let probe = store.create_shared_working_set();
+                    let keys = keys_ahead(&store, probe, 0, &prompt(below(3) as u32, 6));
+                    store.release_working_set(probe, store.current_epoch());
+                    let run = store.cached_run(&keys);
+                    if let Some((pin, ids)) = store.pin_resident(&run) {
+                        let reads = ids.into_iter().collect();
+                        let epoch = store.begin_fire();
+                        let pin = if below(2) == 0 {
+                            store.release_reader(pin);
+                            None
+                        } else {
+                            Some(pin)
+                        };
+                        fires.push(Fire { epoch, reads, pin });
+                    }
+                }
+                // Pages filed, their bytes read in, or a page written over.
+                10 if room >= 2 && below(2) == 0 => {
+                    use super::hash::{chain_slots, page_hash};
+                    fresh += 1;
+                    let rows: Vec<u32> = (0..32).map(|t| 2_000_000 + fresh * 32 + t).collect();
+                    let slots: Vec<Vec<Option<Hash256>>> = chain_slots(&h(9), None, 0, &rows)
+                        .chunks(16)
+                        .map(|page| page.iter().map(|hash| Some(*hash)).collect())
+                        .collect();
+                    let keys = slots.iter().map(|page| page_hash(page)).collect();
+                    let pages = store.reserve_device_pages(2).unwrap();
+                    let backings = pages.into_iter().map(KvPageBacking::Resident).collect();
+                    assert!(store.import_cached_at(&[], slots, keys, backings));
+                }
+                10 if pick < sets.len() && !sets[pick].1.is_empty() && room >= 1 => {
+                    let (ws, tokens) = &mut sets[pick];
+                    let last = tokens.len() / 16 - 1;
+                    let prepared = prepare_write(&mut store, *ws, &[last as u64]);
+                    let commits = [PageCommit {
+                        token_hashes: Vec::new(),
+                        page_hash: None,
+                    }];
+                    publish_prepared(&mut store, prepared, &commits);
+                    fresh += 1;
+                    tokens.truncate(last * 16);
+                    tokens.extend((0..16).map(|t| 1_000_000 + fresh * 16 + t));
+                }
+                _ => continue,
+            }
+            did[op] += 1;
+            let free = store.reserve_device_pages(store.available_pages()).unwrap();
+            for id in &free {
+                for fire in &fires {
+                    assert!(
+                        !fire.reads.contains(id),
+                        "seed {seed} step {step} op {op}: {id:?} free, read by the fire at {}",
+                        fire.epoch
+                    );
+                }
+            }
+            store.release_device_reservation(free);
+        }
+        for fire in fires {
+            if let Some(pin) = fire.pin {
+                store.release_reader(pin);
+            }
+            store.settle(fire.epoch);
+        }
+        for (ws, _) in sets {
+            store.release_working_set(ws, store.current_epoch());
+        }
+        // What was filed last waits on the epoch after it.
+        let last = store.begin_fire();
+        store.settle(last);
+        while store.reclaim_cache(POOL, Kept) > 0 {}
+        store.retire_idle();
+        assert_eq!(store.available_pages(), POOL, "seed {seed}: all of it comes back");
+    }
+    assert!(did.iter().all(|&n| n > 200), "every move made: {did:?}");
+}
+
 /// A process waiting for admission is told when its prompt's prefix joins
 /// the store's cache, and again when it is evicted; a change on a path its
 /// prompt does not need looks it up not at all.
