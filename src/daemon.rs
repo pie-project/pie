@@ -1,12 +1,14 @@
 //! What a long-running pie process does at start and stop: the role it boots
 //! as, its config file, tracing and `/metrics`, signals and panics.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use runtime::governor::{Memory, Tolerance, memory_snapshot};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
@@ -242,14 +244,51 @@ async fn handle_scrape(mut sock: TcpStream, start: Instant, component: &str, ver
 
 fn render(start: Instant, component: &str, version: &str) -> String {
     let uptime = start.elapsed().as_secs_f64();
-    format!(
+    let mut body = format!(
         "# HELP pie_build_info Build/identity info (always 1).\n\
          # TYPE pie_build_info gauge\n\
          pie_build_info{{component=\"{component}\",version=\"{version}\"}} 1\n\
          # HELP pie_uptime_seconds Seconds since process start.\n\
          # TYPE pie_uptime_seconds gauge\n\
          pie_uptime_seconds {uptime}\n"
-    )
+    );
+    let memory = memory_snapshot();
+    for (name, help, value) in [
+        (
+            "pie_memory_target_bytes",
+            "Governor target in bytes.",
+            (|memory: Memory| memory.target_bytes) as fn(Memory) -> u64,
+        ),
+        (
+            "pie_memory_held_bytes",
+            "Memory held by the governed pool in bytes.",
+            |memory| memory.held_bytes,
+        ),
+        (
+            "pie_memory_yielding",
+            "Whether the governor is yielding under memory pressure.",
+            |memory| u64::from(memory.yielding),
+        ),
+    ] {
+        let _ = writeln!(body, "# HELP {name} {help}\n# TYPE {name} gauge");
+        for (&engine, &memory) in &memory.engines {
+            let _ = writeln!(body, "{name}{{engine=\"{engine}\"}} {}", value(memory));
+        }
+    }
+    body.push_str(
+        "# HELP pie_memory_tolerance Process memory tolerance at startup.\n\
+         # TYPE pie_memory_tolerance gauge\n",
+    );
+    for (level, label) in [
+        (Tolerance::Dedicated, "dedicated"),
+        (Tolerance::Aggressive, "aggressive"),
+        (Tolerance::Balanced, "balanced"),
+        (Tolerance::Polite, "polite"),
+    ] {
+        let active = u8::from(level == memory.tolerance);
+        let _ = writeln!(body, "pie_memory_tolerance{{level=\"{label}\"}} {active}");
+    }
+    body
 }
 
 fn install_panic_hook() {

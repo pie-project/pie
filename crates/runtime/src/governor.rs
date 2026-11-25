@@ -25,8 +25,9 @@ pub mod psi;
 pub mod run;
 pub mod steered;
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// What the platform says about the system right now.
@@ -114,6 +115,37 @@ impl Tolerance {
             Self::Polite => (0.7, 1),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct Memory {
+    pub target_bytes: u64,
+    pub held_bytes: u64,
+    pub yielding: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct MemorySnapshot {
+    pub tolerance: Tolerance,
+    pub engines: BTreeMap<usize, Memory>,
+}
+
+static MEMORY: Mutex<MemorySnapshot> = Mutex::new(MemorySnapshot {
+    tolerance: Tolerance::Dedicated,
+    engines: BTreeMap::new(),
+});
+
+pub(crate) fn init(tolerance: Tolerance) {
+    MEMORY.lock().tolerance = tolerance;
+}
+
+pub(crate) fn reset() {
+    *MEMORY.lock() = MemorySnapshot::default();
+}
+
+#[must_use]
+pub fn memory_snapshot() -> MemorySnapshot {
+    MEMORY.lock().clone()
 }
 
 #[derive(Debug, Clone, Copy)]

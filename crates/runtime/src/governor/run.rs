@@ -2,7 +2,8 @@
 
 use super::steered::{self, Shared, Steered};
 use super::{
-    Governor, Growth, Limits, PoolTarget, Pressure, Retarget, Signal, System, TICK, Tolerance,
+    Governor, Growth, Limits, MEMORY, Memory, PoolTarget, Pressure, Retarget, Signal, System, TICK,
+    Tolerance,
 };
 
 /// Steers `pool`, an engine's: a dedicated or fixed pool keeps its size,
@@ -128,6 +129,15 @@ impl Steer {
     }
 }
 
+fn publish(engine: usize, pool: &impl PoolTarget, governor: &Governor) {
+    let memory = Memory {
+        target_bytes: governor.target(),
+        held_bytes: pool.held(),
+        yielding: governor.yielding(),
+    };
+    MEMORY.lock().engines.insert(engine, memory);
+}
+
 async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     let mut steer = Steer::new(&pool, tolerance, GROWTH_STEP);
     let (shared, engine) = pool.with(|pool| (pool.inner().is_shared(), pool.inner().locus().1));
@@ -142,6 +152,7 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
             steer.turn(&mut pool, read, &mut |signal| {
                 steered::signal(engine, signal);
             });
+            publish(engine, &pool, steer.governor());
         }
     }
     // A dedicated shared pool may take every segment its range holds: its
@@ -158,5 +169,6 @@ async fn watch(mut pool: Shared<Steered>, tolerance: Tolerance) {
     loop {
         interval.tick().await;
         steer.turn(&mut pool, Some(Pressure::Calm), &mut |_| {});
+        publish(engine, &pool, steer.governor());
     }
 }

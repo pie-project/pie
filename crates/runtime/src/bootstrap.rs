@@ -78,6 +78,7 @@ pub fn reset() {
     crate::offload::reset();
     crate::handle::snapshot::reset();
     crate::scheduler::reset();
+    crate::governor::reset();
     crate::planner::reset();
     crate::store::reset();
     model::reset();
@@ -726,6 +727,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     for grow in &shared_grows {
         grow.start();
     }
+    crate::governor::init(memory_tolerance);
     for steered in governed {
         crate::governor::run::start(steered, memory_tolerance);
     }
