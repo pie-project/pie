@@ -1348,12 +1348,12 @@ device = ["metal:0"]
     fn a_distributed_worker_states_no_cluster_policies() {
         let toml = format!(
             "{MINIMAL_METAL}\n[cluster]\ncontroller = \"10.0.0.1:7000\"\nrole = \"decode\"\n\
-             cluster_policies = [\"persist-prefix\"]\n"
+             cluster_policies = [\"my-policy\"]\n"
         );
         let err = Config::parse(&toml).unwrap_err().to_string();
         assert!(err.contains("the controller's to run"), "got: {err}");
         let alone =
-            format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"persist-prefix\"]\n");
+            format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"my-policy\"]\n");
         Config::parse(&alone).expect("single-node runs them in its own controller");
     }
 
