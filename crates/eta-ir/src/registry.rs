@@ -139,7 +139,7 @@ impl GeometryClass {
 }
 
 /// The sinks a prologue may call.
-pub const KNOWN_SINKS: &[&str] = &["attn_page_mask", "lora", "minference_sparse"];
+pub const KNOWN_SINKS: &[&str] = &["adapter", "attn_page_mask", "minference_sparse"];
 
 /// Whether an output is one row per lane, per row or per voxel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +167,7 @@ pub struct OutputDecl {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EngineCaps {
+    /// The engine serves the `adapter` sink.
     pub lora: bool,
     pub attn_page_mask: bool,
 }

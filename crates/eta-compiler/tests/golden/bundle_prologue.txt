@@ -1,0 +1,7 @@
+name: bundle_prologue
+hash: 0x0eb4ab63ee0fb6da
+container: 45544100010000000100000001000000000000000100000007006164617074657202010400000001000000000100020000009100000000a200000100000000
+verdict: OK
+plan: stage=prologue signature=0xa7a5d4222159ff67 source_ops=2 normalized_ops=2 singleton_regions=2 fused_regions=2 library_regions=1 static_scratch_bytes=16 direct_sink_bytes=0
+readiness: chan=0 phase=0x00 dir=NeedsFull
+class: chan=0 FullRing

@@ -21,9 +21,17 @@ pub enum Phase {
 pub struct ShadowPlan {
     taken_per_pass: BTreeSet<u32>,
     phases: Vec<Phase>,
+    reads: BTreeSet<u32>,
 }
 
 impl ShadowPlan {
+    /// Whether the host's evaluation of a pass reads channel `chan`: a
+    /// port binds it, or a stage's `chan_put` depends on it.
+    #[must_use]
+    pub fn reads(&self, chan: u32) -> bool {
+        self.reads.contains(&chan)
+    }
+
     pub fn derive(bound: &BoundTrace) -> ShadowPlan {
         let mut taken_per_pass = BTreeSet::new();
         for program in &bound.container.stages {
@@ -73,9 +81,23 @@ impl ShadowPlan {
             .filter_map(phase_of)
             .collect();
 
+        let mut reads: BTreeSet<u32> = bound
+            .container
+            .ports
+            .iter()
+            .filter_map(|binding| match binding.source {
+                PortSource::Channel(chan) => Some(chan),
+                PortSource::Const { .. } => None,
+            })
+            .collect();
+        for program in &bound.container.stages {
+            reads.extend(eta_compiler::eval::pareval::put_reads(&program.ops));
+        }
+
         let plan = ShadowPlan {
             taken_per_pass,
             phases,
+            reads,
         };
         tracing::info!(
             "shadow plan: {} phase(s): {:?}",

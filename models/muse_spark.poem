@@ -4,7 +4,7 @@
 # does, NVFP4 ones.
 
 load("//pie/codec.poem", "stacked_bank", read_fused = "fused")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 
 ATEM = template("atem_open")
 
@@ -98,7 +98,6 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks(hidden)
         bank = w if l in d.dense_experts else routed
         return struct(
             full = full(l),
@@ -125,8 +124,7 @@ def layout(id, deploy):
             down = weight([d.experts, pooled, iw], bank),
             expert_scale = norm("expert_scale", pooled),
             unpool = weight([hidden, pooled], w),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     return struct(
@@ -291,7 +289,7 @@ def forward(m, inputs):
         # Each head normed, then gated, in one pass.
         a = ops.elemwise.rmsnorm_gated(a, gate, None, d, m.norm_eps, "sigmoid")
         o = ops.linear.matmul(a, w.o_proj)
-        o = corrected(normed, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", normed, o)
         y, x = ops.elemwise.norm_gate(o, None, y, w.attn_gate, m.post_norm_eps, m.gate_temperature, (w.pre_ffw_norm, m.norm_eps))
 
         f = moe(m, w, x)

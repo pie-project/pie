@@ -90,36 +90,21 @@ pub mod kernel {
         record_sink(String::from("attn_page_mask"), span);
     }
 
+    /// Attaches an adapter bundle to the pass: `bundle` is one u32 channel
+    /// that holds a safetensors file's bytes, and the engine fills each bank
+    /// the file names.
     #[track_caller]
-    pub fn lora(a: impl AsTensor, b: impl AsTensor, sites: impl AsTensor) {
+    pub fn adapter(bundle: impl AsTensor) {
         let span = Span::here();
-        let (a, _) = a.to_arg().materialize();
-        let (b, _) = b.to_arg().materialize();
-        let (sites, _) = sites.to_arg().materialize();
-        let name = intern_name("lora");
+        let (bundle, _) = bundle.to_arg().materialize();
+        let name = intern_name("adapter");
         emit(
             Op::SinkCall {
                 name,
-                args: vec![a, b, sites],
+                args: vec![bundle],
             },
             &[],
         );
-        record_sink(String::from("lora"), span);
-    }
-
-    #[track_caller]
-    pub fn adapter_scale(l: impl AsTensor, sites: impl AsTensor) {
-        let span = Span::here();
-        let (l, _) = l.to_arg().materialize();
-        let (sites, _) = sites.to_arg().materialize();
-        let name = intern_name("lora");
-        emit(
-            Op::SinkCall {
-                name,
-                args: vec![l, sites],
-            },
-            &[],
-        );
-        record_sink(String::from("lora"), span);
+        record_sink(String::from("adapter"), span);
     }
 }

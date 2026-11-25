@@ -228,6 +228,7 @@ pub struct LaunchChannelRule {
 pub struct StageNeeds {
     pub kernel_call: bool,
     pub page_mask: bool,
+    /// The stage calls the `adapter` sink.
     pub lora: bool,
     pub grouped_valid: bool,
 }
@@ -703,7 +704,7 @@ impl GroupedPlan {
                 continue;
             }
             if op.tag == tags::SINK_CALL {
-                if names.get(op.name_idx as usize).map(String::as_str) == Some("lora") {
+                if names.get(op.name_idx as usize).map(String::as_str) == Some("adapter") {
                     plan.needs.lora = true;
                 } else {
                     plan.needs.page_mask = true;

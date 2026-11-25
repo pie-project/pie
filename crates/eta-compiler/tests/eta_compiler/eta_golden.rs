@@ -136,7 +136,7 @@ fn golden_neg_spsc_second_producer() {
 
 fn golden_neg_sink_at_epilogue() {
     let c = TraceContainer {
-        names: vec!["lora".into()],
+        names: vec!["adapter".into()],
         channels: vec![onechan(HostRole::None)],
         ports: vec![],
         stages: vec![StageProgram {

@@ -15,7 +15,7 @@ fn container_prologue_moves(container: &eta_ir::container::TraceContainer) -> bo
         })
 }
 
-fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> bool {
+fn container_has_adapter_sink(container: &eta_ir::container::TraceContainer) -> bool {
     container
         .stages
         .iter()
@@ -24,7 +24,7 @@ fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> boo
             matches!(
                 op,
                 eta_ir::op::Op::SinkCall { name, .. }
-                    if container.names.get(*name as usize).map(String::as_str) == Some("lora")
+                    if container.names.get(*name as usize).map(String::as_str) == Some("adapter")
             )
         })
 }
@@ -558,7 +558,9 @@ async fn settle_device_folds<C: FireContext>(
 /// Whether the pass's program adapts the KV it writes beyond its tokens.
 fn lora_program_of<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
     let p = ctx.resources().get(fwd)?;
-    Ok(container_has_lora_sink(&p.instance.program.bound.container))
+    Ok(container_has_adapter_sink(
+        &p.instance.program.bound.container,
+    ))
 }
 
 /// `PIE_FIRE_ROWS` overrides it, so a test compares outputs cut at the same

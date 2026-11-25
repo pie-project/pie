@@ -2,7 +2,7 @@
 # six-layer, sixteen-expert miniature.
 
 load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 load("//lib/hyper.poem", "collapse")
 load("//lib/mtp.poem", "draft")
 
@@ -251,7 +251,6 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s: weight([hidden])
-        lora_a, lora_b = banks(hidden)
         keys = index_keys() if ranks(l) else None
         if l < d.dense_layers:
             iw = d.dense_inter
@@ -273,8 +272,7 @@ def layout(id, deploy):
             mlp_norm = norm("mlp_norm"),
             mlp_norm_eps = d.norm_eps,
             mlp = mlp,
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     mtp = None
@@ -543,7 +541,7 @@ def forward(m, inputs):
         x, post_mix, comb_mix = gate(streams, w.attn_mix, hy)
         x = ops.elemwise.rmsnorm(x, w.attn_norm, w.attn_norm_eps)
         o, selection = run_attention(x, inputs, positions, w.attn, selection)
-        o = corrected(x, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", x, o)
         streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 
         x, post_mix, comb_mix = gate(streams, w.mlp_mix, hy)

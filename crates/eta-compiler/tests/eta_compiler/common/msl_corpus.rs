@@ -7,11 +7,11 @@ use eta_ir::validate::bind;
 
 pub const GOLDEN_NAMES: &[&str] = &[
     "beam_epilogue",
+    "bundle_prologue",
     "counter_pingpong",
     "dfa_ingraph",
     "extern_contrastive",
     "greedy_argmax",
-    "lora_prologue",
     "matrix_mask_apply_packed",
     "matrix_select_mask",
     "mtp_verify_tail",
@@ -102,8 +102,8 @@ impl Served {
 
 pub fn golden_served(name: &str) -> Served {
     match name {
-        "counter_pingpong"
-        | "lora_prologue"
+        "bundle_prologue"
+        | "counter_pingpong"
         | "neg_body_type_error"
         | "neg_intrinsic_wrong_stage"
         | "neg_sink_at_epilogue"
@@ -220,7 +220,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, Served)> {
         (
             "synthetic_sink_call",
             TraceContainer {
-                names: vec!["lora".into()],
+                names: vec!["adapter".into()],
                 channels: vec![chan(Shape::vector(4), Dtype::F32, HostRole::None, true)],
                 ports: Vec::new(),
                 stages: vec![StageProgram {

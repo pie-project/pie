@@ -1,0 +1,13 @@
+# (IA)3: rescale k, v and the MLP's up rows by (1 + l). A zero slot is the base model.
+SITES = ("k", "v", "up")
+
+def banks(tap):
+    """One scale vector `l` at k, v and up; no bank elsewhere."""
+    if tap.site in SITES:
+        return struct(l = weight([tap.slots, tap.fan_out]).registered())
+    return None
+
+def apply(tap, x, y, w, routes):
+    """`y` times (1 + l), `l` the row's adapter's scale vector."""
+    l = ops.gather.embed(routes, w.l, tap.slots)
+    return ops.elemwise.add(y, ops.elemwise.mul(y, l))

@@ -21,6 +21,9 @@ pub struct Weight {
     /// The turn its columns are stored against, or `None` for a weight
     /// stored as it reads.
     pub turn: Option<Box<Turn>>,
+    /// How a trainer starts this registered bank, if the text states it
+    /// ([`Param::init`]).
+    pub init: Option<String>,
 }
 
 /// A weight stored against turned inputs, `W·S·H`: a product turns its
@@ -147,6 +150,7 @@ impl Weight {
             layout: ParamLayout::Natural,
             values: None,
             turn: None,
+            init: None,
         }
     }
 
@@ -783,6 +787,7 @@ impl Weight {
             layout: p.layout,
             values: None,
             turn: None,
+            init: p.init.clone(),
         }
     }
 }

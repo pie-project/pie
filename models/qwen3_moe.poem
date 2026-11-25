@@ -10,8 +10,8 @@
 # qwen3-coder-30b-a3b-...`.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
 load("//lib/blocks.poem", "attention")
+load("//lib/taps.poem", "attention_widths", "stanza_banks", "taps")
 load("//lib/spoken.poem", "QWEN_STOP")
 
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
@@ -74,7 +74,8 @@ DEPLOYMENTS = (
 # token embedding, a final norm and the head. The deployment's first dtype
 # stores the projections, its second (or the first) the expert banks; the
 # norms, the router, the embedding and the head stay bf16 under a release's
-# FP8 or NVFP4. Each layer also has the LoRA banks the host registers.
+# FP8 or NVFP4. Each layer also has the banks its mounted stanzas keep at its
+# attention (`//lib/taps.poem`), which the host registers.
 
 def dims(hidden, layers, q_heads, kv_heads, experts, inter, theta):
     return struct(
@@ -119,9 +120,9 @@ def layout(id, deploy):
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
+    widths = attention_widths(hidden, q_width, kv_width)
 
     def layer(l):
-        lora_a, lora_b = banks(hidden)
         return struct(
             attn_norm = weight([hidden]),
             q = weight([q_width, hidden], proj),
@@ -137,8 +138,7 @@ def layout(id, deploy):
             down = weight([d.experts, hidden, d.inter], experts),
             # Its keys and values, two planes of its kv heads a token.
             kv = state([tokens, 2, d.kv_heads, hd], deploy.kv),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, widths)
         )
 
     return struct(
@@ -157,6 +157,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
+        widths = widths,
         final_norm = weight([hidden]),
     )
 
@@ -211,8 +212,8 @@ TRANSFORMERS = [
 # The forward of Qwen 3 MoE: pre-norm layers of full grouped-query attention,
 # its q and k RMS-normed per head and rotated in full (neox halves), and a
 # routed MLP: the router's softmax picks `top_k` experts, their weights
-# renormalized over the pick. A row with an adapter adds its LoRA correction
-# to the attention's output.
+# renormalized over the pick. A row with an adapter runs its stanzas at its
+# attention's taps.
 
 def forward(m, inputs):
     positions = inputs.positions()
@@ -221,8 +222,9 @@ def forward(m, inputs):
 
     def block(l, w, y):
         x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
-        o = attention(x, inputs, m, w, positions, qk_norm = "head")
-        y = ops.elemwise.residual_add(corrected(x, o, w, routes), y)
+        adapt = taps(w, l, len(m.layers), m.widths, routes)
+        o = attention(x, inputs, m, w, positions, qk_norm = "head", adapt = adapt)
+        y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
         return ops.elemwise.residual_add(moe(x, m, w), y)
 

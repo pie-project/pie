@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
+import math
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal, Sequence, TypeAlias
 
@@ -515,9 +517,6 @@ def _lane_outputs(switches: tuple[tuple[str, str], ...]) -> list[OutputDecl]:
 # ForwardPass
 # ---------------------------------------------------------------------------
 
-_SITE_BITS = {"q": 1, "k": 2, "v": 4, "o": 8, "gate_up": 16, "down": 32}
-
-
 class ForwardPass:
     """The forward-pass builder over `pie:inferlet/forward`.
 
@@ -535,8 +534,7 @@ class ForwardPass:
         self._vocab = _wit_model.output_vocab_size()
         self._page_size = kv_page_size()
         self._program_attached = False
-        self._adapter_lowrank_sites = 0
-        self._adapter_scale_sites = 0
+        self._adapted = False
         # Keeps the bound working sets alive while the pass is bound.
         self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
@@ -660,61 +658,18 @@ class ForwardPass:
 
     # -- adapters ------------------------------------------------------------
 
-    def adapter(self, site: str, f: Callable[["AdapterExpr", "AdapterExpr"], "AdapterExpr"]) -> None:
-        """Attach a PEFT adapter at `site` (`"q"|"k"|"v"|"o"|"gate_up"|"down"`):
-        `f(x, y)` returns the corrected expression. Lowers the LoRA
-        (`y + mm(b, mm(a, x))`), IA3 (`scale(y, l)`) and DoRA forms."""
+    def adapter(self, adapter: "Adapter") -> None:
+        """Attach `adapter` to this pass's rows. The engine fills every bank
+        the bundle names and zero-fills the rest, so the pass never says
+        where or how the adapter attaches. The bundle's sink is the pass's
+        prologue."""
         from . import intrinsics as _intr
 
-        bit = _SITE_BITS[site]
-        expr = f(AdapterExpr("x"), AdapterExpr("y"))
-
-        def is_lowrank(e: AdapterExpr):
-            # y + mm(b, mm(a, x)) → (a, b)
-            if e.kind != "add":
-                return None
-            lhs, rhs = e.args
-            delta = rhs if lhs.kind == "y" else (lhs if rhs.kind == "y" else None)
-            if delta is None or delta.kind != "mm":
-                return None
-            b, mid = delta.args
-            if mid.kind != "mm":
-                return None
-            a, x = mid.args
-            if x.kind != "x":
-                return None
-            return a, b
-
-        if expr.kind == "scale":
-            l, inner = expr.args  # noqa: E741
-            lr = is_lowrank(inner)
-            if lr is not None:
-                a, b = lr
-                if (self._adapter_lowrank_sites | self._adapter_scale_sites) & bit:
-                    raise InferletError(f"adapter: site {site} already carries an adapter on this pass")
-                self._adapter_lowrank_sites |= bit
-                self._adapter_scale_sites |= bit
-
-                def body():
-                    _intr.kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32))
-                    _intr.kernel.adapter_scale(l.read(), Tensor.constant(bit, Dtype.U32))
-
-                self.prologue(body)
-                return
-            if inner.kind == "y":
-                if self._adapter_scale_sites & bit:
-                    raise InferletError(f"adapter: site {site} already carries a scale on this pass")
-                self._adapter_scale_sites |= bit
-                self.prologue(lambda: _intr.kernel.adapter_scale(l.read(), Tensor.constant(bit, Dtype.U32)))
-                return
-        lr = is_lowrank(expr)
-        if lr is None:
-            raise InferletError("adapter: form not lowerable (v0 lowers `y + mm(b, mm(a, x))`, `scale(y, l)`)")
-        a, b = lr
-        if self._adapter_lowrank_sites & bit:
-            raise InferletError(f"adapter: site {site} already carries an adapter on this pass")
-        self._adapter_lowrank_sites |= bit
-        self.prologue(lambda: _intr.kernel.lora(a.read(), b.read(), Tensor.constant(bit, Dtype.U32)))
+        if self._adapted:
+            raise InferletError("adapter: this pass already carries an adapter")
+        self._adapted = True
+        bundle = adapter.bundle
+        self.prologue(lambda: _intr.kernel.adapter(bundle.read()))
 
     # -- stages ---------------------------------------------------------------
 
@@ -784,24 +739,57 @@ class ForwardPass:
         self._program_attached = True
 
 
-class AdapterExpr:
-    __slots__ = ("kind", "args")
+class Adapter:
+    """A trained adapter, ready to attach to forward passes with
+    `ForwardPass.adapter`. Passes that attach the same bytes share one engine
+    slot."""
 
-    def __init__(self, kind: str, *args) -> None:
-        self.kind = kind
-        self.args = args
+    __slots__ = ("bundle",)
 
-    def __add__(self, other: "AdapterExpr") -> "AdapterExpr":
-        return AdapterExpr("add", self, other)
+    def __init__(self, bundle: Channel) -> None:
+        self.bundle = bundle
+
+    @staticmethod
+    def from_bundle(data: bytes) -> "Adapter":
+        """Checks that `data` is a safetensors file whose tensors are F32,
+        BF16 or F16 and lie inside it, then packs it, zero-padded to 4, into
+        one u32 channel."""
+        _check_bundle(data)
+        padded = bytes(data) + b"\0" * (-len(data) % 4)
+        return Adapter(Channel.from_(padded, Dtype.U32))
 
 
-def mm(w: Channel, e: AdapterExpr) -> AdapterExpr:
-    """`mm(w, e)` — multiply by the channel-borne weight."""
-    return AdapterExpr("mm", w, e)
-
-
-def scale(e: AdapterExpr, l: Channel) -> AdapterExpr:  # noqa: E741
-    """`scale(e, l)` — elementwise multiply by the channel-borne vector."""
-    return AdapterExpr("scale", l, e)
+def _check_bundle(data: bytes) -> None:
+    """Refuses bytes that are not a safetensors file of F32, BF16 or F16
+    tensors, naming the tensor at fault."""
+    if len(data) < 8:
+        raise InferletError("adapter bundle: not a safetensors file: shorter than its header length")
+    end = 8 + int.from_bytes(data[:8], "little")
+    if end > len(data):
+        raise InferletError("adapter bundle: not a safetensors file: its header runs past the file")
+    try:
+        header = json.loads(bytes(data[8:end]))
+    except ValueError as e:
+        raise InferletError(f"adapter bundle: not a safetensors file: its header is not JSON: {e}") from None
+    if not isinstance(header, dict):
+        raise InferletError("adapter bundle: not a safetensors file: its header is not a JSON object")
+    size = len(data) - end
+    for name, tensor in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(tensor, dict):
+            raise InferletError(f"adapter bundle: tensor `{name}` is not a JSON object")
+        width = {"F32": 4, "BF16": 2, "F16": 2}.get(tensor.get("dtype"))
+        if width is None:
+            raise InferletError(f"adapter bundle: tensor `{name}` is {tensor.get('dtype')!r}; a bank is F32, BF16 or F16")
+        shape, offsets = tensor.get("shape"), tensor.get("data_offsets")
+        if not (isinstance(shape, list) and all(isinstance(d, int) and d >= 0 for d in shape)):
+            raise InferletError(f"adapter bundle: tensor `{name}` has no shape")
+        if not (isinstance(offsets, list) and len(offsets) == 2):
+            raise InferletError(f"adapter bundle: tensor `{name}` has no data offsets")
+        begin, stop = offsets
+        count = math.prod(shape)
+        if not (isinstance(begin, int) and isinstance(stop, int) and 0 <= begin <= stop <= size and stop - begin == count * width):
+            raise InferletError(f"adapter bundle: tensor `{name}` spans bytes {begin}..{stop} of {size} for {count} elements of {width} bytes")
 
 

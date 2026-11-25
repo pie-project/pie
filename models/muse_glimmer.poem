@@ -2,7 +2,7 @@
 # eight layers of the whole model's checkpoint.
 
 load("//pie/codec.poem", "mapped")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 
 ATEM = template("atem")
 
@@ -64,7 +64,6 @@ def layout(id, deploy):
 
     def layer(l):
         norm = lambda s: weight([hidden])
-        lora_a, lora_b = banks(hidden)
         return struct(
             full = l % d.full_every == d.full_every - 1,
             q = weight([q_w, hidden], proj),
@@ -87,8 +86,7 @@ def layout(id, deploy):
             ),
             inter = iw,
             down = weight([hidden, iw], proj),
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     lm_head = weight([d.vocab, hidden], proj)
@@ -189,7 +187,7 @@ def forward(m, inputs):
 
         gate = ops.linear.matmul(normed, w.gate)
         o = ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(a, gate), w.o_proj)
-        o = corrected(normed, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", normed, o)
 
         y = ops.elemwise.residual_add(
             ops.elemwise.rmsnorm_plus_one(o, w.post_attn_norm, w.post_attn_norm_eps),

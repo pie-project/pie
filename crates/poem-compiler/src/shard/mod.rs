@@ -20,7 +20,8 @@ mod tests;
 use std::collections::BTreeMap;
 
 use poem_ir::{
-    CacheRow, Collective, Def, Dim, Node, Operands, Operation, Shard, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Collective, Def, Dim, Guard, Node, Operands, Operation, Shard, Trace, Ty, ValueDecl,
+    ValueId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +160,11 @@ struct Pass {
     /// The ops the rule being applied lands before its node.
     pending: Vec<Operation>,
     whole: BTreeMap<ValueId, ValueId>,
+    /// The rows of registered banks a route picks, each by its bank.
+    rows: BTreeMap<ValueId, usize>,
+    /// The guard of the op reading the value being made whole: the node
+    /// whose rule is being applied, or the arm of a merge it reads.
+    reader: Option<Guard>,
 }
 
 impl Pass {
@@ -172,6 +178,8 @@ impl Pass {
             after: vec![Vec::new(); n],
             pending: Vec::new(),
             whole: BTreeMap::new(),
+            rows: infer::bank_rows(&trace),
+            reader: None,
             trace,
         }
     }
@@ -184,7 +192,9 @@ impl Pass {
             if matches!(node.op, Operation::Collective(_)) {
                 return Err("the trace already states a collective".into());
             }
+            self.reader = Some(node.guard.clone());
             let (op, outs) = rules::apply(self, &node.op)?;
+            self.reader = None;
             let mut ids = Vec::new();
             op.outputs(&mut ids);
             for (id, dist) in ids.into_iter().zip(outs) {
@@ -332,6 +342,14 @@ impl Pass {
         matches!(self.trace.values[v.0 as usize].def, Def::Weight(_))
     }
 
+    /// Whether `v` is a row a route picks of a registered bank every rank
+    /// holds whole, read by one op: an adapter's per-row scale or shift.
+    fn bank_row(&self, v: ValueId) -> bool {
+        self.rows
+            .get(&v)
+            .is_some_and(|p| self.trace.params[*p].shard == Shard::Replicated)
+    }
+
     fn cache_split(&self, v: ValueId) -> Option<bool> {
         let Def::Cache(c) = self.trace.values[v.0 as usize].def else {
             return None;
@@ -380,6 +398,26 @@ impl Pass {
         if let Some(seen) = self.whole.get(&v) {
             return Ok(*seen);
         }
+        if let Def::Merge(arms) = self.trace.values[v.0 as usize].def.clone() {
+            let reader = self.reader.take();
+            let arms = arms
+                .into_iter()
+                .map(|(arm, guard)| {
+                    self.reader = Some(guard.clone());
+                    Ok((self.whole(arm)?, guard))
+                })
+                .collect::<Result<Vec<_>, String>>();
+            self.reader = reader;
+            let arms = arms?;
+            let out = ValueId(self.trace.values.len() as u32);
+            self.trace.values.push(ValueDecl {
+                def: Def::Merge(arms),
+                ty: self.trace.values[v.0 as usize].ty.clone(),
+            });
+            self.dists.push(Some(Dist::Whole));
+            self.whole.insert(v, out);
+            return Ok(out);
+        }
         let Def::Op(at) = self.trace.values[v.0 as usize].def else {
             return Err(format!("value {} is held {dist:?} and no op makes it", v.0));
         };
@@ -405,7 +443,7 @@ impl Pass {
             }
             Dist::Whole => unreachable!(),
         };
-        let guard = self.trace.nodes[at as usize].guard.clone();
+        let guard = self.guard_of(v, at);
         let layer = self.trace.nodes[at as usize].layer;
         self.after[at as usize].push(Node {
             op: Operation::Collective(op),
@@ -414,6 +452,38 @@ impl Pass {
         });
         self.whole.insert(v, out);
         Ok(out)
+    }
+
+    /// The guard of the collective that moves `v`, which node `at` makes:
+    /// `at`'s. An op that updates its input in place under a guard (an
+    /// adapter's correction of a projection every row runs) leaves the rows
+    /// it skips their input's value; where the op reading `v` runs on those
+    /// rows too, as the input's maker does, the collective runs there.
+    fn guard_of(&self, v: ValueId, at: u32) -> Guard {
+        let root = self.root(v, at);
+        match &self.reader {
+            Some(reader) if root != at && *reader == self.trace.nodes[root as usize].guard => {
+                reader.clone()
+            }
+            _ => self.trace.nodes[at as usize].guard.clone(),
+        }
+    }
+
+    /// The node that first made `v`, which node `at` makes, following the
+    /// ops that update their input in place.
+    fn root(&self, mut v: ValueId, mut at: u32) -> u32 {
+        let mut pairs = Vec::new();
+        loop {
+            pairs.clear();
+            self.trace.nodes[at as usize].op.aliases(&mut pairs);
+            let Some(&(_, of)) = pairs.iter().find(|(out, _)| *out == v) else {
+                return at;
+            };
+            let Def::Op(maker) = self.trace.values[of.0 as usize].def else {
+                return at;
+            };
+            (v, at) = (of, maker);
+        }
     }
 
     /// The trace one rank runs: the rewritten nodes with the ops and

@@ -1,5 +1,7 @@
 # The adapter banks a layer's LoRA correction reads: `slots` adapters of
 # `rank`, registered by the host rather than read from a checkpoint.
+# `deepseek_v4` keeps this one bank; every other package attaches its
+# mounted stanzas through `//lib/taps.poem`.
 
 ADAPTERS = struct(slots = 8, rank = 16)
 

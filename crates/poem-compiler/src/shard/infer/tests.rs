@@ -32,6 +32,7 @@ fn mlp(hidden: u64, inner: u64, out: u64) -> (poem_ir::Trace, usize, usize) {
             layout: Default::default(),
             placement: Default::default(),
             experts: None,
+            init: None,
         });
         let ty = Ty::Tensor {
             shape: vec![Dim::Const(rows), Dim::Const(cols)],

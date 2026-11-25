@@ -160,7 +160,7 @@ class Port(IntEnum):
         return self.name.lower()
 
 
-KNOWN_SINKS = ("attn_page_mask", "lora", "minference_sparse")
+KNOWN_SINKS = ("adapter", "attn_page_mask", "minference_sparse")
 
 
 class Axis(str, Enum):

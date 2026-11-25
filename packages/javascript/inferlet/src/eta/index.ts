@@ -19,6 +19,7 @@ export * as diffusion from './diffusion.js';
 export * as intrinsics from './intrinsics.js';
 export {
   TOKEN_PAD,
+  Adapter,
   Channel,
   ForwardPass,
   InferletError,
@@ -27,10 +28,8 @@ export {
   channelCapacity,
   frameSize,
   kvPageSize,
-  mm,
   padTokens,
   readoutSpans,
-  scale,
   submitDeadlineUs,
   unpadTokens,
 } from './bridge.js';

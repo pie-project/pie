@@ -399,6 +399,7 @@ mod tests {
                     layout: poem_ir::ParamLayout::default(),
                     placement: poem_ir::ParamPlacement::default(),
                     experts: None,
+                    init: None,
                 })
                 .collect(),
             caches: Vec::new(),

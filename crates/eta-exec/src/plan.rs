@@ -235,12 +235,12 @@ pub struct Boundaries {
 impl Boundaries {
     pub const METAL: Self = Self {
         kernel_calls: &["metal.identity"],
-        sink_calls: &["metal.discard", "lora"],
+        sink_calls: &["metal.discard", "adapter"],
     };
 
     pub const CUDA: Self = Self {
         kernel_calls: &[],
-        sink_calls: &["lora", "attn_page_mask"],
+        sink_calls: &["adapter", "attn_page_mask"],
     };
 
     fn admits(self, code: u8, name: &str) -> bool {

@@ -20,6 +20,7 @@ from __future__ import annotations
 from . import diffusion, intrinsics
 from .bridge import (
     TOKEN_PAD,
+    Adapter,
     Channel,
     Fold,
     ForwardPass,
@@ -30,10 +31,8 @@ from .bridge import (
     channel_capacity,
     frame_size,
     kv_page_size,
-    mm,
     pad_tokens,
     readout_spans,
-    scale,
     submit_deadline_us,
     unpad_tokens,
 )
@@ -115,6 +114,7 @@ from .value import (
 __all__ = [
     # bridge
     "TOKEN_PAD",
+    "Adapter",
     "Channel",
     "Fold",
     "ForwardPass",
@@ -125,10 +125,8 @@ __all__ = [
     "channel_capacity",
     "frame_size",
     "kv_page_size",
-    "mm",
     "pad_tokens",
     "readout_spans",
-    "scale",
     "submit_deadline_us",
     "unpad_tokens",
     # ir

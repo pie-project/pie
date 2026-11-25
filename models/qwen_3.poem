@@ -5,7 +5,7 @@
 # it that tests trace and import by id.
 
 load("//pie/codec.poem", "bank", "kept", read_fused = "fused", read_weight = "weight")
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_declare = "declare", dflash_head = "head")
 load("//lib/media.poem", "smart_resize")
 load("//lib/qwen.poem", "SMALL", "MEDIUM", "LARGE", "PATCH", "MERGE", "tower", "read_tower", "run_tower", "scatter", "positions", "rope", "routed", "draft_attn", "norm_of")
@@ -539,7 +539,6 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, dim: weight([dim])
-        lora_a, lora_b = banks(hidden)
         attn = None
         delta = None
         if attn_at(l):
@@ -567,8 +566,7 @@ def layout(id, deploy):
             mlp_norm = norm("mlp_norm", hidden),
             mlp_norm_eps = d.norm_eps,
             mlp = mlp,
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     visual = tower(d.tower, hidden, dense) if d.tower != None else None
@@ -1123,7 +1121,7 @@ def forward(m, inputs):
         h_block = y.on(block_rows(dr))
         y = y.on(~block_rows(dr))
 
-    routes = inputs.adapter_routes()
+    routes = trunk_inputs.adapter_routes()
 
     def block(l, w, carried):
         y, fused = carried
@@ -1132,7 +1130,7 @@ def forward(m, inputs):
             o = attn_mixer(x, inputs, m, trunk_inputs, w.attn)
         else:
             o = gdn_mixer(x, inputs, w.gdn)
-        o = corrected(x, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", x, o)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm_plus_one(y, w.mlp_norm, w.mlp_norm_eps)

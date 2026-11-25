@@ -267,13 +267,18 @@ impl Reader<'_> {
                     }
                 }
                 Some(Def::Merge(arms)) => {
-                    let live: Vec<ValueId> = arms
-                        .iter()
-                        .map(|(a, _)| self.resolve(*a))
-                        .filter(
-                            |a| matches!(self.def(*a), Some(Def::Op(n)) if self.runs[*n as usize]),
-                        )
-                        .collect();
+                    let running = |a: &ValueId| matches!(self.def(*a), Some(Def::Op(n)) if self.runs[*n as usize]);
+                    // The arm whose own op runs, where one does: a skipped arm's alias can
+                    // reach a running value too (an adapted arm's residual).
+                    let made: Vec<ValueId> = arms.iter().map(|(a, _)| *a).filter(running).collect();
+                    let live: Vec<ValueId> = match made.as_slice() {
+                        [_] => made,
+                        _ => arms
+                            .iter()
+                            .map(|(a, _)| self.resolve(*a))
+                            .filter(running)
+                            .collect(),
+                    };
                     match live.as_slice() {
                         [one] => v = *one,
                         _ => return v,

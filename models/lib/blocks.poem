@@ -1,35 +1,61 @@
 # The blocks dense decoders share: grouped-query attention over a paged KV
 # cache and a SwiGLU MLP. `m` carries the attention's shape (`q_heads`,
 # `kv_heads`, `head_dim`, `theta`, `sm_scale`, `eps`); `w` a layer's
-# weights under their usual names.
+# weights under their usual names; `adapt`, where a model passes one, the
+# taps a layer's stanzas attach at (`//lib/taps.poem`).
 
-def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False):
+def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_norm = None, biased = False, adapt = None):
     """Grouped-query attention over `w.kv`, the layer's per-token keys and
     values state, out through `w.o`. `biased` adds `w.q_bias`,
     `w.k_bias` and `w.v_bias`; `qk_norm` norms q and k by `w.q_norm` and
     `w.k_norm`, each head on its own ("head") or across its full width
     ("width"); `rotary_dim` rotates only that many leading dims of each
-    head."""
+    head. `adapt` corrects q, k, v and o on the rows that carry an
+    adapter."""
     d = m.head_dim
-    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-    if biased:
-        q, k, v = ops.elemwise.add_bias(w.q_bias, q), ops.elemwise.add_bias(w.k_bias, k), ops.elemwise.add_bias(w.v_bias, v)
-    if qk_norm == "head":
-        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
-        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
-    elif qk_norm == "width":
-        q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
-        k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
-    rotation = rotary.full() if rotary_dim == None else rotary.partial(rotary_dim)
-    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotation, k = k, scaling = scaling)
-    ops.attn.kv_append(k, v, w.kv)
+
+    def project(x, correct):
+        q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
+        if biased:
+            q, k, v = ops.elemwise.add_bias(w.q_bias, q), ops.elemwise.add_bias(w.k_bias, k), ops.elemwise.add_bias(w.v_bias, v)
+        if correct != None:
+            q, k, v = correct("q", x, q), correct("k", x, k), correct("v", x, v)
+        if qk_norm == "head":
+            q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
+            k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
+        elif qk_norm == "width":
+            q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
+            k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)
+        rotation = rotary.full() if rotary_dim == None else rotary.partial(rotary_dim)
+        q, k = ops.elemwise.rope(q, positions, d, m.theta, rotation, k = k, scaling = scaling)
+        ops.attn.kv_append(k, v, w.kv)
+        return q
+
+    q = branched(x, project, adapt)
 
     # Each lane by its kind; a lane may bring its own mask. A lane capturing
     # scores reads them out too.
     o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    return ops.linear.matmul(o, w.o)
+    out = ops.linear.matmul(o, w.o)
+    return out if adapt == None else adapt.correct("o", o, out)
 
-def swiglu(x, w):
-    """The SwiGLU MLP through `w.gate`, `w.up` and `w.down`."""
-    gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
-    return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
+def swiglu(x, w, adapt = None):
+    """The SwiGLU MLP through `w.gate`, `w.up` and `w.down`. `adapt`
+    corrects gate, up and down on the rows that carry an adapter."""
+
+    def mlp(x, correct):
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        if correct != None:
+            gate, up = correct("gate", x, gate), correct("up", x, up)
+        h = ops.linear.glu(gate, gating.swiglu(), up = up)
+        y = ops.linear.matmul(h, w.down)
+        if correct != None:
+            y = correct("down", h, y)
+        return y
+
+    return branched(x, mlp, adapt)
+
+def branched(x, arm, adapt):
+    """`arm(x, correct)`: once with no correction, or split by `adapt` into
+    the rows that carry an adapter and the rest."""
+    return arm(x, None) if adapt == None else adapt.split(x, arm)

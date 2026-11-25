@@ -327,11 +327,8 @@ def test_coverage():
 def test_sinks():
     tok = ch_from([1], dtype.i32)
     indptr_ch = ch_from([0, 1], dtype.u32)
-    a = ch_new([2, 4, 8], dtype.f32)
-    bch = ch_new([2, 8, 4], dtype.f32)
+    bundle = ch_from([0, 0, 0, 0], dtype.u32)
     out = ch_new([1], dtype.i32)
-    host_put(a, [0.0] * 64)
-    host_put(bch, [0.0] * 64)
 
     b = Builder(VOCAB, PAGE)
 
@@ -340,7 +337,7 @@ def test_sinks():
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
 
     def prologue():
-        intrinsics.kernel.lora(a.read(), bch.read(), Tensor.constant(1 | 4, Dtype.U32))
+        intrinsics.kernel.adapter(bundle.read())
         intrinsics.kernel.attn_page_mask(iota(4))
 
     def epilogue():

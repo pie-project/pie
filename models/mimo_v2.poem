@@ -1,7 +1,7 @@
 # MiMo-V2.6: Flash (311B) and Pro (1.02T), each with an eight-expert
 # miniature; and Flash's first six layers with every expert kept.
 
-load("//lib/adapters.poem", "banks", "corrected")
+load("//lib/taps.poem", "block_widths", "stanza_banks", "taps")
 
 MIMO = template("mimo")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]])
@@ -122,7 +122,6 @@ def layout(id, deploy):
         kv_w = kv_heads * PADDED
         q_qk = d.q_heads * d.qk_head_dim
         kv_kv = kv_heads * (d.qk_head_dim + d.v_head_dim)
-        lora_a, lora_b = banks(hidden)
         if l in d.dense:
             di = d.dense_inter
             mlp = struct(
@@ -162,8 +161,7 @@ def layout(id, deploy):
             mlp_norm = norm("mlp_norm"),
             mlp_norm_eps = d.norm_eps,
             mlp = mlp,
-            lora_a = lora_a,
-            lora_b = lora_b,
+            **stanza_banks(l, d.layers, block_widths(hidden))
         )
 
     return struct(
@@ -389,7 +387,7 @@ def forward(m, inputs):
         # cut off before the output projection reads them.
         a, _ = ops.gather.split_q_gate(a, m.v_head_dim)
         o = ops.linear.matmul(a, at.o_proj)
-        o = corrected(x, o, w, routes)
+        o = taps(w, l, len(m.layers), block_widths(m.hidden), routes).correct("attn", x, o)
         y = ops.elemwise.residual_add(o, y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)

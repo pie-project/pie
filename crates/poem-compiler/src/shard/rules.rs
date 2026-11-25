@@ -38,6 +38,10 @@ pub(super) enum Rule {
     /// Group indices for a grouped matmul, which reads no value: they are
     /// a rank's share of the groups when the row it groups is split.
     Groups,
+    /// A low-rank correction `y + B A x`: its banks cut beside the row it
+    /// corrects, `B` along its output when `y` is split, `A` along its input
+    /// when `x` is, so an adapted row shards as its projection does.
+    Correct,
 }
 
 /// An op whose `follow` inputs are split by head or channel, every output
@@ -287,6 +291,9 @@ pub(super) fn rule(op: &Operation) -> Rule {
     if let Operation::Attn(Attn::ScoreCapture { .. }) = op {
         return Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
     }
+    if let Operation::Linear(Linear::LoraCorrect { .. }) = op {
+        return Rule::Correct;
+    }
     let name = op.name();
     match name {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
@@ -333,6 +340,9 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             };
             match cut {
                 Some((0, _)) => vec![Dist::Partial; outs.len()],
+                // A table cut along its columns: each rank a share of every
+                // row it looks up.
+                Some((1, blocks)) => vec![Dist::Split(blocks); outs.len()],
                 Some((axis, _)) => {
                     return Err(format!(
                         "`{}` reads a table split along axis {axis}",
@@ -401,6 +411,24 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                 .collect::<Result<_, _>>()?;
             if held.iter().all(|d| *d == held[0]) {
                 vec![held[0].clone(); outs.len()]
+            } else if let Some(rows) = spread_rows(pass, &followed, &held) {
+                // A bank's row added to partial sums: each rank adds its
+                // share, the row over the count of ranks, so the sum holds
+                // it once.
+                let k = 1.0 / pass.world as f32;
+                for v in rows {
+                    let ty = pass.trace.values[v.0 as usize].ty.clone();
+                    let share = pass.value(ty, Dist::Partial);
+                    pass.pending.push(Operation::Elemwise(Elemwise::Act {
+                        s: None,
+                        x: v,
+                        act: ActFn::Identity,
+                        scale: Some(k),
+                        x_out: share,
+                    }));
+                    at.replace(v, share);
+                }
+                vec![Dist::Partial; outs.len()]
             } else {
                 for v in followed {
                     at.make_whole(pass, v)?;
@@ -450,6 +478,48 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                 }
             }
         }
+        Rule::Correct => {
+            at.whole_except(pass, &["x", "y"])?;
+            let x = at.one("x").expect("a correction reads a row");
+            let y = at.one("y").expect("a correction corrects a row");
+            let a = at.one("bank_a").expect("a correction reads its down bank");
+            let b = at.one("bank_b").expect("a correction reads its up bank");
+            match (pass.weight_cut(a)?, pass.weight_cut(b)?) {
+                (None, None) => {
+                    at.make_whole(pass, x)?;
+                    at.make_whole(pass, y)?;
+                    vec![Dist::Whole; outs.len()]
+                }
+                (None, Some((1, blocks))) => {
+                    at.make_whole(pass, x)?;
+                    match pass.dist(y)? {
+                        Dist::Split(held) if held == blocks => vec![Dist::Split(held); outs.len()],
+                        held => {
+                            return Err(format!(
+                                "`{}` corrects a row held {held:?} by a bank cut in {blocks:?}",
+                                at.name
+                            ));
+                        }
+                    }
+                }
+                (Some((2, _)), None) => match (pass.dist(x)?, pass.dist(y)?) {
+                    (Dist::Split(_), Dist::Partial) => vec![Dist::Partial; outs.len()],
+                    (over, held) => {
+                        return Err(format!(
+                            "`{}` corrects a row held {held:?} over one held {over:?} by a \
+                             bank cut along its input",
+                            at.name
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(format!(
+                        "`{}` reads its banks cut along other axes",
+                        at.name
+                    ));
+                }
+            }
+        }
         Rule::Heads(heads) => {
             let follow = heads.follow;
             at.whole_except(pass, follow)?;
@@ -484,6 +554,15 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
         }
     };
     Ok((tree::op(at.tree), dists))
+}
+
+/// The whole rows of registered banks among `followed`, each read once, when
+/// the rest are partial sums: what a sum spreads across the ranks.
+fn spread_rows(pass: &Pass, followed: &[ValueId], held: &[Dist]) -> Option<Vec<ValueId>> {
+    let (rows, rest): (Vec<usize>, Vec<usize>) =
+        (0..followed.len()).partition(|i| held[*i] == Dist::Whole && pass.bank_row(followed[*i]));
+    (!rows.is_empty() && !rest.is_empty() && rest.iter().all(|i| held[*i] == Dist::Partial))
+        .then(|| rows.into_iter().map(|i| followed[i]).collect())
 }
 
 /// A row norm over `x`, a row the ranks split in `blocks`, as one rank
@@ -579,13 +658,18 @@ impl At {
     fn make_whole(&mut self, pass: &mut Pass, v: ValueId) -> Result<(), String> {
         let whole = pass.whole(v)?;
         if whole != v {
-            let swap = |id: ValueId| if id == v { whole } else { id };
-            self.tree = tree::renumbered(std::mem::replace(&mut self.tree, Tree::Unit), &swap);
-            for id in &mut self.ins {
-                *id = swap(*id);
-            }
+            self.replace(v, whole);
         }
         Ok(())
+    }
+
+    /// The op reading `with` where it read `v`.
+    fn replace(&mut self, v: ValueId, with: ValueId) {
+        let swap = |id: ValueId| if id == v { with } else { id };
+        self.tree = tree::renumbered(std::mem::replace(&mut self.tree, Tree::Unit), &swap);
+        for id in &mut self.ins {
+            *id = swap(*id);
+        }
     }
 
     /// An op on whole values reads no weight the ranks split, and a cache it
