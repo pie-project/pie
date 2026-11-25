@@ -729,7 +729,6 @@ pub struct StorePools {
     pub shared: bool,
     pub page_size: u32,
     pub kv: ShapeRun,
-    pub window_tokens: u32,
     pub state: ShapeRun,
     pub buffer: ShapeRun,
 }
@@ -753,8 +752,8 @@ impl StorePools {
         Ok(Self::shared(facts))
     }
 
-    /// A shared pool's geometry: the kv list's tokens a slot, the widest
-    /// window, and the rs list's slot bytes as the buffer's.
+    /// A shared pool's geometry: the kv list's tokens a slot and the rs
+    /// list's slot bytes as the buffer's.
     fn shared(facts: &ChunkFacts) -> Self {
         let mut pools = Self {
             shared: true,
@@ -784,25 +783,11 @@ impl StorePools {
                         pools.buffer = run;
                     }
                 }
-                SlotKind::List {
-                    tokens,
-                    window: None,
-                    ..
-                } => {
+                // A list of its own window is refused by the shared pool
+                // ([`SharedPool::new`]).
+                SlotKind::List { tokens, .. } => {
                     pools.page_size = tokens;
                     pools.kv = run;
-                }
-                // Window lists: an engine that does not state
-                // `Capabilities::windowed_state`.
-                SlotKind::List {
-                    tokens,
-                    window: Some(window),
-                    ..
-                } => {
-                    if pools.page_size == 0 {
-                        pools.page_size = tokens;
-                    }
-                    pools.window_tokens = pools.window_tokens.max(window);
                 }
                 // An instance's tables and a ring are taken on demand, no
                 // part of a record (`super::roles`).

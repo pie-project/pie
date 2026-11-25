@@ -206,16 +206,7 @@ impl ResidencyPlanner {
     /// its place, which needs that much room while both stand.
     pub(super) fn restore_reserve(&self) -> RsUnits {
         let (_, total) = self.port.rs_host_stats();
-        let mut windows = total.windows;
-        for list in &mut windows {
-            *list = (*list).min(1);
-        }
-        RsUnits {
-            slots: total.slots.min(1),
-            pages: total.pages.min(1),
-            windows,
-            wbuf: 0,
-        }
+        RsUnits::of(total.slots.min(1), total.pages.min(1))
     }
 
     /// Waiter `key` lacks `device` bytes on the device and `host` on the

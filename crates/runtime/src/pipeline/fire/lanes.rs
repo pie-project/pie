@@ -279,61 +279,6 @@ pub(super) fn stamp_lane_translation(
     Ok(())
 }
 
-/// The window plan of a device-geometry fire: every row lands its rows in
-/// the kv pages the fire's write indexes name (each window list's slots
-/// over them) and reads its tables through the working set's mapped pages.
-/// The device decides where its tokens land, so the windows keep every slot
-/// it writes and commit nothing; what each list retires is behind the first
-/// page it writes, where every row lands past, so a decode loop that never
-/// states its positions still holds its windows and not its whole sequence.
-///
-/// Window-list path: what an engine that does not state
-/// `Capabilities::windowed_state` is served by.
-pub(super) fn device_window_plan(
-    stores: &crate::store::registry::Stores,
-    ws: crate::store::kv::page_table::WorkingSetId,
-    write_indexes: &[u64],
-    ids: &[crate::store::rs::RsWorkingSetId],
-) -> Result<rs::RsPlan, String> {
-    if ids.is_empty() {
-        return Ok(rs::RsPlan::Groups(Vec::new()));
-    }
-    let mapped =
-        crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.mapped_len(ws))
-            .map_err(|error| error.to_string())?;
-    let page = stores.kv_page_size.max(1);
-    let index = |at: u64| u32::try_from(at).unwrap_or(u32::MAX);
-    let first = write_indexes.iter().copied().min().map(index);
-    let last = write_indexes.iter().copied().max().map(index);
-    let reach = first.map_or(0, |first| first.saturating_mul(page));
-    let writes = match (first, last) {
-        (Some(first), Some(last)) => {
-            first.saturating_mul(page)..last.saturating_add(1).saturating_mul(page)
-        }
-        _ => 0..0,
-    };
-    let extent = u32::try_from(mapped)
-        .unwrap_or(u32::MAX)
-        .max(last.map_or(0, |last| last.saturating_add(1)));
-    Ok(rs::RsPlan::Window(
-        (0..ids.len())
-            .map(|_| rs::WindowRow {
-                writes: writes.clone(),
-                reads: extent.saturating_mul(page),
-                advance: crate::store::rs::WindowAdvance {
-                    positioned: false,
-                    settled: 0,
-                    reach,
-                    fold: None,
-                    commit_end: 0,
-                    head: None,
-                    keep: None,
-                },
-            })
-            .collect(),
-    ))
-}
-
 pub(super) fn poison_readers(cells: &BoundCells, reason: &str) {
     for cell in cells {
         let mut c = cell.lock().unwrap();

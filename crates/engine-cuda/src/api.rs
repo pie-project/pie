@@ -868,7 +868,6 @@ impl Engine for Cuda {
                     .map(|&(_, adapters, _)| adapters)
                     .min()
                     .unwrap_or(0),
-                window_tokens: paging.window.map_or(0, |window| window.tokens),
             },
             chunks: chunk_facts,
             limits: FireLimits {

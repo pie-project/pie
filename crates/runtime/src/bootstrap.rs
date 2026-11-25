@@ -187,9 +187,6 @@ pub struct EngineConfig {
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
-    /// The model's window (`PoolFacts::window_tokens`): the window-list
-    /// path's.
-    pub window_tokens: u32,
     /// The engine serves windowed layers as ring + buffer
     /// (`Capabilities::windowed_state`, CONTRACT-BC 19, 21).
     pub windowed_state: bool,
@@ -528,7 +525,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): stated only by
     // an engine that serves them so, and the same way by every engine of
     // the model; such a load is a recurrent-state load whose record holds
-    // the rings, no window list.
+    // the rings.
     for (at, d) in engine_configs.iter().enumerate() {
         anyhow::ensure!(
             d.chunks.windowed.is_empty() || d.windowed_state,
@@ -544,8 +541,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .position(|d| d.chunks.window_buffer().is_some() != window_state)
     {
         anyhow::bail!(
-            "engine {at} serves the model's windowed layers otherwise than engine 0 (ring + \
-             buffer on one, window lists on the other); the engines of one model hold one state"
+            "engine {at} serves the model's windowed layers otherwise than engine 0 (a window \
+             buffer on one, none on the other); the engines of one model hold one state"
         );
     }
     let rs_caps = {
@@ -553,11 +550,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let mut caps = model::RsCaps {
             state_size: d0.map_or(0, |d| d.chunks.record_bytes),
             buffer_page_size: 0,
-            window_tokens: if window_state {
-                0
-            } else {
-                d0.map_or(0, |d| d.window_tokens)
-            },
             window_state,
         };
         if caps.has_state() {
@@ -680,13 +672,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .iter()
         .zip(&readouts)
         .map(|(d, readouts)| {
-            let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
+            let pools = crate::store::chunks::StorePools::of(&d.chunks)
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
-            // A window the engine holds no pages for is still a window (the
-            // window-list path; a ring + buffer load holds no window list).
-            if pools.window_tokens == 0 && !rs_caps.window_state {
-                pools.window_tokens = d.window_tokens;
-            }
             // An engine that states a shared pool: the stores draw from one
             // pool built of its facts, a copy-on-write record kept back for
             // each lane a fire runs.
@@ -1728,7 +1715,6 @@ mod tests {
             RsCaps {
                 state_size: facts.record_bytes,
                 buffer_page_size: 0,
-                window_tokens: 0,
                 window_state: false,
             },
         )

@@ -21,10 +21,6 @@ impl Shell {
                 .map(|&(_, adapters, _)| adapters)
                 .min()
                 .unwrap_or(0),
-            // No window list: Metal serves windowed layers as ring + buffer
-            // only (`Capabilities::windowed_state`, each layer's window in
-            // `ChunkFacts::windowed`), so it states no window-list window.
-            window_tokens: 0,
         }
     }
 

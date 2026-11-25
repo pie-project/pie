@@ -117,7 +117,6 @@ pub fn register_model_with_swap(
                             num_host_pages.get(d).copied().unwrap_or(0) as u32,
                         )
                     },
-                    window_tokens: 0,
                     state: run(pool.slots, 0),
                     buffer: run(pool.pages, 0),
                 },
@@ -165,7 +164,7 @@ pub fn register_model_with_chunks(kv_page_size: u32, engines: &[EngineStores]) -
                 kv.set_domain(identity.domain());
             }
             // KV alone resumes a model only when it has no recurrent state.
-            kv.set_keeps(pools.state.device == 0 && pools.window_tokens == 0);
+            kv.set_keeps(pools.state.device == 0);
             kv.set_page_size(kv_page_size);
             let kv = Arc::new(parking_lot::Mutex::new(kv));
             let slots = pools.state.device;
@@ -237,8 +236,8 @@ pub(crate) fn reset() {
 }
 
 /// The stores of an engine whose pool is `shared`: kv pages are the list
-/// shape's slot refs, the rs store's state slots its records (or its
-/// window lists' pages each list's refs), as many seats as records. Below
+/// shape's slot refs, the rs store's state slots its records, as many
+/// seats as records. Below
 /// it `tiers`: the host tier's slots of the same shapes, and kv list slots
 /// on disk, every move between them the engine's `copy_slots`
 /// (CONTRACT-BC 22).
@@ -279,7 +278,7 @@ pub fn shared_stores(
     }
     {
         let mut kv = kv.lock();
-        kv.set_keeps(records == 0 && !rs.is_window());
+        kv.set_keeps(records == 0);
         kv.set_page_size(kv_page_size);
     }
     Stores {

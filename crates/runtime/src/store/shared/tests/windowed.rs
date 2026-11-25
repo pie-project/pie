@@ -185,7 +185,7 @@ fn window_buffer_slots_are_taken_on_demand_and_freed_by_the_fold() {
         assert_eq!(pool.list().map(|shape| shape.id), Some(LIST), "one kv list");
     }
     let mut rs = stores.rs.lock().unwrap();
-    assert!(rs.is_shared() && !rs.is_window(), "a recurrent store, no window list");
+    assert!(rs.is_shared(), "a recurrent store");
 
     let ws = rs.create_working_set(geom());
     let out = prepare(&mut rs, ws, 6).unwrap();
@@ -404,7 +404,6 @@ fn a_windowed_snapshot_is_its_record_and_unfolded_buffer_slots() {
     assert_eq!(export.folded, ring);
     assert_eq!(export.buffer.iter().flatten().count(), 2);
     assert_eq!((export.base, export.frozen), (4, 6));
-    assert!(export.windows.is_empty() && export.window.is_none(), "no window table");
 
     assert!(rs.checkpoint(ws, [7; 32], None).unwrap());
     rs.release_working_set(ws);
@@ -572,7 +571,6 @@ fn the_window_buffer_is_the_buffer_or_a_pool_beside_the_rs_list() {
     assert!(pools.shared);
     assert_eq!(pools.page_size, 16, "the kv list's tokens, not the buffer's");
     assert_eq!(pools.buffer.slot_bytes, MIB / 4, "the window buffer's slots");
-    assert_eq!(pools.window_tokens, 0, "no window list");
 
     let facts = hybrid_facts();
     let pools = crate::store::chunks::StorePools::of(&facts).unwrap();
