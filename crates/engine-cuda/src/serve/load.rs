@@ -1776,6 +1776,10 @@ impl Shell {
         // program's: loaded here, before ready, so no first fire builds them.
         kernels_cuda::runtime::channel::load_wave_kernels()?;
         kernels_cuda::runtime::channel::load_gather_kernels()?;
+        // A load of guest inputs (or voxels) casts their cells ahead of a body.
+        if !self.inputs().is_empty() || self.voxels.is_some() {
+            kernels_cuda::linear::cast::load_input_casts()?;
+        }
         // A load of windowed layers moves ring rows around its fires' bodies.
         if !self.windowed_layers().is_empty() {
             kernels_cuda::runtime::channel::load_ring_kernels()?;
