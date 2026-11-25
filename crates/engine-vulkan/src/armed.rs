@@ -6,11 +6,11 @@
 /// with [`ENCODER_LAYOUT`] set again, by a change that moves it. It keys what
 /// a load armed beside the kernels' code, so a change elsewhere in the
 /// engine keeps every record.
-pub const ENCODING: u32 = 5;
+pub const ENCODING: u32 = 6;
 
 /// The hash of the encoder's layout files as [`ENCODING`] was set for them
 /// (`build.rs`, `PIE_ENCODER_LAYOUT`): a test holds the two together.
-pub const ENCODER_LAYOUT: u64 = 0x001b_fa33_d6b2_e5fd;
+pub const ENCODER_LAYOUT: u64 = 0xda5e_3f13_a514_0b64;
 
 /// What keys what a load armed: [`ENCODING`] and the code of every kernel
 /// the load built (each module's SPIR-V, by its key, in key order).
