@@ -246,15 +246,15 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let (model, stores) = super::unfolded_tests::pool_with_rungs_of(vec![(1, 2), (512, 8)]);
     let shared = stores.shared.clone().expect("a shared pool");
+    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
+        .with_live_lanes(|| 1);
     let planner = crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
-        crate::planner::RegistryPool::new(model, 0, false),
+        crate::planner::RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
     ));
     crate::planner::init_planner(model, ENGINE, planner);
     let planner = crate::planner::planner_for(model, ENGINE).expect("installed");
     // Its passes run on the drain task, once this one yields.
     planner.arm_drain_task();
-    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
-        .with_live_lanes(|| 1);
     let cap = || crate::store::shared::fire_cap(ENGINE);
     // Idle cache, every page there is, a reader on it.
     let list = shared.lock().unwrap().list().expect("a kv list").pool;
@@ -282,6 +282,14 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
         }
     };
     let mut pin = filed();
+    // Asked for, not granted, and not queued yet: nothing is told short.
+    let demand = crate::planner::Demand {
+        kv_pages: 2,
+        rs: crate::store::rs::RsUnits::default(),
+    };
+    assert!(planner.grant_now(pid, demand).is_none(), "idle cache is pinned");
+    grow.walk_rung().await;
+    assert_eq!(cap(), u32::MAX, "no waiter is queued");
     {
         let ask = planner.wait_bind_room(pid, 1, 2, 0);
         tokio::pin!(ask);

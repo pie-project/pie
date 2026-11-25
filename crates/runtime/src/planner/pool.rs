@@ -2158,23 +2158,15 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        let pages = self.with_kv_tagged("planner-reserve", |kv| {
+        self.with_kv_tagged("planner-reserve", |kv| {
             let pages = kv.reserve_device_pages(count as usize);
-            if self.shared.is_some() {
-                if pages.is_none() {
-                    kv.note_short(count);
-                } else {
-                    kv.clear_short();
-                }
+            // Short is marked once the asker is queued ([`Self::grow`]): the
+            // rung comes down for a mark no one is queued for.
+            if self.shared.is_some() && pages.is_some() {
+                kv.clear_short();
             }
             pages
-        });
-        if pages.is_none()
-            && let Some(shared) = &self.shared
-        {
-            shared.wake();
-        }
-        pages
+        })
     }
 
     fn freed(&self) {
