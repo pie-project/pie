@@ -3623,3 +3623,68 @@ fn a_run_no_arrangement_opens_is_refused_by_name() {
     );
     assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
 }
+
+/// A pool with no tier below the device, few segments mapped and the
+/// governor's target above them: a first ask past the pages open now is
+/// admitted, and the walk's commits serve it. One past what the target
+/// lets open is refused at admission.
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_ask_takes_room_the_walk_can_open() {
+    use super::pool::PoolPort;
+    use crate::governor::PoolTarget;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let shape = PoolShape {
+        total: 36,
+        segment: 4,
+        host_chunks: 0,
+        disk_chunks: 0,
+        programs: Vec::new(),
+        governed: true,
+        span_on_demand: false,
+        act: vec![(256, 2)],
+    };
+    let (model, stores) = shape.register();
+    let shared = stores.shared.clone().expect("a shared pool");
+    let mut grow = crate::store::shared::SharedGrow::new(model, 0, shared).with_lane(|_| Ok(()));
+    let _ = grow.retarget(3);
+    grow.walk().await;
+    let port = Arc::new(RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()));
+    let planner = Arc::new(ResidencyPlanner::new(port.clone() as Arc<dyn PoolPort>));
+    super::global::set_test_planner(model, 0, Some(planner.clone()));
+    let (open, _) = port.device_stats();
+    assert_eq!(port.commit_room(), 0, "nothing opens at the target");
+    let ask = |pages: u32| {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let p = planner.clone();
+        crate::rt::spawn(async move {
+            let demand = Demand {
+                kv_pages: pages,
+                rs: Default::default(),
+            };
+            p.acquire(pid, pid, demand).await
+        })
+    };
+    let refused = ask(open + 1).await.unwrap();
+    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+
+    let _ = grow.retarget(6);
+    let more = port.commit_room();
+    assert_eq!(more, 3 * shape.segment * PAGES_PER_CHUNK, "three segments of chunks");
+    let refused = ask(open + more + 1).await.unwrap();
+    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+    let served = ask(open + more);
+    for _ in 0..100 {
+        crate::rt::yield_now().await;
+        grow.walk().await;
+        planner.pages_freed();
+        if served.is_finished() {
+            break;
+        }
+    }
+    assert!(served.is_finished(), "the walk opens its room");
+    assert!(matches!(served.await.unwrap(), Ok(Acquired::Granted(_))));
+    assert_eq!(port.commit_room(), 0, "the target reached");
+    super::global::set_test_planner(model, 0, None);
+}

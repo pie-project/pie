@@ -2275,6 +2275,64 @@ async fn under_noop_device_pressure_moves_idle_cache_down_and_the_waiter_is_serv
     });
 }
 
+/// A device with no tier below it, all idle cache of finished prompts:
+/// each next prompt's first ask drops what it is short of and is granted.
+/// With live sets holding the pages, a first ask is refused at admission.
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_ask_takes_idle_cache_with_no_tier_below() {
+    use crate::planner::{Acquired, Demand, PlannerError, RegistryPool, ResidencyPlanner};
+    use crate::store::registry;
+    use std::sync::Arc;
+
+    let _lock = crate::policy::schedule::TEST_LOCK.write().await;
+    crate::policy::retention::install(None);
+    crate::policy::schedule::install(None);
+    let model = registry::register_model(16, &[8], &[2]);
+    let stores = registry::get(model, 0);
+    let planner = Arc::new(ResidencyPlanner::new(Arc::new(RegistryPool::new(model, 0, false))));
+    let ask = |planner: &Arc<ResidencyPlanner>| {
+        let pid = ProcessId::new_v4();
+        planner.register(pid);
+        planner.note_admitted(pid);
+        let p = planner.clone();
+        let task = crate::rt::spawn(async move {
+            let demand = Demand {
+                kv_pages: 4,
+                rs: Default::default(),
+            };
+            p.acquire(pid, pid, demand).await
+        });
+        (pid, task)
+    };
+    for prompt in 0..6u32 {
+        let (pid, task) = ask(&planner);
+        for _ in 0..400 {
+            crate::rt::yield_now().await;
+            if task.is_finished() {
+                break;
+            }
+        }
+        assert!(task.is_finished(), "prompt {prompt} waits on nothing");
+        let granted = task.await.unwrap().expect("idle cache is room");
+        assert!(matches!(granted, Acquired::Granted(_)), "its pages granted");
+        drop(granted);
+        registry::with_kv_lock(&stores.kv, "test", |kv| {
+            kept_and_gone(kv, 0xb0 + prompt, 4, ProcessId::from_u128(u128::from(prompt)));
+        });
+        planner.unregister(pid);
+    }
+    registry::with_kv_lock(&stores.kv, "test", |kv| {
+        kv.reclaim_cache(kv.current_epoch(), 8, floor);
+        kv.retire_idle();
+        let ws = kv.create_shared_working_set();
+        sealed(kv, ws, &prompt(0xc0, 6));
+        assert_eq!(kv.available_pages(), 2, "a live set holds the rest");
+    });
+    let (_, task) = ask(&planner);
+    let refused = task.await.unwrap();
+    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+}
+
 #[test]
 /// A unified device (no host tier) with a default home: the disk tier the
 /// engine derives when budget_disk is unstated ([`engine::disk::derived_budget`]:
