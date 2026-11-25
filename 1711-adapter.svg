@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600">
+<defs>
+<marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/></marker>
+<marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2b5797"/></marker>
+<pattern id="hatch" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="7" height="7" fill="#f4f4f4"/><line x1="0" y1="0" x2="0" y2="7" stroke="#a0a0a0" stroke-width="1.5"/></pattern>
+</defs>
+<rect width="1600" height="600" fill="#fff"/>
+<circle cx="54" cy="44" r="14" fill="#1a1a1a"/>
+<text x="54" y="50" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">1</text>
+<text x="78" y="51" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="21" font-weight="bold" font-style="normal" fill="#1a1a1a" text-anchor="start">A trained adapter is one file</text>
+<path d="M90,90 L370,90 L400,120 L400,400 L90,400 Z" fill="#fff" stroke="#1a1a1a" stroke-width="1.3"/>
+<path d="M370,90 L370,120 L400,120" fill="none" stroke="#1a1a1a" stroke-width="1.3"/>
+<text x="112" y="126" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="italic" fill="#6b6b6b" text-anchor="start">adapter file</text>
+<rect x="112" y="148" width="266" height="36" rx="5" fill="#2b5797" stroke="#2b5797" stroke-width="1.2"/>
+<text x="128" y="172" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#fff" text-anchor="start">layer 0 · q</text>
+<rect x="112" y="198" width="266" height="36" rx="5" fill="#2b5797" stroke="#2b5797" stroke-width="1.2"/>
+<text x="128" y="222" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#fff" text-anchor="start">layer 0 · v</text>
+<rect x="112" y="248" width="266" height="36" rx="5" fill="#2b5797" stroke="#2b5797" stroke-width="1.2"/>
+<text x="128" y="272" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#fff" text-anchor="start">layer 1 · q</text>
+<rect x="112" y="298" width="266" height="36" rx="5" fill="#2b5797" stroke="#2b5797" stroke-width="1.2"/>
+<text x="128" y="322" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#fff" text-anchor="start">layer 1 · v</text>
+<text x="245" y="378" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="22" font-weight="normal" font-style="normal" fill="#6b6b6b" text-anchor="middle">…</text>
+<text x="40" y="446" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">Each piece is named after the place</text>
+<text x="40" y="470" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">in the model it plugs into.</text>
+<path d="M418,245 L548,245" fill="none" stroke="#1a1a1a" stroke-width="1.4" marker-end="url(#a)"/>
+<circle cx="574" cy="44" r="14" fill="#1a1a1a"/>
+<text x="574" y="50" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">2</text>
+<text x="598" y="51" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="21" font-weight="bold" font-style="normal" fill="#1a1a1a" text-anchor="start">pie plugs each piece in by name</text>
+<text x="600" y="112" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="15" font-weight="normal" font-style="italic" fill="#6b6b6b" text-anchor="middle">pieces</text>
+<text x="900" y="112" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="15" font-weight="normal" font-style="italic" fill="#6b6b6b" text-anchor="middle">places in the model (layer 0)</text>
+<rect x="570" y="150" width="60" height="40" rx="5" fill="#2b5797" stroke="#2b5797" stroke-width="1.2"/>
+<text x="600" y="177" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="18" font-weight="normal" font-style="normal" fill="#fff" text-anchor="middle">q</text>
+<rect x="570" y="260" width="60" height="40" rx="5" fill="#2b5797" stroke="#2b5797" stroke-width="1.2"/>
+<text x="600" y="287" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="18" font-weight="normal" font-style="normal" fill="#fff" text-anchor="middle">v</text>
+<rect x="800" y="132" width="200" height="40" rx="4" fill="#fff" stroke="#1a1a1a" stroke-width="1.2"/>
+<text x="900" y="159" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="18" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="middle">q</text>
+<rect x="800" y="187" width="200" height="40" rx="4" fill="#fff" stroke="#1a1a1a" stroke-width="1.2"/>
+<text x="900" y="214" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="18" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="middle">k</text>
+<rect x="800" y="242" width="200" height="40" rx="4" fill="#fff" stroke="#1a1a1a" stroke-width="1.2"/>
+<text x="900" y="269" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="18" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="middle">v</text>
+<rect x="800" y="297" width="200" height="40" rx="4" fill="#fff" stroke="#1a1a1a" stroke-width="1.2"/>
+<text x="900" y="324" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="18" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="middle">o</text>
+<path d="M632,170 L796,152" fill="none" stroke="#2b5797" stroke-width="1.4" marker-end="url(#b)"/>
+<path d="M632,280 L796,262" fill="none" stroke="#2b5797" stroke-width="1.4" marker-end="url(#b)"/>
+<rect x="570" y="380" width="430" height="62" rx="4" fill="#fdf7f7" stroke="#9b2c2c" stroke-width="1.2" stroke-dasharray="5 3"/>
+<text x="588" y="406" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="normal" fill="#9b2c2c" text-anchor="start">A piece with a name the model does not have:</text>
+<text x="588" y="430" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="normal" fill="#9b2c2c" text-anchor="start">pie refuses the whole file and says which piece.</text>
+<path d="M1018,245 L1118,245" fill="none" stroke="#1a1a1a" stroke-width="1.4" marker-end="url(#a)"/>
+<circle cx="1144" cy="44" r="14" fill="#1a1a1a"/>
+<text x="1144" y="50" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="bold" font-style="normal" fill="#fff" text-anchor="middle">3</text>
+<text x="1168" y="51" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="21" font-weight="bold" font-style="normal" fill="#1a1a1a" text-anchor="start">Metal loads it into a slot, once</text>
+<text x="1150" y="112" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="15" font-weight="normal" font-style="italic" fill="#6b6b6b" text-anchor="start">adapter slots on the GPU</text>
+<text x="1150" y="161" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="normal" fill="#6b6b6b" text-anchor="start">slot 1</text>
+<rect x="1210" y="128" width="340" height="50" rx="4" fill="#c9d6ea" stroke="#9aa9c2" stroke-width="1.2"/>
+<text x="1226" y="160" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">another adapter, used by 3 requests</text>
+<text x="1150" y="233" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="normal" fill="#6b6b6b" text-anchor="start">slot 2</text>
+<rect x="1210" y="200" width="85" height="50" fill="#2b5797" stroke="#fff" stroke-width="2"/>
+<text x="1252" y="232" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#fff" text-anchor="middle">q</text>
+<rect x="1295" y="200" width="85" height="50" fill="url(#hatch)" stroke="#fff" stroke-width="2"/>
+<text x="1337" y="232" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#444" text-anchor="middle">k = 0</text>
+<rect x="1380" y="200" width="85" height="50" fill="#2b5797" stroke="#fff" stroke-width="2"/>
+<text x="1422" y="232" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#fff" text-anchor="middle">v</text>
+<rect x="1465" y="200" width="85" height="50" fill="url(#hatch)" stroke="#fff" stroke-width="2"/>
+<text x="1507" y="232" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#444" text-anchor="middle">o = 0</text>
+<rect x="1210" y="200" width="340" height="50" rx="0" fill="none" stroke="#1a1a1a" stroke-width="1.4"/>
+<text x="1150" y="305" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="normal" fill="#6b6b6b" text-anchor="start">slot 3</text>
+<rect x="1210" y="272" width="340" height="50" rx="4" fill="#fff" stroke="#1a1a1a" stroke-width="1.2" stroke-dasharray="5 3"/>
+<text x="1226" y="304" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="16" font-weight="normal" font-style="italic" fill="#6b6b6b" text-anchor="start">free</text>
+<text x="1550" y="195" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="15" font-weight="bold" font-style="normal" fill="#2b5797" text-anchor="end">this adapter</text>
+<text x="1130" y="380" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">• The same file is loaded once and shared</text>
+<text x="1146" y="404" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">by every request that uses it.</text>
+<text x="1130" y="436" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">• Places the file does not fill are set to zero,</text>
+<text x="1146" y="460" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" font-weight="normal" font-style="normal" fill="#1a1a1a" text-anchor="start">so nothing is left from an older adapter.</text>
+<line x1="40" y1="516" x2="1560" y2="516" stroke="#1a1a1a" stroke-width="0.8"/>
+<text x="40" y="550" font-family="'STIX Two Text', 'Times New Roman', serif" font-size="17" fill="#1a1a1a"><tspan font-weight="bold">Figure 1.</tspan> How pie serves a trained adapter on Metal (#1711). The checking and matching in step 2 is shared by every engine; this PR adds the Metal slots in step 3.</text>
+</svg>
