@@ -653,6 +653,88 @@ fn a_raise_by_demand_says_what_it_lacks_and_moves_the_rest() {
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
 }
 
+/// Twelve rungs, every power of two from 1, the small ones sharing their
+/// activation's chunk count (1 to 16 one class of one chunk).
+fn classed() -> SharedPool {
+    let facts = ChunkFacts {
+        act_chunks: vec![
+            (1, 1),
+            (2, 1),
+            (4, 1),
+            (8, 1),
+            (16, 1),
+            (32, 2),
+            (64, 2),
+            (128, 2),
+            (256, 4),
+            (512, 4),
+            (1024, 8),
+            (2048, 12),
+        ],
+        ..facts()
+    };
+    facts.validate().unwrap();
+    SharedPool::new(&facts, 256).unwrap()
+}
+
+/// The stack wedge (500 processes at once): the rung rose to the largest
+/// while nothing waited, and took the committable room; guest binds then
+/// waited behind it, and the walk held the throughput rung (and asked to
+/// rise again) while they did. A throughput rung is ordered after every
+/// process demand: while one waits the walk comes down at once to what the
+/// live lanes need, its give-back tells the room signal, a throughput raise
+/// asked meanwhile takes nothing, and the rung rises again only once no
+/// demand waits.
+#[tokio::test(flavor = "current_thread")]
+async fn a_throughput_rung_gives_room_back_to_waiting_binds_and_rises_once_none_waits() {
+    const ENGINE: usize = 9306;
+    let mut pool = classed();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    assert_eq!(pool.rung(), 2048);
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 1);
+    // A cuttable pass asks the largest rung, fundable: nothing waits.
+    let want = want_rows(ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+
+    // A guest bind arrives short of room: the walk gives the span back at
+    // once, past the pass's ask and with no patience.
+    let room = shared.lock().unwrap().pool().room_watch();
+    shared.lock().unwrap().set_guest_head(Some((1, 4)));
+    grow.walk_rung().await;
+    assert_eq!(fire_cap(ENGINE), 1, "cut to the live lane's rung");
+    grant_rung(ENGINE, 1);
+    // Behind the retire fence, as every lower.
+    grow.walk_rung().await;
+    grow.walk_rung().await;
+    assert_eq!(
+        shared.lock().unwrap().pool().act_reserved(),
+        1,
+        "lowered: the span given back"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), room.given())
+        .await
+        .expect("the give-back tells the room signal");
+
+    // While the bind waits, a throughput raise takes nothing.
+    raise_now(&shared, ENGINE, 2048);
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().pool().act_reserved(), 1);
+    assert_eq!(fire_cap(ENGINE), 1);
+
+    // The bind lands: the rung rises again for the pass.
+    shared.lock().unwrap().set_guest_head(None);
+    grow.walk_rung().await;
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    drop(want);
+}
+
 /// While the engine holds back part of the range it stated, no slot it
 /// binds none of is handed out: every ref lies in a committed segment,
 /// past the null chunk and below the span held back; once it holds none,

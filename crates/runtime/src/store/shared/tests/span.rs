@@ -9,6 +9,7 @@
 //! activation 52..64.
 
 use super::*;
+use crate::governor::PoolTarget;
 use crate::store::shared::programs::{Mover, carry_raise};
 
 /// The engine's lane as a raise meets it: the fake engine, shared.
@@ -167,6 +168,122 @@ fn a_refused_raise_is_taken_back() {
     pool.raise_copied(1);
     assert_eq!(pool.rung(), 2048);
     assert_eq!(engine.table.as_slice(), pool.pool().chunk_table());
+}
+
+/// The 8B c256 hang (decodes cut at a low cap, waiting on a raise nobody
+/// funds) cannot come back: the walk never lowers the rung under the
+/// decode fire the live lanes take, however long the pool idles, so a
+/// decode batch of every live lane is never held for a raise; and a batch
+/// past it is raised at once where nothing moves.
+#[tokio::test(flavor = "current_thread")]
+async fn the_walk_never_lowers_under_the_live_lanes_decode() {
+    const ENGINE: usize = 53;
+    let mut pool = pool();
+    let mut engine = FakeEngine::new();
+    assert_eq!(
+        walk_segments(&mut pool, 8, 0, &mut engine),
+        Retarget::Reached
+    );
+    let shared: Shared = Arc::new(Mutex::new(pool));
+    let grow = SharedGrow::new(0, ENGINE, shared.clone()).with_live_lanes(|| 200);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+    // A waiter short of a slot: the walk lowers as far as it may.
+    shared.lock().unwrap().pool_mut().wait(1, 0, 1);
+    for _ in 0..6 {
+        grant_rung(ENGINE, fire_cap(ENGINE));
+        grow.walk_rung().await;
+        assert!(fire_cap(ENGINE) >= 200, "a 200-lane decode is never cut");
+    }
+    assert_eq!(
+        shared.lock().unwrap().rung(),
+        256,
+        "down to the live lanes' rung"
+    );
+    shared.lock().unwrap().pool_mut().unwait(1);
+    // The batch of every live lane asks: nothing to raise, nothing held.
+    raise_now(&shared, ENGINE, 200);
+    assert_eq!(fire_cap(ENGINE), 256);
+    // State takes the span the rung lent; a batch past the live lanes is
+    // raised at once once nothing lies in its span.
+    let all = {
+        let mut pool = shared.lock().unwrap();
+        let n = pool.records_available() as usize;
+        pool.take_records(n).unwrap()
+    };
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.give_records(&all);
+        pool.pool_mut().retire_through(u64::MAX);
+    }
+    raise_now(&shared, ENGINE, 300);
+    assert_eq!(shared.lock().unwrap().rung(), 2048);
+    assert_eq!(fire_cap(ENGINE), u32::MAX);
+}
+
+/// `can_grow` is whether the walk's next step maps a segment, by the one
+/// function both take ([`SharedPool::grow_step`]), over every pool state
+/// the stall could stand in: the prefix whole or not, a span lent or not,
+/// a span commit refused or not, the target above what is mapped or at it,
+/// and a waiter short of kv, of state, or none. Spelled out apart from the
+/// code: a live waiter grows into the prefix, then into the span the rung
+/// lends (span lending), under a target above what is mapped, never while
+/// a refused commit waits for an event that can change the device's answer.
+#[test]
+fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
+    const ENGINE: usize = 46;
+    let waiters = [None, Some(Short::Kv), Some(Short::State)];
+    let mut cases = 0;
+    for prefix_whole in [false, true] {
+        for lent in [false, true] {
+            for blocked in [false, true] {
+                for below in [false, true] {
+                    for waiter in waiters {
+                        let case = format!(
+                            "prefix_whole={prefix_whole} lent={lent} blocked={blocked} \
+                             below={below} waiter={waiter:?}"
+                        );
+                        let mut pool = grow_pool(prefix_whole, lent);
+                        assert_eq!(pool.pool().span_to_commit().is_some(), lent, "{case}");
+                        if let Some(short) = waiter {
+                            wait_short(&mut pool, short);
+                        }
+                        let mapped = pool.mapped_segments();
+                        let shared: Shared = Arc::new(Mutex::new(pool));
+                        let mut grow = SharedGrow::new(0, ENGINE, shared.clone());
+                        let target = if below { u32::MAX } else { mapped };
+                        let _ = grow.retarget(u64::from(target));
+                        // A commit refused at this target.
+                        if blocked {
+                            shared.lock().unwrap().block_commit(target);
+                        }
+                        let can = grow.can_grow();
+                        let goal = grow.goal_for_test();
+                        let step = shared.lock().unwrap().next_move(goal, 1);
+                        let maps = matches!(
+                            step,
+                            Some(SegmentMove::Commit { .. } | SegmentMove::CommitSpan { .. })
+                        );
+                        assert_eq!(can, grow.live_step_for_test().is_some(), "{case}");
+                        assert_eq!(can, maps, "{case}: can_grow is the walk's own step");
+                        if waiter.is_some() {
+                            assert_eq!(
+                                can,
+                                below && !blocked && (!prefix_whole || lent),
+                                "{case}"
+                            );
+                            assert_eq!(
+                                matches!(step, Some(SegmentMove::CommitSpan { .. })),
+                                below && prefix_whole && lent && !blocked,
+                                "{case}: the lent span backed once the prefix is whole"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 48);
 }
 
 /// Fires cut under a wide rung are still queued when the walk lowers the

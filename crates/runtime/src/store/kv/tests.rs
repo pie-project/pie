@@ -75,6 +75,7 @@ fn tests_every_case() {
     reclaim_spares_the_prefixes_a_live_working_set_kept();
     a_suspend_past_host_swap_spills_to_disk_and_restores_whole();
     a_suspend_takes_shared_pages_to_the_host_in_place();
+    a_prefix_page_every_reader_left_on_the_device_goes_down_with_them();
     an_entry_left_on_the_host_goes_when_swap_needs_room();
     a_move_under_way_keeps_only_the_pages_it_holds();
     a_page_seals_under_a_key_that_names_its_prefix();
@@ -83,6 +84,7 @@ fn tests_every_case() {
     a_working_set_that_goes_leaves_its_sealed_prefix();
     a_working_set_maps_in_what_another_sealed();
     a_pass_maps_in_more_after_what_it_mapped_in();
+    a_prefix_computed_twice_maps_whole_from_either_copy();
     a_page_no_one_else_reads_is_written_in_place();
     a_lookup_takes_the_copy_on_the_device();
     a_lookup_follows_one_copy_to_its_children();
@@ -92,6 +94,7 @@ fn tests_every_case() {
     what_decode_wrote_is_reclaimed_before_the_prompt_where_a_row_keys_it_below();
     a_sweep_suspends_only_the_readers_of_what_it_moves();
     idle_cache_goes_to_the_host_and_comes_back_on_a_hit();
+    an_exited_owner_holds_its_kv_until_its_working_set_is_released();
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
@@ -705,6 +708,77 @@ fn a_suspend_takes_shared_pages_to_the_host_in_place() {
     assert_eq!(swapped(&store, a), 1);
 }
 
+/// A disk-only load: a prompt-prefix page seven forks share must not stay
+/// on the device after every one of them is evicted (each suspend leaves
+/// it, another reader or a key holding it then) with nothing to move it:
+/// its chunk would hold a head's need for good. Swept with its
+/// readers' sets, it goes down a tier once, every reader's refs pointing
+/// there, the chunk comes free, and a restore reads it back.
+fn a_prefix_page_every_reader_left_on_the_device_goes_down_with_them() {
+    let mut store = KvStore::new_with_swap(12, 0, 12, h(13));
+    let owner = ProcessId::from_u128(7);
+    let tokens = prompt(13, 1);
+    let first = store.create_shared_working_set();
+    sealed(&mut store, first, &tokens);
+    store.keep_checkpoint(first, 1, Some(owner));
+    let mut forks = vec![first];
+    for _ in 1..7 {
+        forks.push(reader(&mut store, &tokens, 1));
+    }
+    // Every reader evicted with the page left where it lay (the field's
+    // state: each suspend found it held then, and moved nothing of it).
+    store.discard_cache(owner, crate::policy::By::Policy);
+    store.mark_suspended(&forks.iter().copied().collect());
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 1, "left on the device, every reader evicted");
+    // The move down of its readers' parked state takes it.
+    let order: Vec<_> = forks.iter().map(|&ws| (ws, 0)).collect();
+    let sweep = store
+        .prepare_sweep(&HashSet::new(), usize::MAX, &order, usize::MAX, floor)
+        .unwrap()
+        .expect("the shared page moves");
+    assert_eq!(store.commit_suspend(sweep).unwrap(), 1, "once, for every reader");
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0, "its chunk comes free");
+    assert_eq!(store.available_pages(), 12);
+    for &ws in &forks {
+        assert_eq!(store.swapped_page_count(&HashSet::from([ws])).unwrap(), 1, "refs intact");
+    }
+    let mut granted = store.reserve_device_pages(1).unwrap();
+    let txn = store.prepare_restore(&HashSet::from([forks[3]]), &mut granted).unwrap();
+    assert_eq!(store.commit_restore(txn).unwrap(), 1, "read back");
+    assert_eq!(on_device(&mut store, &tokens), 1);
+
+    // Evicted one at a time, each finding the page read by the others still
+    // running: the last one's suspend takes it down.
+    let mut store = KvStore::new_with_swap(12, 0, 12, h(14));
+    let tokens = prompt(14, 1);
+    let first = store.create_shared_working_set();
+    sealed(&mut store, first, &tokens);
+    store.keep_checkpoint(first, 1, Some(owner));
+    let forks: Vec<_> = std::iter::once(first)
+        .chain((1..7).map(|_| reader(&mut store, &tokens, 1)))
+        .collect();
+    store.discard_cache(owner, crate::policy::By::Policy);
+    for &ws in &forks[..6] {
+        assert!(
+            store
+                .prepare_suspend(&HashSet::from([ws]), floor)
+                .unwrap()
+                .is_none(),
+            "read by the rest"
+        );
+        store.mark_suspended(&HashSet::from([ws]));
+    }
+    let last = store
+        .prepare_suspend(&HashSet::from([forks[6]]), floor)
+        .unwrap()
+        .expect("the last reader's suspend takes the page");
+    assert_eq!(store.commit_suspend(last).unwrap(), 1);
+    store.retire_idle();
+    assert_eq!(on_device(&mut store, &tokens), 0, "never left on the device");
+}
+
 fn an_entry_left_on_the_host_goes_when_swap_needs_room() {
     let mut store = KvStore::new_with_swap(5, 3, 0, h(12));
     let tokens = prompt(10, 3);
@@ -1268,6 +1342,29 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     store.retire_idle();
     assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 3);
     assert_eq!(store.available_pages(), 8);
+}
+
+/// A process's last fire settles after it exits, and only then is what it
+/// leaves cached: until its working set is released the store still holds
+/// its KV, so its rows are not reaped as a gone set's (a keep the policy
+/// stated would be lost, and the cache it becomes keyed by default).
+fn an_exited_owner_holds_its_kv_until_its_working_set_is_released() {
+    let mut store = KvStore::new(8, h(35));
+    store.set_keeps(true);
+    let (owner, other) = (ProcessId::from_u128(25), ProcessId::from_u128(26));
+    let tokens: Vec<u32> = (0..32).map(|t| 500 + t).collect();
+    let ws = store.create_shared_working_set();
+    store.set_owner(ws, owner).unwrap();
+    commit_opaque(&mut store, ws, 2);
+    seal(&mut store, ws, 0, &tokens);
+    assert!(!store.owns_cache(owner), "nothing cached yet");
+    assert!(store.holds_kv_of(owner), "its working set is still here");
+    assert!(!store.holds_kv_of(other));
+    store.release_working_set(ws, store.current_epoch());
+    store.retire_idle();
+    assert!(store.owns_cache(owner) && store.holds_kv_of(owner), "now cached");
+    assert_eq!(store.discard_cache(owner, crate::policy::By::Policy), 2, "both pages");
+    assert!(!store.holds_kv_of(owner), "gone");
 }
 
 fn a_suspend_short_of_host_room_drops_host_cache_first() {
@@ -1940,6 +2037,47 @@ fn a_waiting_prompt_finds_its_cached_prefix_and_loses_it_when_evicted() {
         "and the waiter, looked up again, finds none"
     );
     crate::store::waiting::left(waiter);
+}
+
+/// Passes that raced each computed a prompt's first page; a later prompt
+/// computed its second page on one of those copies. Whichever copy of the
+/// first page the lookup takes, the prompt maps whole: the path to its
+/// second page holds the same keys.
+fn a_prefix_computed_twice_maps_whole_from_either_copy() {
+    let mut store = KvStore::new(64, h(27));
+    store.set_keeps(true);
+    let prompt = |tail: u32| -> Vec<u32> {
+        (0..16)
+            .map(|t| 2000 + t)
+            .chain((0..17).map(|t| tail * 100 + t))
+            .collect()
+    };
+    let computed = |store: &mut KvStore, tail: u32| {
+        let ws = store.create_shared_working_set();
+        commit_opaque(store, ws, 3);
+        seal(store, ws, 0, &prompt(tail));
+    };
+    let look = |store: &mut KvStore, tail: u32| {
+        let ws = store.create_shared_working_set();
+        let keys = keys_ahead(store, ws, 0, &prompt(tail));
+        let run = store.cached_run(&keys);
+        let mapped = store.attach_run(ws, &run, 2).unwrap();
+        (ws, run.len(), mapped)
+    };
+    computed(&mut store, 1);
+    computed(&mut store, 2);
+    let (ws, found, mapped) = look(&mut store, 3);
+    assert_eq!((found, mapped), (1, 1), "the shared page, from one copy");
+    commit_opaque(&mut store, ws, 2);
+    seal(&mut store, ws, 16, &prompt(3)[16..]);
+    // Another pass computes the shared page again: the newest copy is the
+    // one a lookup of the first page takes.
+    computed(&mut store, 4);
+    let (ws, found, mapped) = look(&mut store, 3);
+    assert_eq!((found, mapped), (2, 2), "the whole prompt, on its path");
+    let theirs = store.flat_table(ws).unwrap().to_vec();
+    let (again, _, _) = look(&mut store, 3);
+    assert_eq!(store.flat_table(again).unwrap(), theirs.as_slice());
 }
 
 #[test]

@@ -300,6 +300,65 @@ fn host_cache_goes_on_down_to_disk_and_a_restart_brings_it_back_bitwise() {
     kv.release_reader(pin);
 }
 
+/// A set a fire on its way folds by a count the device computes keeps its
+/// record where the engine holds it: a suspend moves the other sets' state
+/// and leaves its own, for no want of host rows, until that fold settles;
+/// a set such a fold failed on stays for good.
+#[test]
+fn a_suspend_leaves_a_device_folding_set_where_the_engine_holds_it() {
+    use crate::store::rs::{RsGeometry, RsStore, RsWorkingSetId};
+    let mut facts = fixed_facts();
+    facts.host_chunks = HOST_CHUNKS;
+    let tiers = Tiers::of(&facts).unwrap();
+    let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
+    let mut s = RsStore::shared(&shared, tiers.host.as_ref());
+    assert!(!s.host_available().is_zero(), "the host tier has rows");
+    let folded_at = |s: &mut RsStore, frozen: u32| {
+        let ws = s.create_working_set(RsGeometry {
+            state_size: 4096,
+            buffer_page_tokens: RS_TOKENS,
+        });
+        let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
+        let published = s.publish_prepared(prepared).unwrap();
+        s.settle(published);
+        s.fold(ws, frozen);
+        ws
+    };
+    let (folding, idle) = (folded_at(&mut s, 4), folded_at(&mut s, 4));
+    let slot = |s: &RsStore, ws: RsWorkingSetId| s.folded_slot(ws).unwrap().unwrap();
+    s.begin_device_fold(folding);
+    let both = HashSet::from([folding, idle]);
+    assert!(
+        s.prepare_suspend(&HashSet::from([folding])).is_none(),
+        "its record stays on the device"
+    );
+    assert!(
+        s.suspend_short(&HashSet::from([folding])).is_zero(),
+        "and not for want of host rows"
+    );
+    let txn = s
+        .prepare_suspend(&both)
+        .expect("the settled set's state parks");
+    s.commit_suspend(txn);
+    assert!(!s.on_host(slot(&s, folding)));
+    assert!(s.on_host(slot(&s, idle)), "a set with no such fold moves");
+
+    s.end_device_fold(folding, Some(3), None);
+    let txn = s.prepare_suspend(&both).expect("settled, its record parks");
+    s.commit_suspend(txn);
+    assert!(s.on_host(slot(&s, folding)));
+    assert_eq!(s.frozen(folding), Ok(7));
+
+    // A fold that failed leaves a record of no known length: it stays too.
+    let failed = folded_at(&mut s, 4);
+    s.begin_device_fold(failed);
+    s.end_device_fold(failed, None, Some("pipeline: forward failed: device lost"));
+    let only = HashSet::from([failed]);
+    assert!(s.prepare_suspend(&only).is_none());
+    assert!(s.suspend_short(&only).is_zero());
+    assert!(!s.on_host(slot(&s, failed)));
+}
+
 /// A slot file of `chunks` whole disk chunks, for a store's disk tier.
 struct DiskFile(Mutex<Vec<u32>>);
 

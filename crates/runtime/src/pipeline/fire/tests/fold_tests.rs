@@ -823,6 +823,31 @@ fn in_flight(fold: &geometry::Fold, exact: bool) -> Flight {
     in_flight_on(fold, exact, true)
 }
 
+/// [`in_flight`]'s fire as the engine took it, its pipeline still to
+/// queue it.
+fn submitted(fold: &geometry::Fold, exact: bool) -> (Flight, PendingFire, Unqueued) {
+    let (model, stores, id) = frozen_at(4);
+    let rs = state_at(&stores, 4);
+    if !exact {
+        stores.kv.lock().unsettle(id).unwrap();
+    }
+    let cell = cursor(12);
+    let kv = KvWorkingSet::new(model, 0, id, 8);
+    let failure: PipelineFailure = Arc::new(Mutex::new(None));
+    let (completion, tag, fire, unqueued) = stage(&kv, Some(rs), &cell, &failure, fold);
+    let flight = Flight {
+        stores,
+        fires: Arc::new(PendingFireQueue::new()),
+        completion,
+        failure,
+        kv,
+        rs,
+        cursor: cell,
+        tag,
+    };
+    (flight, fire, unqueued)
+}
+
 /// `recurrent` is whether the pass keeps recurrent state: a pass that
 /// keeps none folds its set with the recurrent store left out.
 fn in_flight_on(fold: &geometry::Fold, exact: bool, recurrent: bool) -> Flight {
@@ -1049,6 +1074,88 @@ pub(crate) async fn ending(dropped: bool) -> Anyhow<Ending> {
         tag,
         _pass: fires,
     })
+}
+
+/// The in-pass fork: the guest forks a set between its own pipelined
+/// fires. The host fork runs the pipeline's fires to their end
+/// ([`drain_pipeline_fires`], which only its own task can); a handle's
+/// fork, a save and the planner's suspend wait on the store and on the
+/// fire's lease. None ends before the fire settles, and each then reads
+/// the folded length the device's count left, one length in both
+/// stores.
+/// A soak's stall: a process fires, then binds a
+/// program short of room, and the planner evicts it while its bind
+/// waits. The fire's lease goes back only as the fire is finalized,
+/// and its finalizer is the guest, in the bind; the eviction's drain
+/// finalizes only fires settled as it starts, and none of a pass whose
+/// geometry the device keeps, so the eviction would wait on the lease
+/// for good.
+/// A bind about to wait settles its process's fires first: the lease
+/// goes back as the fire lands, and the eviction's wait ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_about_to_wait_settles_its_fires_and_an_eviction_s_wait_for_their_leases_ends()
+-> Anyhow<()> {
+    use crate::inferlet::process::residency::{ResidentPipeline, register_residency};
+    use futures::FutureExt;
+    let model = crate::store::registry::register_model(4, &[8], &[1]);
+    let stores = crate::store::registry::get(model, 0);
+    let id = {
+        let mut kv = stores.kv.lock();
+        let id = kv.create_working_set();
+        kv.fold(id, 4, false).unwrap();
+        id
+    };
+    let kv = KvWorkingSet::new(model, 0, id, 8);
+    let cell = cursor(12);
+    let pipeline = Pipeline::new();
+    let (fires, failure, scope) = (
+        pipeline.fires.clone(),
+        pipeline.failure.clone(),
+        pipeline.scope.clone(),
+    );
+    let pid = uuid::Uuid::new_v4();
+    let residency = Arc::new(Mutex::new(
+        crate::inferlet::process::ProcessResidency::default(),
+    ));
+    residency.lock().unwrap().pipelines.push(ResidentPipeline {
+        scope: scope.clone(),
+        fires: Arc::downgrade(&fires),
+    });
+    register_residency(pid, Arc::downgrade(&residency));
+    assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
+    // A fire of a pass whose geometry the device keeps, on its way.
+    let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &geometry::Fold::Device);
+    assert!(!fires.lock().unwrap().front().unwrap().is_preemption_detachable());
+
+    // The eviction: its sets fenced, then it waits for their leases.
+    let handle = kv.suspend_handle();
+    handle.fence();
+    assert_eq!(handle.active_leases(), 1, "the fire holds its lease");
+    let mut quiesced = Box::pin(handle.quiesce());
+    assert!(quiesced.as_mut().now_or_never().is_none());
+
+    // The bind, about to wait, settles what its process has in flight.
+    let mut settled = Box::pin(settle_process_fires(pid));
+    assert!(
+        settled.as_mut().now_or_never().is_none(),
+        "it waits for the fire to land, not for anything the eviction holds"
+    );
+    assert_eq!(handle.active_leases(), 1);
+    // The fire lands.
+    record_kv_writes(vec![report(tag, 2)]);
+    resolve_test_completion(&completion, false);
+    settled.await;
+    assert!(fires.lock().unwrap().is_empty(), "finalized");
+    assert_eq!(handle.active_leases(), 0, "its lease is back");
+    quiesced.await;
+    assert_eq!(
+        stores.kv.lock().folded(id).unwrap(),
+        6,
+        "its fold is placed as its own finalize places it"
+    );
+    assert_eq!(*failure.lock().unwrap(), None, "a fire that ran fails nothing");
+    drop(residency);
+    Ok(())
 }
 
 /// A fold no fire is left to place never lets the cursor come to rest:
@@ -1304,3 +1411,103 @@ async fn a_fire_that_ran_and_reported_no_fold_fails_its_set_by_name() -> Anyhow<
 // arrived. A fire behind one that folds by a count the device computes
 // is therefore staged before that count exists.
 
+
+/// A fire the engine took whose call then traps, here on a pass gone
+/// where each path advances its shadow, is never queued: nothing
+/// finalizes it. Its pipeline fails by that name, and its sets with it.
+/// The marks its submit left stand while the engine may still run it
+/// and lift when the engine is done with it, the pipeline and its queue
+/// long gone, or when the engine itself is gone: nothing waits on them
+/// for good. Its folded length is a bound from then on, which no fork
+/// takes; no other pipeline takes the set, and its recurrent state
+/// stays refused, since what the fire folded was never read.
+#[test]
+fn a_fire_submitted_and_never_queued_fails_its_pipeline_and_its_settle_lifts_the_marks() {
+    use crate::store::{PipelineScope, ScopeRefusal};
+
+    /// What each path does between its submit and its queueing, on a
+    /// pass since gone.
+    fn trapped(
+        ctx: &mut TestContext,
+        fires: &PendingFires,
+        fire: PendingFire,
+        unqueued: Unqueued,
+    ) -> Anyhow<()> {
+        let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
+        advance_shadow(ctx, &gone)?;
+        unqueued.queue(fires, fire);
+        Ok(())
+    }
+
+    let dropped = || RsError::DeviceFoldFailed(RsDeviceFold::DROPPED.to_string());
+    let unqueued = |owner| {
+        Err(ScopeRefusal::Failed {
+            owner,
+            reason: UNQUEUED.to_string(),
+        })
+    };
+    for lost in [false, true] {
+        let (flight, fire, guard) = submitted(&geometry::Fold::Device, true);
+        let Flight {
+            stores,
+            fires,
+            completion,
+            failure,
+            kv,
+            rs,
+            ..
+        } = flight;
+        let scope = PipelineScope::failing_as(failure.clone(), || true);
+        kv.claim_pipeline_scope(&scope).unwrap();
+        let mut ctx = Flight::context();
+        assert!(trapped(&mut ctx, &fires, fire, guard).is_err());
+        assert!(fires.lock().unwrap().is_empty(), "nothing finalizes it");
+        assert_eq!(failure.lock().unwrap().as_deref(), Some(UNQUEUED));
+        assert_eq!(kv.pipeline_failure().as_deref(), Some(UNQUEUED));
+
+        // The engine may still run it: the marks stand.
+        let sets = [rs];
+        let mut waiting = Box::pin(device_folds_settled(&stores.rs, &sets));
+        assert_eq!(
+            stores.rs.lock().unwrap().device_fold_gate(rs),
+            Err(RsError::DeviceFoldUnsettled)
+        );
+        assert_eq!(stores.kv.lock().fork(kv.id), Err(UNSETTLED));
+        assert!(waiting.as_mut().now_or_never().is_none());
+
+        // The pipeline goes, and the engine settles the fire after it.
+        scope.close();
+        drop((fires, failure, ctx));
+        if lost {
+            drop(completion);
+        } else {
+            resolve_test_completion(&completion, false);
+        }
+        assert!(waiting.as_mut().now_or_never().is_some());
+        assert_eq!(stores.kv.lock().unsettled(kv.id).unwrap(), 0);
+        assert_eq!(folded(&stores, kv.id), (4, false));
+        assert_eq!(stores.kv.lock().fork(kv.id), Err(UNPLACED));
+        assert_eq!(
+            stores.rs.lock().unwrap().device_fold_gate(rs),
+            Err(dropped())
+        );
+        let next = PipelineScope::failing_as(Default::default(), || true);
+        assert_eq!(kv.claim_pipeline_scope(&next), unqueued(scope.id()));
+    }
+
+    // A failure that said why first keeps its reason.
+    let (flight, fire, guard) = submitted(&geometry::Fold::Device, true);
+    *flight.failure.lock().unwrap() = Some("pipeline: submit failed".to_string());
+    drop((guard, fire));
+    assert_eq!(
+        flight.failure.lock().unwrap().as_deref(),
+        Some("pipeline: submit failed")
+    );
+    resolve_test_completion(&flight.completion, false);
+
+    // A fire queued leaves none: its pipeline finalizes it.
+    let flight = in_flight(&geometry::Fold::Device, true);
+    assert_eq!(flight.fires.lock().unwrap().len(), 1);
+    assert_eq!(*flight.failure.lock().unwrap(), None);
+    resolve_test_completion(&flight.completion, false);
+}

@@ -267,6 +267,26 @@ fn random_runs_keep_every_invariant() {
     }
 }
 
+/// A beam-4 process's 72 runs of slots priced a whole chunk each where
+/// its placement does not stand now would read past the pool, and
+/// beams the budget serves be refused as never fitting. Placed alone, runs of one length
+/// share chunks of their class: what held them once holds them again.
+#[test]
+fn small_slot_runs_placed_alone_share_chunks_of_their_class() {
+    let fixed = [(ShapeKind::Fixed, 4)];
+    let mut pool = SlotPool::new(facts_with(16, 4, 4, &fixed, &[(16, 2)]));
+    let spc = pool.shape(0).unwrap().slots_per_chunk;
+    let own = vec![OwnPiece::Slots { shape: 0, slots: 1 }; 72];
+    let alone = pool.opens_alone(&own);
+    assert_eq!(alone, 72u32.div_ceil(spc), "packed {spc} a chunk");
+    let all = pool.free_chunks();
+    let _held = pool
+        .acquire_chunk_runs(Holder::WorkingSet(9), 0, 1, all)
+        .unwrap();
+    assert_eq!(pool.opens_beside(&own), None, "no room now");
+    assert_eq!(pool.opens_alone(&own), alone, "placed alone, the same");
+}
+
 /// Whoever plans them, moves that would split a run are refused by
 /// name: one of its chunks without the rest, or the rest not following
 /// its first. A run moved whole is applied.
@@ -435,6 +455,19 @@ fn a_segment_under_a_copy_is_neither_evacuated_nor_released() {
     assert!(pool.release_segment(1).is_ok(), "released once it landed");
 }
 
+/// The run-class pool these tests take from: 1024-slot chunks of one
+/// fixed shape, eleven of them free for state (the null chunk and the
+/// top segment's activation aside).
+fn run_pool() -> SlotPool {
+    SlotPool::new(facts_with(
+        16,
+        4,
+        4,
+        &[(ShapeKind::Fixed, 1024)],
+        &[(16, 4)],
+    ))
+}
+
 /// The pool's table after its moves, one by one, is the engine's after
 /// `ChunkTable::apply` of the same list: held chunks moved into holes
 /// among free ones, free logicals swapped up in their place, and moves
@@ -532,4 +565,30 @@ fn the_pools_moves_leave_the_table_the_engines_apply_does() {
         }
     }
     assert!(applied > 100, "moves applied: {applied}");
+}
+
+/// AMD's 500-concurrent shape: single slots scattered beside guest
+/// state's runs left no chunk holding a run of 483 free, though slots
+/// were free in plenty. Single slots now never take a run chunk's
+/// tail: with every other chunk filled by single slots and holes
+/// scattered among them, the next run of 483 still lies in its own
+/// class's chunk. Before, the single slots filled the fullest chunk
+/// first, the run's, and the run was short.
+#[test]
+fn single_slots_never_fill_a_run_chunk_s_tail() {
+    let mut pool = run_pool();
+    let holder = Holder::WorkingSet(1);
+    let first = pool.acquire_run(holder, 0, 483).unwrap();
+    let room = u64::from(pool.free_chunks()) * 1024;
+    let singles = pool.acquire(holder, 0, room).unwrap();
+    assert!(singles.iter().all(|slot| slot.chunk != first[0].chunk));
+    assert_eq!(pool.free_chunks(), 0, "every chunk taken");
+    // Holes scattered among the single slots: no run of 483 there.
+    let scattered: Vec<Slot> = singles.iter().step_by(2).copied().collect();
+    pool.release(holder, &scattered, 0);
+    let second = pool
+        .acquire_run(holder, 0, 483)
+        .expect("the run's own chunk holds it");
+    assert_eq!(second[0].chunk, first[0].chunk);
+    pool.check();
 }

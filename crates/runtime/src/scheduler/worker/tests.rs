@@ -142,6 +142,48 @@ impl ::engine::Tiers for PanickingEngine {
 }
 
 
+/// A control the lane refuses or drops (a panic on the copy, the
+/// reply lost) tells what waits on it: else a residency move's copy
+/// waits on a completion that never comes, and the move holds its items
+/// moving for good (every restore of a pair's other holders waiting on
+/// it).
+#[test]
+fn a_refused_control_tells_its_tracked_completion() {
+    let tracked = crate::scheduler::ControlCompletion::new();
+    let mut controls = InFlightControls::default();
+    controls.settling.push(PendingControl {
+        state: ControlSlotState::Posted { id: 41 },
+        logical_completion: None,
+        process_id: None,
+        pipeline_id: None,
+        tracked_completion: Some(tracked.clone()),
+        operation: "tracked roles copy",
+        holds_launches: false,
+        prelaunch: false,
+        what: String::new(),
+        since: crate::rt::Instant::now(),
+    });
+    let (rollback, _rx) = tokio::sync::mpsc::unbounded_channel();
+    BatchScheduler::apply_control_commit(
+        41,
+        LaneCommit::AsyncControl {
+            result: Err("the engine lane dropped this control unanswered".to_string()),
+        },
+        &mut controls,
+        &mut HashMap::new(),
+        &mut FramePolicy::new(1, 1, 1, None),
+        &rollback,
+        0,
+    );
+    assert!(controls.settling.is_empty());
+    let told = crate::rt::block_on(async {
+        crate::rt::time::timeout(Duration::from_secs(5), tracked.wait()).await
+    })
+    .expect("told, never left waiting");
+    let error = told.expect_err("told it failed");
+    assert!(error.to_string().contains("unanswered"), "{error}");
+}
+
 /// Fire `fire`'s request: one decode lane in slot `fire`, a page of its own.
 fn refused_request(fire: u64) -> Box<PendingRequest> {
     let slot = u32::try_from(fire).expect("a test fire id");

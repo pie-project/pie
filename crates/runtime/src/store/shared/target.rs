@@ -1049,6 +1049,217 @@ mod tests {
         assert!(grow.can_grow(), "held back no more: it grows");
     }
 
+    /// Mac, yield 1, after a burst, every prompt finished: a pool full of
+    /// idle cache, the system's pressure bringing the target under what it
+    /// maps, and no fire at all. The walk evacuates the top segment into
+    /// the room below; the engine takes the copy and waits it out itself,
+    /// so the segment goes with no fire to retire, and while it does the
+    /// pool answers Moving, asking nothing of the policy. The next segment
+    /// has no room to evacuate into: NoRoom, tier pressure, and once the
+    /// policy shed the idle cache the pool stands at its target. No answer
+    /// is ever Reached past the target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_target_under_what_idle_cache_holds_is_given_back_with_no_fire() {
+        use crate::governor::run::Steer;
+        use crate::governor::{Signal, Source, Yield};
+
+        // The engine's stores, idle: no fire handed out, none outstanding.
+        const ENGINE: usize = 65;
+        let engines = vec![registry::EngineStores::default(); ENGINE + 1];
+        let model = registry::register_model_with_chunks(16, &engines);
+        let mut pool = super::super::tests::pool();
+        pool.committed(6);
+        // The prefix cache, idle: every record the pool holds, no fire
+        // reading any. Those in the lowest chunks went, leaving room for
+        // one segment's evacuation and no more.
+        let records = pool
+            .take_records(pool.records_available() as usize)
+            .unwrap();
+        let (gone, idle) = records.split_at(16);
+        pool.give_records(gone);
+        assert_eq!(pool.mapped_segments(), 8);
+        let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+        // The engine takes every move it is told.
+        let moves = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let told = moves.clone();
+        let mut grow = SharedGrow::new(model, ENGINE, shared.clone()).with_lane(move |op| {
+            // The walk's own check of the engine's table after a move is no
+            // move the engine is told.
+            if !matches!(op, PoolOp::CheckTable(_)) {
+                told.lock().unwrap().push(format!("{op:?}"));
+            }
+            Ok(())
+        });
+
+        let dir = std::env::temp_dir().join(format!("pie-govr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressure");
+        std::fs::write(&path, "0").unwrap();
+        let source = Source::File(path.clone());
+        let mut reader = crate::governor::Reader::new(source.clone());
+        let mut steer = Steer::new(&grow, Yield::new(1.0).unwrap()).with_source(source.name());
+        let segment = grow.segment_bytes();
+        let mut turn = |steer: &mut Steer, grow: &mut SharedGrow| {
+            let mut signals = Vec::new();
+            let turn = steer.turn(grow, reader.read(), &mut |signal| signals.push(signal));
+            let held = grow.held();
+            assert_eq!(turn.mapped.segments * segment, held, "the measure is held's");
+            assert!(
+                turn.answer != Retarget::Reached || held <= turn.segments * segment,
+                "reached with {held} held over a target of {} segments",
+                turn.segments
+            );
+            (turn, signals)
+        };
+        let (first, _) = turn(&mut steer, &mut grow);
+        assert_eq!(first.answer, Retarget::Reached);
+
+        // An app takes memory: the floor is the fewest segments the pool
+        // can map (the reserved chunk's and the span's, 384 MiB, over its
+        // byte floor of 272), and 384 + 640 * 0.55 MiB comes to 6 segments
+        // of the 8 mapped. The walk has yet to look: Moving, nothing raised.
+        std::fs::write(&path, "0.45").unwrap();
+        let (pressed, signals) = turn(&mut steer, &mut grow);
+        assert_eq!(pressed.segments, 6);
+        assert_eq!(pressed.answer, Retarget::Moving { held: 8 });
+        assert!(signals.is_empty(), "{signals:?}");
+        // The walk evacuates segment 5 into the room below; the engine took
+        // the copy, and with no fire handed out the segment goes at once.
+        // Segment 4 has no room left to evacuate into.
+        grow.walk().await;
+        let told: Vec<String> = moves.lock().unwrap().clone();
+        assert!(told[0].starts_with("Evacuate"), "{told:?}");
+        assert_eq!(told[1], "ReleaseSegments(5)", "{told:?}");
+        assert_eq!(shared.lock().unwrap().draining_segments(), 0);
+        let (short, signals) = turn(&mut steer, &mut grow);
+        assert_eq!(short.answer, Retarget::NoRoom { held: 7 });
+        assert_eq!(
+            signals,
+            vec![Signal::TierPressure {
+                held_bytes: 7 * segment,
+                target_bytes: 6 * segment,
+            }]
+        );
+
+        // The policy sheds the idle cache for the tier pressure: the walk
+        // gives segment 4 back, and the pool stands at its target.
+        shared.lock().unwrap().give_records(idle);
+        grow.walk().await;
+        let (eased, signals) = turn(&mut steer, &mut grow);
+        assert_eq!(eased.answer, Retarget::Reached);
+        assert_eq!(eased.mapped.segments, 6);
+        assert_eq!(signals, vec![Signal::Eased]);
+        assert_eq!(
+            registry::get(model, ENGINE).kv.lock().current_epoch(),
+            0,
+            "no fire at all"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The soak's stall: the walk lowered the rung 512 -> 128 under
+    /// prompts cut at 512 (the scheduler holds them out, owed), then a
+    /// process demand waits for room and nothing is in flight. The walk
+    /// raises the rung back to what is owed (512, nothing moved) and the
+    /// fire cap rises with it in the same walk: the held frame seals at
+    /// once under the new cap, never on a later wake that does not come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_back_to_frames_held_under_a_lowered_cap_lifts_the_cap_at_once() {
+        for (at, on_demand) in [false, true].into_iter().enumerate() {
+            for waits in [false, true] {
+                let engine = 9300 + at * 2 + usize::from(waits);
+                let mut facts = super::super::tests::facts();
+                facts.act_chunks = vec![(16, 1), (128, 2), (512, 6), (2048, 12)];
+                facts.span_backed_on_demand = on_demand;
+                let mut pool = super::super::SharedPool::new(&facts, 256).unwrap();
+                let evacuation = pool.plan_raise(512).unwrap();
+                pool.raise_applied(&evacuation).unwrap();
+                pool.raise_copied(0);
+                // The walk lowered it to 128 under the prompts held out.
+                pool.lower_rung(128).unwrap();
+                if waits {
+                    pool.set_guest_head(Some((1, 1)));
+                }
+                let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+                let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = told.clone();
+                let grow = SharedGrow::new(0, engine, shared.clone())
+                    .with_live_lanes(|| 1)
+                    .with_lane(move |op| {
+                        seen.lock().unwrap().push(format!("{op:?}"));
+                        Ok(())
+                    });
+                super::super::set_fire_cap_for_test(engine, 128);
+                super::super::grant_rung(engine, 128);
+                // The scheduler holds prompts cut at 512 out, owed.
+                super::super::owe_cut_rows(engine, 512, None);
+                grow.walk_rung().await;
+                let rung = shared.lock().unwrap().rung();
+                assert_eq!(rung, 512, "on_demand={on_demand} waits={waits}: raised to the owed");
+                assert!(
+                    super::super::fire_cap(engine) >= 512,
+                    "on_demand={on_demand} waits={waits}: the cap rises with the raise, \
+                     now {} (told {:?})",
+                    super::super::fire_cap(engine),
+                    told.lock().unwrap()
+                );
+                assert!(super::super::engine_rows(engine) >= 512, "the engine holds it");
+                super::super::owe_cut_rows(engine, 0, None);
+            }
+        }
+    }
+
+    /// The same stall with the rung raised back outside the walk (a pass's
+    /// or a bind's funding takes the raise, `take_raise`, and lifts no cap
+    /// to the frames held out): the raise asks the walk to look, and the
+    /// walk lifts the cap to what is owed at once, nothing in flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_raise_taken_outside_the_walk_lifts_the_cap_to_frames_held_out() {
+        for (at, on_demand) in [false, true].into_iter().enumerate() {
+            for waits in [false, true] {
+                let engine = 9310 + at * 2 + usize::from(waits);
+                let mut facts = super::super::tests::facts();
+                facts.act_chunks = vec![(16, 1), (128, 2), (512, 6), (2048, 12)];
+                facts.span_backed_on_demand = on_demand;
+                let mut pool = super::super::SharedPool::new(&facts, 256).unwrap();
+                let evacuation = pool.plan_raise(512).unwrap();
+                pool.raise_applied(&evacuation).unwrap();
+                pool.raise_copied(0);
+                pool.lower_rung(128).unwrap();
+                if waits {
+                    pool.set_guest_head(Some((1, 1)));
+                }
+                let shared: Shared = Arc::new(std::sync::Mutex::new(pool));
+                let grow = SharedGrow::new(0, engine, shared.clone())
+                    .with_live_lanes(|| 1)
+                    .with_lane(|_| Ok(()));
+                super::super::set_fire_cap_for_test(engine, 128);
+                super::super::grant_rung(engine, 128);
+                super::super::owe_cut_rows(engine, 512, None);
+                // Drain the ask the hold itself made.
+                let _ = futures::FutureExt::now_or_never(super::super::walk_asked(engine));
+                let taken =
+                    super::super::programs::take_raise(&shared, |_| 512, &WalkMover(&grow))
+                        .await
+                        .expect("taken");
+                assert!(taken.is_some(), "raised outside the walk");
+                assert_eq!(super::super::fire_cap(engine), 128, "no cap lifted by it");
+                assert!(
+                    futures::FutureExt::now_or_never(super::super::walk_asked(engine)).is_some(),
+                    "on_demand={on_demand} waits={waits}: the raise asks the walk to look"
+                );
+                grow.walk_rung().await;
+                assert!(
+                    super::super::fire_cap(engine) >= 512,
+                    "on_demand={on_demand} waits={waits}: the walk lifts the cap to the held \
+                     frames, now {}",
+                    super::super::fire_cap(engine)
+                );
+                super::super::owe_cut_rows(engine, 0, None);
+            }
+        }
+    }
+
     /// Mac's spin (Metal, the grow-time check refusing a prefix commit,
     /// about 1,000 asks a minute): a refused commit is asked again on no
     /// wake that cannot change what the device backs (room freed inside the

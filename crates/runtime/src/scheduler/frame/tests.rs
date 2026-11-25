@@ -45,7 +45,9 @@ fn frame_every_case() {
     a_burst_of_cut_prefills_seals_its_pieces_step_by_step();
     a_wave_reads_out_no_more_than_the_engine_carves();
     a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name();
+    a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary();
     processes_over_the_execution_permits_joining_together_all_finish();
+    joiners_waiting_on_a_claimant_s_prefix_hold_no_frame();
 }
 
 /// More processes than execution permits arrive together (lanes would
@@ -180,6 +182,318 @@ fn processes_over_the_execution_permits_joining_together_all_finish() {
     }
 }
 
+/// Greedy decodes of one prompt arriving together, the prefix cache
+/// cold (16 on Vulkan: 15 of 16 lanes missing from the first frame,
+/// for good): the first pass claims the prefix pages, and each other
+/// process's first pass waits for them to seal
+/// (`coalesce::before_pass`) before it submits, its lane open.
+/// Expected, the frame held the claimant's prefill, whose pages they
+/// wait on. Waiting on another pass's fire, a process is told waiting
+/// (parked: no frame waits on its lanes): the claimant's frame goes
+/// alone, and each waiter, its pages sealed, is unblocked and rides the
+/// next frame with the rest.
+fn joiners_waiting_on_a_claimant_s_prefix_hold_no_frame() {
+    // Four greedy decodes and sixteen.
+    for count in [3usize, 15] {
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        let claimant = pid();
+        let joiners: Vec<ProcessId> = (0..count).map(|_| pid()).collect();
+        for &owner in std::iter::once(&claimant).chain(&joiners) {
+            policy.on_lane_open(owner, owner);
+        }
+        policy.on_fire_enqueued(stamp(claimant, 0, 0, 1), Some(claimant), 1, 16, 1);
+        let queued: QueuedFireIds = [1].into_iter().collect();
+        assert!(
+            !matches!(plan_in_flight(&mut policy, &queued, Instant::now()), FramePlan::Dispatch(_)),
+            "control: the joiners' open lanes are expected"
+        );
+        // Each joiner's pass finds the prefix claimed and waits.
+        for &owner in &joiners {
+            policy.on_owner_waits(owner);
+        }
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![1],
+            "the claimant's prefill goes without the waiting joiners"
+        );
+        policy.on_frame_posted([claimant], Instant::now());
+        policy.on_frame_retired([claimant]);
+        // Its pages seal: each joiner's wait ends (unblocked before its
+        // guest goes on) and it submits its first pass, the claimant its
+        // first decode; they ride one frame.
+        for &owner in &joiners {
+            policy.on_owner_unblocked(owner);
+        }
+        let mut queued: Vec<u64> = vec![100];
+        policy.on_fire_enqueued(stamp(claimant, 1, 0, 1), Some(claimant), 100, 1, 1);
+        for (at, &owner) in joiners.iter().enumerate() {
+            let id = 2 + at as u64;
+            policy.on_fire_enqueued(stamp(owner, 0, 0, 1), Some(owner), id, 4, 1);
+            queued.push(id);
+        }
+        // The joiners' prompts go together in the next frame (the claimant's
+        // decode beside them, or with the joiners' first decodes after, as
+        // the policy packs prompts and decodes): no frame waits on a lane
+        // that does not submit.
+        let ids: QueuedFireIds = queued.iter().copied().collect();
+        let sent = fires(&plan(&mut policy, &ids, Instant::now()));
+        assert!(
+            (2..2 + count as u64).all(|id| sent.contains(&id)),
+            "every joiner rides the next frame: {sent:?}"
+        );
+    }
+}
+
+/// The disk-only soaks' self-cycle: a process whose guest went into a
+/// bind had a complete front frame queued, a continuing lane mid
+/// boundary, and the boundary stayed open on lanes whose owners waited
+/// on the planner's grants. Its frame was never sealed, so its fire
+/// never ran, its lease never went back, and its eviction waited on it
+/// for good. Parked (suspended, or waiting at its bind), an owner is
+/// waited on by no frame; with the other owner blocked on its grant too,
+/// no lane is expected and the frame goes.
+fn a_parked_owner_s_complete_frame_goes_without_waiting_on_the_boundary() {
+    for suspend in [true, false] {
+        let mut policy = FramePolicy::new(1, 64, 4096, None);
+        let (binder, waiting) = (pid(), pid());
+        // A frame of both: the boundary opens with both fired.
+        policy.on_fire_enqueued(stamp(binder, 0, 0, 1), Some(binder), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(waiting, 0, 0, 1), Some(waiting), 2, 1, 1);
+        let queued: QueuedFireIds = [1, 2].into_iter().collect();
+        let mut first = fires(&plan(&mut policy, &queued, Instant::now()));
+        first.sort_unstable();
+        assert_eq!(first, vec![1, 2]);
+        policy.on_frame_posted([binder, waiting], Instant::now());
+        policy.on_frame_retired([binder, waiting]);
+        // The binder's next frame, complete; the other lane's owner
+        // waits on a grant and submits nothing.
+        policy.on_fire_enqueued(stamp(binder, 1, 0, 1), Some(binder), 3, 1, 1);
+        let queued: QueuedFireIds = [3].into_iter().collect();
+        let held = plan_in_flight(&mut policy, &queued, Instant::now());
+        assert!(
+            !matches!(&held, FramePlan::Dispatch(waves) if waves.iter().flatten().any(|&id| id == 3)),
+            "control: mid boundary, it waits for the other lane: {held:?}"
+        );
+        // Its guest goes into a bind that waits, or it is evicted: no
+        // frame waits on it.
+        if suspend {
+            policy.on_process_suspend(binder);
+        } else {
+            policy.on_owner_waits(binder);
+        }
+        // The other owner, blocked on its grant, is waited on by no one
+        // either: no lane is expected, and the binder's frame goes.
+        policy.on_owner_waits(waiting);
+        assert_eq!(
+            fires(&plan(&mut policy, &queued, Instant::now())),
+            vec![3],
+            "no lane left expected: its complete frame goes"
+        );
+    }
+}
+
+/// od-1's census, held for good ("frame k=2 lanes=44 awaited=10
+/// sealed=0 suspended=11 blocked=40", gate "missing=0 candidate=true
+/// in_flight=0"): 10 lanes expected and complete; 13 blocked owners'
+/// lanes with a complete frame; 10 blocked owners' lanes with none; 10
+/// suspended and blocked owners' lanes with none; 1 suspended owner's
+/// lane with a complete frame. Every expected lane is in, so the frame
+/// seals at once, the 14 parked owners' complete frames riding it: 24
+/// lanes' fires in one seal, nothing left behind. Run with the parked
+/// owners' frames submitted before their park and after it (a straggler),
+/// and at k=2 with each frame two slots.
+#[test]
+fn od_1_census_seals_with_every_expected_lane_in() {
+    for straggle in [false, true] {
+        let mut policy = FramePolicy::new(2, 64, 4096, None);
+        let lanes: Vec<ProcessId> = (0..44).map(|_| pid()).collect();
+        let mut next = 1u64;
+        let mut submit = |policy: &mut FramePolicy, lane: ProcessId, seq: u64| -> Vec<u64> {
+            let ids = vec![next, next + 1];
+            for (slot, &id) in ids.iter().enumerate() {
+                policy.on_fire_enqueued(stamp(lane, seq, slot as u32, 2), Some(lane), id, 1, 1);
+            }
+            next += 2;
+            ids
+        };
+        // A first frame of all 44: every lane expected after it.
+        let mut queued: Vec<u64> = Vec::new();
+        for &lane in &lanes {
+            queued.extend(submit(&mut policy, lane, 0));
+        }
+        let ids: QueuedFireIds = queued.iter().copied().collect();
+        assert_eq!(fires(&plan(&mut policy, &ids, Instant::now())).len(), 88);
+        policy.on_frame_posted(lanes.clone(), Instant::now());
+        policy.on_frame_retired(lanes.clone());
+        let mut queued: Vec<u64> = Vec::new();
+        let (expected, rest) = lanes.split_at(10);
+        let (blocked_full, rest) = rest.split_at(13);
+        let (blocked_empty, rest) = rest.split_at(10);
+        let (both_empty, suspended_full) = rest.split_at(10);
+        for &lane in expected {
+            queued.extend(submit(&mut policy, lane, 1));
+        }
+        for &lane in blocked_full {
+            if !straggle {
+                queued.extend(submit(&mut policy, lane, 1));
+            }
+            policy.on_owner_waits(lane);
+            if straggle {
+                queued.extend(submit(&mut policy, lane, 1));
+            }
+        }
+        for &lane in blocked_empty {
+            policy.on_owner_waits(lane);
+        }
+        for &lane in both_empty {
+            policy.on_process_suspend(lane);
+            policy.on_owner_waits(lane);
+        }
+        for &lane in suspended_full {
+            if !straggle {
+                queued.extend(submit(&mut policy, lane, 1));
+            }
+            policy.on_process_suspend(lane);
+            if straggle {
+                queued.extend(submit(&mut policy, lane, 1));
+            }
+        }
+        assert_eq!(policy.lanes.values().filter(|lane| lane.awaited).count(), 10);
+        let ids: QueuedFireIds = queued.iter().copied().collect();
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, Instant::now()) else {
+            panic!("straggle={straggle}: every expected lane is in: the frame seals at once\n{}", policy.debug_summary());
+        };
+        let mut sent: Vec<u64> = waves.iter().flatten().copied().collect();
+        sent.sort_unstable();
+        queued.sort_unstable();
+        assert_eq!(sent, queued, "straggle={straggle}: all 24 lanes' fires in the one seal");
+    }
+}
+
+/// The soak's held frame: k=2, 75 lanes, 18 of them expected, the cap
+/// lowered to 128 under prompts cut at 512 before it came down, nothing
+/// executing. The decodes go; the prompts are held out whole and named
+/// to the cap's owner as owed (`cut_owed`: 512), which is the wake the
+/// hold waits on; once the walk raises the cap to it, they seal. Never
+/// a hold on a raise nothing asked for.
+#[test]
+fn frames_held_under_a_lowered_cap_are_owed_a_raise_and_seal_once_it_comes() {
+    // Planned past any join hold: a frame goes, or what holds it.
+    fn settled(policy: &mut FramePolicy, ids: &QueuedFireIds) -> FramePlan {
+        let mut now = Instant::now();
+        for _ in 0..100 {
+            match plan(policy, ids, now) {
+                FramePlan::Hold(wait) => now += wait.max(Duration::from_millis(1)),
+                plan => return plan,
+            }
+        }
+        panic!("held for good: {}", policy.debug_summary());
+    }
+    let mut policy = FramePolicy::new(2, 4096, 1 << 20, None);
+    let lanes: Vec<ProcessId> = (0..75).map(|_| pid()).collect();
+    // Every lane once, then all but 18 wait on the planner (parked).
+    let mut id = 1u64;
+    let mut queued = Vec::new();
+    for &lane in &lanes {
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), id, 1, 1);
+        queued.push(id);
+        id += 1;
+    }
+    let ids: QueuedFireIds = queued.iter().copied().collect();
+    let first = fires(&settled(&mut policy, &ids));
+    assert_eq!(first.len(), 75);
+    policy.on_frame_posted(lanes.clone(), Instant::now());
+    policy.on_frame_retired(lanes.clone());
+    for &lane in &lanes[18..] {
+        policy.on_owner_waits(lane);
+    }
+    // The cap comes down to 128; six of the 18 had prompts cut at 512.
+    policy.cap_fires(128);
+    let mut queued = Vec::new();
+    let mut prompts = Vec::new();
+    for (at, &lane) in lanes[..18].iter().enumerate() {
+        let tokens = if at < 6 { 512 } else { 1 };
+        policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), id, tokens, 1);
+        queued.push(id);
+        if tokens > 1 {
+            prompts.push(id);
+        }
+        id += 1;
+    }
+    let ids: QueuedFireIds = queued.iter().copied().collect();
+    let decodes = fires(&settled(&mut policy, &ids));
+    assert!(decodes.iter().all(|id| !prompts.contains(id)), "the prompts are held out");
+    assert_eq!(decodes.len(), 12, "the decodes go");
+    policy.on_frame_posted(lanes[6..18].to_vec(), Instant::now());
+    policy.on_frame_retired(lanes[6..18].to_vec());
+    // The decode lanes submit again, nothing executing: the frame is
+    // every expected lane in, the prompts held out under the cap.
+    let mut queued = prompts.clone();
+    for &lane in &lanes[6..18] {
+        policy.on_fire_enqueued(stamp(lane, 2, 0, 1), Some(lane), id, 1, 1);
+        queued.push(id);
+        id += 1;
+    }
+    let ids: QueuedFireIds = queued.iter().copied().collect();
+    let decodes = fires(&settled(&mut policy, &ids));
+    assert!(decodes.iter().all(|id| !prompts.contains(id)), "still held out");
+    policy.on_frame_posted(lanes[6..18].to_vec(), Instant::now());
+    policy.on_frame_retired(lanes[6..18].to_vec());
+    assert_eq!(policy.cut_owed(), 512, "named to the cap's owner");
+    assert!(policy.wake_scheduled(), "the raise is the wake it waits on");
+    // The walk raises the cap to what is owed: the prompts seal.
+    policy.cap_fires(policy.cut_owed());
+    let ids: QueuedFireIds = prompts.iter().copied().collect();
+    let mut sent = fires(&settled(&mut policy, &ids));
+    sent.sort_unstable();
+    assert_eq!(sent, prompts);
+    assert_eq!(policy.cut_owed(), 0);
+}
+
+/// Mac's verified beam mix under pressure: frames cut at a rung of 64
+/// queued, then the cap lowered to 16 while the engine still held 64.
+/// Capped at 16 they sat unsealed on a raise the pressure could not
+/// fund, nothing submitted for 25 minutes. They seal under the rung the
+/// engine holds; once they are gone the cap is granted, and from then
+/// nothing wider seals.
+#[test]
+fn frames_queued_at_a_rung_the_cap_came_down_under_seal_under_the_rung_held() {
+    use crate::scheduler::worker::seal_rows;
+    fn settled(policy: &mut FramePolicy, ids: &QueuedFireIds) -> FramePlan {
+        let mut now = Instant::now();
+        for _ in 0..100 {
+            match plan(policy, ids, now) {
+                FramePlan::Hold(wait) => now += wait.max(Duration::from_millis(1)),
+                plan => return plan,
+            }
+        }
+        panic!("held for good: {}", policy.debug_summary());
+    }
+    let mut policy = FramePolicy::new(1, 4096, 1 << 20, None);
+    let lanes: Vec<ProcessId> = (0..4).map(|_| pid()).collect();
+    policy.cap_fires(64);
+    let mut ids = Vec::new();
+    for (at, &lane) in lanes.iter().enumerate() {
+        let id = at as u64 + 1;
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), id, 64, 1);
+        ids.push(id);
+    }
+    // The cap comes down to 16; the engine holds 64, nothing granted.
+    let seal = seal_rows(16, 64, None, policy.queued_widest());
+    assert_eq!(seal, 64, "they seal under the rung held");
+    policy.cap_fires(seal);
+    let queued: QueuedFireIds = ids.iter().copied().collect();
+    let mut sent = fires(&settled(&mut policy, &queued));
+    sent.sort_unstable();
+    assert_eq!(sent, ids, "every lane serves");
+    assert_eq!(policy.cut_owed(), 0, "no raise owed");
+    policy.on_frame_posted(lanes.clone(), Instant::now());
+    policy.on_frame_retired(lanes.clone());
+    // Gone, the cap is the seal, and once granted nothing wider seals.
+    assert_eq!(seal_rows(16, 64, None, policy.queued_widest()), 16);
+    assert_eq!(seal_rows(16, 64, Some(16), 64), 16, "past the grant");
+}
+
 /// A frame held out under the cap whose raise is refused by name (it
 /// never fits beside its owner's own state) leaves with its fires, for
 /// the scheduler to fail: nothing is held for it after, and another
@@ -195,6 +509,75 @@ fn a_held_frame_whose_raise_is_refused_leaves_with_its_fires() {
     assert_eq!(policy.refuse_held(lane), vec![7], "its fires, to fail");
     assert_eq!(policy.cut_owed(), 256, "the other's still held");
     assert!(policy.refuse_held(lane).is_empty(), "nothing held for it after");
+}
+
+/// The soak's stall as the scheduler's turns meet the walk: the cap
+/// lowered 512 -> 256 -> 128 fast, a prompt cut at 512 queued; a turn
+/// reads 128 and holds the prompt out, and before its report of the
+/// hold lands (`owe_cut_rows`) the walk raises the rung back and the
+/// cap with it, so the raise had no hold to nudge for and the report
+/// found the cap already up. The turn reads the cap again after its
+/// report (`cap_moved`): the next turn seals the prompt under the
+/// current cap at once, nothing in flight, never parked on the 128 it
+/// cached.
+#[test]
+fn a_cap_raised_back_before_the_hold_is_told_seals_on_the_next_turn() {
+    const ENGINE: usize = 9401;
+    fn settled(policy: &mut FramePolicy, ids: &QueuedFireIds) -> FramePlan {
+        let mut now = Instant::now();
+        for _ in 0..100 {
+            match plan(policy, ids, now) {
+                FramePlan::Hold(wait) => now += wait.max(Duration::from_millis(1)),
+                plan => return plan,
+            }
+        }
+        panic!("held for good: {}", policy.debug_summary());
+    }
+    // One scheduler turn: the cap read, the frames planned under it,
+    // and the hold told; `between` runs where the walk may move the
+    // cap after the read. Whether the turn goes again at once.
+    fn turn(
+        policy: &mut FramePolicy,
+        ids: &QueuedFireIds,
+        between: impl FnOnce(),
+    ) -> (FramePlan, bool) {
+        let cap = crate::store::shared::fire_cap(ENGINE);
+        policy.cap_fires(cap as usize);
+        let planned = settled(policy, ids);
+        between();
+        let (owed, by) = policy.cut_owed_by();
+        crate::store::shared::owe_cut_rows(ENGINE, owed as u32, by);
+        (planned, crate::store::shared::cap_moved(ENGINE, cap))
+    }
+    let mut policy = FramePolicy::new(2, 4096, 1 << 20, None);
+    let lane = pid();
+    policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 1, 1, 1);
+    let first: QueuedFireIds = [1].into_iter().collect();
+    crate::store::shared::set_fire_cap_for_test(ENGINE, 512);
+    assert_eq!(fires(&turn(&mut policy, &first, || {}).0), vec![1]);
+    policy.on_frame_posted([lane], Instant::now());
+    policy.on_frame_retired([lane]);
+    // The walk lowers the cap twice, fast; a prompt cut at 512 queues.
+    crate::store::shared::set_fire_cap_for_test(ENGINE, 256);
+    crate::store::shared::set_fire_cap_for_test(ENGINE, 128);
+    policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 2, 512, 1);
+    let prompt: QueuedFireIds = [2].into_iter().collect();
+    // The turn reads 128 and holds the prompt; the raise lands before
+    // the hold is told.
+    let (held, again) = turn(&mut policy, &prompt, || {
+        crate::store::shared::set_fire_cap_for_test(ENGINE, 512);
+    });
+    assert!(
+        matches!(held, FramePlan::Park),
+        "held out under the 128 it read: {}",
+        policy.debug_summary()
+    );
+    assert_eq!(policy.cut_owed(), 512, "owed, told");
+    assert!(again, "the cap moved since the read: the scheduler goes again");
+    let (sealed, again) = turn(&mut policy, &prompt, || {});
+    assert_eq!(fires(&sealed), vec![2], "sealed under the current cap at once");
+    assert!(!again);
+    crate::store::shared::owe_cut_rows(ENGINE, 0, None);
 }
 
 /// Shape (2) as a seeded schedule: lanes submit frames in rounds (one or
