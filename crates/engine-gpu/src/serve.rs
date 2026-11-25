@@ -5670,7 +5670,6 @@ impl<B: Serve> Shell<B> {
             let seats = self.pools.seat_segments();
             self.commit_segments(seats)?;
         }
-        let t = std::time::Instant::now();
         let prepared = FrameShell::prepare(
             self,
             StepView {
@@ -5686,17 +5685,9 @@ impl<B: Serve> Shell<B> {
             },
             None,
         )?;
-        crate::kernel_profile::phase_if(0, t);
-        let t = std::time::Instant::now();
         let enqueued = FrameShell::enqueue(self, prepared)?;
-        crate::kernel_profile::phase_if(1, t);
-        let t = std::time::Instant::now();
         let landed = FrameShell::settle(self, enqueued)?;
-        crate::kernel_profile::phase_if(2, t);
-        let t = std::time::Instant::now();
-        let rows = self.rows_of(&landed);
-        crate::kernel_profile::phase_if(3, t);
-        rows
+        self.rows_of(&landed)
     }
 
     /// Fires `lanes` and reads back every output their programs read, the
@@ -8707,9 +8698,7 @@ impl<B: Serve> Shell<B> {
             Some(len) => handles.rewind_to(len),
             None => handles.rewind(),
         };
-        let t = std::time::Instant::now();
         let walked = self.walk_fill(prepared);
-        crate::kernel_profile::phase_if(4, t);
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
@@ -8727,10 +8716,7 @@ impl<B: Serve> Shell<B> {
         });
         rewind(&self.handles);
         let layout = laid?;
-        let t = std::time::Instant::now();
-        let filled = B::fill(self, frame, prepared, &layout, walked.launches);
-        crate::kernel_profile::phase_if(5, t);
-        filled
+        B::fill(self, frame, prepared, &layout, walked.launches)
     }
 
     /// A serving fire whose walk matched no armed body and which the load
@@ -9427,10 +9413,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 B::ready_fill(self, &prepared);
                 self.fill_once(&mut prepared)?
             };
-            let t = std::time::Instant::now();
-            let plan = B::plan(self, &mut prepared)?;
-            crate::kernel_profile::phase_if(6, t);
-            plan
+            B::plan(self, &mut prepared)?
         } else {
             B::plan(self, &mut prepared)?
         };
@@ -9540,10 +9523,7 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 picks: Vec::new(),
             })
         } else {
-            let t = std::time::Instant::now();
-            let walked = self.walk_once(&prepared, keep.is_some(), split);
-            crate::kernel_profile::phase_if(8, t);
-            walked
+            self.walk_once(&prepared, keep.is_some(), split)
         };
         self.split_layers = 1;
         let walked = walked?;
@@ -11027,24 +11007,7 @@ impl<B: Serve> Shell<B> {
         // `flags`: 1 a capturing lane of the pageless form (its key rows
         // alone), 2 every lane reading out its class's outputs, 4 no lane
         // capturing (a class that captures, fired with none).
-        let mut stride = (std::time::Instant::now(), [0u64; 10]);
         for (at, (lanes, fed, carried, flags)) in shapes.iter().enumerate() {
-            // Under the kernel profile, each 64 shapes' time and its phases:
-            // whether the walk slows as it goes.
-            if crate::kernel_profile::phases_timed() && at % 64 == 0 && at > 0 {
-                let now: [u64; 10] = std::array::from_fn(|phase| {
-                    crate::kernel_profile::WALK_PHASES[phase].load(std::sync::atomic::Ordering::Relaxed)
-                });
-                let ms: Vec<u64> = now.iter().zip(&stride.1).map(|(n, b)| (n - b) / 1_000_000).collect();
-                tracing::info!(
-                    at,
-                    of = shapes.len(),
-                    ms = stride.0.elapsed().as_millis() as u64,
-                    phases_ms = ?ms,
-                    "arm walk stride"
-                );
-                stride = (std::time::Instant::now(), now);
-            }
             // A known lattice states eager what its allowance did; every shape
             // short of it is walked, the ones whose family an earlier shape
             // recorded filling it (their fills kept before ready).
@@ -11055,7 +11018,6 @@ impl<B: Serve> Shell<B> {
             }) {
                 break;
             }
-            let probed = std::time::Instant::now();
             let used = rss().saturating_sub(before);
             // The next shape's bodies cost what the dearest so far did, on
             // each arm: on the host (its resident bytes) and on the device
@@ -11079,7 +11041,6 @@ impl<B: Serve> Shell<B> {
                     .saturating_add(maps_before)
                     >= most
             });
-            crate::kernel_profile::phase_if(9, probed);
             if device_short || host_short || cmds_short || maps_short {
                 let from = lanes.iter().map(|&(_, rows)| rows).sum::<u32>();
                 let eager: Vec<String> = shapes[at..]
@@ -11136,13 +11097,11 @@ impl<B: Serve> Shell<B> {
             }
             let families = self.recorded;
             for arm in 0..depth {
-                let probed = std::time::Instant::now();
                 let ahead = rss();
                 let cmds_ahead = B::command_buffers(self).0;
                 let maps_ahead = maps_seen;
                 let left_ahead = self.device.left();
                 let bodies_ahead = self.recorded;
-                crate::kernel_profile::phase_if(9, probed);
                 let owned = lanes
                     .iter()
                     .map(|&(class, rows)| {
@@ -11194,9 +11153,6 @@ impl<B: Serve> Shell<B> {
                 for before in 0..arm {
                     self.arms.take(before);
                 }
-                crate::kernel_profile::family_log(&format!(
-                    "shape {at} arm {arm} lanes {lanes:?} fed {fed} form {carried:?} flags {flags}"
-                ));
                 self.walk_at = Some(at);
                 let fired = self.fire_seated(&seated);
                 self.walk_at = None;
@@ -11239,7 +11195,6 @@ impl<B: Serve> Shell<B> {
                     recorded += 1;
                     continue;
                 }
-                let probed = std::time::Instant::now();
                 let on_device = left_ahead.saturating_sub(self.device.left());
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
@@ -11249,7 +11204,6 @@ impl<B: Serve> Shell<B> {
                 if let (Some(ahead), Some(after)) = (maps_ahead, maps_seen) {
                     dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
                 }
-                crate::kernel_profile::phase_if(9, probed);
                 recorded += 1;
             }
             if self.recorded > families {

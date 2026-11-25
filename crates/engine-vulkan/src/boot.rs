@@ -24,6 +24,8 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
             fires_stated: false,
             #[cfg(feature = "test-limits")]
             whole_pool: false,
+            #[cfg(feature = "test-limits")]
+            verify_fills: false,
         },
         contract_for,
     ))
