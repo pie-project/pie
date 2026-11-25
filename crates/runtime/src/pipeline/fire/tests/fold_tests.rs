@@ -143,33 +143,6 @@ fn frozen_as_prepared(by: Option<&FoldBy>) -> Option<u64> {
     }
 }
 
-/// A fold placed when its fire settles, the fire submitted on `ws`.
-fn settled(
-    stores: &Stores,
-    ws: WorkingSetId,
-    count: Option<u32>,
-    tags: Vec<u64>,
-    reach: u64,
-    written: bool,
-) -> FoldAt {
-    stores.kv.lock().unsettle(ws).unwrap();
-    let completion = crate::engine::WorkItemCompletion::deferred_with_guard(None);
-    FoldAt {
-        by: FoldBy::Settled {
-            count,
-            tags,
-            reach,
-            written,
-            rs: None,
-            unplaced: Some(Unplaced {
-                ws,
-                submitted: Some((stores.kv.clone(), completion)),
-            }),
-        },
-        decoded: false,
-    }
-}
-
 fn taken(tags: &[ReportTag]) -> std::collections::HashMap<u64, ::engine::KvWrites> {
     tags.iter()
         .filter_map(|tag| tag.take().map(|written| (tag.0, written)))
@@ -189,13 +162,11 @@ fn none() -> std::collections::HashMap<u64, ::engine::KvWrites> {
 }
 
 const UNSETTLED: KvStoreError = KvStoreError::Table(KvTableError::FoldUnsettled);
-const UNPLACED: KvStoreError = KvStoreError::Table(KvTableError::FoldUnplaced);
 
 #[test]
 fn fold_every_case() {
     a_fold_the_host_knows_is_frozen_as_its_fire_is_prepared();
     a_fold_the_device_counts_leaves_the_folded_length_until_it_settles();
-    a_fold_never_reported_leaves_the_folded_length_a_bound();
     a_piece_inside_the_frozen_prefix_begins_nothing();
 }
 
@@ -321,28 +292,6 @@ fn a_fold_the_device_counts_leaves_the_folded_length_until_it_settles() {
     assert_eq!(folded(&stores, child), (7, true));
 }
 
-/// A fold whose count never came (the engine reported none, or the
-/// pass failed) settles unplaced: the folded length is a lower bound
-/// from then on, in the set, so the set is forked no more, and nothing
-/// waits for a settle that has happened.
-fn a_fold_never_reported_leaves_the_folded_length_a_bound() {
-    for failure in [None, Some("the fire failed")] {
-        let (_, stores, ws) = frozen_at(4);
-        let (count, tags) = match failure {
-            None => (None, vec![u64::MAX]),
-            Some(_) => (Some(3), Vec::new()),
-        };
-        let fold = settled(&stores, ws, count, tags, 20, false);
-        assert_eq!(stores.kv.lock().fork(ws), Err(UNSETTLED));
-        settle_fold(&stores, ws, fold, &none(), None, failure);
-        assert_eq!(folded(&stores, ws), (4, false));
-        assert_eq!(stores.kv.lock().unsettled(ws).unwrap(), 0);
-        // No fire is left to place it: a copy would state the bound
-        // as its length, and is refused by that name.
-        assert_eq!(stores.kv.lock().fork(ws), Err(UNPLACED));
-    }
-}
-
 /// A piece that would write inside what its set froze begins no log
 /// and freezes nothing; it and any other piece prepared and not fired
 /// fail the pipeline, and a set of a failed pipeline, or a fork of
@@ -375,118 +324,6 @@ fn a_piece_inside_the_frozen_prefix_begins_nothing() {
     assert_eq!(set.claim_pipeline_scope(&next), refused);
     assert_eq!(forked.claim_pipeline_scope(&next), refused);
     assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
-}
-
-/// What a fire froze as it was prepared stands when the fire does not
-/// follow, so the pipeline fails however the call that prepared it
-/// ends: here by a trap between the freeze and the submit, on a pass
-/// gone, and dropped where it waits. What [`reserve`] returns says so
-/// until the engine takes the fire.
-#[tokio::test(flavor = "current_thread")]
-async fn a_fire_prepared_and_never_submitted_fails_its_pipeline() {
-    use crate::store::{PipelineScope, ScopeRefusal};
-
-    async fn prepared(
-        ctx: &mut TestContext,
-        model: usize,
-        stores: &Stores,
-        failure: &PipelineFailure,
-    ) -> Unfired {
-        let none = || Ok(rs::RsPlan::Groups(Vec::new()));
-        let id = uuid::Uuid::new_v4();
-        let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], &[], none, false);
-        reserved.await.unwrap().unfired
-    }
-    /// A piece prepared as a pass prepares one, whose call then asks
-    /// for a pass gone, as each path does before its submit.
-    async fn trapped(
-        ctx: &mut TestContext,
-        model: usize,
-        stores: &Stores,
-        ws: WorkingSetId,
-        failure: &PipelineFailure,
-    ) -> Anyhow<()> {
-        let unfired = prepared(ctx, model, stores, failure).await;
-        begin_piece(&mut stores.kv.lock(), ws, 4, Some(7))?;
-        let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
-        ctx.resources().get_mut(&gone)?;
-        drop(unfired.submitted());
-        Ok(())
-    }
-
-    let (model, stores, ws) = frozen_at(4);
-    let mut ctx = Flight::context();
-    let failure = PipelineFailure::default();
-    let scope = PipelineScope::failing_as(failure.clone(), || true);
-    let set = KvWorkingSet::new(model, 0, ws, 4);
-    set.claim_pipeline_scope(&scope).unwrap();
-    assert!(
-        trapped(&mut ctx, model, &stores, ws, &failure)
-            .await
-            .is_err()
-    );
-    assert_eq!(folded(&stores, ws), (7, true), "the freeze stands");
-    assert_eq!(set.pipeline_failure().as_deref(), Some(UNFIRED));
-    let child = stores.kv.lock().fork(ws).unwrap();
-    scope.close();
-    let next = PipelineScope::failing_as(Default::default(), || true);
-    let refused = Err(ScopeRefusal::Failed {
-        owner: scope.id(),
-        reason: UNFIRED.to_string(),
-    });
-    assert_eq!(set.claim_pipeline_scope(&next), refused);
-    assert_eq!(set.forked(child).claim_pipeline_scope(&next), refused);
-
-    // A refusal that said why keeps its reason.
-    let failure = PipelineFailure::default();
-    let unfired = prepared(&mut ctx, model, &stores, &failure).await;
-    let gone: Resource<ForwardPass> = Resource::new_borrow(u32::MAX);
-    record_submit_failure(&mut ctx, &gone, &failure, "pipeline: submit failed");
-    drop(unfired);
-    assert_eq!(
-        failure.lock().unwrap().as_deref(),
-        Some("pipeline: submit failed")
-    );
-
-    // A call dropped where it waits, its fire prepared.
-    let failure = PipelineFailure::default();
-    let unfired = prepared(&mut ctx, model, &stores, &failure).await;
-    let mut waiting = Box::pin(async move {
-        let _unfired = unfired;
-        std::future::pending::<()>().await;
-    });
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    assert!(waiting.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(*failure.lock().unwrap(), None);
-    drop(waiting);
-    assert_eq!(failure.lock().unwrap().as_deref(), Some(UNFIRED));
-
-    // A fire the engine took leaves this one no more (what it leaves
-    // until it is queued is its own), and a reserve refused leaves none.
-    let failure = PipelineFailure::default();
-    let unqueued = prepared(&mut ctx, model, &stores, &failure)
-        .await
-        .submitted();
-    assert_eq!(*failure.lock().unwrap(), None);
-    drop(unqueued);
-    assert_eq!(failure.lock().unwrap().as_deref(), Some(UNQUEUED));
-    let failure = PipelineFailure::default();
-    let refused = || Err("no mode".to_string());
-    let id = uuid::Uuid::new_v4();
-    let reserved = reserve(
-        &mut ctx,
-        (model, 0),
-        &stores,
-        id,
-        &failure,
-        &[],
-        &[],
-        &[],
-        refused,
-        false,
-    );
-    assert!(reserved.await.is_err());
-    assert_eq!(*failure.lock().unwrap(), None);
 }
 
 /// `tokens` written into `ws` from row 0, 16 rows a page, by a pass

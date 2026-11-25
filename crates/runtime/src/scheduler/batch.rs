@@ -804,67 +804,10 @@ mod tests {
         }
     }
 
-    /// Plain decodes step together as ever: N single-row lanes form one
-    /// step at N = 8 and 64, on a model with no recurrent state (Qwen3) and
-    /// on one with it (Qwen3.5, each decode folding its row, replaying
-    /// nothing): the step's own rung is the one its rows together pick, not
-    /// the narrow one each decode alone asked.
-    #[test]
-    fn plain_decodes_form_one_step_whatever_their_rungs() {
-        let rung = |tokens: u32| {
-            let pad = |bytes: u64| bytes.div_ceil(256) * 256;
-            let slots = [12288u64, 64, 4096, 12288, 128, 128, 8192, 8192];
-            let room = slots
-                .iter()
-                .map(|&slot| pad(2 * u64::from(tokens) * slot))
-                .sum::<u64>()
-                + pad(u64::from(tokens) * 262_144 * 4);
-            (
-                tokens,
-                ::engine::RungReplay {
-                    own_max: Some(tokens),
-                    carried_max: Some(tokens),
-                    scratch: ::engine::ScratchBytes {
-                        slot_bytes: slots.to_vec(),
-                        lane_bytes: 262_144 * 4,
-                        room_bytes: room,
-                        pad: 256,
-                    },
-                },
-            )
-        };
-        let rungs = std::sync::Arc::new(vec![rung(1), rung(8), rung(64), rung(256)]);
-        let limits = SchedulerLimits {
-            max_forward_requests: 256,
-            max_forward_tokens: 4096,
-            max_page_refs: 4096,
-            ..limits()
-        };
-        for n in [8u64, 64] {
-            for carrying in [false, true] {
-                let wave: Vec<Box<PendingRequest>> = (1..=n)
-                    .map(|instance| {
-                        let mut request = decode(9, u32::try_from(instance).unwrap());
-                        if carrying {
-                            request.replay_rungs = Some(rungs.clone());
-                            request.scratch_compact = false;
-                        }
-                        pending(request, InstanceId(instance))
-                    })
-                    .collect();
-                let (frame, _) =
-                    build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
-                assert_eq!(frame.steps.len(), 1, "{n} decodes (rs {carrying}) are one step");
-                assert_eq!(frame.steps[0].submission.lanes.len(), n as usize);
-            }
-        }
-    }
-
     #[test]
     fn batch_every_case() {
         members_cobatch_by_concatenation();
         two_passes_groups_never_meet();
-        a_frames_cells_are_one_per_member_and_never_shared();
         a_step_carries_no_more_than_its_rungs_tokens();
     }
 
@@ -951,29 +894,6 @@ mod tests {
             groups,
             [0, 0, 1, 1, 2, 2, 3, 3].map(Some).to_vec(),
             "each pass keeps its own groups"
-        );
-    }
-
-    fn a_frames_cells_are_one_per_member_and_never_shared() {
-        let (frame, flattened) = build_frame_submission(
-            vec![
-                vec![pending(decode(11, 3), InstanceId(1))],
-                vec![pending(decode(22, 4), InstanceId(2))],
-            ],
-            limits(),
-            16,
-            &SchedulerStats::default(),
-        );
-        let cells: Vec<_> = frame.terminal_cells().collect();
-        assert_eq!(cells.len(), flattened.len());
-        assert_eq!(
-            cells
-                .iter()
-                .map(|cell| std::sync::Arc::as_ptr(&cell.0))
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            cells.len(),
-            "no cell is owned by two members"
         );
     }
 

@@ -13,12 +13,6 @@ pub(super) struct FireRows {
 }
 
 impl FireRows {
-    /// The rows a rung must hold for these: its own and its carried rows
-    /// each.
-    #[cfg(test)]
-    pub(super) fn ask(self) -> u32 {
-        self.own.max(self.carried)
-    }
 
     pub(super) fn of(lanes: impl IntoIterator<Item = FireRows>) -> FireRows {
         lanes

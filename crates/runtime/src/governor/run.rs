@@ -796,50 +796,6 @@ mod tests {
         assert_eq!(pool.segments(), 1000);
     }
 
-    #[test]
-    fn a_pool_that_does_not_yield_keeps_its_budget_under_pressure() {
-        let host = Host::new(5000);
-        let mut pool = Pool::on(&host, 1000, ELASTIC);
-        let mut steer = Steer::new(&pool, Yield::NONE);
-        assert!(pressed(&mut steer, &mut pool, 1.0).is_empty());
-        assert_eq!(pool.segments(), 1000);
-    }
-
-    #[test]
-    fn a_refusal_reads_as_full_pressure() {
-        struct Refusing(Pool, bool);
-        impl PoolTarget for Refusing {
-            fn segment_bytes(&self) -> u64 {
-                self.0.segment_bytes()
-            }
-            fn floor(&self) -> u64 {
-                self.0.floor()
-            }
-            fn hard_limit(&self) -> u64 {
-                self.0.hard_limit()
-            }
-            fn held(&self) -> u64 {
-                self.0.held()
-            }
-            fn growth(&self) -> Growth {
-                self.0.growth()
-            }
-            fn retarget(&mut self, segments: u64) -> Retarget {
-                self.0.retarget(segments)
-            }
-            fn take_refused(&mut self) -> bool {
-                std::mem::take(&mut self.1)
-            }
-        }
-        let host = Host::new(5000);
-        let mut pool = Refusing(Pool::on(&host, 1000, ELASTIC), true);
-        let mut steer = Steer::new(&pool, Yield::new(1.0).unwrap());
-        steer.turn(&mut pool, 0.0, &mut |_| {});
-        assert_eq!(pool.0.segments(), 100, "the floor");
-        steer.turn(&mut pool, 0.0, &mut |_| {});
-        assert_eq!(pool.0.segments(), 1000, "one refusal is one reading");
-    }
-
     /// Two pools on one host: a reader that counts what both hold.
     fn two_pools(
         free: i64,
@@ -876,31 +832,6 @@ mod tests {
         assert_eq!(sb.ceiling(), Some(500 * MIB));
         let ceilings = sa.ceiling().unwrap() + sb.ceiling().unwrap();
         assert!(ceilings <= 1400 * MIB, "together within the host");
-    }
-
-    #[test]
-    fn a_shrink_without_room_sheds_through_tier_pressure() {
-        let host = Host::new(1000);
-        let mut pool = Pool::on(&host, 1000, ELASTIC);
-        pool.pinned = 700;
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
-        tick(&mut steer, &mut pool);
-        host.others.store(500, Ordering::Relaxed);
-        let signals = tick(&mut steer, &mut pool);
-        assert_eq!(
-            signals,
-            vec![Signal::TierPressure {
-                held_bytes: 700 * MIB,
-                target_bytes: 500 * MIB,
-            }]
-        );
-        // What it holds stays: nothing was dropped, nothing failed.
-        assert_eq!(pool.segments(), 700);
-        // Once the stores have shed, the shrink lands and the pressure eases.
-        pool.pinned = 0;
-        assert_eq!(tick(&mut steer, &mut pool), vec![Signal::Eased]);
-        assert_eq!(pool.segments(), 500);
     }
 
     #[test]

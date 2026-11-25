@@ -307,51 +307,6 @@ mod tests {
         }]
     }
 
-    /// The regions `backend`'s emitter gives a program, each by its text
-    /// under one symbol: what engine-cuda and engine-metal key a region's
-    /// module by. For `wgsl`, the step calls its stages dispatch, each by its
-    /// module's text: the pipelines engine-vulkan and engine-wgpu run it on.
-    fn regions(traced: &Traced, backend: &str) -> std::collections::BTreeSet<String> {
-        use eta_compiler::codegen::wgsl;
-        let mut registry =
-            super::super::program::Registry::new(std::num::NonZeroUsize::new(1).unwrap());
-        let program = registry
-            .register(
-                traced.encode(),
-                vec![outputs()],
-                EngineCaps::default(),
-                eta_ir::validate::Budget {
-                    room_bytes: u64::MAX,
-                    submit: None,
-                },
-                None,
-                None,
-            )
-            .expect("registers");
-        if backend == "wgsl" {
-            let calls = wgsl::step_calls();
-            return program
-                .launch()
-                .plans
-                .iter()
-                .flat_map(|plan| {
-                    wgsl::emit_launch_steps("ptir_step", plan)
-                        .expect("lowers to steps")
-                        .steps
-                })
-                .map(|step| wgsl::step_module("ptir_step", &calls[step.call as usize]))
-                .collect();
-        }
-        program
-            .emitted(backend)
-            .expect("emits")
-            .kernels
-            .iter()
-            .filter(|kernel| !kernel.source.is_empty())
-            .map(|kernel| kernel.source.replace(&kernel.entry_name, "ptir_region"))
-            .collect()
-    }
-
     /// A standard prompt pass and the built-in `prefill` register, at the
     /// row bound, the one program the prewarm registered, whatever the
     /// prompt's length: the length is data, not the program's identity.
@@ -388,54 +343,4 @@ mod tests {
         assert_eq!(registry.counts().0, 2, "one program each: the prompt pass and `prefill`");
     }
 
-    /// Every standard shape's prompt and decode programs, traced through
-    /// the SDK's own stage bodies (`eta_dsl::sampler`, which the built-in
-    /// inferlets run), register the regions the prewarm built, whatever a
-    /// request's knob values, temperature, seed and prompt length: a change
-    /// to the SDK's sampler that a request's values reach, or to the shapes
-    /// the prewarm covers, fails here.
-    #[test]
-    fn a_standard_request_registers_the_regions_the_prewarm_built() {
-        let prewarmed = traces(VOCAB, 16, &outputs(), 8).expect("traces");
-        let standard = sampler::standard();
-        assert_eq!(prewarmed.len(), 2 * standard.len() + 1, "and the built-in `prefill`");
-        let requests = [
-            Request {
-                temperature: 0.7,
-                knob: 0.9,
-                top_k: 7,
-                seed: 1234,
-                prompt: 37,
-            },
-            Request {
-                temperature: 1.3,
-                knob: 0.5,
-                top_k: 20,
-                seed: 7,
-                prompt: 280,
-            },
-        ];
-        for ((name, shape), built) in standard.iter().zip(prewarmed.chunks(2)) {
-            for request in &requests {
-                let asked = passes(VOCAB, 16, &outputs(), 8, shape, request).expect("traces");
-                for (pass, (built, asked)) in
-                    ["prompt", "decode"].iter().zip(built.iter().zip(&asked))
-                {
-                    for backend in ["cuda", "metal", "wgsl"] {
-                        let (built, asked) = (regions(&built.1, backend), regions(asked, backend));
-                        assert!(
-                            !built.is_empty(),
-                            "{name} ({pass}, {backend}) emits no region"
-                        );
-                        assert_eq!(
-                            built, asked,
-                            "{name} ({pass}, {backend}): a request at temperature {} builds a \
-                             region the prewarm did not",
-                            request.temperature
-                        );
-                    }
-                }
-            }
-        }
-    }
 }

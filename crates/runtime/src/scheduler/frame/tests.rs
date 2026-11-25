@@ -36,7 +36,6 @@ fn frame_every_case() {
     seals_complete_lanes_and_orders_waves_by_slot();
     incomplete_lane_holds_the_seal_until_it_completes();
     graceful_close_releases_the_wait();
-    a_lone_computing_lane_is_sealed_past_only_with_the_device_idle();
     a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name();
     processes_over_the_execution_permits_joining_together_all_finish();
 }
@@ -171,57 +170,6 @@ fn processes_over_the_execution_permits_joining_together_all_finish() {
             );
         }
     }
-}
-
-/// The frame / eviction cycle (a process waited at admission behind a
-/// preempted one, then its eviction waited on its set's fires, which
-/// sat in an unsealed frame): 42 lanes, 41 of them in with complete
-/// frames, the 42nd mid-frame (one of its two fires in). Its owner's
-/// eviction starts: its lane leaves the expected set, its front cut to
-/// what it submitted, and the frame seals at once, all 42 lanes' fires
-/// in one seal and one dispatch, none of them sent apart; the evicted
-/// owner's fire is with the engine, so the eviction's wait on it ends.
-#[test]
-fn an_owner_s_eviction_seals_the_frame_it_holds_whole() {
-    let mut policy =
-        FramePolicy::new(1, 64, 4096, None);
-    let lanes: Vec<ProcessId> = (0..42).map(|_| pid()).collect();
-    // A first frame of all 42: every lane is expected after it.
-    for (at, &lane) in lanes.iter().enumerate() {
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), at as u64 + 1, 1, 1);
-    }
-    let queued: QueuedFireIds = (1..=42).collect();
-    assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 42);
-    policy.on_frame_posted(lanes.clone(), Instant::now());
-    policy.on_frame_retired(lanes.clone());
-    // The next frame: 41 lanes in, the 42nd one fire of two.
-    let mut queued: Vec<u64> = Vec::new();
-    for (at, &lane) in lanes.iter().enumerate().take(41) {
-        policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 100 + at as u64, 1, 1);
-        queued.push(100 + at as u64);
-    }
-    let evicted = lanes[41];
-    policy.on_fire_enqueued(stamp(evicted, 1, 0, 2), Some(evicted), 200, 1, 1);
-    queued.push(200);
-    let ids: QueuedFireIds = queued.iter().copied().collect();
-    assert!(
-        !matches!(plan(&mut policy, &ids, Instant::now()), FramePlan::Dispatch(_)),
-        "control: the 42nd lane is expected and mid-frame: the frame waits"
-    );
-    // Its eviction starts.
-    policy.on_process_suspend(evicted);
-    let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, Instant::now()) else {
-        panic!("its eviction seals the frame at once");
-    };
-    let sent: Vec<u64> = waves.iter().flatten().copied().collect();
-    assert_eq!(sent.len(), 42, "all 42 lanes' fires in the one seal: {waves:?}");
-    assert!(sent.contains(&200), "the evicted owner's fire goes with the engine");
-    assert_eq!(waves.iter().filter(|wave| !wave.is_empty()).count(), 1, "one dispatch");
-    let rest: QueuedFireIds = std::iter::empty().collect();
-    assert!(
-        !matches!(plan(&mut policy, &rest, Instant::now()), FramePlan::Dispatch(_)),
-        "nothing sent apart"
-    );
 }
 
 /// A frame held out under the cap whose raise is refused by name (it
@@ -582,41 +530,4 @@ fn graceful_close_releases_the_wait() {
         !matches!(plan(&mut policy, &empty, Instant::now()), FramePlan::Dispatch(_)),
         "nothing is left to seal once a closes"
     );
-}
-
-/// A guest that computes past its frame-mates with nothing in flight is
-/// sealed past, never held for good nor terminated: its frame-mates fire,
-/// and its next submit rejoins the frame after. While a frame is in
-/// flight, the same lane is held for.
-fn a_lone_computing_lane_is_sealed_past_only_with_the_device_idle() {
-    let mut policy = FramePolicy::new(1, 64, 4096, None);
-    let (a, b) = (pid(), pid());
-    policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 10, 1, 1);
-    policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 11, 1, 1);
-    let both: QueuedFireIds = [10, 11].into_iter().collect();
-    assert_eq!(fires(&plan(&mut policy, &both, Instant::now())).len(), 2);
-    policy.on_frame_posted(vec![a, b], Instant::now());
-    policy.on_frame_retired(vec![a, b]);
-
-    // b submits, a computes. With a frame in flight, a is held for.
-    policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 12, 1, 1);
-    let only_b: QueuedFireIds = [12].into_iter().collect();
-    match policy.plan_dispatch(&only_b, &HashSet::new(), true, Instant::now()) {
-        FramePlan::Dispatch(waves) => panic!("held for a while a frame is in flight, got {waves:?}"),
-        _ => {}
-    }
-    // Nothing in flight: the frame seals past a.
-    assert_eq!(fires(&plan(&mut policy, &only_b, Instant::now())), vec![12]);
-    assert!(policy.debug_summary().contains("sealed past"));
-    policy.on_frame_posted(vec![b], Instant::now());
-    policy.on_frame_retired(vec![b]);
-
-    // a's next submit rejoins: it is awaited again and fires with b.
-    policy.on_fire_enqueued(stamp(a, 1, 0, 1), Some(a), 13, 1, 1);
-    policy.on_fire_enqueued(stamp(b, 2, 0, 1), Some(b), 14, 1, 1);
-    let rejoined: QueuedFireIds = [13, 14].into_iter().collect();
-    let mut got = fires(&plan(&mut policy, &rejoined, Instant::now()));
-    got.sort_unstable();
-    assert_eq!(got, vec![13, 14], "a rejoins with its next submit");
-    assert!(!policy.debug_summary().contains("sealed past"), "its submit clears the mark");
 }

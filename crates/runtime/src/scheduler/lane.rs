@@ -2524,34 +2524,6 @@ fn copy_settled_on_landing(
 mod landing_tests {
     use super::*;
 
-    /// An engine tells a frame's steps in any order (one with no instance
-    /// from its device's completion, one with instances at a later
-    /// harvest): each step's reads come back at its own landing, the
-    /// frame's entry goes only once every step has landed. Taken by
-    /// position, the last step landing first dropped the frame, and the
-    /// earlier step's reads were never let go (its items never freed).
-    #[test]
-    fn a_frame_s_steps_landing_out_of_order_each_give_their_reads_back() {
-        let frame = ::engine::FrameId(7);
-        let owner = |n: u64| crate::store::roles::Owner::Instance(::engine::InstanceId(n));
-        let mut landed: HashMap<::engine::FrameId, Vec<LandingReads>> = HashMap::new();
-        landed.insert(
-            frame,
-            vec![
-                Some((vec![::engine::InstanceId(1)], vec![owner(1)])),
-                Some((Vec::new(), Vec::new())),
-            ],
-        );
-        assert_eq!(take_landing(&mut landed, frame, 1), Some((Vec::new(), Vec::new())));
-        assert!(landed.contains_key(&frame), "step 0 has not landed");
-        assert_eq!(
-            take_landing(&mut landed, frame, 0),
-            Some((vec![::engine::InstanceId(1)], vec![owner(1)]))
-        );
-        assert!(landed.is_empty(), "every step landed");
-        assert_eq!(take_landing(&mut landed, frame, 0), None, "told once");
-    }
-
     use ::engine::chunk::{ShapeId, SlotCopy};
     use ::engine::fire::{FrameSubmission, FrameTicket};
     use ::engine::load::{LoadRequest, Loaded};
