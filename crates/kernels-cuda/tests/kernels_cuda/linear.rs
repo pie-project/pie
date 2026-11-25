@@ -4,6 +4,7 @@ mod dequant_scratch;
 mod gemm;
 mod gemm_sm100;
 mod gemm_sm100_epilogue;
+mod lora;
 mod moe_mega;
 mod moe_priced;
 mod moe_route;

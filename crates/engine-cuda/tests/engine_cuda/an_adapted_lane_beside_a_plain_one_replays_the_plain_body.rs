@@ -10,7 +10,13 @@ use std::path::Path;
 use crate::common_encoder::{Weights, contract_for};
 use engine::fire::Readout;
 use engine::live::Tally;
-use engine_cuda::{AdapterPlane, Boot, Graphs, Lane, Seated, Shell};
+use engine_cuda::adapter::{planes_of, sink_of};
+use engine_cuda::{AdapterPlane, AdapterSource, Boot, Graphs, Lane, Seated, Shell};
+use eta_compiler::plan::compile_bound;
+use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use eta_ir::op::Op;
+use eta_ir::registry::Stage;
+use eta_ir::types::Shape;
 use poem::{
     Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, fact, ops,
     trace_hybrid,
@@ -91,14 +97,68 @@ fn shell(trace: poem::Trace, path: &Path, lanes: u32) -> Shell {
     .expect("the shell loads")
 }
 
-/// A bf16 plane of `count` values from a seeded ramp, `scale` wide.
+/// The adapter a program's `lora` sink binds: its planes seeded into the
+/// channels the sink reads, landed as the engine's bind lands them. The
+/// load states no adapter capacity.
+fn bind_through_a_sink(shell: &mut Shell) -> u32 {
+    let chan = |shape| ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(eta_ir::types::Dtype::F32),
+        capacity: 1,
+        host_role: HostRole::None,
+        seeded: true,
+    };
+    let (rank, width) = (RANK as u32, WIDTH as u32);
+    let container = TraceContainer {
+        names: vec!["lora".to_string()],
+        channels: vec![
+            chan(Shape::new(&[1, rank, width]).expect("A is [layers, rank, hidden]")),
+            chan(Shape::new(&[1, width, rank]).expect("B is [layers, hidden, rank]")),
+            chan(Shape::vector(1)),
+        ],
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::Prologue,
+            ops: vec![
+                Op::ChanRead(0),
+                Op::ChanRead(1),
+                Op::ChanRead(2),
+                Op::SinkCall { name: 0, args: vec![0, 1, 2] },
+            ],
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let bound = crate::bound::logits(container, VOCAB).expect("the lora prologue binds");
+    let package = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
+    let sink = sink_of(&package).expect("the sink reads").expect("the program has a sink");
+    let seeds = [plane(RANK * WIDTH, 7, 0.5), plane(WIDTH * RANK, 13, 0.5)];
+    let seats = shell.bank_seats();
+    let site = sink.site().expect("the sink names one site or none");
+    let built: Vec<(String, Vec<u8>)> = sink
+        .planes
+        .iter()
+        .flat_map(|(role, channel)| {
+            planes_of(*role, site, &seeds[*channel as usize], &seats).expect("a plane fits")
+        })
+        .collect();
+    let planes: Vec<AdapterPlane<'_>> = built
+        .iter()
+        .map(|(bank, bytes)| AdapterPlane { bank, bytes })
+        .collect();
+    shell
+        .bind_adapter(AdapterSource::Own { instance: engine::InstanceId(1), planes: &planes })
+        .expect("a load stating no capacity binds a sink's adapter")
+        .slot
+}
+
+/// An f32 plane of `count` values from a seeded ramp, `scale` wide.
 fn plane(count: u64, seed: u32, scale: f32) -> Vec<u8> {
     (0..count as u32)
         .flat_map(|at| {
             let unit = ((at.wrapping_mul(2_654_435_761).wrapping_add(seed)) >> 8) as f32
                 / (1u32 << 24) as f32;
-            let value = (unit * 2.0 - 1.0) * scale;
-            ((value.to_bits() >> 16) as u16).to_le_bytes()
+            ((unit * 2.0 - 1.0) * scale).to_le_bytes()
         })
         .collect()
 }
@@ -119,22 +179,7 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = Weights::random(&trace, 4111).write(dir.path());
     let mut shell = shell(trace.clone(), &path, 2);
-    assert!(shell.adapters().slots().seats() > 0, "the load seats adapters");
-    shell
-        .register_adapter(
-            1,
-            &[
-                AdapterPlane {
-                    bank: BANK_A,
-                    bytes: &plane(RANK * WIDTH, 7, 0.5),
-                },
-                AdapterPlane {
-                    bank: BANK_B,
-                    bytes: &plane(WIDTH * RANK, 13, 0.5),
-                },
-            ],
-        )
-        .expect("the adapter registers");
+    let adapter = bind_through_a_sink(&mut shell);
 
     let pages: Vec<Vec<u32>> = (0..8u32)
         .map(|slot| {
@@ -174,7 +219,7 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
 
     // Lane 0 plain, lane 1 adapted: batched in slots 0 and 1, alone in 2
     // and 3; the adapted lane's prompt without its adapter in slot 4.
-    let adapter_of = |lane: u32| (lane == 1).then_some(1u32);
+    let adapter_of = |lane: u32| (lane == 1).then_some(adapter);
     let mut tokens = [[0u32; 2]; 2];
     for lane in 0..2u32 {
         for (side, slot) in [(0usize, lane), (1, 2 + lane)] {
@@ -224,7 +269,7 @@ fn an_adapted_lane_beside_a_plain_one_replays_the_plain_body() {
     // The adapter is read: the adapted lane's prompt without it answers
     // otherwise than with it.
     shell.open(5).expect("a slot opens");
-    let with = fire(&mut shell, &[(5, &prompt(1), 0, Some(1))]).swap_remove(0);
+    let with = fire(&mut shell, &[(5, &prompt(1), 0, Some(adapter))]).swap_remove(0);
     let (moved, span) = worst(&with, &bare);
     eprintln!("the adapter moves the prompt's logits {moved} of a span {span}");
     assert!(moved > span * 5e-2, "the adapter moves the logits ({moved} of {span})");
