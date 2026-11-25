@@ -360,6 +360,8 @@ impl Forms {
 
 #[cfg(test)]
 mod tests {
+    use eta_exec::Extents;
+
     use super::*;
 
     /// A stage of two values and one op, `args` its operands, its result at
@@ -418,6 +420,8 @@ mod tests {
         use eta_dsl::prelude::*;
         use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port};
 
+        pub const QWEN_VOCAB: u32 = 151_936;
+
         fn leak(channel: Channel) -> &'static Channel {
             Box::leak(Box::new(channel))
         }
@@ -443,6 +447,68 @@ mod tests {
             (b, tok_in)
         }
 
+        /// `text-completion-bench`'s decode epilogue: a temperature-scaled
+        /// top-p Gumbel-max draw.
+        pub fn top_p(vocab: u32) -> Traced {
+            let (temperature, top_p) = (0.6f32, 0.95f32);
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = intrinsics::output(0, "logits");
+                let probs = softmax(cast(&logits, dtype::bf16) * (1.0 / temperature));
+                let keep = pivot_threshold(probs, cummass_le(top_p));
+                let r = rng.take();
+                let r_next = &r + iota(2);
+                rng.put(&r_next);
+                let t = reshape(gumbel_argmax(&logits, &keep, 1.0 / temperature, &r), [1]);
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            out.note_host_take();
+            b.build().expect("the top-p epilogue traces")
+        }
+
+        /// The `compat` generate step's sampler with a top-k and a top-p
+        /// cut: both pivots, their `and`, the mask and a Gumbel-max draw.
+        pub fn top_k_top_p(vocab: u32) -> Traced {
+            let temperature = 0.8f32;
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let probs = softmax(cast(&logits, dtype::bf16) * (1.0 / temperature));
+                let ranked = pivot_threshold(&probs, rank_le(40u32));
+                let nucleus = pivot_threshold(&probs, cummass_le(0.9f32));
+                let keep = and(&ranked, &nucleus);
+                let token = reshape(gumbel_argmax(&logits, keep, 1.0 / temperature, &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the top-k top-p epilogue traces")
+        }
+
+        /// A temperature Gumbel-max draw with no cut.
+        pub fn gumbel_max_only(vocab: u32) -> Traced {
+            let rng = leak(Channel::from([0x7ce1u32, 0]));
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let r = rng.take();
+                let logits = intrinsics::output(0, "logits");
+                let token = reshape(gumbel_argmax(logits, true, 1.0 / 0.7f32, &r), [1]);
+                rng.put(&r + iota(2));
+                tok_in.put(&token);
+                out.put(&token);
+            });
+            out.note_host_take();
+            b.build().expect("the gumbel-max epilogue traces")
+        }
+
         /// The greedy decode epilogue.
         pub fn greedy(vocab: u32) -> Traced {
             let out = leak(Channel::new([1], dtype::i32).capacity(8));
@@ -456,6 +522,116 @@ mod tests {
             b.build().expect("the greedy epilogue traces")
         }
 
+        /// A greedy step that lands its top logprobs: a top-k region.
+        pub fn top_logprobs(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let values_out = leak(Channel::new([5], dtype::f32).capacity(8));
+            let ids_out = leak(Channel::new([5], dtype::i32).capacity(8));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (values, ids) = top_k(log_softmax(cast(&logits, dtype::bf16)), 5);
+                values_out.put(cast(&values, dtype::f32));
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            values_out.note_host_take();
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the top-logprobs epilogue traces")
+        }
+
+        /// A greedy step that lands the whole row in order: a sort region.
+        pub fn sorted(vocab: u32) -> Traced {
+            let out = leak(Channel::new([1], dtype::i32).capacity(8));
+            let ids_out = leak(Channel::new([vocab], dtype::i32).capacity(2));
+            let (mut b, tok_in) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = reshape(intrinsics::output(0, "logits"), [vocab]);
+                let t = reshape(reduce_argmax(&logits), [1]);
+                let (_, ids) = sort_desc(softmax(cast(&logits, dtype::bf16)));
+                ids_out.put(cast(&ids, dtype::i32));
+                tok_in.put(&t);
+                out.put(&t);
+            });
+            ids_out.note_host_take();
+            out.note_host_take();
+            b.build().expect("the sorted epilogue traces")
+        }
+
+        /// `beam-search`'s prompt epilogue: the prompt's top `beams` by log
+        /// probability, and its greedy pick beside them.
+        pub fn beam_prefill(vocab: u32, beams: u32) -> Traced {
+            let ids = leak(Channel::new([beams], dtype::i32));
+            let scores = leak(Channel::new([beams], dtype::f32));
+            let greedy = leak(Channel::new([1], dtype::i32));
+            let (mut b, _) = builder(vocab);
+            b.stage(Stage::Epilogue, move || {
+                let logits = cast(
+                    reshape(intrinsics::output(0, "logits"), [vocab]),
+                    dtype::bf16,
+                );
+                let (s, i) = top_k(log_softmax(&logits), beams);
+                ids.put(cast(&i, dtype::i32));
+                scores.put(cast(&s, dtype::f32));
+                greedy.put(reshape(reduce_argmax(&logits), [1]));
+            });
+            ids.note_host_take();
+            scores.note_host_take();
+            greedy.note_host_take();
+            b.build().expect("the beam prefill epilogue traces")
+        }
+
+        /// `beam-search`'s decode epilogue over `beams` rows: each beam's
+        /// score plus its row's log probabilities, the top `beams` of all
+        /// of them, their parents and tokens, and each row's greedy pick.
+        pub fn beam_decode(vocab: u32, beams: u32) -> Traced {
+            let carried = leak(Channel::from(vec![0f32; beams as usize]));
+            let out = leak(Channel::new([beams], dtype::i32).capacity(8));
+            let parents = leak(Channel::new([beams], dtype::u32).capacity(8));
+            let greedy = leak(Channel::new([beams], dtype::i32).capacity(8));
+            let mut b = Builder::new(vocab, 16);
+            b.outputs(logits(vocab));
+            let rows = beams as usize;
+            b.bind_port(Port::EmbedTokens, leak(Channel::from(vec![42i32; rows])));
+            b.bind_port(Port::EmbedIndptr, leak(Channel::from((0u32..=beams).collect::<Vec<u32>>())));
+            b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
+            b.stage(Stage::Epilogue, move || {
+                let logits = cast(
+                    reshape(intrinsics::output(0, "logits"), [beams, vocab]),
+                    dtype::bf16,
+                );
+                let scores = carried.take();
+                let best = reduce_max(&scores);
+                let relative = cast(&scores - &best, dtype::bf16);
+                let cand = broadcast(reshape(relative, [beams, 1]), [beams, vocab])
+                    + log_softmax(&logits);
+                let (s, i) = top_k(reshape(cand, [beams * vocab]), beams);
+                carried.put(cast(&s, dtype::f32) + &best);
+                out.put(cast(&i % vocab, dtype::i32));
+                parents.put(&i / vocab);
+                greedy.put(reshape(reduce_argmax(&logits), [beams]));
+            });
+            out.note_host_take();
+            parents.note_host_take();
+            greedy.note_host_take();
+            b.build().expect("the beam decode epilogue traces")
+        }
+
+        /// Every program here, by name.
+        pub fn all(vocab: u32) -> Vec<(&'static str, Traced)> {
+            vec![
+                ("top-p", top_p(vocab)),
+                ("top-k + top-p", top_k_top_p(vocab)),
+                ("gumbel-max", gumbel_max_only(vocab)),
+                ("greedy", greedy(vocab)),
+                ("top logprobs", top_logprobs(vocab)),
+                ("sorted", sorted(vocab)),
+            ]
+        }
+
         pub fn package(traced: &Traced, vocab: u32) -> LaunchPackage {
             let caps = EngineCaps {
                 lora: true,
@@ -465,6 +641,84 @@ mod tests {
                 .expect("the program binds");
             let stages = compile_bound(&bound);
             eta_compiler::codegen::launch::build(&bound, &stages)
+        }
+    }
+
+    /// Laid over the shipped programs, no two values alive together share a
+    /// byte, a reshape read as its source lies at its source's offset and
+    /// keeps the source alive through its own readers, and no value alive
+    /// with a node's temporary area shares a byte of it or of the reserve
+    /// below it: an area takes only bytes of values dead while it is.
+    #[test]
+    fn a_shipped_program_s_live_items_share_no_bytes() {
+        let vocab = shipped::QWEN_VOCAB;
+        let four = Extents {
+            row_count: 4,
+            token_count: 4,
+            sampled_rows: 4,
+            ..Extents::default()
+        };
+        let mut programs: Vec<(&str, eta_dsl::Traced, Extents)> = shipped::all(vocab)
+            .into_iter()
+            .map(|(name, traced)| (name, traced, Extents::default()))
+            .collect();
+        programs.push(("beam prefill", shipped::beam_prefill(vocab, 4), Extents::default()));
+        programs.push(("beam-4 decode", shipped::beam_decode(vocab, 4), four));
+        for (name, traced, extents) in &programs {
+            let package = shipped::package(traced, vocab);
+            let plan = &package.plans[0];
+            let tables = session::stage_tables(plan, extents).expect("static shapes");
+            let stepping = session::Stepping::of(plan);
+            let launches = stepping.launches(&tables.descriptors);
+            let lifetimes = eta_exec::value_lifetimes(plan, &launches).expect("every node runs");
+            let laid = eta_exec::lay_out(plan, &tables.descriptors, &launches).expect("fits");
+            let span = |value: usize| {
+                let at = tables.offsets[value];
+                (at, at + tables.descriptors[value].device_bytes())
+            };
+            let overlap = |a: eta_exec::Lifetime, b: eta_exec::Lifetime| {
+                a.last >= b.def && b.last >= a.def
+            };
+            let aliases = eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases;
+            for &(result, source) in &aliases {
+                let (result, source) = (result as usize, source as usize);
+                assert!(lifetimes[result].dead, "{name}: alias {result} takes no bytes");
+                assert_eq!(tables.offsets[result], tables.offsets[source], "{name}");
+                assert!(
+                    lifetimes[source].last >= lifetimes[result].last,
+                    "{name}: value {source} dies before its alias {result} is read"
+                );
+            }
+            let live: Vec<usize> = (0..lifetimes.len()).filter(|&v| !lifetimes[v].dead).collect();
+            for (at, &a) in live.iter().enumerate() {
+                for &b in &live[at + 1..] {
+                    let ((sa, ea), (sb, eb)) = (span(a), span(b));
+                    if overlap(lifetimes[a], lifetimes[b]) {
+                        assert!(ea <= sb || eb <= sa, "{name}: values {a} and {b} alive together");
+                    }
+                }
+            }
+            let areas = eta_exec::launch_areas(&launches);
+            assert_eq!(areas.len(), laid.areas.len(), "{name}");
+            for (at, (area, &first)) in areas.iter().zip(&laid.areas).enumerate() {
+                let low = first - area.reserve;
+                let high = first + area.bytes;
+                for &value in &live {
+                    let (start, end) = span(value);
+                    if overlap(lifetimes[value], area.life) {
+                        assert!(end <= low || high <= start, "{name}: value {value} in area {at}");
+                    }
+                }
+                for (other, (them, &their)) in areas.iter().zip(&laid.areas).enumerate().skip(at + 1) {
+                    if overlap(area.life, them.life) {
+                        assert!(
+                            high <= their - them.reserve || their + them.bytes <= low,
+                            "{name}: areas {at} and {other}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(laid.temporary_bytes, 0, "{name}: no area is the stage's");
         }
     }
 

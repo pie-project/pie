@@ -31,8 +31,8 @@ pub struct Header {
 }
 
 /// A sealed page a slot holds: its key, the key of the page before it (none
-/// at token 0), its tokens' hashes, and the cluster retention key it was
-/// kept under: swap takes the lowest first.
+/// at token 0), its tokens' hashes, and the retention key it was demoted
+/// under: swap takes the lowest first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRecord {
     pub page: Hash256,

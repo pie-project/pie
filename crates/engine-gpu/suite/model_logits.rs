@@ -330,8 +330,11 @@ pub fn load_with(
     chunk: Option<u64>,
     residency: engine::load::Residency,
 ) -> Option<Shell> {
-    let _alone = loading();
-    load_alone(fixture, page, context, chunk, residency)
+    let device = DeviceBoot {
+        chunk_bytes: chunk,
+        ..crate::gpu::device_boot()
+    };
+    load_on(fixture, page, context, &device, residency, engine::runahead::Runahead::F1)
 }
 
 /// [`load`] as the engine raises a served load: one whose programs it
@@ -362,9 +365,38 @@ fn load_alone(
         chunk_bytes: chunk,
         ..crate::gpu::device_boot()
     };
-    let residency = allowed(&device, residency)?;
+    load_booted(fixture, page, context, &device, residency, engine::runahead::Runahead::F1)
+}
+
+/// [`load_with`] on the device `device` boots, running ahead by `runahead`
+/// (an arm a frame in flight).
+pub fn load_on(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    device: &DeviceBoot,
+    residency: engine::load::Residency,
+    runahead: engine::runahead::Runahead,
+) -> Option<Shell> {
+    let _alone = loading();
+    load_booted(fixture, page, context, device, residency, runahead)
+}
+
+/// [`load_on`], [`LOADING`] held by the caller.
+fn load_booted(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    device: &DeviceBoot,
+    residency: engine::load::Residency,
+    runahead: engine::runahead::Runahead,
+) -> Option<Shell> {
+    let residency = allowed(device, residency)?;
     Some(
-        Shell::load(boot(fixture, page, context, &device, residency))
+        Shell::load(Boot {
+            runahead,
+            ..boot(fixture, page, context, device, residency)
+        })
             .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )
 }
@@ -1111,13 +1143,26 @@ fn scattered_at(model: &str, chunk: Option<u64>) -> Vec<Vec<f32>> {
     seats
 }
 
-/// [`scattered`] on each family; and a record cut over several slots (a
-/// chunk smaller than it, as `PIE_GOLDEN_CHUNK` forces on CUDA) lands the
-/// same logits, bit for bit, as the record in one slot.
 #[test]
-fn a_scattered_pool_and_a_record_in_pieces_serve_the_same_logits() {
+fn a_scattered_dense_pool_serves_the_same_logits() {
     scattered("qwen3-micro-text");
+}
+
+#[test]
+fn a_scattered_hybrid_pool_serves_the_same_logits() {
+    scattered("qwen35-tiny");
+}
+
+#[test]
+fn a_scattered_windowed_pool_serves_the_same_logits() {
     scattered("gemma4-e4b-mini-l1");
+}
+
+/// A record cut over several slots (a chunk smaller than it, as
+/// `PIE_GOLDEN_CHUNK` forces on CUDA): the same logits, bit for bit, as the
+/// record in one slot, its pieces scattered and evacuated as above.
+#[test]
+fn a_record_in_pieces_serves_the_same_logits() {
     let whole = scattered("qwen35-tiny");
     let chunk = std::env::var(backend::CHUNK)
         .map_or(64 << 10, |bytes| bytes.parse().expect("the chunk is bytes"));
@@ -1812,5 +1857,321 @@ fn a_device_counted_fold_folds_what_its_count_says() {
         &format!("{MODEL}: a device-counted fold"),
         &rows,
         &want[want.len() - rows.len()..],
+    );
+}
+
+/// [`load`] on a device whose largest buffer is `max_buffer` bytes, as a
+/// device that binds less does, its pool `kv_budget` bytes in chunks of
+/// `chunk` (the kernels bind at most four segments of it, none past that
+/// buffer).
+pub fn load_capped(
+    fixture: &Fixture,
+    context: u32,
+    max_buffer: u64,
+    kv_budget: u64,
+    chunk: u64,
+) -> Option<Shell> {
+    load_capped_with(
+        fixture,
+        PAGE,
+        context,
+        max_buffer,
+        chunk,
+        engine::load::Residency {
+            device_kv_budget: Some(kv_budget),
+            ..engine::load::Residency::default()
+        },
+    )
+}
+
+/// [`load_capped`] with kv pages of `page` tokens, under `residency` (its
+/// pool's budget, and whether the weights start held).
+pub fn load_capped_with(
+    fixture: &Fixture,
+    page: u32,
+    context: u32,
+    max_buffer: u64,
+    chunk: u64,
+    residency: engine::load::Residency,
+) -> Option<Shell> {
+    let _alone = loading();
+    let device = DeviceBoot {
+        max_buffer: Some(max_buffer),
+        chunk_bytes: Some(chunk),
+        ..crate::gpu::device_boot()
+    };
+    let residency = allowed(&device, residency)?;
+    Some(
+        Shell::load(boot(fixture, page, context, &device, residency))
+            .unwrap_or_else(|why| panic!("the shell loads: {why}")),
+    )
+}
+
+/// State lent in the activation span under a narrow rung's carve stands
+/// through that rung's fires, the first (recorded where the backend
+/// records) and every replay: no fire writes past the chunks its rung
+/// states.
+#[test]
+fn state_lent_in_the_span_outlives_a_narrow_rungs_fires() {
+    use engine::chunk::{SlotCopy, SlotKind};
+    use engine::transfer::MemoryDomain;
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        Some(64 << 10),
+        engine::load::Residency {
+            host_kv_budget: Some(256 << 20),
+            // State well within the kernels' index of the pool (8 GiB of
+            // 64 KiB chunks), whatever the device has: a pool whose state
+            // reaches it states every rung at the span's chunks and lends
+            // none (`store::pool::sized`), so a share of a large device
+            // would leave no narrow rung to test.
+            device_kv_budget: Some(256 << 20),
+            ..engine::load::Residency::default()
+        },
+    ) else {
+        return;
+    };
+    let device = <backend::Api as engine_gpu::api::Host>::domain(&crate::gpu::device_boot());
+    // The prefills take the top rung; the decodes after them two lanes.
+    let mut fed: [Vec<u32>; 2] = prompts();
+    let mut held = [0u32; 2];
+    for lane in 0..2usize {
+        let seated = Seated {
+            held: Some(held[lane]),
+            ..Seated::of(Lane {
+                slot: lane as u32,
+                word: word(&fixture.trace, fed[lane].len() as u32),
+                tokens: &fed[lane],
+            })
+        };
+        let got = shell.fire_seated(&[seated]).expect("the prefill lands");
+        held[lane] += fed[lane].len() as u32;
+        fed[lane] = vec![argmax(&got[0])];
+    }
+    let facts = shell.pool_chunk_facts();
+    let total = facts.total_chunks;
+    let rung = |tokens: u32| {
+        facts
+            .act_chunks
+            .iter()
+            .find(|&&(rung, _)| rung >= tokens)
+            .map_or(0, |&(_, chunks)| chunks)
+    };
+    let (narrow, widest) = (rung(2), facts.act_chunks_max());
+    assert!(
+        widest > narrow,
+        "a two-lane rung lends span chunks: {:?}",
+        facts.act_chunks
+    );
+    let list = facts
+        .shapes
+        .iter()
+        .find(|shape| shape.id == LIST && matches!(shape.kind, SlotKind::List { .. }))
+        .expect("a kv list");
+    let per = list.slots_per_chunk;
+    // Every chunk of the span the narrow rung lends.
+    let lent: Vec<u32> = (total - widest..total - narrow).collect();
+    let device_refs: Vec<u32> = lent
+        .iter()
+        .flat_map(|&chunk| (0..per).map(move |i| chunk * per + i))
+        .collect();
+    let slots = device_refs.len() as u32;
+    let host_in: Vec<u32> = (0..slots).collect();
+    let host_out: Vec<u32> = (slots..2 * slots).collect();
+    let pattern: Vec<u8> = (0..u64::from(slots) * list.slot_bytes)
+        .map(|at| (at.wrapping_mul(2_654_435_761) >> 13) as u8 | 1)
+        .collect();
+    shell
+        .write_tier_slots(&[(LIST, host_in.clone())], &pattern)
+        .expect("the host slots take the pattern");
+    let pairs = |from: &[u32], to: &[u32]| from.iter().copied().zip(to.iter().copied()).collect();
+    shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: MemoryDomain::HostPinned,
+            dst: device,
+            slots: pairs(&host_in, &device_refs),
+            runs: Vec::new(),
+        })
+        .expect("the pattern lands in the lent chunks");
+    for _ in 0..6 {
+        let seated: Vec<Seated<'_>> = (0..2usize)
+            .map(|lane| Seated {
+                held: Some(held[lane]),
+                ..Seated::of(Lane {
+                    slot: lane as u32,
+                    word: word(&fixture.trace, 1),
+                    tokens: &fed[lane],
+                })
+            })
+            .collect();
+        let got = shell.fire_seated(&seated).expect("the decode lands");
+        for lane in 0..2 {
+            held[lane] += 1;
+            fed[lane] = vec![argmax(&got[lane])];
+        }
+    }
+    shell
+        .copy_slots(&SlotCopy {
+            shape: LIST,
+            src: device,
+            dst: MemoryDomain::HostPinned,
+            slots: pairs(&device_refs, &host_out),
+            runs: Vec::new(),
+        })
+        .expect("the lent chunks read back");
+    let back = shell
+        .read_tier_slots(&[(LIST, host_out)])
+        .expect("the host slots read");
+    let first = back.iter().zip(&pattern).position(|(a, b)| a != b);
+    assert_eq!(
+        first, None,
+        "a two-lane fire wrote lent span chunks {lent:?} (rung chunks {narrow} of {widest}, \
+         total {total})"
+    );
+}
+
+/// A masked fire after a partial fold: a lane's mask speaks of the keys from
+/// its committed boundary on (`KvDelta::folded`). Past a boundary at 100 of
+/// a 150-key prompt, a mask over the buffer and the fire's own rows lands
+/// the same logits, bit for bit, as the same bits over the whole context
+/// from a boundary at 0, its committed columns set; the mask is read (it
+/// lands other logits than all set), and one short of its buffer and rows
+/// is refused for that extent.
+#[test]
+fn a_masked_fire_after_a_partial_fold_admits_the_committed_keys() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let [prompt, _] = prompts();
+    let have = prompt.len() as u32;
+    shell
+        .fire_seated(&[Seated {
+            held: Some(0),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, have),
+                tokens: &prompt,
+            })
+        }])
+        .expect("the prefill lands");
+
+    const ROWS: u32 = 4;
+    const FOLDED: u32 = 100;
+    let tokens: Vec<u32> = (0..ROWS).map(|at| (at * 29 + 3) % 256).collect();
+    let masked = fixture.trace.facts.word(&Request::new(ROWS, true));
+    let buffer = u64::from(have - FOLDED);
+    // Hides every third buffered key; admits the fire's own rows.
+    let hidden = |column: u64| column < buffer && column % 3 == 1;
+    let bits = |committed: u64, hide: &dyn Fn(u64) -> bool| {
+        let total = committed + buffer + u64::from(ROWS);
+        let mut runs = vec![0u32];
+        let mut admitted = false;
+        for column in 0..total {
+            let keep = column < committed || !hide(column - committed);
+            if keep != admitted {
+                runs.push(0);
+                admitted = keep;
+            }
+            *runs.last_mut().unwrap() += 1;
+        }
+        engine::fire::Masking::Extent(engine::fire::Mask::new(runs, total))
+    };
+    let mut fire = |folded: u32, mask: &engine::fire::Masking| {
+        shell.fire_seated(&[Seated {
+            held: Some(have),
+            folded,
+            mask: Some(mask),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: masked,
+                tokens: &tokens,
+            })
+        }])
+    };
+    let past = fire(FOLDED, &bits(0, &hidden)).expect("the masked fire lands");
+    let whole = fire(0, &bits(u64::from(FOLDED), &hidden)).expect("the whole mask lands");
+    same("a mask past the boundary against the whole", &past, &whole);
+    let all = fire(FOLDED, &bits(0, &|_| false)).expect("an all-set mask lands");
+    assert!(
+        past[0]
+            .iter()
+            .zip(&all[0])
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "the mask hid nothing"
+    );
+    let short = {
+        let engine::fire::Masking::Extent(mask) = bits(0, &hidden) else {
+            unreachable!()
+        };
+        let total = mask.total - 1;
+        engine::fire::Masking::Extent(engine::fire::Mask::new(mask.runs, total))
+    };
+    let refused = fire(FOLDED, &short).expect_err("a mask short of its extent");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("will read {}", buffer + u64::from(ROWS))),
+        "{refused}"
+    );
+}
+
+/// A row's causal bound is its row order, the cache row; a stated position
+/// rotates the row and bounds nothing. A lane's four rows land at slots
+/// 0..4 and all state position 0: the last row still reads the three before
+/// it, so two lanes whose middle tokens differ answer differently (bounded
+/// by the stated position, the last row read slot 0 alone and the two
+/// answered the same). The rotation follows the stated position: stating
+/// 0 everywhere answers otherwise than stating nothing, and stating the
+/// slots answers the same, bit for bit.
+#[test]
+fn a_stated_position_rotates_and_bounds_no_key() {
+    let fixture = fixture("qwen3-micro-text", None);
+    let Some(mut shell) = load(&fixture, CONTEXT) else {
+        return;
+    };
+    let mut last = |slot: u32, tokens: &[u32], positions: &[u32]| {
+        let seated = Seated {
+            held: Some(0),
+            positions,
+            ..Seated::of(Lane {
+                slot,
+                word: word(&fixture.trace, tokens.len() as u32),
+                tokens,
+            })
+        };
+        shell
+            .fire_seated(&[seated])
+            .expect("the fire lands")
+            .remove(0)
+    };
+    let zeros = [0u32; 4];
+    let one = last(0, &[11, 48, 85, 122], &zeros);
+    let two = last(1, &[11, 200, 7, 122], &zeros);
+    let apart = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    assert!(
+        apart(&one, &two) > 1e-3,
+        "the last row's logits are the same whatever the rows before it say: its \
+         attention was bounded by its stated position, not its cache row"
+    );
+    let unstated = last(0, &[11, 48, 85, 122], &[]);
+    let slots = last(0, &[11, 48, 85, 122], &[0, 1, 2, 3]);
+    same(
+        "positions stated as the slots",
+        &[slots],
+        &[unstated.clone()],
+    );
+    assert!(
+        apart(&one, &unstated) > 1e-3,
+        "stating position 0 everywhere rotated the rows as their slots"
     );
 }

@@ -63,13 +63,6 @@ pub struct FireLimits {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolFacts {
     pub adapter_banks: u32,
-    /// The window the model's sliding rows are read through, a fact of the
-    /// model: an engine that pages its sliding rows in full states no window
-    /// list for it. Zero when the model declares no windowed row. Removed
-    /// by the windowed-state change; do not use in new code (each windowed
-    /// layer's window is [`crate::chunk::WindowedLayer::window`]).
-    #[serde(default)]
-    pub window_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

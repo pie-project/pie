@@ -1256,4 +1256,117 @@ mod tests {
         assert_eq!(dense.at(1, 4096, 4096).vector, 0);
     }
 
+
+    /// A curve stopped short of a rung's rows (the phone's head, its vector
+    /// curve beaten at 512 rows) keeps weighing its plane: no candidate's
+    /// estimate falls as the rungs grow, and the kernel measured at every
+    /// plane is taken over one whose cost there would be carried past its
+    /// curve. Dropping the head from the sum instead had a rung of 512 rows
+    /// estimated below one of 256 and the vector kernel taken at 512 and
+    /// 1024 by the layers alone.
+    #[test]
+    fn a_curve_stopped_short_neither_lowers_an_estimate_nor_wins_past_it() {
+        let tiled = |_| Tactic {
+            tier: Tier::Subgroup,
+            vector: 0,
+            wide: false,
+        };
+        let shape = |n: u32, k: u32, planes| engine::load::GemmShape {
+            planes,
+            ..engine::load::GemmShape::dense(
+                n,
+                k,
+                2 * u64::from(n) * u64::from(k),
+                2 * u64::from(n) * u64::from(k),
+            )
+        };
+        let (head_n, head_k) = (151_936, 1024);
+        let model = Counts {
+            gemm_shapes: vec![shape(1024, 1024, 28), shape(head_n, head_k, 1)],
+            ..counts()
+        };
+        let curve = |kind, key, n, k, points: Vec<(u32, f64)>, stop| profile::curves::KernelCurve {
+            by: profile::rates::MeasuredBy::default(),
+            kind,
+            key,
+            n,
+            k,
+            curve: points,
+            stop,
+            spread: Vec::new(),
+        };
+        let tile = |n, k| crate::rates::curve_key(Target::Wgsl, tiled(0), n, k).1;
+        let (v, t) = (
+            profile::curves::KernelCurve::VECTOR,
+            profile::curves::KernelCurve::TILE,
+        );
+        let mut curves = vec![
+            // The layers: the vector kernel ahead of the tile to 1024 rows.
+            curve(
+                t,
+                tile(1024, 1024),
+                1024,
+                1024,
+                vec![(1, 0.01), (1024, 1.0)],
+                None,
+            ),
+            curve(v, 8, 1024, 1024, vec![(1, 0.05), (1024, 2.0)], None),
+            // The head: the tile timed to 1024; the vector kernel beaten at
+            // 512, its last point at 256.
+            curve(
+                t,
+                tile(head_n, head_k),
+                head_n,
+                head_k,
+                vec![(1, 0.02), (1024, 8.0)],
+                None,
+            ),
+            curve(
+                v,
+                8,
+                head_n,
+                head_k,
+                vec![(1, 1.0), (256, 1.5)],
+                Some((512, profile::curves::KernelCurve::BEATEN)),
+            ),
+        ];
+        curves.sort_by_key(profile::curves::KernelCurve::id);
+        let r = profile::rates::Rates {
+            kernel_curves: Some(curves),
+            ..rates(None, Vec::new())
+        };
+        let rungs = [256, 512, 1024];
+        let (dense, weighed) = choose(
+            Target::Wgsl,
+            &rungs,
+            tiled,
+            &r,
+            &planes(&model, None),
+            true,
+            None,
+        )
+        .unwrap();
+        for rows in [512, 1024] {
+            assert_eq!(
+                dense.at(rows, head_n, head_k).vector,
+                0,
+                "{rows}: {:?}",
+                dense.runs()
+            );
+            assert!(!weighed[1].costs.is_empty());
+        }
+        // Each kernel's estimate at a rung's top only grows with the rungs.
+        for pair in weighed.windows(2) {
+            for &(tactic, _, top) in &pair[1].costs {
+                if let Some(&(_, _, below)) = pair[0].costs.iter().find(|c| c.0 == tactic) {
+                    assert!(
+                        top >= below,
+                        "{tactic:?}: {below} at {} then {top} at {}",
+                        pair[0].top,
+                        pair[1].top
+                    );
+                }
+            }
+        }
+    }
 }

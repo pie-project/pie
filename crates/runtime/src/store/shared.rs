@@ -8,12 +8,9 @@
 //! [`super::chunks::ShapePool::shared`]:
 //!
 //! - the kv store's pages are slot refs of the list shape;
-//! - a working set's window pages (CONTRACT-BC 19, 21) are slot refs of
-//!   each window list (one a distinct window, `T_w` tokens a slot of its
-//!   own), refcounted by the rs store and dropped list by list once a slot
-//!   lies wholly behind that list's window; a lane's table of each window
-//!   list is in its own token order, ref 0 (the null chunk, never handed
-//!   out) where it holds none;
+//! - a list shape of its own window is refused: windowed layers are ring +
+//!   buffer (CONTRACT-BC 19, 21), the rings in the record and the unfolded
+//!   rows in the window buffer;
 //! - the rs store's state slots are **records**: one working set's fixed
 //!   state, a slot of every fixed shape of role [`SlotRole::State`] for each
 //!   of its pieces;
@@ -28,8 +25,8 @@
 //!   unfolded rows accumulate, refcounted by the store so forks share their
 //!   common unfolded prefix, and given back as rows fold.
 //!
-//! A lane names its slots in [`::engine::fire::Lane::tables`] (kv list and
-//! window list refs in token order) and [`::engine::fire::Lane::fixed`] (one `[run, cow]`
+//! A lane names its slots in [`::engine::fire::Lane::tables`] (kv list refs
+//! in token order) and [`::engine::fire::Lane::fixed`] (one `[run, cow]`
 //! a piece). `cow == run` writes the record in place; a lane whose record is
 //! shared (a fork, or a snapshot restored, in that fire) writes a fresh
 //! record the engine copies `run` onto first. The copy-on-write record is
@@ -683,7 +680,7 @@ pub enum SharedError {
         slots_per_chunk: u32,
     },
     #[error(
-        "{kind} shapes {shapes:?}: the stores hold one kv list, one rs list, one window list a distinct window, and one one-piece instance and channel shape"
+        "{kind} shapes {shapes:?}: the stores hold one kv list, one rs list, one window buffer, and one one-piece instance and channel shape"
     )]
     Shapes {
         kind: &'static str,
@@ -773,8 +770,6 @@ pub struct TokenShape {
     pub id: EngineShape,
     pub pool: ShapeId,
     pub tokens: u32,
-    /// The rows a window list retains; 0 for the kv list and the rs list.
-    pub window: u32,
     pub slot_bytes: u64,
     pub slots_per_chunk: u32,
 }
@@ -945,8 +940,6 @@ pub struct SharedPool {
     /// (`ChunkFacts::record_bytes` past `ring_bytes`): the model has
     /// recurrent layers, whose rows replay.
     recurrent: bool,
-    /// The window lists, narrowest window first (CONTRACT-BC 19).
-    windows: Vec<TokenShape>,
     /// The fixed shapes of role [`SlotRole::State`]: a record's.
     fixed: Vec<FixedShape>,
     /// The fixed shapes taken on demand, outside every record.
@@ -1167,18 +1160,20 @@ impl SharedPool {
             let pool = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
             let kind = match shape.kind {
                 SlotKind::List { tokens, window, .. } => {
-                    let found = match window {
-                        // Window lists: the window-list path.
-                        Some(_) => &mut windows,
-                        None if shape.role == SlotRole::RsBuffer => &mut rs_lists,
-                        None if shape.role == SlotRole::WindowBuffer => &mut window_buffers,
-                        None => &mut lists,
+                    // A list of its own window: the stores take windowed
+                    // layers as ring + buffer alone.
+                    if window.is_some() {
+                        windows.push(shape.id.0);
+                    }
+                    let found = match shape.role {
+                        SlotRole::RsBuffer => &mut rs_lists,
+                        SlotRole::WindowBuffer => &mut window_buffers,
+                        _ => &mut lists,
                     };
                     found.push(TokenShape {
                         id: shape.id,
                         pool,
                         tokens,
-                        window: window.unwrap_or(0),
                         slot_bytes: shape.slot_bytes,
                         slots_per_chunk: shape.slots_per_chunk,
                     });
@@ -1231,17 +1226,10 @@ impl SharedPool {
                 });
             }
         }
-        windows.sort_by_key(|shape: &TokenShape| shape.window);
-        if windows.len() > crate::store::rs::MAX_WINDOW_LISTS {
+        if !windows.is_empty() {
             return Err(SharedError::Shapes {
                 kind: "window list",
-                shapes: windows.iter().map(|shape| shape.id.0).collect(),
-            });
-        }
-        if let Some(pair) = windows.windows(2).find(|w| w[0].window == w[1].window) {
-            return Err(SharedError::Shapes {
-                kind: "window list",
-                shapes: pair.iter().map(|shape| shape.id.0).collect(),
+                shapes: windows,
             });
         }
         let weights_first = ShapeId::try_from(shapes.len()).expect("shapes fit a shape id");
@@ -1273,7 +1261,6 @@ impl SharedPool {
             rs_list: rs_lists.first().copied(),
             window_buffer: window_buffers.first().copied(),
             recurrent: facts.record_bytes > facts.ring_bytes(),
-            windows,
             fixed,
             roles: RoleShapes {
                 instance: instances.first().copied(),
@@ -1386,13 +1373,6 @@ impl SharedPool {
         self.rs_list.or(self.window_buffer)
     }
 
-    /// The window lists, narrowest window first: an engine that does not
-    /// state `Capabilities::windowed_state`.
-    #[must_use]
-    pub fn windows(&self) -> &[TokenShape] {
-        &self.windows
-    }
-
     /// The fixed shapes of a record: role [`SlotRole::State`].
     #[must_use]
     pub fn fixed(&self) -> &[FixedShape] {
@@ -1430,17 +1410,13 @@ impl SharedPool {
     }
 
     /// The single slots of each state shape `rs` takes: the rs list's
-    /// (`pages`), each window list's (`windows`) and whole records'
+    /// (`pages`), the window buffer's (`wbuf`) and whole records'
     /// (`slots`, each fixed shape's pieces), as a restore's serve takes
     /// them before its unpark ([`SlotPool::opens_for`] places them).
     #[must_use]
     pub fn state_takes(&self, rs: crate::store::rs::RsUnits) -> Vec<(ShapeId, u64)> {
         let mut takes = Vec::new();
-        if rs.windows.iter().any(|&n| n > 0) {
-            for (window, &n) in self.windows.iter().zip(&rs.windows) {
-                takes.push((window.pool, u64::from(n)));
-            }
-        } else if let Some(rs_list) = self.buffer_list() {
+        if let Some(rs_list) = self.buffer_list() {
             takes.push((rs_list.pool, u64::from(rs.pages.saturating_sub(rs.wbuf))));
             if let Some(window) = self.rs_list.and(self.window_buffer) {
                 takes.push((window.pool, u64::from(rs.wbuf)));
@@ -1454,8 +1430,8 @@ impl SharedPool {
     }
 
     /// The kv list slots whose chunks, let go whole, hold `rs` of the state
-    /// shapes: the rs list's slots (`pages`), each window list's
-    /// (`windows`, a store of windows) and whole records (`slots`). Any
+    /// shapes: the rs list's slots (`pages`), the window buffer's (`wbuf`)
+    /// and whole records (`slots`). Any
     /// chunk opens for any shape, so kv that parks makes the room state
     /// lacks; 0 without a kv list.
     #[must_use]
@@ -1471,11 +1447,7 @@ impl SharedPool {
             slots.div_ceil(u64::from(spc))
         };
         let mut wanted = 0u64;
-        if rs.windows.iter().any(|&n| n > 0) {
-            for (window, &n) in self.windows.iter().zip(&rs.windows) {
-                wanted += chunks(window.pool, u64::from(n));
-            }
-        } else if let Some(rs_list) = self.buffer_list() {
+        if let Some(rs_list) = self.buffer_list() {
             wanted += chunks(rs_list.pool, u64::from(rs.pages.saturating_sub(rs.wbuf)));
             if let Some(window) = self.rs_list.and(self.window_buffer) {
                 wanted += chunks(window.pool, u64::from(rs.wbuf));
@@ -1494,7 +1466,6 @@ impl SharedPool {
             .iter()
             .chain(&self.rs_list)
             .chain(&self.window_buffer)
-            .chain(&self.windows)
             .find(|shape| shape.pool == pool)
             .map(|shape| shape.id)
             .or_else(|| {
@@ -1625,10 +1596,8 @@ impl SharedPool {
         u32::try_from(low).unwrap_or(u32::MAX)
     }
 
-    /// Chunks one working set takes at `context` tokens: its list slots, a
-    /// slots of each window list its window covers and the one its oldest
-    /// row retires from, its record, and an rs list slot for the rows a fire
-    /// leaves unfolded.
+    /// Chunks one working set takes at `context` tokens: its list slots, its
+    /// record, and an rs list slot for the rows a fire leaves unfolded.
     fn working_set_chunks(&self, context: u32) -> u32 {
         let per_chunk = |slots: u64, spc: u32| slots.div_ceil(u64::from(spc.max(1)));
         let list = self.list.map_or(0, |list| {
@@ -1637,21 +1606,10 @@ impl SharedPool {
                 list.slots_per_chunk,
             )
         });
-        let windows: u64 = self
-            .windows
-            .iter()
-            .map(|list| {
-                let tokens = list.tokens.max(1);
-                let slots = context
-                    .div_ceil(tokens)
-                    .min(list.window.div_ceil(tokens) + 1);
-                per_chunk(u64::from(slots), list.slots_per_chunk)
-            })
-            .sum();
         // The rs list's or the window buffer's slot of rows a fire leaves
         // unfolded; a windowed layer's ring rides in the record.
         let rs = u64::from(self.rs_list.is_some()) + u64::from(self.window_buffer.is_some());
-        u32::try_from(list + windows + rs + self.record_chunks(1)).unwrap_or(u32::MAX)
+        u32::try_from(list + rs + self.record_chunks(1)).unwrap_or(u32::MAX)
     }
 
     // ---- slot refs of the list shapes ----
@@ -1957,43 +1915,14 @@ impl SharedPool {
             .collect()
     }
 
-    /// A lane's [`::engine::fire::Lane::tables`]: its list slot refs, and
-    /// each window list's own table `windows[l]` (slot refs in its token
-    /// order, 0 where trimmed: the null chunk); a shape the pool lacks or
-    /// the lane does not read is left out.
+    /// A lane's [`::engine::fire::Lane::tables`]: its list slot refs; none
+    /// where the pool has no kv list or the lane reads none.
     #[must_use]
-    pub fn lane_tables(&self, list: &[u32], windows: &[Vec<u32>]) -> Vec<(EngineShape, Vec<u32>)> {
-        let mut tables = Vec::new();
-        if let Some(shape) = self.list.filter(|_| !list.is_empty()) {
-            tables.push((shape.id, list.to_vec()));
-        }
-        for (shape, table) in self.windows.iter().zip(windows) {
-            if !table.is_empty() {
-                tables.push((shape.id, table.clone()));
-            }
-        }
-        tables
-    }
-
-    /// Whole-slot copies `[src, dst]` of each window list, from slot refs
-    /// copied `(list, src, dst)`, as [`::engine::fire::Lane::slot_copies`]
-    /// states them; a list with none left out.
-    #[must_use]
-    pub fn window_copies(&self, copies: &[(usize, u32, u32)]) -> Vec<(EngineShape, Vec<[u32; 2]>)> {
-        self.windows
-            .iter()
-            .enumerate()
-            .map(|(at, shape)| {
-                (
-                    shape.id,
-                    copies
-                        .iter()
-                        .filter(|&&(list, ..)| list == at)
-                        .map(|&(_, src, dst)| [src, dst])
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .filter(|(_, pairs)| !pairs.is_empty())
+    pub fn lane_tables(&self, list: &[u32]) -> Vec<(EngineShape, Vec<u32>)> {
+        self.list
+            .filter(|_| !list.is_empty())
+            .map(|shape| (shape.id, list.to_vec()))
+            .into_iter()
             .collect()
     }
 
@@ -2330,7 +2259,6 @@ impl SharedPool {
             .iter()
             .chain(&self.rs_list)
             .chain(&self.window_buffer)
-            .chain(&self.windows)
             .find(|shape| shape.id == engine)
             .map(|shape| shape.pool)
             .or_else(|| {

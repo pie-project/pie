@@ -186,7 +186,6 @@ pub(super) async fn reserve<C: FireContext>(
     set_lanes: &[Vec<usize>],
     rs_ids: &[crate::store::rs::RsWorkingSetId],
     rs_plan: impl Fn() -> Result<rs::RsPlan, String>,
-    windowed: bool,
 ) -> Result<Reserved, String> {
     let mut stale_at = None;
     'grant: loop {
@@ -201,7 +200,7 @@ pub(super) async fn reserve<C: FireContext>(
             rs: rs_slot_demand(stores, rs_ids, &plan)?,
         };
         let alone = || alone_demands(stores, sets, set_lanes, rs_ids, &plan);
-        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, windowed, alone).await?
+        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, alone).await?
         else {
             continue;
         };

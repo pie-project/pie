@@ -13,7 +13,6 @@ name = "engine_gpu"
 path = "src/lib.rs"
 
 [dependencies]
-toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-slang = { path = "../kernels-slang" }
 engine = { path = "../engine" }

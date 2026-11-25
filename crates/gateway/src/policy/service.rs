@@ -19,7 +19,7 @@ use worker_api::Request;
 use crate::admission::{AdmissionDecision, RejectReason};
 use crate::controller::GatewayControl;
 use crate::route::RoutingHandle;
-use crate::session::AdmitReject;
+use crate::session::{AdmitReject, Facts};
 
 /// Who caused a process's end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +48,7 @@ struct Acted {
     /// Moves asked of the sessions: (process, target).
     moves: HashSet<(u64, WorkerId)>,
     /// Copies asked of workers, and when.
-    asked: HashMap<(String, WorkerId, bool), Instant>,
+    asked: HashMap<(String, WorkerId), Instant>,
     /// The helpers each running process was last given.
     helpers: HashMap<u64, Vec<WorkerId>>,
 }
@@ -254,7 +254,12 @@ impl Cluster {
         }
     }
 
-    pub async fn admit(&self, req: &Request, routing: &RoutingHandle) -> Result<(), AdmitReject> {
+    pub async fn admit(
+        &self,
+        req: &Request,
+        facts: Facts,
+        routing: &RoutingHandle,
+    ) -> Result<(), AdmitReject> {
         let id = req.req_id.0;
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let (props, session) = match &req.message {
@@ -277,6 +282,8 @@ impl Cluster {
             session,
             props,
             prompt,
+            connection: facts.connection.map(|session| session.0),
+            tied: facts.tied,
         };
         if self.active() {
             self.shared
@@ -576,14 +583,14 @@ fn retell_helpers(shared: &Shared, acted: &mut Acted, fleet: &crate::worker::Wor
 }
 
 fn carry(
-    asked: &mut HashMap<(String, WorkerId, bool), Instant>,
+    asked: &mut HashMap<(String, WorkerId), Instant>,
     orders: Vec<ReplicateOrder>,
     fleet: &crate::worker::WorkerRegistry,
 ) {
     let now = Instant::now();
     asked.retain(|_, at| now.duration_since(*at) < REPLICATE_RETRY);
     for order in orders {
-        let key = (order.group.clone(), order.worker, order.disk);
+        let key = (order.group.clone(), order.worker);
         if asked.contains_key(&key) {
             continue;
         }
@@ -599,17 +606,15 @@ fn carry(
                 worker,
                 keys,
                 from,
-                retention,
-                disk,
                 table,
             } = order;
-            match client.replicate(ctx, keys, from, retention, disk).await {
-                Ok(Ok(pages)) => tracing::info!(%group, %worker, table, pages, disk, "replicated"),
+            match client.replicate(ctx, keys, from).await {
+                Ok(Ok(pages)) => tracing::info!(%group, %worker, table, pages, "replicated"),
                 Ok(Err(why)) => {
-                    tracing::warn!(%group, %worker, table, %why, disk, "replication refused")
+                    tracing::warn!(%group, %worker, table, %why, "replication refused")
                 }
                 Err(error) => {
-                    tracing::warn!(%group, %worker, table, %error, disk, "replication not delivered")
+                    tracing::warn!(%group, %worker, table, %error, "replication not delivered")
                 }
             }
         });
@@ -810,6 +815,10 @@ mod tests {
             .collect()
     }
 
+    /// What a call of a policy may take here: no load reaches it, so the
+    /// gate opens when the policies have heard, and only then.
+    const CALL: Duration = Duration::from_secs(60 * 60);
+
     async fn rig(kv: u8) -> Rig {
         rig_of(kv, &["test-route"]).await
     }
@@ -817,15 +826,17 @@ mod tests {
     /// A gateway, its policies `names` running in a controller beside it,
     /// once the gateway has heard they run.
     async fn rig_of(kv: u8, names: &[&str]) -> Rig {
-        rig_with(kv, names, DirectoryView::default()).await
+        rig_on(table(kv), names, DirectoryView::default()).await
     }
 
-    /// As [`rig_of`], the directory reading `directory`.
-    async fn rig_with(kv: u8, names: &[&str], directory: DirectoryView) -> Rig {
-        let (table, table_rx) = watch::channel(table(kv));
+    /// As [`rig_of`], the workers `table`'s, the directory reading
+    /// `directory`.
+    async fn rig_on(table: RoutingTable, names: &[&str], directory: DirectoryView) -> Rig {
+        let (table, table_rx) = watch::channel(table);
         let (connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
         let routing = RoutingHandle::new(table_rx.clone(), connected_rx.clone());
-        let host = Host::start(programs(names), table_rx, watch::channel(directory).1).unwrap();
+        let directory = watch::channel(directory).1;
+        let host = Host::start(programs(names), CALL, table_rx, directory).unwrap();
         let (me, me_rx) = watch::channel(Some(GatewayId(0)));
         let (router, cancelled, moves) = Cluster::start(
             HostControl(host.clone()),
@@ -833,14 +844,7 @@ mod tests {
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !router.active() {
-            assert!(
-                Instant::now() < deadline,
-                "the gateway never heard the policies run"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        when(&router, || router.active()).await;
         Rig {
             router,
             host,
@@ -853,6 +857,27 @@ mod tests {
         }
     }
 
+    /// Waits for the decisions to make `so` true, however long they take.
+    async fn when(router: &Cluster, mut so: impl FnMut() -> bool) {
+        loop {
+            let changed = router.shared.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if so() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Waits for `req` to stand at the gate, its policies heard.
+    async fn queued(router: &Cluster, req: &Request) {
+        let at = |id: &u64| *id == req.req_id.0;
+        while !router.shared.waiting.lock().unwrap().values().any(at) {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// `test-route` places a process on the workers its `to` hint names
     /// (`""` holds it at the gateway); `refuse` and `stop` end it.
     fn placed_on(rig: &Rig, req: &Request) -> Option<Vec<WorkerId>> {
@@ -860,37 +885,24 @@ mod tests {
     }
 
     async fn until_placed(rig: &Rig, req: &Request, want: Option<Vec<WorkerId>>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while placed_on(rig, req) != want {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "placed on {:?}, wanted {want:?}",
-                placed_on(rig, req)
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        when(&rig.router, || placed_on(rig, req) == want).await;
     }
 
     /// `default-cluster` names every worker that serves others' passes
     /// (`pie/prefill-listen`) a helper of every process.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn the_default_cluster_policy_names_the_listening_workers_helpers() {
         let directory = DirectoryView {
             links: vec![(WorkerId(1), "10.0.0.1:7100".into())],
             ..DirectoryView::default()
         };
-        let rig = rig_with(0, &["default-cluster"], directory).await;
+        let rig = rig_on(table(0), &["default-cluster"], directory).await;
         let req = launch(1, serde_json::json!({}));
-        rig.router.admit(&req, &rig.routing).await.unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while rig.router.placement(&req).2 != [WorkerId(1)] {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "helpers {:?}",
-                rig.router.placement(&req).2
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        rig.router.admit(&req, Facts::default(), &rig.routing).await.unwrap();
+        when(&rig.router, || {
+            rig.router.placement(&req).2 == [WorkerId(1)]
+        })
+        .await;
         assert_eq!(
             placed_on(&rig, &req),
             Some(vec![WorkerId(1), WorkerId(2)]),
@@ -900,17 +912,114 @@ mod tests {
 
     /// `default-cluster` places a pending launch least loaded first (its
     /// kv pressure, then its processes, then its id).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn the_default_cluster_policy_places_a_launch_least_loaded_first() {
-        let rig = rig_of(0, &["default-cluster"]).await;
         let mut loaded = table(0);
-        loaded.epoch = 2;
         loaded.workers[0].coarse_load.kv_pressure_bucket = 100;
         loaded.workers[1].coarse_load.kv_pressure_bucket = 10;
-        rig.table.send_replace(loaded);
+        let rig = rig_on(loaded, &["default-cluster"], DirectoryView::default()).await;
         let first = launch(1, serde_json::json!({}));
-        rig.router.admit(&first, &rig.routing).await.unwrap();
-        until_placed(&rig, &first, Some(vec![WorkerId(2), WorkerId(1)])).await;
+        rig.router.admit(&first, Facts::default(), &rig.routing).await.unwrap();
+        assert_eq!(
+            placed_on(&rig, &first),
+            Some(vec![WorkerId(2), WorkerId(1)])
+        );
+    }
+
+    /// `default-cluster` sends a session's turns where its last went, with
+    /// none of its processes alive: a named session's, or a connection's.
+    /// Load orders only launches of neither, and a full worker is left off.
+    #[tokio::test]
+    async fn the_default_cluster_policy_keeps_a_session_on_its_worker() {
+        async fn first(rig: &Rig, req: u64, connection: u64, named: Option<&str>) -> WorkerId {
+            let mut turn = launch(req, serde_json::json!({}));
+            if let (Some(name), ClientMessage::LaunchProcess { session, .. }) =
+                (named, &mut turn.message)
+            {
+                *session = Some(name.into());
+            }
+            let facts = Facts {
+                connection: Some(SessionId(connection)),
+                ..Facts::default()
+            };
+            rig.router.admit(&turn, facts, &rig.routing).await.unwrap();
+            let row = placed_on(rig, &turn).expect("a row");
+            rig.router.exited(&turn, Outcome::Completed);
+            row[0]
+        }
+        let pressed = |kv: u8| {
+            let mut now = table(0);
+            now.workers[0].coarse_load.kv_pressure_bucket = kv;
+            rig_on(now, &["default-cluster"], DirectoryView::default())
+        };
+        // Enough connections reach both workers, equally loaded as they are.
+        let rig = pressed(0).await;
+        let mut at = HashMap::new();
+        for connection in 0..16 {
+            at.insert(connection, first(&rig, connection, connection, None).await);
+        }
+        let used: HashSet<WorkerId> = at.values().copied().collect();
+        assert_eq!(used.len(), 2, "{at:?}");
+        // A named session is the same one on any connection.
+        let named = first(&rig, 200, 50, Some("chat")).await;
+        for connection in 0..8 {
+            let again = first(&rig, 201 + connection, connection, Some("chat")).await;
+            assert_eq!(again, named);
+        }
+        // Worker 1 the more pressed, under a new controller: a session stays
+        // where it was.
+        let rig = pressed(200).await;
+        for connection in 0..16 {
+            let again = first(&rig, connection, connection, None).await;
+            assert_eq!(again, at[&connection], "connection {connection}");
+        }
+        // Worker 1 full: its sessions go to the other.
+        let rig = pressed(255).await;
+        for connection in 0..16 {
+            assert_eq!(
+                first(&rig, connection, connection, None).await,
+                WorkerId(2)
+            );
+        }
+    }
+
+    /// `default-cluster` gives a launch that can run on one worker alone
+    /// that worker, full or draining as it is; a policy that leaves it off
+    /// fails the launch, by name.
+    #[tokio::test]
+    async fn a_tied_launch_goes_to_its_worker_or_fails_by_name() {
+        use crate::session::{DispatchFail, TurnRouter};
+
+        let tied = Facts {
+            tied: Some(WorkerId(2)),
+            ..Facts::default()
+        };
+        for (full, draining) in [(0, false), (255, false), (0, true)] {
+            let mut now = table(0);
+            now.workers[1].coarse_load.kv_pressure_bucket = full;
+            now.workers[1].coarse_load.draining = draining;
+            let rig = rig_on(now, &["default-cluster"], DirectoryView::default()).await;
+            let turn = launch(1, serde_json::json!({}));
+            rig.router.admit(&turn, tied, &rig.routing).await.unwrap();
+            assert_eq!(placed_on(&rig, &turn), Some(vec![WorkerId(2)]));
+        }
+
+        let rig = self::rig(0).await;
+        let turn = launch(1, serde_json::json!({"to": "1"}));
+        rig.router.admit(&turn, tied, &rig.routing).await.unwrap();
+        assert_eq!(placed_on(&rig, &turn), Some(vec![WorkerId(1)]));
+        let backend = crate::RouteBackend {
+            routing: rig.routing.clone(),
+            workers: crate::worker::WorkerRegistry::new(),
+            located: Default::default(),
+            router: rig.router.clone(),
+        };
+        let failed = backend.dispatch(&turn, tied.tied).await.unwrap_err();
+        assert_eq!(failed, DispatchFail::Excluded(WorkerId(2)));
+        assert_eq!(
+            crate::session::SessionError::Excluded(WorkerId(2)).to_string(),
+            "the policy excluded worker 2, which holds this launch's session"
+        );
     }
 
     /// Under `default-cluster` a launch waits at its gateway while every
@@ -925,66 +1034,80 @@ mod tests {
             let (router, routing, order) = (rig.router.clone(), rig.routing.clone(), order.clone());
             waits.push(tokio::spawn(async move {
                 router
-                    .admit(&launch(req, serde_json::json!({})), &routing)
+                    .admit(&launch(req, serde_json::json!({})), Facts::default(), &routing)
                     .await
                     .unwrap();
                 order.lock().unwrap().push(req);
             }));
-            // Each is heard before the next arrives.
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            let req = launch(req, serde_json::json!({}));
+            queued(&rig.router, &req).await;
+            assert_eq!(placed_on(&rig, &req), Some(Vec::new()), "held");
         }
         assert!(order.lock().unwrap().is_empty(), "every worker is full");
+        // One whose client went leaves the queue: it holds up none behind it.
+        waits.remove(0).abort();
         let mut room = table(0);
         room.epoch = 2;
         rig.table.send_replace(room);
         for wait in waits {
             wait.await.unwrap();
         }
-        assert_eq!(*order.lock().unwrap(), [1, 2, 3]);
+        assert_eq!(*order.lock().unwrap(), [2, 3]);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_reload_swaps_the_policies_and_withdraws_the_old_ones_rows() {
         let rig = rig(0).await;
         let placed = launch(1, serde_json::json!({"to": "1"}));
-        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
         assert_eq!(placed_on(&rig, &placed), Some(vec![WorkerId(1)]));
         // An empty list holds a launch at the gateway.
         let held = launch(2, serde_json::json!({"to": ""}));
         let waiting = {
-            let (router, routing) = (rig.router.clone(), rig.routing.clone());
-            tokio::spawn(async move { router.admit(&held, &routing).await })
+            let (router, routing, held) = (rig.router.clone(), rig.routing.clone(), held.clone());
+            tokio::spawn(async move { router.admit(&held, Facts::default(), &routing).await })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        queued(&rig.router, &held).await;
+        assert_eq!(placed_on(&rig, &held), Some(Vec::new()));
         assert!(!waiting.is_finished(), "held at the gateway");
 
         rig.host.reload(programs(&["noop"])).await.unwrap();
         // test-route's rows go with it: the held launch leaves, and nothing
         // places the first any more.
-        tokio::time::timeout(Duration::from_secs(5), waiting)
-            .await
-            .expect("let through once its row is withdrawn")
-            .unwrap()
-            .unwrap();
+        waiting.await.unwrap().unwrap();
         until_placed(&rig, &placed, None).await;
+    }
+
+    /// Policies that write different columns run beside each other, in
+    /// either order, each one's rows in force.
+    #[tokio::test]
+    async fn a_policy_beside_another_places_what_it_places() {
+        for names in [["test-share", "test-route"], ["test-route", "test-share"]] {
+            let rig = rig_of(0, &names).await;
+            let placed = launch(1, serde_json::json!({"to": "1"}));
+            rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
+            assert_eq!(placed_on(&rig, &placed), Some(vec![WorkerId(1)]));
+            rig.host
+                .decisions(GatewayId(0))
+                .wait_for(|view| !view.share.groups.is_empty())
+                .await
+                .unwrap();
+        }
     }
 
     /// The share grants a cluster policy writes (`pie:plex-ext/share-groups`)
     /// reach the gateway whole, each grant with its id; unloaded, the policy's
     /// rows are withdrawn under a newer version, so every worker holds none.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn share_grants_reach_the_gateway_and_go_with_their_policy() {
         let rig = rig_of(0, &["test-share"]).await;
-        let decisions = rig.host.decisions(GatewayId(0));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let granted = loop {
-            let share = decisions.borrow().share.clone();
-            if !share.groups.is_empty() && share.default.is_some() {
-                break share;
-            }
-            assert!(Instant::now() < deadline, "no grants: {share:?}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let mut decisions = rig.host.decisions(GatewayId(0));
+        let granted = decisions
+            .wait_for(|view| !view.share.groups.is_empty() && view.share.default.is_some())
+            .await
+            .unwrap()
+            .share
+            .clone();
         let (group, tenants, id) = &granted.groups[0];
         assert_eq!(
             (group.as_str(), tenants.clone()),
@@ -996,22 +1119,19 @@ mod tests {
         assert!(granted.version >= (*id).max(default_id));
 
         rig.host.reload(programs(&["noop"])).await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let share = decisions.borrow().share.clone();
-            if share.groups.is_empty() && share.default.is_none() {
-                assert!(
-                    share.version > granted.version,
-                    "a newer version: workers take it"
-                );
-                break;
-            }
-            assert!(Instant::now() < deadline, "grants not withdrawn: {share:?}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let withdrawn = decisions
+            .wait_for(|view| view.share.groups.is_empty() && view.share.default.is_none())
+            .await
+            .unwrap()
+            .share
+            .version;
+        assert!(
+            withdrawn > granted.version,
+            "a newer version: workers take it"
+        );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_reload_that_does_not_load_leaves_the_running_set() {
         let rig = rig(0).await;
         let mut broken = programs(&["noop"]);
@@ -1027,11 +1147,11 @@ mod tests {
         );
         // test-route still places.
         let placed = launch(1, serde_json::json!({"to": "1"}));
-        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
         assert_eq!(placed_on(&rig, &placed), Some(vec![WorkerId(1)]));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_launch_is_held_at_the_gateway_or_placed_on_its_list_best_first() {
         let rig = rig(0).await;
         let held = launch(1, serde_json::json!({"to": ""}));
@@ -1040,11 +1160,11 @@ mod tests {
 
         let waiting = tokio::spawn({
             let (router, routing, held) = (rig.router.clone(), rig.routing.clone(), held.clone());
-            async move { router.admit(&held, &routing).await }
+            async move { router.admit(&held, Facts::default(), &routing).await }
         });
-        rig.router.admit(&listed, &rig.routing).await.unwrap();
-        rig.router.admit(&free, &rig.routing).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.router.admit(&listed, Facts::default(), &rig.routing).await.unwrap();
+        rig.router.admit(&free, Facts::default(), &rig.routing).await.unwrap();
+        queued(&rig.router, &held).await;
         assert!(!waiting.is_finished(), "an empty list holds it");
         assert_eq!(placed_on(&rig, &held), Some(Vec::new()));
 
@@ -1058,26 +1178,23 @@ mod tests {
         waiting.abort();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_terminated_launch_is_refused_while_it_waits_and_cancelled_once_it_runs() {
         let mut rig = rig(0).await;
         let refused = launch(1, serde_json::json!({"refuse": "not today"}));
-        match rig.router.admit(&refused, &rig.routing).await {
+        match rig.router.admit(&refused, Facts::default(), &rig.routing).await {
             Err(AdmitReject::Refused(why)) => assert_eq!(why, "not today"),
             other => panic!("refused while it waits, got {other:?}"),
         }
 
         let stopped = launch(2, serde_json::json!({"stop": true}));
-        rig.router.admit(&stopped, &rig.routing).await.unwrap();
+        rig.router.admit(&stopped, Facts::default(), &rig.routing).await.unwrap();
         rig.router.dispatched(&stopped, WorkerId(1));
         rig.router.started(&stopped);
-        let cancelled = tokio::time::timeout(Duration::from_secs(5), rig.cancelled.recv())
-            .await
-            .expect("the gateway is told to cancel it");
-        assert_eq!(cancelled, Some(ReqId(2)));
+        assert_eq!(rig.cancelled.recv().await, Some(ReqId(2)));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_running_process_moves_only_when_its_list_leaves_its_worker_out() {
         let mut rig = rig(0).await;
         let mut placed = launch(1, serde_json::json!({}));
@@ -1088,7 +1205,7 @@ mod tests {
             "t/s".into(),
             serde_json::from_value(serde_json::json!({"to": "1,2"})).unwrap(),
         );
-        rig.router.admit(&placed, &rig.routing).await.unwrap();
+        rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
         until_placed(&rig, &placed, Some(vec![WorkerId(1), WorkerId(2)])).await;
         rig.router.dispatched(&placed, WorkerId(1));
 
@@ -1098,26 +1215,22 @@ mod tests {
             serde_json::from_value(serde_json::json!({"to": "2,1"})).unwrap(),
         );
         until_placed(&rig, &placed, Some(vec![WorkerId(2), WorkerId(1)])).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), rig.moves.recv())
-                .await
-                .is_err(),
-            "a reorder moves nothing"
-        );
+        assert!(rig.moves.try_recv().is_err(), "a reorder moves nothing");
 
         // Left out, it moves to the first the list names, once.
         rig.router.session_props(
             "t/s".into(),
             serde_json::from_value(serde_json::json!({"to": "2"})).unwrap(),
         );
-        let moved = tokio::time::timeout(Duration::from_secs(5), rig.moves.recv())
+        assert_eq!(rig.moves.recv().await, Some((ReqId(1), WorkerId(2))));
+        // Decisions about another: what they say of this one stands.
+        let other = launch(2, serde_json::json!({"to": "1"}));
+        rig.router
+            .admit(&other, Facts::default(), &rig.routing)
             .await
-            .expect("the gateway is told to move it");
-        assert_eq!(moved, Some((ReqId(1), WorkerId(2))));
+            .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), rig.moves.recv())
-                .await
-                .is_err(),
+            rig.moves.try_recv().is_err(),
             "asked once while the placement stands"
         );
         rig.router.moved(&placed, Some(WorkerId(2)), "");
@@ -1129,7 +1242,28 @@ mod tests {
     #[derive(Clone, Default)]
     struct Recorder {
         heard: Arc<Mutex<Vec<ProcessEvent>>>,
+        told: Arc<Notify>,
         generation: Arc<AtomicU64>,
+    }
+
+    impl Recorder {
+        /// What it was told, up to a session's props: the last thing a
+        /// gateway tells.
+        async fn heard(&self) -> Vec<ProcessEvent> {
+            loop {
+                let told = self.told.notified();
+                {
+                    let mut heard = self.heard.lock().unwrap();
+                    if heard
+                        .iter()
+                        .any(|event| matches!(event, ProcessEvent::SessionProps { .. }))
+                    {
+                        return std::mem::take(&mut *heard);
+                    }
+                }
+                told.await;
+            }
+        }
     }
 
     impl GatewayControl for Recorder {
@@ -1153,6 +1287,7 @@ mod tests {
         }
         async fn cluster_events(&self, _g: GatewayId, e: Vec<ProcessEvent>) -> anyhow::Result<()> {
             self.heard.lock().unwrap().extend(e);
+            self.told.notify_one();
             Ok(())
         }
         fn decisions_watch(&self, _g: GatewayId) -> watch::Receiver<GatewayDecisions> {
@@ -1169,7 +1304,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_new_controller_hears_the_live_processes_and_sessions_first() {
         let recorder = Recorder::default();
         let (_table, table_rx) = watch::channel(table(0));
@@ -1182,28 +1317,22 @@ mod tests {
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !router.active() {
-            assert!(Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        when(&router, || router.active()).await;
         let (live, gone) = (
             launch(1, serde_json::json!({"key": 1})),
             launch(2, serde_json::json!({})),
         );
-        router.admit(&live, &routing).await.unwrap();
+        router.admit(&live, Facts::default(), &routing).await.unwrap();
         router.dispatched(&live, WorkerId(1));
-        router.admit(&gone, &routing).await.unwrap();
+        router.admit(&gone, Facts::default(), &routing).await.unwrap();
         router.exited(&gone, Outcome::Completed);
         let changes: Props = serde_json::from_value(serde_json::json!({"eta": 9})).unwrap();
         router.session_props("t/s".into(), changes);
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        recorder.heard.lock().unwrap().clear();
+        recorder.heard().await;
 
         // The controller is dialed again: a new one.
         recorder.generation.fetch_add(1, Ordering::AcqRel);
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let heard = std::mem::take(&mut *recorder.heard.lock().unwrap());
+        let heard = recorder.heard().await;
         let kinds: Vec<String> = heard
             .iter()
             .filter(|event| !matches!(event, ProcessEvent::Workers(_)))
@@ -1297,7 +1426,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn a_controller_that_replaces_a_dead_one_takes_up_its_running_processes() {
         let (_table, table_rx) = watch::channel(table(0));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::from([WorkerId(1)])));
@@ -1305,6 +1434,7 @@ mod tests {
         let start = || {
             Host::start(
                 programs(&["test-route"]),
+                CALL,
                 table_rx.clone(),
                 watch::channel(DirectoryView::default()).1,
             )
@@ -1319,14 +1449,7 @@ mod tests {
             connected_rx,
             crate::worker::WorkerRegistry::new(),
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !router.active() {
-            assert!(
-                Instant::now() < deadline,
-                "the gateway never heard the policies run"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        when(&router, || router.active()).await;
         let mut placed = launch(1, serde_json::json!({}));
         if let ClientMessage::LaunchProcess { session, .. } = &mut placed.message {
             *session = Some("s".into());
@@ -1334,13 +1457,11 @@ mod tests {
         let to =
             |workers: &str| serde_json::from_value(serde_json::json!({ "to": workers })).unwrap();
         router.session_props("t/s".into(), to("1"));
-        rig_admit(&router, &placed, &routing).await;
+        router
+            .admit(&placed, Facts::default(), &routing)
+            .await
+            .unwrap();
         router.dispatched(&placed, WorkerId(1));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while router.placement(&placed).0.is_none() {
-            assert!(Instant::now() < deadline, "the placement never arrived");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
         assert_eq!(router.placement(&placed).0, Some(vec![WorkerId(1)]));
 
         // The controller dies; the session's list changes while it is down.
@@ -1359,22 +1480,12 @@ mod tests {
         // A new one hears the process and its session from the gateway, and
         // its list, which leaves worker 1 out, moves it.
         control.up(start());
-        let moved = tokio::time::timeout(Duration::from_secs(5), moves.recv())
-            .await
-            .expect("the new controller moves it");
-        assert_eq!(moved, Some((ReqId(1), WorkerId(2))));
+        assert_eq!(moves.recv().await, Some((ReqId(1), WorkerId(2))));
         router.moved(&placed, Some(WorkerId(2)), "");
         router.exited(&placed, Outcome::Completed);
     }
 
-    async fn rig_admit(router: &Cluster, req: &Request, routing: &RoutingHandle) {
-        tokio::time::timeout(Duration::from_secs(5), router.admit(req, routing))
-            .await
-            .expect("admitted in time")
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn with_no_policy_running_the_gateway_goes_by_its_defaults() {
         let (_table, table_rx) = watch::channel(table(0));
         let (_connected, connected_rx) = watch::channel(Arc::new(HashSet::new()));

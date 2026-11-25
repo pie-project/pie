@@ -1397,4 +1397,62 @@ mod tests {
         assert!(matches!(clocked.admit(decode), Admitted::Whole { .. }));
     }
 
+
+    /// A device slowing under load (a phone's GPU at its thermal cap):
+    /// each fire's measured time over its estimate at a ratio of 1 rises
+    /// from fire to fire. An estimate is read at the stored ratio (the
+    /// rates step's worst times the probe's scale) until a measured ratio
+    /// passes it, then at that one: a step that fit whole at load is split
+    /// before it reaches the bound. One fast fire after a slow one does not
+    /// lower it (the worst, not a mean); once the slow fires are a bound
+    /// old, the stored ratio again.
+    #[test]
+    fn a_device_slowing_fire_by_fire_splits_a_step_that_fit_at_load() {
+        let at_one = bound(1.0);
+        let step = prompt(256, 1024);
+        let (raw, per_layer) = at_one.raw_ns(step);
+        // The field's worst ratio; the step whole under it with a layer to
+        // spare, by 5%.
+        let worst = 2.062;
+        let mut b = SubmitBound {
+            worst,
+            bound_ns: (raw + per_layer) * worst * 1.05,
+            ..at_one
+        };
+        assert!(matches!(b.admit(step), Admitted::Whole { .. }));
+        assert_eq!(b.ratio_now(), worst);
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| std::time::Duration::from_millis(n);
+        let fire = 100.0 * MS;
+        let mut read = Vec::new();
+        for (at, ratio) in [1.5, 2.0, 2.1, 2.3, 2.6].into_iter().enumerate() {
+            b.landed(t0 + ms(at as u64 * 100), 256, fire, (fire * ratio) as u64, None);
+            read.push((b.ratio_now(), b.admit(step).split()));
+        }
+        // Under the stored ratio: read at it, whole (2.1 is past it but
+        // within the 5% to spare). Past it: read at the measured, split.
+        let want = [(worst, false), (worst, false), (2.1, false), (2.3, true), (2.6, true)];
+        for ((got, split), (ratio, splits)) in read.iter().zip(want) {
+            assert!((got - ratio).abs() < 1e-6 && *split == splits, "{read:?}");
+        }
+        let (scaled, _) = b.step_ns(step);
+        assert!((scaled - raw * 2.6).abs() < 1e-6 * scaled);
+        // A fast fire after: the worst stands.
+        b.landed(t0 + ms(500), 256, fire, fire as u64, None);
+        assert!(b.admit(step).split());
+        assert!((b.ratio_now() - 2.6).abs() < 1e-6);
+        let why = b.refusal(step, &b.admit(step));
+        assert!(why.contains("at the ratio 2.600"), "{why}");
+        assert!(why.contains("worst ratio 2.600 measured over the 6 fires of every rung"), "{why}");
+        // A bound past the slow fires: the stored ratio again.
+        b.age(t0 + ms(501) + std::time::Duration::from_nanos(b.bound_ns as u64));
+        assert!(b.measured.is_empty());
+        assert_eq!(b.ratio_now(), worst);
+        assert!(matches!(b.admit(step), Admitted::Whole { .. }));
+        // A probe's scale raises the stored ratio over a measured one it
+        // passes: 2.062 x 1.2 = 2.474 over 2.3.
+        b.landed(t0 + ms(10_000), 256, fire, (fire * 2.3) as u64, None);
+        let probed = SubmitBound { scale: 1.2, ..b };
+        assert!((probed.ratio_now() - worst * 1.2).abs() < 1e-6);
+    }
 }
