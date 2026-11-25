@@ -862,6 +862,26 @@ impl Shell {
         self.predicate.lands_snapshots()
     }
 
+    /// The snapshots a fire lands inside itself, a lane at most
+    /// (`Capabilities::rs_snapshots`; 0: none). A load of rings alone lands
+    /// its snapshots itself (`serve::ring`); one of recurrent state too, as
+    /// its state lands them. Both the caps and the arm walk's step facts
+    /// read it here.
+    #[must_use]
+    pub fn rs_snapshots(&self) -> u32 {
+        let state_rows = self
+            .trace
+            .caches
+            .iter()
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+        let lands = if state_rows {
+            self.lands_snapshots()
+        } else {
+            !self.windowed_layers().is_empty()
+        };
+        if lands { crate::store::rs::SNAPSHOTS } else { 0 }
+    }
+
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
         self.weights
             .register_adapter(self.device.stream(), id, planes)
