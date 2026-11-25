@@ -1548,8 +1548,17 @@ impl Shell {
             let copies = format!("|{:?}", kernels_cuda::hip::sys::copy_queues());
             #[cfg(not(feature = "rocm"))]
             let copies = String::new();
-            let record =
-                super::measured::path(dir, &format!("{bodies_shape}|{:?}{copies}", shell.budget));
+            // A rank of a group holds what its own card's bodies took, beside
+            // its peers' (each writing the same file, the last rename wins).
+            let rank = if boot.world.size > 1 {
+                format!("|rank {}", boot.world.rank)
+            } else {
+                String::new()
+            };
+            let record = super::measured::path(
+                dir,
+                &format!("{bodies_shape}|{:?}{copies}{rank}", shell.budget),
+            );
             if let Some(measured) = super::measured::read(&record) {
                 recorded = true;
                 let held = usize::try_from(measured.hold()).unwrap_or(usize::MAX);
