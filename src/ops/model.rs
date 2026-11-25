@@ -13,6 +13,7 @@ pub mod check;
 pub mod facts;
 pub mod import;
 pub mod reload;
+pub mod trace;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
@@ -24,6 +25,8 @@ pub enum ModelCmd {
     Import(import::ImportArgs),
     /// Writes a checkpoint's weights over a running server's model, in place.
     Reload(reload::ReloadArgs),
+    /// Writes what a trainer replays: the model's trace, its banks and its checkpoint reads.
+    Trace(trace::TraceArgs),
     Remove {
         name: String,
         #[arg(long, short = 'y')]
@@ -43,6 +46,7 @@ pub fn run(cmd: ModelCmd, global: &crate::args::GlobalArgs, json: bool) -> Resul
         ModelCmd::Info { name } => info(name),
         ModelCmd::Import(args) => import::run(args, global, json),
         ModelCmd::Reload(args) => reload::run(args, global),
+        ModelCmd::Trace(args) => trace::run(args),
         ModelCmd::Remove { name, yes } => remove(name, yes),
         ModelCmd::Families => check::families(),
         ModelCmd::Check(args) => check::run(args),

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
 
-pub use poem_compiler::catalog::{Catalog, Deployment, Refused, Tree, requantizes};
+pub use poem_compiler::catalog::{Catalog, Deployment, Refused, Tree, one_rank, requantizes};
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/packages.rs"));
