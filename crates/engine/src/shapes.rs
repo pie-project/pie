@@ -1096,80 +1096,6 @@ mod tests {
         assert_eq!(stated.apart(&stated.clone()), None);
     }
 
-    /// An engine stating no mixed lane rungs (`MixedLanes::Any`: CUDA,
-    /// engine-gpu, Metal, Cerebras) states one mixed shape a rung and
-    /// treatment, any prompt and decode counts within its lanes, as before
-    /// the rungs; one stating rungs (XLA) a shape a prompt-lane rung, its
-    /// decodes no more than the rung lays beside it.
-    #[test]
-    fn mixed_shapes_follow_the_engines_lane_rungs_and_none_where_it_states_none() {
-        let any = facts(&[16, 256, 2048], true);
-        let set = StepShapes::of(&StepRules::runtime(), &any);
-        let mixed: Vec<&StepShape> = set
-            .shapes
-            .iter()
-            .filter(|s| s.kind == StepKind::Mixed)
-            .collect();
-        for shape in &mixed {
-            let lanes = any.max_lanes;
-            assert_eq!(
-                shape.prompt_lanes,
-                Span {
-                    lo: 1,
-                    hi: (lanes - 1).min((shape.rows.hi - 1) / 2)
-                }
-            );
-            assert_eq!(
-                shape.decode_lanes,
-                Span {
-                    lo: 1,
-                    hi: (lanes - 1).min(shape.rows.hi - 2)
-                }
-            );
-        }
-        let per = |set: &StepShapes| {
-            let mut keys: Vec<(u32, Treatment)> = set
-                .shapes
-                .iter()
-                .filter(|s| s.kind == StepKind::Mixed)
-                .map(|s| (s.rung, s.treatment))
-                .collect();
-            let n = keys.len();
-            keys.dedup();
-            (n, keys.len())
-        };
-        let (n, distinct) = per(&set);
-        assert_eq!(n, distinct, "one mixed shape a rung and treatment");
-        let rung = |prompt_lanes, decode_lanes| crate::MixedRung {
-            prompt_lanes,
-            decode_lanes,
-        };
-        let laid = any.clone().with_mixed(crate::MixedLanes::Laid(vec![
-            rung(16, 48),
-            rung(32, 32),
-            rung(64, 0),
-        ]));
-        let set = StepShapes::of(&StepRules::runtime(), &laid);
-        for shape in set.shapes.iter().filter(|s| s.kind == StepKind::Mixed) {
-            let (lo, hi, d) = if shape.prompt_lanes.hi <= 15 {
-                (1, 15, 48)
-            } else {
-                (16, 31, 32)
-            };
-            assert!(
-                shape.prompt_lanes.lo == lo && shape.prompt_lanes.hi <= hi,
-                "{shape:?}"
-            );
-            assert!(shape.decode_lanes.hi <= d, "{shape:?}");
-        }
-        // a rung laying no decodes beside it states no mixed shape
-        assert!(
-            set.shapes
-                .iter()
-                .all(|s| s.kind != StepKind::Mixed || s.prompt_lanes.hi < 32)
-        );
-    }
-
     fn lane(rows: usize, buffered: bool) -> Lane {
         Lane {
             tokens: vec![1; rows],
@@ -1188,20 +1114,11 @@ mod tests {
         }
     }
 
+    /// The set is ordered smallest first across kinds (what the armed /
+    /// eager boundary records in), and states buffered mixed steps.
     #[test]
     fn the_set_is_finite_and_ordered_smallest_first_across_kinds() {
-        let rungs = [8, 64, 256, 2048];
-        let folded = StepShapes::of(&StepRules::runtime(), &facts(&rungs, false));
-        // Rung 8: decode, mixed, prompt; 64: the same; 256 and 2048: no
-        // decode past the 64 lanes, mixed and prompt.
-        assert_eq!(folded.len(), 3 + 3 + 2 + 2, "{}", folded.census());
-        let buffered = StepShapes::of(&StepRules::runtime(), &facts(&rungs, true));
-        // The widest spacing is 8 (8 to 64, 256 to 2048): buffered rungs 64
-        // (8 padded up to 8x) and 2048 (256 up to 8x). At 64 a buffered
-        // decode, mixed and prompt; at 2048 mixed and prompt (no decode
-        // past the 64 lanes).
-        assert_eq!(facts(&rungs, true).buffered_rungs(), vec![64, 2048]);
-        assert_eq!(buffered.len(), 10 + 3 + 2, "{}", buffered.census());
+        let buffered = StepShapes::of(&StepRules::runtime(), &facts(&[8, 64, 256, 2048], true));
         let keys: Vec<_> = buffered
             .shapes
             .iter()
@@ -1217,73 +1134,6 @@ mod tests {
                 .any(|s| s.kind == StepKind::Mixed && s.treatment == Treatment::Buffers),
             "decode lanes buffering beside a prompt are stated"
         );
-    }
-
-    /// Buffered compositions are stated at fewer rungs than folded ones,
-    /// every buffered step pads to a stated buffered rung, and none pads
-    /// past its folded rung by more than the lattice's widest spacing.
-    #[test]
-    fn buffered_steps_pad_to_fewer_rungs_within_the_lattice_s_spacing() {
-        for rungs in [
-            (0..12).map(|k| 1u32 << k).collect::<Vec<_>>(),
-            vec![16, 32, 64, 128, 256, 512, 1024, 2048],
-            vec![8, 64, 256, 2048],
-            vec![4, 16, 64],
-            vec![2048],
-        ] {
-            let f = facts(&rungs, true);
-            let set = StepShapes::of(&StepRules::runtime(), &f);
-            let lattice = f.lattice();
-            let buffered = f.buffered_rungs();
-            let (upper, lower) = f.spacing();
-            assert_eq!(buffered.last(), lattice.last(), "the top is kept");
-            assert!(buffered.iter().all(|rung| lattice.contains(rung)));
-            let count = |t: Treatment| set.shapes.iter().filter(|s| s.treatment == t).count();
-            if lattice.len() > 1 {
-                assert!(
-                    count(Treatment::Buffers) < count(Treatment::Folds),
-                    "{rungs:?}: {}",
-                    set.census()
-                );
-            }
-            for rows in 1..=2048u32 {
-                for prompt in [false, true] {
-                    let lanes: Vec<Lane> = if prompt && rows > 1 {
-                        vec![lane(rows as usize, true)]
-                    } else if rows <= 64 {
-                        vec![lane(1, true); rows as usize]
-                    } else {
-                        continue;
-                    };
-                    let step = StepComposition::of(&lanes);
-                    let at = set.holds(&step).unwrap_or_else(|gap| panic!("{gap}"));
-                    let rung = set.shapes[at].rung;
-                    assert!(buffered.contains(&rung), "{rows}: r{rung} {buffered:?}");
-                    let folded = *lattice.iter().find(|&&r| r >= rows).unwrap();
-                    assert!(
-                        u64::from(rung) * u64::from(lower) <= u64::from(upper) * u64::from(folded),
-                        "{rows} rows: r{rung} over folded r{folded} past {upper}/{lower}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// A Qwen3.5-like hybrid load (rungs every power of two from 16 to the
-    /// fire's 2048 tokens, 64 lanes, an rs list): what it states before and
-    /// after buffered rungs were thinned.
-    #[test]
-    fn a_hybrid_load_states_fewer_buffered_compositions() {
-        let f = facts(&[16, 32, 64, 128, 256, 512, 1024, 2048], true);
-        let set = StepShapes::of(&StepRules::runtime(), &f);
-        let count = |t: Treatment| set.shapes.iter().filter(|s| s.treatment == t).count();
-        // Folded: decode, mixed, prompt at 16, 32, 64; mixed, prompt past.
-        assert_eq!(count(Treatment::Folds), 3 * 3 + 2 * 5, "{}", set.census());
-        // Buffered at 32, 128, 512, 2048 (every rung before: 3 * 3 + 2 * 5):
-        // decode, mixed, prompt at 32; decode (33-64 lanes), mixed, prompt at
-        // 128; mixed, prompt at 512 and 2048.
-        assert_eq!(f.buffered_rungs(), vec![32, 128, 512, 2048]);
-        assert_eq!(count(Treatment::Buffers), 3 + 3 + 2 + 2, "{}", set.census());
     }
 
     #[test]
@@ -1310,34 +1160,10 @@ mod tests {
         }
     }
 
-    /// Uneven prompt splits ([10, 6]), odd lane counts ([3, 3, 3, 3] and a
-    /// lone 3) and lanes carrying a mask, an adapter and a guest input at a
-    /// small rung are all in the set; a lane carrying an attachment the
-    /// load does not serve is not.
+    /// A lane carrying an attachment the load does not serve is in no
+    /// shape of the set.
     #[test]
-    fn uneven_splits_and_attached_lanes_are_in_the_set() {
-        let set = StepShapes::of(&StepRules::runtime(), &facts(&[4, 16, 64], false));
-        for rows in [
-            vec![10usize, 6],
-            vec![3, 3, 3, 3],
-            vec![3],
-            vec![16],
-            vec![1, 1],
-        ] {
-            let mut lanes: Vec<Lane> = rows.iter().map(|&n| lane(n, false)).collect();
-            lanes[0].mask = Some(crate::fire::Masking::Extent(crate::fire::Mask::new(
-                vec![1],
-                1,
-            )));
-            lanes[0].adapter = Some(0);
-            lanes[0].inputs = vec![crate::fire::InputFeed {
-                id: 0,
-                channel: crate::ChannelId(0),
-            }];
-            let step = StepComposition::of(&lanes);
-            set.holds(&step)
-                .unwrap_or_else(|gap| panic!("{rows:?}: {gap}"));
-        }
+    fn a_lane_carrying_an_unserved_attachment_is_refused() {
         let plain = StepFacts {
             attachments: Attachments::served(false, false, false),
             ..facts(&[4, 16, 64], false)

@@ -17,22 +17,6 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
-    /// A timed step's frame committed as a serving step is (kept and
-    /// replayed where `keep`), and its device time read as the harvest reads
-    /// it, from its timestamps once its fence was waited.
-    pub fn fired_time(frame: engine_vulkan::device::Frame, keep: bool) -> Option<u64> {
-        let pending = if keep {
-            frame
-                .into_kept()
-                .and_then(|kept| kept.replay(None))
-                .expect("the kept frame replays")
-        } else {
-            frame.commit_async(None).expect("the frame is submitted")
-        };
-        pending.wait().expect("the frame lands");
-        pending.span_ns().expect("its timestamps read")
-    }
-
     /// Every frame this thread waits on from here timed by the device's
     /// timestamps (`on`), or no longer.
     pub fn watch_frames(on: bool) {
@@ -44,12 +28,6 @@ mod backend {
     /// [`watch_frames`]; `None` where the backend times none.
     pub fn longest_frame_ns() -> Option<u64> {
         Some(engine_vulkan::encode::take_longest_frame_span_ns())
-    }
-
-    /// The backend's profile registry: what a user's or a committed file is
-    /// read against.
-    pub fn registry() -> &'static profile::Registry {
-        engine_vulkan::chip::registry()
     }
 
     pub const NAME: &str = "vulkan";

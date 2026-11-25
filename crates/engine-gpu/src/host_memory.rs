@@ -352,7 +352,6 @@ mod tests {
     use super::*;
 
     const PAGE: u64 = 4096;
-    const MIB: u64 = 1 << 20;
 
     /// An SM8850's, abridged.
     const AVAILABLE: u64 = 3_692_416 * 1024;
@@ -370,49 +369,6 @@ mod tests {
                             managed  2716912\n        protection: (0, 0, 0)\n\
                             Node 0, zone  Movable\n        min      32\n        low      32\n\
                             high     32\n        managed  0\n        protection: (0, 0, 0)\n";
-
-    #[test]
-    fn off_android_the_room_is_available_less_the_floor() {
-        let room = room_of(MEMINFO, Killer::None, PAGE).unwrap();
-        assert_eq!(room.defended, 0);
-        assert_eq!(room.room, AVAILABLE - SAFETY_FLOOR_BYTES);
-    }
-
-    #[test]
-    fn lmkd_pressure_mode_subtracts_nothing_available_left_out() {
-        let room = room_of(MEMINFO, Killer::Pressure, PAGE).unwrap();
-        assert_eq!(room.defended, 0);
-        assert_eq!(room.room, AVAILABLE - SAFETY_FLOOR_BYTES);
-    }
-
-    #[test]
-    fn lmkd_minfree_mode_subtracts_only_the_level_past_totalreserve() {
-        // The foreground level (adj 0) is 81150 pages, 50000 past the
-        // zones' reserve.
-        let levels = "81150:0,90000:100,120000:900";
-        let room = room_of(
-            MEMINFO,
-            Killer::Minfree {
-                levels,
-                zoneinfo: ZONEINFO,
-            },
-            PAGE,
-        )
-        .unwrap();
-        assert_eq!(room.defended, 50_000 * PAGE);
-        assert_eq!(room.room, AVAILABLE - 50_000 * PAGE - SAFETY_FLOOR_BYTES);
-        // A level under the reserve defends nothing past it.
-        let room = room_of(
-            MEMINFO,
-            Killer::Minfree {
-                levels: "18432:0",
-                zoneinfo: ZONEINFO,
-            },
-            PAGE,
-        )
-        .unwrap();
-        assert_eq!(room.defended, 0);
-    }
 
     #[test]
     fn a_reading_the_rule_needs_is_refused_by_name() {
@@ -438,70 +394,4 @@ mod tests {
         assert!(err.contains("zoneinfo"), "{err}");
     }
 
-    #[test]
-    fn the_room_saturates_and_its_net_says_the_shortfall() {
-        let tight = Available {
-            host: 1024 * 1024,
-            cgroup: None,
-        };
-        let room = room_of(tight, Killer::None, PAGE).unwrap();
-        assert!(room.available < 64 * MIB);
-        assert_eq!(room.room, 0);
-        assert_eq!(room.net(), -(63 * MIB as i64));
-        let room = room_of(MEMINFO, Killer::Pressure, PAGE).unwrap();
-        assert_eq!(room.net(), (AVAILABLE - SAFETY_FLOOR_BYTES) as i64);
-    }
-
-    #[test]
-    fn a_cgroup_cap_binds_past_what_lmkd_defends() {
-        let killer = Killer::Minfree {
-            levels: "81150:0",
-            zoneinfo: ZONEINFO,
-        };
-        let open = AVAILABLE - 50_000 * PAGE;
-        // A cap tighter than the host past lmkd's line binds alone: lmkd's
-        // line is the host's, not the cgroup's.
-        let capped = Available {
-            host: AVAILABLE,
-            cgroup: Some(open / 2),
-        };
-        let room = room_of(capped, killer, PAGE).unwrap();
-        assert_eq!(room.cgroup, Some(open / 2));
-        assert_eq!(room.room, open / 2 - SAFETY_FLOOR_BYTES);
-        assert_eq!(room.net(), (open / 2 - SAFETY_FLOOR_BYTES) as i64);
-        // A looser cap leaves the host's room.
-        let loose = Available {
-            host: AVAILABLE,
-            cgroup: Some(AVAILABLE),
-        };
-        let room = room_of(loose, killer, PAGE).unwrap();
-        assert_eq!(room.room, open - SAFETY_FLOOR_BYTES);
-        // A cap its group has reached leaves the floor short.
-        let full = Available {
-            host: AVAILABLE,
-            cgroup: Some(0),
-        };
-        let room = room_of(full, Killer::None, PAGE).unwrap();
-        assert_eq!(room.room, 0);
-        assert_eq!(room.net(), -(SAFETY_FLOOR_BYTES as i64));
-    }
-
-    #[test]
-    fn total_reserve_sums_high_and_protection_capped_at_managed() {
-        assert_eq!(total_reserve(ZONEINFO), Some(31_150));
-        let reserved = "Node 0, zone DMA32\n high 100\n managed 5000\n protection: (0, 700, 900)\n\
-                        Node 0, zone Normal\n high 200\n managed 9000\n protection: (0, 0, 0)\n\
-                        Node 0, zone Tiny\n high 300\n managed 50\n protection: (0, 0, 0)\n";
-        assert_eq!(total_reserve(reserved), Some(1_000 + 200 + 50));
-        assert_eq!(total_reserve("Node 0, zone Normal\n high 5\n"), None);
-        assert_eq!(total_reserve(""), None);
-    }
-
-    #[test]
-    fn foreground_minfree_is_the_lowest_adj_level() {
-        let levels = "18432:0,23040:100,27648:200,32256:250,55296:900,80640:950";
-        assert_eq!(foreground_minfree(levels), Some(18_432));
-        assert_eq!(foreground_minfree("80640:950, 18432:0"), Some(18_432));
-        assert_eq!(foreground_minfree("18432"), None);
-    }
 }

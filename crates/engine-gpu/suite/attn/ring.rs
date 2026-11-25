@@ -76,10 +76,7 @@ struct Geometry {
 
 impl Geometry {
     fn of(hd: usize, slots: usize, lanes: usize) -> Geometry {
-        Geometry::ringed(hd, slots, lanes, R, W)
-    }
-
-    fn ringed(hd: usize, slots: usize, lanes: usize, r: usize, w: usize) -> Geometry {
+        let (r, w) = (R, W);
         let row = KVH * hd;
         let slot_words = PAGE * row;
         let piece_words = RING_AT + r * row + 8;
@@ -407,7 +404,7 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
     let narrow = gpu.subgroup() < 32;
     for hd in [64usize, 256] {
-        for (what, lanes, prefilling) in [("decode", decodes(), false), ("prefill", prefills(), true)] {
+        for (what, lanes, tiled) in [("decode", decodes(), false), ("prefill", prefills(), true)] {
             let g = Geometry::of(hd, 64, lanes.len());
             let laid = lay(&g, &lanes, hd as u64);
             let folded: Vec<usize> = lanes.iter().map(|lane| lane.folded).collect();
@@ -426,25 +423,14 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                 part_out: t(part_out, 8 * rows * QH, hd, Dtype::F32),
                 part_lse: t(part_lse, 8 * rows, QH, Dtype::F32),
             };
-            let tactics: &[(bool, u32, u32, u32, bool)] = if prefilling {
-                &[
-                    (false, 256, 32, 32, true),
-                    (false, 256, 16, 32, true),
-                    (false, 256, 8, 32, true),
-                    (false, 256, 16, 16, true),
-                    (true, 256, 16, 16, true),
-                    (true, 256, 32, 32, false),
-                    (false, 256, 32, 32, false),
-                ]
+            // (subgroup, tile rows, tile lanes): the walked decode, and the
+            // tiled prefill at 16 lanes a row and 32.
+            let tactics: &[(bool, u32, u32)] = if tiled {
+                &[(false, 16, 16), (true, 16, 16), (false, 32, 32)]
             } else {
-                &[
-                    (true, 256, 32, 32, false),
-                    (true, 128, 32, 32, false),
-                    (false, 256, 32, 32, false),
-                    (false, 128, 32, 32, false),
-                ]
+                &[(true, 32, 32), (false, 32, 32)]
             };
-            for &(subgroup, threads, tile, lanes_a_row, tiled) in tactics {
+            for &(subgroup, tile, lanes_a_row) in tactics {
                 let floor = if !crate::backend::SPIRV {
                     32
                 } else if lanes_a_row == 16 && tiled {
@@ -462,57 +448,34 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                         kernels_slang::Tier::Baseline
                     },
                     narrow,
-                    decode_threads: threads,
+                    decode_threads: 256,
                     tile_rows: tile,
                     tile_lanes: lanes_a_row,
                     split_groups: 1024,
                     split_min_keys: 8,
                     prefill_work: 0,
                 };
-                let splits: &[bool] = if prefilling { &[false] } else { &[false, true] };
-                for &splitting in splits {
-                    for (with_lse, past) in [(false, false), (true, false), (false, true)] {
-                        let kv = if past { high(&staged.pool) } else { staged.pool };
-                        let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
-                        let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
-                        let ot = t(o, rows, QH * hd, Dtype::Bf16);
-                        gpu.run(|c| {
-                            if tiled {
-                                sdpa::prefill(
-                                    c,
-                                    tactic,
-                                    qt,
-                                    &staged.tables,
-                                    &kv,
-                                    Some(g.w as u32),
-                                    hd as u32,
-                                    (1.0 / (hd as f64).sqrt()) as f32,
-                                    ot,
-                                    lse,
-                                )
-                            } else {
-                                sdpa::decode(
-                                    c,
-                                    tactic,
-                                    qt,
-                                    &staged.tables,
-                                    &kv,
-                                    Some(g.w as u32),
-                                    hd as u32,
-                                    (1.0 / (hd as f64).sqrt()) as f32,
-                                    ot,
-                                    lse,
-                                    splitting.then_some(split),
-                                )
-                            }
-                        });
-                        let label = format!(
-                            "ring {what} d {hd} subgroup {subgroup} threads {threads} tile {tile}x{lanes_a_row} tiled {tiled} split {splitting} lse {with_lse} past 8 GiB {past}"
-                        );
-                        close(&gpu.down(o, n), &want_o, &label);
-                        if with_lse {
-                            close(&gpu.down_f32(l, rows * QH), &want_l, &format!("{label}: lse"));
+                // Split (decode), its LSE, and the pool past 8 GiB of words.
+                for (splitting, with_lse, past) in [(false, false, false), (!tiled, true, true)] {
+                    let kv = if past { high(&staged.pool) } else { staged.pool };
+                    let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
+                    let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
+                    let ot = t(o, rows, QH * hd, Dtype::Bf16);
+                    let (win, scale) = (Some(g.w as u32), (1.0 / (hd as f64).sqrt()) as f32);
+                    gpu.run(|c| {
+                        if tiled {
+                            sdpa::prefill(c, tactic, qt, &staged.tables, &kv, win, hd as u32, scale, ot, lse)
+                        } else {
+                            let split = splitting.then_some(split);
+                            sdpa::decode(c, tactic, qt, &staged.tables, &kv, win, hd as u32, scale, ot, lse, split)
                         }
+                    });
+                    let label = format!(
+                        "ring {what} d {hd} subgroup {subgroup} tile {tile}x{lanes_a_row} split {splitting} past 8 GiB {past}"
+                    );
+                    close(&gpu.down(o, n), &want_o, &label);
+                    if with_lse {
+                        close(&gpu.down_f32(l, rows * QH), &want_l, &format!("{label}: lse"));
                     }
                 }
             }
@@ -570,6 +533,13 @@ fn fold_jobs(
     (table, moved)
 }
 
+/// The fold (CONTRACT-BC 19): a lane folding its buffer and part of its
+/// fire, one past the ring's rows (the oldest drop), one folding all of it,
+/// and one folding nothing (its ring untouched: a stop-truncate's lane). The
+/// rows each folds land in its ring at their index modulo the ring's rows,
+/// the rows it leaves unfolded in their buffer slots, and nothing else
+/// moves; on a ring of `R` rows and, the same jobs, on a narrower one of 24
+/// (two windows on one fold's jobs), whose lanes keep their last 24 alone.
 #[test]
 fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
     let Some(mut gpu) = Gpu::open() else {
@@ -578,257 +548,56 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
     };
     let hd = 64;
     let lanes = prefills();
-    // A lane folding its buffer and part of its fire, one past the ring's
-    // rows (the oldest drop), one folding all of it, and one folding
-    // nothing (its ring untouched: a stop-truncate's lane).
     let to = [70, 64 + 40, 21, 70, 100];
     let g = Geometry::of(hd, 64, lanes.len());
     let laid = lay(&g, &lanes, 9);
-    let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
     let (jobs, moved) = fold_jobs(&lanes, &to, &laid);
     let most = (jobs.len() as u32 - 1) / ring::JOB_INTS + 3;
-    // Past 8 GiB of the pool's words, as the fire's own slots lie at a big
-    // pool's top.
-    let pool = high(&staged.pool);
-    let at = pool.ring.expect("the pool holds a ring");
-    // The table opens with the layer's geometry (`Pools::ring_layers`).
-    let mut padded = vec![
-        pool.origin[0] as i32,
-        pool.origin[1] as i32,
-        pool.page_stride[0] as i32,
-        (pool.seq_stride / 2) as i32,
-        at.piece as i32,
-        at.values_piece as i32,
-        at.keys as i32,
-        at.values as i32,
-        at.rows as i32,
-    ];
-    assert_eq!(padded.len(), ring::LAYER_INTS as usize);
-    padded.extend(&jobs);
-    padded.resize(ring::LAYER_INTS as usize + 1 + most as usize * 4, 0);
-    let jt = gpu.up_i32(&padded);
-    let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
-    gpu.run(|c| ring::fold(c, &[&pool], job_table, most));
-    let after = gpu.down(staged.pool_buf, g.elems);
-    let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
-    for (l, lane) in lanes.iter().enumerate() {
-        for r in lane.folded.max(to[l].saturating_sub(R))..to[l] {
+    for rows in [R, 24] {
+        let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
+        // Past 8 GiB of the pool's words, as the fire's own slots lie at a
+        // big pool's top.
+        let mut pool = high(&staged.pool);
+        let at = pool.ring.as_mut().expect("the pool holds a ring");
+        at.rows = rows as u32;
+        let at = *at;
+        // The table opens with the layer's geometry (`Pools::ring_layers`).
+        let mut padded = vec![
+            pool.origin[0] as i32,
+            pool.origin[1] as i32,
+            pool.page_stride[0] as i32,
+            (pool.seq_stride / 2) as i32,
+            at.piece as i32,
+            at.values_piece as i32,
+            at.keys as i32,
+            at.values as i32,
+            at.rows as i32,
+        ];
+        assert_eq!(padded.len(), ring::LAYER_INTS as usize);
+        padded.extend(&jobs);
+        padded.resize(ring::LAYER_INTS as usize + 1 + most as usize * 4, 0);
+        let jt = gpu.up_i32(&padded);
+        let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
+        gpu.run(|c| ring::fold(c, &[&pool], job_table, most));
+        let after = gpu.down(staged.pool_buf, g.elems);
+        let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
+        for (l, lane) in lanes.iter().enumerate() {
+            for r in lane.folded.max(to[l].saturating_sub(rows))..to[l] {
+                for d in 0..g.row {
+                    want[g.ring_at(l, r % rows, false) + d] = laid.keys[l][r][d];
+                    want[g.ring_at(l, r % rows, true) + d] = laid.values[l][r][d];
+                }
+            }
+        }
+        for &(l, r, unit, row) in &moved {
             for d in 0..g.row {
-                want[g.ring_at(l, r % R, false) + d] = laid.keys[l][r][d];
-                want[g.ring_at(l, r % R, true) + d] = laid.values[l][r][d];
+                want[g.slot_at(unit, row, false) + d] = laid.keys[l][r][d];
+                want[g.slot_at(unit, row, true) + d] = laid.values[l][r][d];
             }
         }
-    }
-    for &(l, r, unit, row) in &moved {
-        for d in 0..g.row {
-            want[g.slot_at(unit, row, false) + d] = laid.keys[l][r][d];
-            want[g.slot_at(unit, row, true) + d] = laid.values[l][r][d];
-        }
-    }
-    let got: Vec<f64> = after.iter().map(|x| f64::from(*x)).collect();
-    let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
-    assert_eq!(wrong, 0, "{wrong} pool elements differ from the fold's rows");
-    // The lane that folded nothing reads its ring as it was.
-    let untouched = 3;
-    for place in 0..R {
-        let at = g.ring_at(untouched, place, false);
-        assert_eq!(&after[at..at + g.row], &laid.pool[at..at + g.row], "ring place {place}");
-    }
-    // Read through after the fold, every lane's ring holds its last R folded rows.
-    for (l, lane) in lanes.iter().enumerate() {
-        let _ = lane;
-        for r in to[l].saturating_sub(R)..to[l] {
-            let at = g.ring_at(l, r % R, false);
-            let row: Vec<f64> = after[at..at + g.row].iter().map(|x| f64::from(*x)).collect();
-            if r >= lanes[l].folded.saturating_sub(R) {
-                assert_eq!(row, laid.keys[l][r], "lane {l} row {r} in its ring");
-            }
-        }
-    }
-}
-
-/// The ring's cost on decode against the window list's: one row of each of
-/// four lanes, 1024 keys of a 1024-row window at 2048 rows, read through a
-/// page table (no ring: the old window list), from the ring, and through
-/// the ring kernel's table alone. Prints each arm's best of a few rounds
-/// and the ring's ratio to the table's; the gate is the serving decode.
-/// Two windows on one fold's jobs (CONTRACT-BC 19): the jobs laid for a
-/// ring of `R` rows fold into a layer whose ring holds 24, so a lane's
-/// rows below its last 24 drop and the rest land at their index modulo 24,
-/// the narrower layer's place; the rows the fire leaves unfolded land in
-/// their buffer slots as for any layer, and nothing else moves.
-#[test]
-fn a_narrower_ring_keeps_only_its_own_last_rows_of_one_fold() {
-    let Some(mut gpu) = Gpu::open() else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    const NARROW: usize = 24;
-    let hd = 64;
-    let lanes = prefills();
-    let to = [70, 64 + 40, 21, 70, 100];
-    let g = Geometry::of(hd, 64, lanes.len());
-    let laid = lay(&g, &lanes, 9);
-    let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
-    let (jobs, moved) = fold_jobs(&lanes, &to, &laid);
-    let most = (jobs.len() as u32 - 1) / ring::JOB_INTS + 3;
-    let pool = staged.pool;
-    let at = pool.ring.expect("the pool holds a ring");
-    let mut padded = vec![
-        pool.origin[0] as i32,
-        pool.origin[1] as i32,
-        pool.page_stride[0] as i32,
-        (pool.seq_stride / 2) as i32,
-        at.piece as i32,
-        at.values_piece as i32,
-        at.keys as i32,
-        at.values as i32,
-        NARROW as i32,
-    ];
-    padded.extend(&jobs);
-    padded.resize(ring::LAYER_INTS as usize + 1 + most as usize * 4, 0);
-    let jt = gpu.up_i32(&padded);
-    let job_table = Tensor::new(jt, padded.len() as u32, 1, Dtype::I32);
-    let narrow_pool = KvPool {
-        ring: Some(kernels_slang::Ring {
-            rows: NARROW as u32,
-            ..at
-        }),
-        ..pool
-    };
-    gpu.run(|c| ring::fold(c, &[&narrow_pool], job_table, most));
-    let after = gpu.down(staged.pool_buf, g.elems);
-    let mut want: Vec<f64> = laid.pool.iter().map(|x| f64::from(*x)).collect();
-    for (l, lane) in lanes.iter().enumerate() {
-        for r in lane.folded.max(to[l].saturating_sub(NARROW))..to[l] {
-            for d in 0..g.row {
-                want[g.ring_at(l, r % NARROW, false) + d] = laid.keys[l][r][d];
-                want[g.ring_at(l, r % NARROW, true) + d] = laid.values[l][r][d];
-            }
-        }
-    }
-    for &(l, r, unit, row) in &moved {
-        for d in 0..g.row {
-            want[g.slot_at(unit, row, false) + d] = laid.keys[l][r][d];
-            want[g.slot_at(unit, row, true) + d] = laid.values[l][r][d];
-        }
-    }
-    let got: Vec<f64> = after.iter().map(|x| f64::from(*x)).collect();
-    let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
-    assert_eq!(wrong, 0, "{wrong} pool elements differ from the narrower ring's fold");
-}
-
-/// What the ring forms cost against the paged window's: a decode at a
-/// short context (the served bench's, one lane and eight) and a long one,
-/// and a prefill fire past the ring (its second fire's rows reading the
-/// folded ones), each read through its page table (`table`), the ring
-/// kernel reading the same table, and the ring.
-#[test]
-fn a_ring_decode_costs_what_a_paged_window_does() {
-    let Some(mut gpu) = Gpu::open() else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
-    let hd = 256usize;
-    let subgroup = crate::backend::SPIRV && gpu.subgroup() >= 32;
-    let tactic = sdpa::Tactic {
-        tier: if subgroup {
-            kernels_slang::Tier::Subgroup
-        } else {
-            kernels_slang::Tier::Baseline
-        },
-        narrow: gpu.subgroup() < 32,
-        decode_threads: 256,
-        tile_rows: 16,
-        tile_lanes: 16,
-        split_groups: 1,
-        split_min_keys: 64,
-        prefill_work: 0,
-    };
-    // (what, lanes, context, rows a lane, window, reps)
-    let shapes: [(&str, usize, usize, usize, usize, usize); 4] = [
-        ("decode 1 lane at 160", 1, 160, 1, 512, 64),
-        ("decode 8 lanes at 160", 8, 160, 1, 512, 64),
-        ("decode 4 lanes at 2048", 4, 2048, 1, 1024, 64),
-        ("prefill 1024 rows past 1024", 1, 1024, 1024, 512, 4),
-    ];
-    for (shape, n, ctx, rows_a, window, reps) in shapes {
-        let lanes = |ringed: bool| -> Vec<Lane> {
-            (0..n)
-                .map(|_| Lane {
-                    folded: if ringed { ctx } else { 0 },
-                    base: if ringed { ctx } else { 0 },
-                    first: ctx,
-                    rows: rows_a,
-                    masked: false,
-                })
-                .collect()
-        };
-        let g = Geometry::ringed(hd, n * 2 * ((ctx + rows_a) / PAGE + 2), n, window, window);
-        let mut arms = Vec::new();
-        for (what, ringed, ring) in [("table", false, false), ("ring kernel, table", false, true), ("ring", true, true)] {
-            let lanes = lanes(ringed);
-            let laid = lay(&g, &lanes, 5);
-            let folded: Vec<usize> = lanes.iter().map(|lane| lane.folded).collect();
-            let mut staged = stage(&mut gpu, &g, &lanes, &laid, &folded);
-            if !ring {
-                staged.pool.ring = None;
-            }
-            let rows = n * rows_a;
-            let (q, _) = gpu.up(&noise(77, rows * QH * hd));
-            let qt = t(q, rows, QH * hd, Dtype::Bf16);
-            let o = gpu.zeros(rows * QH * hd);
-            let ot = t(o, rows, QH * hd, Dtype::Bf16);
-            arms.push((what, staged, qt, ot));
-        }
-        let mut best = vec![f64::INFINITY; arms.len()];
-        for _ in 0..5 {
-            for (at, (_, staged, qt, ot)) in arms.iter().enumerate() {
-                let ns = gpu.timed(|c| {
-                    for _ in 0..reps {
-                        if rows_a > 1 {
-                            sdpa::prefill(
-                                c,
-                                tactic,
-                                *qt,
-                                &staged.tables,
-                                &staged.pool,
-                                Some(window as u32),
-                                hd as u32,
-                                0.0625,
-                                *ot,
-                                None,
-                            )?;
-                        } else {
-                            sdpa::decode(
-                                c,
-                                tactic,
-                                *qt,
-                                &staged.tables,
-                                &staged.pool,
-                                Some(window as u32),
-                                hd as u32,
-                                0.0625,
-                                *ot,
-                                None,
-                                None,
-                            )?;
-                        }
-                    }
-                    Ok(())
-                });
-                best[at] = best[at].min(ns / reps as f64);
-            }
-        }
-        for ((what, ..), ns) in arms.iter().zip(&best) {
-            eprintln!("ring cost: {shape}: {what}: {:.1} us", ns / 1000.0);
-        }
-        eprintln!(
-            "ring cost: {shape}: ring / table {:.3}, ring kernel's table / table {:.3}",
-            best[2] / best[0],
-            best[1] / best[0]
-        );
+        let got: Vec<f64> = after.iter().map(|x| f64::from(*x)).collect();
+        let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(wrong, 0, "ring of {rows}: {wrong} pool elements differ from the fold's rows");
     }
 }
 

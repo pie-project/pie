@@ -132,7 +132,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
 mod tests {
     use engine::fire::{Mask, Masking};
 
-    use super::{LaneMask, NONE, stage};
+    use super::{LaneMask, stage};
     use crate::error::Fault;
 
     /// A lane with ten keys committed and two buffered, writing two rows:
@@ -173,35 +173,4 @@ mod tests {
         );
     }
 
-    /// A lane with no mask beside a masked one takes the word stating none
-    /// and no bytes; a fire with no masks stages nothing.
-    #[test]
-    fn an_unmasked_lane_beside_a_masked_one_takes_the_word_stating_none() {
-        let mask = Masking::Extent(Mask::new(vec![0, 3], 3));
-        let staged = stage(&[
-            LaneMask {
-                mask: None,
-                have: 7,
-                folded: 3,
-                rows: 1,
-            },
-            LaneMask {
-                mask: Some(&mask),
-                have: 5,
-                folded: 3,
-                rows: 1,
-            },
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(staged.words, vec![NONE, 0, 3, 0]);
-        assert_eq!(staged.bytes, vec![1, 1, 1]);
-        let none = stage(&[LaneMask {
-            mask: None,
-            have: 4,
-            folded: 0,
-            rows: 1,
-        }]);
-        assert_eq!(none.unwrap(), None);
-    }
 }

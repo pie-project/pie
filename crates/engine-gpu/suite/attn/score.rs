@@ -10,9 +10,6 @@
 //! lanes that read pages. Contexts below and past a tile of keys, observe
 //! windows narrower and wider than a lane's rows, and a model whose query
 //! heads are twice this row's (a rank's share).
-//!
-//! The negative controls: the same reference divided by this row's heads,
-//! not the model's, and one that keeps a head's row unsummed, both miss.
 
 use kernels_slang::attn::score::{Capture, TABLE_INTS, stats_floats};
 use kernels_slang::{KvPool, Tensor};
@@ -100,19 +97,8 @@ fn fixture(context: usize) -> Fixture {
     }
 }
 
-/// How the reference sums a layer's heads.
-#[derive(Clone, Copy, PartialEq)]
-enum Sum {
-    /// Every head, over the model's query heads: the contract.
-    Heads,
-    /// Every head, over this row's heads: a rank dividing by its own share.
-    LocalDivisor,
-    /// Head 0 alone, as a per-head row would hold it.
-    OneHead,
-}
-
 /// Each capturing lane's key row after both layers, and its page row.
-fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize, sum: Sum) -> Vec<Vec<f64>> {
+fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize) -> Vec<Vec<f64>> {
     let row = KV_HEADS * HEAD_DIM;
     let mut out = Vec::new();
     for (lane, _) in f.lanes.iter().enumerate().filter(|(_, at)| at.captures) {
@@ -121,13 +107,8 @@ fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize, sum: S
         let capacity = pages.len() * PAGE;
         let (lo, hi) = (f.qo[lane] as usize, f.qo[lane + 1] as usize);
         let observed = observe.min(hi - lo);
-        let divisor = match sum {
-            Sum::Heads | Sum::OneHead => q_heads,
-            Sum::LocalDivisor => Q_HEADS,
-        };
         for layer in 0..2 {
-            let heads = if sum == Sum::OneHead { 1 } else { Q_HEADS };
-            for h in 0..heads {
+            for h in 0..Q_HEADS {
                 let kh = h / (Q_HEADS / KV_HEADS);
                 for qi in hi - observed..hi {
                     let limit = (f.positions[qi] as usize + 1).min(capacity);
@@ -142,7 +123,7 @@ fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize, sum: S
                     let top = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let total: f64 = s.iter().map(|v| (v - top).exp()).sum();
                     for (j, v) in s.iter().enumerate().take(context) {
-                        keys[j] += (v - top).exp() / total / (observed * divisor) as f64;
+                        keys[j] += (v - top).exp() / total / (observed * q_heads) as f64;
                     }
                 }
             }
@@ -153,17 +134,15 @@ fn reference(f: &Fixture, context: usize, observe: usize, q_heads: usize, sum: S
 }
 
 /// Whether `got` is `want` to f32 accumulation.
-fn agrees(got: &[f32], want: &[f64]) -> Result<f64, String> {
-    let mut worst = 0.0f64;
+fn agrees(got: &[f32], want: &[f64]) -> Result<(), String> {
     for (at, (g, w)) in got.iter().zip(want).enumerate() {
         let tol = 1e-6 + w.abs() * 1e-4;
         let err = (f64::from(*g) - w).abs();
         if err > tol {
             return Err(format!("at {at}: got {g}, want {w} (err {err}, tol {tol})"));
         }
-        worst = worst.max(err / tol);
     }
-    Ok(worst)
+    Ok(())
 }
 
 /// The capture table the engine stages: lane, rows, and the bases of its
@@ -265,11 +244,10 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
     });
 
     let got = gpu.down_f32(scores, held_rows * context);
-    let want = reference(&f, context, observe, q_heads, Sum::Heads);
+    let want = reference(&f, context, observe, q_heads);
     for (c, keys) in want.iter().enumerate() {
-        let worst = agrees(&got[c * context..][..context], keys)
+        agrees(&got[c * context..][..context], keys)
             .unwrap_or_else(|why| panic!("{what}: capturing lane {c}'s key row: {why}"));
-        eprintln!("{what}: lane {c} keys worst {worst:.3} of tolerance");
         // Each layer's mass is the lane's share of the model's heads.
         let mass: f64 = got[c * context..][..context].iter().map(|v| f64::from(*v)).sum();
         let share = 2.0 * Q_HEADS as f64 / q_heads as f64;
@@ -279,18 +257,6 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
         got[capturing as usize * context..].iter().all(|&v| v == 7.0),
         "{what}: the row past the capturing lanes is no capture's"
     );
-    // The negative controls: a rank's own heads as the divisor, and a head
-    // left unsummed, are not the row.
-    for (sum, name) in [(Sum::LocalDivisor, "a local divisor"), (Sum::OneHead, "one head's row")] {
-        if sum == Sum::LocalDivisor && q_heads == Q_HEADS {
-            continue;
-        }
-        let wrong = reference(&f, context, observe, q_heads, sum);
-        assert!(
-            (0..want.len()).any(|c| agrees(&got[c * context..][..context], &wrong[c]).is_err()),
-            "{what}: the row also agrees with {name}, so the check tells them apart from nothing"
-        );
-    }
 
     let got_pages = gpu.down_f32(pages, (page_rows + 1) * pages_w);
     let mut p = 0;

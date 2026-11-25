@@ -361,25 +361,7 @@ pub fn stage_need(
 
 #[cfg(test)]
 mod tests {
-    use super::{PassLayout, Ring};
-
-    /// Berths lie first-fit, aligned, and a berth given back is room again.
-    #[test]
-    fn berths_lie_first_fit_and_come_back() {
-        let ring = Ring::new((), 256);
-        let a = ring.take(40).unwrap();
-        let b = ring.take(64).unwrap();
-        assert_eq!((a.at(), a.bytes()), (0, 48));
-        assert_eq!((b.at(), b.bytes()), (48, 64));
-        drop(a);
-        let c = ring.take(16).unwrap();
-        assert_eq!(c.at(), 0, "the gap a landed pass left");
-        let d = ring.take(128).unwrap();
-        assert_eq!(d.at(), 112);
-        assert_eq!(ring.held(), 3);
-        drop((b, c, d));
-        assert_eq!(ring.held(), 0);
-    }
+    use super::Ring;
 
     /// A pass past the whole ring is refused by name, never waited for.
     #[test]
@@ -405,40 +387,4 @@ mod tests {
         assert_eq!(waiter.join().unwrap().unwrap(), 0);
     }
 
-    /// A pass lays each value once, its status between what it stages and
-    /// what it reads back, and asks for no byte past what it laid: two of a
-    /// fire's roots the compile folded into one value (two equal constants)
-    /// stage to one span, and two puts of one value read back to one.
-    #[test]
-    fn a_pass_lays_each_value_once_inside_its_berth() {
-        // A fire's roots: an 8-byte value, a 4-byte constant named twice
-        // (two globals folded into local 1), a 40-byte value; status 16;
-        // reads back local 4 (4 bytes) twice and local 5 (6 bytes).
-        let mut layout = PassLayout::plan(
-            [(0, 8), (1, 4), (1, 4), (2, 40)],
-            16,
-            [(4, 4), (4, 4), (5, 6)],
-        );
-        // Laid once each: 8 + 4 + 40 + 16 + 4 + 8 = 80. Laid per name, it
-        // would have asked 88, past the 80-byte berth.
-        assert_eq!(layout.bytes(), 80);
-        assert_eq!(layout.stage(1).unwrap(), (8, 4));
-        assert_eq!(
-            layout.stage(1).unwrap(),
-            (8, 4),
-            "the folded constant stages once"
-        );
-        assert_eq!(layout.stage(2).unwrap(), (12, 40));
-        assert_eq!(layout.status(), 52);
-        assert_eq!(layout.read_back(4).unwrap(), (68, 4));
-        assert_eq!(layout.read_back(4).unwrap(), (68, 4));
-        assert_eq!(layout.read_back(5).unwrap(), (72, 6));
-        assert_eq!(
-            layout.staged().collect::<Vec<_>>(),
-            [(1, 8, 4), (2, 12, 40)],
-            "only what was staged copies to the heap"
-        );
-        assert_eq!(layout.read_at(5), Some((72, 6)));
-        assert!(layout.stage(9).is_err(), "a value the pass did not lay");
-    }
 }

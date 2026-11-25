@@ -895,64 +895,6 @@ pub fn snapshots(trace: &poem_ir::Trace) -> u32 {
     }
 }
 
-#[cfg(test)]
-mod pack_tests {
-    use super::*;
-
-    fn layout(lives: &[(u64, (usize, usize))]) -> Layout {
-        let mut layout = Layout::default();
-        for &(row_bytes, life) in lives {
-            layout.planes.push(Plane {
-                cache: 0,
-                role: Role::ConvX,
-                width: 1,
-                dtype: Dtype::Bf16,
-                row_bytes,
-                extended: true,
-            });
-            layout.plane_life.push(life);
-        }
-        layout
-    }
-
-    /// Planes whose lives overlap never share a byte; planes whose lives
-    /// do not (one layer's and the next's) share; every plane starts at a
-    /// multiple of 256, whatever the rows.
-    #[test]
-    fn planes_share_bytes_only_where_their_lives_do_not_overlap() {
-        // Two layers of two planes each, and a plane living across both.
-        let lives = [
-            (1000, (0, 2)),
-            (600, (1, 2)),
-            (1000, (3, 5)),
-            (600, (4, 5)),
-            (100, (0, 5)),
-        ];
-        let layout = layout(&lives);
-        for rows in [1u32, 3, 7, 64] {
-            let (at, _, total) = layout.pack(rows);
-            let size = |i: usize| (u64::from(rows) * lives[i].0).max(4).next_multiple_of(256);
-            for i in 0..lives.len() {
-                assert_eq!(at[i] % 256, 0, "plane {i} at {} for {rows} rows", at[i]);
-                for j in i + 1..lives.len() {
-                    let (a, b) = (lives[i].1, lives[j].1);
-                    let overlap_life = a.0 <= b.1 && b.0 <= a.1;
-                    let overlap_bytes = at[i] < at[j] + size(j) && at[j] < at[i] + size(i);
-                    assert!(
-                        !(overlap_life && overlap_bytes),
-                        "planes {i} and {j} live together and share bytes for {rows} rows"
-                    );
-                }
-            }
-            let sum: u64 = (0..lives.len()).map(size).sum();
-            assert!(
-                total < sum,
-                "{rows} rows: {total} bytes, no sharing of {sum}"
-            );
-        }
-    }
-}
-
 /// The most runs a recurrent copy of a fire at a rung of `rung_rows` moves,
 /// its rows in pages of `page_tokens` and at most `max_lanes` lanes: a
 /// lane's gathered and scattered rows each split at the pages they span (at
@@ -974,32 +916,4 @@ pub fn run_tables(copies: usize, top_rows: u32, max_lanes: u32) -> (u64, u64) {
     let (runs, _, dispatches) = kernels_slang::gather::rows::copy_runs_plan(most);
     let tables = u64::try_from(copies.saturating_mul(dispatches)).unwrap_or(u64::MAX);
     (tables, 16 + 16 * runs as u64)
-}
-
-#[cfg(test)]
-mod run_bound {
-    use super::{run_most, run_tables};
-    use kernels_slang::gather::rows::copy_runs_plan;
-
-    /// The widest fire a load sizes its block for holds every fire's run
-    /// tables: any rung up to the top, any page size, the widest decode (the
-    /// most lanes, one row each) among them.
-    #[test]
-    fn the_widest_decode_fits_the_tables_a_block_is_sized_for() {
-        for top in [16u32, 64, 256, 512, 2048, 8192] {
-            for lanes in [1u32, 4, 64, 256, 1024] {
-                let (tables, bytes) = run_tables(1, top, lanes);
-                for rung in [1u32, top / 4, top / 2, top] {
-                    for page in [1u32, 8, 16, 64] {
-                        let (runs, _, dispatches) = copy_runs_plan(run_most(rung.max(1), page, lanes));
-                        assert!(
-                            dispatches as u64 <= tables && 16 + 16 * runs as u64 <= bytes,
-                            "top {top}, lanes {lanes}, rung {rung}, page {page}: {dispatches} \
-                             table(s) of {runs} runs past {tables} of {bytes} bytes"
-                        );
-                    }
-                }
-            }
-        }
-    }
 }

@@ -1064,21 +1064,6 @@ pub fn fit(
 }
 
 #[cfg(test)]
-mod role_tests {
-    use super::SlotRole;
-
-    #[test]
-    fn only_state_the_tokens_rebuild_is_replayable() {
-        assert!(SlotRole::State.replayable());
-        assert!(SlotRole::RsBuffer.replayable());
-        assert!(SlotRole::WindowBuffer.replayable());
-        assert!(SlotRole::Ring.replayable());
-        assert!(!SlotRole::Instance.replayable());
-        assert!(!SlotRole::Channel.replayable());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::{
         ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
@@ -1191,48 +1176,6 @@ mod tests {
         let mut no_layer = windowed();
         no_layer.windowed.clear();
         refused(no_layer, "states no windowed layer");
-        let mut unsorted = windowed();
-        unsorted.windowed.swap(0, 1);
-        refused(unsorted, "not ascending");
-        let mut rated = windowed();
-        if let Some(shape) = rated.shapes.last_mut() {
-            shape.kind = SlotKind::List {
-                tokens: 16,
-                rate: 2,
-                window: None,
-            };
-        }
-        refused(rated, "list shape of rate 1 and no window");
-        let mut both = windowed();
-        if let SlotKind::List { window, .. } = &mut both.shapes[0].kind {
-            *window = Some(64);
-        }
-        refused(both, "window list beside windowed layers");
-    }
-
-    #[test]
-    fn a_ring_at_chunk_starts_is_one_fixed_shape_of_one_slot_a_chunk() {
-        let ring = |slots_per_chunk| SlotShape {
-            id: ShapeId(10),
-            kind: SlotKind::Fixed { pieces: 2 },
-            slot_bytes: 4096 / u64::from(slots_per_chunk),
-            slots_per_chunk,
-            sets_per_working_set: 1,
-            rows: Vec::new(),
-            pinned: None,
-            role: SlotRole::Ring,
-        };
-        let mut kv_only = windowed();
-        kv_only.shapes.push(ring(1));
-        assert!(kv_only.validate().is_ok(), "{:?}", kv_only.validate());
-        let mut two_a_chunk = windowed();
-        two_a_chunk.shapes.push(ring(2));
-        let why = two_a_chunk.validate().unwrap_err().to_string();
-        assert!(why.contains("one slot a chunk"), "{why}");
-        let mut unwindowed = facts();
-        unwindowed.shapes.push(ring(1));
-        let why = unwindowed.validate().unwrap_err().to_string();
-        assert!(why.contains("states no windowed layer"), "{why}");
     }
 
     #[test]

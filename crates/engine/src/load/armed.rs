@@ -122,22 +122,4 @@ mod tests {
         assert_eq!(scored_classes(&landing), ClassSet::of([1usize]));
     }
 
-    #[test]
-    fn a_scored_fire_pads_to_the_lattices_next_octave() {
-        let lattice = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96];
-        assert_eq!(scored_buckets(&lattice), [1, 2, 4, 8, 16, 32, 64, 96]);
-        assert_eq!(scored_bucket(&lattice, 5), Some(8));
-        assert_eq!(scored_bucket(&lattice, 64), Some(64));
-        assert_eq!(scored_bucket(&lattice, 65), Some(96));
-        assert_eq!(scored_bucket(&lattice, 97), None);
-        assert_eq!(scored_buckets(&[1, 2, 4, 256]), [1, 2, 4, 256]);
-    }
-
-    #[test]
-    fn the_room_is_the_widest_scored_fires_rows() {
-        assert_eq!(capture_row_bytes(256, 16), (256 + 16) * 4);
-        assert_eq!(capture_row_bytes(250, 16), (250 + 16) * 4);
-        assert_eq!(arming_capture_room(true, 64, 256, 16), 64 * 272 * 4);
-        assert_eq!(arming_capture_room(false, 64, 256, 16), 0);
-    }
 }

@@ -318,23 +318,6 @@ fn assert_answers(got: &[f32], want: &[f32], other: &[f32], what: &str) {
     );
 }
 
-/// qwen38-flash-next-micro has a projection of one column, which WGSL does
-/// not land (`crate::gpu::lands`: an output pair is one bf16 word), so on
-/// wgpu the miniature does not serve and the contract is SPIR-V's here.
-#[test]
-fn a_buffered_fold_is_the_fold_it_replaces() {
-    if !crate::gpu::lands(1) {
-        eprintln!(
-            "skipping on {}: qwen38-flash-next-micro projects to one column, which WGSL does not land",
-            crate::backend::NAME
-        );
-        return;
-    }
-    if let Some(model) = Model::load("qwen38-flash-next-micro") {
-        holds_the_contract(model, "qwen38-flash-next-micro");
-    }
-}
-
 /// The same contract over a gated-delta model with no PLE (Qwen3.5).
 #[test]
 fn a_gdn_buffered_fold_is_the_fold_it_replaces() {

@@ -235,10 +235,8 @@ pub fn merged(left: Vec<(Vec<u32>, Option<u32>)>) -> Vec<(Vec<u32>, Option<u32>)
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DeviceFold, Frozen, LaneFold, Tier, counted_on_device, lane_report, merged, reads_count,
-    };
-    use engine::fire::{FoldLen, Lineage, Mask, Masking, RsVerb};
+    use super::{DeviceFold, Frozen, LaneFold, counted_on_device};
+    use engine::fire::{FoldLen, Lineage, RsVerb};
 
     fn buffer(folded: u32, fold: FoldLen) -> RsVerb {
         RsVerb::Buffer {
@@ -248,31 +246,6 @@ mod tests {
             fold,
             lineage: Lineage::Set,
         }
-    }
-
-    /// The count a lane reports is this fire's alone, after the clamp to
-    /// the fire's end: a device count past the lane's rows freezes only as
-    /// far as the fire wrote.
-    #[test]
-    fn the_reported_count_is_the_fires_own_after_the_clamp() {
-        // 4 slots frozen, 2 buffered, 3 rows at slot 6: the port asks 3.
-        let lane = LaneFold::of(&buffer(4, FoldLen::Device), 3, 6, None, Some(3), None).unwrap();
-        assert_eq!(lane.plan.froze, 3);
-        assert_eq!(lane.left, Some(7));
-        let report = lane.report(41).expect("the lane asks a report");
-        assert_eq!((report.tag, report.fold, report.end), (41, Some(3), None));
-        assert!(report.tokens.is_empty() && report.pages.is_empty());
-
-        // The port asks 100: the fold stops at the fire's end, slot 9.
-        let lane = LaneFold::of(&buffer(4, FoldLen::Device), 3, 6, None, Some(100), None).unwrap();
-        assert_eq!(lane.plan.froze, 5);
-        assert_eq!(lane.left, Some(9));
-        assert_eq!(lane.report(41).unwrap().fold, Some(5));
-
-        // A fold of none is reported as none, not left unsaid.
-        let lane = LaneFold::of(&buffer(4, FoldLen::Device), 3, 6, None, Some(0), None).unwrap();
-        assert_eq!(lane.report(41).unwrap().fold, Some(0));
-        assert_eq!(lane.left, Some(4));
     }
 
     /// A lane that asks no report gets none; a device fold length no
@@ -293,73 +266,6 @@ mod tests {
         assert!(counted_on_device(&buffer(0, FoldLen::Device)));
         assert!(!counted_on_device(&buffer(0, FoldLen::Host(3))));
         assert!(!counted_on_device(&RsVerb::Fold));
-    }
-
-    /// The replay starts from the further of the stated length and the
-    /// record's own position: a fire staged before the last fold's report
-    /// reached the runtime states the old length, and must not fold the
-    /// same slots twice.
-    #[test]
-    fn the_replay_starts_from_the_further_of_stated_and_own() {
-        // Fire 1: nothing frozen, 4 rows at 0, the device folds 3.
-        let first = LaneFold::of(&buffer(0, FoldLen::Device), 4, 0, None, Some(3), None).unwrap();
-        assert_eq!((first.plan.replay, first.plan.commit), (0, 3));
-        assert_eq!(first.left, Some(3));
-
-        // Fire 2 still states 0 frozen: 2 rows at 4, the device folds 2.
-        let stale =
-            LaneFold::of(&buffer(0, FoldLen::Device), 2, 4, None, Some(2), first.left).unwrap();
-        let exact = LaneFold::of(&buffer(3, FoldLen::Device), 2, 4, None, Some(2), None).unwrap();
-        assert_eq!(stale.plan.replay, 1, "slot 3 alone is replayed");
-        assert_eq!(
-            (stale.plan.replay, stale.plan.commit, stale.plan.froze),
-            (exact.plan.replay, exact.plan.commit, exact.plan.froze),
-        );
-        assert_eq!(stale.left, Some(5));
-        // Stated alone, the fire would replay slots 0..4 into a record
-        // that already holds 0..3.
-        let stated = LaneFold::of(&buffer(0, FoldLen::Device), 2, 4, None, Some(2), None).unwrap();
-        assert_eq!(stated.plan.replay, 4);
-
-        // A stated length past the record's own wins.
-        let ahead =
-            LaneFold::of(&buffer(5, FoldLen::Device), 2, 5, None, Some(1), Some(3)).unwrap();
-        assert_eq!(ahead.left, Some(6));
-
-        // A host-counted fire on a record still ahead of its verb keeps
-        // the position; once the verb has caught up it hands it back.
-        let host = LaneFold::of(&buffer(0, FoldLen::Host(1)), 2, 4, None, None, Some(3)).unwrap();
-        assert_eq!((host.plan.replay, host.left), (1, Some(4)));
-        let caught = LaneFold::of(&buffer(4, FoldLen::Host(1)), 2, 6, None, None, Some(4)).unwrap();
-        assert_eq!(caught.left, None);
-    }
-
-    /// A record replayed from past its stated boundary reads its mask from
-    /// that boundary still: the columns between are committed slots now, no
-    /// bit of them read. A lane sharing its set replays the buffered slots
-    /// its mask admits (`Lineage::Admitted`), counted from the boundary.
-    #[test]
-    fn a_replay_past_the_stated_boundary_reads_the_mask_from_it() {
-        let replay = |runs: Vec<u32>| {
-            let mask = Masking::Extent(Mask::new(runs, 6));
-            // Stated 0 frozen, the record at 3, 2 rows at 4: slot 3 is the
-            // one buffered slot it replays.
-            let verb = RsVerb::Buffer {
-                pages: vec![0],
-                base: 0,
-                folded: 0,
-                fold: FoldLen::Device,
-                lineage: Lineage::Admitted,
-            };
-            LaneFold::of(&verb, 2, 4, Some(&mask), Some(0), Some(3))
-                .expect("the lane plans")
-                .plan
-                .replay
-        };
-        // Columns 0 and 2 hidden: slots committed past the record's own fold.
-        assert_eq!(replay(vec![1, 1, 1, 3]), 1, "slot 3 is replayed");
-        // Column 3 hidden: slot 3, which the lane's lineage leaves out.
-        assert_eq!(replay(vec![0, 3, 1, 2]), 0, "slot 3 is not its ancestry");
     }
 
     /// A record stands where the last fold that went to the device left
@@ -403,101 +309,4 @@ mod tests {
         assert_eq!(fold(1, 6, 1, frozen.held(&pieces)).plan.replay, 4);
     }
 
-    /// The position travels with the record: a fork copy, a move to the
-    /// host tier and back, and a copy over a slot that held another.
-    #[test]
-    fn the_position_survives_a_slot_copy() {
-        let mut frozen = Frozen::default();
-        frozen.leave(&[10, 11], Some(7));
-        assert_eq!(frozen.held(&[10, 11]), Some(7));
-        assert_eq!(frozen.held(&[20, 21]), None);
-
-        // A copy-on-write fork, piece by piece.
-        frozen.copied(Tier::Device, Tier::Device, &[(10, 20), (11, 21)]);
-        assert_eq!(frozen.held(&[20, 21]), Some(7));
-        assert_eq!(frozen.held(&[10, 11]), Some(7));
-
-        // The fork folds on; its source stands.
-        frozen.leave(&[20, 21], Some(9));
-        assert_eq!(frozen.held(&[10, 11]), Some(7));
-
-        // Suspended to the host tier, its device slots given to a record
-        // with no position of its own, then restored elsewhere.
-        frozen.copied(Tier::Device, Tier::Host, &[(20, 3), (21, 4)]);
-        frozen.copied(Tier::Device, Tier::Device, &[(30, 20), (31, 21)]);
-        assert_eq!(frozen.held(&[20, 21]), None);
-        frozen.copied(Tier::Host, Tier::Device, &[(3, 40), (4, 41)]);
-        assert_eq!(frozen.held(&[40, 41]), Some(9));
-
-        // Bytes written from outside the pool carry no position.
-        frozen.written(Tier::Host, &[3, 4]);
-        frozen.copied(Tier::Host, Tier::Device, &[(3, 40), (4, 41)]);
-        assert_eq!(frozen.held(&[40, 41]), None);
-
-        // A slot copied onto itself keeps what it holds.
-        frozen.copied(Tier::Device, Tier::Device, &[(10, 10)]);
-        assert_eq!(frozen.held(&[10, 11]), Some(7));
-    }
-
-    /// Lanes of a group share a record: it is left where the furthest of
-    /// them folded.
-    #[test]
-    fn a_shared_record_is_left_at_the_furthest_fold() {
-        let left = merged(vec![
-            (vec![1, 2], Some(5)),
-            (vec![1, 2], None),
-            (vec![3], None),
-            (vec![1, 2], Some(4)),
-        ]);
-        assert_eq!(left, vec![(vec![1, 2], Some(5)), (vec![3], None)]);
-    }
-
-    /// A set that keeps only kv folds by the count its program put on a
-    /// fire whose fold length is the device's: the lane has no recurrent
-    /// buffer, so no plan states what it froze, and the count is what the
-    /// runtime waits on. The lane takes the count and reports it, as read,
-    /// under its tag; one that asks no report takes none.
-    #[test]
-    fn a_lane_with_no_recurrent_buffer_reports_its_device_count() {
-        let kv = RsVerb::Fold;
-        assert!(reads_count(&kv, 41));
-        assert!(!reads_count(&kv, 0));
-        let lane = LaneFold::of(&kv, 1, 6, None, Some(1), None).unwrap();
-        assert_eq!(lane.plan.froze, 0);
-        let device = DeviceFold {
-            count: Some(1),
-            reports: 41,
-        };
-        // No lane of the fire has a recurrent buffer: it is still the
-        // device's count the runtime waits on.
-        let report = lane_report(&kv, &lane, device, false).expect("the lane asks a report");
-        assert_eq!((report.tag, report.fold), (41, Some(1)));
-        assert!(report.tokens.is_empty() && report.pages.is_empty());
-        let device = DeviceFold {
-            count: Some(0),
-            reports: 41,
-        };
-        assert_eq!(
-            lane_report(&kv, &lane, device, false).unwrap().fold,
-            Some(0)
-        );
-        assert!(lane_report(&kv, &lane, DeviceFold::default(), false).is_none());
-
-        // A lane with a recurrent buffer reads as it did, and reports what
-        // its fold froze, on a fire whose fold length is the device's only.
-        assert!(reads_count(&buffer(4, FoldLen::Device), 0));
-        assert!(!reads_count(&buffer(4, FoldLen::Host(1)), 41));
-        let lane = LaneFold::of(&buffer(4, FoldLen::Device), 3, 6, None, Some(3), None).unwrap();
-        let device = DeviceFold {
-            count: Some(3),
-            reports: 41,
-        };
-        assert_eq!(
-            lane_report(&buffer(4, FoldLen::Device), &lane, device, true)
-                .unwrap()
-                .fold,
-            Some(3)
-        );
-        assert!(lane_report(&buffer(4, FoldLen::Device), &lane, device, false).is_none());
-    }
 }

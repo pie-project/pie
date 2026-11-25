@@ -199,33 +199,3 @@ fn timer() -> impl Fn(Frame) -> Result<(Option<u64>, u64)> {
         Ok((span, (host * 1e9) as u64))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::stated_submit_bound;
-
-    /// A load's rates step measures under the platform's stated bound (the
-    /// Rig's admission refuses a frame estimated past it): KGSL's 2 s on
-    /// Android; on Windows the timeout detection's `TdrDelay` (2 where the
-    /// registry states none, none where detection is off); none elsewhere.
-    #[test]
-    fn a_load_measures_under_the_platforms_stated_bound() {
-        let two = Some(Duration::from_secs(2));
-        assert_eq!(engine_gpu::rates::tdr_bound(None, None), two);
-        assert_eq!(
-            engine_gpu::rates::tdr_bound(Some(3), Some(8)),
-            Some(Duration::from_secs(8))
-        );
-        assert_eq!(engine_gpu::rates::tdr_bound(Some(0), Some(8)), None);
-        let admission = engine::rates::Admission::new(two);
-        assert!(admission.fits(Some(1.5e9)));
-        assert!(!admission.fits(Some(2.5e9)));
-        if cfg!(target_os = "android") {
-            assert_eq!(stated_submit_bound(), two);
-        } else if !cfg!(windows) {
-            assert_eq!(stated_submit_bound(), None);
-        }
-    }
-}

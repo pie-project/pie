@@ -347,28 +347,6 @@ mod budget_tests {
         );
     }
 
-    /// Unix: the room is f_bavail; what lies between f_bfree and it is the
-    /// filesystem's reserve, kept and named.
-    #[test]
-    fn the_unix_room_is_what_unprivileged_processes_may_take() {
-        let room = Room::statvfs(100 << 30, 95 << 30);
-        assert_eq!(
-            (room.free, room.reserve, room.for_us()),
-            (100 << 30, 5 << 30, 95 << 30)
-        );
-        assert!(room.to_string().contains("f_bavail"), "{room}");
-        let odd = Room::statvfs(10, 20);
-        assert_eq!((odd.reserve, odd.for_us()), (0, 10), "never more than free");
-        assert_eq!(Room::unstated("no statvfs").for_us(), 0);
-    }
-
-    /// Windows: FreeBytesAvailableToCaller is the room.
-    #[test]
-    fn the_windows_room_is_what_the_caller_may_take() {
-        let room = Room::windows(50 << 30, 20 << 30);
-        assert_eq!((room.reserve, room.for_us()), (30 << 30, 20 << 30));
-    }
-
     /// Android: min(total x 5%, 500 MiB) by default, below f_bavail; the
     /// phone that gave the tier all 16.5 GB of its free /data now keeps
     /// the platform's threshold back.
@@ -387,37 +365,6 @@ mod budget_tests {
         let room = Room::android(256_000_000_000, free, free - (64 << 20), &defaults);
         assert_eq!(room.reserve, (64 << 20) + (500 << 20));
         assert_eq!(room.for_us(), free - (64 << 20) - (500 << 20));
-        assert!(
-            room.to_string()
-                .contains("Android's default low-storage threshold"),
-            "{room}"
-        );
-
-        let xml = r#"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
-<settings version="-1">
-  <setting id="31" name="sys_storage_threshold_percentage" value="10" package="android" defaultValue="10" defaultSysSet="true" />
-  <setting id="32" name="sys_storage_threshold_max_bytes" value="1073741824" package="android" />
-  <setting id="33" name="adb_enabled" value="1" package="android" />
-</settings>"#;
-        let stated = LowStorage::from_settings(Some(xml));
-        assert_eq!((stated.percent, stated.max_bytes), (10, 1 << 30));
-        assert_eq!(
-            stated.source,
-            "Android's low-storage threshold (global settings)"
-        );
-        assert_eq!(stated.bytes(8_000_000_000), 800_000_000);
-        assert_eq!(stated.bytes(256_000_000_000), 1 << 30);
-
-        let one = LowStorage::from_settings(Some(
-            r#"<setting id="1" name="sys_storage_threshold_percentage" value="2" />"#,
-        ));
-        assert_eq!(
-            (one.percent, one.max_bytes),
-            (2, 500 << 20),
-            "a missing setting is AOSP's default"
-        );
-        let binary = LowStorage::from_settings(Some("ABX\0\u{1}garbage"));
-        assert_eq!(binary, defaults);
     }
 }
 

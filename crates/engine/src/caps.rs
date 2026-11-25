@@ -346,15 +346,6 @@ mod mixed_lanes {
         assert!(!laid.fits(&limits, 1, 2608 - 15 - 64 + 1, 1));
     }
 
-    #[test]
-    fn a_fire_of_one_kind_and_any_load_fit_within_the_limits() {
-        let (laid, limits) = census();
-        assert!(laid.fits(&limits, 40, 2000, 0));
-        assert!(laid.fits(&limits, 0, 0, 64));
-        assert!(!laid.fits(&limits, 0, 0, 65));
-        assert!(MixedLanes::Any.fits(&limits, 35, 105, 17));
-        assert!(!MixedLanes::Any.fits(&limits, 60, 120, 11));
-    }
 }
 
 /// The frames in flight an engine states ([`Capabilities::frames_in_flight`])

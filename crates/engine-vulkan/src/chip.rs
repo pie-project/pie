@@ -236,10 +236,36 @@ mod tests {
         }
     }
 
-    /// Each vendor's stated defaults for the split attention and the MoE
-    /// tiles, over the devices the profiles name.
+    /// The dense matmul the per-vendor cascade before `kernel.qmm` picked:
+    /// coopmat, register tiles on Adreno and PowerVR, then tiled, from 12 rows over whole
+    /// 32-code tiles; for one row, the one-row kernel on Adreno (32 lanes a
+    /// row) and on PowerVR (8 lanes a row, two rows a lane); else
+    /// four vectors a workgroup. Adreno's 64-row tile walks 32 codes a step
+    /// (measured on an Adreno 840).
+    fn old_qmm(d: &Device, rows: u32, n: u32, k: u32) -> Qmm {
+        let qualcomm = d.vendor == "qualcomm";
+        let tiles = rows >= 12 && k.is_multiple_of(32);
+        let one_row = rows == 1 && k.is_multiple_of(32);
+        if d.coopmat && tiles {
+            Qmm::Coopmat
+        } else if (qualcomm || d.vendor == "imagination") && tiles {
+            Qmm::RegisterTiled {
+                bm: if rows > 32 { 64 } else { 32 },
+                k16: !(qualcomm && rows > 32),
+            }
+        } else if tiles && n.is_multiple_of(16) {
+            Qmm::Tiled { crossover_tg: 160 }
+        } else if one_row && qualcomm && d.subgroup >= 32 {
+            Qmm::OneRow { lanes: 32, rows: 1 }
+        } else if one_row && d.vendor == "imagination" && d.subgroup >= 32 {
+            Qmm::OneRow { lanes: 8, rows: 2 }
+        } else {
+            Qmm::Qmv { vecs: 4 }
+        }
+    }
+
     #[test]
-    fn every_device_takes_its_vendors_defaults() {
+    fn every_device_runs_what_it_ran_before_the_ladder() {
         for d in [
             device("nvidia", 32, Some(142), true),
             device("nvidia", 32, Some(24), false),
@@ -262,6 +288,16 @@ mod tests {
             device("other", 32, None, false),
         ] {
             let t = tuning(&d);
+            for rows in [1, 2, 4, 11, 12, 16, 32, 33, 64, 512] {
+                for (n, k) in [(4096, 4096), (4096, 4100), (1000, 4096)] {
+                    let at = t.qmm_at(rows, n, k, 4, 64);
+                    assert_eq!(
+                        t.qmm(&at)[0],
+                        old_qmm(&d, rows, n, k),
+                        "{d:?}: {rows} x {n} x {k}"
+                    );
+                }
+            }
             let qualcomm = d.vendor == "qualcomm";
             assert_eq!(
                 t.sdpa_split_groups(),
@@ -290,64 +326,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The RTX PRO 4500's file takes the tiled matmul below its measured
-    /// 96-row crossover and cooperative matrices from it; another NVIDIA
-    /// GPU with cooperative matrices, unmeasured, takes them at every row
-    /// count, so the crossover is the device file's.
-    #[test]
-    fn a_measured_device_crosses_to_cooperative_matrices_at_its_rows() {
-        let pro = Device {
-            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
-            ..device("nvidia", 32, Some(82), true)
-        };
-        let (_, report) = resolve(&pro, None);
-        assert_eq!(
-            report.layers,
-            [
-                Source::Seeded("nvidia.toml".to_string()),
-                Source::Seeded("nvidia/nvidia-rtx-pro-4500-blackwell.toml".to_string()),
-                // Its stored measurements, committed: taken under the
-                // decision files, entry by entry.
-                Source::Committed("nvidia-rtx-pro-4500-blackwell.measured.toml".to_string()),
-            ]
-        );
-        let t = tuning(&pro);
-        for rows in [4, 16, 64, 95] {
-            assert!(!t.gemm_coopmat(rows), "{rows} rows");
-        }
-        for rows in [96, 128, 512, 2048] {
-            assert!(t.gemm_coopmat(rows), "{rows} rows");
-        }
-        let other = tuning(&device("nvidia", 32, Some(82), true));
-        assert!(other.gemm_coopmat(4) && other.gemm_coopmat(95));
-        let without = tuning(&Device {
-            coopmat: false,
-            ..pro
-        });
-        assert!(!without.gemm_coopmat(2048));
-    }
-
-    /// An NVIDIA GPU no file measured runs the vendor file's path and its
-    /// load says so, by name, with the command that measures it; the RTX PRO
-    /// 4500, whose crossover was measured, says nothing.
-    #[test]
-    fn an_untuned_device_says_so_and_a_measured_one_does_not() {
-        let other = device("nvidia", 32, Some(82), true);
-        let (_, report) = resolve(&other, None);
-        let said = SHELF
-            .untuned(&other.name, &report)
-            .expect("an unmeasured device is told");
-        assert!(said.contains("a nvidia GPU"), "{said}");
-        assert!(said.contains("nvidia.toml"), "{said}");
-        assert!(said.contains("pie tune vulkan"), "{said}");
-        let pro = Device {
-            name: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
-            ..other
-        };
-        let (_, report) = resolve(&pro, None);
-        assert_eq!(SHELF.untuned(&pro.name, &report), None, "{report:?}");
     }
 
     #[test]

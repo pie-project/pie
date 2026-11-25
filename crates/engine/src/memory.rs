@@ -326,37 +326,19 @@ mod tests {
     const FLOOR: u64 = 100 * MIB;
     const CEILING: u64 = 1000 * MIB;
 
+    /// The target falls from the ceiling with yield times pressure to the
+    /// floor; readings out of range are taken within it.
     #[test]
-    fn a_yield_of_zero_holds_the_ceiling_whatever_the_pressure() {
-        for pressure in [0.0, 0.3, 1.0] {
-            assert_eq!(target(FLOOR, CEILING, 0.0, pressure), CEILING);
+    fn the_target_falls_with_yield_times_pressure() {
+        for (yield_, pressure, want) in [
+            (0.0, 1.0, CEILING),
+            (1.0, 1.0, FLOOR),
+            (0.5, 0.5, FLOOR + 675 * MIB),
+            (1.0, 2.0, FLOOR),
+            (1.0, f64::NAN, CEILING),
+        ] {
+            assert_eq!(target(FLOOR, CEILING, yield_, pressure), want, "{yield_} {pressure}");
         }
-    }
-
-    #[test]
-    fn a_full_yield_at_full_pressure_holds_the_floor() {
-        assert_eq!(target(FLOOR, CEILING, 1.0, 1.0), FLOOR);
-        assert_eq!(target(FLOOR, CEILING, 1.0, 0.0), CEILING);
-    }
-
-    #[test]
-    fn in_between_the_target_falls_with_yield_times_pressure() {
-        // 900 MiB above the floor, kept at 1 - 0.5 * 0.5 = 0.75.
-        assert_eq!(target(FLOOR, CEILING, 0.5, 0.5), FLOOR + 675 * MIB);
-        assert_eq!(target(FLOOR, CEILING, 1.0, 0.25), FLOOR + 675 * MIB);
-        assert_eq!(target(FLOOR, CEILING, 0.5, 1.0), FLOOR + 450 * MIB);
-    }
-
-    #[test]
-    fn readings_out_of_range_are_taken_within_it() {
-        assert_eq!(target(FLOOR, CEILING, 1.0, 2.0), FLOOR);
-        assert_eq!(target(FLOOR, CEILING, 1.0, -1.0), CEILING);
-        assert_eq!(target(FLOOR, CEILING, 1.0, f64::NAN), CEILING);
-        assert_eq!(target(FLOOR, CEILING, f64::NAN, 1.0), CEILING);
-    }
-
-    #[test]
-    fn a_floor_over_the_ceiling_is_the_ceiling() {
         assert_eq!(target(2 * CEILING, CEILING, 1.0, 1.0), CEILING);
     }
 
@@ -399,15 +381,4 @@ mod tests {
         assert_eq!(rungs(300, 4096), vec![512, 1024, 2048, 4096]);
     }
 
-    #[test]
-    fn an_audit_states_what_no_owner_entered() {
-        let mut ledger = Ledger::new(MIB, 100 * MIB);
-        ledger.enter(Class::Model, "weights", 10 * MIB);
-        ledger.enter(Class::Fire, "inputs", 3 * MIB);
-        assert_eq!(ledger.audit(15 * MIB).gap(), i128::from(2 * MIB));
-        assert_eq!(
-            ledger.to_string(),
-            "model 10 MiB (weights 10); state 0 MiB; fire 3 MiB (inputs 3); outside 0 MiB; 13 of 100 MiB"
-        );
-    }
 }

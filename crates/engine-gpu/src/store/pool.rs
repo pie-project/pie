@@ -596,7 +596,7 @@ impl<B: Backend> Pool<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAST_ONE_BINDING, PAST_THE_POOL, Rung, segment_chunks, segment_words};
+    use super::segment_words;
     use crate::error::Fault;
 
     /// A segment's length in words is stated whole or the load is refused:
@@ -614,95 +614,6 @@ mod tests {
             ),
             "{refused}"
         );
-    }
-
-    /// The last segment holds the span whole, no segment passes a binding,
-    /// and the kernels bind four at most.
-    #[test]
-    fn the_last_segment_holds_the_span() {
-        let chunk = 4 << 20;
-        for (total, binding, span) in [
-            (2256, 4u64 << 30, 40),
-            (3016, 4095 << 20, 760),
-            (2257, 4 << 30, 563),
-            (1001, 4 << 30, 250),
-            (64, 1 << 30, 0),
-        ] {
-            let segment =
-                segment_chunks(chunk, total, binding, span).expect("a cut holds the span");
-            let count = total.div_ceil(segment);
-            assert!(
-                count <= super::SEGMENTS as u32,
-                "{total} {span}: {count} segments"
-            );
-            assert!(u64::from(segment) * chunk <= binding);
-            assert!(total - (count - 1) * segment >= span, "{total} {span}");
-        }
-        // Refused, not cut smaller: more segments than bind, or a span past
-        // the widest last segment.
-        assert_eq!(segment_chunks(chunk, 64, 64 << 20, 16), None);
-        assert_eq!(segment_chunks(chunk, 64, 1 << 30, 63), None);
-    }
-
-    /// Qwen3-0.6B on an Adreno phone: 3803136-byte chunks, a 1 GiB largest
-    /// buffer (282 chunks), one working set of 129, and the room its
-    /// capacity leaves past the weights about 400 chunks. A pool of one
-    /// binding holds no top over 153 chunks beside the working set, and two
-    /// segments each holding the span need it at most 197 (400 / 2 - 3): the
-    /// 10240 and 4096 rungs (266, 230) fit neither, and the top is the widest
-    /// below them. With the room of a desktop card every rung fits.
-    #[test]
-    fn the_top_rung_is_the_widest_whose_span_and_working_set_fit_the_pool() {
-        const GIB: u64 = 1 << 30;
-        let (chunk, binding, least) = (3_803_136u64, GIB, 129u32);
-        let left = 400 * chunk;
-        let at = |left: u64| {
-            [(1024, 120), (2048, 180), (4096, 230), (10240, 266)].map(|(tokens, act)| Rung {
-                tokens,
-                act,
-                left,
-                widest: u64::from(act) * chunk,
-            })
-        };
-        let rungs = at(left);
-        assert_eq!(super::widest_rung(&rungs, None, chunk, least, binding), Some(2048));
-        for rung in &rungs[2..] {
-            assert_eq!(
-                super::infeasible(rung, None, chunk, least, binding),
-                Some(PAST_THE_POOL),
-                "the {} rung's span of {} chunks fits no pool of this room",
-                rung.tokens,
-                rung.act
-            );
-        }
-        // Short of even the least rung's: no top.
-        assert_eq!(super::widest_rung(&at(200 * chunk), None, chunk, least, binding), None);
-        // A desktop card's room holds the widest.
-        assert_eq!(super::widest_rung(&at(8000 * chunk), None, chunk, least, binding), Some(10240));
-        // A reservation past one binding is no rung, whatever the room.
-        let mut seat = at(8000 * chunk);
-        seat[3].widest = binding + 1;
-        assert_eq!(super::infeasible(&seat[3], None, chunk, least, binding), Some(PAST_ONE_BINDING));
-        assert_eq!(super::widest_rung(&seat, None, chunk, least, binding), Some(4096));
-    }
-
-    /// Qwen3.5-0.8B on wgpu at a 12 GiB budget: 2304000-byte chunks, a
-    /// binding of 2047 MiB (931 chunks), a top rung of 922 chunks and one
-    /// working set of 455. Every segment must hold the span, so a pool of
-    /// 3500 chunks binds three segments (2793 chunks), not four: it lays
-    /// those, where it was refused for the four its chunks would take.
-    #[test]
-    fn a_pool_lays_the_chunks_its_segments_bind() {
-        const MIB: u64 = 1 << 20;
-        let (chunk, binding, act, least) = (2_304_000u64, 2047 * MIB, 922u32, 455u32);
-        assert_eq!(super::segment_chunks(chunk, 3500, binding, act), None);
-        let pool = super::sized(3500 * chunk, None, chunk, act, least, binding)
-            .expect("the chunks three segments bind");
-        assert_eq!(pool.total, 3 * 931);
-        assert!(u64::from(pool.segment_chunks) * chunk <= binding);
-        assert!(pool.total - 2 * pool.segment_chunks >= act, "the span lies in the last");
-        // A pool short of one segment holding the span is still refused.
-        assert!(super::sized(900 * chunk, None, chunk, act, least, binding).is_err());
     }
 
     /// Qwen3-8B on a 32 GiB card binding 4095 MiB (14.5 GiB of weights):

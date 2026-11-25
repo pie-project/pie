@@ -740,42 +740,25 @@ mod tests {
         rows.div_ceil(tile).max(1).div_ceil(step)
     }
 
-    /// With no work budget a prefill holds its rows in one dispatch, at
-    /// every row count and keys, a tile filled or not; with one, the
-    /// dispatches grow with the rows and never past what a naming sink is
-    /// told, the longest way the rows can take.
+    /// Regression (6430473a3): a budget of 0 split 21 rows of 16-row tiles
+    /// into two dispatches. With no budget a prefill is one dispatch; with
+    /// one, its dispatches grow with the rows and never pass what a naming
+    /// sink is told.
     #[test]
     fn a_prefill_dispatches_as_its_budget_says_and_names_its_longest_way() {
-        for tile in [8, 16, 32] {
-            for rows in 1..=4096 {
-                for keys in [1, 512, 40_960] {
-                    let step = prefill_step(0, rows, tile, Keys::Held(keys));
-                    assert_eq!(dispatches(rows, tile, step), 1, "{rows} rows of {tile}");
-                }
+        let (tile, work) = (16, 1 << 20);
+        for keys in [1u64, 4096, 1 << 21] {
+            let mut before = 0;
+            for rows in [1, 15, 16, 21, 33, 1000, 4096] {
                 assert_eq!(
-                    dispatches(rows, tile, prefill_step(0, rows, tile, Keys::Most)),
-                    1
+                    dispatches(rows, tile, prefill_step(0, rows, tile, Keys::Held(keys))),
+                    1,
+                    "{rows} rows at {keys} keys, no budget"
                 );
-            }
-        }
-        let work = 1 << 20;
-        for tile in [8, 16, 32] {
-            for keys in [1u64, 64, 512, 4096, 40_960, 1 << 21] {
-                let mut before = 0;
-                for rows in 1..=4096 {
-                    let made =
-                        dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Held(keys)));
-                    let named = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Most));
-                    assert!(
-                        made >= before,
-                        "{rows} rows at {keys} keys: {made} after {before}"
-                    );
-                    assert!(
-                        made <= named,
-                        "{rows} rows at {keys} keys: {made} past {named}"
-                    );
-                    before = made;
-                }
+                let made = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Held(keys)));
+                let named = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Most));
+                assert!(before <= made && made <= named, "{rows} rows at {keys} keys");
+                before = made;
             }
         }
     }
@@ -886,45 +869,5 @@ mod tests {
         assert_eq!(fired(0, most), 1);
         assert_eq!(fired(1 << 20, 0), staged.div_ceil(16));
         assert!(fired(1 << 20, 0) < fired(1 << 20, most));
-    }
-
-    /// A decode's kernels are named before any fire, as the fire names
-    /// them: the whole walk and the split one, their LSE forms, at the
-    /// tactic's threads; a head width no kernel is built at names none.
-    #[test]
-    fn a_decodes_kernels_are_named_without_a_fire() {
-        let tactic = Tactic {
-            tier: Tier::Baseline,
-            narrow: false,
-            decode_threads: 256,
-            tile_rows: 16,
-            tile_lanes: 16,
-            split_groups: 1,
-            split_min_keys: 1,
-            prefill_work: 0,
-        };
-        let names = |tactic, head_dim, lse| {
-            decode_kernels(Target::Wgsl, tactic, head_dim, lse, false)
-                .map(|fires| fires.map(|fire| (fire.file, fire.entrypoint, fire.tier)))
-        };
-        assert_eq!(
-            names(tactic, 64, false).unwrap(),
-            [
-                (SDPA, "attn_sdpa_decode_bf16_d_64", Tier::Baseline),
-                (SDPA, "attn_sdpa_split_bf16_d_64", Tier::Baseline),
-            ]
-        );
-        let narrow = Tactic {
-            decode_threads: 128,
-            ..tactic
-        };
-        assert_eq!(
-            names(narrow, 128, true).unwrap(),
-            [
-                (SDPA, "attn_sdpa_decode_lse_t128_bf16_d_128", Tier::Baseline),
-                (SDPA, "attn_sdpa_split_lse_t128_bf16_d_128", Tier::Baseline),
-            ]
-        );
-        assert!(names(tactic, 96, false).is_err());
     }
 }

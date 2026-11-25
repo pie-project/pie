@@ -368,11 +368,8 @@ fn an_idle_capture_needs_no_chunk() {
     shell.filled_serving();
     shell.serving = true;
     let segment = shell.pools().layout().segment_chunks;
-    let committed = shell
-        .chunk_facts()
-        .expect("the pool states its chunks")
-        .segments
-        .committed;
+    let facts = shell.chunk_facts().expect("the pool states its chunks").segments;
+    let committed = facts.committed;
     let mut held = 0u32;
     let mut fire = |shell: &mut Shell, tokens: &[u32]| {
         shell
@@ -388,13 +385,29 @@ fn an_idle_capture_needs_no_chunk() {
         held += tokens.len() as u32;
     };
     fire(&mut shell, &[5, 9, 2, 7]);
-    shell.commit_segments(committed + 1).expect("a segment commits");
+    // Where the pool grows, a segment committed for the move and given back
+    // after it. One laid whole at its load (`Growth::Fixed`, as wgpu lays
+    // it) has no such segment: the chunk moves to the first free chunk past
+    // the seats' segments, and the run's stays backed.
+    let fixed = facts.growth == engine::chunk::Growth::Fixed;
+    let to = if fixed {
+        (1 + shell.pool_layout().seat_chunks()).div_ceil(segment) * segment
+    } else {
+        shell.commit_segments(committed + 1).expect("a segment commits");
+        committed * segment
+    };
+    assert!(
+        !fixed || to < first,
+        "a free chunk lies between the seats' segments and the run's: {to}, {first}"
+    );
     shell
         .evacuate(&engine::chunk::Evacuation {
-            moves: vec![(first, committed * segment)],
+            moves: vec![(first, to)],
         })
         .expect("the chunk moves");
-    shell.release_segments(committed).expect("its segment goes back");
+    if !fixed {
+        shell.release_segments(committed).expect("its segment goes back");
+    }
     fire(&mut shell, &[3]);
     if <crate::backend::Api as engine_gpu::serve::Serve>::RECORDS {
         assert_eq!(

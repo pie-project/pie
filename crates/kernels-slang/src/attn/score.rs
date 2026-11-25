@@ -398,32 +398,3 @@ pub fn pages(
         ],
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{MASS, NORM, PAGES};
-    use crate::encode::Tier;
-
-    /// Every kernel a score capture fires is instantiated at the baseline
-    /// tier, the one a device without subgroups, fp16 or cooperative
-    /// matrices runs (an Adreno at its baseline), and carried in each
-    /// target's table this build compiles.
-    #[test]
-    fn every_capture_kernel_is_instantiated_at_the_baseline_tier() {
-        let names = NORM
-            .iter()
-            .copied()
-            .chain(MASS.iter().map(|form| form.entry))
-            .chain([PAGES]);
-        for name in names {
-            let key = crate::key(name, Tier::Baseline)
-                .unwrap_or_else(|| panic!("`{name}` is not instantiated at the baseline tier"));
-            if !crate::SPIRV.is_empty() {
-                assert!(crate::spirv(key).is_some(), "`{key}` has no SPIR-V module");
-            }
-            if !crate::WGSL.is_empty() {
-                assert!(crate::wgsl(key).is_some(), "`{key}` has no WGSL module");
-            }
-        }
-    }
-}

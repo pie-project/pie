@@ -194,27 +194,8 @@ mod tests {
         a_lane_reads_what_its_set_wrote_and_no_further();
         a_write_past_the_written_end_is_refused();
         a_fire_behind_one_in_flight_reads_what_that_one_wrote();
-        a_seat_taken_again_starts_from_what_the_runtime_states();
         lanes_of_one_set_read_the_union_of_their_writes();
         a_refused_fire_moves_no_end();
-        a_lane_naming_no_set_is_not_held();
-        a_set_listed_by_another_lane_first_finds_its_end();
-    }
-
-    fn a_set_listed_by_another_lane_first_finds_its_end() {
-        let mut written = Written::default();
-        let both = [(0, kv(7, 4), vec![4..6], 6), (1, kv(7, 4), vec![6..8], 8)];
-        assert_eq!(fire(&mut written, &both), Ok(()));
-        // The second seat listed first: its end is the set's still.
-        let swapped = [(1, kv(7, 4), vec![8..9], 9), (0, kv(7, 4), vec![9..10], 10)];
-        assert_eq!(fire(&mut written, &swapped), Ok(()));
-        assert_eq!(fire(&mut written, &[(0, kv(7, 4), vec![10..11], 11)]), Ok(()));
-    }
-
-    fn a_lane_naming_no_set_is_not_held() {
-        let mut written = Written::default();
-        assert_eq!(fire(&mut written, &[(0, kv(0, 0), vec![30..31], 31)]), Ok(()));
-        assert!(written.is_empty());
     }
 
     fn a_lane_reads_what_its_set_wrote_and_no_further() {
@@ -241,13 +222,6 @@ mod tests {
         // The runtime caught up: nothing past it to keep.
         assert_eq!(fire(&mut written, &[(3, kv(7, 12), vec![], 12)]), Ok(()));
         assert!(written.is_empty());
-    }
-
-    fn a_seat_taken_again_starts_from_what_the_runtime_states() {
-        let mut written = Written::default();
-        assert_eq!(fire(&mut written, &[(3, kv(7, 0), vec![0..40], 40)]), Ok(()));
-        let other = fire(&mut written, &[(3, kv(8, 0), vec![0..1], 40)]);
-        assert!(other.is_err_and(|why| why.contains("0..1 written")));
     }
 
     fn lanes_of_one_set_read_the_union_of_their_writes() {

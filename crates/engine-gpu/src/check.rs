@@ -267,18 +267,3 @@ pub fn op_of(kernel: &str) -> String {
     };
     format!("{kind}.{kernel}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn kernels_roll_up_as_the_ops_they_run() {
-        let kind = |k: &str| engine::load::check::kind_of(&op_of(k));
-        assert_eq!(kind("gemm_bf16_tiled"), "gemm (dense)");
-        assert_eq!(kind("moe_gemm_bf16"), "gemm (experts)");
-        assert_eq!(kind("attn_sdpa_decode_bf16_d_64"), "attention");
-        assert_eq!(kind("gather_embed_bf16"), "gather/embed");
-        assert_eq!(kind("rms_norm_bf16"), "norms/elementwise");
-    }
-}

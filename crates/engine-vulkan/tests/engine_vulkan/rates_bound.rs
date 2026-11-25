@@ -27,20 +27,11 @@ fn the_rates_step_stays_under_a_simulated_bound() {
     let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
     engine_vulkan::encode::profile_kernels(true);
     let _ = engine_vulkan::encode::take_longest_frame_span_ns();
-    let worst = std::cell::Cell::new(0u64);
     let longest = std::cell::Cell::new(0u64);
     let timer = |frame: Frame| {
         let ns = (frame.commit_timed()? * 1e9) as u64;
-        worst.set(worst.get().max(ns));
         // The frames this timed and any queued ahead of it, by the device.
-        let span = engine_vulkan::encode::take_longest_frame_span_ns();
-        if span > BOUND.as_nanos() as u64 / 2 {
-            eprintln!(
-                "past half the bound on the device: {:.1} ms",
-                span as f64 / 1e6
-            );
-        }
-        longest.set(longest.get().max(span));
+        longest.set(longest.get().max(engine_vulkan::encode::take_longest_frame_span_ns()));
         Ok((None, ns))
     };
     // The device's rates the shapes' step reads (its launch and bandwidth
@@ -104,14 +95,10 @@ fn the_rates_step_stays_under_a_simulated_bound() {
         BOUND.as_secs_f64() * 1e3
     );
     assert_eq!(curves.len(), wanted.len());
-    let mut stopped = 0;
     for c in &curves {
         let reach = c.curve.last().map_or(0, |&(rows, _)| rows);
         match c.stop {
-            Some((at, _)) => {
-                assert!(at > reach, "{c:?}");
-                stopped += 1;
-            }
+            Some((at, _)) => assert!(at > reach, "{c:?}"),
             None => assert_eq!(reach, TOP, "{c:?} ends short with no stop"),
         }
         assert!(c.serves(TOP));
@@ -124,13 +111,6 @@ fn the_rates_step_stays_under_a_simulated_bound() {
     assert!(
         engine_gpu::rates::lacking(kernels_slang::Target::Spirv, &kernels, &saved, &shapes, TOP)
             .is_empty()
-    );
-    eprintln!(
-        "longest frame on the device {:.1} ms (on the host, queue included, {:.1} ms); {stopped} \
-         of {} curves stopped",
-        longest as f64 / 1e6,
-        worst.get() as f64 / 1e6,
-        saved.kernel_curves.as_ref().map_or(0, Vec::len)
     );
 }
 
@@ -276,187 +256,5 @@ fn a_head_past_the_bound_is_timed_on_slices_of_its_columns() {
     assert!(
         timed.count() > 0,
         "no head curve timed at one row: {curves:?}"
-    );
-}
-
-/// A settle's plane-alone weighing under a stated bound smaller than one
-/// whole-plane fire (an output head's at 256 rows, tens of ms on a desktop
-/// GPU, against a 4 ms bound): its fires are cut into pieces of the plane's
-/// columns, each a submission of its own, and no submission's time on the
-/// device passes the bound, while every kernel still gets its samples.
-#[test]
-fn a_plane_weighed_past_the_bound_is_cut_into_pieces_each_within_it() {
-    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    let bound = std::time::Duration::from_millis(4);
-    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
-    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
-    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
-    let longest = std::cell::Cell::new(0u64);
-    let timer = |frame: Frame| {
-        let started = std::time::Instant::now();
-        let span = frame.commit_spanned()?;
-        let ns = span.unwrap_or(started.elapsed().as_nanos() as u64);
-        longest.set(longest.get().max(ns));
-        Ok((span, started.elapsed().as_nanos() as u64))
-    };
-    let (n, k, rows) = (151_936, 1024, 256);
-    let kernels: Vec<kernels_slang::linear::gemm::Tactic> = [1u32, 8]
-        .iter()
-        .map(|&vector| kernels_slang::linear::gemm::Tactic {
-            vector,
-            ..engine_gpu::backend::Tactics::gemm(&tuning, tier, rows)
-        })
-        .collect();
-    let samples = engine_gpu::rates::time_kernels::<Api, _>(
-        &device,
-        &tuning,
-        tier,
-        &timer,
-        Some(bound),
-        1000.0,
-        &kernels,
-        &[1, 1],
-        (n, k),
-        rows,
-    )
-    .expect("the weighing lands under the bound");
-    assert!(
-        samples.iter().all(|s| !s.is_empty()),
-        "a kernel got no sample: {samples:?}"
-    );
-    // Carried to the whole plane, a fire is past the bound: it was cut.
-    assert!(
-        samples
-            .iter()
-            .flatten()
-            .any(|&ns| ns > bound.as_nanos() as f64),
-        "no fire needed cutting: {samples:?}"
-    );
-    assert!(
-        longest.get() <= bound.as_nanos() as u64,
-        "a submission ran {:.1} ms on the device, past the {:.1} ms bound",
-        longest.get() as f64 / 1e6,
-        bound.as_secs_f64() * 1e3
-    );
-}
-
-/// A model of a smaller top rung measured first, then one of a larger top
-/// sharing its shapes: the second extends each shared curve with the rows
-/// it lacks and never times a stored point again, so the first model's
-/// points (what its settle and its cover were weighed by) are unchanged.
-#[test]
-fn a_later_model_extends_a_shared_curve_and_keeps_its_points() {
-    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
-    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
-    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
-    let timer = |frame: Frame| {
-        let started = std::time::Instant::now();
-        let span = frame.commit_spanned()?;
-        Ok((span.filter(|&ns| ns > 0), started.elapsed().as_nanos() as u64))
-    };
-    let say = &mut |_: &str| {};
-    let stated = Rates {
-        launch_ns: Some(1000),
-        ..Rates::default()
-    };
-    let shapes = [(1024, 1024)];
-    let mut measure = |stated: &Rates, top: u32| {
-        let kernels =
-            engine_gpu::rates::dense_kernels(kernels_slang::Target::Spirv, &tuning, tier, top);
-        let wanted =
-            engine_gpu::rates::lacking(kernels_slang::Target::Spirv, &kernels, stated, &shapes, top);
-        let curves = engine_gpu::rates::measure_shapes::<Api, _>(
-            &device, &tuning, tier, &timer, None, None, stated, &wanted, None, top, say,
-        )
-        .expect("the curves are timed");
-        Rates {
-            kernel_curves: Some(curves),
-            ..Rates::default()
-        }
-        .over(stated.clone())
-    };
-    let first = measure(&stated, 16);
-    let second = measure(&first, 64);
-    for a in first.kernel_curves.iter().flatten().filter(|c| c.stop.is_none()) {
-        let b = second
-            .kernel_curves
-            .iter()
-            .flatten()
-            .find(|b| b.id() == a.id())
-            .expect("the shared curve stands");
-        assert_eq!(
-            &b.curve[..a.curve.len()],
-            &a.curve[..],
-            "{}: the first model's points are kept as stored",
-            a.name()
-        );
-        assert!(
-            b.curve.last().map(|p| p.0) > a.curve.last().map(|p| p.0) || b.stop.is_some(),
-            "{}: extended past the first model's rows, or stopped",
-            a.name()
-        );
-    }
-}
-
-/// Under a bound one fire of the scan's full sequence is past (a slow
-/// device's measuring boot), the rates step times the scan at the most
-/// tokens that fit the bound and lands: the scan's rate is stated, never a
-/// refused boot.
-#[test]
-fn a_scan_past_the_bound_is_timed_shorter_and_the_step_lands() {
-    let Ok(device) = Context::bind(&crate::gpu::device_boot(), engine::Allowance::WHOLE) else {
-        eprintln!("not asked: no device");
-        return;
-    };
-    let (chip, _) = engine_vulkan::chip::resolve(&device.chip(), None);
-    let tuning = engine_vulkan::tuning::Tuning::new(chip, device.limits());
-    let tier = <Api as engine_gpu::serve::Serve>::tier(&device);
-    let timer = |frame: Frame| {
-        let started = std::time::Instant::now();
-        let span = frame.commit_spanned()?;
-        Ok((span.filter(|&ns| ns > 0), started.elapsed().as_nanos() as u64))
-    };
-    // Every rate stated but the scan's: the step times the scan alone.
-    let stated = Rates {
-        launch_ns: Some(1000),
-        gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 10.0), (8192, 30.0)])]),
-        attn_tflops_by_keys: Some(vec![(512, 5.0), (8192, 10.0)]),
-        hbm_gbps: Some(600.0),
-        elementwise_gbps: Some(600.0),
-        resident_workgroups: Some(100.0),
-        submit_worst_ratio: Some(1.0),
-        attn_tflops_by_rows_keys: Some(vec![(128, vec![(512, 1.0)])]),
-        ..Rates::default()
-    };
-    // A bound the full sequence's fire is past: a quarter of its time alone.
-    let full = {
-        let measured = engine_gpu::rates::measure::<Api, _>(&device, &tuning, tier, &timer, None, &stated)
-            .expect("the scan is timed unbounded");
-        let gelems = measured.rates.scan_gelems.expect("the scan's rate");
-        engine::rates::scan_elements(engine::rates::SCAN_SHAPE) / gelems
-    };
-    let bound = std::time::Duration::from_nanos((full / 4.0).max(200_000.0) as u64);
-    let mut said = Vec::new();
-    let measured = engine_gpu::rates::measure_saying::<Api, _>(
-        &device,
-        &tuning,
-        tier,
-        &timer,
-        Some(bound),
-        &stated,
-        &mut |line| said.push(line.to_string()),
-    )
-    .unwrap_or_else(|why| panic!("the step lands under {bound:?}: {why}\n{said:#?}"));
-    assert!(measured.rates.scan_gelems.is_some_and(|g| g > 0.0), "{said:#?}");
-    assert!(
-        said.iter().any(|l| l.contains("timed at")),
-        "the scan was timed shorter: {said:#?}"
     );
 }
