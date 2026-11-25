@@ -11,6 +11,7 @@ mod a_load_walks_every_readout_tier_its_set_states;
 mod a_refused_lane_is_refused_alone;
 mod a_fenced_frame_lands_both_sides;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
+mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_scattered_pool_serves_the_same_logits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;

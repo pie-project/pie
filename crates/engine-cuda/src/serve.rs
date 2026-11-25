@@ -890,10 +890,6 @@ impl Shell {
         Ok(written)
     }
 
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.adapters.mount(root);
-    }
-
     pub fn bind_adapter(
         &mut self,
         source: crate::blob::Source<'_>,

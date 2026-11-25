@@ -2847,12 +2847,20 @@ impl Shell {
                     ..*seated
                 };
                 self.windowed_pages(k, &seat, fold, None, have, row.rows)?
+            } else if !self.warming {
+                return Err(Fault::program(
+                    "serve::windowed",
+                    format!(
+                        "lane in slot {} of a load whose windowed layers are ring + buffer \
+                         states no ring pieces and no window fold (`Lane::window`)",
+                        lane.slot
+                    ),
+                ));
             } else {
-                // A runtime lane with no fold and no ring (arming, the
-                // load's own fires, the pipeline walk): nothing reads
-                // what such a fire computes, so every page it names is
-                // one scratch page, in the own-row region's last chunk
-                // (past every arm's share).
+                // The pipeline walk drops its fires: nothing reads what
+                // one computes, so every page it names is one scratch
+                // page, in the own-row region's last chunk (past every
+                // arm's share).
                 let page_size = self.pools.window_paging(k).page_size.max(1);
                 let (first, chunks) = self.own_top;
                 if chunks == 0 {
