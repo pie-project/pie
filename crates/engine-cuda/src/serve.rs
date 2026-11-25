@@ -20,6 +20,8 @@ pub use load::Staged;
 pub(crate) mod pages;
 mod prepare;
 mod ring;
+#[doc(hidden)]
+pub mod ring_table;
 mod segments;
 mod settle;
 mod stats;
@@ -84,9 +86,9 @@ pub struct Shell {
     /// The rungs the load weighed its top by and the estimate it weighed
     /// them with (`None` where the profile states no rates).
     weighed: Option<crate::top::Weighed>,
-    /// A windowed fire's ring-fold runs as the device reads them, grown to
-    /// the most a fire has folded (`serve::ring`).
-    ring_runs: Option<crate::device::alloc::Buffer>,
+    /// The table a windowed fire's ring runs go out over; `None` where the
+    /// load keeps no ring (`serve::ring_table`).
+    ring_runs: Option<ring_table::RingTable>,
     /// What the windowed fires served have done since load: pages they
     /// wrote on their rings directly, own-row pages they took, and the ring
     /// pages they folded onto that their own reads had read.
