@@ -6,7 +6,6 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
         .map_err(|error| format!("the vulkan boot config is not utf-8: {error}"))?
         .parse()
         .map_err(|error| format!("the vulkan boot config is not TOML: {error}"))?;
-    engine_gpu::adapter::refuse_adapter_dir(&doc, "vulkan")?;
     let profiles = profiles(&doc)?;
     Ok(Vulkan::new(
         DeviceBoot {
