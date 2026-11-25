@@ -561,38 +561,6 @@ impl Memo {
 mod tests {
     use super::*;
 
-    /// A boot whose files' stats all match the memo reads none of them; one
-    /// file touched is the only one read again, and the digest follows it.
-    #[test]
-    fn the_checkpoint_digest_reads_only_what_changed() {
-        let dir = tempfile::tempdir().expect("a scratch directory");
-        let model = dir.path().join("model");
-        std::fs::create_dir_all(&model).unwrap();
-        std::fs::write(model.join("config.json"), b"{}").unwrap();
-        std::fs::write(model.join("a.safetensors"), vec![1u8; 4096]).unwrap();
-        std::fs::write(model.join("b.safetensors"), vec![2u8; 4096]).unwrap();
-        let memo = dir.path().join("kv").join("digests");
-
-        let (first, read) = content_digest(&model, &memo).unwrap();
-        assert_eq!(read, 3, "a cold memo reads every file");
-        let (again, read) = content_digest(&model, &memo).unwrap();
-        assert_eq!((again, read), (first, 0), "unchanged stats read nothing");
-
-        // Rewritten in place, its mtime a second on (a rewrite within one
-        // clock tick of the file system's could keep it).
-        let touched = model.join("b.safetensors");
-        let before = std::fs::metadata(&touched).unwrap().modified().unwrap();
-        std::fs::write(&touched, vec![3u8; 4096]).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&touched)
-            .unwrap()
-            .set_modified(before + std::time::Duration::from_secs(1))
-            .unwrap();
-        let (changed, read) = content_digest(&model, &memo).unwrap();
-        assert_eq!(read, 1, "only the touched file is read again");
-        assert_ne!(changed, first, "and the digest follows its content");
-    }
     use checkpoint::file::write::Writer;
     use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 

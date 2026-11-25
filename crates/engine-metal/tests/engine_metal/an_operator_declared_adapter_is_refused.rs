@@ -9,7 +9,6 @@ use engine_metal::{DeviceBoot, Metal};
 fn an_operator_declared_adapter_is_refused() {
     let mut metal = Metal::new(
         DeviceBoot {
-            adapter_dir: None,
             profiles: None,
             measure: engine::rates::Measuring::Time,
             ..DeviceBoot::default()

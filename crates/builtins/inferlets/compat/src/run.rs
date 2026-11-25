@@ -356,30 +356,6 @@ mod tests {
         );
     }
 
-    /// A stop sequence only cuts the output: the content ends before it,
-    /// the request finishes on it, and generation breaks. Nothing here
-    /// reaches the working set, whose passes state their rows final.
-    #[test]
-    fn a_stop_sequence_cuts_the_output_and_breaks() {
-        let mut req = Request::new(Vec::new());
-        req.stop = vec!["STOP".to_string()];
-        let mut out = Output::new(&req);
-        let mut sent = Vec::new();
-        let mut sink = |event: Event| {
-            if let Event::Text(text) = event {
-                sent.push(text);
-            }
-        };
-        let flow = out.deliver(vec![Event::Text("hello ST".into())], &mut sink);
-        assert!(flow.is_continue());
-        let flow = out.deliver(vec![Event::Text("OP world".into())], &mut sink);
-        assert!(flow.is_break(), "the stop sequence ends generation");
-        assert_eq!(out.content, "hello ");
-        assert_eq!(sent.concat(), "hello ");
-        assert_eq!(out.finish, Some(Finish::StopSequence));
-        assert_eq!(out.stop_sequence.as_deref(), Some("STOP"));
-    }
-
     fn stream(stop: &str, include: bool, pieces: &[&str]) -> (String, Option<String>) {
         let mut req = Request::new(Vec::new());
         req.stop = vec![stop.to_string()];

@@ -3109,7 +3109,7 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         )
     };
     let before = moves();
-    if crate::planner::trace_enabled() {
+    if tracing::enabled!(tracing::Level::DEBUG) {
         println!("SIM CHECK {step}");
     }
     let queue = planner.debug_queue();
@@ -3404,7 +3404,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
             crate::rt::test_clock::advance(STEP);
         }
         ctx.step.store(u64::from(step), Ordering::Relaxed);
-        if crate::planner::trace_enabled() {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             println!("SIM STEP {step}");
         }
         ctx.stepped.notify_waiters();

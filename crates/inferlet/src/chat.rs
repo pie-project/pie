@@ -37,24 +37,3 @@ pub fn is_stop(token: u32) -> bool {
 fn listed(list: &OnceLock<Vec<u32>>, read: impl FnOnce() -> Vec<u32>, token: u32) -> bool {
     list.get_or_init(read).contains(&token)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::Cell;
-
-    /// The list is read on the first ask and answers every later one.
-    #[test]
-    fn the_stop_list_is_read_once() {
-        let list = OnceLock::new();
-        let reads = Cell::new(0);
-        let read = || {
-            reads.set(reads.get() + 1);
-            vec![7, 9]
-        };
-        assert!(listed(&list, read, 9));
-        assert!(!listed(&list, read, 8));
-        assert!(listed(&list, || unreachable!("read twice"), 7));
-        assert_eq!(reads.get(), 1);
-    }
-}

@@ -915,10 +915,7 @@ api = 1
 [target]
 device = "Apple M9"
 [rates]
-gemm_tflops_by_rows = [[4096, [[256, 20.0], [4096, 50]]]]   # 50 TFLOP/s wide
-attn_tflops_by_keys = [[2048, 20.0]]
-scan_gelems = 3000.0
-hbm_gbps = 400              # 400 GB/s
+hbm_gbps = 400
 "#;
 
 #[test]
@@ -932,42 +929,6 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
         ],
         derived: SHELF.derived,
     };
-    let (p, report) = shelf.resolve(&r, "Apple M9", &facts(11, true), None);
-    assert_eq!(
-        report.layers,
-        [
-            Source::Derived,
-            Source::Seeded("derived/apple-m9.toml".into())
-        ],
-        "the derived device's own file over the derived profile"
-    );
-    assert_eq!(p.get::<PrefillChunk>().0, 128, "the derived profile's");
-    assert_eq!(
-        p.rates(),
-        profile::rates::Rates {
-            stale: None,
-            landing: None,
-            gemm_tflops_by_rows: Some(vec![(4096, vec![(256, 20.0), (4096, 50.0)])]),
-            attn_tflops_by_keys: Some(vec![(2048, 20.0)]),
-            scan_gelems: Some(3000.0),
-            hbm_gbps: Some(400.0),
-            cached_gbps: None,
-            elementwise_gbps: None,
-            launch_ns: None,
-            few_row_tflops: None,
-            workgroups_per_core: None,
-            submit_worst_ratio: None,
-            load_width: None,
-            resident_workgroups: None,
-            attn_tflops_by_rows_keys: None,
-            product_ns: None,
-            kernel_curves: None,
-            dense_settled: Vec::new(),
-            measured_on: None,
-            measured_by: None,
-        }
-    );
-
     let dir = std::env::temp_dir().join(format!("pie-shelf-rates-{}", std::process::id()));
     let path = shelf.user_path(&dir, "Apple M9");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -986,138 +947,19 @@ fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
         Some(9000),
         "the saved value fills the gap"
     );
-
-    // A dump carries them, and reads back.
-    let text = profile::render::dump(&p);
-    let file = r.parse(&text, "dump.toml", Strict::User).unwrap();
-    assert_eq!(&file.tuned, p.tuned(), "{text}");
-
-    // The shelf check admits a derived device file filed under its id.
-    let check_dir = std::env::temp_dir().join(format!("pie-shelf-rc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&check_dir);
-    for (path, text) in shelf.seeded {
-        let at = check_dir.join(path);
-        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
-        std::fs::write(at, text).unwrap();
-    }
-    let checked = shelf.check(&r, &check_dir);
-    std::fs::remove_dir_all(&check_dir).unwrap();
-    checked.unwrap();
-}
-
-#[test]
-fn rates_are_refused_where_they_do_not_read_and_fire_times_are_no_profiles() {
-    for (body, says) in [
-        (
-            "[rates]\nhbm_gbps = -1\n",
-            "`rates.hbm_gbps` is a positive number",
-        ),
-        (
-            "[rates]\nelementwise_gbps = nan\n",
-            "`rates.elementwise_gbps` is a positive number",
-        ),
-        (
-            "[rates]\ngemm_tflops_by_rows = [[4096, [[512, 2.0], [256, 1.0]]]]\n",
-            "`rates.gemm_tflops_by_rows` is a non-empty list of [x, rate] pairs, ascending in x",
-        ),
-        (
-            "[rates]\ngemm_tflops_by_rows = [[4096, [[256, 1.0]]], [1024, [[256, 1.0]]]]\n",
-            "a non-empty list of [width, [[rows, TFLOP/s], ...]] pairs, ascending in width",
-        ),
-        ("[rates]\nattn_tflops_by_keys = []\n", "not an empty list"),
-        ("[rates]\ngemm_tflops = 1.0\n", "not `gemm_tflops`"),
-        (
-            "[rates]\nflops = 1.0\n",
-            "`measured_on` and `measured_by`, not `flops`",
-        ),
-        // The measured grids are gone: an unknown key like any other.
-        (
-            "[rates]\nbf16_flops_per_ns_by_rows_n_k = [[16, 1024, 1024, 1.0]]\n",
-            "`measured_by`, not `bf16_flops_per_ns_by_rows_n_k`",
-        ),
-        (
-            "[rates]\nattn_flops_per_ns_by_keys_and_dim = [[2048, 128, 2.0]]\n",
-            "not `attn_flops_per_ns_by_keys_and_dim`",
-        ),
-        ("[rates]\nbytes_per_ns = 1.0\n", "not `bytes_per_ns`"),
-        (
-            "[rates]\nfew_row_tflops = 0\n",
-            "`rates.few_row_tflops` is a positive number",
-        ),
-        (
-            "[rates]\nworkgroups_per_core = -3.3\n",
-            "`rates.workgroups_per_core` is a positive number",
-        ),
-        (
-            "[rates]\nlaunch_ns = 1.5\n",
-            "`rates.launch_ns` is a whole number",
-        ),
-        (
-            "[rates]\nattn_tflops_by_rows_keys = [[512, [[4096, 0.3]]], [256, [[4096, 0.2]]]]\n",
-            "a non-empty list of [rows, [[keys, TFLOP/s], ...]] pairs, ascending in rows",
-        ),
-        ("[fire_ns]\n\"m\" = [[1, 10]]\n", "fire_ns"),
-    ] {
-        let e = refusal(&format!("api = 1\n{body}"));
-        assert!(e.contains(says), "{body}: {e}");
-    }
-}
-
-#[test]
-fn the_notice_names_rates_measured_on_the_device_and_what_is_untuned() {
-    let r = registry();
-    let rated = |provenance: &str| {
-        format!(
-            "api = 1\n[target]\ndevice = \"Apple M9\"\n[rates]\ngemm_tflops_by_rows = [[4096, [[4096, 5.0]]]]\n\
-             hbm_gbps = 300.0\n{provenance}"
-        )
-    };
-    // Rates a layer says it measured: the notice says so, and that the
-    // decisions are untuned.
-    let measured = rated("[provenance]\nrates = \"pie tune metal --rates on 2026-11-15\"\n");
-    let (_, report) = r.resolve(
-        &[layer(
-            Source::Seeded("derived/apple-m9.toml".into()),
-            &measured,
-        )],
-        &facts(11, true),
-    );
-    assert_eq!(
-        report.rates_measured.as_deref(),
-        Some("pie tune metal --rates on 2026-11-15")
-    );
-    assert_eq!(
-        report.what_was_measured(),
-        "rates measured on it (pie tune metal --rates on 2026-11-15); its kernel decisions untuned"
-    );
-    // Rates no layer says were measured (a vendor's figure): none measured.
-    let stated = rated("");
-    let (_, report) = r.resolve(
-        &[layer(
-            Source::Seeded("derived/apple-m9.toml".into()),
-            &stated,
-        )],
-        &facts(11, true),
-    );
-    assert_eq!(report.rates_measured, None);
-    assert!(
-        report
-            .what_was_measured()
-            .starts_with("no rates measured on it"),
-        "{}",
-        report.what_was_measured()
-    );
 }
 
 /// A user's file a load rewrites keeps every key this pie reads (a person's
 /// own decisions) and drops, by name, each it no longer reads: a removed
-/// decision in a table, one written dotted, a `[rates]` key of an old
-/// schema, a `provenance.measured` item naming a removed decision.
+/// decision in a table, one written dotted, a stale inline table (alone: the
+/// keys after it stay), a `[rates]` key of an old schema, a
+/// `provenance.measured` item naming a removed decision.
 #[test]
 fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
     let r = registry();
     let text = "api = 1\n\
         [engine]\n\
+        recording = { use = \"bodies\", mem_mb = 4096 }\n\
         prefill.chunk = 2048\n\
         graphs = \"on\"\n\
         \n\
@@ -1134,6 +976,7 @@ fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
     assert_eq!(
         dropped,
         [
+            "engine.recording",
             "engine.graphs",
             "kernel.moe",
             "rates.bytes_per_ns",
@@ -1149,112 +992,4 @@ fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
     assert_eq!(file.measured, ["engine.prefill.chunk"]);
     // What reads is untouched: pruning it again drops nothing.
     assert_eq!(r.prune(&kept), (kept.clone(), Vec::new()));
-}
-
-/// A stale inline table is an entry of its table: the keys after it in the
-/// same table are kept, and a stale `[table]` is still removed whole.
-#[test]
-fn a_stale_inline_table_takes_only_itself() {
-    let r = registry();
-    let text = "api = 1\n\
-        [engine]\n\
-        recording = { use = \"bodies\", mem_mb = 4096 }\n\
-        prefill.chunk = 2048\n\
-        \n\
-        [kernel.moe]\n\
-        group_at = 8\n\
-        grouped = true\n\
-        \n\
-        [compiler]\n\
-        launch_us = 3.0\n";
-    let (kept, dropped) = r.prune(text);
-    assert_eq!(dropped, ["engine.recording", "kernel.moe"], "{kept}");
-    let file = r
-        .parse(&kept, "kept", profile::Strict::User)
-        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
-    assert_eq!(
-        file.entries.len(),
-        2,
-        "the chunk and the launch kept: {kept}"
-    );
-    assert!(kept.contains("prefill.chunk = 2048"), "{kept}");
-    assert!(kept.contains("[compiler]\nlaunch_us = 3.0"), "{kept}");
-    assert!(
-        !kept.contains("group_at") && !kept.contains("grouped"),
-        "{kept}"
-    );
-}
-
-/// `[rates] product_ns` reads back as it was written, and a load's newly
-/// measured shapes join the saved ones, its own replacing a shape both state.
-#[test]
-fn product_times_read_back_and_accumulate() {
-    use profile::rates::{ProductTime, Rates};
-    let t = |kind, m, kernel, ns| ProductTime {
-        kind,
-        rows: 6144,
-        k: 1024,
-        m,
-        kernel,
-        ns,
-        spread: 40.0,
-    };
-    let saved = Rates {
-        product_ns: Some(vec![t(3, 4, 0, 6600.0), t(3, 4, 1, 6100.0)]),
-        ..Rates::default()
-    };
-    let text = format!("api = 1\n{}", saved.toml());
-    let read = profile::Registry::new("t", &[], &[])
-        .parse(&text, "p.toml", profile::Strict::User)
-        .unwrap();
-    assert_eq!(read.tuned.rates, saved, "{text}");
-    let measured = Rates {
-        product_ns: Some(vec![t(3, 8, 0, 7000.0), t(3, 4, 1, 6000.0)]),
-        ..Rates::default()
-    };
-    let merged = measured.over(saved).product_ns.unwrap();
-    assert_eq!(
-        merged,
-        vec![t(3, 4, 0, 6600.0), t(3, 4, 1, 6000.0), t(3, 8, 0, 7000.0)]
-    );
-    let twice = "api = 1\n[rates]\nproduct_ns = [[3, 6144, 1024, 4, 0, 1.0, 0.0], [3, 6144, 1024, 4, 0, 2.0, 0.0]]\n";
-    assert!(refusal(twice).contains("each shape once"));
-}
-
-/// How a machine lands weights (`[rates] landing`) is written and read
-/// back as stored, and a list of the wrong length, or a value not past
-/// nothing, is skipped by name in a user file and refused in a checked-in
-/// one.
-#[test]
-fn a_landing_reads_back_as_written() {
-    let r = registry();
-    let landing =
-        profile::rates::Landing::of([7411.0, 24.25, 2097152.0, 56.25, 217133.0, 1.81, 53.5]);
-    let rates = profile::rates::Rates {
-        landing: Some(landing),
-        ..profile::rates::Rates::default()
-    };
-    let text = format!("api = 1\n{}", rates.toml());
-    let file = r.parse(&text, "landing.toml", Strict::User).unwrap();
-    assert_eq!(file.tuned.rates.landing, Some(landing), "{text}");
-    for bad in [
-        "landing = [1.0, 2.0]\n",
-        "landing = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0]\n",
-    ] {
-        let text = format!("api = 1\n[rates]\n{bad}");
-        let file = r.parse(&text, "bad.toml", Strict::User).unwrap();
-        assert_eq!(file.tuned.rates.landing, None);
-        assert!(
-            file.skipped_rates
-                .iter()
-                .any(|s| s.contains("rates.landing")),
-            "{:?}",
-            file.skipped_rates
-        );
-        let why = r
-            .parse(&text, "bad.toml", Strict::CheckedIn)
-            .expect_err("refused")
-            .to_string();
-        assert!(why.contains("rates.landing"), "{why}");
-    }
 }

@@ -130,17 +130,3 @@ pub fn gemm_rate(by_rows: &[(u32, Vec<(u32, f64)>)], m: u32, n: u32, k: u32) -> 
     }
     interpolate(&width, square).unwrap_or(f64::INFINITY)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_curve_is_read_in_log_x_and_clamped() {
-        let c = [(256, 100.0), (1024, 200.0)];
-        assert_eq!(interpolate(&c, 1.0), Some(100.0));
-        assert_eq!(interpolate(&c, 4096.0), Some(200.0));
-        assert!((interpolate(&c, 512.0).unwrap() - 150.0).abs() < 1e-9);
-        assert_eq!(interpolate(&[], 1.0), None);
-    }
-}

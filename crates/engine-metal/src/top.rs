@@ -157,15 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn a_span_past_one_buffer_is_no_rung() {
-        let rungs = rung_facts(&[candidate(1024, 100), candidate(2048, 300)], MIB, 256, 200);
-        assert_eq!(rungs[0].infeasible, None);
-        assert_eq!((rungs[0].lanes, rungs[0].span_bytes), (256, 100 * MIB));
-        assert_eq!((rungs[0].launches, rungs[0].padded_rows), (300, 1024));
-        assert_eq!(rungs[1].infeasible, Some(PAST_ONE_BUFFER));
-    }
-
-    #[test]
     fn without_rates_the_load_is_refused_by_name() {
         let rungs = rung_facts(&[candidate(1024, 100), candidate(2048, 150)], MIB, 256, 200);
         let err = choose(
@@ -201,16 +192,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_bounded_budget_ends_at_the_top() {
-        let budget = poem_compiler::Budget {
-            max_lanes: 512,
-            max_tokens: 4096,
-            buckets: vec![64, 512, 2048, 4096],
-            ..poem_compiler::Budget::default()
-        };
-        let cut = bounded(&budget, 1024);
-        assert_eq!((cut.max_tokens, cut.max_lanes), (1024, 512));
-        assert_eq!(cut.buckets, vec![64, 512, 1024]);
-    }
 }

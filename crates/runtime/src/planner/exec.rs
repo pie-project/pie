@@ -711,7 +711,7 @@ impl MoveGuard {
         }
         for (copy, started, completion) in waits {
             let copied = completion.wait().await;
-            ptrace!(
+            tracing::debug!(
                 "tier-copy {} slots={} ms={}",
                 copy.label(),
                 copy.device.len(),
@@ -1154,7 +1154,7 @@ pub(super) async fn evict(planner: Arc<ResidencyPlanner>, pid: ProcessId) {
         store.lock().unwrap().commit(txn);
     }
     fence.keep_raised();
-    ptrace!(
+    tracing::debug!(
         "evict-phases pid={} drained_ms={} quiesced_ms={} prepared_ms={} copied_ms={} done_ms={} freed={}",
         pid,
         drained.as_millis(),
@@ -1624,7 +1624,7 @@ async fn restore(
         }
     }
     planner.rebind_waiting(pid, None);
-    ptrace!(
+    tracing::debug!(
         "restore-done pid={} ms={}",
         pid,
         began.elapsed().as_millis()
