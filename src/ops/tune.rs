@@ -349,7 +349,7 @@ fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<St
             covers
         ));
     }
-    if bodies.is_empty() {
+    if bodies.is_empty() && backend.name == "cuda" {
         return Ok(format!(
             "{named}{measured}{covers}no bodies record written: none of this build.\n"
         ));
