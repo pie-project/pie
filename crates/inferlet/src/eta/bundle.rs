@@ -39,11 +39,11 @@ impl Adapter {
 /// Refuses bytes that are not a safetensors file of F32, BF16 or F16 tensors,
 /// naming the tensor at fault.
 fn check(bytes: &[u8]) -> Result<(), String> {
-    let bad = |why: &str| format!("adapter bundle: {why}");
+    let bad = |why: &str| format!("adapter bundle: not a safetensors file: {why}");
     let len = bytes
         .get(..8)
         .map(|head| u64::from_le_bytes(head.try_into().expect("eight bytes")))
-        .ok_or_else(|| bad("shorter than a safetensors header"))?;
+        .ok_or_else(|| bad("shorter than its header length"))?;
     let end = usize::try_from(len)
         .ok()
         .and_then(|len| len.checked_add(8))

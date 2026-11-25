@@ -763,16 +763,16 @@ def _check_bundle(data: bytes) -> None:
     """Refuses bytes that are not a safetensors file of F32, BF16 or F16
     tensors, naming the tensor at fault."""
     if len(data) < 8:
-        raise InferletError("adapter bundle: shorter than a safetensors header")
+        raise InferletError("adapter bundle: not a safetensors file: shorter than its header length")
     end = 8 + int.from_bytes(data[:8], "little")
     if end > len(data):
-        raise InferletError("adapter bundle: its header runs past the file")
+        raise InferletError("adapter bundle: not a safetensors file: its header runs past the file")
     try:
         header = json.loads(bytes(data[8:end]))
     except ValueError as e:
-        raise InferletError(f"adapter bundle: its header is not JSON: {e}") from None
+        raise InferletError(f"adapter bundle: not a safetensors file: its header is not JSON: {e}") from None
     if not isinstance(header, dict):
-        raise InferletError("adapter bundle: its header is not a JSON object")
+        raise InferletError("adapter bundle: not a safetensors file: its header is not a JSON object")
     size = len(data) - end
     for name, tensor in header.items():
         if name == "__metadata__":

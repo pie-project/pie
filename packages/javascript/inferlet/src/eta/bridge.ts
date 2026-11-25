@@ -697,17 +697,17 @@ export class Adapter {
 
 /** Refuses bytes that are not a safetensors file of F32, BF16 or F16 tensors, naming the tensor at fault. */
 function checkBundle(bytes: Uint8Array): void {
-  if (bytes.length < 8) throw new InferletError('adapter bundle: shorter than a safetensors header');
+  if (bytes.length < 8) throw new InferletError('adapter bundle: not a safetensors file: shorter than its header length');
   const end = 8 + Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true));
-  if (end > bytes.length) throw new InferletError('adapter bundle: its header runs past the file');
+  if (end > bytes.length) throw new InferletError('adapter bundle: not a safetensors file: its header runs past the file');
   let header: unknown;
   try {
     header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, end)));
   } catch (e) {
-    throw new InferletError(`adapter bundle: its header is not JSON: ${e}`);
+    throw new InferletError(`adapter bundle: not a safetensors file: its header is not JSON: ${e}`);
   }
   if (typeof header !== 'object' || header === null || Array.isArray(header)) {
-    throw new InferletError('adapter bundle: its header is not a JSON object');
+    throw new InferletError('adapter bundle: not a safetensors file: its header is not a JSON object');
   }
   const size = bytes.length - end;
   for (const [name, tensor] of Object.entries(header as Record<string, { dtype?: string; shape?: number[]; data_offsets?: number[] }>)) {
