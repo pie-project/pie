@@ -1274,13 +1274,16 @@ fn same_cut_check(model: &str, layers: Option<u32>, page: u32, budget: Option<u6
     near(&format!("{model}: ring + buffer against plain attention, fire for fire"), &rows, &want);
 }
 
-/// Windowed layers beside full ones (the buffer's slot the kv page), and
-/// Gemma's shared tail (layers that write no kv and read their owners'
-/// rings: the 30-layer miniature's six over 24 owners), answer what the
-/// same model with plain attention does, fire for fire.
+/// Windowed layers beside full ones, the buffer's slot the kv page.
 #[test]
-fn windowed_layers_and_a_shared_tail_answer_what_plain_attention_does() {
+fn windowed_layers_beside_full_ones_answer_what_plain_attention_does() {
     same_cut_check("gemma4-e4b-mini-l6", None, 32, None, 16);
+}
+
+/// Gemma's shared tail: its layers write no kv and read their owner
+/// layers' rings (the 30-layer miniature: six tail layers over 24 owners).
+#[test]
+fn a_shared_tail_answers_what_plain_attention_does() {
     same_cut_check("gemma4-e4b-mini-l30", None, PAGE, Some(20 << 30), 8);
 }
 
