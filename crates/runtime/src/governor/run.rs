@@ -663,7 +663,7 @@ fn read_ledger(pool: &Shared<Steered>, engine: usize) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
     use super::*;
 
@@ -673,17 +673,31 @@ mod tests {
     /// once both have taken theirs, less what is defended and the floor, is
     /// the room its reader reports, negative where it is short.
     struct Host {
+        /// What the host could give the pool and the others, in MiB.
+        free: AtomicI64,
+        /// What the others hold, in MiB.
+        others: AtomicI64,
         /// What the pool holds, in segments of a MiB.
         pool: AtomicU64,
     }
 
     impl Host {
-        fn new() -> Arc<Self> {
+        fn new(free: i64) -> Arc<Self> {
             Arc::new(Self {
+                free: AtomicI64::new(free),
+                others: AtomicI64::new(0),
                 pool: AtomicU64::new(0),
             })
         }
 
+        fn reader(self: &Arc<Self>) -> ::engine::HostRoom {
+            let host = self.clone();
+            Arc::new(move || {
+                let used = host.others.load(Ordering::Relaxed)
+                    + i64::try_from(host.pool.load(Ordering::Relaxed)).unwrap();
+                Ok((host.free.load(Ordering::Relaxed) - used) * MIB as i64)
+            })
+        }
     }
 
     /// A pool of 1 MiB segments, 100 MiB its floor and 1000 its limit, on
@@ -743,6 +757,10 @@ mod tests {
         Yield::new(0.5).unwrap()
     }
 
+    fn tick(steer: &mut Steer, pool: &mut Pool) -> Vec<Signal> {
+        pressed(steer, pool, 0.0)
+    }
+
     fn pressed(steer: &mut Steer, pool: &mut Pool, pressure: f64) -> Vec<Signal> {
         let mut signals = Vec::new();
         steer.turn(pool, pressure, &mut |signal| signals.push(signal));
@@ -751,7 +769,7 @@ mod tests {
 
     #[test]
     fn a_yielding_pool_follows_the_rule_and_sheds_through_tier_pressure() {
-        let host = Host::new();
+        let host = Host::new(5000);
         let mut pool = Pool::on(&host, 1000, ELASTIC);
         pool.pinned = 700;
         let mut steer = Steer::new(&pool, half());
@@ -778,4 +796,460 @@ mod tests {
         assert_eq!(pool.segments(), 1000);
     }
 
+    #[test]
+    fn a_pool_that_does_not_yield_keeps_its_budget_under_pressure() {
+        let host = Host::new(5000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        let mut steer = Steer::new(&pool, Yield::NONE);
+        assert!(pressed(&mut steer, &mut pool, 1.0).is_empty());
+        assert_eq!(pool.segments(), 1000);
+    }
+
+    /// The pressure from the system's source, changed mid-run (the file
+    /// source a test writes): the pool gives back down to the rule's target
+    /// as it rises, the crossing named once, and takes its budget back as
+    /// it falls.
+    #[test]
+    fn a_pool_follows_a_pressure_source_changed_mid_run() {
+        let dir = std::env::temp_dir().join(format!("pie-govfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressure");
+        std::fs::write(&path, "0").unwrap();
+        let source = super::super::Source::File(path.clone());
+        let mut reader = super::super::Reader::new(source.clone());
+        let host = Host::new(5000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        let mut steer = Steer::new(&pool, Yield::new(1.0).unwrap()).with_source(source.name());
+        let turn = |steer: &mut Steer, pool: &mut Pool, reader: &mut super::super::Reader| {
+            let pressure = reader.read();
+            let mut signals = Vec::new();
+            steer.turn(pool, pressure, &mut |signal| signals.push(signal));
+            signals
+        };
+        assert!(turn(&mut steer, &mut pool, &mut reader).is_empty());
+        assert_eq!(pool.segments(), 1000);
+        assert_eq!(steer.under(), Some(false));
+        // An app takes memory: the system reads 0.62.
+        std::fs::write(&path, "0.62").unwrap();
+        turn(&mut steer, &mut pool, &mut reader);
+        // 100 + 900 * 0.38 = 442.
+        assert_eq!(pool.segments(), 442, "given back to the target");
+        assert_eq!(steer.under(), Some(true), "the crossing, named once");
+        // The pool holds what nothing can evacuate: tier pressure, then
+        // eased once the policy freed it.
+        std::fs::write(&path, "1").unwrap();
+        pool.pinned = 300;
+        assert_eq!(
+            turn(&mut steer, &mut pool, &mut reader),
+            vec![Signal::TierPressure {
+                held_bytes: 300 * MIB,
+                target_bytes: 100 * MIB,
+            }]
+        );
+        assert_eq!(steer.under(), Some(true));
+        pool.pinned = 0;
+        assert_eq!(turn(&mut steer, &mut pool, &mut reader), vec![Signal::Eased]);
+        assert_eq!(pool.segments(), 100);
+        // The app goes: the budget comes back.
+        std::fs::write(&path, "0").unwrap();
+        turn(&mut steer, &mut pool, &mut reader);
+        assert_eq!(pool.segments(), 1000);
+        assert_eq!(steer.under(), Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What each engine states of its device pool decides whether `yield`
+    /// moves it: XLA's one PJRT buffer and wgpu's pool are laid whole at
+    /// load (`Growth::Fixed`, engine-xla's chunk facts and engine-wgpu's
+    /// `Backend::RESIZES_POOL`), so yield is a no-op there; the others
+    /// commit and release segments.
+    #[test]
+    fn yield_moves_only_a_pool_its_engine_states_can_move() {
+        for (engine, growth) in [
+            ("cuda", ELASTIC),
+            ("rocm", ELASTIC),
+            ("metal", ELASTIC),
+            ("vulkan", ELASTIC),
+            ("wgpu", Growth::Fixed),
+            ("xla", Growth::Fixed),
+        ] {
+            let host = Host::new(5000);
+            let mut pool = Pool::on(&host, 1000, growth);
+            let mut steer = Steer::new(&pool, Yield::new(1.0).unwrap());
+            assert!(pressed(&mut steer, &mut pool, 1.0).is_empty(), "{engine}");
+            let moves = growth != Growth::Fixed;
+            assert_eq!(steer.governor().yields().yields(), moves, "{engine}");
+            let want = if moves { 100 } else { 1000 };
+            assert_eq!(pool.segments(), want, "{engine}: full yield at full pressure");
+        }
+    }
+
+    #[test]
+    fn a_refusal_reads_as_full_pressure() {
+        struct Refusing(Pool, bool);
+        impl PoolTarget for Refusing {
+            fn segment_bytes(&self) -> u64 {
+                self.0.segment_bytes()
+            }
+            fn floor(&self) -> u64 {
+                self.0.floor()
+            }
+            fn hard_limit(&self) -> u64 {
+                self.0.hard_limit()
+            }
+            fn held(&self) -> u64 {
+                self.0.held()
+            }
+            fn growth(&self) -> Growth {
+                self.0.growth()
+            }
+            fn retarget(&mut self, segments: u64) -> Retarget {
+                self.0.retarget(segments)
+            }
+            fn take_refused(&mut self) -> bool {
+                std::mem::take(&mut self.1)
+            }
+        }
+        let host = Host::new(5000);
+        let mut pool = Refusing(Pool::on(&host, 1000, ELASTIC), true);
+        let mut steer = Steer::new(&pool, Yield::new(1.0).unwrap());
+        steer.turn(&mut pool, 0.0, &mut |_| {});
+        assert_eq!(pool.0.segments(), 100, "the floor");
+        steer.turn(&mut pool, 0.0, &mut |_| {});
+        assert_eq!(pool.0.segments(), 1000, "one refusal is one reading");
+    }
+
+    #[test]
+    fn the_ceiling_follows_a_falling_and_recovering_room() {
+        let host = Host::new(1200);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        let mut steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling(), Some(1000 * MIB));
+        assert_eq!(pool.segments(), 1000);
+        // Another app takes 800 MiB: the host is 600 short, and the pool
+        // gives it back on the next tick.
+        host.others.store(800, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling(), Some(400 * MIB));
+        assert_eq!(pool.segments(), 400);
+        // And past the floor, never under it.
+        host.others.store(1150, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(pool.segments(), 100);
+        // The app goes: the room comes back and the pool grows into it.
+        host.others.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            tick(&mut steer, &mut pool);
+        }
+        assert_eq!(steer.ceiling(), Some(1000 * MIB));
+        assert_eq!(pool.segments(), 1000);
+    }
+
+    #[test]
+    fn the_log_names_a_change_of_regime() {
+        let host = Host::new(900);
+        let mut pool = Pool::on(&host, 600, ELASTIC);
+        let mut steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.regime(), Some(Regime::Room));
+        // Another app takes 500 MiB: the ceiling falls under what is held.
+        host.others.store(500, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.regime(), Some(Regime::Short));
+        // It goes: room again.
+        host.others.store(0, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.regime(), Some(Regime::Room));
+        // Nearly all of it is taken: the pool is left its floor.
+        host.others.store(880, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.regime(), Some(Regime::AtFloor));
+        // More room than the pool may ever hold: its hard limit.
+        let roomy = Host::new(5000);
+        let mut big = Pool::on(&roomy, 600, ELASTIC);
+        let mut held = Steer::new(&big, half())
+            .with_room(&big, Some(PoolRoom::alone(roomy.reader())));
+        tick(&mut held, &mut big);
+        assert_eq!(held.regime(), Some(Regime::AtLimit));
+    }
+
+    #[test]
+    fn the_pool_reaching_and_leaving_its_hard_limit_is_an_edge_each() {
+        let host = Host::new(2000);
+        let mut pool = Pool::on(&host, 300, ELASTIC);
+        let mut steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        // The room lets it take its whole budget on its first tick, which
+        // is named once.
+        tick(&mut steer, &mut pool);
+        assert_eq!(pool.segments(), 1000);
+        assert_eq!(steer.at_limit(), Some(true));
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.at_limit(), Some(true));
+        // Another app takes most of the host: the pool gives some back.
+        host.others.store(1500, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert!(pool.segments() < 1000);
+        assert_eq!(steer.at_limit(), Some(false));
+    }
+
+    #[test]
+    fn regimes_are_read_against_the_floor_the_limit_and_what_is_held() {
+        let limits = Limits {
+            floor: 100,
+            hard_limit: 1000,
+            segment_bytes: 1,
+        };
+        assert_eq!(Regime::of(100, 500, &limits), Regime::AtFloor);
+        assert_eq!(Regime::of(1000, 500, &limits), Regime::AtLimit);
+        assert_eq!(Regime::of(400, 500, &limits), Regime::Short);
+        assert_eq!(Regime::of(600, 500, &limits), Regime::Room);
+        assert_eq!(Regime::of(500, 500, &limits), Regime::Room);
+    }
+
+    /// Two pools on one host: a reader that counts what both hold.
+    fn two_pools(
+        free: i64,
+        a: u64,
+        b: u64,
+    ) -> (Arc<HostShare>, Arc<Host>, Arc<Host>, Arc<AtomicI64>) {
+        let (ha, hb) = (Host::new(0), Host::new(0));
+        ha.pool.store(a, Ordering::Relaxed);
+        hb.pool.store(b, Ordering::Relaxed);
+        let free = Arc::new(AtomicI64::new(free));
+        let (ra, rb, rf) = (ha.clone(), hb.clone(), free.clone());
+        let reader: ::engine::HostRoom = Arc::new(move || {
+            let held =
+                i64::try_from(ra.pool.load(Ordering::Relaxed) + rb.pool.load(Ordering::Relaxed))
+                    .unwrap();
+            Ok((rf.load(Ordering::Relaxed) - held) * MIB as i64)
+        });
+        (HostShare::new(reader), ha, hb, free)
+    }
+
+    #[test]
+    fn pools_on_one_host_are_granted_its_room_once() {
+        let (share, ha, hb, _free) = two_pools(1400, 500, 500);
+        let (mut a, mut b) = (Pool::on(&ha, 500, ELASTIC), Pool::on(&hb, 500, ELASTIC));
+        let dedicated = |pool: &Pool| {
+            Steer::new(pool, Yield::NONE).with_room(pool, Some(share.pool()))
+        };
+        let (mut sa, mut sb) = (dedicated(&a), dedicated(&b));
+        tick(&mut sa, &mut a);
+        tick(&mut sb, &mut b);
+        // 400 MiB of room: the first pool is granted it, the second none of
+        // it, not 400 each.
+        assert_eq!(sa.ceiling(), Some(900 * MIB));
+        assert_eq!(sb.ceiling(), Some(500 * MIB));
+        let ceilings = sa.ceiling().unwrap() + sb.ceiling().unwrap();
+        assert!(ceilings <= 1400 * MIB, "together within the host");
+    }
+
+    #[test]
+    fn pools_on_one_host_give_back_its_shortfall_once() {
+        let (share, ha, hb, free) = two_pools(1000, 500, 500);
+        let (mut a, mut b) = (Pool::on(&ha, 500, ELASTIC), Pool::on(&hb, 500, ELASTIC));
+        let (mut sa, mut sb) = (
+            Steer::new(&a, half()).with_room(&a, Some(share.pool())),
+            Steer::new(&b, half()).with_room(&b, Some(share.pool())),
+        );
+        tick(&mut sa, &mut a);
+        tick(&mut sb, &mut b);
+        // The host loses 300 MiB to another app: 300 short, given back once.
+        free.store(700, Ordering::Relaxed);
+        tick(&mut sa, &mut a);
+        tick(&mut sb, &mut b);
+        assert_eq!(a.segments() + b.segments(), 700, "300 given back, not 600");
+    }
+
+    #[test]
+    fn a_pool_that_goes_leaves_its_grant() {
+        let (share, _ha, _hb, _free) = two_pools(1400, 500, 500);
+        let (a, b) = (share.pool(), share.pool());
+        // The first is granted all 400 MiB of room and has not taken it.
+        assert_eq!(
+            a.grant(500 * MIB, |room| 500 * MIB + room.unwrap() as u64),
+            900 * MIB
+        );
+        assert_eq!(
+            b.grant(500 * MIB, |room| 500 * MIB + room.unwrap().max(0) as u64),
+            500 * MIB
+        );
+        // It goes: what it was granted is the host's again.
+        drop(a);
+        assert_eq!(
+            b.grant(500 * MIB, |room| 500 * MIB + room.unwrap().max(0) as u64),
+            900 * MIB
+        );
+    }
+
+    #[test]
+    fn a_shrink_without_room_sheds_through_tier_pressure() {
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        pool.pinned = 700;
+        let mut steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        tick(&mut steer, &mut pool);
+        host.others.store(500, Ordering::Relaxed);
+        let signals = tick(&mut steer, &mut pool);
+        assert_eq!(
+            signals,
+            vec![Signal::TierPressure {
+                held_bytes: 700 * MIB,
+                target_bytes: 500 * MIB,
+            }]
+        );
+        // What it holds stays: nothing was dropped, nothing failed.
+        assert_eq!(pool.segments(), 700);
+        // Once the stores have shed, the shrink lands and the pressure eases.
+        pool.pinned = 0;
+        assert_eq!(tick(&mut steer, &mut pool), vec![Signal::Eased]);
+        assert_eq!(pool.segments(), 500);
+    }
+
+    /// One episode end to end: the host's room drops below what the pool
+    /// holds, the governor raises tier pressure for exactly the shortfall,
+    /// the stores shed idle cache in retention order (no runtime responder
+    /// chooses), the shrink lands with no retarget failing, and once the
+    /// room recovers the pool grows back to its limit with nothing raised.
+    #[test]
+    fn a_room_under_the_pool_sheds_and_recovers() {
+        use crate::governor::steered::short_bytes;
+
+        let live: u64 = 850;
+
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        pool.pinned = live;
+        let mut steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        assert!(tick(&mut steer, &mut pool).is_empty());
+        assert_eq!(steer.ceiling(), Some(1000 * MIB));
+
+        // Another app takes 500 MiB: the ceiling falls to 500, under the
+        // 850 the live sets hold, so the pool evacuates to them and asks.
+        host.others.store(500, Ordering::Relaxed);
+        let signals = tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling(), Some(500 * MIB));
+        assert_eq!(
+            signals,
+            vec![Signal::TierPressure {
+                held_bytes: live * MIB,
+                target_bytes: 500 * MIB,
+            }]
+        );
+        assert_eq!(pool.segments(), live, "nothing live was dropped");
+        let short = short_bytes(signals[0]);
+        assert_eq!(short, 350 * MIB);
+
+        // The same reading again says the same shortfall: it stands.
+        assert_eq!(tick(&mut steer, &mut pool), signals);
+
+        // The stores let idle cache go for it (`ResidencyPlanner::yield_idle`);
+        // the shrink lands and the pressure eases.
+        pool.pinned = live - short / MIB;
+        assert_eq!(tick(&mut steer, &mut pool), vec![Signal::Eased]);
+        assert_eq!(pool.segments(), 500);
+
+        // The app goes: the room comes back and the pool grows into it,
+        // raising nothing on the way.
+        host.others.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            assert!(tick(&mut steer, &mut pool).is_empty());
+        }
+        assert_eq!(steer.ceiling(), Some(1000 * MIB));
+        assert_eq!(pool.segments(), 1000);
+    }
+
+    #[test]
+    fn a_dedicated_pool_is_held_within_the_room_too() {
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        let mut steer = Steer::new(&pool, Yield::NONE)
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        tick(&mut steer, &mut pool);
+        assert_eq!(pool.segments(), 1000);
+        host.others.store(300, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(pool.segments(), 700);
+        host.others.store(0, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(pool.segments(), 1000);
+    }
+
+    #[test]
+    fn a_dedicated_pool_with_no_room_reader_keeps_its_size() {
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 1000, ELASTIC);
+        let mut steer = Steer::new(&pool, Yield::NONE).with_room(&pool, None);
+        host.others.store(600, Ordering::Relaxed);
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling(), None);
+        assert_eq!(pool.segments(), 1000);
+    }
+
+    #[test]
+    fn an_unreadable_room_holds_what_the_pool_has_and_grows_nothing() {
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 600, ELASTIC);
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = host.reader();
+        let flag = broken.clone();
+        let flaky: ::engine::HostRoom = Arc::new(move || {
+            if flag.load(Ordering::Relaxed) {
+                Err("no /proc/meminfo".to_string())
+            } else {
+                reader()
+            }
+        });
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(flaky)));
+        // Another app holds 300: the pool may hold 700, and grows into it.
+        host.others.store(300, Ordering::Relaxed);
+        for _ in 0..4 {
+            tick(&mut steer, &mut pool);
+        }
+        assert_eq!(pool.segments(), 700);
+        // The reading fails: the pool keeps its 700, not its floor, and
+        // grows no further though the app goes.
+        broken.store(true, Ordering::Relaxed);
+        host.others.store(0, Ordering::Relaxed);
+        for _ in 0..4 {
+            tick(&mut steer, &mut pool);
+        }
+        assert_eq!(steer.regime(), Some(Regime::Unreadable));
+        assert_eq!(steer.ceiling(), Some(700 * MIB));
+        assert_eq!(pool.segments(), 700);
+        // It reads again: the room is there and the pool grows into it.
+        broken.store(false, Ordering::Relaxed);
+        for _ in 0..4 {
+            tick(&mut steer, &mut pool);
+        }
+        assert_eq!(pool.segments(), 1000);
+    }
+
+    #[test]
+    fn an_unreadable_first_reading_holds_what_the_pool_has() {
+        let host = Host::new(1000);
+        let mut pool = Pool::on(&host, 600, ELASTIC);
+        let unreadable: ::engine::HostRoom = Arc::new(|| Err("no /proc/meminfo".to_string()));
+        let mut steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(unreadable)));
+        tick(&mut steer, &mut pool);
+        assert_eq!(steer.ceiling(), Some(600 * MIB));
+        assert_eq!(pool.segments(), 600);
+    }
+
+    #[test]
+    fn a_fixed_pool_takes_no_room_reader() {
+        let host = Host::new(1000);
+        let pool = Pool::on(&host, 1000, Growth::Fixed);
+        let steer = Steer::new(&pool, half())
+            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        assert!(!steer.has_room());
+    }
 }

@@ -892,3 +892,383 @@ pub(crate) mod testing {
         port.host.stop();
     }
 }
+
+/// What the port tells its policies, read off the `test-watch` policy's
+/// note, and how the host takes a faulting policy.
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::policy::{Arrival, Resting};
+
+    fn props(value: serde_json::Value) -> Props {
+        serde_json::from_value(value).unwrap()
+    }
+
+    const NO_CACHE: Cache = Cache {
+        owns: |_| false,
+        list: || (Vec::new(), 16),
+        rooms: || [(100, 40), (400, 300), (0, 0)],
+        resident: |_| None,
+    };
+
+    fn manual() -> Host {
+        Host::new(Config {
+            supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            manual: true,
+            ..Config::default()
+        })
+    }
+
+    fn component(name: &str) -> &'static [u8] {
+        builtins::policy(name)
+            .unwrap_or_else(|| panic!("no built-in policy {name}"))
+            .component
+    }
+
+    /// A port whose rounds a test runs itself, `test-watch` loaded.
+    fn port(cache: Cache) -> Port {
+        let host = manual();
+        host.load("test-watch", component("test-watch")).unwrap();
+        let mut port = Port {
+            host,
+            cache,
+            procs: HashMap::new(),
+            retained: HashMap::new(),
+            handles: HashMap::new(),
+            sessions: HashMap::new(),
+            put: HashSet::new(),
+            offloaded: HashMap::new(),
+            loaded: ("test-watch".to_string(), Vec::new()),
+            version: 0,
+        };
+        seen(&mut port);
+        port
+    }
+
+    /// What the policy saw in a round run now, a line each.
+    fn seen(port: &mut Port) -> Vec<String> {
+        port.put_working_sets();
+        assert!(port.host.run(true), "{:?}", port.host.stats().last_fault);
+        let notes = port.host.poll_delta().notes;
+        let Some((.., Some(Value::Text(text)))) =
+            notes.into_iter().find(|(_, _, name, _)| name == "seen")
+        else {
+            panic!("the policy notes what it saw");
+        };
+        text.lines().map(String::from).collect()
+    }
+
+    fn has(seen: &[String], line: &str) -> bool {
+        seen.iter().any(|l| l == line)
+    }
+
+    fn arrive(port: &mut Port, tenant: &str, session: Option<&str>) -> ProcessId {
+        let pid = ProcessId::new_v4();
+        port.apply(Event::Arrived(
+            pid,
+            Arrival {
+                tenant: tenant.into(),
+                session: session.map(Into::into),
+                ..Arrival::default()
+            },
+        ));
+        pid
+    }
+
+    fn process(id: ProcessId, seen: &[String]) -> Option<String> {
+        seen.iter()
+            .find_map(|l| l.strip_prefix(&format!("process {id} ")))
+            .map(String::from)
+    }
+
+    #[test]
+    fn a_process_arrives_with_its_props_and_its_changes_are_edges() {
+        let mut port = port(NO_CACHE);
+        let pid = ProcessId::new_v4();
+        port.apply(Event::Arrived(
+            pid,
+            Arrival {
+                tenant: "t".into(),
+                props: props(json!({"priority": 1})),
+                ..Arrival::default()
+            },
+        ));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("arrived {pid}")), "{saw:?}");
+        assert!(process(pid, &saw).unwrap().ends_with("priority=Value::Int(1)"), "{saw:?}");
+
+        port.apply(Event::PropsChanged(
+            pid,
+            props(json!({"priority": 7})),
+            vec!["priority".into()],
+        ));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("hint process:{pid} priority")), "{saw:?}");
+        assert!(process(pid, &saw).unwrap().ends_with("priority=Value::Int(7)"), "{saw:?}");
+        assert!(!saw.iter().any(|l| l.contains("tier")));
+
+        // A process the policy never heard of has no props to change.
+        port.apply(Event::PropsChanged(
+            ProcessId::new_v4(),
+            props(json!({"a": 1})),
+            vec!["a".into()],
+        ));
+        let saw = seen(&mut port);
+        assert!(!saw.iter().any(|l| l.starts_with("hint ")), "{saw:?}");
+    }
+
+    #[test]
+    fn a_session_is_scoped_by_its_tenant() {
+        let mut port = port(NO_CACHE);
+        let a1 = arrive(&mut port, "a", Some("chat"));
+        arrive(&mut port, "a", Some("chat"));
+        let b1 = arrive(&mut port, "b", Some("chat"));
+        let lone = arrive(&mut port, "a", None);
+        let saw = seen(&mut port);
+        let of = |id| process(id, &saw).unwrap();
+        assert!(of(a1).starts_with("session=a/chat tenant=a "), "{saw:?}");
+        assert!(of(b1).starts_with("session=b/chat tenant=b "), "{saw:?}");
+        assert!(of(lone).starts_with("session= tenant=a "), "{saw:?}");
+    }
+
+    #[test]
+    fn a_session_s_props_change_between_its_processes_and_it_closes() {
+        let mut port = port(NO_CACHE);
+        let session = || "t/chat".to_string();
+        let hints = |saw: &[String]| -> Vec<String> {
+            let mut names: Vec<_> = saw
+                .iter()
+                .filter_map(|l| l.strip_prefix("hint session:t/chat "))
+                .map(String::from)
+                .collect();
+            names.sort();
+            names
+        };
+        port.apply(Event::SessionProps(
+            session(),
+            props(json!({"tool-eta-ms": 5000, "tool": "grep"})),
+        ));
+        let saw = seen(&mut port);
+        assert_eq!(hints(&saw), ["tool", "tool-eta-ms"]);
+        assert!(has(&saw, "has session:t/chat tool-eta-ms=Value::Int(5000)"), "{saw:?}");
+
+        port.apply(Event::SessionProps(session(), props(json!({"tool": "grep"}))));
+        assert!(hints(&seen(&mut port)).is_empty(), "nothing changed");
+        port.apply(Event::SessionProps(session(), props(json!({"tool": null}))));
+        assert_eq!(hints(&seen(&mut port)), ["tool"]);
+
+        port.apply(Event::SessionClosed(session()));
+        let saw = seen(&mut port);
+        assert!(has(&saw, "closed t/chat"), "{saw:?}");
+        assert!(has(&saw, "has session:t/chat tool-eta-ms=none"), "{saw:?}");
+    }
+
+    #[test]
+    fn the_call_about_a_process_exit_still_reads_it() {
+        let mut port = port(NO_CACHE);
+        let id = arrive(&mut port, "t", None);
+        seen(&mut port);
+        port.apply(Event::Exited(id, Outcome::Completed));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("exited {id}")), "{saw:?}");
+        let of = process(id, &saw).expect("the call about its exit reads it");
+        assert!(of.contains("tenant=t ") && of.contains("state=ProcessState::Exited"), "{of}");
+        assert_eq!(process(id, &seen(&mut port)), None, "the next call does not");
+    }
+
+    #[test]
+    fn a_resting_handle_is_a_working_set_the_policy_reads_until_it_is_lent() {
+        let mut port = port(NO_CACHE);
+        let id = ProcessId::new_v4();
+        let rest = Event::HandleRested(
+            id,
+            Resting {
+                tenant: "t".into(),
+                session: Some("chat".into()),
+                props: props(json!({"pico/frozen-tokens": 512})),
+                tokens: 640,
+                folded: 512,
+            },
+        );
+        port.apply(rest.clone());
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("retained {id}")), "{saw:?}");
+        let set =
+            format!("working-set {id} owner= session=chat tokens=640 folded=Value::Int(512)");
+        assert!(has(&saw, &set), "{saw:?}");
+        let frozen = format!("has working-set:{id} pico/frozen-tokens=Value::Int(512)");
+        assert!(has(&saw, &frozen), "{saw:?}");
+
+        port.apply(Event::HandleProps(id, props(json!({"a": 1})), vec!["a".into()]));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("hint working-set:{id} a")), "{saw:?}");
+        assert!(has(&saw, &format!("has working-set:{id} a=Value::Int(1)")), "{saw:?}");
+
+        // Lent to a process, it is out of the policy's reach.
+        port.apply(Event::HandleLent(id));
+        assert!(!has(&seen(&mut port), &set));
+        port.apply(rest);
+        assert!(has(&seen(&mut port), &set), "at rest again");
+        port.apply(Event::HandleGone(id, By::Client));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("evicted {id} by By::Client")), "{saw:?}");
+        assert!(!has(&saw, &set), "{saw:?}");
+    }
+
+    static CACHED: std::sync::Mutex<Vec<(ProcessId, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    const TEST_CACHE: Cache = Cache {
+        owns: |owner| CACHED.lock().unwrap().iter().any(|(o, _)| *o == owner),
+        list: || {
+            let now = crate::rt::Instant::now();
+            let sets = CACHED
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&(owner, pages)| CachedWorkingSet {
+                    owner,
+                    entries: pages as usize,
+                    pages,
+                    last_use: now,
+                    on_device: true,
+                    on_host: false,
+                })
+                .collect();
+            (sets, 16)
+        },
+        rooms: || [(100, 40), (400, 300), (0, 0)],
+        resident: |_| None,
+    };
+
+    #[test]
+    fn a_working_set_is_retained_when_its_owner_exits_until_its_last_entry_goes() {
+        let mut port = port(TEST_CACHE);
+        let gone = arrive(&mut port, "t", Some("chat"));
+        let live = arrive(&mut port, "t", None);
+        let uncached = arrive(&mut port, "t", None);
+        port.apply(Event::Cached(gone, 32));
+        port.apply(Event::Cached(gone, 0));
+        assert_eq!(port.procs[&gone].cached_tokens, Some(32), "what its fires mapped in");
+        assert_eq!(port.procs[&live].cached_tokens, None, "it never looked");
+        CACHED.lock().unwrap().extend([(gone, 4), (live, 2)]);
+
+        port.apply(Event::Exited(gone, Outcome::Completed));
+        port.apply(Event::Exited(uncached, Outcome::Completed));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("exited {gone}")) && has(&saw, &format!("retained {gone}")));
+        assert!(has(&saw, &format!("exited {uncached}")));
+        assert!(!has(&saw, &format!("retained {uncached}")), "nothing of it outlives it");
+        let set = |id, owner: &str, session, tokens| {
+            format!("working-set {id} owner={owner} session={session} tokens={tokens} folded=none")
+        };
+        assert!(has(&saw, &set(gone, "", "t/chat", 64)), "{saw:?}");
+        assert!(has(&saw, &set(live, &live.to_string(), "", 32)), "{saw:?}");
+        assert!(!saw.iter().any(|l| l.starts_with(&format!("working-set {uncached}"))));
+
+        CACHED.lock().unwrap().retain(|(owner, _)| *owner != live);
+        port.apply(Event::CacheEmptied(live, By::Client));
+        let saw = seen(&mut port);
+        assert!(
+            !saw.iter().any(|l| l.starts_with("evicted ")),
+            "a live working set ends with its owner: {saw:?}"
+        );
+        CACHED.lock().unwrap().retain(|(owner, _)| *owner != gone);
+        port.apply(Event::CacheEmptied(gone, By::Host));
+        let saw = seen(&mut port);
+        assert!(has(&saw, &format!("evicted {gone} by By::Host")), "{saw:?}");
+        assert!(!saw.iter().any(|l| l.starts_with("working-set ")), "{saw:?}");
+        CACHED.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn a_client_prop_becomes_the_contracts_value() {
+        let mut got = hints(&props(json!({
+            "flag": true, "priority": 3, "weight": 0.5, "tier": "gold", "tags": ["a", "b"],
+            "gone": null,
+        })));
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = [
+            ("flag", Value::Boolean(true)),
+            ("priority", Value::Int(3)),
+            ("tags", Value::Text(r#"["a","b"]"#.into())),
+            ("tier", Value::Text("gold".into())),
+            ("weight", Value::Float(0.5)),
+        ]
+        .map(|(name, value)| (name.to_string(), value));
+        assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+    }
+
+    /// Every built-in is a worker's or a cluster's: a worker host loads the
+    /// first, which write no placement, replication or share column, and
+    /// refuses the second by name.
+    #[test]
+    fn every_built_in_policy_loads_and_imports_no_cluster_writes() {
+        use plex_host::tables::COLUMNS;
+        let mut loaded = Vec::new();
+        for builtin in builtins::policies() {
+            match manual().load(builtin.name, builtin.component) {
+                Ok(imports) => {
+                    let writes: Vec<_> = imports
+                        .iter()
+                        .filter(|i| COLUMNS.contains(&i.as_str()))
+                        .collect();
+                    assert!(
+                        writes.iter().all(|i| SUPPORTED.contains(&i.as_str())),
+                        "{}: {writes:?}",
+                        builtin.name
+                    );
+                    loaded.push(builtin.name);
+                }
+                Err(why) => {
+                    assert!(why.contains("which this host cannot enact"), "{}: {why}", builtin.name);
+                    let mut columns = COLUMNS.map(String::from).to_vec();
+                    columns.retain(|c| !SUPPORTED.contains(&c.as_str()));
+                    let cluster = Host::new(Config {
+                        supported: columns,
+                        manual: true,
+                        ..Config::default()
+                    });
+                    cluster
+                        .load(builtin.name, builtin.component)
+                        .unwrap_or_else(|why| panic!("{}: {why}", builtin.name));
+                }
+            }
+        }
+        for worker in ["default", "noop"] {
+            assert!(loaded.contains(&worker), "{worker} is a worker's: {loaded:?}");
+        }
+        assert!(!loaded.contains(&"default-cluster"), "{loaded:?}");
+    }
+
+    #[test]
+    fn a_trap_discards_the_call_and_the_program_runs_again() {
+        let host = manual();
+        host.load("test-trap", component("test-trap")).unwrap();
+        for calls in 1..=2 {
+            host.run(true);
+            let stats = host.stats();
+            assert_eq!((stats.calls, stats.traps, stats.commits), (calls, calls, 0));
+            let default = host.poll_delta().schedule_priority.default;
+            assert_eq!(default, None, "its row is discarded");
+        }
+    }
+
+    #[test]
+    fn an_overrun_is_cut_off_at_the_deadline() {
+        let host = manual();
+        host.load("test-spin", component("test-spin")).unwrap();
+        let deadline = Duration::from_millis(Config::default().deadline_ms);
+        for calls in 1..=2 {
+            let started = std::time::Instant::now();
+            host.run(true);
+            let spent = started.elapsed();
+            let stats = host.stats();
+            assert_eq!((stats.calls, stats.deadlines, stats.commits), (calls, calls, 0));
+            assert!(spent < deadline * 20, "cut off in {spent:?}");
+            let default = host.poll_delta().schedule_priority.default;
+            assert_eq!(default, None, "its row is discarded");
+        }
+    }
+}

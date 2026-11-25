@@ -14,7 +14,9 @@ members = [
     "test-pause",
     "test-route",
     "test-share",
+    "test-spin",
     "test-trap",
+    "test-watch",
 ]
 
 [profile.release]
