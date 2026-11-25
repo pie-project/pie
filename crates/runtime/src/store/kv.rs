@@ -3648,6 +3648,12 @@ impl KvStore {
         {
             return pages;
         }
+        self.reclaimable_cache_pages_now()
+    }
+
+    /// [`Self::reclaimable_cache_pages`] counted now, however recent the
+    /// last count.
+    pub fn reclaimable_cache_pages_now(&self) -> u32 {
         let began = Instant::now();
         let pages = self.table.unused_cache_lease_pages();
         self.reclaimable.set(Some((began, began.elapsed(), pages)));
