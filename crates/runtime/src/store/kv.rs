@@ -1609,10 +1609,10 @@ impl KvStore {
         self.prepare_demote_where(room, keys, false)
     }
 
-    /// The tiers entry `id`'s KV may sit on.
+    /// The tiers idle cache entry `id`'s KV may sit on.
     fn tiers_of(&self, id: u64, keys: &impl Keys) -> u8 {
         self.cache.get(&id).map_or(retention::ALL_TIERS, |entry| {
-            keys.tiers_at(entry.owner, self.key_token(entry.path.pages))
+            keys.cache_tiers_at(entry.owner, self.key_token(entry.path.pages))
         })
     }
 

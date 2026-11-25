@@ -2494,9 +2494,12 @@ fn run_policy(name: &str, events: Vec<crate::policy::Event>) {
 /// kept on the device alone: when the device wants its room it is dropped,
 /// not demoted, while a live process's set still suspends to the host; a
 /// resting handle's rows are the column's own. Its prompt outranks its
-/// decoded tail (A16). Under `noop` the same cache moves down a tier.
+/// decoded tail (A16). Under `noop`, which keys nothing, the same cache is
+/// dropped too, and a suspended set still moves to the host; a row naming
+/// the host keeps it demotable. So is the cache of an exit before the
+/// policy's round has keyed it.
 #[test]
-fn the_default_policy_drops_what_an_exit_left_and_noop_demotes_it() {
+fn the_default_policy_drops_what_an_exit_left_and_noop_drops_it_too() {
     use crate::policy::retention::{DEVICE, Installed, install};
     let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
     install(None);
@@ -2549,32 +2552,58 @@ fn the_default_policy_drops_what_an_exit_left_and_noop_demotes_it() {
     assert_eq!(store.commit_suspend(txn).unwrap(), 2);
     assert_eq!(store.host_swap_available(), 6, "on the host");
 
-    // `noop` writes no rows: the columns' own defaults demote the same
-    // cache to the host.
-    install(None);
-    let (exited, live) = (ProcessId::from_u128(0xdef4), ProcessId::from_u128(0xdef5));
-    run_policy("noop", an_exit_and_a_live_one(exited, live, 32, 16));
-    assert_eq!(Installed.tiers_at(Some(exited), 0), own, "no row: the column's own");
-    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdee));
-    let tokens = kept_and_gone(&mut store, 71, 3, exited);
-    let txn = store
-        .prepare_demote(8, Installed)
-        .unwrap()
-        .expect("every tier: it moves down");
+    // An exit no round has keyed yet: dropped, not copied.
+    let unkeyed = ProcessId::from_u128(0xdef6);
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdf0));
+    kept_and_gone(&mut store, 72, 3, unkeyed);
+    assert!(store.prepare_demote(8, Installed).unwrap().is_none(), "unkeyed: no copy");
+    assert_eq!(store.reclaim_cache(1, Installed), 3, "dropped");
+    assert_eq!(store.host_swap_available(), 8);
+
+    // A row naming the host keeps it demotable.
+    let hosted = ProcessId::from_u128(0xdef7);
+    crate::policy::retention::apply(crate::policy::retention::Change {
+        tiers: vec![((hosted, None), Some(DEVICE | crate::policy::retention::HOST))],
+        ..Default::default()
+    });
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdf1));
+    let tokens = kept_and_gone(&mut store, 73, 3, hosted);
+    let txn = store.prepare_demote(8, Installed).unwrap().expect("its row names the host");
     store.commit_suspend(txn).unwrap();
     store.retire_idle();
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert_eq!(store.host_swap_available(), 5, "kept on the host");
+
+    // `noop` writes no rows: the same cache is dropped; a suspended set
+    // still moves to the host.
+    install(None);
+    let (exited, live) = (ProcessId::from_u128(0xdef4), ProcessId::from_u128(0xdef5));
+    run_policy("noop", an_exit_and_a_live_one(exited, live, 32, 16));
+    assert_eq!(Installed.tiers_at(Some(live), 0), own, "a live set: the column's own");
+    let mut store = KvStore::new_with_swap(8, 8, 0, h(0xdee));
+    let tokens = kept_and_gone(&mut store, 71, 3, exited);
+    assert!(store.prepare_demote(8, Installed).unwrap().is_none(), "unkeyed: no copy");
+    assert_eq!(store.reclaim_cache(1, Installed), 3, "dropped");
+    assert_eq!(on_device(&mut store, &tokens), 0);
+    assert_eq!(store.host_swap_available(), 8, "nothing went to the host");
+    let ws = store.create_shared_working_set();
+    store.set_owner(ws, live).unwrap();
+    commit_fresh(&mut store, ws, 2, 1);
+    let txn = store
+        .prepare_suspend(&HashSet::from([ws]), Installed)
+        .unwrap()
+        .expect("a live set suspends");
+    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
+    assert_eq!(store.host_swap_available(), 6, "on the host");
     install(None);
 }
 
-/// No runtime responder answers tier pressure (A1): under `noop` (no rows,
-/// so every tier and least recently used among equals), a device full of
-/// idle cache is pressure the stores answer themselves. A process short of
-/// pages waits in the planner, which moves the idle cache down to the host
-/// (not dropped: its tiers name the host) and serves it there.
+/// No runtime responder answers tier pressure (A1): under `noop` (no rows),
+/// a device full of idle cache is pressure the stores answer themselves. A
+/// process short of pages waits in the planner, which drops the idle cache
+/// (no row keys it: nothing is copied down for it) and serves it.
 #[tokio::test(flavor = "current_thread")]
-async fn under_noop_device_pressure_moves_idle_cache_down_and_the_waiter_is_served() {
+async fn under_noop_device_pressure_drops_idle_cache_and_the_waiter_is_served() {
     use crate::planner::{Acquired, Demand, RegistryPool, ResidencyPlanner};
     use crate::scheduler::worker::test_lane::TestLane;
     use crate::store::registry;
@@ -2629,11 +2658,9 @@ async fn under_noop_device_pressure_moves_idle_cache_down_and_the_waiter_is_serv
     let granted = ask.await.unwrap().expect("no refusal");
     assert!(matches!(granted, Acquired::Granted(_)), "its pages granted");
     registry::with_kv_lock(&stores.kv, "test", |kv| {
-        assert!(kv.host_cache_pages() > 0, "the idle cache moved down to the host");
-        assert!(
-            kv.cached_working_sets().iter().any(|set| set.owner == owner),
-            "and is kept there, not dropped"
-        );
+        assert_eq!(kv.host_cache_pages(), 0, "nothing moved down to the host");
+        assert_eq!(kv.host_swap_available(), 8);
+        let _ = owner;
     });
 }
 

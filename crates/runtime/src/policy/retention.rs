@@ -87,6 +87,14 @@ impl Table {
     /// The tiers `owner`'s KV at token `at` may sit on: every row covering
     /// it, together (the most protective), else the default, else all.
     fn tiers_at(&self, owner: ProcessId, at: u64) -> u8 {
+        self.rows_at(owner, at)
+            .or(self.tiers_default)
+            .unwrap_or_else(own_tiers)
+    }
+
+    /// What the rows covering `owner`'s token `at` say, together; `None`
+    /// where none does.
+    fn rows_at(&self, owner: ProcessId, at: u64) -> Option<u8> {
         self.tiers
             .get(&crate::policy::schedule::plex_id(owner))
             .and_then(|rows| {
@@ -95,8 +103,6 @@ impl Table {
                     .map(|&(_, tiers)| tiers)
                     .reduce(|a, b| a | b)
             })
-            .or(self.tiers_default)
-            .unwrap_or_else(own_tiers)
     }
 
     fn key_at(&self, owner: ProcessId, at: u64) -> Option<i64> {
@@ -134,6 +140,13 @@ pub trait Keys {
     /// any may have.
     fn changed_since(&self, _revision: u64) -> Option<Vec<ProcessId>> {
         None
+    }
+
+    /// The tiers idle cache of `owner`'s at token `at` may sit on: a row's
+    /// or the policy's default; with neither, the device alone
+    /// ([`Installed`]'s).
+    fn cache_tiers_at(&self, owner: Option<ProcessId>, at: u64) -> u8 {
+        self.tiers_at(owner, at)
     }
 
     /// The tiers `owner`'s KV at token `at` may sit on ([`ALL_TIERS`]
@@ -195,6 +208,23 @@ impl Keys for Installed {
             Some(owner) => table.tiers_at(owner, at),
             None => table.tiers_default.unwrap_or_else(own_tiers),
         }
+    }
+
+    /// Only what a policy keys is kept: idle cache no row and no default
+    /// covers (under `noop`, and from an exit until the policy's round) is
+    /// kept on the device alone, and dropped when its room is wanted, never
+    /// moved down. This departs from PLEX 1.1, whose tiers column defaults
+    /// to every tier the worker has; live, suspended and resting sets keep
+    /// that default ([`Self::tiers_at`]).
+    fn cache_tiers_at(&self, owner: Option<ProcessId>, at: u64) -> u8 {
+        let current = CURRENT.read();
+        let Some(table) = current.as_ref() else {
+            return DEVICE;
+        };
+        owner
+            .and_then(|owner| table.rows_at(owner, at))
+            .or(table.tiers_default)
+            .unwrap_or(DEVICE)
     }
 
     fn revision(&self) -> Option<u64> {
