@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod bundle;
 pub mod caps;
 pub mod channel;
 pub mod chunk;

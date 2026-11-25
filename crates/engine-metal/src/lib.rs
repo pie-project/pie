@@ -12,7 +12,6 @@ pub mod adapter;
 pub mod ane;
 pub mod api;
 pub mod arena;
-pub mod blob;
 pub mod boot;
 pub mod chip;
 pub mod chunks;
@@ -42,13 +41,9 @@ pub mod tune;
 pub mod weights;
 pub mod window;
 
-pub use adapter::{
-    Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site,
-    Source as AdapterSource,
-};
+pub use adapter::{Binding as AdapterBinding, Key as AdapterKey};
 pub use api::{ContractFor, DeviceBoot, Metal};
 pub use arena::Arena;
-pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
 pub use boot::open;
 pub use device::{Buffer, Context, Handles, Pipelines};
 pub use diag::Diagnostics;

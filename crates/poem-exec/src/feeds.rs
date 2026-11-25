@@ -514,6 +514,16 @@ pub fn classes_reading(
     classes
 }
 
+/// The classes that read a registered bank: the rows an adapter reaches,
+/// whatever form the adapter takes there.
+#[must_use]
+pub fn adapted_classes(trace: &Trace, compiled: &CompiledModel) -> ClassSet {
+    classes_reading(trace, compiled, |def| {
+        matches!(def, Def::Weight(param) if trace.params.get(*param as usize)
+            .is_some_and(|param| param.source == poem_ir::ParamSource::Registered))
+    })
+}
+
 /// The classes running a region that writes `value`, or an arm of it.
 #[must_use]
 pub fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {

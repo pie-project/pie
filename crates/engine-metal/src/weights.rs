@@ -14,7 +14,7 @@ use checkpoint::plan::{LoadPlan, StorageTarget, compile};
 use checkpoint::serving::{self, Stamp};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_metal::Tensor;
-use poem_ir::{Dtype, ParamSource, Trace};
+use poem_ir::{Dtype, ParamSource, Shard, Trace};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
@@ -50,7 +50,7 @@ pub struct Weights {
     places: Vec<Place>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Bank {
     offset: u64,
     adapters: u32,
@@ -58,6 +58,8 @@ struct Bank {
     rows: u64,
     cols: u64,
     elem: u64,
+    dtype: Dtype,
+    shard: Shard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +70,10 @@ pub struct BankSeat {
     pub rows: u64,
     pub cols: u64,
     pub elem: u64,
+    /// The element type the bank holds.
+    pub dtype: Dtype,
+    /// How the ranks cut the bank.
+    pub shard: Shard,
 }
 
 fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeMap<String, Bank> {
@@ -95,6 +101,8 @@ fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeM
                     rows,
                     cols,
                     elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
+                    dtype: param.dtype,
+                    shard: param.shard.clone(),
                 },
             )
         })
@@ -281,6 +289,9 @@ impl Weights {
         self.mapped.len()
     }
 
+    /// Writes slot `id` of every bank: each plane into the bank it names, and
+    /// zeros into the banks no plane names, so a slot never keeps what an
+    /// earlier adapter wrote into it.
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
         for plane in planes {
             let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
@@ -312,8 +323,14 @@ impl Weights {
                 });
             }
         }
+        for (name, bank) in &self.banks {
+            if id < bank.adapters && planes.iter().all(|plane| plane.bank != name) {
+                self.store
+                    .zero_span(bank.offset + u64::from(id) * bank.slot, bank.slot)?;
+            }
+        }
         for plane in planes {
-            let bank = self.banks[plane.bank];
+            let bank = &self.banks[plane.bank];
             let at = bank.offset + u64::from(id) * bank.slot;
             self.store.zero_span(at, bank.slot)?;
             self.store.write(at, plane.bytes)?;
@@ -395,6 +412,8 @@ impl Weights {
                 rows: bank.rows,
                 cols: bank.cols,
                 elem: bank.elem,
+                dtype: bank.dtype,
+                shard: bank.shard.clone(),
             })
             .collect()
     }
