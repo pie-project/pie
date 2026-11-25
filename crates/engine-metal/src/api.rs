@@ -299,6 +299,69 @@ fn told_within(budgets: &mut LoadBudgets, served: &Budget) {
 
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
 /// general figure, so a vocab-wide head carves only the rows a fire can read.
+/// The tokens a kv page of this engine holds.
+pub const PAGE_SIZE: u32 = 32;
+
+/// The widest fire this engine asks of its load
+/// ([`Engine::fire_ceiling`]).
+pub const FIRE_CEILING: engine::load::FireCeiling = engine::load::FireCeiling {
+    lanes: 512,
+    tokens: 10240,
+    page_size: Some(PAGE_SIZE),
+    context_binds: false,
+};
+
+/// The budgets a load at [`FIRE_CEILING`] and no adapter seats starts from.
+pub(crate) fn ceiling_budgets() -> LoadBudgets {
+    LoadBudgets {
+        max_lanes: FIRE_CEILING.lanes,
+        max_tokens: FIRE_CEILING.tokens,
+        page_size: PAGE_SIZE,
+        slots: 0,
+        ..LoadBudgets::default()
+    }
+}
+
+/// What `trace`'s weights take of device memory whatever the pool holds, and
+/// the streamable weights' whole bytes: every plane where nothing streams
+/// (`caches` false); else the planes the weight cache does not stream, and
+/// the floor it keeps of those it does.
+pub(crate) fn weight_demand(
+    trace: &Trace,
+    budgets: &LoadBudgets,
+    caches: bool,
+    held: bool,
+) -> crate::error::Result<(u64, u64)> {
+    let planes = crate::weights::plane_bytes(trace)?;
+    if !caches {
+        let whole = planes
+            .iter()
+            .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+            .sum();
+        return Ok((whole, 0));
+    }
+    let recipe = crate::chunks::recipe(
+        trace,
+        &poem_compiler::Budgets::of(bake_budgets(budgets, trace)),
+    )?;
+    Ok(crate::store::streamed::resident_demand(
+        trace,
+        &recipe,
+        &planes,
+        crate::experts::rows_streamed(held),
+    ))
+}
+
+/// What one sequence of `context` tokens takes of the pool.
+pub(crate) fn sequence_demand(
+    trace: &Trace,
+    page_size: u32,
+    context: u32,
+) -> crate::error::Result<u64> {
+    let paging = crate::store::kv::Paging::of(page_size, context, 1, 1)?;
+    Ok(crate::store::PoolDemand::of(trace, paging, None)?.bytes(u64::from(paging.pages_per_slot)))
+}
+
 fn bake_budgets(budgets: &LoadBudgets, trace: &Trace) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -512,12 +575,7 @@ impl Engine for Metal {
     /// what the device's resident weights leave room for; its kv page is
     /// its own (no planner derives one).
     fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
-        Some(engine::load::FireCeiling {
-            lanes: 512,
-            tokens: 10240,
-            page_size: Some(32),
-            context_binds: false,
-        })
+        Some(FIRE_CEILING)
     }
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
@@ -577,38 +635,16 @@ impl Engine for Metal {
         // (routed experts, token-id tables) only the floor the cache keeps
         // must: the rest leaves the device under streaming, and a held set
         // seats it in the pool.
-        let planes = crate::weights::plane_bytes(&trace).map_err(fault)?;
-        let (weights, streamable) = if caches {
-            let recipe = crate::chunks::recipe(
-                &trace,
-                &poem_compiler::Budgets::of(bake_budgets(&budgets, &trace)),
-            )
-            .map_err(fault)?;
-            crate::store::streamed::resident_demand(
-                &trace,
-                &recipe,
-                &planes,
-                crate::experts::rows_streamed(residency.weights_held),
-            )
-        } else {
-            (
-                planes
-                    .iter()
-                    .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
-                    .sum::<u64>(),
-                0,
-            )
-        };
+        let (weights, streamable) =
+            weight_demand(&trace, &budgets, caches, residency.weights_held).map_err(fault)?;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
-            .map_err(|error| fault(Fault::from(error)))?;
         // The pool the weights must leave room for: the stated budget,
         // or one sequence when the pool fills what is left.
         let kv_pool = match residency.device_kv_budget {
             Some(budget) => budget,
-            None => crate::store::PoolDemand::of(&trace, paging, None)
-                .map_err(fault)?
-                .bytes(u64::from(paging.pages_per_slot)),
+            None => {
+                sequence_demand(&trace, budgets.page_size, budgets.max_context).map_err(fault)?
+            }
         };
         let accounting = |weights: u64, scratch: u64| {
             crate::store::accounting::Accounting::of(

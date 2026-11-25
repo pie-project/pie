@@ -113,9 +113,73 @@ impl Accounting {
     }
 }
 
+/// What a load of a trace needs of a device before a weight is read, by the
+/// rule [`Accounting::admit`] applies: the weights that stay in device memory
+/// ([`crate::api::weight_demand`]), one sequence at the context, and the
+/// driver's floor, against the working set less what the device holds for
+/// this process already. No `[engine.memory] budget_device` is read. The
+/// widest fire's activation is not counted: a load narrows the fire until it
+/// fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Need {
+    /// `recommendedMaxWorkingSetSize`.
+    pub working_set: u64,
+    /// The working set less what the device held for this process: what the
+    /// weights, the pool and the floor have between them.
+    pub ceiling: u64,
+    /// The weights that stay in device memory, streamable ones at the floor
+    /// the weight cache keeps of them.
+    pub weights: u64,
+    /// One sequence at the context.
+    pub pool: u64,
+    /// The driver's safety floor.
+    pub floor: u64,
+}
+
+impl Need {
+    /// `trace`'s need at `context` tokens, loaded at the budgets the engine
+    /// states ([`crate::api::FIRE_CEILING`]), on a device of `working_set`
+    /// bytes that holds `outside` of them for this process; `caches` as the
+    /// load asks it of the device.
+    pub fn of(
+        trace: &poem_ir::Trace,
+        context: u32,
+        working_set: u64,
+        outside: u64,
+        caches: bool,
+    ) -> Result<Need> {
+        let (weights, _) =
+            crate::api::weight_demand(trace, &crate::api::ceiling_budgets(), caches, false)?;
+        let pool = crate::api::sequence_demand(
+            trace,
+            crate::api::PAGE_SIZE,
+            context.max(crate::api::PAGE_SIZE),
+        )?;
+        Ok(Need::within(working_set, outside, weights, pool))
+    }
+
+    fn within(working_set: u64, outside: u64, weights: u64, pool: u64) -> Need {
+        Need {
+            working_set,
+            ceiling: working_set.saturating_sub(outside),
+            weights,
+            pool,
+            floor: DRIVER_FLOOR,
+        }
+    }
+
+    /// The bytes the load takes in all.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.weights
+            .saturating_add(self.pool)
+            .saturating_add(self.floor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Accounting, DRIVER_FLOOR};
+    use super::{Accounting, DRIVER_FLOOR, Need};
 
     const GIB: u64 = 1 << 30;
 
@@ -125,6 +189,15 @@ mod tests {
         a_load_under_the_capacity_is_admitted_and_one_over_it_refuses();
         what_the_device_held_before_the_load_comes_off_the_capacity();
         a_budget_caps_the_capacity();
+        a_need_past_its_ceiling_is_a_load_refused();
+    }
+
+    fn a_need_past_its_ceiling_is_a_load_refused() {
+        for pool in [GIB, 4 * GIB, 9 * GIB - DRIVER_FLOOR, 9 * GIB, 20 * GIB] {
+            let need = Need::within(21 * GIB, GIB, 11 * GIB, pool);
+            let admitted = Accounting::of(21 * GIB, GIB, None, 11 * GIB, 0, pool).admit();
+            assert_eq!(need.bytes() > need.ceiling, admitted.is_err(), "{pool}");
+        }
     }
 
     fn the_fire_counts_against_the_capacity() {
