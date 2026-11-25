@@ -246,7 +246,6 @@ pub fn fault(fault: Fault) -> Error {
         },
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
-        Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Vulkan { .. }
         | Fault::Wgpu { .. }
@@ -352,10 +351,7 @@ fn adapter_of<B: Host>(
             ))
         })?;
     let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
-    shell
-        .bind_adapter(crate::adapter::Source::Bundle { bundle: &bundle })
-        .map(Some)
-        .map_err(fault)
+    shell.bind_adapter(&bundle).map(Some).map_err(fault)
 }
 
 impl<B: Host> Engine for Gpu<B>

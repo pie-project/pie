@@ -138,12 +138,6 @@ pub enum Fault {
         why: String,
     },
 
-    Blob {
-        path: String,
-
-        why: String,
-    },
-
     AdapterSlots {
         seats: u32,
     },
@@ -335,7 +329,6 @@ impl fmt::Display for Fault {
             ),
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
-            Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
             Self::AdapterSlots { seats } => write!(
                 f,
                 "this load's banks seat {seats} adapters and every slot is pinned by a \

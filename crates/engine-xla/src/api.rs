@@ -199,8 +199,7 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Unaffine { .. }
         | Fault::Unstructured { .. }
         | Fault::Straddled { .. }
-        | Fault::Adapter { .. }
-        | Fault::Blob { .. } => Error::Load(fault.to_string()),
+        | Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
@@ -297,10 +296,7 @@ fn adapter_of(
             ))
         })?;
     let bundle = engine::bundle::Bundle::read(wire).map_err(|why| fault(why.into()))?;
-    shell
-        .bind_adapter(crate::adapter::Source::Bundle { bundle: &bundle })
-        .map(Some)
-        .map_err(fault)
+    shell.bind_adapter(&bundle).map(Some).map_err(fault)
 }
 
 impl Engine for Xla {
