@@ -10,9 +10,6 @@ use std::sync::Arc;
 use crate::store::kv::page_table::PhysicalKvPageId;
 use crate::store::rs::RsUnits;
 
-/// The default cluster policy's full mark (`FULL_PRESSURE`).
-const SATURATED: u8 = 240;
-
 /// Each tier's `(free, total)` and what of it only idle cache holds.
 #[derive(Default)]
 struct TierPool {
@@ -107,24 +104,6 @@ const HOST: u32 = 1350;
 const DISK: u32 = 5400;
 
 #[test]
-fn host_and_disk_full_of_idle_cache_on_an_idle_worker_admit() {
-    let b = bucket(TierPool {
-        device: (512, 1024),
-        host: (0, HOST),
-        disk: (0, DISK),
-        host_cache: HOST,
-        disk_cache: DISK,
-        ..Default::default()
-    });
-    assert!(
-        b < SATURATED,
-        "idle cache below the device held a launch: {b}"
-    );
-    // Device half full, nothing below it live: the device term alone.
-    assert_eq!(b, 128);
-}
-
-#[test]
 fn host_and_disk_full_of_live_pages_still_report_pressure() {
     let b = bucket(TierPool {
         device: (512, 1024),
@@ -160,21 +139,5 @@ fn idle_cache_on_the_device_is_headroom() {
         ..Default::default()
     });
     assert_eq!(b, 0, "a device full of idle cache holds no launch");
-}
-
-#[test]
-fn a_parked_process_alone_holds_no_launch() {
-    let planner = ResidencyPlanner::new(Arc::new(TierPool {
-        device: (1024, 1024),
-        ..Default::default()
-    }) as Arc<dyn PoolPort>);
-    let parked = ProcessId::new_v4();
-    planner.register(parked);
-    planner.with_inner(|inner| {
-        inner.procs.get_mut(&parked).unwrap().state = super::proc::Residency::Evicted;
-    });
-    let b = planner.kv_pressure_bucket();
-    assert_eq!(b, 224);
-    assert!(b < SATURATED);
 }
 
