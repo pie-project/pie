@@ -163,11 +163,14 @@ impl Dense {
         let said = |t: Tactic| format!("{}.{}.{}", t.vector, u8::from(t.wide), tier_code(t.tier));
         let mut planes: Vec<&((u32, u32), Vec<(u32, Tactic)>)> = self.planes.iter().collect();
         planes.sort_by_key(|(at, _)| *at);
-        let mut out = format!("all:{}", said(at_rows(&self.by_rows, 1)));
-        for ((n, k), by) in planes {
-            out.push_str(&format!(" {n}x{k}:{}", said(at_rows(by, 1))));
+        if planes.is_empty() {
+            return said(at_rows(&self.by_rows, 1));
         }
-        out
+        planes
+            .iter()
+            .map(|((n, k), by)| format!("{n}x{k}:{}", said(at_rows(by, 1))))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Every tactic a fire of `rows` runs at some plane: what its rows are
