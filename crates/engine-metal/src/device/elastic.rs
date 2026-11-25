@@ -715,14 +715,19 @@ impl Elastic {
                 Some(chunk) => {
                     // A heap given back holds what its last owner wrote; a
                     // made one comes zeroed, and so does this. Its unmap has
-                    // landed, so no GPU work touches it.
-                    // SAFETY: the alias spans the heap's `bytes`, host-visible.
-                    unsafe {
-                        std::ptr::write_bytes(
-                            chunk.alias.contents().as_ptr().cast::<u8>(),
-                            0,
-                            usize_of(chunk.bytes),
-                        );
+                    // landed, so no GPU work touches it. One never mapped is
+                    // as it was made, and takes no memory until written: the
+                    // zeroing would be what backs it.
+                    if chunk.mapped > 0 {
+                        // SAFETY: the alias spans the heap's `bytes`,
+                        // host-visible.
+                        unsafe {
+                            std::ptr::write_bytes(
+                                chunk.alias.contents().as_ptr().cast::<u8>(),
+                                0,
+                                usize_of(chunk.bytes),
+                            );
+                        }
                     }
                     Ok(chunk)
                 }

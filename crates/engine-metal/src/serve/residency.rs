@@ -34,6 +34,9 @@ impl Shell {
         // runtime cuts fires to `from` (the M1 stress: "this fire wants 2
         // token rows ... the load reserved 1" at rung 2).
         let left = self.arena.current();
+        // No fire the pipeline walk prepares runs: a raise of it leaves its
+        // staged regions' bytes alone, which zeroing would back for good.
+        let zeroed = !self.warming;
         if moved {
             if let Err(fault) = host_rung(
                 &self.pools,
@@ -41,6 +44,7 @@ impl Shell {
                 &mut self.readout,
                 left,
                 false,
+                zeroed,
             ) {
                 self.rehost(left);
                 return Err(fault);
@@ -52,6 +56,7 @@ impl Shell {
                 &mut self.readout,
                 index,
                 true,
+                zeroed,
             ) {
                 self.unswitch(from, index, left);
                 return Err(fault);
@@ -77,7 +82,7 @@ impl Shell {
     /// Hosts rung `slot`'s regions again after a move that failed; a failure
     /// here leaves the load unable to stage, and says so.
     pub(super) fn rehost(&mut self, slot: usize) {
-        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, slot, true) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, slot, true, true) {
             tracing::error!(%fault, "metal: a refused rung move could not host the rung it kept");
         }
     }
@@ -86,7 +91,7 @@ impl Shell {
     /// regions let go, the arena back on `from` and its regions (`left`)
     /// hosted again.
     pub(super) fn unswitch(&mut self, from: u32, index: usize, left: usize) {
-        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, index, false) {
+        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, index, false, true) {
             tracing::error!(%fault, "metal: a refused rung move could not let go of the rung it tried");
         }
         self.arena.set_current(from);

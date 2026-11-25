@@ -470,10 +470,12 @@ impl Shell {
         self.warming = false;
         let shapes = kernels_metal::linear::gemm::record_shapes(false);
         let fires = walked?;
-        // What the walk backed goes back, and the rung stands where it
-        // stood.
+        // What the walk mapped goes back, and the rung stands where it
+        // stood, its staged regions zeroed as the load laid them.
         if self.rung != standing {
             self.set_rung(self.rung, standing)?;
+        } else {
+            self.rehost(self.arena.current());
         }
         // Every dense matmul kernel a fire's rows can reach is built: each
         // shape the walk dispatched, at every row count up to the most it
