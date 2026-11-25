@@ -448,9 +448,7 @@ fn lanes_of_one_set_fold_to_where_the_first_ends() {
     let groups = lane_groups(&[ws, ws]);
     assert_eq!(groups.len(), 1);
     let plan = host_rs_plan(&stores, &ids, &groups, &req, &all(), &[], None, None).unwrap();
-    let rs::RsPlan::Groups(plan) = plan else {
-        panic!("a plain recurrent model plans groups");
-    };
+    let rs::RsPlan::Groups(plan) = plan;
     assert_eq!(plan[0].fold, rs::GroupFold::Host(3));
     let mut tags = Vec::new();
     let by = fold_at(
@@ -514,9 +512,7 @@ fn a_count_on_rows_the_device_places_is_frozen_as_the_fire_is_prepared() {
         // Its recurrent state folds the same count, as the plan is
         // reserved.
         let plan = device_rs_plan(&stores, &[rs], &groups, &pass, &[0, 1], &all(), false).unwrap();
-        let rs::RsPlan::Groups(plan) = plan else {
-            panic!("a plain recurrent model plans groups");
-        };
+        let rs::RsPlan::Groups(plan) = plan;
         assert_eq!(plan[0].fold, rs::GroupFold::Host(1));
         stores.rs.lock().unwrap().fold(rs, 1);
         let mut req = request(1);
@@ -650,9 +646,7 @@ fn fire_piece(
     if let Some(rs) = rs {
         let groups = lane_groups(&[ws]);
         let plan = host_rs_plan(stores, &[rs], &groups, &req, fold, &[], None, None).unwrap();
-        let rs::RsPlan::Groups(plan) = plan else {
-            panic!("a plain recurrent model plans groups");
-        };
+        let rs::RsPlan::Groups(plan) = plan;
         if let rs::GroupFold::Host(count) = plan[0].fold {
             stores.rs.lock().unwrap().fold(rs, count);
         }
@@ -804,7 +798,7 @@ async fn a_fire_prepared_and_never_submitted_fails_its_pipeline() {
     ) -> Unfired {
         let none = || Ok(rs::RsPlan::Groups(Vec::new()));
         let id = uuid::Uuid::new_v4();
-        let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], &[], none, false);
+        let reserved = reserve(ctx, (model, 0), stores, id, failure, &[], &[], &[], none);
         reserved.await.unwrap().unfired
     }
     /// A piece prepared as a pass prepares one, whose call then asks
@@ -893,7 +887,6 @@ async fn a_fire_prepared_and_never_submitted_fails_its_pipeline() {
         &[],
         &[],
         refused,
-        false,
     );
     assert!(reserved.await.is_err());
     assert_eq!(*failure.lock().unwrap(), None);
@@ -1503,7 +1496,6 @@ fn a_record_checkpoint_on_a_cut_is_kept_with_the_next_piece_on_its_way() {
             snapshot: false,
             pages: 2,
             key: keys[1],
-            window_at: None,
         }];
         if ahead {
             checkpoints_ahead(&stores, &mut checkpoints, &mut []);
@@ -1586,7 +1578,6 @@ fn a_checkpoint_taken_ahead_follows_the_fold_the_device_counts() {
             snapshot: false,
             pages: 1,
             key,
-            window_at: None,
         }];
         checkpoints_ahead(&stores, &mut checkpoints, &mut []);
         let snapshot = checkpoints[0].rs;
@@ -1696,7 +1687,6 @@ impl Flight {
         TestContext {
             id: uuid::Uuid::new_v4(),
             resources: wasmtime::component::ResourceTable::new(),
-            tails: Vec::new(),
         }
     }
 }

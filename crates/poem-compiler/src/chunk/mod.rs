@@ -949,14 +949,6 @@ fn plan_with(
             row.window = None;
         }
     }
-    if device.one_window
-        && ring.is_none()
-        && let Some(widest) = token_rows.iter().filter_map(|r| r.window).max()
-    {
-        for row in token_rows.iter_mut().filter(|r| r.window.is_some()) {
-            row.window = Some(widest);
-        }
-    }
     let full: Vec<&TokenRow> = token_rows.iter().filter(|r| r.window.is_none()).collect();
     // Windowed rows as ring + buffer ([`plan_windowed`]) leave no window
     // list.
@@ -1022,14 +1014,8 @@ fn plan_with(
             let grain = rows
                 .iter()
                 .fold(TOKEN_GRAIN, |base, r| census::lcm(base, r.ratio));
-            // A backend that pages its windowed rows by one table pages them
-            // by its stated page; one with a table a window list takes the
-            // window's own slot.
-            let least = if device.token_slot.is_some() && device.one_window {
-                page
-            } else {
-                grain.min(page)
-            };
+            // A window list takes the window's own slot.
+            let least = grain.min(page);
             core::iter::successors(Some(least), |t| t.checked_mul(2))
                 .take_while(|&t| t <= page)
                 .chain(core::iter::once(page))

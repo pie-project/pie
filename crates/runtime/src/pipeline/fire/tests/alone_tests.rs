@@ -27,7 +27,6 @@ fn device(engine: usize, pages: usize) -> (usize, Stores, TestContext) {
     let ctx = TestContext {
         id: pid,
         resources: wasmtime::component::ResourceTable::new(),
-        tails: Vec::new(),
     };
     (model, stores, ctx)
 }
@@ -71,7 +70,7 @@ async fn fire(
     let failure = PipelineFailure::default();
     let none = || Ok(rs::RsPlan::Groups(Vec::new()));
     let id = uuid::Uuid::new_v4();
-    let asked = reserve(ctx, (model, 0), stores, id, &failure, &sets, &[], &[], none, false);
+    let asked = reserve(ctx, (model, 0), stores, id, &failure, &sets, &[], &[], none);
     tokio::time::timeout(std::time::Duration::from_secs(5), asked)
         .await
         .expect("answered at once, never parked")

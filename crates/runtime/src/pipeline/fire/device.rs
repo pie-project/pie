@@ -156,7 +156,6 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
             )
         })
         .collect();
-    let windowed = crate::model::model().rs_caps().window_tokens > 0;
     // The fire stages its rows whole (the device places them, so it is never
     // cut): it asks the activation rung for them as every pass does
     // ([`RungAsk`]), and is staged once the rung takes them. It asks for
@@ -167,7 +166,7 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
         &rs_ws_ids,
         &groups,
         pass_lanes.places.len(),
-        windowed || crate::model::model().rs_caps().window_state,
+        crate::model::model().rs_caps().window_state,
     ) {
         Ok(frozen) => frozen,
         Err(error) => return Ok(Err(error)),
@@ -225,13 +224,6 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
     {
         return Ok(Err(refusal));
     }
-    if windowed && groups.len() > 1 {
-        return Ok(Err(
-            "pipeline: on a model with window lists, a pass whose rows land where the device \
-             says writes one working set"
-                .to_string(),
-        ));
-    }
     let sets: Vec<(&KvWorkingSet, Written)> = group_sets
         .iter()
         .zip(&write_indexes)
@@ -243,11 +235,7 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
         groups.iter().map(|(_, lanes)| lanes.clone()).collect()
     };
     let rs_plan = || {
-        if windowed {
-            device_window_plan(&stores, ws.id, &write_indexes[0], &rs_ws_ids)
-        } else {
-            device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold, states_parents)
-        }
+        device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold, states_parents)
     };
     let reserved = reserve(
         ctx,
@@ -259,7 +247,6 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
         &set_lanes,
         &rs_ws_ids,
         rs_plan,
-        windowed,
     )
     .await;
     let Reserved {
@@ -500,7 +487,7 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
         }
         // What the host could place was frozen as the fire was prepared; the
         // rest is placed when the fire settles.
-        let rs = rs_ws_ids.get(lanes[0]).copied().filter(|_| !windowed);
+        let rs = rs_ws_ids.get(lanes[0]).copied();
         let by = device_fold_at(
             &pass_lanes,
             lanes[0],
@@ -553,7 +540,6 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
         completion.clone(),
         copy_src,
         copy_dst,
-        rs_prepared.windowed_copies(),
         rs_copy,
         frame,
         lora_program,

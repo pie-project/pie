@@ -275,7 +275,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         &[],
         &rs_ids,
         || Ok(plan.clone()),
-        false,
     )
     .await
     {
@@ -325,7 +324,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         pid,
         quorum_pipeline_id,
         completion.clone(),
-        Vec::new(),
         Vec::new(),
         Vec::new(),
         rs_copy,

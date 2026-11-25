@@ -251,8 +251,7 @@ impl Carve {
 /// Wavefronts a block at most.
 const MAX_SPLIT: u32 = 16;
 
-/// Wavefronts a block at least: two on each of a CU's four SIMDs, so one
-/// hides the other's loads.
+/// Wavefronts a block at least: a chosen bound, not a measured one.
 pub const MIN_SPLIT: u32 = 8;
 
 /// The rows up to which a product takes the thin split-K maximum

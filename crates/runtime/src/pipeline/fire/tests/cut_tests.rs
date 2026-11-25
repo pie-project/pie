@@ -14,57 +14,6 @@ fn cut_every_case() {
     a_pass_with_media_is_cut_before_its_first_span();
     a_pass_with_media_keys_the_rows_before_it();
     the_rest_of_a_pass_is_cut_again_wider();
-    a_windowed_cut_on_its_checkpoint_row_keeps_it_through_the_next_piece();
-}
-
-/// Each piece of `req` cut as `pass_pieces` cuts a single lane, as slots,
-/// with the window checkpoint it takes and its keep.
-fn window_pieces(
-    req: &crate::engine::FireRequest,
-    share: u32,
-    forced: &[u32],
-    checkpoints: &[u64],
-) -> Vec<((u64, u64), Option<u64>, Option<u32>)> {
-    let held = u64::from(req.lanes[0].kv.held);
-    pass_pieces(req, true, true, share, 16, forced, &[])
-        .into_iter()
-        .map(|piece| {
-            let (from, to) = piece[0].expect("one lane, in every piece");
-            let slots = held + u64::from(from)..held + u64::from(to);
-            let (at, keep) = piece_window_rows(checkpoints, true, held, &slots);
-            ((slots.start, slots.end), at, keep)
-        })
-        .collect()
-}
-
-/// 2050 rows cut at 1024, a checkpoint asked at 2048: it is the second
-/// piece's own end. That piece takes it and keeps it, and so does the
-/// last piece, on its way before the second settles; the first keeps
-/// nothing. Cut a row past it instead, the piece it lies inside takes it
-/// and every piece from there keeps it.
-fn a_windowed_cut_on_its_checkpoint_row_keeps_it_through_the_next_piece() {
-    let req = prefill_lane(0, 2050, 16);
-    assert_eq!(
-        window_pieces(&req, 1024, &[], &[2048]),
-        [
-            ((0, 1024), None, None),
-            ((1024, 2048), Some(2048), Some(2048)),
-            ((2048, 2050), None, Some(2048)),
-        ],
-        "cut on the checkpoint row"
-    );
-    assert_eq!(
-        window_pieces(&req, 0, &[2049], &[2048]),
-        [((0, 2049), Some(2048), Some(2048)), ((2049, 2050), None, Some(2048))],
-        "cut a row past it"
-    );
-    // Not windowed: nothing kept, nothing taken here.
-    assert_eq!(
-        piece_window_rows(&[2048], false, 0, &(1024..2048)),
-        (None, None)
-    );
-    // A pass that starts past the checkpoint keeps none of it.
-    assert_eq!(piece_window_rows(&[2048], true, 2048, &(2048..2050)), (None, None));
 }
 
 /// A raise landing mid-pass: what is left from the last cut is cut at

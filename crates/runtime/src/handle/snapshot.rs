@@ -25,7 +25,7 @@ use crate::store::kv::page_table::{ExportedPage, ExportedSet, HostKvSlotId, KvPa
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
-use crate::store::rs::{RsExport, RsGeometry, RsSlotId, WindowState};
+use crate::store::rs::{RsExport, RsGeometry, RsSlotId};
 
 const VERSION: u32 = 2;
 /// Names are file names here, written out in hex.
@@ -181,11 +181,6 @@ struct SavedState {
     base: u32,
     frozen: u32,
     bytes: u64,
-    /// The windows' position, for a model whose state is one window list:
-    /// `buffer` is then its table, and `window_tokens` the window (the
-    /// window-list path).
-    window: Option<WindowState>,
-    window_tokens: u32,
     /// The model's windowed layers are ring + buffer (CONTRACT-BC 19, 21):
     /// the record holds the rings and `buffer` is the window buffer's
     /// unfolded slots, saved as a recurrent state's are; no window table.
@@ -440,15 +435,9 @@ async fn read_state(
 ) -> Result<(SavedState, Vec<u8>), HandleError> {
     let stores = store_registry::get(rs.model, rs.engine);
     let held: Vec<RsSlotId> = set.folded.iter().copied().collect();
-    if set.windows.len() > 1 {
-        return Err(HandleError::invalid(
-            "a state of several window lists is not saved to the host",
-        ));
-    }
-    // A window list's table rides as the buffer (the window-list path). A
-    // ring + buffer set's buffer is
-    // its window buffer's unfolded slots, its rings in its record.
-    let table = set.windows.first().unwrap_or(&set.buffer);
+    // A ring + buffer set's buffer is its window buffer's unfolded slots,
+    // its rings in its record.
+    let table = &set.buffer;
     let pages: Vec<RsSlotId> = table
         .iter()
         .chain(&set.wbuffer)
@@ -470,8 +459,6 @@ async fn read_state(
             base: set.base,
             frozen: set.frozen,
             bytes: bytes.len() as u64,
-            window: set.window,
-            window_tokens: crate::model::model().rs_caps().window_tokens,
             window_state: crate::model::model().rs_caps().window_state,
             window_buffer: set.wbuffer.iter().map(Option::is_some).collect(),
             window_base: set.wbase,
@@ -1060,8 +1047,6 @@ async fn load_state(
     if !caps.has_state()
         || caps.state_size != geom.state_size
         || caps.buffer_page_size != geom.buffer_page_tokens
-        || caps.window_tokens != saved.window_tokens
-        || (caps.window_tokens > 0) != saved.window.is_some()
         || caps.window_state != saved.window_state
     {
         return Err(HandleError::invalid(
@@ -1104,14 +1089,11 @@ async fn load_state(
         .iter()
         .map(|&page| page.then(|| buffered.next().expect("counted above")))
         .collect();
-    let windowed = saved.window.is_some();
     let set = RsExport {
         folded: saved.folded.then(|| rows[0]),
-        buffer: if windowed { Vec::new() } else { table.clone() },
+        buffer: table,
         base: saved.base,
         frozen: saved.frozen,
-        windows: if windowed { vec![table] } else { Vec::new() },
-        window: saved.window,
         wbuffer,
         wbase: saved.window_base,
     };

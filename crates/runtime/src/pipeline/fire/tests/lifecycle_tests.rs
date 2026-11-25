@@ -4,7 +4,6 @@ use wasmtime::component::ResourceTable;
 pub(super) struct TestContext {
     pub(super) id: uuid::Uuid,
     pub(super) resources: ResourceTable,
-    pub(super) tails: Vec<PendingFires>,
 }
 
 impl FireContext for TestContext {
@@ -14,10 +13,6 @@ impl FireContext for TestContext {
 
     fn process_id(&self) -> uuid::Uuid {
         self.id
-    }
-
-    fn pipeline_tails(&self) -> Vec<PendingFires> {
-        self.tails.clone()
     }
 }
 
@@ -93,100 +88,6 @@ async fn a_beams_finish_waits_for_a_frame_held_under_the_cap() -> anyhow::Result
     // table: they name the listed pages alone.
     let stamped = working_set_flat_table(&stores, ws).expect("the set's table");
     assert_eq!(stamped, [before[0].0, before[3].0, before[1].0]);
-    Ok(())
-}
-
-/// Mac's gemma-4-e4b c64 stall: a windowed ask that settled its tail
-/// whole first waited on its pass's earlier piece, whose frame only the
-/// piece asking completes. The ask now returns once the planner grants
-/// (growth), the tail still in flight and untouched.
-#[tokio::test(flavor = "current_thread")]
-async fn a_windowed_ask_never_waits_on_its_own_unlanded_tail() -> anyhow::Result<()> {
-    let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
-    let mut context = TestContext {
-        id: uuid::Uuid::new_v4(),
-        resources: ResourceTable::new(),
-        tails: vec![fires.clone()],
-    };
-    context.resources.push(ws)?;
-    let (grow, grown) = tokio::sync::oneshot::channel::<()>();
-    let ask = async move {
-        grown.await.expect("the pool grows");
-        "granted"
-    };
-    let task = tokio::spawn(async move {
-        // The pool grows a moment later; the tail never lands meanwhile.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        let _ = grow.send(());
-    });
-    let asked = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ask_while_tail_lands(&mut context, ask, || {}),
-    )
-    .await
-    .expect("the ask returns without its tail landing");
-    assert_eq!(asked.map_err(anyhow::Error::msg)?, "granted");
-    task.await?;
-    assert_eq!(fires.lock().expect("test FIFO").len(), 1, "the tail stays");
-    resolve_test_completion(&completion, false);
-    finalize_all(&mut context, &fires, true).await?;
-    Ok(())
-}
-
-/// Two windowed processes, a pool that cannot grant at once: one ask is
-/// served only by the window slots the other's tail gives back, and the
-/// other's tail lands while it asks too. Each finalizes its tail as it
-/// lands, so the slots come back and both asks are served.
-#[tokio::test(flavor = "current_thread")]
-async fn two_windowed_asks_are_served_by_the_tails_they_finalize_as_they_land()
--> anyhow::Result<()> {
-    let mut processes = Vec::new();
-    for _ in 0..2 {
-        let (fires, completion, ws, _stores, _failure) = pending_fire_fixture(Vec::new());
-        let mut context = TestContext {
-            id: uuid::Uuid::new_v4(),
-            resources: ResourceTable::new(),
-            tails: vec![fires.clone()],
-        };
-        context.resources.push(ws)?;
-        processes.push((context, fires, completion));
-    }
-    // The planner's room: slots come back as a tail is finalized.
-    let freed = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut tasks = Vec::new();
-    for (mut context, fires, completion) in processes {
-        let freed = freed.clone();
-        let released = freed.clone();
-        tasks.push(tokio::spawn(async move {
-            let ask = async move {
-                // Served once the other process's tail gave its slots back.
-                freed.acquire().await.expect("room").forget();
-            };
-            let lands = tokio::spawn(async move {
-                for _ in 0..5 {
-                    tokio::task::yield_now().await;
-                }
-                resolve_test_completion(&completion, false);
-            });
-            ask_while_tail_lands(&mut context, ask, || released.add_permits(1))
-                .await
-                .map_err(anyhow::Error::msg)?;
-            lands.await?;
-            // Whatever landed after the grant is finalized on the fire's
-            // own path, and its slots go back to the planner as well.
-            finalize_all(&mut context, &fires, true).await?;
-            released.add_permits(1);
-            anyhow::Ok(fires.lock().expect("test FIFO").len())
-        }));
-    }
-    for task in tasks {
-        let left = tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .expect("both asks are served")??;
-        assert_eq!(left, 0);
-    }
     Ok(())
 }
 
@@ -357,7 +258,6 @@ async fn cancelled_full_drain_keeps_pending_kv_for_teardown() -> anyhow::Result<
         let mut context = TestContext {
             id: uuid::Uuid::new_v4(),
             resources: ResourceTable::new(),
-            tails: Vec::new(),
         };
         context.resources.push(ws)?;
         {
@@ -410,7 +310,6 @@ async fn every_lane_waiting_on_the_front_fire_wakes_when_it_settles() -> anyhow:
     let mut context = TestContext {
         id: uuid::Uuid::new_v4(),
         resources: ResourceTable::new(),
-        tails: Vec::new(),
     };
     context.resources.push(ws)?;
     let flag = || Arc::new(Flag(AtomicBool::new(false)));
@@ -519,7 +418,6 @@ fn run_ahead_stating(
     let mut context = TestContext {
         id: uuid::Uuid::new_v4(),
         resources: ResourceTable::new(),
-        tails: Vec::new(),
     };
     let pipeline = context.resources.push(Pipeline::new())?.rep();
     let borrowed: Resource<Pipeline> = Resource::new_borrow(pipeline);
@@ -828,7 +726,6 @@ async fn what_cannot_be_taken_back_is_refused_by_name() -> anyhow::Result<()> {
     let mut context = TestContext {
         id: uuid::Uuid::new_v4(),
         resources: ResourceTable::new(),
-        tails: Vec::new(),
     };
     let open = context.resources.push(Pipeline::new())?.rep();
     let refused = pipeline_retract(&mut context, Resource::new_borrow(open), 1).await?;
@@ -841,7 +738,6 @@ async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<
     let mut context = TestContext {
         id: uuid::Uuid::new_v4(),
         resources: ResourceTable::new(),
-        tails: Vec::new(),
     };
     let pipeline = context.resources.push(Pipeline::new())?;
     let rep = pipeline.rep();

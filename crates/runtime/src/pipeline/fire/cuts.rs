@@ -176,33 +176,6 @@ pub(crate) fn rows_of_lanes(
     req
 }
 
-/// A windowed pass's piece over slots `slots`: the window checkpoint it
-/// takes (the furthest of the pass's `checkpoints` inside it, its own end
-/// included), and the row its advance retires no slot behind (`keep`): the
-/// pass's earliest checkpoint past `held` (where the pass starts) at or
-/// before the piece's end, its own end included and one an earlier piece
-/// takes (its next pieces may be on their way before it settles and takes
-/// it). Its windows reach back from there.
-pub(super) fn piece_window_rows(
-    checkpoints: &[u64],
-    windowed: bool,
-    held: u64,
-    slots: &std::ops::Range<u64>,
-) -> (Option<u64>, Option<u32>) {
-    let window_at = checkpoints
-        .iter()
-        .copied()
-        .filter(|&row| windowed && slots.start < row && row <= slots.end)
-        .max();
-    let keep = checkpoints
-        .iter()
-        .copied()
-        .filter(|&row| windowed && held < row && row <= slots.end)
-        .min()
-        .and_then(|row| u32::try_from(row).ok());
-    (window_at, keep)
-}
-
 /// Several lanes are cut alike and aligned at their ends, so the last piece
 /// holds every lane's read-out rows.
 pub(crate) fn pass_pieces(

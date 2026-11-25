@@ -61,16 +61,10 @@ pub struct ChunkProfile {
     /// from the row's `[b | a]` and keys lays none.
     pub rs_scalars: bool,
     /// The tokens a slot of the kv list holds, where the backend's kernels
-    /// page their rows by a count of their own (and a slot of each window
-    /// list too where `one_window` holds; else a window list still picks
+    /// page their rows by a count of their own (a window list still picks
     /// its own `T_w` no larger); `None` lets the plan choose
     /// ([`super::MIN_RUN`]).
     pub token_slot: Option<u32>,
-    /// Whether every windowed row shares one window list, of the widest
-    /// window: a backend that pages its windowed rows by one table (a row of
-    /// a narrower window then keeps slots its kernels no longer read). Else
-    /// a window list a window.
-    pub one_window: bool,
     /// The context a working set is held to, where the backend knows it: a
     /// window at least this wide keeps every token, so its rows are list
     /// rows.
@@ -85,14 +79,6 @@ impl ChunkProfile {
     pub const fn paged(mut self, tokens: u32, context: u32) -> ChunkProfile {
         self.token_slot = Some(tokens);
         self.full_from = Some(context);
-        self
-    }
-
-    /// The profile with every windowed row in one window list, of the
-    /// widest window ([`ChunkProfile::one_window`]).
-    #[must_use]
-    pub const fn merged(mut self) -> ChunkProfile {
-        self.one_window = true;
         self
     }
 
@@ -114,7 +100,6 @@ impl ChunkProfile {
         rs_corrected: true,
         rs_scalars: false,
         token_slot: None,
-        one_window: false,
         full_from: None,
     };
 
@@ -136,7 +121,6 @@ impl ChunkProfile {
         rs_corrected: true,
         rs_scalars: true,
         token_slot: None,
-        one_window: false,
         full_from: None,
     };
 
@@ -157,7 +141,6 @@ impl ChunkProfile {
         rs_corrected: false,
         rs_scalars: false,
         token_slot: None,
-        one_window: false,
         full_from: None,
     };
 

@@ -250,6 +250,12 @@ pub enum ProcessEvent {
         session: Option<String>,
         props: JsonProps,
         prompt: Option<Vec<u64>>,
+        /// The client connection it came on, by the gateway's own count:
+        /// none for one that came alone (an HTTP request).
+        connection: Option<u64>,
+        /// The worker that holds its session's handles: it can run nowhere
+        /// else.
+        tied: Option<WorkerId>,
     },
     Dispatched {
         req: u64,
