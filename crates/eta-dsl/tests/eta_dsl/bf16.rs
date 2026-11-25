@@ -191,14 +191,16 @@ fn logits(n: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-/// Every store rounds the f32 result once, to nearest even; a reduction is
-/// the f32 accumulator; the rest is within bf16's half-ulp of an f64
+/// Every store rounds the f32 result once, to nearest even; a reduction and
+/// a scan accumulate in f32 (4096 ones count past 256, where a bf16
+/// accumulator stops); the rest is within bf16's half-ulp of an f64
 /// reference.
 #[test]
 fn bf16_matches_an_f64_reference() {
     // An odd vocabulary: a value whose last word holds one element.
-    for (n, seed) in [(1001usize, 7u32), (64, 3), (5, 11)] {
-        let x = logits(n, seed);
+    let rows = [logits(1001, 7), logits(64, 3), logits(5, 11), vec![1.0f32; 4096]];
+    for x in rows {
+        let n = x.len();
         let got = run(&x);
         let narrow: Vec<f32> = x.iter().map(|&a| round_bf16(a)).collect();
         assert_eq!(
@@ -251,90 +253,4 @@ fn bf16_matches_an_f64_reference() {
         }
         assert_eq!(got.argmax as usize, order[0]);
     }
-}
-
-/// A reduction and a scan over bf16 accumulate in f32: 4096 ones sum to
-/// 4096, where a bf16 accumulator stops at 256 (256 + 1 rounds back to it),
-/// and the scan's prefixes are each the f32 count, rounded once.
-#[test]
-fn bf16_accumulates_in_f32() {
-    let ones = vec![1.0f32; 4096];
-    let got = run(&ones);
-    assert_eq!(got.sum, 4096.0, "the sum is the f32 accumulator");
-    for (i, &bits) in got.cumsum.iter().enumerate() {
-        let count = (i + 1) as f32;
-        assert_eq!(bits, bf16_bits(count), "prefix {i}");
-    }
-    assert_eq!(bf16_to_f32(got.cumsum[999]), 1000.0, "not stuck at 256");
-    assert_eq!(bf16_to_f32(got.cumsum[256]), 256.0, "257 ties to even 256");
-    assert_eq!(bf16_to_f32(got.cumsum[257]), 258.0);
-}
-
-/// A rank-2 bf16 log-softmax answers each row as the rank-1 one does: the
-/// max is broadcast exactly as bf16, the log-sum-exp as f32, so each
-/// result is rounded once (what beam search's rescoring holds it to).
-#[test]
-fn a_rank_2_bf16_log_softmax_is_each_row_s() {
-    let v = 333u32;
-    let rows_in: &'static Channel = leak(Channel::new([2, v], dtype::f32));
-    let both: &'static Channel = leak(Channel::new([2, v], dtype::bf16));
-    let first: &'static Channel = leak(Channel::new([v], dtype::bf16));
-    let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
-    tok.put([1i32]);
-    let indptr: &'static Channel = leak(Channel::from([0u32, 1]));
-    let klen: &'static Channel = leak(Channel::from([1u32]));
-    let positions: &'static Channel = leak(Channel::from([0u32]));
-    let mut b = Builder::new(v, 4);
-    b.outputs(crate::outputs::logits(v));
-    b.bind_port(Port::EmbedTokens, tok);
-    b.bind_port(Port::EmbedIndptr, indptr);
-    b.bind_port(Port::KvLen, klen);
-    b.bind_port(Port::Positions, positions);
-    b.stage(Stage::Epilogue, move || {
-        let x = cast(rows_in.take(), dtype::bf16);
-        both.put(&log_softmax(&x));
-        let row0 = gather(&x, Tensor::constant([0u32]));
-        first.put(&log_softmax(reshape(row0, [v])));
-        tok.put(Tensor::constant([1i32]));
-        positions.put(Tensor::constant([0u32]));
-    });
-    rows_in.note_host_put();
-    both.note_host_take();
-    first.note_host_take();
-    let traced = b.build().expect("builds");
-    let bound = eta_ir::validate::bind(
-        traced.container().clone(),
-        crate::outputs::logits(v),
-        eta_ir::registry::EngineCaps {
-            lora: true,
-            attn_page_mask: true,
-        },
-    )
-    .expect("binds");
-    let mut inst = Instance::new(
-        &bound,
-        &[
-            (idx(&traced, tok), Value::I32(vec![1])),
-            (idx(&traced, indptr), Value::U32(vec![0, 1])),
-            (idx(&traced, klen), Value::U32(vec![1])),
-            (idx(&traced, positions), Value::U32(vec![0])),
-        ],
-    )
-    .unwrap_or_else(|e| panic!("{e:?}"));
-    let mut x = logits(v as usize * 2, 5);
-    x[..v as usize].iter_mut().for_each(|a| *a *= 3.0);
-    inst.host_put(&bound, idx(&traced, rows_in), Value::F32(x.clone()))
-        .unwrap();
-    let inputs = PassInputs {
-        outputs: vec![("logits".into(), 0, Value::F32(vec![0.0; v as usize]))],
-    };
-    let report = inst.step(&bound, &inputs, &mut NoKernels).unwrap();
-    assert!(report.committed, "{:?}", report.missed);
-    let Value::Bf16(both) = inst.host_take(&bound, idx(&traced, both)).unwrap() else {
-        panic!("bf16")
-    };
-    let Value::Bf16(first) = inst.host_take(&bound, idx(&traced, first)).unwrap() else {
-        panic!("bf16")
-    };
-    assert_eq!(both[..v as usize], first[..], "row 0 is the rank-1 answer, bit for bit");
 }

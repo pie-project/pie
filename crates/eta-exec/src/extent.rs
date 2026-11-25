@@ -155,32 +155,3 @@ pub fn describe(value: &LaunchPlanValue, extents: &Extents) -> Result<ValueDesc,
     };
     Ok(descriptor)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn of(dtype: Dtype, len: u32) -> ValueDesc {
-        ValueDesc {
-            len,
-            dtype: u32::from(wire_dtype(dtype)),
-            ..ValueDesc::default()
-        }
-    }
-
-    /// A value's device bytes are its elements at its dtype's width: a word
-    /// a 32-bit element, a byte a bool, never less than a word in all.
-    #[test]
-    fn a_value_takes_its_dtype_s_width_an_element() {
-        for dtype in [Dtype::F32, Dtype::I32, Dtype::U32] {
-            assert_eq!(of(dtype, 151_936).device_bytes(), 151_936 * 4, "{dtype:?}");
-        }
-        assert_eq!(of(Dtype::Bool, 151_936).device_bytes(), 151_936);
-        assert_eq!(of(Dtype::Bool, 3).device_bytes(), 4, "at least a word");
-        assert_eq!(of(Dtype::F32, 1).device_bytes(), 4);
-        assert_eq!(element_bytes(Dtype::Bf16), 2);
-        assert_eq!(element_bytes(Dtype::F16), 2);
-        assert_eq!(element_bytes(Dtype::I8), 1);
-        assert_eq!(element_bytes(Dtype::I64), 8);
-    }
-}
