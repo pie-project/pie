@@ -69,6 +69,42 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
     assert!(!pending, "the next boot reads the stored settle: nothing left behind serving");
 }
 
+/// A boot whose 1-row range an earlier one decided times one decode step of
+/// its own before any wider point: no boot fires a point it knows no limit
+/// for.
+#[test]
+fn a_boot_with_the_one_row_range_decided_times_a_decode_step_first() {
+    let profiles = profiles_at("settle-limit");
+    let boot = || backend::DeviceBoot {
+        profiles: Some(profiles.clone()),
+        ..crate::gpu::device_boot()
+    };
+    let behind = ::engine::BehindServing {
+        others: &|| 0,
+        arrived: &|| false,
+        seats: None,
+        step: None,
+    };
+    let Some(mut first) = loaded_boot("settle-limit", &Outputs, 4, boot()) else {
+        return;
+    };
+    let stored = |loaded: &mut super::outputs::Loaded| {
+        let shell = loaded.engine.loaded_mut().expect("loaded");
+        shell.behind_status().map_or(1, |(_, stored, _)| stored)
+    };
+    while stored(&mut first) == 0 {
+        assert!(first.engine.measure_behind(&behind).expect("measuring behind"));
+    }
+    drop(first);
+    let mut second = loaded_boot("settle-limit", &Outputs, 4, boot()).expect("the device opened once");
+    assert!(second.engine.measures_behind(), "wider ranges are left");
+    assert!(second.engine.measure_behind(&behind).expect("measuring behind"));
+    let need = second.engine.behind_need().expect("a point is next");
+    drop(second);
+    let _ = std::fs::remove_dir_all(&profiles);
+    assert_eq!((need.lanes, need.tokens), (1, 1), "one decode step, before any wider point");
+}
+
 /// Every timed settle point overlapped by another lane's submission (the
 /// runtime's count moves while it runs) is discarded: none is stored, and
 /// the settle stays pending.
