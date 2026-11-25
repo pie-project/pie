@@ -475,55 +475,75 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         let counts = crate::top::counts(&boot.trace)?;
         // A card on which no rung fits beside one sequence is refused by
         // name, with the room it had: too small for this load as stated.
-        let (top, estimate) = crate::top::choose(
-            &rungs,
-            after_weights,
-            prompt_rows,
-            &chip.rates(),
-            crate::top::shape(&chip)?,
-            device.name(),
-            &counts,
-        )
-        .map_err(|fault| match fault {
+        let refused = |fault| match fault {
             Fault::Card(why) => Fault::Card(format!(
                 "{room_line}; one sequence at {} tokens takes {} MiB beside a fire: {why}",
                 boot.context,
                 candidates.first().map_or(0, |c| c.beside) >> 20,
             )),
             fault => fault,
-        })?;
-        // Which pricing the estimate gave the dense matmuls, said once: the
-        // waves of the kernels hipBLASLt states, or the measured curve as
-        // timed and why its solutions went unread.
-        #[cfg(feature = "rocm")]
-        tracing::info!(
-            "the matmuls weighed by {}",
-            kernels_cuda::hip::lt_kernel::pricing()
-        );
-        tracing::info!(
-            "{}",
-            engine::load::line_of(
-                &top,
-                top.tokens,
-                top.span_bytes,
+        };
+        // A load that skips measuring (`[engine] measure = false`) on a card
+        // whose roofline no layer states has no rate to weigh the rungs by:
+        // its fire top is the narrowest rung a decode fire takes, a prompt
+        // chunked to it; said by name.
+        let unstated = chip.rates().missing(&crate::rates::KEYS);
+        let skipped =
+            boot.knobs.measuring == engine::rates::Measuring::Skip && !unstated.is_empty();
+        let top_tokens = if skipped {
+            let rung = crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
+            tracing::info!(
+                "skipped: the roofline `[rates]` {unstated:?} (`[engine] measure = false`, no \
+                 layer states them): the fire top is {rung}, the narrowest rung a decode fire of \
+                 {fire_lanes} lanes takes, a prompt chunked to it"
+            );
+            weighed = None;
+            rung
+        } else {
+            let (top, estimate) = crate::top::choose(
+                &rungs,
                 after_weights,
-                chip.tuned()
+                prompt_rows,
+                &chip.rates(),
+                crate::top::shape(&chip)?,
+                device.name(),
+                &counts,
             )
-        );
-        weighed = Some(crate::top::Weighed {
-            rungs: rungs.clone(),
-            estimate,
-            live: after_weights,
-            fire_top: top.tokens,
-        });
-        let widest = crate::top::widest(&rungs).unwrap_or(top.tokens);
+            .map_err(refused)?;
+            // Which pricing the estimate gave the dense matmuls, said once: the
+            // waves of the kernels hipBLASLt states, or the measured curve as
+            // timed and why its solutions went unread.
+            #[cfg(feature = "rocm")]
+            tracing::info!(
+                "the matmuls weighed by {}",
+                kernels_cuda::hip::lt_kernel::pricing()
+            );
+            tracing::info!(
+                "{}",
+                engine::load::line_of(
+                    &top,
+                    top.tokens,
+                    top.span_bytes,
+                    after_weights,
+                    chip.tuned()
+                )
+            );
+            weighed = Some(crate::top::Weighed {
+                rungs: rungs.clone(),
+                estimate,
+                live: after_weights,
+                fire_top: top.tokens,
+            });
+            top.tokens
+        };
+        let widest = crate::top::widest(&rungs).unwrap_or(top_tokens);
         match boot.knobs.every_rung {
-            None => top.tokens,
+            None => top_tokens,
             // Past the top (`engine::load::check::laid_top`), so a top set
             // too low shows in the check.
             Some(super::EveryRung::PastTop) => {
                 let lattice: Vec<u32> = rungs.iter().map(|r| r.tokens).collect();
-                engine::load::check::laid_top(&lattice, top.tokens).min(widest)
+                engine::load::check::laid_top(&lattice, top_tokens).min(widest)
             }
             Some(super::EveryRung::To(_)) => widest,
         }

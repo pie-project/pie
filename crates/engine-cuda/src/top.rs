@@ -4,7 +4,8 @@
 //! after the weight tier, every fire timed by the estimate from the
 //! device's rates (its profile's `[rates]`) and the model's counts
 //! ([`engine::load::Counts`]). A device whose profile states no rates has
-//! nothing to weigh the rungs by, and the load is refused, naming it.
+//! nothing to weigh the rungs by: the load is refused, naming it, or, where it
+//! skips measuring, takes the narrowest decode rung ([`narrowest`]).
 
 use engine::load::{Counts, Kept, RungFacts, TopRung};
 use poem_ir::Trace;
@@ -112,6 +113,26 @@ pub fn widest(rungs: &[RungFacts]) -> Option<u32> {
         .filter(|r| r.infeasible.is_none())
         .map(|r| r.tokens)
         .max()
+}
+
+/// The narrowest feasible rung of `rungs` a decode fire of `lanes` takes (a
+/// row a lane), else the widest feasible: the fire top of a load that skips
+/// measuring on a card whose profile states no rates to weigh them by.
+/// Refused, with the widest rung's reason, where none is feasible.
+pub fn narrowest(rungs: &[RungFacts], lanes: u32) -> Result<u32> {
+    let feasible = || rungs.iter().filter(|r| r.infeasible.is_none());
+    feasible()
+        .map(|r| r.tokens)
+        .filter(|&tokens| tokens >= lanes)
+        .min()
+        .or_else(|| widest(rungs))
+        .ok_or_else(|| {
+            let why = rungs.last().and_then(|r| r.infeasible);
+            Fault::Card(format!(
+                "no rung of this load is feasible: {}",
+                why.unwrap_or("it offers none")
+            ))
+        })
 }
 
 /// The rows of the tile each dense bf16 product of `m x n x k` computes
