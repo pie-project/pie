@@ -233,3 +233,89 @@ async fn a_bind_waiting_in_the_planner_takes_the_span_back_and_the_rung_rises_af
     assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
     drop(want);
 }
+
+/// A bind's room queued for while idle cache holds the room: the rung stays where it
+/// stands until a pass has asked idle cache and found it out, and comes down
+/// then. A bind short of a run outside the planner's queue, which no pass
+/// asks idle cache for, has the rung down at once.
+#[tokio::test(flavor = "current_thread")]
+async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
+    use crate::store::kv::hash::{Hash256, chain_slots, page_hash};
+    use crate::store::kv::page_table::KvPageBacking;
+    const ENGINE: usize = 75;
+    let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
+    let (model, stores) = super::unfolded_tests::pool_with_rungs_of(vec![(1, 2), (512, 8)]);
+    let shared = stores.shared.clone().expect("a shared pool");
+    let planner = crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
+        crate::planner::RegistryPool::new(model, 0, false),
+    ));
+    crate::planner::init_planner(model, ENGINE, planner);
+    let planner = crate::planner::planner_for(model, ENGINE).expect("installed");
+    // Its passes run on the drain task, once this one yields.
+    planner.arm_drain_task();
+    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
+        .with_live_lanes(|| 1);
+    let cap = || crate::store::shared::fire_cap(ENGINE);
+    // Idle cache, every page there is, a reader on it.
+    let list = shared.lock().unwrap().list().expect("a kv list").pool;
+    let filed = || {
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
+            let pages = kv.reserve_device_pages(kv.available_pages()).unwrap();
+            let rows: Vec<u32> = (0..pages.len() as u32 * 16).collect();
+            let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&[3; 32], None, 0, &rows)
+                .chunks(16)
+                .map(|page| page.iter().map(|hash| Some(*hash)).collect())
+                .collect();
+            let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
+            let backings = pages.into_iter().map(KvPageBacking::Resident).collect();
+            assert!(kv.import_cached_at(&[], tokens, keys.clone(), backings));
+            let run = kv.cached_run(&keys);
+            kv.pin_resident(&run).expect("on the device").0
+        })
+    };
+    let pid = uuid::Uuid::new_v4();
+    planner.register(pid);
+    planner.note_admitted(pid);
+    let passes = || async {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let mut pin = filed();
+    {
+        let ask = planner.wait_bind_room(pid, 1, 2, 0);
+        tokio::pin!(ask);
+        assert!(futures::poll!(ask.as_mut()).is_pending(), "idle cache is pinned");
+        passes().await;
+        assert!(futures::poll!(ask.as_mut()).is_pending());
+        // The reader's end has idle cache found out asked again.
+        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.release_reader(pin));
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+            .await
+            .expect("woken by the reader's end");
+        assert!(matches!(served, Ok(crate::planner::BindRoomWait::Served)));
+    }
+    passes().await;
+    pin = filed();
+    {
+        let ask = planner.wait_bind_room(pid, 1, 2, 0);
+        tokio::pin!(ask);
+        assert!(futures::poll!(ask.as_mut()).is_pending(), "idle cache is pinned");
+        grow.walk_rung().await;
+        assert_eq!(cap(), u32::MAX, "a pass asks idle cache first");
+        passes().await;
+        grow.walk_rung().await;
+        assert_eq!(cap(), 1, "asked and found out: the rung comes down");
+    }
+    passes().await;
+    crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
+    {
+        let mut pool = shared.lock().unwrap();
+        pool.pool_mut().wait(crate::store::roles::GUEST_WAITER, list, 2);
+        pool.set_guest_head(Some((2, 1)));
+    }
+    planner.pages_freed();
+    grow.walk_rung().await;
+    assert_eq!(cap(), 1, "a bind outside the queue, idle cache pinned");
+    crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.release_reader(pin));
+}

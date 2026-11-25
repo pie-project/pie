@@ -116,6 +116,10 @@ impl ResidencyPlanner {
         // may have read before it came: the pass runs again on the pool as
         // it stands ([`super::grant::RoomReturns`]), so the drop, which
         // cannot plan itself, wakes the head within this step.
+        // What a reader held is idle cache again.
+        if self.returns.take_reader_ended() {
+            self.re_arm_idle_reclaim();
+        }
         // Edge-triggered: a wake on the generation the last no-step pass
         // ended on reads what that pass read, and plans nothing new. A
         // stuck head is said once and costs no pass until an event.
@@ -616,6 +620,10 @@ impl ResidencyPlanner {
         else {
             return;
         };
+        // A reader's end gives room back and plans again: a wait on it.
+        if self.port.readers_hold() {
+            return;
+        }
         // Every tier full with nothing runnable: no step can come, and the
         // lowest in the policy's order fails by name so the others proceed
         // ([`Self::fail_tiers_full`]): never read as a planner bug. Short
@@ -793,6 +801,12 @@ impl ResidencyPlanner {
         true
     }
 
+    /// The whole chunks an ask of `chunks` is short of: one at least, where
+    /// those free lie in no run it takes.
+    fn chunks_short(&self, chunks: u32) -> u32 {
+        chunks.saturating_sub(self.port.free_chunks()).max(1)
+    }
+
     /// One pass over the queue's heads; true where it ends waiting on a
     /// grow. Heads passed over this pass ([`Self::stuck_head`]) stay passed
     /// until [`Self::plan`] clears them.
@@ -813,7 +827,7 @@ impl ResidencyPlanner {
     /// that free pages would serve, nothing in flight). Read once a pass
     /// where the stall dump read its head before: a firing fleet's pass
     /// pays nothing more.
-    fn stuck_head(&self) -> Option<(EntryKey, ProcessId)> {
+    pub(super) fn stuck_head(&self) -> Option<(EntryKey, ProcessId)> {
         let stuck = self.with_inner(|inner| {
             let Some((key, waiter)) = inner.unmet_head() else {
                 // No head at all (none passed over): none to say again.
@@ -1092,13 +1106,17 @@ impl ResidencyPlanner {
                     // fleet that keeps decoding never stalls, and the bind
                     // waited behind it for good). Idle cache its tiers let
                     // below the device moves down before any is dropped.
-                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                    if self.demote_idle_for(
+                        self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        self.chunks_short(run.saturating_mul(pieces).saturating_add(singles)),
+                    ) {
                         self.plan_stopped("short of runs: idle cache moves down");
                         return false;
                     }
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
                         rs: true,
+                        chunks: self.chunks_short(run.saturating_mul(pieces).saturating_add(singles)),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1190,13 +1208,21 @@ impl ResidencyPlanner {
                         room_stood = Some(key);
                         continue;
                     }
-                    if self.demote_idle(self.port.chunks_as_pages(need.run.saturating_mul(need.pieces))) {
+                    if self.demote_idle_for(
+                        self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
+                        self.chunks_short(
+                            need.run.saturating_mul(need.pieces).saturating_add(need.singles),
+                        ),
+                    ) {
                         self.plan_stopped("bind short of runs: idle cache moves down");
                         return false;
                     }
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
                         rs: true,
+                        chunks: self.chunks_short(
+                            need.run.saturating_mul(need.pieces).saturating_add(need.singles),
+                        ),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1336,7 +1362,10 @@ impl ResidencyPlanner {
                     // the device moves down, else one set goes, and the
                     // restore tries again in what it left, before any
                     // resident moves for it.
-                    if self.demote_idle(self.port.chunks_as_pages(run.saturating_mul(pieces))) {
+                    if self.demote_idle_for(
+                        self.port.chunks_as_pages(run.saturating_mul(pieces)),
+                        self.chunks_short(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
+                    ) {
                         self.plan_stopped("restore short of runs: idle cache moves down");
                         return false;
                     }
@@ -1345,6 +1374,7 @@ impl ResidencyPlanner {
                             .port
                             .chunks_as_pages(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
                         rs: true,
+                        chunks: self.chunks_short(u32::try_from(room.chunks()).unwrap_or(u32::MAX)),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1422,6 +1452,7 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: count.max(queued),
                         rs: false,
+                        chunks: 0,
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
@@ -1485,6 +1516,7 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: as_pages,
                         rs: true,
+                        chunks: 0,
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {

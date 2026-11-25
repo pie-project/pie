@@ -7,14 +7,56 @@ impl BatchScheduler {
     /// Fires held for a refused chunk's move whose state has moved go
     /// again, ahead of what is queued, as fires of their own (no frame):
     /// their frame went when they were first sent.
+    /// Takes out of `pending` what the pipelines of held fires queued behind
+    /// them, launches and the copies that fill what they read: posted ahead
+    /// of the held fires, they would read what those have not written.
+    pub(super) fn hold_behind(held: &mut [HeldForPlacement], pending: &mut PendingQueue) {
+        if held.is_empty() {
+            return;
+        }
+        let holder = |held: &[HeldForPlacement], item: &QueuedItem| {
+            let pipeline = match item {
+                QueuedItem::Launch(launch) => launch.pipeline_id,
+                QueuedItem::PreLaunchCopy { pipeline_id, .. } => *pipeline_id,
+                _ => None,
+            }?;
+            held.iter().rposition(|batch| batch.holds(pipeline))
+        };
+        if !pending.iter().any(|item| holder(held, item).is_some()) {
+            return;
+        }
+        let mut kept = VecDeque::with_capacity(pending.len());
+        for item in std::mem::take(&mut pending.items) {
+            match holder(held, &item) {
+                Some(at) => held[at].later.push(item),
+                None => kept.push_back(item),
+            }
+        }
+        pending.replace(kept);
+    }
+
     pub(super) fn release_held(
         held: &mut Vec<HeldForPlacement>,
         pending: &mut PendingQueue,
         engine_id: EngineId,
     ) -> bool {
-        let (ready, mut waiting): (Vec<_>, Vec<_>) = std::mem::take(held)
-            .into_iter()
-            .partition(|batch| !crate::store::shared::refusals_pending(engine_id, &batch.chunks));
+        let (mut ready, mut waiting) = (Vec::new(), Vec::<HeldForPlacement>::new());
+        for batch in std::mem::take(held) {
+            // Behind an earlier held fire of a pipeline of its, whatever
+            // moved for it.
+            let behind = waiting.iter().any(|ahead| {
+                batch
+                    .requests
+                    .iter()
+                    .filter_map(|request| request.pipeline_id)
+                    .any(|pipeline| ahead.holds(pipeline))
+            });
+            if behind || crate::store::shared::refusals_pending(engine_id, &batch.chunks) {
+                waiting.push(batch);
+            } else {
+                ready.push(batch);
+            }
+        }
         // A move that found no free chunk below for some of its chunks is a
         // need like any other: the planner is asked for that many free
         // chunks, funded as a bind's room (idle cache, parked state down,
@@ -51,6 +93,16 @@ impl BatchScheduler {
         }
         let mut items = std::mem::take(&mut pending.items);
         for batch in ready.into_iter().rev() {
+            for item in batch.later.into_iter().rev() {
+                items.push_front(match item {
+                    QueuedItem::Launch(launch) => {
+                        let mut request = launch.into_request();
+                        request.frame = None;
+                        QueuedItem::Launch(QueuedLaunch::new(request))
+                    }
+                    item => item,
+                });
+            }
             for mut request in batch.requests.into_iter().rev() {
                 request.frame = None;
                 let mut launch = QueuedLaunch::new(request);
@@ -165,6 +217,7 @@ impl BatchScheduler {
                             requests: retired.requests,
                             solo: repeat,
                             funding: false,
+                            later: Vec::new(),
                         });
                         progress = true;
                         continue;

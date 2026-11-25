@@ -421,6 +421,10 @@ impl ResidencyPlanner {
         {
             return;
         }
+        // What a reader holds comes back as it ends: no one fails for it.
+        if self.port.readers_hold() {
+            return;
+        }
         let Some(victim_key) = self.pick_starvation_victim(cause) else {
             return;
         };

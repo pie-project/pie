@@ -524,6 +524,13 @@ pub fn planner_demand_waits(model: usize, engine: usize) -> bool {
     crate::planner::planner_for(model, engine).is_some_and(|planner| planner.demand_waits())
 }
 
+/// Whether idle cache may still give what a waiter of `engine`'s is short of
+/// ([`crate::planner::ResidencyPlanner::idle_gives`]).
+#[must_use]
+pub fn planner_idle_gives(model: usize, engine: usize) -> bool {
+    crate::planner::planner_for(model, engine).is_some_and(|planner| planner.idle_gives())
+}
+
 /// The most rows a pass still to run on `engine` asks of one fire; 0 where
 /// none asks.
 #[must_use]

@@ -773,6 +773,17 @@ struct HeldForPlacement {
     solo: bool,
     /// The planner was asked for the free chunks its move lacks.
     funding: bool,
+    /// What its fires' pipelines queued behind them, in order: each reads
+    /// what they write, so it goes behind them ([`BatchScheduler::hold_behind`]).
+    later: Vec<QueuedItem>,
+}
+
+impl HeldForPlacement {
+    fn holds(&self, pipeline: ProcessId) -> bool {
+        self.requests
+            .iter()
+            .any(|request| request.pipeline_id == Some(pipeline))
+    }
 }
 
 enum ControlSlotState {
@@ -1245,6 +1256,7 @@ impl BatchScheduler {
                 &mut refused_once,
                 engine_id,
             );
+            Self::hold_behind(&mut held_for_placement, &mut pending);
             progress |= Self::release_held(&mut held_for_placement, &mut pending, engine_id);
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC

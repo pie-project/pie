@@ -177,6 +177,9 @@ impl SharedGrow {
             // Read before the pool's lock: the planner reads the pool under
             // its own.
             let planner_waits = super::planner_demand_waits(self.model, self.engine);
+            // Idle cache yields before the rung does: a planner with a queue
+            // asks it first, and wakes the walk once it gives no more.
+            let idle_gives = super::planner_idle_gives(self.model, self.engine);
             let (current, retired) = self.epochs();
             // What a raise taken below owes the engine, and whether the
             // rung stood under it ([`SharedPool::raise_applied`]).
@@ -214,14 +217,14 @@ impl SharedGrow {
                 // within the budget, and comes down the same way: under
                 // the system's pressure, as the yield says.
                 let past = pool.pool().act_chunks(goal) < pool.pool().act_reserved();
-                let needed = pool.pool().waiting()
+                let needed = (pool.pool().waiting() && !idle_gives)
                     || (self.target.load(Ordering::Acquire) < pool.mapped_segments()
                         && self.no_room.load(Ordering::Acquire));
                 // An engine holding a rung the terms no longer fit is
                 // brought down at once too: a bind waits on it. So is a
                 // rung past what the admitted work needs while a process's
                 // demand waits for room.
-                let forced = cap > pool.fit_cap() || pool.told_unfit() || (waits && past);
+                let forced = cap > pool.fit_cap() || pool.told_unfit() || (waits && past && !idle_gives);
                 let waited = forced || !past || needed;
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
