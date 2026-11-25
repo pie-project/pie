@@ -674,6 +674,7 @@ impl Inner {
                     served: false,
                     withdrawn,
                     rise: None,
+                    ..
                 } => {
                     *withdrawn = true;
                     wake.push(notify.clone());

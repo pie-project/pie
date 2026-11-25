@@ -278,11 +278,6 @@ pub struct KvStore {
     /// The cache's entries by the node their last pages are in: an attach
     /// ages the entries on its own path, not every entry.
     by_owner: HashMap<NodeId, Vec<u64>>,
-    /// Per trie node, the epoch through which a fire may still read its
-    /// pages: the last a working set holding it was let go at (or a copy
-    /// into it was handed out at). An idle entry's pages go back after the
-    /// latest of its path's nodes and every fire in flight ([`Self::fence_of`]).
-    node_epochs: HashMap<NodeId, u64>,
     /// Entries already split at a step, by the entry and the pages kept.
     splits: HashSet<(u64, u64)>,
     owners: HashMap<ProcessId, usize>,
@@ -441,8 +436,9 @@ struct KeptEntry {
     last_use: Instant,
 }
 
-/// The reclaim order ([`KvStore::reclaim_order`]) a reclaim left, and the
-/// revisions it was read under: the table's, the entries' and the keys'.
+/// The reclaim order ([`KvStore::kept_order`]) a reclaim left, and the
+/// revisions it was read under: the entries' and the keys', and the
+/// table's where the disk tier keeps copies.
 /// Any change to what the order reads moves one of them, and the order is
 /// walked again; the reclaim's own drops and settles leave it in order.
 #[derive(Debug)]
@@ -542,7 +538,6 @@ impl KvStore {
             private_nonce: 0,
             cache: CacheMap::new(),
             by_owner: HashMap::new(),
-            node_epochs: HashMap::new(),
             splits: HashSet::new(),
             owners: HashMap::new(),
             keeps: false,
@@ -884,13 +879,20 @@ impl KvStore {
     /// segment an evacuation drained) waits until it retires. Closed by
     /// [`Self::settle`].
     pub fn begin_fire(&mut self) -> u64 {
-        self.seq += 1;
-        self.outstanding.insert(self.seq);
+        self.hand_out();
         self.seq
     }
 
+    fn hand_out(&mut self) {
+        self.seq += 1;
+        self.outstanding.insert(self.seq);
+        self.table.epochs(self.seq, self.retired_through());
+    }
+
     pub fn retire_idle(&mut self) {
-        self.pool.retire_through(self.retired_through());
+        let retired = self.retired_through();
+        self.table.epochs(self.seq, retired);
+        self.pool.retire_through(retired);
     }
 
     /// The last epoch every fire through which has retired.
@@ -907,32 +909,12 @@ impl KvStore {
         ws
     }
 
-    /// Stamps the nodes on `node`'s path: a fire handed out through `epoch`
-    /// may read their pages.
-    fn stamp_path(&mut self, node: NodeId, epoch: u64) {
-        for node in self.table.lineage(node) {
-            let stamp = self.node_epochs.entry(node).or_insert(0);
-            *stamp = (*stamp).max(epoch);
-        }
-    }
-
-    /// The epoch after which the pages an idle entry ending at `terminal`
-    /// holds alone may go back: the latest stamp on its path, at least
-    /// `epoch` (now). Stamps every fire has retired through are dropped.
-    fn fence_of(&mut self, terminal: NodeId, epoch: u64) -> u64 {
-        let retired = self.retired_through();
-        self.node_epochs.retain(|_, stamp| *stamp > retired);
-        self.table
-            .lineage(terminal)
-            .iter()
-            .filter_map(|node| self.node_epochs.get(node).copied())
-            .max()
-            .unwrap_or(0)
-            .max(epoch)
-    }
-
-    fn release_entry(&mut self, entry: KeptEntry, epoch: u64) -> usize {
-        let epoch = self.fence_of(entry.path.terminal, epoch);
+    /// Its device pages go back now, or where a fire in flight may still
+    /// read them (a set that left its path under one, a pin let go, a copy
+    /// into it) once that fire retires, never behind fires that read none
+    /// of them.
+    fn release_entry(&mut self, entry: KeptEntry) -> usize {
+        let epoch = self.table.read_through(entry.path.terminal);
         let freed = self.table.release_cache_root(entry.path.terminal);
         // Device pages: a host or disk slot given back seats no one.
         let count = freed
@@ -1008,7 +990,7 @@ impl KvStore {
 
     pub fn rekey(&mut self, domain: Hash256) -> usize {
         let keys: Vec<u64> = self.cache.keys().copied().collect();
-        let freed = self.drop_entries(keys, By::Client, self.current_epoch());
+        let freed = self.drop_entries(keys, By::Client);
         self.domain = domain;
         freed
     }
@@ -1041,10 +1023,10 @@ impl KvStore {
             .filter(|(_, entry)| entry.owner == Some(owner))
             .map(|(&key, _)| key)
             .collect();
-        self.drop_entries(keys, by, self.current_epoch())
+        self.drop_entries(keys, by)
     }
 
-    fn drop_entries(&mut self, keys: Vec<u64>, by: By, epoch: u64) -> usize {
+    fn drop_entries(&mut self, keys: Vec<u64>, by: By) -> usize {
         let mut freed = 0;
         for key in keys {
             if let Some(entry) = self.cache.remove(&key) {
@@ -1052,7 +1034,7 @@ impl KvStore {
                 self.unlist(key, entry.path.terminal);
                 self.splits.retain(|&(split, _)| split != key);
                 self.disown(&entry, by);
-                freed += self.release_entry(entry, epoch);
+                freed += self.release_entry(entry);
             }
         }
         self.forget_lost_copies();
@@ -1069,16 +1051,7 @@ impl KvStore {
     /// so what is left has none, and cached KV yields to running work,
     /// whatever its key. Pages the disk tier keeps a copy of settle there
     /// instead, at no cost, and their entries stay.
-    pub fn reclaim_cache(&mut self, epoch: u64, short: usize, keys: impl Keys) -> usize {
-        self.reclaim_cache_where(epoch, short, keys)
-    }
-
-    fn reclaim_cache_where(
-        &mut self,
-        epoch: u64,
-        short: usize,
-        keys: impl Keys,
-    ) -> usize {
+    pub fn reclaim_cache(&mut self, short: usize, keys: impl Keys) -> usize {
         // Pages an earlier reclaim freed are on their way back: what they
         // cover is not short.
         let short = short.saturating_sub(self.reclaim_returning());
@@ -1092,6 +1065,7 @@ impl KvStore {
         // what is short is freed, so it reads only the groups it reaches.
         let mut later = Vec::new();
         let mut reached = Vec::new();
+        let reads = self.table.live_reads();
         'passes: for last in [false, true] {
             let walk = if last {
                 std::mem::take(&mut later)
@@ -1102,19 +1076,32 @@ impl KvStore {
             for at in 0..count {
                 let at = if last { walk[at] } else { at };
                 let (key, ids) = &order[at];
-                let roots = self.roots(ids);
-                // A kept order may name a group its last reclaim settled
-                // whole on disk: it holds no device page now.
-                if roots.iter().all(|&root| !self.table.holds_resident(root)) {
+                // Of the group, what no live set reads, at rest on the
+                // device now: the order kept says none of that.
+                let ids: Vec<u64> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        self.cache.get(id).is_some_and(|entry| {
+                            let root = entry.path.terminal;
+                            self.table.unused_under(&reads, root)
+                                && !self.table.in_move_at(root)
+                                && self.table.holds_resident(root)
+                        })
+                    })
+                    .collect();
+                if ids.is_empty() {
                     continue;
                 }
+                let ids = &ids;
+                let roots = self.roots(ids);
                 if !last && !self.table.frees_device_pages(&roots) {
                     later.push(at);
                     continue;
                 }
                 let key = *key;
                 let before = freed;
-                freed += self.settle_on_disk(ids, key, &keys, epoch, short - freed);
+                freed += self.settle_on_disk(ids, key, &keys, short - freed);
                 if freed == before {
                     let ids: Vec<u64> = ids
                         .iter()
@@ -1131,12 +1118,17 @@ impl KvStore {
                             continue;
                         };
                         let set: Vec<u64> = self
-                            .cache
-                            .iter()
-                            .filter(|(_, e)| e.path.terminal == terminal)
-                            .map(|(&id, _)| id)
+                            .table
+                            .path_owner(terminal)
+                            .and_then(|owner| self.by_owner.get(&owner))
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|id| {
+                                self.cache.get(id).is_some_and(|e| e.path.terminal == terminal)
+                            })
                             .collect();
-                        freed += self.drop_entries(set, By::Host, epoch);
+                        freed += self.drop_entries(set, By::Host);
                         if freed >= short {
                             break;
                         }
@@ -1170,23 +1162,29 @@ impl KvStore {
         self.returning.len()
     }
 
-    /// [`Self::reclaim_order`], walked again (and the entries split at
-    /// their steps and persisted heads first) only when something it reads
-    /// changed since the last reclaim left it: a reclaim short of a page at
-    /// a time walked every cached entry under the lock every guest's fire
-    /// waits on, each time. A split joins entries, so it moves the order;
+    /// Every entry in [`Self::order_of`]'s groups, walked again (and the
+    /// entries split at their steps and persisted heads first) only when an
+    /// entry or a key changed since the last reclaim left it: a reclaim
+    /// short of a page at a time walked every cached entry under the lock
+    /// every guest's fire waits on, each time. What is in use or off the
+    /// device is read as the reclaim reaches it, so a decode's appends and
+    /// a fork move the order not at all. A split joins entries, so it moves the order;
     /// what would split again moves one of the revisions too.
     fn kept_order(&mut self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
+        // What splits at a persisted head moves with the table's pages.
+        let copies = self.persisted.as_ref().is_some_and(|p| !p.by_key.is_empty());
         let table = self.table.revision();
         let (entries, revision) = (self.entries_rev, keys.revision());
         if let Some(kept) = self.order.take().filter(|kept| {
-            kept.table == table && kept.entries == entries && Some(kept.keys) == revision
+            (kept.table == table || !copies)
+                && kept.entries == entries
+                && Some(kept.keys) == revision
         }) {
             return kept.groups;
         }
         self.split_at_steps(keys);
         self.split_persisted();
-        self.reclaim_order(keys)
+        self.order_of(keys, |_| true)
     }
 
     /// Keeps what of `order` a reclaim left (its dropped entries taken out),
@@ -1222,7 +1220,6 @@ impl KvStore {
         ids: &[u64],
         key: i64,
         keys: &impl Keys,
-        epoch: u64,
         most: usize,
     ) -> usize {
         if self.persisted.as_ref().is_none_or(|p| p.by_key.is_empty()) {
@@ -1256,6 +1253,11 @@ impl KvStore {
             moves.iter().for_each(|&(_, _, slot)| persisted.back(slot));
         }
         let freed = moves.len();
+        let epoch = moves
+            .iter()
+            .map(|(location, ..)| self.table.node_read_through(location.node))
+            .max()
+            .unwrap_or(0);
         tracing::debug!(
             target: "runtime::store::kv",
             pages = ?moves.iter().map(|&(_, gpu, slot)| (gpu.0, slot.0)).collect::<Vec<_>>(),
@@ -1368,14 +1370,25 @@ impl KvStore {
         if unused.is_empty() {
             return Vec::new();
         }
+        self.order_of(keys, |root| {
+            unused.contains(&root) && !self.table.in_move_at(root) && held(&self.table, root)
+        })
+    }
+
+    /// The entries whose terminal `of` takes, in groups, the first to go
+    /// first.
+    fn order_of(
+        &self,
+        keys: &impl Keys,
+        of: impl Fn(NodeId) -> bool,
+    ) -> Vec<(i64, Vec<u64>)> {
         type Group = (Vec<u64>, Instant);
         // An owner's entries group by their row's key; an entry no process
         // owns (a sealed prefix an exited set left) is a group of its own,
         // never pooled with every other exited set's.
         let mut groups: HashMap<(Result<ProcessId, u64>, i64), Group> = HashMap::new();
         for (&id, entry) in &self.cache {
-            let root = entry.path.terminal;
-            if !unused.contains(&root) || self.table.in_move_at(root) || !held(&self.table, root) {
+            if !of(entry.path.terminal) {
                 continue;
             }
             let key = keys.key_at(entry.owner, self.key_token(entry.path.pages));
@@ -1465,7 +1478,7 @@ impl KvStore {
             return 0;
         }
         tracing::debug!(target: "pie::retention", entries = gone.len(), "dropped: their row allows no tier they are on");
-        self.drop_entries(gone, By::Policy, self.current_epoch())
+        self.drop_entries(gone, By::Policy)
     }
 
     /// [`Self::prepare_demote`], or (`now`) only cache whose row keeps it
@@ -2459,7 +2472,7 @@ impl KvStore {
         self.table.lease_cache_root(node);
         // The copy filling its pages is handed out with the fires after now.
         let now = self.current_epoch().saturating_add(1);
-        self.stamp_path(node, now);
+        self.table.stamp_path(node, None, now);
         // An entry's pages are its path's, from token 0: the prefix it was
         // grafted below as well as its own.
         let pages = self.table.path_len(node);
@@ -2687,7 +2700,7 @@ impl KvStore {
         // Its fires through `epoch` may still read what its path holds,
         // whatever stays cached of it.
         if let Ok(Some(terminal)) = self.table.terminal(ws) {
-            self.stamp_path(terminal, epoch);
+            self.table.stamp_path(terminal, None, epoch);
         }
         // Only a set that shares leaves its prefix for others to find.
         if self.keeps && self.shares(ws) {
@@ -3349,8 +3362,7 @@ impl KvStore {
             });
         }
 
-        self.seq += 1;
-        self.outstanding.insert(self.seq);
+        self.hand_out();
         Ok(KvPreparedWrite {
             ws,
             targets,
@@ -3897,7 +3909,7 @@ impl KvStore {
             if freed(self) >= wanted {
                 break;
             }
-            self.drop_entries(vec![id], By::Host, self.current_epoch());
+            self.drop_entries(vec![id], By::Host);
         }
         tracing::debug!(target: "pie::kv", wanted, freed = freed(self), "disk copies given up for swap");
     }
@@ -3952,7 +3964,7 @@ impl KvStore {
             if self.host_pool.available() >= wanted {
                 break;
             }
-            self.drop_entries(vec![id], By::Host, self.current_epoch());
+            self.drop_entries(vec![id], By::Host);
             dropped.push(key);
         }
         tracing::debug!(target: "pie::kv", entries = dropped.len(), keys = ?dropped, wanted, ?below, "dropped off device");

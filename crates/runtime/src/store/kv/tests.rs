@@ -100,7 +100,7 @@ fn tests_every_case() {
     a_demote_leaves_what_a_higher_key_covers();
     idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
-    idle_cache_comes_back_past_the_fires_in_flight();
+    idle_cache_comes_back_past_the_fires_that_read_it();
     among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
     a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
@@ -486,21 +486,21 @@ fn store_reclaims_cache_lowest_rank_first_and_spares_what_live_ones_read() {
     let rank = |owner: Option<ProcessId>| i64::from(owner == Some(kept));
 
     // Equal ranks: the one used longest ago goes, and alone.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
+    assert_eq!(store.reclaim_cache(1, rank), 2);
     assert!(!store.owns_cache(old) && store.owns_cache(new));
     assert_eq!(on_device(&mut store, &old_tokens), 0);
 
     // A live working set reads `new`, so dropping it would free nothing:
     // the higher-ranked one goes instead.
     let reader = reader(&mut store, &new_tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
+    assert_eq!(store.reclaim_cache(1, rank), 2);
     assert!(store.owns_cache(new) && !store.owns_cache(kept));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
+    assert_eq!(store.reclaim_cache(1, rank), 0);
 
     // Once nothing reads it, it can go too.
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
+    assert_eq!(store.reclaim_cache(1, rank), 2);
     assert!(store.cached_working_sets().is_empty());
 
     // An owner's whole cached working-set goes when the policy drops it.
@@ -533,16 +533,16 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
 
     // The running process's entries are the older, but freeing pages
     // means taking the idle one, and only it.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
+    assert_eq!(store.reclaim_cache(1, rank), 2);
     assert!(store.owns_cache(running) && !store.owns_cache(idle));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 0);
+    assert_eq!(store.reclaim_cache(1, rank), 0);
     assert_eq!(entries(&store, running), 4);
 
     // Once it ends they are the cache's alone, and go.
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
     assert_eq!(store.available_pages(), 4);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 4);
+    assert_eq!(store.reclaim_cache(1, rank), 4);
     assert!(store.cached_working_sets().is_empty());
 
     // A reader of a shorter prefix spares only what it reads: the longer
@@ -555,11 +555,11 @@ fn reclaim_spares_the_prefixes_a_live_working_set_kept() {
     }
     store.release_working_set(ws, store.current_epoch());
     let reader = reader(&mut store, &tokens, 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
+    assert_eq!(store.reclaim_cache(1, rank), 2);
     assert_eq!(entries(&store, idle), 2);
     assert_eq!(on_device(&mut store, &tokens), 2);
     store.release_working_set(reader, store.current_epoch());
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, rank), 2);
+    assert_eq!(store.reclaim_cache(1, rank), 2);
     assert_eq!(store.available_pages(), 8);
 }
 
@@ -1295,7 +1295,7 @@ fn what_decode_wrote_is_reclaimed_before_the_prompt_where_a_row_keys_it_below() 
     let reader = store.create_shared_working_set();
     let keys = keys_ahead(&store, reader, 0, &tokens);
     assert_eq!(store.cached_run(&keys).len(), 2);
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, TailBelow), 1);
+    assert_eq!(store.reclaim_cache(1, TailBelow), 1);
     assert_eq!(store.cached_run(&keys).len(), 1, "the prompt's page stays");
 }
 
@@ -1309,7 +1309,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
         .expect("three cache-only pages");
     assert_eq!(txn.page_count(), 3);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
+        store.reclaim_cache(1, |_| 0),
         0,
         "a group in a move is not dropped"
     );
@@ -1318,7 +1318,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     assert_eq!(store.available_pages(), 8);
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
+        store.reclaim_cache(1, |_| 0),
         0,
         "nothing on the device to free"
     );
@@ -1340,7 +1340,7 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     store.release_reader(pin);
     store.release_working_set(reader, store.current_epoch());
     store.retire_idle();
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, |_| 0), 3);
+    assert_eq!(store.reclaim_cache(1, |_| 0), 3);
     assert_eq!(store.available_pages(), 8);
 }
 
@@ -1403,19 +1403,19 @@ fn a_tail_past_its_step_goes_before_another_head() {
         entries: vec![(a, None, -1), (a, Some(40), 0), (b, None, -1)],
     };
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, keys.clone()),
+        store.reclaim_cache(1, keys.clone()),
         1,
         "A's tail"
     );
     assert_eq!(on_device(&mut store, &a_tokens), 3);
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, keys.clone()),
+        store.reclaim_cache(1, keys.clone()),
         4,
         "B whole"
     );
     assert_eq!(on_device(&mut store, &b_tokens), 0);
     assert_eq!(on_device(&mut store, &a_tokens), 3, "A's head stays");
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keys.clone()), 3);
+    assert_eq!(store.reclaim_cache(1, keys.clone()), 3);
     assert_eq!(store.available_pages(), 16);
 }
 
@@ -1472,7 +1472,7 @@ fn idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted() {
     }
     assert_eq!(store.host_swap_available(), 8, "the host is untouched");
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, Rows(100, DEVICE)),
+        store.reclaim_cache(1, Rows(100, DEVICE)),
         3,
         "it is dropped, however high its key"
     );
@@ -1518,7 +1518,7 @@ fn among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt() {
     store.fold(ws, 40, true).unwrap();
     store.release_working_set(ws, store.current_epoch());
     store.retire_idle();
-    assert!(store.reclaim_cache(store.current_epoch(), 1, |_| 0) >= 1);
+    assert!(store.reclaim_cache(1, |_| 0) >= 1);
     assert_eq!(on_device(&mut store, &other), 0, "the older prompt goes first");
     assert_eq!(on_device(&mut store, &tokens), 2, "the newer answer stays");
 }
@@ -1723,19 +1723,18 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
     let run = store.cached_run_any_tier(&keys);
     assert_eq!(store.below_device(&run), 0, "the pages are on the device");
 
-    let epoch = store.current_epoch();
     assert_eq!(
-        store.reclaim_cache(epoch, 1, Steps::default()),
+        store.reclaim_cache(1, Steps::default()),
         1,
         "settled as far as is short"
     );
-    assert_eq!(store.reclaim_cache(epoch, 3, Steps::default()), 2);
+    assert_eq!(store.reclaim_cache(3, Steps::default()), 2);
     let run = store.cached_run_any_tier(&keys);
     assert_eq!(run.len(), 3, "the entry stays");
     assert_eq!(store.below_device(&run), 3, "settled on its copies");
     assert_eq!(store.disk_pool.available(), 5, "with nothing copied");
     assert_eq!(
-        store.reclaim_cache(epoch, 1, Steps::default()),
+        store.reclaim_cache(1, Steps::default()),
         0,
         "what is on disk alone frees no device page"
     );
@@ -1809,8 +1808,7 @@ fn a_persisted_prefix_is_a_run() {
     assert_eq!(persisted, expected);
 
     let ids: Vec<u64> = store.cache.keys().copied().collect();
-    let epoch = store.current_epoch();
-    store.drop_entries(ids, crate::policy::By::Host, epoch);
+    store.drop_entries(ids, crate::policy::By::Host);
     assert_eq!(
         store.persisted_pages(),
         0,
@@ -1929,17 +1927,18 @@ fn a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_deman
     assert_eq!(on_device(&mut store, &unkept_tokens), 3);
     // The policy keys one higher: a demand reclaims the lower first.
     let keep = move |owner: Option<ProcessId>| i64::from(owner == Some(kept));
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keep), 3);
+    assert_eq!(store.reclaim_cache(1, keep), 3);
     assert_eq!(on_device(&mut store, &unkept_tokens), 0, "the lower key goes first");
     assert_eq!(on_device(&mut store, &kept_tokens), 3, "the higher stays");
     // No lower tier to move to: cached KV yields to the next demand,
     // whatever its key.
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keep), 3);
+    assert_eq!(store.reclaim_cache(1, keep), 3);
     assert_eq!(on_device(&mut store, &kept_tokens), 0);
 }
 
-/// Idle cache dropped while fires are in flight goes back once they retire.
-fn idle_cache_comes_back_past_the_fires_in_flight() {
+/// Idle cache dropped goes back at once, whatever fires of others are in
+/// flight; what a fire in flight reads, once that fire retires.
+fn idle_cache_comes_back_past_the_fires_that_read_it() {
     let mut store = KvStore::new(8, h(41));
     let owner = ProcessId::from_u128(46);
     kept_and_gone(&mut store, 20, 3, owner);
@@ -1948,15 +1947,13 @@ fn idle_cache_comes_back_past_the_fires_in_flight() {
     let busy = store.begin_fire();
     let other = store.begin_fire();
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
+        store.reclaim_cache(1, |_| 0),
         3,
         "dropped"
     );
-    assert_eq!(store.available_pages(), 5, "fires in flight");
+    assert_eq!(store.available_pages(), 8, "back at once: no fire reads it");
     store.settle(busy);
     store.settle(other);
-    store.retire_idle();
-    assert_eq!(store.available_pages(), 8, "back once they retire");
 
     // A reader holds it in a fire now in flight, and lets go.
     let tokens = kept_and_gone(&mut store, 21, 3, owner);
@@ -1965,7 +1962,7 @@ fn idle_cache_comes_back_past_the_fires_in_flight() {
     store.release_working_set(ws, read);
     store.retire_idle();
     assert_eq!(
-        store.reclaim_cache(store.current_epoch(), 1, |_| 0),
+        store.reclaim_cache(1, |_| 0),
         3,
         "dropped"
     );
@@ -1978,6 +1975,18 @@ fn idle_cache_comes_back_past_the_fires_in_flight() {
     store.settle(read);
     store.retire_idle();
     assert_eq!(store.available_pages(), 8, "and back once it retires");
+
+    // A reader cut back under a fire that reads the whole of it, the pages
+    // it left the cache's alone.
+    let tokens = kept_and_gone(&mut store, 22, 3, owner);
+    let ws = reader(&mut store, &tokens, 3);
+    let read = store.begin_fire();
+    store.table.truncate(ws, 1, 1).unwrap();
+    store.reclaim_cache(2, |_| 0);
+    store.retire_idle();
+    assert_eq!(store.available_pages(), 5, "the fire that reads them is in flight");
+    store.settle(read);
+    assert_eq!(store.available_pages(), 7, "all but the page it still holds");
 }
 
 /// A process waiting for admission is told when its prompt's prefix joins
@@ -2173,7 +2182,7 @@ fn the_default_policy_drops_what_an_exit_left_and_noop_demotes_it() {
         store.prepare_demote(8, Installed).unwrap().is_none(),
         "nothing moves: its row keeps it off the host"
     );
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, Installed), 3, "dropped");
+    assert_eq!(store.reclaim_cache(1, Installed), 3, "dropped");
     assert_eq!(on_device(&mut store, &tokens), 0);
     assert!(store.cached_working_sets().is_empty());
     assert_eq!(store.host_swap_available(), 8, "nothing went to the host");
@@ -2322,7 +2331,7 @@ async fn a_first_ask_takes_idle_cache_with_no_tier_below() {
         planner.unregister(pid);
     }
     registry::with_kv_lock(&stores.kv, "test", |kv| {
-        kv.reclaim_cache(kv.current_epoch(), 8, floor);
+        kv.reclaim_cache(8, floor);
         kv.retire_idle();
         let ws = kv.create_shared_working_set();
         sealed(kv, ws, &prompt(0xc0, 6));

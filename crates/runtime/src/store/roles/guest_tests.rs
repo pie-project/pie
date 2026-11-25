@@ -963,6 +963,7 @@ fn waiting_bind<'a>(
         move |prefix, run| super::grow_for_guest(device, engine_id, prefix, run),
         move || Some(roles.lock().unwrap().room_watch()),
         move |run, pieces, singles| roles.lock().unwrap().room_free(run, pieces, singles),
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         |_, _, _| false,
         move |_, _, _| {
             asked.set(asked.get() + 1);
@@ -1676,6 +1677,53 @@ fn rebinds_never_name_an_emptied_guest_part_over_random_park_and_restore_schedul
     assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// A bind short of room waits for what idle cache gives, its process running
+/// on, as often as that serves it; suspended only once idle cache is out.
+#[tokio::test(flavor = "current_thread")]
+async fn a_bind_takes_idle_cache_s_room_before_its_process_is_suspended() {
+    use crate::planner::BindRoomWait;
+    use std::cell::RefCell;
+    let short = || {
+        anyhow::Error::new(RolesError::BindShort(Box::new(RolesError::Short {
+            role: SlotRole::Instance,
+            slots: 3,
+        })))
+    };
+    let did = RefCell::new(Vec::new());
+    let mut gives = vec![BindRoomWait::IdleOut, BindRoomWait::Served, BindRoomWait::Served];
+    let gives = RefCell::new(&mut gives);
+    let bound = super::bind_when_resident(
+        holder(7),
+        || {
+            did.borrow_mut().push("bind");
+            let binds = did.borrow().iter().filter(|step| **step == "bind").count();
+            std::future::ready(if binds <= 3 { Err(short()) } else { Ok(()) })
+        },
+        || std::future::ready(Ok::<(), String>(())),
+        |_, _| std::future::ready(Ok::<(), String>(())),
+        || None,
+        |_, _, _| false,
+        |_, _, _| {
+            did.borrow_mut().push("idle");
+            std::future::ready(Ok(gives.borrow_mut().pop().expect("asked no more once out")))
+        },
+        |_, _, _| {
+            did.borrow_mut().push("suspend");
+            true
+        },
+        |_, _, _| std::future::ready(Ok::<_, String>(BindRoomWait::Served)),
+        || {},
+        |_| {},
+        || std::future::ready(()),
+    )
+    .await;
+    assert!(bound.is_ok(), "{bound:?}");
+    assert_eq!(
+        did.into_inner(),
+        ["bind", "idle", "bind", "idle", "bind", "idle", "suspend", "bind"]
+    );
+}
+
 /// Suspended once for its bind's room and restored, a process whose bind is
 /// short again waits parked in the planner for the room, and binds once
 /// served; it is suspended once only, never in a cycle of suspend, restore and
@@ -1706,6 +1754,7 @@ async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
         |_, _| std::future::ready(Ok::<(), String>(())),
         || None,
         |_, _, _| false,
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         {
             let suspends = suspends.clone();
             move |_, _, _| {
@@ -2208,6 +2257,7 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
             let roles = roles.clone();
             move |run, pieces, singles| roles.lock().unwrap().room_free(run, pieces, singles)
         },
+        |_, _, _| std::future::ready(Ok(crate::planner::BindRoomWait::IdleOut)),
         |_, _, _| false,
         {
             // The planner: asked beside the commit, it makes room only once
