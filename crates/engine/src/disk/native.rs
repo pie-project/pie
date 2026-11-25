@@ -688,8 +688,9 @@ mod tests {
             for slot in 0..file.slots() {
                 file.write(slot, stage.as_slice()).unwrap();
             }
+            // The filesystem's own block for the file's extents counts too.
             assert!(
-                used() <= budget,
+                used() <= budget + crate::disk::ALIGN as u64,
                 "{} bytes on disk for a budget of {budget}",
                 used()
             );
