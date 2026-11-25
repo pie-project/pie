@@ -934,9 +934,33 @@ impl PendingQueue {
         idx
     }
 
-    fn rotate_launch_run_to_back(&mut self, run_len: usize) {
-        self.items.rotate_left(run_len);
+    /// The item at `at` comes to the front; every other keeps its order. A
+    /// launch never moves behind a later one: a cut pass's pieces, each
+    /// reading what the one before it writes, reach the device in the order
+    /// they were queued.
+    fn bring_to_front(&mut self, at: usize) {
+        if let Some(item) = self.items.remove(at) {
+            self.items.push_front(item);
+        }
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// A launch queued behind a later one of its pipeline, `(pipeline, the
+    /// later fire ahead, the fire behind it)`: a mover of the queue broke
+    /// their order.
+    fn out_of_order(&self) -> Option<(ProcessId, u64, u64)> {
+        let mut last: HashMap<ProcessId, u64> = HashMap::new();
+        self.items.iter().find_map(|item| {
+            let QueuedItem::Launch(launch) = item else {
+                return None;
+            };
+            let pipeline = launch.pipeline_id?;
+            let fire = launch.request.logical_fire_id;
+            match last.insert(pipeline, fire) {
+                Some(ahead) if ahead > fire => Some((pipeline, ahead, fire)),
+                _ => None,
+            }
+        })
     }
 
     fn insert_before_closes(&mut self, item: QueuedItem) {
