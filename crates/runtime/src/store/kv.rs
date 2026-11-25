@@ -372,6 +372,7 @@ impl Persisted {
 
 /// Persisting a run: its resident pages, each copied to a fresh disk slot
 /// while it stays where it is.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct KvPersistTxn {
     pages: Vec<(
@@ -381,22 +382,6 @@ pub struct KvPersistTxn {
         journal::PageRecord,
     )>,
     pinned: NodeId,
-    shape: Option<::engine::chunk::ShapeId>,
-}
-
-impl KvPersistTxn {
-    /// The list shape the pages are slots of, on a shared pool.
-    pub fn shape(&self) -> Option<::engine::chunk::ShapeId> {
-        self.shape
-    }
-
-    /// The device pages to copy, and the disk slots they go to.
-    pub fn copy_plan(&self) -> (Vec<u32>, Vec<u32>) {
-        self.pages
-            .iter()
-            .map(|(_, gpu, slot, _)| (gpu.0, slot.0))
-            .unzip()
-    }
 }
 
 type HeldPage = (DiskKvSlotId, journal::PageRecord);
@@ -3930,6 +3915,7 @@ impl KvStore {
     /// copy of each resident page goes to a fresh disk slot while the page
     /// stays where it is. `None` when nothing is left to copy, or the disk
     /// tier is not kept or full; never at swap's cost.
+    #[cfg(test)]
     pub fn prepare_persist(&mut self, keys: &[Hash256], retention: i64) -> Option<KvPersistTxn> {
         let run = self.table.sealed_run(keys, false);
         self.raise_retention(keys, &run, retention);
@@ -3975,12 +3961,12 @@ impl KvStore {
                 .map(|((location, gpu, record), slot)| (location, gpu, slot, record))
                 .collect(),
             pinned,
-            shape: self.shape,
         })
     }
 
     /// Keeps the copies `run` already has under `retention` where that is
     /// higher than the key they were kept under, in the journal too.
+    #[cfg(test)]
     fn raise_retention(&mut self, keys: &[Hash256], run: &[TriePageLocation], retention: i64) {
         let Some(persisted) = &mut self.persisted else {
             return;
@@ -4026,6 +4012,7 @@ impl KvStore {
 
     /// The copies landed: the journal names them, durably. Answers the pages
     /// persisted.
+    #[cfg(test)]
     pub fn commit_persist(&mut self, txn: KvPersistTxn) -> usize {
         self.unpin_persist(&txn);
         let Some(persisted) = &mut self.persisted else {
@@ -4060,13 +4047,7 @@ impl KvStore {
         count
     }
 
-    /// The copies did not land: their slots go back.
-    pub fn abort_persist(&mut self, txn: KvPersistTxn) {
-        self.unpin_persist(&txn);
-        self.disk_pool
-            .release_reserved(txn.pages.into_iter().map(|(.., slot, _)| slot).collect());
-    }
-
+    #[cfg(test)]
     fn unpin_persist(&mut self, txn: &KvPersistTxn) {
         let mut freed = self.table.unpin(txn.pinned);
         freed.extend(

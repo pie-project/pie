@@ -1973,7 +1973,7 @@ fn a_persisted_run_settles_on_disk_and_outlives_hits_and_restarts() {
     let txn = store
         .prepare_persist(&keys, 0)
         .expect("three pages to copy");
-    assert_eq!(txn.copy_plan().0.len(), 3);
+    assert_eq!(txn.pages.len(), 3);
     assert!(
         store.prepare_persist(&keys, 0).is_none(),
         "pages in a copy are copied once"
