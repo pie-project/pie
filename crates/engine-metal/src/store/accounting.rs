@@ -133,6 +133,61 @@ impl Accounting {
     }
 }
 
+/// What a load of a trace needs of a device before a weight is read, by the
+/// rule [`Accounting::admit`] applies: every plane resident, the pool one
+/// sequence at the context takes, and the driver's floor, against the ceiling
+/// `device_memory_share` leaves. The arena scratch is not counted: a load
+/// narrows its forward width until the scratch fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Need {
+    /// `recommendedMaxWorkingSetSize`.
+    pub working_set: u64,
+    /// What `device_memory_share` of the working set allows, with nothing held elsewhere.
+    pub ceiling: u64,
+    /// Every plane, at its stored dtype and the device's alignment.
+    pub weights: u64,
+    /// The kv pages and state slot of one sequence at the context.
+    pub pool: u64,
+    /// The driver's safety floor.
+    pub floor: u64,
+}
+
+impl Need {
+    /// `trace`'s need at `context` tokens on `page_size` pages, on a device
+    /// of `working_set` bytes of which the load may take `utilization`.
+    pub fn of(
+        trace: &poem_ir::Trace,
+        context: u32,
+        page_size: u32,
+        working_set: u64,
+        utilization: f64,
+    ) -> Result<Need> {
+        let weights = crate::weights::plane_bytes(trace)?
+            .iter()
+            .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+            .sum();
+        let paging = crate::store::kv::Paging::of(page_size, context, 1, 1).map_err(Fault::from)?;
+        let pool = crate::store::PoolDemand::of(trace, paging, None)?
+            .bytes(u64::from(paging.pages_per_slot));
+        let accounting = Accounting::of(working_set, 0, utilization, weights, pool);
+        Ok(Need {
+            working_set,
+            ceiling: accounting.ceiling,
+            weights,
+            pool,
+            floor: accounting.floor,
+        })
+    }
+
+    /// The bytes the load takes in all.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.weights
+            .saturating_add(self.pool)
+            .saturating_add(self.floor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Accounting;

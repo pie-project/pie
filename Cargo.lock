@@ -4148,6 +4148,8 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "tar",
  "tempfile",
  "tokenizer",
