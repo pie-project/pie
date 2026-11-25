@@ -371,21 +371,21 @@ impl Windows {
             .max(1)
     }
 
+    /// Run `run` of region `region`'s window; `None` past the runs this
+    /// fire cut the region into ([`Self::runs`]).
     #[must_use]
-    pub fn at(&self, region: u32, run: u32) -> &Window {
+    pub fn at(&self, region: u32, run: u32) -> Option<&Window> {
         self.of_region
             .get(region as usize)
             .filter(|&&(_, runs)| run < runs)
             .and_then(|&(start, _)| self.runs.get((start + run) as usize))
             .and_then(|index| self.windows.get(*index as usize))
-            .unwrap_or_else(|| {
-                panic!(
-                    "region {region} has no run {run}; this fire cut it into {} \
-                     over a template of {}",
-                    self.runs(region),
-                    self.of_region.len()
-                )
-            })
+    }
+
+    /// The regions this fire's windows are cut over.
+    #[must_use]
+    pub fn regions(&self) -> usize {
+        self.of_region.len()
     }
 }
 
