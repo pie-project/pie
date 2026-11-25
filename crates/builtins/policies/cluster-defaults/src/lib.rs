@@ -80,6 +80,21 @@ pub fn named(process: &snapshot::Process) -> Option<WorkerId> {
     }
 }
 
+/// The one worker a process can run on: it holds its session's handles.
+pub fn tied(process: &snapshot::Process) -> Option<WorkerId> {
+    match snapshot::get_attr(&Subject::Process(process.id.clone()), "pie/tied") {
+        Some(Value::Text(tied)) => Some(tied),
+        _ => None,
+    }
+}
+
+/// The row that moves a process from `from` to `to`, then to any other of
+/// `serving`.
+pub fn move_row(to: &WorkerId, from: &WorkerId, serving: &[WorkerId]) -> Vec<WorkerId> {
+    let rest = serving.iter().filter(|w| *w != to && *w != from);
+    std::iter::once(to).chain(rest).cloned().collect()
+}
+
 /// Where `session` ranks `worker` (rendezvous hashing: FNV-1a over both,
 /// mixed): the highest is its worker. One that joins or leaves moves only
 /// the sessions it ranks first for.
@@ -138,8 +153,8 @@ impl Placement {
                 .filter(|load| !load.full())
                 .map(|load| load.id.clone())
                 .collect();
-            let tied = snapshot::get_attr(&Subject::Process(process.id.clone()), "pie/tied");
-            if let Some(Value::Text(tied)) = &tied {
+            let tied = tied(process);
+            if let Some(tied) = &tied {
                 // Gone, it has no row: its gateway says its handles went.
                 if !known.contains(tied) {
                     continue;

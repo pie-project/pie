@@ -12,6 +12,7 @@ members = [
     "deadline",
     "default",
     "default-cluster",
+    "drain-migrate",
     "fair",
     "keep-session",
     "noop",

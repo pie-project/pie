@@ -2,6 +2,7 @@
 
 mod deadline;
 mod defaults;
+mod drain_migrate;
 mod fair;
 mod keep_session;
 mod pin;
