@@ -1710,7 +1710,7 @@ impl Shell {
         }
         let seats = self.weights.seats();
         let landed = bundle
-            .planes(&crate::adapter::banks(&seats))
+            .planes(&crate::adapter::banks(&seats), engine::bundle::Rank::WHOLE)
             .map_err(Fault::from)
             .and_then(|built| {
                 let planes: Vec<AdapterPlane<'_>> = built

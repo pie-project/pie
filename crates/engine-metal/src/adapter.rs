@@ -19,6 +19,7 @@ pub fn banks(seats: &[BankSeat]) -> Vec<engine::bundle::Bank<'_>> {
             cols: seat.cols,
             slot: seat.slot,
             dtype: seat.dtype,
+            shard: &seat.shard,
         })
         .collect()
 }

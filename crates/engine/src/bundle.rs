@@ -4,11 +4,15 @@
 //! one channel, and an engine writes it into one adapter slot, keyed by its
 //! digest so that every pass attaching the same bytes shares that slot. The
 //! reading and the refusals are the same on every engine; each engine zeroes
-//! the banks a bundle does not bring when it writes the slot.
+//! the banks a bundle does not bring when it writes the slot. A bundle holds
+//! each bank whole, and a rank of a tensor-parallel deployment takes the share
+//! of it its bank holds.
+
+use std::borrow::Cow;
 
 use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
-use poem_ir::Dtype;
+use poem_ir::{Dtype, Shard};
 
 /// The sink name `kernel::adapter(bundle)` emits.
 pub const SINK: &str = "adapter";
@@ -26,6 +30,22 @@ pub struct Bank<'a> {
     pub slot: u64,
     /// The element type the bank holds.
     pub dtype: Dtype,
+    /// How the ranks cut the bank, as the trace this rank runs states it:
+    /// its axis counts the slot axis, and its segments are this rank's.
+    pub shard: &'a Shard,
+}
+
+/// Which rank of how many an engine is in the ranks its deployment is split
+/// across.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rank {
+    pub rank: u32,
+    pub world: u32,
+}
+
+impl Rank {
+    /// The one rank of a deployment no ranks split.
+    pub const WHOLE: Rank = Rank { rank: 0, world: 1 };
 }
 
 /// Why an engine will not bind a bundle: the bank or tensor it is about
@@ -256,10 +276,15 @@ impl<'a> Bundle<'a> {
     }
 
     /// One whole-slot plane per tensor, in the dtype of the bank it names.
-    /// Refuses, naming the tensor, one that names no bank of `banks` (the
-    /// bundle was trained for another program) or whose shape is not that
-    /// bank's without the slot axis.
-    pub fn planes(&self, banks: &[Bank<'_>]) -> Result<Vec<(String, Vec<u8>)>, Refusal> {
+    /// Each tensor is the bank whole, so on `rank` it is first cut to the
+    /// rank's share of the bank's cut. Refuses, naming the tensor, one that
+    /// names no bank of `banks` (the bundle was trained for another program)
+    /// or whose shape is not that bank's whole without the slot axis.
+    pub fn planes(
+        &self,
+        banks: &[Bank<'_>],
+        rank: Rank,
+    ) -> Result<Vec<(String, Vec<u8>)>, Refusal> {
         self.tensors
             .iter()
             .map(|tensor| {
@@ -274,22 +299,28 @@ impl<'a> Bundle<'a> {
                                 .to_string(),
                         )
                     })?;
-                let (rows, cols) = match tensor.shape.split_first() {
+                let (shape, bytes) = tensor.share(bank, rank).map_err(refuse)?;
+                let (rows, cols) = match shape.split_first() {
                     Some((rows, rest)) => (*rows, rest.iter().product()),
                     None => (1, 1),
                 };
                 if (rows, cols) != (bank.rows, bank.cols) {
+                    let share = if shape == tensor.shape {
+                        String::new()
+                    } else {
+                        format!(", {shape:?} on this rank,")
+                    };
                     return Err(refuse(format!(
-                        "has shape {:?} and the bank holds {} x {} values a slot",
+                        "has shape {:?}{share} and the bank holds {} x {} values a slot",
                         tensor.shape, bank.rows, bank.cols
                     )));
                 }
                 let mut plane = vec![0u8; usize::try_from(bank.slot).unwrap_or(usize::MAX)];
-                let values = tensor.bytes.chunks_exact(tensor.dtype.bytes());
+                let values = bytes.chunks_exact(tensor.dtype.bytes());
                 let wrote = match bank.dtype {
                     dtype if tensor.dtype.is(dtype) => plane
-                        .get_mut(..tensor.bytes.len())
-                        .map(|to| to.copy_from_slice(tensor.bytes)),
+                        .get_mut(..bytes.len())
+                        .map(|to| to.copy_from_slice(&bytes)),
                     Dtype::Bf16 => plane.get_mut(..values.len() * 2).map(|to| {
                         for (to, value) in to.as_chunks_mut::<2>().0.iter_mut().zip(values) {
                             to.copy_from_slice(&bf16(tensor.dtype.value(value)).to_le_bytes());
@@ -316,6 +347,78 @@ impl<'a> Bundle<'a> {
                 Ok((tensor.name.clone(), plane))
             })
             .collect()
+    }
+}
+
+impl<'a> Tensor<'a> {
+    /// This tensor, which holds `bank` whole, cut to the share `rank` holds:
+    /// along the bank's cut, each segment's band of the whole, a segment of
+    /// fewer heads than ranks held whole by each rank of its group, as
+    /// `poem::import` bands a checkpoint. A bank no ranks cut is the whole.
+    fn share(&self, bank: &Bank<'_>, rank: Rank) -> Result<(Vec<u64>, Cow<'a, [u8]>), String> {
+        let Shard::Cut {
+            axis,
+            segments,
+            heads,
+        } = bank.shard
+        else {
+            return Ok((self.shape.clone(), Cow::Borrowed(self.bytes)));
+        };
+        if rank.world <= 1 {
+            return Ok((self.shape.clone(), Cow::Borrowed(self.bytes)));
+        }
+        // A bank's first axis is its slot axis, which a tensor has not.
+        let at = axis
+            .checked_sub(1)
+            .map(|at| at as usize)
+            .filter(|at| *at < self.shape.len())
+            .ok_or_else(|| {
+                format!(
+                    "has shape {:?} and the bank is cut on its axis {axis}, which is no \
+                     axis of the tensor after the slot axis",
+                    self.shape
+                )
+            })?;
+        if rank.rank >= rank.world {
+            return Err(format!(
+                "is cut across {} ranks, and this engine is rank {}",
+                rank.world, rank.rank
+            ));
+        }
+        let world = u64::from(rank.world);
+        let mut bands = Vec::with_capacity(segments.len());
+        let mut extent = 0u64;
+        for (i, segment) in segments.iter().enumerate() {
+            let parts = Shard::parts(heads.get(i).copied(), world)
+                .map_err(|why| format!("is cut across ranks, and {why}"))?;
+            let group = u64::from(rank.rank) / (world / parts);
+            bands.push((extent + group * segment, *segment));
+            extent += segment * parts;
+        }
+        if self.shape[at] != extent {
+            return Err(format!(
+                "has shape {:?} and the bank holds {extent} values whole along axis {at}, \
+                 which {world} ranks cut",
+                self.shape
+            ));
+        }
+        let mut shape = self.shape.clone();
+        shape[at] = segments.iter().sum();
+        if self.bytes.is_empty() {
+            return Ok((shape, Cow::Borrowed(self.bytes)));
+        }
+        // No axis is zero, so no product of axes holds more than the file.
+        let outer: u64 = self.shape[..at].iter().product();
+        let inner = self.shape[at + 1..].iter().product::<u64>() as usize * self.dtype.bytes();
+        let row = inner * extent as usize;
+        let mut bytes = Vec::with_capacity(self.bytes.len() / rank.world as usize);
+        for o in 0..outer as usize {
+            for (start, len) in &bands {
+                let from = o * row + *start as usize * inner;
+                bytes.extend_from_slice(&self.bytes[from..from + *len as usize * inner]);
+            }
+        }
+        Ok((shape, Cow::Owned(bytes)))
     }
 }
 
