@@ -107,6 +107,36 @@ fn a_boot_with_the_one_row_range_decided_times_a_decode_step_first() {
     assert_eq!((need.lanes, need.tokens), (1, 1), "one decode step, before any wider point");
 }
 
+/// The host cover's key as a load states it, at two widest rungs and lane
+/// budgets (what the memory a load finds moves): one key, whatever else of
+/// the load moved with them.
+#[test]
+fn a_cover_is_keyed_alike_at_every_rung() {
+    let profiles = profiles_at("cover-rung");
+    let boot = || backend::DeviceBoot {
+        profiles: Some(profiles.clone()),
+        ..crate::gpu::device_boot()
+    };
+    let mut seen = Vec::new();
+    for lanes in [4u32, 16] {
+        let Some(mut loaded) = loaded_boot("cover-rung", &Outputs, lanes, boot()) else {
+            return;
+        };
+        let shell = loaded.engine.loaded_mut().expect("loaded");
+        let budget = (shell.budget().max_tokens, shell.budget().max_lanes);
+        let rungs = shell.dense_picks().entries().len();
+        let key = loaded.engine.cover_fingerprint().expect("the load keys its host cover");
+        seen.push((budget, rungs, key));
+        drop(loaded);
+    }
+    let _ = std::fs::remove_dir_all(&profiles);
+    let [(narrow, few, at_narrow), (wide, many, at_wide)] = &seen[..] else {
+        panic!("two loads");
+    };
+    assert!(narrow.0 < wide.0 && narrow.1 < wide.1 && few < many, "{narrow:?} {wide:?} {few} {many}");
+    assert_eq!(at_narrow, at_wide, "one cover key");
+}
+
 /// Every timed settle point overlapped by another lane's submission (the
 /// runtime's count moves while it runs) is discarded: none is stored, and
 /// the settle stays pending.

@@ -810,6 +810,29 @@ fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     })
 }
 
+/// The tuning a lone lane's one-row decode frames run by, what the host
+/// cover is timed over (two warm rounds' difference, which cancels the
+/// prompt): the profile's `decisions`, the kernel a one-row fire takes at
+/// each plane as resolved, whichever layer decided it, the tier, and the
+/// cores and workgroups a guest step strides over. Not the load's rows or
+/// lanes, nor the kernels its wider fires take: they follow the memory a
+/// load finds and no such frame reads them.
+fn cover_tuning(
+    decisions: &str,
+    dense: &crate::dense::Dense,
+    tier: kernels_slang::Tier,
+    cores: u32,
+    resident: Option<u32>,
+) -> u32 {
+    profile::rates::fingerprint(
+        format!(
+            "{decisions}|{}|{tier:?}|cores {cores} resident {resident:?}",
+            dense.one_row()
+        )
+        .as_bytes(),
+    )
+}
+
 /// The settles of `all` (stored before committed) nearest a load keyed `of`
 /// whose planes are `mine`, nearest first: those of its key, then each other
 /// that shares a plane with it, the most shared first and the stored first
@@ -4531,13 +4554,8 @@ impl<B: Serve> Shell<B> {
     /// measurement is keyed by (`crate::stored`): the device `on` names
     /// (vendor, device id, driver), the code of every kernel the load's
     /// fires can ask for, the guest emitter's and planner's versions, and
-    /// the tuning its fires run by (the profile's decisions, the dense
-    /// kernel a one-row fire takes at each plane, the tier and the load's
-    /// lanes). The cover is timed over a lone lane's one-row decode frames
-    /// (two warm rounds' difference, which cancels the prompt), so neither
-    /// the rows its widest rung holds nor the kernels its wider fires take
-    /// key it: they follow the memory a load finds. Nothing of the build but
-    /// these: a version bump reuses the cover.
+    /// the tuning its fires run by ([`cover_tuning`]). Nothing of the build
+    /// but these: a version bump reuses the cover.
     pub fn cover_fingerprint(&self, on: &str) -> Result<String> {
         use crate::backend::Tactics as _;
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
@@ -4549,20 +4567,12 @@ impl<B: Serve> Shell<B> {
             .entries()
             .map(|(spec, rungs, _)| (spec.id, rungs))
             .collect();
-        // The picks as resolved, whichever layer decided them (a user's
-        // stored entry, a committed one, a measurement, the estimate under
-        // skip): the dense kernel a one-row fire takes after the settle, and
-        // the workgroups a guest step strides over; never which file stated them.
-        let tuning = profile::rates::fingerprint(
-            format!(
-                "{decisions:?}|{}|{:?}|{}|cores {} resident {:?}",
-                self.dense.one_row(),
-                self.tier,
-                self.budgets.tokens.max_lanes,
-                crate::backend::Context::cores(&self.device),
-                crate::backend::Context::resident(&self.device),
-            )
-            .as_bytes(),
+        let tuning = cover_tuning(
+            &format!("{decisions:?}"),
+            &self.dense,
+            self.tier,
+            crate::backend::Context::cores(&self.device),
+            crate::backend::Context::resident(&self.device),
         );
         Ok(format!(
             "{:?}|{on}|kernels {} {code:#010x}|emitter wgsl {} compiler {} plan {} lanes {}|tuning \
