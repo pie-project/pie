@@ -2719,7 +2719,7 @@ impl Frame {
         let (slab, chunk, at) = self
             .block
             .borrow_mut()
-            .lay(&self.inner.core, bytes, align, kept)?;
+            .lay(&self.inner.core, bytes, align, kept, !self.kept && !self.dry)?;
         self.retain(&slab);
         Ok((slab.buffer, (chunk, at)))
     }
@@ -3057,10 +3057,10 @@ impl Frame {
         Ok(set)
     }
 
-    /// The frame lays in an arm's fire block (live for the device), not
-    /// chunks of its own.
-    pub(crate) fn arms_block(&self) -> bool {
-        self.block.borrow().arm().is_some()
+    /// Whether `buffer`, which the frame laid in, is its arm's fire block
+    /// (live for the device), not a chunk of the frame's own.
+    pub(crate) fn arms_block(&self, buffer: vk::Buffer) -> bool {
+        self.block.borrow().is_arms(buffer)
     }
 
     /// [`Frame::fire_set`] for an arm-less frame, whose chunks go with it:
@@ -3410,7 +3410,7 @@ impl Frame {
             .copier
             .fire_layout
             .expect("the copier reads its count from the fire block");
-        let fire_set = if self.arms_block() {
+        let fire_set = if self.arms_block(params_buffer) {
             self.fire_set(fire_layout, fire.binding, params_buffer, u64::from(fire.bytes))?
         } else {
             self.own_fire_set(fire_layout, fire.binding, params_buffer, u64::from(fire.bytes))?
@@ -4649,6 +4649,34 @@ mod tests {
             "the cache went without its writer writing it"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A walk run once lays what runs past its arm's block in chunks of its
+    /// own; a kept walk is refused.
+    #[test]
+    fn a_walk_run_once_lays_past_its_arms_block() {
+        let bound = Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE);
+        let Ok(context) = bound else {
+            eprintln!("not asked: {:?}", bound.err());
+            return;
+        };
+        let arm = crate::device::ArmBlock::new(&context, 256).unwrap();
+        let takes = context.core.books.takes();
+        context.arm_next(Some(Arc::clone(&arm)));
+        let frame = context.frame().unwrap();
+        let (held, _) = frame.lay(&[1; 200], 4).unwrap();
+        assert!(frame.arms_block(held));
+        assert_eq!(context.core.books.takes(), takes, "what fits reserves nothing");
+        for _ in 0..2 {
+            let (past, _) = frame.lay(&[2; 200], 4).unwrap();
+            assert!(!frame.arms_block(past));
+        }
+        assert_eq!(context.core.books.takes(), takes + 1, "one chunk holds both");
+        frame.commit().unwrap();
+        context.arm_next(Some(arm));
+        let kept = context.frame_kept().unwrap();
+        kept.lay(&[1; 200], 4).unwrap();
+        assert!(kept.lay(&[2; 200], 4).is_err(), "a kept walk is refused");
     }
 
     /// A replayed frame's fence has one waiter, the watcher that runs its

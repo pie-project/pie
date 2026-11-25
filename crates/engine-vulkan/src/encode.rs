@@ -699,7 +699,7 @@ impl Sink<'_> {
             (Some(layout), Some(((_, at), _)), Some(buffer)) => {
                 let binding = params_at.expect("a fire layout has its binding") as u32;
                 let range = u64::from(pipeline.fire.as_ref().map_or(0, |block| block.bytes));
-                let set = if self.frame.arms_block() {
+                let set = if self.frame.arms_block(buffer) {
                     self.frame.fire_set(layout, binding, buffer, range)
                 } else {
                     self.frame.own_fire_set(layout, binding, buffer, range)

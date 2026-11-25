@@ -1262,6 +1262,9 @@ pub struct Shell<B: Serve> {
 
     /// The pipelines built as of the last count ([`Shell::built_serving`]).
     built: u64,
+    /// Kernels built outside a bind walk that none has counted yet
+    /// ([`Self::built_serving`]).
+    built_owed: Vec<&'static str>,
 
     /// The steps walked to be kept since the last count
     /// ([`Shell::recorded_serving`]).
@@ -3181,6 +3184,7 @@ impl<B: Serve> Shell<B> {
             behind_stamps: Vec::new(),
             served_step_ns: None,
             built: B::compiled(&pipelines),
+            built_owed: Vec::new(),
             recorded: 0,
             unkept: 0,
             eager_rows: None,
@@ -5204,10 +5208,11 @@ impl<B: Serve> Shell<B> {
     pub fn built_serving(&mut self) -> Vec<&'static str> {
         let now = B::compiled(&self.pipelines);
         let from = std::mem::replace(&mut self.built, now);
-        if now == from {
-            return Vec::new();
+        let mut built = std::mem::take(&mut self.built_owed);
+        if now != from {
+            built.extend(B::built_since(&self.pipelines, from));
         }
-        B::built_since(&self.pipelines, from)
+        built
     }
 
     /// What a dispatch binds built since the last count
@@ -9345,7 +9350,10 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                 split: false,
             }
         } else if self.armed && !self.arming && B::RECORDS && self.eager_kind(&prepared) {
-            // A fire of a kind the load stated eager walks eagerly.
+            // A fire of a kind the load stated eager walks eagerly, laying its
+            // block in its arm's as any fire does: a frame opened with none
+            // reserves one of its own.
+            B::ready_fill(self, &prepared);
             self.eager_next = true;
             Plan::Walk {
                 keep: None,
@@ -10288,6 +10296,17 @@ impl<B: Serve> Shell<B> {
         if !B::BINDS_AT_LOAD {
             return Ok(0);
         }
+        // What the walk itself builds (a rebased twin under its kernel's
+        // name) is the load's, never a fire's: the count moves past it alone,
+        // and what was built before it stays owed to the next count.
+        let owed = self.built_serving();
+        self.built_owed.extend(owed);
+        let walked = self.walk_binds_of_load();
+        self.built = B::compiled(&self.pipelines);
+        walked
+    }
+
+    fn walk_binds_of_load(&mut self) -> Result<u64> {
         let top = self
             .span
             .rungs()

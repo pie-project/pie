@@ -1,5 +1,5 @@
-//! A decode whose keys grow past its pages replays the recording its first
-//! fire kept: the page count is no part of what a recording binds.
+//! A decode whose keys grow past its pages replays the recording the load
+//! armed: the page count is no part of what a recording binds.
 
 use crate::backend::{Lane, Seated};
 use crate::model_logits::{CONTEXT, PAGE, fixture, load, word};
@@ -19,24 +19,34 @@ fn a_decode_whose_keys_grow_past_its_pages_replays_its_recording() {
             tokens: &tokens[..rows],
         })
     };
+    shell.record_bodies(None, None).expect("the load arms its bodies");
+    shell.serving = true;
     let prompt = 20u32;
     shell.fire_seated(&[lane(0, prompt as usize)]).expect("the prompt fires");
     let mut held = prompt;
-    // The first decode of each arm records.
+    // The first decodes of the armed body.
     for _ in 0..4 {
         shell.fire_seated(&[lane(held, 1)]).expect("a decode fires");
         held += 1;
     }
     shell.recorded_serving();
+    shell.unkept_serving();
+    shell.eager_serving();
+    shell.filled_serving();
     // Six pages of keys more, every decode one key further on.
     for _ in 0..6 * PAGE {
         shell.fire_seated(&[lane(held, 1)]).expect("a decode fires");
         held += 1;
     }
     assert_eq!(
-        (shell.recorded_serving(), shell.unkept_serving()),
-        (0, 0),
-        "a decode {} pages of keys further on recorded or walked unkept",
+        (
+            shell.recorded_serving(),
+            shell.unkept_serving(),
+            shell.eager_serving(),
+            shell.filled_serving(),
+        ),
+        (0, 0, 0, 0),
+        "a decode {} pages of keys further on recorded, walked unkept or eager, or walked for its fill",
         6
     );
 }
