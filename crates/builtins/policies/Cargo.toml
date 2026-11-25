@@ -14,6 +14,7 @@ members = [
     "default-cluster",
     "fair",
     "noop",
+    "priority",
     "test-pause",
     "test-route",
     "test-share",

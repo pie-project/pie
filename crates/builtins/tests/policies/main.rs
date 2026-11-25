@@ -3,4 +3,5 @@
 mod deadline;
 mod defaults;
 mod fair;
+mod priority;
 mod rig;
