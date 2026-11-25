@@ -1058,20 +1058,19 @@ impl<B: Serve> Shell<B> {
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
-        // chunks; the kernels bind it in at most four segments, none past
-        // the device's binding limit.
+        // chunks; the kernels bind it in the segments the device binds, none
+        // past the device's binding limit.
         let room = kv_budget.unwrap_or_else(|| device.left());
         let total = engine::chunk::fit(room, chunk, 0, least_chunks)
             .map_err(|short| Fault::Residency(short.to_string()))?;
-        let binds = u32::try_from(
-            (device.max_buffer() / chunk).saturating_mul(kernels_slang::SEGMENTS as u64),
-        )
-        .unwrap_or(u32::MAX);
-        // Whole segments of a quarter of the pool, all four within the
+        let segments = device.pool_segments();
+        let binds = u32::try_from((device.max_buffer() / chunk).saturating_mul(segments as u64))
+            .unwrap_or(u32::MAX);
+        // Whole segments of an equal share of the pool, all within the
         // bf16-element index the kernels address the pool by.
         let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
-            / kernels_slang::SEGMENTS as u32
-            * kernels_slang::SEGMENTS as u32;
+            / segments as u32
+            * segments as u32;
         // The compressor side planes hold a cell a token of every physical
         // list page, beside the pool in one scratch buffer: a chunk costs its
         // share of them, and they stay within one binding.
@@ -1092,11 +1091,12 @@ impl<B: Serve> Shell<B> {
         if total < least_chunks {
             return Err(Fault::Residency(format!(
                 "one working set takes {least_chunks} chunks of {chunk} bytes, and this device \
-                 binds four segments of {} MiB",
+                 binds {segments} segments of {} MiB",
                 device.max_buffer() >> 20
             )));
         }
-        let segment_chunks = crate::store::pool::segment_chunks(chunk, total, device.max_buffer());
+        let segment_chunks =
+            crate::store::pool::segment_chunks(chunk, total, device.max_buffer(), segments);
         let layout = crate::store::layout::Layout::new(
             chunk,
             total,

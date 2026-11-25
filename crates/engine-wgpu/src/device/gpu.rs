@@ -65,6 +65,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::max_buffer(self)
     }
 
+    fn pool_segments(&self) -> usize {
+        Context::pool_segments(self)
+    }
+
     fn name(&self) -> &str {
         Context::name(self)
     }
