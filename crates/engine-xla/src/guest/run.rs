@@ -264,7 +264,7 @@ fn guest_admit(need: Option<u64>) -> Result<GuestAdmitted, String> {
     }
     loop {
         let admitted = match need {
-            None if st.count == 0 && st.loads == 0 => {
+            None if st.count == 0 && st.loads == 0 && st.ended == 0 => {
                 st.unmeasured -= 1;
                 st.measuring = true;
                 st.count = 1;
@@ -283,10 +283,11 @@ fn guest_admit(need: Option<u64>) -> Result<GuestAdmitted, String> {
                 && st.loads == 0
                 && st.ended > 0
                 && u64::from(st.count) < (2 * st.ended).min(cores())
-                && available_memory().is_none_or(|free| {
-                    free.saturating_sub(st.waiting)
-                        >= st.largest.saturating_mul(u64::from(st.count) + 1)
-                }) =>
+                && (st.count == 0
+                    || available_memory().is_none_or(|free| {
+                        free.saturating_sub(st.waiting)
+                            >= st.largest.saturating_mul(u64::from(st.count) + 1)
+                    })) =>
             {
                 st.unmeasured -= 1;
                 st.count += 1;

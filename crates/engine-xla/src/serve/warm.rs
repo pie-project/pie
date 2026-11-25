@@ -988,7 +988,7 @@ impl Shell {
         // beside those under way. The rest are parked: compiled onto the disk
         // cache (not held) where they are not there yet, loaded (~1 s, never
         // compiled) by the first fire that takes their shape. With a disk
-        // cache the ladder holds none it compiles while it compiles: a held
+        // cache the ladder holds none, compiled now or found there: a held
         // program's memory is a compile's room (Qwen3.6-35B-A3B's v5e ladder
         // held 25 GB of a 47 GB host by its end, its last compiles one at a
         // time); those the free memory holds load once the compiles are done.
@@ -1028,7 +1028,7 @@ impl Shell {
                             parked.fetch_add(1, SeqCst);
                             continue;
                         }
-                        let reserved = if !parks || device.code_on_disk(text) {
+                        let reserved = if !parks {
                             host_room.take(text.len())
                         } else {
                             None
