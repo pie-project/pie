@@ -1,5 +1,5 @@
-//! Beam groups' page lists on XLA (`state-geometry.parents`,
-//! `new-memory/designs/BEAM-PAGE-LISTS.md`): what an instance whose program
+//! Beam groups' page lists on XLA (`state-geometry.parents`: each beam's
+//! own list of kv pages, the shared prefix's pages once): what an instance whose program
 //! states each beam's parent keeps on the device, laid from the load's
 //! paging and frames in flight. The step itself is `kernels_xla::beam`,
 //! run in the fire's own program ahead of its first append or read.

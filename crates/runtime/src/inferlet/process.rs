@@ -1173,17 +1173,15 @@ impl Process {
         if let Err(ref err) = result {
             tracing::info!("Process {process_id} failed: {err}");
         }
-        if crate::planner::trace_enabled() {
-            println!(
-                "[process t_us={} pid={}] guest finished ok={} restart_requested={} \
-                 admission_wait_us={admission_wait_us} instantiate_us={instantiate_us} \
-                 wasm_run_us={wasm_run_us}",
-                crate::scheduler::fire_timing_now_us(),
-                process_id,
-                result.is_ok(),
-                restart_requested(process_id)
-            );
-        }
+        tracing::debug!(
+            pid = %process_id,
+            ok = result.is_ok(),
+            restart_requested = restart_requested(process_id),
+            admission_wait_us,
+            instantiate_us,
+            wasm_run_us,
+            "guest finished"
+        );
 
         if !restart_requested(process_id)
             && let Some(tx) = result_tx.lock().unwrap().take()
@@ -1261,14 +1259,11 @@ impl Process {
                 let _ = tx.send(result.clone());
             }
 
-            if crate::planner::trace_enabled() {
-                println!(
-                    "[process t_us={} pid={}] delivering {}",
-                    crate::scheduler::fire_timing_now_us(),
-                    self.process_id,
-                    if result.is_ok() { "return" } else { "error" }
-                );
-            }
+            tracing::debug!(
+                pid = %self.process_id,
+                "delivering {}",
+                if result.is_ok() { "return" } else { "error" }
+            );
             match result {
                 Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
                 Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),

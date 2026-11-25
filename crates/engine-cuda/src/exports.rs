@@ -236,15 +236,18 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     })
 }
 
-/// Each class's requests, the plainest first.
+/// Each class's requests, the plainest first, each classed by
+/// `class_word` of its word (a load folding adapters lands a plain request
+/// in its adapted class, [`class_word`]).
 #[must_use]
 pub(crate) fn landing_requests(
     facts: &poem_ir::Facts,
     classes: &poem_ir::ClassTable,
+    class_word: impl Fn(u64) -> u64,
 ) -> Vec<Vec<poem_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
     for request in facts.requests() {
-        let word = facts.word(&request) & classes.mask;
+        let word = class_word(facts.word(&request)) & classes.mask;
         if let Some(class) = classes.class_of(word) {
             landing[class].push(request);
         }
@@ -252,12 +255,29 @@ pub(crate) fn landing_requests(
     landing
 }
 
+/// The word a lane is classed by. Where the load folds adapters (`fold`,
+/// the adapter fact's bit: the load seats adapters and one fact decides the
+/// correction), it is the lane's word adapted wherever the correction
+/// reaches it: an adapter is the lane's data (its row's route, -1 for none,
+/// whose correction kernels exit before any work), not its class, so an
+/// adapted lane and a plain one share a class and its bodies.
+#[must_use]
+pub(crate) fn class_word(
+    classes: &poem_ir::ClassTable,
+    corrected: &poem_ir::ClassSet,
+    fold: Option<u32>,
+    word: u64,
+) -> u64 {
+    fold.and_then(|bit| classes.adapted_word(corrected, bit, word))
+        .unwrap_or(word)
+}
+
 /// The classes the lattice keys and arms: those a plain request lands in,
 /// and, on a model with a drafter (an output only drafting classes write,
 /// MTP's `mtp.drafts`), those writing it that a request plain but for
-/// reading its pass's drafts lands in (the drafter's verify). A class only
-/// an adapted request lands in is not keyed: it is armed as north-star
-/// arms it, one lane, never mixed.
+/// reading its pass's drafts lands in (the drafter's verify). On a load
+/// folding adapters a plain request lands in its adapted class
+/// ([`class_word`]), which is then keyed like any plain one.
 #[must_use]
 pub(crate) fn plain_of(
     landing: &[Vec<poem_ir::Request>],
@@ -590,7 +610,7 @@ mod tests {
             mask: (1 << bits) - 1,
             dead: Vec::new(),
         };
-        let landing = landing_requests(&facts, &classes);
+        let landing = landing_requests(&facts, &classes, |word| word);
         for (class, requests) in landing.iter().enumerate() {
             assert!(
                 requests

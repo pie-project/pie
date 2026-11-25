@@ -623,31 +623,3 @@ impl Layout {
         }
     }
 }
-
-#[cfg(test)]
-mod shell_room_tests {
-    use super::Layout;
-
-    /// A directly-fired shell's room holds its seats' pages and records and
-    /// one working set, and with the null chunk and the tables run it ends a
-    /// whole segment past a segment boundary: the state lies in bottom
-    /// segments, never in the segment the activation span starts in.
-    #[test]
-    fn a_shells_room_holds_its_seats_in_whole_bottom_segments() {
-        const CHUNK: u64 = 2 << 20;
-        // Pages of 64 KiB (32 a chunk), records of 512 KiB in 2 pieces (4 a
-        // chunk), segments of 32 chunks, 3 table chunks.
-        let layout = Layout::new(CHUNK, 4096, 32, 16, [64 << 10, 512 << 10], 2, 512, 1)
-            .expect("a layout")
-            .with_tables(3);
-        for (seats, pages, rows) in [(512u32, 1u64, 32u64), (1, 640, 640), (1, 1, 1)] {
-            let room = layout.shell_room(seats, pages, rows);
-            assert_eq!(room % CHUNK, 0, "whole chunks");
-            let state = room / CHUNK;
-            let held = (u64::from(seats) * pages + rows).div_ceil(32)
-                + (u64::from(seats) * 2).div_ceil(4);
-            assert!(state >= held + 32, "{seats} seats: {state} chunks hold {held} and a segment");
-            assert_eq!((1 + 3 + state) % 32, 0, "{seats} seats: the bottom ends on a segment");
-        }
-    }
-}

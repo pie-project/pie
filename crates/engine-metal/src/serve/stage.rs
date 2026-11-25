@@ -774,6 +774,19 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A load for a runtime lays no seat runs: every chunk is the
+        // runtime's to name, so a lane it did not address by ref has none.
+        if self.addressing == super::Addressing::Refs
+            && let Some(seated) = lanes.iter().find(|seated| !seated.refs)
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a seat-addressed lane (seat {}) on a load placed for the runtime: its \
+                     pool lays no seat runs, and every lane names its slots by ref",
+                    seated.lane.slot
+                ),
+            });
+        }
         // A seat-addressed lane writes the seat runs' chunks; a weight slot
         // named there would be overwritten under the cache's feet.
         if lanes.iter().any(|seated| !seated.refs) && self.pools.weights_in_seats() {
@@ -1966,31 +1979,17 @@ impl Shell {
         if !captures {
             return Ok((None, CaptureRows::default()));
         }
-        let Some(layout) = self.capture.as_mut() else {
+        let Some(layout) = self.capture.as_ref() else {
             return Ok((None, CaptureRows::default()));
         };
-        let count = layout.tables.len();
-        let (keys_table, pages_table) = &mut layout.tables[arm % count];
-        let words = |offsets: &[u64]| -> Vec<u8> {
-            offsets.iter().flat_map(|offset| offset.to_le_bytes()).collect()
-        };
-        keys_table.write(0, &words(&keys_at))?;
-        pages_table.write(0, &words(&pages_at))?;
-        let table_bytes = keys_at.len() as u64 * 8;
-        let lanes_u32 = u32::try_from(keys_at.len()).unwrap_or(u32::MAX);
+        let (keys_table, pages_table) = self.inputs[self.arena.current()][arm].stage_captures(
+            &self.handles,
+            &keys_at,
+            &pages_at,
+        )?;
         let seat = crate::run::CaptureSeat {
-            keys_at: kernels_metal::Tensor::new(
-                self.handles.bind(keys_table, 0, table_bytes)?,
-                lanes_u32,
-                1,
-                Dtype::U64,
-            ),
-            pages_at: kernels_metal::Tensor::new(
-                self.handles.bind(pages_table, 0, table_bytes)?,
-                lanes_u32,
-                1,
-                Dtype::U64,
-            ),
+            keys_at: keys_table,
+            pages_at: pages_table,
             keys: layout.keys,
             pages: layout.pages,
             page_size: layout.page_size,

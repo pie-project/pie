@@ -47,10 +47,6 @@ pub enum RsPlan {
     /// buffer (CONTRACT-BC 19, 21): lanes sharing a set (a beam group)
     /// share its folded window and fold it once.
     Groups(Vec<GroupPlan>),
-    /// The model's state is window lists: each row lands its rows in each
-    /// list's slots, then moves its windows: an engine that does not state
-    /// `Capabilities::windowed_state`.
-    Window(Vec<WindowRow>),
 }
 
 /// The first lane carries its fold.
@@ -77,15 +73,6 @@ pub enum GroupFold {
     None,
     Host(u32),
     Device,
-}
-
-/// A lane of a windowed model: the rows (token positions) it lands, the
-/// rows up to which its tables are read, and how its windows move after.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WindowRow {
-    pub writes: std::ops::Range<u32>,
-    pub reads: u32,
-    pub advance: crate::store::rs::WindowAdvance,
 }
 
 /// What a fire writes of a working set's state: whether the state, to a
@@ -134,15 +121,6 @@ pub fn demand(
 ) -> Result<RsUnits, String> {
     let mut total = RsUnits::default();
     match plan {
-        RsPlan::Window(rows) => {
-            for (&ws, row) in working_sets.iter().zip(rows) {
-                total = total.add(
-                    store
-                        .window_demand(ws, row.writes.clone())
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-        }
         RsPlan::Groups(groups) => {
             for group in groups {
                 let ws = working_sets[group.lanes[0]];
@@ -159,9 +137,9 @@ pub fn demand(
     Ok(total)
 }
 
-/// What `plan` asks of the state of the lanes `lanes` alone: the rows of a
-/// windowed plan they own, and the groups a plan of groups leads with one
-/// of them ([`demand`] of the lanes one KV working set carries).
+/// What `plan` asks of the state of the lanes `lanes` alone: the groups it
+/// leads with one of them ([`demand`] of the lanes one KV working set
+/// carries).
 pub fn demand_of_lanes(
     store: &RsStore,
     working_sets: &[RsWorkingSetId],
@@ -170,18 +148,6 @@ pub fn demand_of_lanes(
 ) -> Result<RsUnits, String> {
     let mut total = RsUnits::default();
     match plan {
-        RsPlan::Window(rows) => {
-            for &lane in lanes {
-                let (Some(&ws), Some(row)) = (working_sets.get(lane), rows.get(lane)) else {
-                    continue;
-                };
-                total = total.add(
-                    store
-                        .window_demand(ws, row.writes.clone())
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-        }
         RsPlan::Groups(groups) => {
             for group in groups.iter().filter(|group| lanes.contains(&group.lanes[0])) {
                 let ws = working_sets[group.lanes[0]];
@@ -211,14 +177,6 @@ pub struct PreparedRs {
     pub page_copy_lanes: Vec<usize>,
     pub buffer_slot_ids: Vec<u32>,
     pub verbs: Vec<engine::fire::RsVerb>,
-    /// A windowed model's rows: each lane's table of each window list (in
-    /// the engine's numbering: a shared pool's slot refs, 0 where trimmed or
-    /// not written), and the window slots a lane writes into after a fork
-    /// shared them, `(lane, list, src, dst)`, copied before the fire runs:
-    /// in a shared pool each lane's own `Lane::slot_copies` of its list
-    /// (CONTRACT-BC 19, 21), else the pre-launch copy's windowed pages.
-    pub window: Vec<Vec<Vec<u32>>>,
-    pub window_copies: Vec<(usize, usize, u32, u32)>,
     /// Each lane's window-buffer table as the fire found it and the row
     /// its entry 0 holds, where the store buffers windowed layers' rows
     /// (CONTRACT-BC 19, 21); `None` for a lane that buffers nothing.
@@ -326,21 +284,6 @@ impl PreparedRs {
                 .collect();
         }
     }
-
-    /// The window pages the pre-launch copy moves `(src, dst)` before the
-    /// fire, in the engine's own numbering: an engine on today's pools only.
-    /// A shared pool states them as each lane's `Lane::slot_copies`.
-    #[must_use]
-    pub fn windowed_copies(&self) -> Vec<(u32, u32)> {
-        if self.shared {
-            Vec::new()
-        } else {
-            self.window_copies
-                .iter()
-                .map(|&(_, _, src, dst)| (src, dst))
-                .collect()
-        }
-    }
 }
 
 /// Names each lane's slots by the shared pool's shapes, for an engine that
@@ -349,9 +292,7 @@ impl PreparedRs {
 /// writes buffered rows into a slot it shares); nothing where `shared` is
 /// `None`. The lane's other fields stay as they are. A lane's list table is its
 /// translation where one is stated, else its pages (the list shape's slot
-/// refs either way), each window list's table its own (0 where trimmed)
-/// and the window slots it copies first among its `Lane::slot_copies`
-/// (CONTRACT-BC 19, 21); its fixed records the
+/// refs either way); its fixed records the
 /// `[run, cow]` [`PreparedRs::run_cow`] names, a snapshot the slot ref of its
 /// record's first piece and, where the record takes more than one, every
 /// piece.
@@ -375,20 +316,7 @@ pub fn apply_shared(
         } else {
             &lane.translation
         };
-        let windows = rs
-            .and_then(|rs| rs.window.get(row))
-            .map_or(&[][..], Vec::as_slice);
-        lane.tables = pool.lane_tables(list, windows);
-        let window_copies: Vec<(usize, u32, u32)> = rs
-            .filter(|rs| rs.shared)
-            .map(|rs| {
-                rs.window_copies
-                    .iter()
-                    .filter(|&&(at, ..)| at == row)
-                    .map(|&(_, list, src, dst)| (list, src, dst))
-                    .collect()
-            })
-            .unwrap_or_default();
+        lane.tables = pool.lane_tables(list);
         let records = rs.filter(|rs| rs.shared).and_then(|rs| rs.run_cow(row));
         // A load that holds state states every lane's record: its pieces,
         // or none.
@@ -412,11 +340,6 @@ pub fn apply_shared(
             })
             .filter(|(_, pairs)| !pairs.is_empty())
             .into_iter()
-            .chain(
-                pool.window_copies(&window_copies)
-                    .into_iter()
-                    .filter(|(_, pairs)| !pairs.is_empty()),
-            )
             .chain(
                 // A hybrid's window-buffer tail copies, under its shape.
                 rs.filter(|rs| rs.shared && rs.window_buffer_apart)
@@ -535,14 +458,6 @@ fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
     } else {
         Vec::new()
     };
-    let windows: Vec<RsSlotId> = out
-        .window
-        .iter()
-        .flat_map(|lists| lists.iter().enumerate())
-        .flat_map(|(list, table)| table.iter().map(move |&slot| (list, slot)))
-        .filter(|(_, slot)| live(slot))
-        .map(|(list, slot)| store.window_slot(list, slot))
-        .collect();
     let pages: Vec<RsSlotId> = out
         .page_copies
         .0
@@ -551,65 +466,9 @@ fn note_reads(store: &mut RsStore, published: &RsPublished, out: &PreparedRs) {
         .chain(verb_pages)
         .filter(live)
         .map(|page| store.page_id(page))
-        .chain(windows)
         .chain(window_buffer)
         .collect();
     store.note_reads(seq, slots.into_iter().chain(pages));
-}
-
-fn prepare_window_rows(
-    store: &mut RsStore,
-    working_sets: &[RsWorkingSetId],
-    rows: &[WindowRow],
-    mut granted: Option<&mut RsGrant>,
-) -> Result<PreparedRs, String> {
-    if rows.len() != working_sets.len() {
-        return Err(format!(
-            "a window plan of {} row(s) for {} recurrent state(s)",
-            rows.len(),
-            working_sets.len()
-        ));
-    }
-    let mut out = PreparedRs {
-        shared: store.is_shared(),
-        ..PreparedRs::default()
-    };
-    let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(rows.len());
-    for (index, (&ws, row)) in working_sets.iter().zip(rows).enumerate() {
-        match store.prepare_window(ws, row.writes.clone(), granted.as_deref_mut()) {
-            Ok(prepared) => prepared_rows.push(prepared),
-            Err(error) => {
-                store.cancel_batch(prepared_rows);
-                return Err(format!("request row {index}: {error}"));
-            }
-        }
-    }
-    for (lane, prepared) in prepared_rows.iter().enumerate() {
-        for (src, dst) in prepared.buffer_copy_plan() {
-            let list = store.window_list_of(dst).unwrap_or(0);
-            out.window_copies
-                .push((lane, list, store.engine_id(src), store.engine_id(dst)));
-        }
-    }
-    let (published, folds) = store
-        .publish_batch(prepared_rows)
-        .map_err(|error| error.to_string())?;
-    store.commit_folds(folds);
-    // The fire reads the tables as published; only then does the commit
-    // retire what falls behind each window.
-    for (&ws, row) in working_sets.iter().zip(rows) {
-        out.window.push(
-            store
-                .window_tables(ws, row.reads)
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    note_reads(store, &published, &out);
-    for (&ws, row) in working_sets.iter().zip(rows) {
-        store.window_advance(ws, row.advance);
-    }
-    out.txn = Some(RsTxn { published });
-    Ok(out)
 }
 
 pub fn prepare_many(
@@ -621,23 +480,7 @@ pub fn prepare_many(
     if working_sets.is_empty() {
         return Ok(PreparedRs::default());
     }
-    let groups = match plan {
-        RsPlan::Window(rows) => {
-            // The window-list path's own refusal. An engine that
-            // states `windowed_state` plans `RsPlan::Groups`, its beams
-            // sharing one folded window.
-            for (index, ws) in working_sets.iter().enumerate() {
-                if working_sets[..index].contains(ws) {
-                    return Err(format!(
-                        "lane {index} names an earlier lane's working set; on a model whose state is a \
-                         window each lane needs a working set of its own"
-                    ));
-                }
-            }
-            return prepare_window_rows(store, working_sets, rows, granted);
-        }
-        RsPlan::Groups(groups) => groups,
-    };
+    let RsPlan::Groups(groups) = plan;
     // The beam groups' sets: their folds keep their buffers (§11.3).
     let beam_sets: Vec<RsWorkingSetId> = groups
         .iter()

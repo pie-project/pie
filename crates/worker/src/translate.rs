@@ -161,7 +161,6 @@ fn build_model(
             let disk_kept = kept_disk(&user.engine.memory, group, &g);
             runtime::bootstrap::EngineConfig {
                 chunks: g.caps.chunks.clone(),
-                window_tokens: g.caps.pools.window_tokens,
                 windowed_state: g.caps.windowed_state,
                 disk_kept,
                 draft_block: g.caps.draft_block,

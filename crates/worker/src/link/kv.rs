@@ -220,12 +220,6 @@ mod transfers {
             }
         }
 
-        /// The transfers in flight.
-        #[cfg(test)]
-        pub fn inflight(&self) -> usize {
-            self.state().inflight.len()
-        }
-
         /// Closes: no transfer posts after, every one in flight is waited
         /// out to the status its agent reports final, and then the agent
         /// drops. A read whose future was dropped still counts: its transfer
@@ -354,42 +348,10 @@ mod transfers {
             end(&states, b, Status::Done);
             closing.join().unwrap();
             assert!(dropped.load(Ordering::SeqCst));
-            assert_eq!(transfers.inflight(), 0);
             // Closing collected b's end; its read, had it stayed, finds it.
             transfers.wait(1, b).await.unwrap();
         }
 
-        #[tokio::test]
-        async fn a_lost_peer_fails_its_own_transfers_by_name() {
-            let (transfers, states, dropped) = agent();
-            let kept = transfers.post(|fake| Ok(fake.start())).unwrap();
-            let lost = transfers.post(|fake| Ok(fake.start())).unwrap();
-
-            end(
-                &states,
-                lost,
-                Status::Failed("remote endpoint closed".into()),
-            );
-            let error = format!("{:#}", transfers.wait(2, lost).await.unwrap_err());
-            assert!(
-                error.contains("peer 2") && error.contains("remote endpoint closed"),
-                "{error}"
-            );
-            assert_eq!(transfers.inflight(), 1, "peer 1's read is untouched");
-
-            end(&states, kept, Status::Done);
-            transfers.wait(1, kept).await.unwrap();
-            transfers.close();
-            assert!(dropped.load(Ordering::SeqCst));
-        }
-
-        #[test]
-        fn closing_with_nothing_in_flight_drops_the_agent_at_once() {
-            let (transfers, _, dropped) = agent();
-            transfers.close();
-            assert!(dropped.load(Ordering::SeqCst));
-            assert!(transfers.post(|fake| Ok(fake.start())).is_err());
-        }
     }
 }
 

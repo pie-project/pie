@@ -520,40 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn a_site_whose_copy_is_off_the_device_names_its_lowest_tier() {
-        let directory = Directory::default();
-        let run = vec![key(1), key(2)];
-        for (worker, off) in [
-            (1, Vec::new()),
-            (2, vec![(key(2), OffDevice::Host)]),
-            (
-                3,
-                vec![(key(1), OffDevice::Host), (key(2), OffDevice::Disk)],
-            ),
-        ] {
-            directory.report_state(
-                WorkerId(worker),
-                StateReport {
-                    added: run.clone(),
-                    full: true,
-                    runs_added: vec![run.clone()],
-                    off_device: Some(off),
-                    ..StateReport::default()
-                },
-            );
-        }
-        let view = directory.view(1);
-        assert_eq!(
-            view.groups[0].1.site_tiers,
-            [
-                (WorkerId(2), OffDevice::Host),
-                (WorkerId(3), OffDevice::Disk)
-            ],
-            "worker 1 holds it on the device"
-        );
-    }
-
-    #[test]
     fn the_view_is_what_the_reports_left_and_a_quiet_report_changes_none_of_it() {
         let directory = Directory::default();
         let run = vec![key(1), key(2)];

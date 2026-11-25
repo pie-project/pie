@@ -268,7 +268,7 @@ pub(super) async fn promote<C: FireContext>(
         kv_pages: u32::try_from(below).unwrap_or(u32::MAX),
         rs: Default::default(),
     };
-    let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, false, || Ok(Vec::new())).await? else {
+    let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, || Ok(Vec::new())).await? else {
         return Ok(None);
     };
     let Ok(lease) = ws.fire_lease() else {

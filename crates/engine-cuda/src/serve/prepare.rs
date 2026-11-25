@@ -718,15 +718,15 @@ impl Shell {
             .zip(&lane_rows)
             .enumerate()
             .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
-                (None, None) => FireLane::new(seated.lane.word, rows),
+                (None, None) => FireLane::new(self.class_word(seated.lane.word), rows),
                 (Some(shot), _) => FireLane::with_images(
-                    seated.lane.word,
+                    self.class_word(seated.lane.word),
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().sum(),
                 ),
                 (None, Some(clips)) => FireLane::with_clips(
-                    seated.lane.word,
+                    self.class_word(seated.lane.word),
                     rows,
                     clips.clips.len() as u32,
                     u32::try_from(clips.voxels()).unwrap_or(u32::MAX),
@@ -1122,7 +1122,10 @@ impl Shell {
             ..Default::default()
         };
         let mut adapter_routes: Vec<i32> = Vec::new();
-        let any_adapter = lanes.iter().any(|seated| seated.adapter.is_some());
+        // A load folding adapters stages every fire's routes: its bodies'
+        // corrections read them, a lane carrying no adapter routing -1.
+        let any_adapter =
+            self.adapter_fold.is_some() || lanes.iter().any(|seated| seated.adapter.is_some());
         if any_adapter {
             adapter_routes.reserve(rows as usize);
         }
@@ -1495,7 +1498,10 @@ impl Shell {
                     .compiled
                     .classes
                     .correction_reaches(&self.corrected, lane.word);
-            if seated.adapter.is_some() != runs_correction && !unreachable {
+            // A plain lane in a correcting class is a load folding adapters:
+            // its rows route -1 and correct nothing.
+            let folded = seated.adapter.is_none() && self.adapter_fold.is_some();
+            if seated.adapter.is_some() != runs_correction && !unreachable && !folded {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
                     word: lane.word,

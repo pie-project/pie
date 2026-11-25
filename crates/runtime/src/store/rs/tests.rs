@@ -46,11 +46,6 @@ fn tests_every_case() {
 // A checkpoint's rows are held by its cache entry: they count as cache only
 // once no working set holds them too, and the hold goes with the checkpoint.
 
-// A windowed model's state is a window list: a fire takes the slots it
-// writes, the slots behind the committed position's window retire, a write
-// moves the head back without touching a slot, a fork shares the list and
-// copies only the slot it overwrites.
-
 fn idle_snapshots_go_in_retention_order() {
     use crate::inferlet::process::ProcessId;
     let mut s = store();
@@ -423,7 +418,6 @@ fn a_device_counted_fold_gates_every_copy_until_it_settles() {
     assert_eq!(s.fork(ws), Err(unsettled()));
     assert_eq!(s.export(ws).map(|set| set.frozen), Err(unsettled()));
     assert_eq!(s.checkpoint(ws, [1; 32], None), Err(unsettled()));
-    assert_eq!(s.checkpoint_at(ws, [1; 32], None, 4), Err(unsettled()));
     assert!(!s.has_checkpoint(&[1; 32]));
 
     s.end_device_fold(ws, Some(3), None);

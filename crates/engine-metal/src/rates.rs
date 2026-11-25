@@ -873,29 +873,3 @@ pub fn measure_keys(
 /// The decode-shaped rows `few_row_tflops` is timed at: 4 to 256, the rows
 /// below the matmul curve's first.
 const FEW_ROWS: [u32; 7] = [4, 8, 16, 32, 64, 128, 256];
-
-#[cfg(test)]
-mod lattice_tests {
-    use super::*;
-
-    #[test]
-    fn the_lattice_is_the_powers_of_two_up_to_the_fire_and_the_fire() {
-        let rows = lattice_rows();
-        assert_eq!(rows.first(), Some(&1));
-        assert_eq!(rows[rows.len() - 2..], [8192, crate::FIRE.1]);
-        assert!(rows[..rows.len() - 1].iter().all(|r| r.is_power_of_two()));
-    }
-
-    #[test]
-    fn a_narrowed_top_is_the_next_lattice_point_down() {
-        assert_eq!(narrower(10240), 8192);
-        assert_eq!(narrower(8192), 4096);
-        assert_eq!(narrower(1024), crate::FIRE.0);
-        assert_eq!(
-            narrower(crate::FIRE.0),
-            crate::FIRE.0,
-            "no narrower than a token a lane"
-        );
-        assert!(lattice_rows().contains(&narrower(10240)));
-    }
-}

@@ -16,17 +16,153 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use eta_compiler::codegen::program::{Backend, emit_program};
+use eta_compiler::plan::compile_bound;
+use eta_ir::container::{
+    ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+};
+use eta_ir::op::Op;
+use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Port, PortMask, Stage};
+use eta_ir::types::{Dtype as EtaDtype, Shape};
+
+use engine::program::ProgramRegistration;
 use engine::frame::Shell as FrameShell;
 use engine_metal::serve::{Attached, Seated, StepView};
 use engine_metal::{Done, Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{Fixture, fixture_of, load_ahead, word};
-use super::an_envelope_keeps_two_passes_in_flight::{Heard, bind_envelope};
 
 /// The plain lane's slot and its token: a different context from the
 /// envelope's, so its row's argmax is another lane's.
 const PLAIN_SLOT: u32 = 3;
 const PLAIN_TOKEN: u32 = 99;
+
+const ROWS: u32 = 1;
+
+const FIRST_TOKEN: i32 = 42;
+
+/// A decode envelope's least form: its token rides channel 1 (`tok`,
+/// seeded), which `embed_tokens` reads; the epilogue puts the logits'
+/// argmax on channel 0 for the host and as the next token on `tok`.
+fn program(vocab: u32) -> ProgramRegistration {
+    let logits = OutputDecl {
+        name: "logits".into(),
+        axis: Axis::Row,
+        width: vocab,
+        dtype: eta_ir::Dtype::F32,
+        layers: 0,
+        readout: true,
+    };
+    let container = TraceContainer {
+        names: vec!["logits".to_string()],
+        channels: vec![
+            ChannelDecl {
+                shape: Shape::vector(1),
+                dtype: ChanDType::Concrete(EtaDtype::I32),
+                capacity: 4,
+                host_role: HostRole::Reader,
+                seeded: false,
+            },
+            ChannelDecl {
+                shape: Shape::vector(1),
+                dtype: ChanDType::Concrete(EtaDtype::I32),
+                capacity: 2,
+                host_role: HostRole::None,
+                seeded: true,
+            },
+        ],
+        ports: vec![PortBinding {
+            port: Port::EmbedTokens,
+            source: PortSource::Channel(1),
+        }],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::Output {
+                    index: 0,
+                    lane: 0,
+                    shape: Shape::matrix(1, vocab),
+                    dtype: EtaDtype::F32,
+                },
+                Op::ReduceArgmax(0),
+                Op::ChanPut { chan: 0, value: 1 },
+                Op::ChanTake(1),
+                Op::ChanPut { chan: 1, value: 1 },
+            ],
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    };
+    let bound = eta_ir::validate::bind(
+        container,
+        vec![vec![logits]],
+        EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
+    .expect("the program binds");
+    let stages = compile_bound(&bound);
+    let backend = Backend::parse("metal").expect("the metal codegen backend");
+    ProgramRegistration {
+        program_hash: bound.hash,
+        emitted_kernels: emit_program(backend, &stages, &bound),
+        emitter_version: backend.emitter_version(),
+        launch: eta_compiler::codegen::launch::build(&bound, &stages),
+        ..Default::default()
+    }
+}
+
+/// Binds the envelope as a decode envelope at `slot`'s places, `tok`
+/// seeded with [`FIRST_TOKEN`].
+fn bind_envelope(shell: &mut Shell, vocab: u32, slot: u32) -> engine::InstanceId {
+    let program = shell.register_program(&program(vocab)).expect("the program registers");
+    let facts = shell.program_facts(program).expect("the program's facts");
+    let layout = shell.pool_layout();
+    let instance = layout.instance.expect("an instance shape");
+    let channel = layout.channel.expect("a channel shape");
+    let free = layout.free_chunk();
+    let base = (free + slot) * instance.per_chunk;
+    let slots: Vec<u32> = (base..base + facts.instance.slots).collect();
+    let mut next = (free + 2 + slot) * channel.per_chunk;
+    let rings: Vec<engine::RingSlots> = facts
+        .rings
+        .iter()
+        .map(|ring| {
+            let slots = (next..next + ring.footprint.slots).collect();
+            next += ring.footprint.slots;
+            engine::RingSlots {
+                channel: ring.channel,
+                slots,
+            }
+        })
+        .collect();
+    let extents = eta_exec::Extents {
+        row_count: ROWS,
+        token_count: ROWS,
+        sampled_rows: 1,
+        query_len: ROWS,
+        ..eta_exec::Extents::default()
+    };
+    let (scratch, pair) = crate::guest_places(shell, program, &extents, slot);
+    shell
+        .bind_program(
+            program,
+            &[(1, FIRST_TOKEN.to_le_bytes().to_vec())],
+            extents,
+            GeometryClass::DecodeEnvelope,
+            PortMask::DECODE_ENVELOPE,
+            &[engine::ChannelId(90), engine::ChannelId(91)],
+            &slots,
+            &rings,
+            &scratch,
+            &pair,
+            0,
+        )
+        .expect("the decode envelope binds")
+}
+
+type Heard = (engine::StepDone, engine::StepOutcome);
 
 /// Submits step `frame`: the envelope's lane (slot 0), after a plain lane
 /// (slot [`PLAIN_SLOT`]) where `beside` is set, harvesting nothing.

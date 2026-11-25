@@ -127,15 +127,6 @@ fn state_rebind_diff(existing: &StateBinding, next: &StateBinding) -> Option<&'s
     None
 }
 
-fn first_repeat(reps: &[u32]) -> Option<(usize, usize)> {
-    reps.iter().enumerate().find_map(|(again, rep)| {
-        reps[..again]
-            .iter()
-            .position(|earlier| earlier == rep)
-            .map(|first| (first, again))
-    })
-}
-
 fn validate_descriptor_bindings(
     container: &TraceContainer,
     channel_reps: &[u32],
@@ -575,17 +566,6 @@ impl ProcessCtx {
             && self.shares_nothing(&reps)?
         {
             return Ok(Err(UNSHARED_CHECKPOINT.to_string()));
-        }
-        // The window-list path's refusal. A load whose engine
-        // serves windowed layers as ring + buffer states no window tokens
-        // (`RsCaps::window_state`): its beams share one folded window.
-        if crate::model::model().rs_caps().window_tokens > 0
-            && let Some((first, again)) = first_repeat(&reps)
-        {
-            return Ok(Err(format!(
-                "lanes {first} and {again} name the same working set; on a model whose \
-                 state is a window each lane needs a working set of its own"
-            )));
         }
         if parents.is_some() && self.ctx().table.get(&this)?.bindings.final_rows {
             return Ok(Err(FINAL_BEAMS.to_string()));

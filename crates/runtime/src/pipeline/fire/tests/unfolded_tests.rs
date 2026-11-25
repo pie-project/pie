@@ -826,10 +826,8 @@ fn lane(held: u32, rows: u32) -> crate::engine::FireRequest {
 }
 
 fn groups(plan: rs::RsPlan) -> Vec<rs::GroupPlan> {
-    match plan {
-        rs::RsPlan::Groups(groups) => groups,
-        rs::RsPlan::Window(_) => panic!("a plain recurrent model plans groups"),
-    }
+    let rs::RsPlan::Groups(groups) = plan;
+    groups
 }
 
 /// A lane staged to fold by the device's count asks for its report,
@@ -1201,7 +1199,7 @@ fn mtp_k4_rides_one_row_rs_pages() {
     // A host fold may leave any count behind it: the next fire asks.
     let left = groups(host(13, 100, vec![4]).expect("a fold of four of a hundred"));
     assert_eq!(left[0].fold, rs::GroupFold::Host(4));
-    // A model with window lists, or a pass binding no state, carries none.
+    // A pass binding no state carries none.
     assert_eq!(
         lanes_frozen(&stores, &ids, &groups_of, 1, true).unwrap(),
         [None]

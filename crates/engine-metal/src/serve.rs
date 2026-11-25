@@ -304,6 +304,8 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// How this load's lanes name their slots ([`Addressing`]).
+    addressing: Addressing,
     /// What the load weighed its rungs by, where its profile states rates:
     /// the rungs, the estimate and the live range (`--check-estimate`).
     weighed: Option<crate::top::Weighed>,
@@ -413,7 +415,6 @@ pub struct Shell {
     /// which landing each instance holds.
     landings: BTreeMap<u32, Landing>,
     held_landing: BTreeMap<engine::InstanceId, u32>,
-    blobs: crate::blob::Store,
     held: Vec<u32>,
     programs: crate::program::Plane,
     /// Each set's written end as far as the fires admitted carried it,
@@ -739,6 +740,7 @@ impl Shell {
             placed: None,
             ruled: None,
             ane_cache: None,
+            addressing: Addressing::Seats,
         })
     }
 }
@@ -753,7 +755,23 @@ struct Placed {
     weight_caches: Vec<crate::store::streamed::Cache>,
 }
 
-/// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
+/// How a load's lanes name their pool slots. Set by the constructor that
+/// places the load, never by its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Addressing {
+    /// The runtime's slot refs, and nothing else: the pool lays no seat runs
+    /// (every chunk past the null chunk and the tables is the runtime's to
+    /// name), and a seat-addressed lane is refused by name. A served load.
+    Refs,
+    /// The direct-firing harness ([`PreparedLoad::load`], [`Shell::load`]):
+    /// a caller with no runtime fires seat-addressed lanes, seat `s` taking
+    /// its own runs of list and fixed slots laid in the lowest chunks.
+    Seats,
+}
+
+/// A load compiled and not yet placed; [`PreparedLoad::load`] places it for
+/// the direct-firing harness, [`PreparedLoad::load_for_runtime`] for a
+/// runtime naming slot refs.
 pub struct PreparedLoad<'a> {
     boot: Boot<'a>,
     device: Context,
@@ -773,6 +791,7 @@ pub struct PreparedLoad<'a> {
     /// Where the Neural Engine keeps its compiled programs
     /// ([`DeviceBoot::cache`](crate::DeviceBoot::cache)).
     ane_cache: Option<std::path::PathBuf>,
+    addressing: Addressing,
 }
 
 impl PreparedLoad<'_> {
@@ -794,6 +813,15 @@ impl PreparedLoad<'_> {
         self.ane_cache = cache;
     }
 
+    /// Places the load for a runtime that names every slot by ref: no seat
+    /// runs, and a seat-addressed lane refused ([`Addressing::Refs`]).
+    pub fn load_for_runtime(mut self) -> Result<Shell> {
+        self.addressing = Addressing::Refs;
+        self.load()
+    }
+
+    /// Places the load for the direct-firing harness ([`Addressing::Seats`]),
+    /// or as [`Self::load_for_runtime`] set it.
     pub fn load(self) -> Result<Shell> {
         let PreparedLoad {
             boot,
@@ -808,6 +836,7 @@ impl PreparedLoad<'_> {
             placed,
             ruled,
             ane_cache,
+            addressing,
         } = self;
         let mut boot = boot;
 
@@ -1499,6 +1528,7 @@ impl PreparedLoad<'_> {
                     }),
                     ruled: Some(pick),
                     ane_cache,
+                    addressing,
                 }
                 .load();
             }
@@ -1593,7 +1623,10 @@ impl PreparedLoad<'_> {
                 page_size,
                 bytes,
                 rows.pieces,
-                boot.slots,
+                match addressing {
+                    Addressing::Refs => 0,
+                    Addressing::Seats => boot.slots,
+                },
                 seated.pages_per_slot,
             )?
             .with_tables(tables_chunks)
@@ -1773,14 +1806,7 @@ impl PreparedLoad<'_> {
             )?),
             false => None,
         };
-        let capture = CaptureLayout::of(
-            &device,
-            &outputs,
-            boot.context,
-            page_size,
-            boot.budget.max_lanes,
-            arms,
-        )?;
+        let capture = CaptureLayout::of(&outputs, boot.context, page_size);
         let capture_bytes = capture.as_ref().map_or(0, CaptureLayout::member_bytes);
         let beam_widest = beam_max_lanes(&device)?;
         let weighed = weighed.and_then(|(counts, rungs, live, fire_top)| {
@@ -1795,6 +1821,7 @@ impl PreparedLoad<'_> {
                 })
         });
         let shell = Shell {
+            addressing,
             weighed,
             measured_at_load: chip.tuned().timed.clone(),
             tuning,
@@ -1857,7 +1884,6 @@ impl PreparedLoad<'_> {
             adapter_fact,
             landings: BTreeMap::new(),
             held_landing: BTreeMap::new(),
-            blobs: crate::blob::Store::new(),
             corrected,
             held: vec![0; paging.slots as usize],
             programs: {
@@ -2208,11 +2234,6 @@ impl Shell {
             }
         };
         self.pools.seat_disk(dir, budget)
-    }
-
-    /// Seats the shared pool's host tier of `budget` bytes.
-    pub fn seat_tier(&mut self, budget: u64) {
-        self.pools.seat_tier(budget);
     }
 
     /// No rs buffer pages: the buffer's rows live in the records.
@@ -2684,14 +2705,14 @@ pub struct Clips<'a> {
 /// each one's key row (`keys` f32s, the load's context) and page row
 /// (`pages` f32s), laid together as state of its reader instance, in its
 /// `Instance` slots after its tables ([`crate::program::Plane::facts`]). `classes` are the classes that
-/// compute them: a lane of one captures. Each arm keeps the two tables of
-/// its fire's lanes' row starts the kernels read, one u64 a lane.
+/// compute them: a lane of one captures. The two tables of a fire's lanes'
+/// row starts the kernels read, one u64 a lane, lie in its arm's staged
+/// inputs ([`crate::inputs::Inputs::stage_captures`]).
 pub struct CaptureLayout {
     keys: u32,
     pages: u32,
     page_size: u32,
     classes: poem_ir::ClassSet,
-    tables: Vec<(crate::device::Buffer, crate::device::Buffer)>,
 }
 
 /// What a capturing lane's rows take of its reader's state: its key row and
@@ -2703,13 +2724,10 @@ fn capture_row_bytes(keys: u32, pages: u32) -> (u64, u64) {
 
 impl CaptureLayout {
     fn of(
-        device: &Context,
         outputs: &[poem_exec::feeds::ClassOutput],
         context: u32,
         page_size: u32,
-        lanes: u32,
-        arms: usize,
-    ) -> Result<Option<CaptureLayout>> {
+    ) -> Option<CaptureLayout> {
         let mut classes = poem_ir::ClassSet::default();
         for out in outputs
             .iter()
@@ -2720,19 +2738,14 @@ impl CaptureLayout {
             }
         }
         if classes.is_empty() {
-            return Ok(None);
+            return None;
         }
-        let bytes = u64::from(lanes.max(1)) * 8;
-        let tables = (0..arms.max(1))
-            .map(|_| Ok((Buffer::zeroed(device, bytes)?, Buffer::zeroed(device, bytes)?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Some(CaptureLayout {
+        Some(CaptureLayout {
             keys: context,
             pages: context.div_ceil(page_size.max(1)),
             page_size: page_size.max(1),
             classes,
-            tables,
-        }))
+        })
     }
 
     /// What a capturing lane's rows take of a guest region, together.

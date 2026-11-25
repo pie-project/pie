@@ -206,16 +206,7 @@ impl ResidencyPlanner {
     /// its place, which needs that much room while both stand.
     pub(super) fn restore_reserve(&self) -> RsUnits {
         let (_, total) = self.port.rs_host_stats();
-        let mut windows = total.windows;
-        for list in &mut windows {
-            *list = (*list).min(1);
-        }
-        RsUnits {
-            slots: total.slots.min(1),
-            pages: total.pages.min(1),
-            windows,
-            wbuf: 0,
-        }
+        RsUnits::of(total.slots.min(1), total.pages.min(1))
     }
 
     /// Waiter `key` lacks `device` bytes on the device and `host` on the
@@ -903,7 +894,7 @@ impl ResidencyPlanner {
             return false;
         };
         let pages = txn.page_count() as u32;
-        ptrace!("demote begins pages={}", pages);
+        tracing::debug!("demote begins pages={}", pages);
         self.with_inner(|inner| {
             inner.evicting.insert(
                 DEMOTE,
@@ -991,7 +982,7 @@ impl ResidencyPlanner {
     }
 
     fn demote_done(self: &Arc<Self>, moved: bool) {
-        ptrace!("demote done moved={}", moved);
+        tracing::debug!("demote done moved={}", moved);
         self.with_inner(|inner| inner.settle_eviction(DEMOTE));
         self.demoting.store(false, Ordering::Release);
         if moved {
@@ -2013,7 +2004,7 @@ impl ResidencyPlanner {
         };
 
         let before = self.stats.evictions_started.load(Ordering::Relaxed);
-        ptrace!(
+        tracing::debug!(
             "suspend-for-room pid={} run={} pieces={}",
             pid,
             need.run,
@@ -2060,7 +2051,7 @@ impl ResidencyPlanner {
     /// Suspends those of `pids` that are running and a lower tier can hold.
     fn pause(self: &Arc<Self>, pids: Vec<ProcessId>, still: fn(&Proc) -> bool) {
         if !self.port.suspend_capable() {
-            ptrace!("pause: cannot suspend");
+            tracing::debug!("pause: cannot suspend");
             return;
         }
         let pausable: Vec<(ProcessId, Rank)> = self.with_inner(|inner| {
@@ -2075,7 +2066,7 @@ impl ResidencyPlanner {
                 })
                 .collect()
         });
-        ptrace!("pause candidates={}", pausable.len());
+        tracing::debug!("pause candidates={}", pausable.len());
         if pausable.is_empty() {
             return;
         }
@@ -2091,7 +2082,7 @@ impl ResidencyPlanner {
         let (picks, unhostable) =
             self.quote_and_pick(pausable, everything, self.swap_room(), 0, model, engine);
         // No tier takes them: they keep running.
-        ptrace!(
+        tracing::debug!(
             "pause picks={} unhostable={} room={:?}",
             picks.len(),
             unhostable.len(),

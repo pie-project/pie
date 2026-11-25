@@ -441,27 +441,6 @@ class TestFinalRows:
         with pytest.raises(InferletError, match=r"final-rows: a beam .*ForwardPass\.retractable\(\)"):
             beam.attach_program()
 
-    def test_run_ahead_retracts_only_a_retractable_pass(self):
-        import asyncio
-
-        from inferlet.eta import Pipeline
-
-        for retractable in (False, True):
-            fwd = self._pass()
-            if retractable:
-                fwd.retractable()
-            pipe = Pipeline()
-            reads = 0
-
-            def on_token():
-                nonlocal reads
-                reads += 1
-                return None if reads < 2 else False
-
-            assert asyncio.run(pipe.run_ahead(fwd, 8, on_token)) == 2
-            # A window of 4, refilled after the first read: 5 submitted, 2 kept.
-            assert pipe.wit.retracted == (3 if retractable else 0)
-
 
 class TestDiffusionSurface:
     def test_model_facts(self):

@@ -2,14 +2,7 @@
 
 use super::*;
 
-/// `windowed`: the fire reads window slots, which come back only once every
-/// fire that read them settles (its process finalizes it). A fire that would
-/// park finalizes its own tail as it lands while it waits, rather than
-/// settle it whole first: the tail may hold this pass's earlier pieces,
-/// which make up one frame with the piece now asking, and settling them
-/// before this ask returns waited on a frame only this ask completes (Mac's
-/// gemma-4-e4b c64 stall). The lane is parked first, so the scheduler waits
-/// on none of its fires.
+/// The planner's grant for a fire's `demand`.
 ///
 /// `alone`: what each unit of the fire takes on the device by itself
 /// ([`alone_demands`]), read only where the planner cannot grant the whole
@@ -20,7 +13,6 @@ pub(super) async fn acquire_grant<C: FireContext>(
     ctx: &mut C,
     pipeline_id: uuid::Uuid,
     demand: crate::planner::Demand,
-    windowed: bool,
     alone: impl FnOnce() -> Result<Vec<crate::planner::Demand>, String>,
 ) -> Result<Option<crate::planner::AllocationGrant>, String> {
     let pid = ctx.process_id();
@@ -37,13 +29,7 @@ pub(super) async fn acquire_grant<C: FireContext>(
     {
         return Ok(Some(grant));
     }
-    if windowed {
-        if let Some(grant) = planner.grant_now(pid, demand) {
-            planner.note_peak(pid, demand);
-            return Ok(Some(grant));
-        }
-        crate::scheduler::worker::notify_lane_close(pipeline_id, Some(pid));
-    } else if !demand.is_zero()
+    if !demand.is_zero()
         && let Some(grant) = planner.grant_now(pid, demand)
     {
         planner.note_peak(pid, demand);
@@ -60,16 +46,12 @@ pub(super) async fn acquire_grant<C: FireContext>(
     }
     // A yield may have dropped snapshots the demand was quoted against, so
     // the caller quotes it again rather than asking for the same.
-    let acquire = crate::inferlet::process::said(
+    let acquired = crate::inferlet::process::said(
         "plan: the planner's grant",
         pid,
         planner.acquire(pid, pipeline_id, demand),
-    );
-    let acquired = if windowed {
-        ask_while_tail_lands(ctx, acquire, || planner.pages_freed()).await?
-    } else {
-        acquire.await
-    };
+    )
+    .await;
     // A request the planner dropped while its process is still its own
     // (its entry gone under it) is asked again, quoted anew: a wait, never
     // the client's failure (a beam must not fail with "planner request
@@ -159,7 +141,7 @@ pub(crate) async fn relist_beam<C: FireContext>(
                 rs: crate::store::rs::RsUnits::default(),
             };
             let pid = ctx.process_id();
-            let Some(mut granted) = acquire_grant(ctx, pid, demand, false, || Ok(vec![demand])).await? else {
+            let Some(mut granted) = acquire_grant(ctx, pid, demand, || Ok(vec![demand])).await? else {
                 continue;
             };
             let pages: Vec<crate::store::kv::page_table::PhysicalKvPageId> =
@@ -215,62 +197,6 @@ pub(crate) async fn relist_beam<C: FireContext>(
             }
         }
     }
-}
-
-/// Awaits `ask` (a windowed planner ask) while finalizing the process's
-/// pending fires as each lands, `drained` told when any did (their window
-/// slots are back): never waits on the tail whole before the ask, since the
-/// tail may be this pass's earlier pieces, whose frame only the piece now
-/// asking completes.
-pub(super) async fn ask_while_tail_lands<C: FireContext, A: std::future::Future>(
-    ctx: &mut C,
-    ask: A,
-    drained: impl Fn(),
-) -> Result<A::Output, String> {
-    tokio::pin!(ask);
-    loop {
-        let tails = ctx.pipeline_tails();
-        let landed = tail_landed(&tails);
-        tokio::select! {
-            asked = &mut ask => return Ok(asked),
-            () = landed => {
-                // What landed is finalized: the window slots its fires read
-                // come back, and the planner looks again.
-                let mut any = false;
-                for fires in &tails {
-                    any |= drain_settled(ctx, Some(fires))
-                        .await
-                        .map_err(|error| format!("pipeline: settle for windowed kv: {error:#}"))?;
-                }
-                // A front signals exactly when it reads as settled: none
-                // drained means another finalizer took it, and the next
-                // front is waited on.
-                if any {
-                    drained();
-                }
-            }
-        }
-    }
-}
-
-/// Resolves once the front of any of `tails` has landed; never where all
-/// are empty.
-pub(super) async fn tail_landed(tails: &[PendingFires]) {
-    let fronts: Vec<_> = tails
-        .iter()
-        .filter_map(|fires| {
-            fires
-                .lock()
-                .unwrap()
-                .front()
-                .map(PendingOp::completion_signal)
-        })
-        .map(Box::pin)
-        .collect();
-    if fronts.is_empty() {
-        return std::future::pending().await;
-    }
-    futures::future::select_all(fronts).await;
 }
 
 pub(super) async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), String> {

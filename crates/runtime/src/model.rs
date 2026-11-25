@@ -271,11 +271,6 @@ pub struct Lane {
 pub struct RsCaps {
     pub state_size: u64,
     pub buffer_page_size: u32,
-    /// The window the model's state is read through, when it is one:
-    /// its bounded half is then its window lists of kv rows, not a slot.
-    /// The window-list path's; 0 on a load whose engine serves windowed
-    /// layers as ring + buffer.
-    pub window_tokens: u32,
     /// The engine serves the model's windowed layers as ring + buffer
     /// (CONTRACT-BC 19, 21; `Capabilities::windowed_state`): each ring is
     /// record bytes (in `state_size`), the unfolded rows sit in the window
@@ -286,9 +281,9 @@ pub struct RsCaps {
 }
 
 impl RsCaps {
-    /// The model has a bounded half beside its kv: a folded state or a window.
+    /// The model has a bounded half beside its kv: a folded state.
     pub fn has_state(&self) -> bool {
-        self.state_size > 0 || self.window_tokens > 0
+        self.state_size > 0
     }
 }
 

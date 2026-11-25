@@ -187,9 +187,6 @@ pub struct EngineConfig {
     /// The pools as chunks: what the engine states
     /// ([`::engine::Capabilities::chunks`]).
     pub chunks: ::engine::chunk::ChunkFacts,
-    /// The model's window (`PoolFacts::window_tokens`): the window-list
-    /// path's.
-    pub window_tokens: u32,
     /// The engine serves windowed layers as ring + buffer
     /// (`Capabilities::windowed_state`, CONTRACT-BC 19, 21).
     pub windowed_state: bool,
@@ -528,7 +525,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // Windowed layers as ring + buffer (CONTRACT-BC 19, 21): stated only by
     // an engine that serves them so, and the same way by every engine of
     // the model; such a load is a recurrent-state load whose record holds
-    // the rings, no window list.
+    // the rings.
     for (at, d) in engine_configs.iter().enumerate() {
         anyhow::ensure!(
             d.chunks.windowed.is_empty() || d.windowed_state,
@@ -544,8 +541,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .position(|d| d.chunks.window_buffer().is_some() != window_state)
     {
         anyhow::bail!(
-            "engine {at} serves the model's windowed layers otherwise than engine 0 (ring + \
-             buffer on one, window lists on the other); the engines of one model hold one state"
+            "engine {at} serves the model's windowed layers otherwise than engine 0 (a window \
+             buffer on one, none on the other); the engines of one model hold one state"
         );
     }
     let rs_caps = {
@@ -553,11 +550,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let mut caps = model::RsCaps {
             state_size: d0.map_or(0, |d| d.chunks.record_bytes),
             buffer_page_size: 0,
-            window_tokens: if window_state {
-                0
-            } else {
-                d0.map_or(0, |d| d.window_tokens)
-            },
             window_state,
         };
         if caps.has_state() {
@@ -680,13 +672,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .iter()
         .zip(&readouts)
         .map(|(d, readouts)| {
-            let mut pools = crate::store::chunks::StorePools::of(&d.chunks)
+            let pools = crate::store::chunks::StorePools::of(&d.chunks)
                 .map_err(|error| anyhow::anyhow!("engine pools: {error}"))?;
-            // A window the engine holds no pages for is still a window (the
-            // window-list path; a ring + buffer load holds no window list).
-            if pools.window_tokens == 0 && !rs_caps.window_state {
-                pools.window_tokens = d.window_tokens;
-            }
             // An engine that states a shared pool: the stores draw from one
             // pool built of its facts, a copy-on-write record kept back for
             // each lane a fire runs.
@@ -970,138 +957,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             .as_ref()
             .context("a worker names its policy (`noop` writes no rows)")?;
         crate::policy::start(name, component).with_context(|| format!("worker policy {name}"))?;
-    }
-    if let Some(period) = std::env::var("PIE_CONTENTION_TRACE_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        && let Some(planner) = crate::planner::planner_for(arena_model_idx, 0)
-    {
-        crate::rt::spawn(async move {
-            let mut interval = crate::rt::time::interval(std::time::Duration::from_millis(period));
-            loop {
-                interval.tick().await;
-                let d = planner.diagnostics();
-                let pass = planner.pass_census();
-                let phases = planner.phase_census();
-                let map = planner.map_census();
-                let edge = planner.edge_census();
-                let stuck = planner.stuck_census();
-                let (lk_n, lk_wait, lk_hold, lk_wmax, lk_hmax) = planner.lock_census();
-                // Who holds the device pool's slots, whatever the queue.
-                if let Some(shared) = crate::store::registry::try_get(arena_model_idx, 0)
-                    .and_then(|stores| stores.shared)
-                {
-                    println!(
-                        "[pool-held] {}",
-                        shared.lock().unwrap().pool().held_census()
-                    );
-                }
-                if d.queue.is_empty() && d.proc_states[1..].iter().all(|&n| n == 0) {
-                    continue;
-                }
-                println!(
-                    "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
-                     free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
-                     parks={} serves={} evictions={} deferrals={} \
-                     evict_rollbacks={} evict_faults={} restore_faults={} restores={} restore_failures={} restore_roles_short={} leaked_role_slots={} gate_parks={} \
-                     hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} rshort={} \
-                     grow_waits={} compaction_waits={} list_compactions={} grow_parked={} no_grows={} \
-                     lock_n={} lock_wait_ms={} lock_hold_ms={} lock_wmax_us={} lock_hmax_us={} \
-                     d2h_pages={} h2d_pages={} d2h_rs={} h2d_rs={} d2h_ms={} h2d_ms={} \
-                     disk_free={}/{} disk_w_pages={} host_disk_pages={} disk_r_pages={} disk_w_ms={} disk_r_ms={} \
-                     resident={} evicting={} evicted={} restoring={} admitted={} \
-                     passes={} pass_ms={} pass_mean_us={} pass_p99_under_us={} \
-                     pass_steps_ms={} pass_wants_ms={} pass_rest_ms={} \
-                     map_passes={} map_pass_ms={} quiet_waits={} skipped_wakes={} map_cache_hits={} \
-                     stuck_settles={} forced_passes={} oldest_wait_ms={} refusal_repeats={} \
-                     runners=[{}]",
-                    d.queue.len(),
-                    d.unmet_queued,
-                    d.unmet_head_pages,
-                    d.unmet_head_kind,
-                    d.bypassable_entries,
-                    d.bypassable_pages,
-                    d.accumulation,
-                    d.device_pages_free,
-                    d.device_pages_total,
-                    d.host_slots_free,
-                    d.host_slots_total,
-                    d.queue.first().map_or(0, |w| w.rs.slots),
-                    d.rs_free.slots,
-                    d.rs_total.slots,
-                    d.parks_total,
-                    d.serves_total,
-                    d.evictions_total,
-                    d.eviction_deferrals_total,
-                    d.eviction_rollbacks_total,
-                    d.eviction_faults_total,
-                    d.restore_faults_total,
-                    d.restores_total,
-                    d.restore_failures_total,
-                    d.restore_roles_short_total,
-                    d.leaked_role_slots_total,
-                    d.gate_parks_total,
-                    d.hog_failures_total,
-                    d.starvations_total,
-                    d.starvation_restarts_total,
-                    d.salvages_total,
-                    d.host_swap_exhaustions_total,
-                    d.host_swap_unblocks_total,
-                    d.e6_relaxations_total,
-                    d.restore_absorb_short_total,
-                    d.grow_waits_total,
-                    d.compaction_waits_total,
-                    d.list_compactions_total,
-                    d.grow_parked,
-                    d.no_grows_total,
-                    lk_n,
-                    lk_wait / 1000,
-                    lk_hold / 1000,
-                    lk_wmax,
-                    lk_hmax,
-                    d.d2h_pages_total,
-                    d.h2d_pages_total,
-                    d.d2h_rs_slots_total,
-                    d.h2d_rs_slots_total,
-                    d.d2h_copy_us_total / 1000,
-                    d.h2d_copy_us_total / 1000,
-                    d.disk_slots_free,
-                    d.disk_slots_total,
-                    d.disk_write_pages_total,
-                    d.host_disk_pages_total,
-                    d.disk_read_pages_total,
-                    d.disk_write_us_total / 1000,
-                    d.disk_read_us_total / 1000,
-                    d.proc_states[0],
-                    d.proc_states[1],
-                    d.proc_states[2],
-                    d.proc_states[3],
-                    d.admitted_procs,
-                    pass.0,
-                    pass.1 / 1000,
-                    pass.2,
-                    pass.3,
-                    phases[0] / 1000,
-                    phases[1] / 1000,
-                    phases[2] / 1000,
-                    map.0,
-                    map.1 / 1000,
-                    map.2,
-                    edge.0,
-                    edge.1,
-                    stuck.0,
-                    stuck.1,
-                    stuck.2,
-                    planner.refusal_repeats(),
-                    d.runners
-                        .iter()
-                        .map(|(seq, held, progressed)| format!("{seq}:h{held}:p{progressed}"))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-            }
-        });
     }
 
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
@@ -1860,7 +1715,6 @@ mod tests {
             RsCaps {
                 state_size: facts.record_bytes,
                 buffer_page_size: 0,
-                window_tokens: 0,
                 window_state: false,
             },
         )
