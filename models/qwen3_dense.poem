@@ -72,8 +72,9 @@ DEPLOYMENTS = [
 # token embedding, which the 0.6B and 1.7B also read out through (tied), a
 # final norm.
 # Each layer also has the banks its mounted stanzas keep (`//lib/taps.poem`),
-# which the host registers. A deployment's dtype is its projections'; the embedding and head stay at its compute dtype, as
-# an AWQ or GPTQ export keeps them.
+# which the host registers. A deployment's dtype is its projections'; the
+# embedding and head stay at its compute dtype, as an AWQ or GPTQ export keeps
+# them.
 
 def dims(hidden, layers, q_heads, kv_heads, inter, tied, vocab = 151936):
     return struct(

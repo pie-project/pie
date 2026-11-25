@@ -74,8 +74,8 @@ DEPLOYMENTS = (
 # token embedding, a final norm and the head. The deployment's first dtype
 # stores the projections, its second (or the first) the expert banks; the
 # norms, the router, the embedding and the head stay bf16 under a release's
-# FP8 or NVFP4. Each layer also has the banks its mounted
-# stanzas keep at its attention (`//lib/taps.poem`), which the host registers.
+# FP8 or NVFP4. Each layer also has the banks its mounted stanzas keep at its
+# attention (`//lib/taps.poem`), which the host registers.
 
 def dims(hidden, layers, q_heads, kv_heads, experts, inter, theta):
     return struct(
