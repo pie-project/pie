@@ -1,8 +1,6 @@
 #![cfg(feature = "device")]
-//! A guest program's scratch is state, not the fire's: each instance holds
-//! its lane's value scratch and the pair its tables, both in `Instance`
-//! slots, and a fire of 64 bound lanes lays nothing of the guest in the
-//! activation's span, which stays what the rungs state.
+//! A guest program's state lies in `Instance` slots: it changes owner clean,
+//! and parks, unparks and evacuations move it whole or not at all.
 
 use std::path::Path;
 
