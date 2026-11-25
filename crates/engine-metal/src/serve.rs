@@ -304,6 +304,8 @@ pub struct Attached {
 }
 
 pub struct Shell {
+    /// How this load's lanes name their slots ([`Addressing`]).
+    addressing: Addressing,
     /// What the load weighed its rungs by, where its profile states rates:
     /// the rungs, the estimate and the live range (`--check-estimate`).
     weighed: Option<crate::top::Weighed>,
@@ -738,6 +740,7 @@ impl Shell {
             placed: None,
             ruled: None,
             ane_cache: None,
+            addressing: Addressing::Seats,
         })
     }
 }
@@ -752,7 +755,23 @@ struct Placed {
     weight_caches: Vec<crate::store::streamed::Cache>,
 }
 
-/// A load compiled and not yet placed; [`PreparedLoad::load`] places it.
+/// How a load's lanes name their pool slots. Set by the constructor that
+/// places the load, never by its configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Addressing {
+    /// The runtime's slot refs, and nothing else: the pool lays no seat runs
+    /// (every chunk past the null chunk and the tables is the runtime's to
+    /// name), and a seat-addressed lane is refused by name. A served load.
+    Refs,
+    /// The direct-firing harness ([`PreparedLoad::load`], [`Shell::load`]):
+    /// a caller with no runtime fires seat-addressed lanes, seat `s` taking
+    /// its own runs of list and fixed slots laid in the lowest chunks.
+    Seats,
+}
+
+/// A load compiled and not yet placed; [`PreparedLoad::load`] places it for
+/// the direct-firing harness, [`PreparedLoad::load_for_runtime`] for a
+/// runtime naming slot refs.
 pub struct PreparedLoad<'a> {
     boot: Boot<'a>,
     device: Context,
@@ -772,6 +791,7 @@ pub struct PreparedLoad<'a> {
     /// Where the Neural Engine keeps its compiled programs
     /// ([`DeviceBoot::cache`](crate::DeviceBoot::cache)).
     ane_cache: Option<std::path::PathBuf>,
+    addressing: Addressing,
 }
 
 impl PreparedLoad<'_> {
@@ -793,6 +813,15 @@ impl PreparedLoad<'_> {
         self.ane_cache = cache;
     }
 
+    /// Places the load for a runtime that names every slot by ref: no seat
+    /// runs, and a seat-addressed lane refused ([`Addressing::Refs`]).
+    pub fn load_for_runtime(mut self) -> Result<Shell> {
+        self.addressing = Addressing::Refs;
+        self.load()
+    }
+
+    /// Places the load for the direct-firing harness ([`Addressing::Seats`]),
+    /// or as [`Self::load_for_runtime`] set it.
     pub fn load(self) -> Result<Shell> {
         let PreparedLoad {
             boot,
@@ -807,6 +836,7 @@ impl PreparedLoad<'_> {
             placed,
             ruled,
             ane_cache,
+            addressing,
         } = self;
         let mut boot = boot;
 
@@ -1498,6 +1528,7 @@ impl PreparedLoad<'_> {
                     }),
                     ruled: Some(pick),
                     ane_cache,
+                    addressing,
                 }
                 .load();
             }
@@ -1592,7 +1623,10 @@ impl PreparedLoad<'_> {
                 page_size,
                 bytes,
                 rows.pieces,
-                boot.slots,
+                match addressing {
+                    Addressing::Refs => 0,
+                    Addressing::Seats => boot.slots,
+                },
                 seated.pages_per_slot,
             )?
             .with_tables(tables_chunks)
@@ -1787,6 +1821,7 @@ impl PreparedLoad<'_> {
                 })
         });
         let shell = Shell {
+            addressing,
             weighed,
             measured_at_load: chip.tuned().timed.clone(),
             tuning,

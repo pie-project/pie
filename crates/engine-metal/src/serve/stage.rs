@@ -774,6 +774,19 @@ impl Shell {
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
+        // A load for a runtime lays no seat runs: every chunk is the
+        // runtime's to name, so a lane it did not address by ref has none.
+        if self.addressing == super::Addressing::Refs
+            && let Some(seated) = lanes.iter().find(|seated| !seated.refs)
+        {
+            return Err(Fault::Unbound {
+                what: format!(
+                    "a seat-addressed lane (seat {}) on a load placed for the runtime: its \
+                     pool lays no seat runs, and every lane names its slots by ref",
+                    seated.lane.slot
+                ),
+            });
+        }
         // A seat-addressed lane writes the seat runs' chunks; a weight slot
         // named there would be overwritten under the cache's feet.
         if lanes.iter().any(|seated| !seated.refs) && self.pools.weights_in_seats() {
