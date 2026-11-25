@@ -42,7 +42,11 @@ impl EmittedKernel {
         emitted: Result<String, EmitError>,
     ) -> Self {
         let (source, error) = match emitted {
-            Ok(source) => (source, String::new()),
+            // Held for the program's life: the emitter's growth is not.
+            Ok(mut source) => {
+                source.shrink_to_fit();
+                (source, String::new())
+            }
             Err(error) => (String::new(), error.to_string()),
         };
         Self {
