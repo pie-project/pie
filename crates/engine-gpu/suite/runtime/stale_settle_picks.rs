@@ -12,7 +12,7 @@ use crate::backend;
 #[test]
 fn a_settle_stale_by_code_alone_serves_its_picks_range_by_range() {
     let profiles = std::env::temp_dir().join(format!(
-        "pie-{}-stale-settle-picks-{}",
+        "pie-{}-stale-settle-picks-profiles-{}",
         backend::NAME,
         std::process::id()
     ));
