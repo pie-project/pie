@@ -4,9 +4,7 @@
 //! only where serving submits that step whole and each option only where
 //! its step, priced by the curves, fits; a range serving splits keeps its
 //! kernel from the curves, unchecked. Here the bound is simulated between a
-//! one-row step's estimate and the load's widest step's. And a settle
-//! point another lane's work overlaps, or a slice an arrival preempts, is
-//! never weighed or stored.
+//! one-row step's estimate and the load's widest step's.
 
 use std::time::Duration;
 
@@ -14,7 +12,7 @@ use engine::Engine;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine_gpu::submit::StepRows;
 
-use super::outputs::{Outputs, contract_for, loaded_with};
+use super::outputs::contract_for;
 use crate::backend;
 use crate::model_logits::fixture;
 
@@ -108,52 +106,4 @@ fn the_settle_submits_no_fire_past_the_bound() {
     );
     drop(engine);
     let _ = std::fs::remove_dir_all(&profiles);
-}
-
-/// Every timed settle point overlapped by another lane's submission (the
-/// runtime's count moves while it runs) is discarded, and a slice a request
-/// arrives before gives the device back unfired: no range is weighed,
-/// nothing is stored, and the settle stays pending for a later idle turn.
-#[test]
-fn a_settle_overlapped_or_preempted_is_not_stored() {
-    let submitted = std::cell::Cell::new(0u64);
-    let busy = || {
-        submitted.set(submitted.get() + 1);
-        submitted.get()
-    };
-    let overlapped = ::engine::BehindServing { others: &busy, arrived: &|| false, seats: None, step: None };
-    let preempted = ::engine::BehindServing { others: &|| 0, arrived: &|| true, seats: None, step: None };
-    for (what, behind) in [("overlapped", overlapped), ("preempted", preempted)] {
-        // A profile directory of its own: the process's shared one keeps
-        // each model's settle once another test weighed it.
-        let profiles = std::env::temp_dir().join(format!("pie-{}-settle-{what}-{}", backend::NAME, std::process::id()));
-        let _ = std::fs::remove_dir_all(&profiles);
-        let boot = backend::DeviceBoot { profiles: Some(profiles.clone()), ..crate::gpu::device_boot() };
-        let Some(mut loaded) = loaded_with(what, &Outputs, None, boot) else {
-            return;
-        };
-        let mut slices = 0;
-        while slices < 64 && loaded.engine.measure_behind(&behind).expect("measuring behind") {
-            slices += 1;
-        }
-        let shell = loaded.engine.loaded_mut().expect("loaded");
-        assert!(shell.settled().iter().all(|range| !range.checked), "{what}: {:?}", shell.settled());
-        assert!(shell.behind_status().is_some(), "{what}: the settle is still pending");
-        drop(loaded);
-        let stored = stores_a_settle(&profiles);
-        let _ = std::fs::remove_dir_all(&profiles);
-        assert!(!stored, "{what}: nothing was stored");
-    }
-}
-
-/// Whether a file under `dir` holds a stored settle.
-fn stores_a_settle(dir: &std::path::Path) -> bool {
-    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            stores_a_settle(&path)
-        } else {
-            std::fs::read_to_string(&path).is_ok_and(|text| text.contains("dense_settled_keyed"))
-        }
-    })
 }

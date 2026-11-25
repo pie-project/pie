@@ -66,6 +66,7 @@ impl ResidencyPlanner {
         let uncontended = self.returns.waiters.load(Ordering::Acquire) == 0
             && self.nonresident.load(Ordering::Acquire) == 0;
         if uncontended {
+            self.take_idle_room(demand.kv_pages);
             // The room read, the growth held back and the grant taken as one
             // step: a burst of prompts read apart from their grants would each
             // see the room the others are about to take, and seat lanes their
@@ -259,6 +260,7 @@ impl ResidencyPlanner {
                 let short = super::pool::IdleShort {
                     kv_pages: self.port.rs_as_pages(demand.rs.sub(rs_free)),
                     rs: true,
+                    chunks: 0,
                 };
                 // A demote on its way is room on its way back, as a
                 // reclaim's returning pages are.

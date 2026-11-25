@@ -428,6 +428,17 @@ impl Admission {
     }
 }
 
+/// What a queue of single-fire frames is held to take where its fires are
+/// estimated at `estimate_ns` and the host spent `host_ns` laying and
+/// committing them (0 for a frame of one submission): the longer, as both
+/// run at once. A queue the host held back says nothing of how far the
+/// device runs past its estimate; one the device held back is compared with
+/// the estimate alone.
+#[must_use]
+pub fn queued_estimate(estimate_ns: f64, host_ns: f64) -> f64 {
+    estimate_ns.max(host_ns)
+}
+
 /// The side of the cube the warm-up's size walk ([`warm_side`]) times
 /// first, and the one after it: the walk's first growth is theirs.
 pub const WARM_PROBE: u32 = 1024;
@@ -1797,6 +1808,40 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("derived/card-x.toml"), "{err}");
         assert!(err.contains("`[rates] bytes_per_ns`"), "{err}");
+    }
+
+    /// A queue the host held back teaches the admission nothing of the
+    /// device (recorded, RTX PRO 4500, a debug build: 985 one-row 128 x 128
+    /// matmuls, one a submission, estimated 3.96 ms, 330.7 ms of the host
+    /// laying and committing them, 507.3 ms in all); one the
+    /// device held back does, by its own estimate, and a frame of one
+    /// submission by its estimate alone. What is refused is as before.
+    #[test]
+    fn a_queue_the_host_held_back_teaches_no_ratio() {
+        let bound = Some(std::time::Duration::from_millis(105));
+        let big = Some(50e6);
+        let tiny = || {
+            let mut a = Admission::new(bound);
+            a.settled = true;
+            a
+        };
+        // The host's lay and commit was 65% of the queue's time: 1.53x.
+        let mut a = tiny();
+        a.landed(Some(queued_estimate(3.96e6, 330.7e6)), 507.3e6, true);
+        assert!(a.worst < 1.6, "{}", a.worst);
+        assert!(a.fits(big), "a 50 ms frame is admitted under 105 ms");
+        // The same queue against its estimate alone: 128x.
+        let mut b = tiny();
+        b.landed(Some(queued_estimate(3.96e6, 0.0)), 507.3e6, true);
+        assert!(b.worst > 100.0 && !b.fits(big));
+        // A mid-sized queue three times its estimate, past the host's time.
+        let mut c = tiny();
+        c.landed(Some(queued_estimate(100e6, 20e6)), 300e6, true);
+        assert!((c.worst - 3.0).abs() < 1e-9 && !c.fits(big));
+        // Ten times the host's time or more: the ratio is the estimate's.
+        assert_eq!(queued_estimate(500e6, 50e6).to_bits(), 500e6f64.to_bits());
+        // A frame past the bound is refused as before.
+        assert!(!tiny().fits(Some(106e6)) && !tiny().fits(None));
     }
 
     #[test]

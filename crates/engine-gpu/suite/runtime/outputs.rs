@@ -226,6 +226,38 @@ pub(super) fn loaded_with(
 
 const LANES: u32 = 4;
 
+/// What `engine`'s load left to measure behind serving (the dense settle's
+/// ranges, a stale rate), run to its end as the runtime's idle lane runs
+/// it: one slice a call, no other lane submitting, on a served step no point
+/// outlasts (else a range whose point runs longer ends the settle, undecided).
+/// The slices it ran.
+pub(super) fn measure_behind(engine: &mut impl ::engine::Engine) -> usize {
+    let mut slices = 0;
+    let behind = ::engine::BehindServing {
+        others: &|| 0,
+        arrived: &|| false,
+        seats: None,
+        step: Some(std::time::Duration::from_secs(60)),
+    };
+    while engine
+        .measure_behind(&behind)
+        .expect("measuring behind serving")
+    {
+        slices += 1;
+    }
+    slices
+}
+
+/// [`loaded`] for `lanes` lanes on `boot`.
+pub(super) fn loaded_boot(
+    tag: &str,
+    model: &impl ForwardHybrid,
+    lanes: u32,
+    boot: backend::DeviceBoot,
+) -> Option<Loaded> {
+    loaded_flight(tag, model, lanes, None, boot, 1)
+}
+
 /// [`loaded_with`] for `lanes` lanes, `frames` frames in flight.
 pub(super) fn loaded_flight(
     tag: &str,

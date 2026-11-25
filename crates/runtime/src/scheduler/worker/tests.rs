@@ -438,6 +438,7 @@ fn worker_every_case() {
     a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
     a_launch_waits_for_the_copy_queued_ahead_of_it();
     a_control_brought_forward_leaves_a_cut_pass_s_pieces_in_order();
+    a_held_fire_holds_its_pipeline_s_later_ones();
     a_pass_that_only_reorders_lets_the_worker_park();
 }
 
@@ -501,6 +502,48 @@ fn a_pass_that_only_reorders_lets_the_worker_park() {
     assert!(!progress, "nothing left the queue");
     assert_eq!(pending.len(), 2);
     lane.shutdown();
+}
+
+/// A fire held for placement holds what its pipeline queued behind it, and
+/// a later held fire of the pipeline, until it goes again: the pipeline's
+/// order stands, and another pipeline's fire goes meanwhile.
+fn a_held_fire_holds_its_pipeline_s_later_ones() {
+    let engine = 9_997;
+    let (one, other) = (ProcessId::from_u128(5), ProcessId::from_u128(6));
+    let request = |fire: u64, pipeline| {
+        let mut request = refused_request(fire);
+        request.pipeline_id = Some(pipeline);
+        request.prelaunch_copy = None;
+        request.prelaunch_state_copy = None;
+        request
+    };
+    let batch = |fire| HeldForPlacement {
+        chunks: Vec::new(),
+        requests: vec![request(fire, one)],
+        solo: false,
+        funding: false,
+        later: Vec::new(),
+    };
+    let mut held = vec![batch(7), batch(8)];
+    let mut pending = PendingQueue::default();
+    for (fire, pipeline) in [(9, one), (10, other), (11, one)] {
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(request(fire, pipeline))));
+    }
+    let fires = |pending: &PendingQueue| -> Vec<u64> {
+        pending
+            .iter()
+            .filter_map(|item| match item {
+                QueuedItem::Launch(launch) => Some(launch.request.logical_fire_id),
+                _ => None,
+            })
+            .collect()
+    };
+    BatchScheduler::hold_behind(&mut held, &mut pending);
+    assert_eq!(fires(&pending), [10], "another pipeline's goes meanwhile");
+    assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+    assert!(held.is_empty());
+    assert_eq!(fires(&pending), [7, 8, 9, 11, 10]);
+    assert_eq!(pending.out_of_order(), None);
 }
 
 /// A cut pass's two pieces with a close between them: the close comes to

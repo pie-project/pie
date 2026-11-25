@@ -77,7 +77,10 @@ const MEASURED_UNDER: std::time::Duration = std::time::Duration::from_secs(2);
 pub fn profiles() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        // A suite built on another machine (a phone's) has no such path:
+        // `PIE_SUITE_TMPDIR` states one.
+        let root = std::env::var_os("PIE_SUITE_TMPDIR")
+            .map_or_else(|| env!("CARGO_TARGET_TMPDIR").into(), std::path::PathBuf::from)
             .join(format!("pie-{}-profiles", crate::backend::NAME));
         #[cfg(target_os = "linux")]
         for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {

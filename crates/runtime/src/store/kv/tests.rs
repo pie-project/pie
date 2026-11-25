@@ -1990,8 +1990,7 @@ fn idle_cache_comes_back_past_the_fires_that_read_it() {
 }
 
 /// What a fire may read goes back once it retires, each way a page is left
-/// under one: a pin let go, a copy into it on its way, and an owner's pages
-/// that go as the entry below it does (a longer prompt's, its selections
+/// under one: a pin let go, and an owner's pages that go as the entry below it does (a longer prompt's, its selections
 /// alone left).
 #[test]
 fn idle_cache_read_under_a_fire_waits_for_it() {
@@ -2027,11 +2026,11 @@ fn idle_cache_read_under_a_fire_waits_for_it() {
         pages.into_iter().map(KvPageBacking::Resident).collect(),
     ));
     assert_eq!(store.reclaim_cache(3, |_| 0), 3);
-    store.retire_idle();
-    assert_eq!(store.available_pages(), 5, "the copy into them is handed out next");
-    let copy = store.begin_fire();
-    store.settle(copy);
-    assert_eq!(store.available_pages(), 8);
+    assert_eq!(
+        store.available_pages(),
+        8,
+        "filed with their bytes read in: no fire to wait for, none may come"
+    );
 
     let mut table = KvPageTable::new();
     let (short, long, reader) = (

@@ -37,6 +37,9 @@ pub(super) const WAKE_BEAT: u8 = 3;
 #[derive(Default)]
 pub(super) struct RoomReturns {
     epoch: AtomicU64,
+    /// A reader of cached pages ended since a pass last looked
+    /// ([`Self::reader_ended`]).
+    reader_ended: std::sync::atomic::AtomicBool,
     /// The planner's queue length, kept by `with_inner`: a drop with no
     /// one waiting wakes nothing.
     pub(super) waiters: AtomicUsize,
@@ -88,6 +91,11 @@ impl RoomReturns {
     /// planner woken while anyone waits. Lock-free: the pool's release
     /// calls it under its own lock and its caller's.
     pub(super) fn slots_freed(&self, count: crate::store::slots::RoomCount) {
+        if count.tier == crate::store::slots::RoomTier::Reader {
+            self.reader_ended.store(true, Ordering::Release);
+            self.given();
+            return;
+        }
         self.freed.fetch_add(1, Ordering::AcqRel);
         if self.planning.load(Ordering::Acquire) || self.waiters.load(Ordering::Acquire) == 0 {
             return;
@@ -110,6 +118,7 @@ impl RoomReturns {
                 count.chunks >= self.want_chunks.load(Ordering::Acquire)
                     || count.slots >= self.want_list.load(Ordering::Acquire)
             }
+            RoomTier::Reader => true,
             RoomTier::Swap => count.slots >= self.want_swap.load(Ordering::Acquire),
         }
     }
@@ -125,6 +134,12 @@ impl RoomReturns {
     pub(super) fn plan_begins(&self) {
         self.freed_at_plan
             .store(self.freed.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// Whether a reader ended since this last answered: idle cache found out
+    /// before may give room now.
+    pub(super) fn take_reader_ended(&self) -> bool {
+        self.reader_ended.swap(false, Ordering::AcqRel)
     }
 
     /// Slots come free on any tier so far ([`Self::slots_freed`]).

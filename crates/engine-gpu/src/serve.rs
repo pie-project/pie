@@ -810,6 +810,78 @@ fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     })
 }
 
+/// The tuning a lone lane's one-row decode frames run by, what the host
+/// cover is timed over (two warm rounds' difference, which cancels the
+/// prompt): the profile's `decisions`, the kernel a one-row fire takes at
+/// each plane as resolved, whichever layer decided it, the tier, and the
+/// cores and workgroups a guest step strides over. Not the load's rows or
+/// lanes, nor the kernels its wider fires take: they follow the memory a
+/// load finds and no such frame reads them.
+fn cover_tuning(
+    decisions: &str,
+    dense: &crate::dense::Dense,
+    tier: kernels_slang::Tier,
+    cores: u32,
+    resident: Option<u32>,
+) -> u32 {
+    profile::rates::fingerprint(
+        format!(
+            "{decisions}|{}|{tier:?}|cores {cores} resident {resident:?}",
+            dense.one_row()
+        )
+        .as_bytes(),
+    )
+}
+
+/// The settles of `all` (stored before committed) nearest a load keyed `of`
+/// whose planes are `mine`, nearest first: those of its key, then each other
+/// that shares a plane with it, the most shared first and the stored first
+/// on a tie; with how many it shares (`None` for its own key's).
+fn nearest<'a>(
+    of: u32,
+    mine: &[(u32, u32)],
+    all: &[(&'static str, &'a profile::curves::DenseSettled)],
+) -> Vec<(&'static str, &'a profile::curves::DenseSettled, Option<usize>)> {
+    let mut near: Vec<_> = all
+        .iter()
+        .filter(|(_, s)| s.of == of)
+        .map(|&(whence, s)| (whence, s, None))
+        .collect();
+    let mut others: Vec<_> = all
+        .iter()
+        .filter(|(_, s)| s.of != of)
+        .map(|&(whence, s)| {
+            let shared = s.planes.iter().filter(|p| mine.contains(p)).count();
+            (whence, s, Some(shared))
+        })
+        .filter(|(.., shared)| *shared > Some(0))
+        .collect();
+    others.sort_by_key(|&(.., shared)| std::cmp::Reverse(shared));
+    near.extend(others);
+    near
+}
+
+/// The kernel each range of `left` is served by from `layers` (stored rows a
+/// settle, nearest first) and which layer: the first that states the range
+/// decides it, whatever the layers under it say. A range its row names no
+/// kernel of, or one not `built`, keeps the curves' pick.
+fn layered(
+    left: &std::collections::VecDeque<(u32, u32)>,
+    layers: &[&[[u32; 6]]],
+    built: impl Fn(kernels_slang::linear::gemm::Tactic) -> bool,
+) -> Vec<((u32, u32), kernels_slang::linear::gemm::Tactic, usize)> {
+    left.iter()
+        .filter_map(|&range| {
+            let (from, row) = layers.iter().enumerate().find_map(|(at, rows)| {
+                let row = rows.iter().find(|row| (row[0], row[1]) == range)?;
+                Some((at, *row))
+            })?;
+            let tactic = row_tactic(row).filter(|&tactic| built(tactic))?;
+            Some((range, tactic, from))
+        })
+        .collect()
+}
+
 /// A stored settle row's third field: the range kept the curves' kernel,
 /// not named (a row written before the kept kernel was recorded, or a range
 /// whose planes took different kernels): the curves' pick serves it.
@@ -912,6 +984,9 @@ struct Trial {
     idle_before: bool,
     /// The longest fire of the range so far, ns (the warm round's too).
     seen_ns: Option<f64>,
+    /// One decode step of the load timed, nothing weighed: what bounds the
+    /// other points where the 1-row range was decided by an earlier load.
+    reference: bool,
 }
 
 /// What a range's weighing found to open ([`Shell::open_trial`]).
@@ -3308,7 +3383,7 @@ impl<B: Serve> Shell<B> {
     ///
     /// A load never weighs before ready. A stored or committed settle whose
     /// key matches is taken; where none does, the nearest one's picks serve
-    /// ([`Shell::nearest_settle`]), else the curves'. Every range no
+    /// ([`Shell::nearest_settles`]), else the curves'. Every range no
     /// matching settle decided is left to weigh behind serving
     /// ([`Shell::measure_behind`]): this load serves its picks as they stand,
     /// and each range weighed is stored for the next load of the key.
@@ -3348,7 +3423,7 @@ impl<B: Serve> Shell<B> {
                 None
             }
         };
-        let mut taken: Option<(&str, profile::curves::DenseSettled)> = None;
+        let mut taken: Vec<(&str, profile::curves::DenseSettled)> = Vec::new();
         for (whence, settled) in [
             ("stored", self.dense_rates.dense_settled.clone()),
             ("committed", self.committed_settle.clone()),
@@ -3375,8 +3450,7 @@ impl<B: Serve> Shell<B> {
                         "dense settle: {whence}, its key matches; its {} decided ranges taken",
                         settled.ranges.len()
                     );
-                    taken = Some((whence, settled));
-                    break;
+                    taken.push((whence, settled));
                 }
                 Some(why) => tracing::info!(
                     method = SETTLE_METHOD,
@@ -3386,10 +3460,21 @@ impl<B: Serve> Shell<B> {
                 ),
             }
         }
-        let (whence, stored): (&str, Vec<[u32; 6]>) = match taken {
-            Some((whence, settled)) => (whence, settled.ranges),
-            None => ("none", Vec::new()),
-        };
+        let whence = taken.first().map_or("none", |(whence, _)| whence);
+        // Range by range: the user's stored, then a committed profile's. Its
+        // own alone are stored again (`Behind::rows`).
+        let mut own: Vec<[u32; 6]> = Vec::new();
+        let mut stored: Vec<[u32; 6]> = Vec::new();
+        for (from, settled) in &taken {
+            for &row in &settled.ranges {
+                if stored.iter().all(|have| (have[0], have[1]) != (row[0], row[1])) {
+                    stored.push(row);
+                    if *from == "stored" {
+                        own.push(row);
+                    }
+                }
+            }
+        }
         for &row in &stored {
             if let Some(tactic) = row_tactic(row) {
                 self.dense = self.dense.with_rows(row[0], row[1], tactic);
@@ -3431,34 +3516,38 @@ impl<B: Serve> Shell<B> {
             .into_iter()
             .filter(|range| !decided.contains(range))
             .collect();
-        // No settle of this key: the nearest one's picks serve meanwhile,
-        // range by range, each where its kernel is built for every plane of
-        // this load (a pick is served only by a kernel built before ready).
+        // The ranges no settle of this key decided: the nearest ones' picks
+        // serve meanwhile, range by range, each where its kernel is built for
+        // every plane of this load (a pick is served only by a kernel built
+        // before ready).
         let mut served_by = if stored.is_empty() {
             "the curves' picks".to_string()
         } else {
             format!("the {whence} settle's picks")
         };
-        if stored.is_empty()
-            && !left.is_empty()
-            && let Some((near, nearest, how)) = self.nearest_settle(of)
-        {
-            let mut took = 0;
-            for &row in &nearest.ranges {
-                let Some(tactic) = row_tactic(row) else {
-                    continue;
-                };
-                let (bottom, top) = (row[0], row[1]);
-                if left.contains(&(bottom, top)) && self.tactic_built(tactic) {
-                    self.dense = self.dense.with_rows(bottom, top, tactic);
-                    took += 1;
-                }
+        let near = self.nearest_settles(of);
+        if !left.is_empty() && !near.is_empty() {
+            let layers: Vec<&[[u32; 6]]> =
+                near.iter().map(|(_, settled, _)| settled.ranges.as_slice()).collect();
+            let picks = layered(&left, &layers, |tactic| self.tactic_built(tactic));
+            for &((bottom, top), tactic, _) in &picks {
+                self.dense = self.dense.with_rows(bottom, top, tactic);
             }
-            served_by = format!(
-                "the nearest {near} settle's picks ({how}, of {:#010x}: {took} of its ranges \
-                 taken), else the curves'",
-                nearest.of
-            );
+            let took = |at: usize| picks.iter().filter(|&&(_, _, from)| from == at).count();
+            let from: Vec<String> = near
+                .iter()
+                .enumerate()
+                .map(|(at, (whence, settled, how))| {
+                    format!(
+                        "the nearest {whence} settle's picks ({how}, of {:#010x}: {} of its \
+                         ranges taken)",
+                        settled.of,
+                        took(at)
+                    )
+                })
+                .collect();
+            let own = if stored.is_empty() { String::new() } else { format!("{served_by}, then ") };
+            served_by = format!("{own}{}, else the curves'", from.join(", then "));
         }
         if left.is_empty() {
             self.say_served(
@@ -3498,7 +3587,7 @@ impl<B: Serve> Shell<B> {
             lanes,
             of,
             code,
-            rows: stored,
+            rows: own,
             standing: self.dense.clone(),
             pending: left.len(),
             left,
@@ -3514,12 +3603,15 @@ impl<B: Serve> Shell<B> {
         Ok(())
     }
 
-    /// The settle nearest this load's key `of` where none matches it: a
-    /// stored settle of the same model (its method or code changed), then a
-    /// committed one; else the settle whose model shares the most planes
-    /// with this one's (the stored first on a tie). `(whence, settle, how
-    /// near)`; `None` where no settle shares a plane.
-    fn nearest_settle(&self, of: u32) -> Option<(&'static str, profile::curves::DenseSettled, String)> {
+    /// The settles nearest this load's key `of`, nearest first: a stored
+    /// settle of the same model (its method or code changed, or short of
+    /// ranges), a committed one, then each of another key that shares a plane
+    /// with this one, the most shared first ([`nearest`]). `(whence, settle,
+    /// how near)` each; a range is served by the first that states it.
+    fn nearest_settles(
+        &self,
+        of: u32,
+    ) -> Vec<(&'static str, profile::curves::DenseSettled, String)> {
         let all: Vec<(&'static str, &profile::curves::DenseSettled)> = self
             .dense_rates
             .dense_settled
@@ -3527,24 +3619,17 @@ impl<B: Serve> Shell<B> {
             .map(|s| ("stored", s))
             .chain(self.committed_settle.iter().map(|s| ("committed", s)))
             .collect();
-        if let Some(&(whence, same)) = all.iter().find(|(_, s)| s.of == of) {
-            return Some((whence, same.clone(), "the same model's".to_string()));
-        }
         let mine: Vec<(u32, u32)> = self.dense_planes.iter().map(|&(n, k, ..)| (n, k)).collect();
-        let mut best: Option<(usize, &'static str, &profile::curves::DenseSettled)> = None;
-        for &(whence, settle) in &all {
-            let shared = settle.planes.iter().filter(|p| mine.contains(p)).count();
-            if shared > 0 && best.is_none_or(|(most, ..)| shared > most) {
-                best = Some((shared, whence, settle));
-            }
-        }
-        best.map(|(shared, whence, settle)| {
-            (
-                whence,
-                settle.clone(),
-                format!("{shared} of this model's {} planes shared", mine.len()),
-            )
-        })
+        nearest(of, &mine, &all)
+            .into_iter()
+            .map(|(whence, settle, shared)| {
+                let how = shared.map_or_else(
+                    || "the same model's".to_string(),
+                    |shared| format!("{shared} of this model's {} planes shared", mine.len()),
+                );
+                (whence, settle.clone(), how)
+            })
+            .collect()
     }
 
     /// The ranges a settle weighs: each power of two of rows to the load's
@@ -3863,6 +3948,13 @@ impl<B: Serve> Shell<B> {
         seats: Option<&[engine::BehindSeat]>,
     ) -> Result<bool> {
         let Some(mut trial) = behind.trial.take() else {
+            // No point past one row fires before one decode step of this
+            // load is known: where the 1-row range needs no weighing (an
+            // earlier load decided it), that step is timed alone.
+            if behind.decode_ns.is_none() && behind.left.front().is_some_and(|&(_, top)| top > 1) {
+                behind.trial = Some(self.reference_trial(&behind.standing));
+                return Ok(true);
+            }
             let Some((bottom, top)) = behind.left.pop_front() else {
                 return Ok(false);
             };
@@ -3886,6 +3978,11 @@ impl<B: Serve> Shell<B> {
                 discarded = ?behind.discarded,
                 "dense settle behind serving: a point discarded ({why}); fired again later"
             );
+        }
+        if trial.reference && let Some(&ns) = trial.samples[0].last() {
+            behind.decode_ns = Some(ns);
+            behind.last_range = Some((1, ns));
+            return Ok(!behind.left.is_empty());
         }
         if trial.round <= trial.limit {
             behind.trial = Some(trial);
@@ -4064,7 +4161,33 @@ impl<B: Serve> Shell<B> {
             built_before: B::compiled(&self.pipelines),
             idle_before: crate::backend::Context::idle(&self.device),
             seen_ns: None,
+            reference: false,
         }))
+    }
+
+    /// One decode step of the load as it serves, timed once
+    /// ([`Trial::reference`]).
+    fn reference_trial(&self, standing: &crate::dense::Dense) -> Trial {
+        Trial {
+            bottom: 1,
+            top: 1,
+            samples: vec![Vec::new()],
+            options: vec![standing.clone()],
+            taking: vec![None],
+            estimates: Vec::new(),
+            fire_lanes: 1,
+            per_lane: 1,
+            round: 0,
+            limit: crate::rates::REPEATS,
+            last_spread: f64::INFINITY,
+            next: 0,
+            clock: None,
+            host_clock: false,
+            built_before: B::compiled(&self.pipelines),
+            idle_before: crate::backend::Context::idle(&self.device),
+            seen_ns: None,
+            reference: true,
+        }
     }
 
     /// One fire of `trial`'s next option, on fresh seats and timed to its
@@ -4431,9 +4554,8 @@ impl<B: Serve> Shell<B> {
     /// measurement is keyed by (`crate::stored`): the device `on` names
     /// (vendor, device id, driver), the code of every kernel the load's
     /// fires can ask for, the guest emitter's and planner's versions, and
-    /// the tuning its fires run by (the profile's decisions, the dense
-    /// kernel each rung takes, the tier and the load's lanes and rows).
-    /// Nothing of the build but these: a version bump reuses the cover.
+    /// the tuning its fires run by ([`cover_tuning`]). Nothing of the build
+    /// but these: a version bump reuses the cover.
     pub fn cover_fingerprint(&self, on: &str) -> Result<String> {
         use crate::backend::Tactics as _;
         let kernels: std::collections::BTreeSet<crate::naming::Kernel> =
@@ -4445,21 +4567,12 @@ impl<B: Serve> Shell<B> {
             .entries()
             .map(|(spec, rungs, _)| (spec.id, rungs))
             .collect();
-        // The picks as resolved, whichever layer decided them (a user's
-        // stored entry, a committed one, a measurement, the estimate under
-        // skip): the dense kernel each rung takes after the settle, and the
-        // workgroups a guest step strides over; never which file stated them.
-        let tuning = profile::rates::fingerprint(
-            format!(
-                "{decisions:?}|{:?}|{:?}|{}|{}|cores {} resident {:?}",
-                self.dense,
-                self.tier,
-                self.budgets.tokens.max_lanes,
-                self.budgets.tokens.max_tokens,
-                crate::backend::Context::cores(&self.device),
-                crate::backend::Context::resident(&self.device),
-            )
-            .as_bytes(),
+        let tuning = cover_tuning(
+            &format!("{decisions:?}"),
+            &self.dense,
+            self.tier,
+            crate::backend::Context::cores(&self.device),
+            crate::backend::Context::resident(&self.device),
         );
         Ok(format!(
             "{:?}|{on}|kernels {} {code:#010x}|emitter wgsl {} compiler {} plan {} lanes {}|tuning \
@@ -12001,8 +12114,82 @@ mod tests {
 
 #[cfg(test)]
 mod settle_row_tests {
-    use super::{ROW_KEPT, ROW_KEPT_UNNAMED, ROW_REPLACED, kept_row, row_tactic};
+    use super::{ROW_KEPT, ROW_KEPT_UNNAMED, ROW_REPLACED, kept_row, layered, nearest, row_tactic};
     use kernels_slang::linear::gemm::Tactic;
+
+    /// A load whose stored settle decided one range serves a committed one's
+    /// picks at the ranges it did not: each range by the nearest settle that
+    /// states it, so a range weighed here changes that range's pick alone.
+    #[test]
+    fn a_partial_stored_settle_leaves_the_committed_picks_at_the_other_ranges() {
+        let of = |vector| [ROW_KEPT, vector, 0, 0];
+        let row = |bottom, top, vector| {
+            let [kept, v, wide, tier] = of(vector);
+            [bottom, top, kept, v, wide, tier]
+        };
+        let (committed, stored) = ([row(1, 1, 1), row(2, 2, 4)], [row(1, 1, 8)]);
+        let ranges = std::collections::VecDeque::from([(1, 1), (2, 2), (3, 4)]);
+        let cold = layered(&ranges, &[&committed], |_| true);
+        let got = |picks: &[((u32, u32), Tactic, usize)]| {
+            picks.iter().map(|&(r, t, at)| (r, t.vector, at)).collect::<Vec<_>>()
+        };
+        assert_eq!(got(&cold), [((1, 1), 1, 0), ((2, 2), 4, 0)], "3-4 rows: the curves'");
+        // One range decided by the stored settle: the other range is served
+        // the committed pick, as before it.
+        let left = std::collections::VecDeque::from([(2, 2), (3, 4)]);
+        assert_eq!(got(&layered(&left, &[&stored, &committed], |_| true)), [((2, 2), 4, 1)]);
+        // A stored row under a changed key serves its range over the
+        // committed one's; a kernel not built, and a row naming none, keep
+        // the curves' pick.
+        assert_eq!(
+            got(&layered(&ranges, &[&stored, &committed], |_| true)),
+            [((1, 1), 8, 0), ((2, 2), 4, 1)]
+        );
+        assert_eq!(got(&layered(&ranges, &[&stored, &committed], |t| t.vector != 8)), [((2, 2), 4, 1)]);
+        let unnamed = [[1, 1, ROW_KEPT_UNNAMED, 0, 0, 0]];
+        assert_eq!(got(&layered(&ranges, &[&unnamed, &committed], |_| true)), [((2, 2), 4, 1)]);
+    }
+
+    /// At a rung of another key (a phone whose available memory moved), the
+    /// one range the last boot stored does not drop the committed picks: each
+    /// settle of another key is a layer, the most planes shared first, the
+    /// stored first on a tie.
+    #[test]
+    fn a_stored_range_of_another_key_leaves_the_committed_picks_of_another_key() {
+        let settle = |of, planes: &[(u32, u32)], ranges: &[[u32; 6]]| {
+            profile::curves::DenseSettled {
+                method: 1,
+                of,
+                code: 0,
+                ranges: ranges.to_vec(),
+                planes: planes.to_vec(),
+            }
+        };
+        let mine = [(1024, 2048), (4096, 1024)];
+        let row = |bottom, top, vector| [bottom, top, ROW_KEPT, vector, 0, 0];
+        let stored = settle(1, &mine, &[row(1, 1, 8)]);
+        let committed = settle(2, &mine, &[row(1, 1, 1), row(2, 2, 4)]);
+        let fewer = settle(3, &mine[..1], &[row(3, 4, 16)]);
+        let apart = settle(4, &[(7, 7)], &[row(3, 4, 2)]);
+        let own = settle(9, &[], &[row(5, 8, 2)]);
+        let all = [
+            ("stored", &stored),
+            ("committed", &fewer),
+            ("committed", &apart),
+            ("committed", &committed),
+            ("committed", &own),
+        ];
+        let near = nearest(9, &mine, &all);
+        assert_eq!(
+            near.iter().map(|(_, s, shared)| (s.of, *shared)).collect::<Vec<_>>(),
+            [(9, None), (1, Some(2)), (2, Some(2)), (3, Some(1))]
+        );
+        let layers: Vec<&[[u32; 6]]> = near.iter().map(|(_, s, _)| s.ranges.as_slice()).collect();
+        let left = std::collections::VecDeque::from([(1, 1), (2, 2), (3, 4), (9, 16)]);
+        let got: Vec<_> =
+            layered(&left, &layers, |_| true).iter().map(|&(r, t, _)| (r, t.vector)).collect();
+        assert_eq!(got, [((1, 1), 8), ((2, 2), 4), ((3, 4), 16)]);
+    }
 
     /// A settle row names the kernel it kept where every plane took one, and
     /// a load reads it back as that kernel; a row that names none (an old

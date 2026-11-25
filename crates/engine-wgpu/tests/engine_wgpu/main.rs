@@ -17,6 +17,14 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
+    /// wgpu times no frame apart from its own fires here: nothing to watch.
+    pub fn watch_frames(_on: bool) {}
+
+    /// `None`: wgpu keeps no longest frame span.
+    pub fn longest_frame_ns() -> Option<u64> {
+        None
+    }
+
     pub const NAME: &str = "wgpu";
     pub const PLATFORM: poem::Platform = poem::Platform::Wgpu;
     /// Kernels compile to WGSL: no register-tiled or cooperative-matrix
