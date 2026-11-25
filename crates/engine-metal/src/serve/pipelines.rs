@@ -65,9 +65,12 @@ impl Shell {
     /// the pipelines built.
     /// What decides the pipelines this load builds: the device, its OS
     /// build, this binary, the model's graph, the rungs, the token and lane
-    /// budgets, the paging, the step set the walk fires and what routes
-    /// among the kernels ([`routing`]). A later boot with the same key
-    /// builds the same keys; any change and it walks again.
+    /// budgets, the paging, the step set the walk fires, what routes among
+    /// the kernels ([`routing`]), the compiled plan (its regions and copies
+    /// are priced by the device's measured rates, which no decision states),
+    /// where the weights lie, and whether the load splits work with the
+    /// Neural Engine or checks for NaN. A later boot with the same key builds
+    /// the same keys; any change and it walks again.
     #[must_use]
     pub fn pipeline_cache_key(&self, steps: &engine::StepShapes) -> String {
         let fnv = |bytes: &[u8]| {
@@ -92,14 +95,18 @@ impl Shell {
             .unwrap_or_default();
         let trace = fnv(format!("{:?}", self.trace).as_bytes());
         let paging = self.paging();
+        let weights: Vec<_> = self.weights.lines().into_iter().map(|(owner, _)| owner).collect();
         let shape = format!(
-            "{:?}|{:?}|{}:{}:{}|{steps:?}|{}",
+            "{:?}|{:?}|{}:{}:{}|{steps:?}|{}|{:016x}|{weights:?}|ane {} nan {}",
             self.arena.rung_tokens(),
             self.budgets.tokens,
             paging.page_size,
             paging.pages_per_slot,
             paging.context(),
             routing(&self.tuning, self.device.family()),
+            fnv(format!("{:?}", self.compiled).as_bytes()),
+            self.ane.is_some(),
+            self.nan_flags.is_some(),
         );
         format!(
             "metal-pipelines-2|{}|{os}|{binary}|{trace:016x}|{:016x}",
