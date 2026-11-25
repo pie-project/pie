@@ -303,15 +303,6 @@ pub(crate) fn set_fire_cap_for_test(engine: usize, tokens: u32) {
     set_fire_cap(engine, tokens);
 }
 
-/// Publishes the rows of the rung `engine` holds as a steering pool
-/// would: for a test of what the lane refuses.
-#[cfg(test)]
-pub(crate) fn set_engine_rows_for_test(engine: usize, rows: u32) {
-    rung_gate(engine)
-        .held
-        .store(rows, std::sync::atomic::Ordering::Release);
-}
-
 fn set_fire_cap(engine: usize, tokens: u32) {
     let was = rung_gate(engine)
         .cap

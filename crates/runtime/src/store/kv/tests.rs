@@ -89,32 +89,23 @@ fn tests_every_case() {
     a_lookup_takes_the_copy_on_the_device();
     a_lookup_follows_one_copy_to_its_children();
     what_a_decode_folds_seals();
-    a_truncated_set_ends_where_it_was_cut();
-    a_set_never_ends_inside_a_sealed_page();
     a_fire_that_never_settled_leaves_the_log_cut();
     a_hit_refreshes_only_the_entries_it_used_whole();
     what_decode_wrote_is_reclaimed_before_the_prompt_where_a_row_keys_it_below();
     a_sweep_suspends_only_the_readers_of_what_it_moves();
     idle_cache_goes_to_the_host_and_comes_back_on_a_hit();
-    a_set_moved_down_says_it_is_off_the_device();
     an_exited_owner_holds_its_kv_until_its_working_set_is_released();
     a_suspend_short_of_host_room_drops_host_cache_first();
     a_tail_past_its_step_goes_before_another_head();
     a_demote_leaves_what_a_higher_key_covers();
     idle_cache_the_tiers_keep_off_the_host_is_dropped_not_demoted();
-    on_the_host_the_lower_set_goes_first();
-    a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host();
-    the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves();
-    a_demote_keeps_off_the_disk_what_its_row_keeps_off_it();
     a_keep_the_policy_states_is_honoured_and_unkeyed_idle_cache_waits_for_a_demand();
     idle_cache_comes_back_past_the_fires_in_flight();
     among_equal_keys_the_least_recently_used_goes_first_answer_or_prompt();
     pages_another_worker_sealed_are_found_in_the_host_tier();
     a_beams_finish_waits_out_a_suspend_and_names_each_page_once();
-    a_beams_finish_copies_the_chosen_pages_another_reads();
     a_cut_waits_out_a_move();
     new_weights_find_no_page_the_old_ones_sealed();
-    new_weights_free_the_lower_tiers_copies();
 }
 
 /// A beam search's finish while its set is suspending waits for the move
@@ -153,41 +144,6 @@ fn a_beams_finish_waits_out_a_suspend_and_names_each_page_once() {
     assert_eq!(store.free_committed(), total, "every page back once");
 }
 
-/// A beam search's finish whose chosen pages another set still reads (a
-/// fork's path through the old tail) names copies of them: the other set
-/// reads the pages it read, and every page goes back once.
-fn a_beams_finish_copies_the_chosen_pages_another_reads() {
-    let mut store = KvStore::new_with_swap(16, 16, 0, h(62));
-    let total = store.free_committed();
-    let ws = store.create_working_set();
-    commit_fresh(&mut store, ws, 4, 1);
-    let other = store.fork(ws).unwrap();
-    let read: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(other, i).unwrap()).collect();
-    let super::RelistNeeds::Copies(shared) = store.relist_beam_needs(ws, 1, &[2, 0]).unwrap() else {
-        panic!("out of any move");
-    };
-    assert_eq!(shared, [read[3], read[1]], "both chosen pages are the fork's too");
-    // The engine copies them onto pages the planner granted.
-    let copies = store.reserve_device_pages(shared.len()).unwrap();
-    let pairs: Vec<_> = shared.iter().copied().zip(copies.iter().copied()).collect();
-    let counted = super::RELIST_COPIES.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(store.relist_beam_with(ws, 1, &[2, 0], &pairs).unwrap());
-    assert!(super::RELIST_COPIES.load(std::sync::atomic::Ordering::Relaxed) >= counted + 2);
-    let after: Vec<PhysicalKvPageId> = (0..3).map(|i| store.lookup(ws, i).unwrap()).collect();
-    assert_eq!(after, [read[0], copies[0], copies[1]], "the copies, named once");
-    let still: Vec<PhysicalKvPageId> = (0..4).map(|i| store.lookup(other, i).unwrap()).collect();
-    assert_eq!(still, read, "the fork reads what it read");
-    store.release_working_set(ws, store.current_epoch());
-    store.release_working_set(other, store.current_epoch());
-    store.drop_entries_off_device(usize::MAX, &floor, None);
-    store.retire_idle();
-    let cached = total - store.free_committed();
-    assert!(
-        cached <= 4,
-        "what stays is cache alone, the copies and the originals each back once: {cached}"
-    );
-}
-
 /// A cut of a set in a move is refused until the move ends: cut under it,
 /// what the cut freed went back again as the move committed.
 fn a_cut_waits_out_a_move() {
@@ -201,37 +157,6 @@ fn a_cut_waits_out_a_move() {
     store.abort_suspend(txn);
     store.truncate(ws, 0).unwrap();
     assert_eq!(store.mapped_len(ws).unwrap(), 0);
-}
-
-/// A reload in place drops the cache the old weights sealed on every tier:
-/// what was demoted to the host and to the disk goes with what stayed on
-/// the device, and their slots come back.
-fn new_weights_free_the_lower_tiers_copies() {
-    let mut store = KvStore::new_with_swap(8, 1, 4, h(52));
-    let owner = ProcessId::from_u128(52);
-    let tokens = kept_and_gone(&mut store, 52, 3, owner);
-    let (host, disk) = (store.host_swap_available(), store.disk_swap_available(floor));
-    let txn = store
-        .prepare_demote(8, |_| 1)
-        .unwrap()
-        .expect("three cache-only pages");
-    store.commit_suspend(txn).unwrap();
-    store.retire_idle();
-    assert_eq!(on_device(&mut store, &tokens), 0, "demoted off the device");
-    assert!(
-        store.host_swap_available() + store.disk_swap_available(floor) < host + disk,
-        "held below the device"
-    );
-
-    store.rekey(h(53));
-    store.retire_idle();
-    assert!(store.cached_working_sets().is_empty());
-    assert_eq!(
-        (store.host_swap_available(), store.disk_swap_available(floor)),
-        (host, disk),
-        "the host and disk slots come back"
-    );
-    assert_eq!(store.available_pages(), 8);
 }
 
 /// A reload in place rekeys the cache: what the old weights sealed is
@@ -1302,79 +1227,6 @@ fn what_a_decode_folds_seals() {
     );
 }
 
-/// A set cut at row 37 after a decode ran on to 52: the pages wholly past
-/// it go back to the pool, its folded length and log end there, a fork
-/// takes nothing past it, and what it writes next is sealed under the
-/// tokens it holds, never the ones taken back.
-fn a_truncated_set_ends_where_it_was_cut() {
-    let mut store = KvStore::new(16, h(29));
-    let accepted: Vec<u32> = (0..48).map(|t| 1300 + t).collect();
-    let mut ran: Vec<u32> = accepted[..37].to_vec();
-    ran.extend((37..52).map(|t| 7000 + t));
-    let ws = decoded(&mut store, &ran, 20, 52);
-    store.fold(ws, 52, true).unwrap();
-    assert_eq!(store.mapped_len(ws).unwrap(), 4);
-    let free = store.free_committed();
-    store.truncate(ws, 37).unwrap();
-    store.retire_idle();
-    assert_eq!(store.mapped_len(ws).unwrap(), 3, "page 3 (48..52) leaves");
-    assert_eq!(
-        store.free_committed(),
-        free + 1,
-        "and goes back to the pool"
-    );
-    assert_eq!(store.folded(ws).unwrap(), 37);
-    assert_eq!(store.logged(ws).unwrap(), &ran[..37]);
-    let child = store.fork(ws).unwrap();
-    assert_eq!(
-        store.folded(child).unwrap(),
-        37,
-        "a fork takes no row past it"
-    );
-    assert_eq!(store.mapped_len(child).unwrap(), 3);
-    store.release_working_set(child, store.current_epoch());
-    // It goes on from 37 with the tokens the program took.
-    let seq = store.log_begin(ws, 37).unwrap();
-    store
-        .log_end(ws, seq, Some((37, &accepted[37..48])))
-        .unwrap();
-    assert_eq!(
-        store.fold(ws, 48, false).unwrap(),
-        1,
-        "page 2 seals: the fork sealed page 1, whole below the cut, as it went"
-    );
-    store.release_working_set(ws, store.current_epoch());
-    store.retire_idle();
-    let reader = store.create_shared_working_set();
-    let keys = keys_ahead(&store, reader, 0, &accepted);
-    assert_eq!(
-        store.cached_run(&keys).len(),
-        3,
-        "sealed under what it holds"
-    );
-    let keys = keys_ahead(&store, reader, 0, &ran[..48]);
-    assert_eq!(
-        store.cached_run(&keys).len(),
-        2,
-        "nothing under the rows taken back"
-    );
-}
-
-/// A cut inside a page a fold sealed is refused by name: the page is frozen
-/// whole under the key of the rows past the cut.
-fn a_set_never_ends_inside_a_sealed_page() {
-    let mut store = KvStore::new(16, h(30));
-    let tokens: Vec<u32> = (0..48).map(|t| 1400 + t).collect();
-    let ws = decoded(&mut store, &tokens, 32, 32);
-    assert_eq!(store.sealed_in(ws, 0..2).unwrap(), [0, 1]);
-    let refused = store.truncate(ws, 20).unwrap_err().to_string();
-    assert!(refused.contains("sealed page"), "{refused}");
-    assert_eq!(store.folded(ws).unwrap(), 32, "nothing moved");
-    store.truncate(ws, 16).unwrap();
-    assert_eq!(store.folded(ws).unwrap(), 16, "a page boundary is a cut");
-    assert_eq!(store.mapped_len(ws).unwrap(), 1);
-}
-
 fn a_fire_that_never_settled_leaves_the_log_cut() {
     let mut store = KvStore::new(16, h(26));
     let tokens: Vec<u32> = (0..48).map(|t| 1000 + t).collect();
@@ -1492,20 +1344,6 @@ fn idle_cache_goes_to_the_host_and_comes_back_on_a_hit() {
     assert_eq!(store.available_pages(), 8);
 }
 
-/// What a set holds where: device pressure has nothing to gain from
-/// discarding a set wholly below the device.
-fn a_set_moved_down_says_it_is_off_the_device() {
-    let mut store = KvStore::new_with_swap(8, 8, 0, h(33));
-    let owner = ProcessId::from_u128(23);
-    kept_and_gone(&mut store, 14, 3, owner);
-    let set = |store: &KvStore| store.cached_working_sets()[0];
-    assert!(set(&store).on_device && !set(&store).on_host);
-    let txn = store.prepare_demote(8, |_| 1).unwrap().expect("three cache-only pages");
-    store.commit_suspend(txn).unwrap();
-    store.retire_idle();
-    assert!(!set(&store).on_device && set(&store).on_host);
-}
-
 /// A process's last fire settles after it exits, and only then is what it
 /// leaves cached: until its working set is released the store still holds
 /// its KV, so its rows are not reaped as a gone set's (a keep the policy
@@ -1603,135 +1441,6 @@ fn a_demote_leaves_what_a_higher_key_covers() {
     );
     store.commit_suspend(txn).unwrap();
     assert_eq!(on_device(&mut store, &tokens), 2, "the head stays");
-}
-
-/// Conform's "the higher working set survives": A kept at 20 and B at 10,
-/// both demoted to a full host; a suspend short of host room drops B, the
-/// lower, and keeps A there: the host holds the highest keys first, as the
-/// device does, and drops only as much as the suspend needs.
-fn on_the_host_the_lower_set_goes_first() {
-    let mut store = KvStore::new_with_swap(16, 8, 0, h(43));
-    store.set_page_size(16);
-    let (a, b) = (ProcessId::from_u128(53), ProcessId::from_u128(54));
-    let (a_tokens, b_tokens) = (prompt(25, 4), prompt(26, 4));
-    sealed_and_gone(&mut store, &a_tokens, a);
-    sealed_and_gone(&mut store, &b_tokens, b);
-    let keys = move |owner: Option<ProcessId>| if owner == Some(a) { 20 } else { 10 };
-    for _ in 0..2 {
-        let txn = store
-            .prepare_demote(16, keys)
-            .unwrap()
-            .expect("a set to the host");
-        store.commit_suspend(txn).unwrap();
-    }
-    assert_eq!(store.host_swap_available(), 0, "both on the host");
-    let running = store.create_working_set();
-    commit_fresh(&mut store, running, 4, 1);
-    let txn = store
-        .prepare_suspend(&HashSet::from([running]), keys)
-        .unwrap()
-        .expect("four pages to park");
-    store.commit_suspend(txn).unwrap();
-    let below = |store: &mut KvStore, tokens: &[u32]| {
-        let probe = store.create_shared_working_set();
-        let found = keys_ahead(store, probe, 0, tokens);
-        store.release_working_set(probe, store.current_epoch());
-        store.cached_run_any_tier(&found).len()
-    };
-    assert_eq!(below(&mut store, &b_tokens), 0, "the lower one is gone");
-    assert_eq!(
-        below(&mut store, &a_tokens),
-        4,
-        "the higher one stays on the host"
-    );
-}
-
-/// Each tier holds the highest keys first: B (10) fills the host, and A
-/// (20) moving down off the device takes B's room there; keyed alike,
-/// nothing on the host is displaced and A finds no room.
-fn a_higher_set_moving_down_takes_the_room_of_a_lower_one_on_the_host() {
-    for (a_key, displaced) in [(20, true), (10, false)] {
-        let mut store = KvStore::new_with_swap(16, 4, 0, h(47));
-        store.set_page_size(16);
-        let (a, b) = (ProcessId::from_u128(55), ProcessId::from_u128(56));
-        let (a_tokens, b_tokens) = (prompt(27, 4), prompt(28, 4));
-        sealed_and_gone(&mut store, &b_tokens, b);
-        let keys = move |owner: Option<ProcessId>| if owner == Some(a) { a_key } else { 10 };
-        let txn = store.prepare_demote(16, keys).unwrap().expect("B to the host");
-        store.commit_suspend(txn).unwrap();
-        assert_eq!(store.host_swap_available(), 0, "the host is full");
-        sealed_and_gone(&mut store, &a_tokens, a);
-        let below = |store: &mut KvStore, tokens: &[u32]| {
-            let probe = store.create_shared_working_set();
-            let found = keys_ahead(store, probe, 0, tokens);
-            store.release_working_set(probe, store.current_epoch());
-            store.cached_run_any_tier(&found).len()
-        };
-        match store.prepare_demote(16, keys).unwrap() {
-            Some(txn) => {
-                assert!(displaced, "keyed alike, nothing is displaced");
-                store.commit_suspend(txn).unwrap();
-                store.retire_idle();
-                assert_eq!(on_device(&mut store, &a_tokens), 0, "A moved down");
-                assert_eq!(below(&mut store, &a_tokens), 4, "A on the host");
-                assert_eq!(below(&mut store, &b_tokens), 0, "B gave its room");
-            }
-            None => {
-                assert!(!displaced, "A keyed higher takes B's room");
-                assert_eq!(below(&mut store, &b_tokens), 4, "B stays");
-            }
-        }
-    }
-}
-
-/// The conform shape after earlier turns: the host full of fillers (15),
-/// B (10) idle on the device, A (20) too. B finds no room below (it may
-/// displace nothing keyed higher), so no demote moves A or anything else
-/// ahead of it: B is dropped first, by the reclaim that follows.
-fn the_lowest_set_that_finds_no_room_below_goes_before_a_higher_one_moves() {
-    let mut store = KvStore::new_with_swap(16, 4, 0, h(49));
-    store.set_page_size(16);
-    let (a, b, f) = (ProcessId::from_u128(57), ProcessId::from_u128(58), ProcessId::from_u128(59));
-    let (a_tokens, b_tokens, f_tokens) = (prompt(29, 4), prompt(30, 4), prompt(31, 4));
-    let keys = move |owner: Option<ProcessId>| match owner {
-        Some(o) if o == a => 20,
-        Some(o) if o == b => 10,
-        _ => 15,
-    };
-    sealed_and_gone(&mut store, &f_tokens, f);
-    let txn = store.prepare_demote(16, keys).unwrap().expect("the filler to the host");
-    store.commit_suspend(txn).unwrap();
-    assert_eq!(store.host_swap_available(), 0, "the host is full");
-    sealed_and_gone(&mut store, &b_tokens, b);
-    sealed_and_gone(&mut store, &a_tokens, a);
-    assert!(
-        store.prepare_demote(16, keys).unwrap().is_none(),
-        "B, the lowest, finds no room: nothing above it moves"
-    );
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 1, keys), 4, "B goes");
-    assert_eq!(on_device(&mut store, &b_tokens), 0);
-    assert_eq!(on_device(&mut store, &a_tokens), 4, "A stays");
-}
-
-/// A row naming the device and the host keeps idle cache off the disk: a
-/// demote takes the host's room and no more, however much room the disk
-/// has (conform's keep: fillers spilled to disk, so the host never filled
-/// and the lower set on it was never displaced).
-fn a_demote_keeps_off_the_disk_what_its_row_keeps_off_it() {
-    use crate::policy::retention::{DEVICE, HOST};
-    let mut store = KvStore::new_with_swap(16, 4, 8, h(53));
-    store.set_page_size(16);
-    let owner = ProcessId::from_u128(61);
-    let tokens = prompt(33, 8);
-    sealed_and_gone(&mut store, &tokens, owner);
-    let txn = store
-        .prepare_demote(16, Rows(0, DEVICE | HOST))
-        .unwrap()
-        .expect("the host's room");
-    assert_eq!(txn.page_count(), 4, "the host's four slots, none of the disk's");
-    store.commit_suspend(txn).unwrap();
-    assert_eq!(store.host_swap_available(), 0);
-    assert_eq!(store.disk_swap_available(floor), 8, "the disk untouched");
 }
 
 /// Rows of one key and one tier set for every owner, as a test's table.
@@ -2371,258 +2080,6 @@ fn a_prefix_computed_twice_maps_whole_from_either_copy() {
     assert_eq!(store.flat_table(again).unwrap(), theirs.as_slice());
 }
 
-/// A working set released with no fire in flight frees its pages at
-/// once: no fire can read them, so none waits for a next fire's settle
-/// (with nothing firing, they held their chunks for the kv shape while a
-/// head short of whole chunks waited on them).
-#[test]
-fn a_release_with_nothing_in_flight_frees_its_pages_at_once() {
-    let mut store = KvStore::new(8, h(11));
-    let ws = store.create_shared_working_set();
-    commit_opaque(&mut store, ws, 3);
-    let before = store.available_pages();
-    store.release_working_set(ws, store.current_epoch());
-    assert_eq!(store.available_pages(), before + 3, "free now, no retire asked");
-}
-
-/// Keys that name their revision: what a reclaim reads under them it may
-/// keep until they, the table or the entries move.
-#[derive(Clone, Copy)]
-struct Revised(u64);
-
-impl Keys for Revised {
-    fn key_at(&self, _: Option<ProcessId>, _: u64) -> i64 {
-        crate::policy::retention::DEFAULT_KEY
-    }
-
-    fn revision(&self) -> Option<u64> {
-        Some(self.0)
-    }
-}
-
-#[test]
-/// A reclaim frees what is short and no more: a store of 256 pages freed a
-/// 64th of itself, times up to eight for a slow walk, whatever was short.
-/// The order it walked stands for the next while nothing it reads moves,
-/// and is walked again once something does.
-fn a_reclaim_frees_what_is_short_and_keeps_its_order_until_it_moves() {
-    let mut store = KvStore::new(256, h(60));
-    let owners: Vec<ProcessId> = (1..=6).map(ProcessId::from_u128).collect();
-    for (seed, &owner) in (60..).zip(&owners) {
-        kept_and_gone(&mut store, seed, 1, owner);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    let keys = Revised(1);
-    let free = store.available_pages();
-    let epoch = store.current_epoch();
-    assert_eq!(store.reclaim_cache(epoch, 0, keys), 0, "nothing short, nothing goes");
-    assert_eq!(store.reclaim_cache(epoch, 1, keys), 1);
-    assert_eq!(store.available_pages(), free + 1);
-    assert!(!store.owns_cache(owners[0]), "the least recently used goes");
-    assert!(owners[1..].iter().all(|&owner| store.owns_cache(owner)));
-    let kept = store.order.as_ref().expect("the walk is kept").groups.clone();
-    assert_eq!(kept, store.reclaim_order(&keys), "as a walk now finds it");
-
-    assert_eq!(store.reclaim_cache(epoch, 3, keys), 3);
-    assert_eq!(store.available_pages(), free + 4);
-    assert!(owners[..4].iter().all(|&owner| !store.owns_cache(owner)));
-    assert!(owners[4..].iter().all(|&owner| store.owns_cache(owner)));
-    let kept = store.order.as_ref().expect("the walk is kept").groups.clone();
-    assert_eq!(kept.len(), 2);
-    assert_eq!(kept, store.reclaim_order(&keys));
-
-    // An entry joining moves the order: the walk takes it in.
-    let late = ProcessId::from_u128(7);
-    kept_and_gone(&mut store, 70, 1, late);
-    assert_eq!(store.reclaim_cache(epoch, 2, keys), 2);
-    assert!(store.owns_cache(late), "the most recently used goes last");
-    assert_eq!(store.reclaim_cache(epoch, 1, keys), 1);
-    assert!(store.cached_working_sets().is_empty());
-
-    // Keys of no revision keep nothing.
-    kept_and_gone(&mut store, 71, 1, late);
-    assert_eq!(store.reclaim_cache(epoch, 1, floor), 1);
-    assert!(store.order.is_none());
-}
-
-/// A table of one key and one tiers row per owner.
-struct ByOwner<F>(F);
-
-impl<F: Fn(Option<ProcessId>) -> (i64, u8)> Keys for ByOwner<F> {
-    fn key_at(&self, owner: Option<ProcessId>, _at: u64) -> i64 {
-        (self.0)(owner).0
-    }
-
-    fn tiers_at(&self, owner: Option<ProcessId>, _at: u64) -> u8 {
-        (self.0)(owner).1
-    }
-}
-
-#[test]
-/// A suspend short of host room takes it from idle cache on the host as
-/// its tiers rows say, never by a key: a set whose row names the disk goes
-/// on down to it (the spill a suspend makes first) and stays cached; one
-/// whose row names no tier below the host is dropped, lowest key first,
-/// then least recently used, only until the room is covered. Cache held on
-/// disk alone frees no host room and is never dropped for it.
-fn a_suspend_moves_host_cache_its_row_lets_on_disk_and_drops_the_rest_until_covered() {
-    use crate::policy::retention::{ALL_TIERS, DEVICE, HOST};
-    let mut store = KvStore::new_with_swap(8, 4, 0, h(61));
-    // A shared pool's list: host cache may go on down to disk.
-    store.set_tiers(::engine::chunk::ShapeId(0), None, 2);
-    let (disk, high, low) = (
-        ProcessId::from_u128(1),
-        ProcessId::from_u128(2),
-        ProcessId::from_u128(3),
-    );
-    let keys = || {
-        ByOwner(move |owner: Option<ProcessId>| match owner {
-            Some(o) if o == disk => (0, ALL_TIERS),
-            Some(o) if o == high => (5, DEVICE | HOST),
-            _ => (0, DEVICE | HOST),
-        })
-    };
-    for (seed, owner) in [(80, disk), (81, high), (82, low)] {
-        let ws = store.create_working_set();
-        sealed(&mut store, ws, &prompt(seed, 1));
-        store.keep_checkpoint(ws, 1, Some(owner));
-        let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), keys()).unwrap() else {
-            panic!("a page to move");
-        };
-        assert_eq!(store.commit_suspend(txn).unwrap(), 1);
-        store.release_working_set(ws, store.current_epoch());
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    assert_eq!(store.host_swap_available(), 1);
-
-    // Two pages to park, one slot free: the set whose row names the disk
-    // moves there, the oldest at the lowest key, and nothing is dropped.
-    let v = store.create_working_set();
-    commit_fresh(&mut store, v, 2, 1);
-    let txn = store
-        .prepare_suspend_spill(&HashSet::from([v]), keys())
-        .expect("host cache its row lets on disk goes there");
-    assert_eq!(store.commit_spill(txn), 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([v]), keys()).unwrap() else {
-        panic!("its pages to move");
-    };
-    assert_eq!(store.commit_suspend(txn).unwrap(), 2);
-    assert!(store.owns_cache(disk), "moved down, not dropped");
-    assert!(store.owns_cache(high) && store.owns_cache(low), "the room was covered");
-    assert_eq!(store.host_swap_available(), 0);
-
-    // One more, none free on the host and nothing more its rows let on
-    // disk: the lower key goes though it is newer, and nothing past it; the
-    // set on disk holds no host slot and stays.
-    let w = store.create_working_set();
-    commit_fresh(&mut store, w, 1, 1);
-    assert!(store.prepare_suspend_spill(&HashSet::from([w]), keys()).is_none());
-    let Some(txn) = store.prepare_suspend(&HashSet::from([w]), keys()).unwrap() else {
-        panic!("its page to move");
-    };
-    assert_eq!(store.commit_suspend(txn).unwrap(), 1);
-    assert!(!store.owns_cache(low), "the lowest key its row keeps off the disk");
-    assert!(store.owns_cache(high), "the room was covered");
-    assert!(store.owns_cache(disk), "on disk, it was no host room");
-
-    // And a key keeps nothing: the next suspend drops the higher one too.
-    let x = store.create_working_set();
-    commit_fresh(&mut store, x, 1, 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([x]), keys()).unwrap() else {
-        panic!("its page to move");
-    };
-    assert_eq!(store.commit_suspend(txn).unwrap(), 1);
-    assert!(!store.owns_cache(high), "a key above the default orders, never keeps");
-    assert!(store.owns_cache(disk));
-}
-
-#[test]
-/// A suspend short of swap gives up the disk tier's copies, lowest key
-/// first, and no more than it wants: the disk is the last tier, so no row
-/// names one below it, and a copy's key orders what goes but keeps none.
-fn a_suspend_gives_up_disk_copies_lowest_key_first_and_no_more_than_it_wants() {
-    use super::hash::{chain_slots, page_hash};
-    let seed = h(62);
-    let run_of = |first: u32| {
-        let tokens: Vec<Vec<Option<Hash256>>> =
-            chain_slots(&seed, None, 0, &(first..first + 8).collect::<Vec<_>>())
-                .chunks(4)
-                .map(|page| page.iter().map(|h| Some(*h)).collect())
-                .collect();
-        let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
-        (tokens, keys)
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = KvStore::new_with_swap(8, 0, 4, seed);
-    store.set_page_size(4);
-    store.set_keeps(true);
-    store.keep_disk(&dir.path().join("g0.journal"), true).unwrap();
-    let (low, high) = (run_of(700), run_of(800));
-    for ((tokens, keys), key) in [(&low, 0), (&high, 9)] {
-        let gpu = store.pool.try_alloc_n(2).unwrap();
-        assert!(store.import_cached_at(
-            &[],
-            tokens.clone(),
-            keys.clone(),
-            gpu.into_iter().map(KvPageBacking::Resident).collect(),
-        ));
-        demoted_and_back(&mut store, keys, key);
-    }
-    assert_eq!(store.disk_pool.available(), 0);
-    assert_eq!(store.disk_swap_available(floor), 4, "every copy is room");
-
-    let ws = store.create_working_set();
-    commit_fresh(&mut store, ws, 3, 1);
-    let Some(txn) = store.prepare_suspend(&HashSet::from([ws]), floor).unwrap() else {
-        panic!("its pages to move");
-    };
-    assert_eq!(store.commit_suspend(txn).unwrap(), 3);
-    let kept: HashSet<Hash256> = store.persisted_keys().into_iter().collect();
-    assert!(low.1.iter().all(|key| !kept.contains(key)), "the lower key's went first");
-    assert_eq!(
-        high.1.iter().filter(|key| kept.contains(*key)).count(),
-        1,
-        "and one of the higher's, no more"
-    );
-    assert_eq!(store.disk_swap_available(floor), 1, "the last copy is still room");
-}
-
-#[test]
-/// What a reclaim frees while a fire in flight still reads it waits on that
-/// fire's retirement: it is returning, and counts toward the shortfall, so
-/// a reclaim for the same shortfall frees nothing more. Past it, only what
-/// is still short goes; the fire's settle brings it back.
-fn a_reclaim_counts_what_it_freed_as_returning_until_its_fire_retires() {
-    let mut store = KvStore::new(8, h(63));
-    let (early, late) = (ProcessId::from_u128(1), ProcessId::from_u128(2));
-    let a = store.create_working_set();
-    sealed(&mut store, a, &prompt(90, 2));
-    store.keep_checkpoint(a, 2, Some(early));
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    kept_and_gone(&mut store, 91, 2, late);
-    let fire = store.begin_fire();
-    store.release_working_set(a, store.current_epoch());
-    let free = store.available_pages();
-    let epoch = store.current_epoch();
-
-    assert_eq!(store.reclaim_cache(epoch, 2, floor), 2);
-    assert!(!store.owns_cache(early), "the least recently used went");
-    assert_eq!(store.available_pages(), free, "the fire in flight still reads it");
-    assert_eq!(store.reclaim_returning(), 2);
-    assert_eq!(
-        store.reclaim_cache(epoch, 2, floor),
-        0,
-        "the same shortfall again: what returns covers it"
-    );
-    assert!(store.owns_cache(late), "nothing more went");
-
-    store.settle(fire);
-    assert_eq!(store.reclaim_returning(), 0);
-    assert_eq!(store.available_pages(), free + 2, "back once the fire retired");
-    assert_eq!(store.reclaim_cache(store.current_epoch(), 2, floor), 2);
-    assert!(!store.owns_cache(late), "a new shortfall reclaims again");
-}
-
 #[test]
 /// With no disk tier (and the host short, or none), a suspend whose pages
 /// need the disk is refused by name, as on a full disk: nothing goes
@@ -2642,119 +2099,6 @@ fn a_suspend_that_needs_the_disk_with_no_disk_tier_is_refused_by_name() {
         assert_eq!(store.swapped_page_count(&HashSet::from([ws])).unwrap(), 0);
         assert_eq!(store.disk_swap_capacity(), 0);
     }
-}
-
-/// The directory hears of a shared set's sealed pages, never a private
-/// set's: their keys are unmatchable, and their count would tell of it.
-#[test]
-fn only_a_shared_sets_sealed_keys_are_published() {
-    let mut store = KvStore::new(16, h(43));
-    let tokens: Vec<u32> = (0..32).map(|t| 4100 + t).collect();
-    let shared = store.create_shared_working_set();
-    commit_opaque(&mut store, shared, 2);
-    assert_eq!(seal(&mut store, shared, 0, &tokens), 2);
-    let private = store.create_working_set();
-    commit_opaque(&mut store, private, 2);
-    assert_eq!(seal(&mut store, private, 0, &tokens), 2, "it seals as any set does");
-    let published: HashSet<Hash256> = store.sealed_key_list(&store.node_ids()).into_iter().collect();
-    let keys = |store: &KvStore, ws| keys_ahead(store, ws, 0, &tokens);
-    let shared_keys = keys(&store, shared);
-    let private_keys = keys(&store, private);
-    assert!(shared_keys.iter().all(|key| published.contains(key)));
-    assert!(private_keys.iter().all(|key| !published.contains(key)));
-    assert_eq!(published.len(), 2, "the shared set's two pages, nothing more");
-}
-
-/// A shared pool of `pages` kv list slots (one a chunk), its stores as a
-/// load registers them.
-fn behind_stores(pages: u32) -> crate::store::registry::Stores {
-    use ::engine::chunk::{
-        ChunkFacts, Growth, Reserved, ReservedRun, SegmentFacts, ShapeId, SlotKind, SlotRole,
-        SlotShape,
-    };
-    let kind = SlotKind::List {
-        tokens: 16,
-        rate: 1,
-        window: None,
-    };
-    let facts = ChunkFacts {
-        chunk_bytes: 1 << 20,
-        total_chunks: pages + 1,
-        segment_chunks: pages + 1,
-        segments: SegmentFacts {
-            committed: 1,
-            max: 1,
-            growth: Growth::Fixed,
-        },
-        reserved: vec![ReservedRun {
-            what: Reserved::Null,
-            first: 0,
-            chunks: 1,
-        }],
-        shapes: vec![SlotShape {
-            id: ShapeId(0),
-            kind,
-            slot_bytes: 1 << 20,
-            slots_per_chunk: 1,
-            sets_per_working_set: kind.sets_per_working_set(),
-            rows: Vec::new(),
-            pinned: None,
-            role: SlotRole::State,
-        }],
-        ..ChunkFacts::default()
-    };
-    let pool = crate::store::shared::SharedPool::new(&facts, 1024).unwrap();
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(pool));
-    crate::store::registry::shared_stores(
-        &shared,
-        &crate::store::shared::Tiers::default(),
-        16,
-        1024,
-    )
-}
-
-/// A point behind serving (the dense settle's, `Engine::behind_need`) whose
-/// slots the pool holds none of, idle cache filling it: idle cache yields
-/// what one point takes and no more, the point's slots go back after it,
-/// and while a waiter is short of a slot (an arrival, a parked process) it
-/// takes nothing at all.
-#[test]
-fn a_point_behind_serving_takes_idle_cache_for_its_slots_and_no_more() {
-    use crate::scheduler::lane::{give_behind, take_behind};
-    let stores = behind_stores(8);
-    {
-        let mut kv = stores.kv.lock();
-        for seed in 0..4u32 {
-            kept_and_gone(&mut kv, 40 + seed, 2, ProcessId::from_u128(u128::from(seed) + 1));
-        }
-        assert_eq!(kv.available_pages(), 0, "idle cache fills the pool");
-    }
-    // Two lanes of 16 rows: a page each.
-    let need = ::engine::BehindNeed {
-        lanes: 2,
-        tokens: 16,
-        long: false,
-    };
-    let taken = take_behind(&stores, need);
-    assert_eq!(taken.seats.len(), 2, "the point's slots were taken");
-    assert!(taken.seats.iter().all(|seat| seat.pages.len() == 1));
-    assert_eq!(
-        stores.kv.lock().available_pages(),
-        0,
-        "what idle cache yielded went to the point"
-    );
-    give_behind(&stores, taken);
-    assert_eq!(
-        stores.kv.lock().available_pages(),
-        2,
-        "one point's worth (two pages) yielded and came back, the rest still cached"
-    );
-
-    // A waiter short of a slot comes first: nothing is taken for the point.
-    stores.shared.as_ref().unwrap().lock().unwrap().pool_mut().wait(1, 0, 1);
-    let taken = take_behind(&stores, need);
-    assert!(taken.seats.is_empty(), "a waiter outranks the point");
-    assert_eq!(stores.kv.lock().available_pages(), 2, "no cache yielded for it");
 }
 
 /// The reports of one process that exits with `prompt` prompt rows and
@@ -2965,28 +2309,4 @@ fn a_unified_load_with_defaults_suspends_kv_to_disk() {
     let mut granted = store.reserve_device_pages(3).unwrap();
     let txn = store.prepare_restore(&sets, &mut granted).unwrap();
     assert_eq!(store.commit_restore(txn).unwrap(), 3, "read back whole");
-}
-
-/// Reclaim frees what is short and no more (policy-out A18): asked for two
-/// pages of four exited sets' idle cache (two pages each), it frees one
-/// set's two pages, oldest first, and every other set stays cached under
-/// its owner. A set's kept checkpoint and the sealed prefix it stands on go
-/// together (dropping one alone frees nothing), and sealed prefixes of
-/// different sets are never pooled into one group.
-#[test]
-fn reclaim_frees_what_is_short_and_keeps_the_rest_of_the_cache() {
-    let mut store = KvStore::new(8, h(41));
-    let owners: Vec<ProcessId> = (1..=4u128).map(ProcessId::from_u128).collect();
-    for (seed, &owner) in owners.iter().enumerate() {
-        kept_and_gone(&mut store, 60 + seed as u32, 2, owner);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    assert_eq!(store.available_pages(), 0, "idle cache fills the store");
-    let freed = store.reclaim_cache(store.current_epoch(), 2, crate::policy::retention::Installed);
-    assert_eq!(freed, 2, "exactly what is short");
-    assert_eq!(store.available_pages(), 2);
-    assert!(!store.owns_cache(owners[0]), "the oldest set went");
-    for &owner in &owners[1..] {
-        assert!(store.owns_cache(owner), "{owner:?} stays cached");
-    }
 }

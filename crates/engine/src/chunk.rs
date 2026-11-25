@@ -231,9 +231,8 @@ pub enum Growth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reserved {
     /// Chunk 0: what the null record ([`crate::LaneRecord::Null`]), an
-    /// unset table entry, or (removed by the windowed-state change; do not
-    /// use in new code) a window list's slot trimmed behind its window,
-    /// reads (ref 0). Replaces the windowed pool's page 0.
+    /// unset table entry, or a window list's slot trimmed behind its window,
+    /// reads (ref 0).
     Null,
     /// State of lanes the runtime does not seat (`Lane::kv_less` lanes that
     /// carry state of their own), `lanes` of them.
@@ -290,8 +289,8 @@ pub enum SlotKind {
     /// compressed pools): a slot holds `tokens` tokens, of which the model
     /// keeps one row every `rate` (`tokens // rate` rows a slot).
     ///
-    /// `window`: removed by the windowed-state change; do not use in new
-    /// code (windowed layers are ring + buffer: [`ChunkFacts::windowed`],
+    /// `window`: `None` on every shape the runtime serves (windowed layers
+    /// are ring + buffer: [`ChunkFacts::windowed`],
     /// [`SlotRole::WindowBuffer`]). With a `window`, a window list: the
     /// rows of the layers read through that sliding window, `tokens`
     /// (`T_w`) its own page size. A lane's table for it is in its own token
@@ -336,8 +335,7 @@ pub struct SlotShape {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SlotRole {
     /// The state its kind names: kv for a list (a window's for a window
-    /// list: removed by the windowed-state change; do not use in new code),
-    /// a record for a fixed shape.
+    /// list), a record for a fixed shape.
     #[default]
     State,
     /// The rs buffer (a list shape only): a slot holds `tokens` unfolded
@@ -421,7 +419,6 @@ impl SlotKind {
     }
 
     /// The rows a window list retains; `None` for every other kind.
-    /// Removed by the windowed-state change; do not use in new code.
     #[must_use]
     pub const fn window(self) -> Option<u32> {
         match self {
@@ -474,8 +471,7 @@ impl ChunkFacts {
     /// The kv list: the list shape of full (unwindowed) kv pages.
     #[must_use]
     pub fn kv_list(&self) -> Option<&SlotShape> {
-        // `window: None`: the window-list filter goes with the windowed-state
-        // change's final integration.
+        // `window: None`: a window list is no kv list.
         self.shapes.iter().find(|shape| {
             shape.role == SlotRole::State
                 && matches!(shape.kind, SlotKind::List { window: None, .. })

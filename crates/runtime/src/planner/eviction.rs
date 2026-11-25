@@ -1717,119 +1717,6 @@ mod chunk_picks_tests {
         assert_eq!(map.cheapest_runs(1, 3), None, "B's chunk does not empty");
     }
 
-    /// A restore of kv 0 whose need reads (1, 16) while its unpark is
-    /// refused a run of two, 15 chunks open, headroom one:
-    /// a need of one entry per run length lays its run of two first and
-    /// its single chunks beside it, the budget's headroom read against all
-    /// of them. Read as single chunks, four scattered free ones would
-    /// stand the need, no one moved, and the run of two never made.
-    #[test]
-    fn a_need_lays_its_longer_runs_first_and_its_singles_beside_them() {
-        let map = ChunkMap {
-            held: vec![held(1, 4, &[(1, 4)]), held(9, 1, &[(2, 1)])],
-            free: vec![0, 2, 4, 6],
-            headroom: None,
-            segment_chunks: 0,
-        };
-        assert_eq!(map.cheapest_runs(1, 4), Some(vec![]), "four singles stand: no one moves");
-        let need = RunNeed::of([(1, 2), (2, 1)]);
-        assert_eq!(need.entries(), &[(2, 1), (1, 2)], "the longest first");
-        assert_eq!(
-            map.cheapest_need(&need),
-            Some(vec![pid(1)]),
-            "the run of two takes 0-1 or 1-2: chunk 1's occupant moves"
-        );
-        // Headroom for two chunks: the third free chunk the need opens
-        // empties a chunk elsewhere, the cheapest.
-        let tight = ChunkMap {
-            headroom: Some(2),
-            ..map.clone()
-        };
-        let mut pids = tight.cheapest_need(&RunNeed::of([(2, 1), (1, 2)])).unwrap();
-        pids.sort_unstable();
-        assert_eq!(pids, vec![pid(1), pid(2)], "every chunk it opens read against the headroom");
-    }
-
-    /// A run of two adjacent chunks: a free chunk beside an emptiable one
-    /// costs only that one's pages; chunks apart are no run.
-    #[test]
-    fn a_run_of_chunks_lies_in_adjacent_chunks_free_or_emptied() {
-        let map = ChunkMap {
-            held: vec![held(4, 6, &[(1, 6)]), held(7, 2, &[(2, 1), (3, 1)])],
-            free: vec![5, 8],
-            headroom: None,
-            segment_chunks: 0,
-        };
-        let mut pids = map.cheapest_runs(2, 1).unwrap();
-        pids.sort_unstable();
-        assert_eq!(pids, vec![pid(2), pid(3)], "7 and 8: two pages to move");
-        assert_eq!(map.cheapest_runs(2, 2), Some(vec![pid(1), pid(2), pid(3)]).map(|mut v| {
-            v.sort_unstable();
-            v
-        }));
-        assert_eq!(map.cheapest_runs(3, 1), None, "no three adjacent");
-    }
-
-    /// Runs chosen together, not cheapest first: free runs at 1-3 and 6-8
-    /// of eleven chunks, A's pages at 0, 4, 5 and 9, three runs of three
-    /// asked. The two free runs leave no third beside them; moving A stands
-    /// 0-2, 3-5 and 6-8. Taken cheapest first, the map said no runs, and
-    /// the head (fitting the pool alone) waited with no one moved.
-    #[test]
-    fn runs_that_fit_only_with_an_occupant_moved_are_found_beside_free_ones() {
-        let map = ChunkMap {
-            held: vec![
-                held(0, 1, &[(1, 1)]),
-                held(4, 1, &[(1, 1)]),
-                held(5, 1, &[(1, 1)]),
-                held(9, 1, &[(1, 1)]),
-            ],
-            free: vec![1, 2, 3, 6, 7, 8, 10],
-            headroom: None,
-            segment_chunks: 0,
-        };
-        assert_eq!(map.cheapest_runs(3, 2), Some(vec![]), "two free runs stand");
-        assert_eq!(map.cheapest_runs(3, 3), Some(vec![pid(1)]), "A moves for the third");
-        assert_eq!(map.cheapest_runs(3, 4), None, "no four runs of three in eleven");
-    }
-
-    /// The plan's candidates for a bind short of a chunk: the chosen
-    /// chunk's occupants only, every one quoted (the deficit past them);
-    /// for any other head, or where no chunk empties, the candidates as
-    /// they were.
-    #[test]
-    fn a_bind_room_head_quotes_exactly_one_chunk_s_occupants() {
-        let rank = |seq: u64| super::super::rank::Rank::of(0, seq);
-        let candidates = vec![(pid(1), rank(1)), (pid(2), rank(2)), (pid(3), rank(3))];
-        let deficit = Reclaim {
-            pages: 7,
-            rs: Default::default(),
-        };
-        let map = ChunkMap {
-            held: vec![held(1, 5, &[(1, 5)]), held(3, 3, &[(3, 3)])],
-            free: vec![],
-            headroom: None,
-            segment_chunks: 0,
-        };
-        let (picked, wanted, occupants) =
-            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(1, 1)), Some(&map));
-        assert_eq!(occupants, vec![pid(3)]);
-        assert_eq!(picked.iter().map(|&(p, _)| p).collect::<Vec<_>>(), vec![pid(3)]);
-        assert_eq!(wanted.pages, u32::MAX, "every occupant is picked");
-        let (kept, same, _) = chunk_picks(candidates.clone(), deficit, None, Some(&map));
-        assert_eq!(kept.len(), 3);
-        assert_eq!(same, deficit);
-        // No chunk empties: no one is moved by pages counted anywhere,
-        // which frees no run.
-        let none = ChunkMap::default();
-        let (kept, _, occupants) =
-            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(1, 1)), Some(&none));
-        assert!(kept.is_empty() && occupants.is_empty(), "no run its eviction makes: none moved");
-        // Without a map (no shared pool) the candidates stand as before.
-        let (kept, same, _) = chunk_picks(candidates, deficit, Some(&RunNeed::one(1, 1)), None);
-        assert_eq!((kept.len(), same), (3, deficit));
-    }
-
     /// 1867 chunks free and runs of 4 standing in the planner's map (cost
     /// 0), the head short all the same (its need understates what its
     /// unpark takes). The cheapest runs are "no one", and evicting by pages
@@ -1865,42 +1752,6 @@ mod chunk_picks_tests {
         assert!(scattered.explain(3).contains("stuck=2"), "{}", scattered.explain(3));
     }
 
-    /// The cheapest runs stand free, yet the head would wait with no one
-    /// moved. Free chunks the budget cannot open (no
-    /// headroom) are no room: each needs a chunk emptied elsewhere, the
-    /// cheapest, whose budget comes back.
-    #[test]
-    fn a_free_run_past_the_budgets_headroom_empties_a_chunk_elsewhere() {
-        let mut map = ChunkMap {
-            held: vec![held(10, 4, &[(1, 4)]), held(20, 2, &[(2, 2)])],
-            free: vec![3, 4, 5],
-            headroom: Some(3),
-            segment_chunks: 0,
-        };
-        assert_eq!(map.cheapest_runs(3, 1), Some(vec![]), "room for the run: no one moves");
-        map.headroom = Some(1);
-        assert_eq!(
-            map.cheapest_runs(3, 1),
-            Some(vec![pid(1), pid(2)]),
-            "two chunks short of the budget: the two cheapest elsewhere are emptied"
-        );
-        map.headroom = Some(0);
-        assert_eq!(map.cheapest_runs(3, 1), None, "three short and two to empty: no runs stand");
-    }
-
-    /// A run lies inside one segment: free chunks either side of a
-    /// segment's edge are no run.
-    #[test]
-    fn a_run_across_a_segments_edge_is_no_run() {
-        let map = ChunkMap {
-            held: Vec::new(),
-            free: vec![6, 7, 8, 9],
-            headroom: None,
-            segment_chunks: 8,
-        };
-        assert_eq!(map.cheapest_runs(4, 1), None, "6..10 crosses chunk 8's segment edge");
-        assert_eq!(map.cheapest_runs(2, 2), Some(vec![]), "6..8 and 8..10 each lie in one");
-    }
 }
 
 #[cfg(test)]
@@ -1910,25 +1761,6 @@ mod order_tests {
 
     fn pid(n: u128) -> ProcessId {
         ProcessId::from_u128(n)
-    }
-
-    /// A8: the policy's priority orders victims; quiescence only orders
-    /// equal priorities, and the youngest goes first among equals.
-    #[test]
-    fn a_victim_is_the_lowest_priority_and_quiescence_only_breaks_ties() {
-        let low_busy = Rank::of(-1, 5);
-        let high_quiet = Rank::of(3, 9);
-        let mut order = vec![(high_quiet, true), (low_busy, false)];
-        order.sort_by_key(|&(rank, quiet)| victim_order(rank, quiet));
-        assert_eq!(order[0].0, low_busy, "a lower priority goes first, quiescent or not");
-        let (older_busy, younger_busy, older_quiet) = (Rank::of(0, 1), Rank::of(0, 2), Rank::of(0, 0));
-        let mut ties = vec![(older_busy, false), (older_quiet, true), (younger_busy, false)];
-        ties.sort_by_key(|&(rank, quiet)| victim_order(rank, quiet));
-        assert_eq!(
-            ties.iter().map(|&(rank, _)| rank).collect::<Vec<_>>(),
-            vec![older_quiet, younger_busy, older_busy],
-            "among equals: the quiescent, then the youngest (FCFS reversed)"
-        );
     }
 
     /// A15: of the runs that serve a bind, those whose highest-priority

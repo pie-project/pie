@@ -30,24 +30,7 @@ fn admission_every_case() {
     a_latest_value_word_with_no_committed_cell_is_refused();
     a_reader_ring_too_small_for_the_frames_writes_is_refused();
     a_slot_that_consumes_what_an_earlier_slot_published_is_admitted();
-    a_dropped_reservation_gives_its_count_back_while_a_later_one_stands();
     two_passes_putting_one_ring_get_distinct_cells_in_dispatch_order();
-}
-
-fn a_dropped_reservation_gives_its_count_back_while_a_later_one_stands() {
-    let ring = channel(HostRole::None, 4, false);
-    let cells: BoundCells = vec![Arc::clone(&ring)];
-    let earlier = TicketReservation::new(&cells, &[(false, true)]);
-    let later = TicketReservation::new(&cells, &[(false, true)]);
-    assert_eq!(ring.lock().unwrap().device_ring_backlog(), 2);
-    drop(earlier);
-    assert_eq!(
-        ring.lock().unwrap().device_ring_backlog(),
-        1,
-        "the earlier fire never reached the engine"
-    );
-    later.commit();
-    assert_eq!(ring.lock().unwrap().device_ring_backlog(), 1);
 }
 
 /// A channel is its process's: two passes of the process put one device

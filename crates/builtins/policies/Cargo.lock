@@ -231,7 +231,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-spin"
+version = "0.1.0"
+dependencies = [
+ "plex",
+]
+
+[[package]]
 name = "test-trap"
+version = "0.1.0"
+dependencies = [
+ "plex",
+]
+
+[[package]]
+name = "test-watch"
 version = "0.1.0"
 dependencies = [
  "plex",

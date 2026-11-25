@@ -110,19 +110,18 @@ pub fn source_for(yields: Yield, source: impl FnOnce() -> Result<Source, String>
 
 /// The yield a load runs at, and the line its load log states it in. A
 /// deployment's `[engine.memory] yield` is kept as configured. Unset, it is
-/// `1` where an engine the governor steers states unified memory (the pool
-/// and the host share one RAM, so a pool that never yields starves the
-/// system and the device's own command buffers with it), and `0` (a
-/// dedicated machine) on separate device memory. Where an engine reads
-/// the host's room itself (`Engine::host_room`: it holds its pool within
-/// what its own host side leaves), the yield reacts only to the rest of
-/// the system: `own` says this system's pressure can discount the
-/// process's own memory ([`Source::of_this_system_beside_own`]), and an
-/// unset yield is `1` over that reading; where it cannot (`own` false),
-/// an unset yield is `0`, the room reader alone holding the pool (a
-/// system-wide reading counts the process's own load as pressure, and the
-/// pool would give its room back to itself: the M1's gemma-4-E4B at
-/// c256 kept 3.8 of its 10.4 GB and ran 34% slower).
+/// `1` where an engine the governor steers states unified memory (the pool and
+/// the host share one RAM, so a pool that never yields starves the system and
+/// the device's own command buffers with it), and `0` (a dedicated machine) on
+/// separate device memory. Where an engine reads the host's room itself
+/// (`Engine::host_room`: it holds its pool within what its own host side
+/// leaves), the yield reacts only to the rest of the system: `own` says this
+/// system's pressure can discount the process's own memory
+/// ([`Source::of_this_system_beside_own`]), and an unset yield is `1` over
+/// that reading; where it cannot (`own` false), an unset yield is `0`, the
+/// room reader alone holding the pool (a system-wide reading counts the
+/// process's own load as pressure, and the pool would give its room back to
+/// itself).
 #[must_use]
 pub fn yield_for(configured: Option<Yield>, unified_memory: bool, room: Room) -> (Yield, String) {
     match configured {
@@ -484,9 +483,9 @@ mod tests {
 
     /// Where an engine reads the host's room itself, the unset yield reacts
     /// only to the rest of the system: full over a reading beside the
-    /// process's own memory where the system can discount it, else 0 (a
-    /// pool that yielded to its own load ran the M1's gemma-4-E4B c256 34%
-    /// slower). A configured yield is kept either way.
+    /// process's own memory where the system can discount it, else 0 (a pool
+    /// would otherwise yield to its own load). A configured yield is kept
+    /// either way.
     #[test]
     fn a_room_reading_engine_yields_only_to_the_rest_of_the_system() {
         let (yields, line) = yield_for(None, true, Room::BesideOwn);
