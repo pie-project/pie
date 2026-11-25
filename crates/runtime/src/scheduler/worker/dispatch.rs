@@ -22,7 +22,7 @@ impl BatchScheduler {
         {
             return false;
         }
-        pending.rotate_launch_run_to_back(run_len);
+        pending.bring_to_front(run_len);
         true
     }
 
@@ -245,6 +245,11 @@ impl BatchScheduler {
         if cache.taken_at == Some((pending.epoch(), stopping)) {
             return &cache.scan;
         }
+        debug_assert_eq!(
+            pending.out_of_order(),
+            None,
+            "a launch queued behind a later one of its pipeline"
+        );
         let scan = &mut cache.scan;
         scan.clear();
         for item in pending.iter() {

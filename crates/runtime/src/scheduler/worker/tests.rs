@@ -437,6 +437,7 @@ fn worker_every_case() {
     a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
     a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
     a_launch_waits_for_the_copy_queued_ahead_of_it();
+    a_control_brought_forward_leaves_a_cut_pass_s_pieces_in_order();
     a_pass_that_only_reorders_lets_the_worker_park();
 }
 
@@ -500,6 +501,41 @@ fn a_pass_that_only_reorders_lets_the_worker_park() {
     assert!(!progress, "nothing left the queue");
     assert_eq!(pending.len(), 2);
     lane.shutdown();
+}
+
+/// A cut pass's two pieces with a close between them: the close comes to
+/// the front and the pieces keep their order, the first one the next to go.
+fn a_control_brought_forward_leaves_a_cut_pass_s_pieces_in_order() {
+    let pipeline = ProcessId::from_u128(5);
+    let piece = |fire: u64, frame: Option<crate::scheduler::FrameStamp>| {
+        let mut request = *refused_request(fire);
+        request.pipeline_id = Some(pipeline);
+        request.frame = frame;
+        request.prelaunch_copy = None;
+        request.prelaunch_state_copy = None;
+        QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))
+    };
+    let mut pending = PendingQueue::default();
+    pending.push_back(piece(9, None));
+    pending.push_back(QueuedItem::CloseChannels { ids: Vec::new() });
+    pending.push_back(piece(
+        10,
+        Some(crate::scheduler::FrameStamp {
+            lane: pipeline,
+            seq: 0,
+            slot: 0,
+            fires: 2,
+        }),
+    ));
+    assert!(BatchScheduler::rotate_launch_for_wave_work(&mut pending, false, true));
+    assert!(matches!(
+        pending.front(),
+        Some(QueuedItem::CloseChannels { .. })
+    ));
+    assert_eq!(pending.out_of_order(), None);
+    let mut cache = ScanCache::default();
+    let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
+    assert_eq!(scan.untracked, [9], "the first piece goes, its pass's last behind it");
 }
 
 fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
