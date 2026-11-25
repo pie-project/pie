@@ -16,10 +16,10 @@ def attention(x, inputs, m, w, positions, rotary_dim = None, scaling = None, qk_
 
     def project(x, correct):
         q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
-        if correct != None:
-            q, k, v = correct("q", x, q), correct("k", x, k), correct("v", x, v)
         if biased:
             q, k, v = ops.elemwise.add_bias(w.q_bias, q), ops.elemwise.add_bias(w.k_bias, k), ops.elemwise.add_bias(w.v_bias, v)
+        if correct != None:
+            q, k, v = correct("q", x, q), correct("k", x, k), correct("v", x, v)
         if qk_norm == "head":
             q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
             k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
