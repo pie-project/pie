@@ -25,7 +25,7 @@ use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};
 use crate::policy::By;
 use crate::route::RoutingHandle;
-use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
+use crate::session::{AdmitReject, DispatchFail, Facts, Sessions, TurnRouter};
 use crate::worker::WorkerRegistry;
 use controller_api::Outcome;
 
@@ -111,9 +111,9 @@ fn addressed(req: &Request) -> Option<&str> {
 
 #[async_trait::async_trait]
 impl TurnRouter for RouteBackend {
-    async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
+    async fn admit(&self, req: &Request, facts: Facts) -> std::result::Result<(), AdmitReject> {
         if let Some(router) = self.router_for(req) {
-            return router.admit(req, &self.routing).await;
+            return router.admit(req, facts, &self.routing).await;
         }
         match self.routing.admit(req) {
             AdmissionDecision::Admit => Ok(()),
@@ -147,6 +147,9 @@ impl TurnRouter for RouteBackend {
         let worker = match preferred {
             // A placement's list: the first of it that takes the process.
             Some(Placed::List(list)) => {
+                if let Some(tied) = pinned.filter(|worker| !list.contains(worker)) {
+                    return Err(DispatchFail::Excluded(tied));
+                }
                 let mut taken = None;
                 for worker in list {
                     if pinned.is_some_and(|p| p != worker) {
@@ -161,20 +164,20 @@ impl TurnRouter for RouteBackend {
                         break;
                     }
                 }
-                taken.ok_or(DispatchFail)?
+                taken.ok_or(DispatchFail::NoWorker)?
             }
             Some(Placed::Located(at)) => {
                 self.routing
                     .dispatch_with_retry(&self.workers, req, Some(at), pinned)
                     .await
-                    .map_err(|_| DispatchFail)?
+                    .map_err(|_| DispatchFail::NoWorker)?
                     .worker_id
             }
             None => {
                 self.routing
                     .dispatch_with_retry(&self.workers, req, None, pinned)
                     .await
-                    .map_err(|_| DispatchFail)?
+                    .map_err(|_| DispatchFail::NoWorker)?
                     .worker_id
             }
         };
@@ -200,6 +203,10 @@ impl TurnRouter for RouteBackend {
 
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
         self.workers.connected_watch()
+    }
+
+    fn eligible(&self) -> Vec<WorkerId> {
+        self.routing.select_worker()
     }
 
     fn launched(&self, req: ReqId, process: &str, worker: WorkerId) {

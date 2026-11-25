@@ -347,9 +347,6 @@ async fn assemble_distributed<C: ControlLink>(
         model,
         engine,
         addr,
-        // Launched by the controller's actuator, the token it was given.
-        // So a controller restarted after the one that launched it can
-        // signal it.
         pid: Some(std::process::id()),
         prior: None,
     };

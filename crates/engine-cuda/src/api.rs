@@ -45,7 +45,6 @@ pub struct DeviceBoot {
     pub comm: Option<Arc<crate::comm::Comm>>,
     pub knobs: Knobs,
     pub cache_dir: Option<std::path::PathBuf>,
-    pub adapter_dir: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct PendingStep {
@@ -787,8 +786,6 @@ impl Engine for Cuda {
             staged.shell.keep_contiguous();
         }
         let mut shell = staged.finish().map_err(fault)?;
-
-        shell.mount_adapters(self.boot.adapter_dir.clone());
         // The context the load serves, a declared one as the load's room cut it.
         let context = shell.paging().context();
         if let engine::HostTier::Seated(stated) = host_tier {
