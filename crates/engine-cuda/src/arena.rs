@@ -79,8 +79,14 @@ impl Arena {
     /// is wider) that state may take at that rung: no more than the prefix
     /// backed from the span's start ([`Arena::ensure`]), so state never
     /// lands where nothing is backed.
+    ///
+    /// A wider rung never states more under it than a narrower one: the
+    /// arena's packer can lay a wider fire in less (a readout slot that
+    /// fits a gap only the wider fire's token rows leave), so each rung
+    /// states the widest carve of its own and every narrower rung's.
     #[must_use]
     pub fn rungs(&self, forked: Option<&ArenaMap>) -> Vec<(u32, u64)> {
+        let mut widest = 0u64;
         self.rungs
             .iter()
             .map(|(tokens, _)| {
@@ -93,7 +99,8 @@ impl Arena {
                     .iter()
                     .find(|(rung, _)| rung >= tokens && *rung >= self.lane_reach)
                     .map_or(self.reserved - self.top, |(_, map)| map.bytes);
-                let bytes = carve.max(forked.map_or(0, |forked| forked.bytes)) + self.top;
+                widest = widest.max(carve);
+                let bytes = widest.max(forked.map_or(0, |forked| forked.bytes)) + self.top;
                 (
                     *tokens,
                     self.reserved.saturating_sub(bytes).min(self.committed),
@@ -329,6 +336,28 @@ mod tests {
         arena.reach_lanes(2048);
         assert_eq!(arena.rungs(None), vec![(256, 0), (1024, 0)]);
         assert_eq!(arena.carve_of(None, 1, 1), 3000);
+    }
+
+    /// A wider rung whose carve the packer laid in less than a narrower
+    /// one's (gpt-oss-20b: 1767 MB at 8192 tokens, 1731 MB at 15025) states
+    /// no more under it than the narrower: the runtime's rungs ascend.
+    #[test]
+    fn a_wider_rung_never_states_more_under_it_than_a_narrower() {
+        let map = |bytes| ArenaMap {
+            placements: Vec::new(),
+            spans: Vec::new(),
+            live_in: Vec::new(),
+            bytes,
+        };
+        let mut arena = Arena::reserve(3000).with_rungs(vec![
+            (256, map(1000)),
+            (512, map(2000)),
+            (1024, map(1500)),
+        ]);
+        arena.committed = 3000;
+        assert_eq!(arena.rungs(None), vec![(256, 2000), (512, 1000), (1024, 1000)]);
+        // A fire still lays its own rung's carve.
+        assert_eq!(arena.carve_of(None, 1024, 1), 1500);
     }
 
     #[test]

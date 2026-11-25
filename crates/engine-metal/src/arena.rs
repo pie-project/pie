@@ -63,7 +63,8 @@ pub fn io_room((inputs, readout): (u64, u64)) -> u64 {
 
 /// The span's chunks of `chunk_bytes` each rung takes: the `scratch` plane,
 /// `arms` frames' staged regions `io`, its rs scratch `rs` and its carve,
-/// `(tokens, chunks)` ascending.
+/// `(tokens, chunks)` ascending: a rung the packer laid in less than a
+/// narrower one's takes the narrower's chunks.
 #[must_use]
 pub fn act_chunks(
     rungs: &[(u32, ArenaMap)],
@@ -83,6 +84,10 @@ pub fn act_chunks(
                 *tokens,
                 u32::try_from(bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX),
             )
+        })
+        .scan(0u32, |most, (tokens, chunks)| {
+            *most = (*most).max(chunks);
+            Some((tokens, *most))
         })
         .collect()
 }
@@ -355,4 +360,30 @@ pub fn capacities(map: &ArenaMap) -> Vec<u32> {
             u32::try_from(bytes / row).unwrap_or(u32::MAX)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wider rung whose carve the packer laid in less than a narrower
+    /// one's (gpt-oss-20b: 1767 MB at 8192 tokens, 1731 MB at 15025) takes
+    /// the narrower's chunks: the runtime's rungs ascend.
+    #[test]
+    fn a_wider_rung_never_takes_fewer_chunks_than_a_narrower() {
+        let map = |bytes| ArenaMap {
+            placements: Vec::new(),
+            spans: Vec::new(),
+            live_in: Vec::new(),
+            bytes,
+        };
+        let rungs = vec![(256, map(1 << 20)), (512, map(3 << 20)), (1024, map(2 << 20))];
+        let chunks = act_chunks(&rungs, 0, &[(0, 0); 3], &[0; 3], 1, 1 << 20);
+        assert_eq!(
+            chunks.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            vec![256, 512, 1024]
+        );
+        assert!(chunks.windows(2).all(|p| p[0].1 <= p[1].1), "{chunks:?}");
+        assert_eq!(chunks[2].1, chunks[1].1);
+    }
 }
