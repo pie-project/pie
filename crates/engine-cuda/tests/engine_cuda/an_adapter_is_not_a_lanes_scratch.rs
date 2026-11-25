@@ -12,34 +12,31 @@ const LAYERS: u32 = 24;
 const HIDDEN: u32 = 1024;
 const RANK: u32 = 16;
 
-const SITES: u32 = 4;
-
-fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceContainer {
+fn bundle_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceContainer {
     let chan = |shape| ChannelDecl {
         shape,
-        dtype: ChanDType::Concrete(Dtype::F32),
+        dtype: ChanDType::Concrete(Dtype::U32),
         capacity: 1,
         host_role: HostRole::None,
         seeded: true,
     };
-    let a = Shape::new(&[layers, rank, hidden]).expect("A is [layers, rank, hidden]");
-    let b = Shape::new(&[layers, hidden, rank]).expect("B is out-major, per §6.3");
-    let mut channels = vec![chan(a), chan(b), chan(Shape::vector(SITES))];
-    let mut ops = vec![Op::ChanRead(0), Op::ChanRead(1), Op::ChanRead(2)];
+    let bundle = Shape::new(&[layers, rank, hidden]).expect("a bundle as large as one plane");
+    let mut channels = vec![chan(bundle)];
+    let mut ops = vec![Op::ChanRead(0)];
     if also_read {
         channels.push(ChannelDecl {
             seeded: false,
-            ..chan(a)
+            ..chan(bundle)
         });
         ops.push(Op::Neg(0));
-        ops.push(Op::ChanPut { chan: 3, value: 3 });
+        ops.push(Op::ChanPut { chan: 1, value: 1 });
     }
     ops.push(Op::SinkCall {
         name: 0,
-        args: vec![0, 1, 2],
+        args: vec![0],
     });
     TraceContainer {
-        names: vec!["lora".to_string()],
+        names: vec!["adapter".to_string()],
         channels,
         ports: vec![],
         stages: vec![StageProgram {
@@ -52,7 +49,7 @@ fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceC
 }
 
 fn package(container: TraceContainer) -> LaunchPackage {
-    let bound = crate::bound::logits(container, 32).expect("the lora prologue binds");
+    let bound = crate::bound::logits(container, 32).expect("the adapter prologue binds");
     let stages = compile_bound(&bound);
     eta_compiler::codegen::launch::build(&bound, &stages)
 }
@@ -75,7 +72,7 @@ fn naive_bytes(plan: &LaunchStagePlan, extents: Extents) -> u64 {
 }
 
 fn adapter_scratch(layers: u32, rank: u32, hidden: u32) -> u64 {
-    let package = package(lora_prologue(layers, rank, hidden, false));
+    let package = package(bundle_prologue(layers, rank, hidden, false));
     scratch_bytes(adapter_stage(&package), Extents::default()).expect("the stage's scratch")
 }
 
@@ -105,8 +102,8 @@ fn the_sinks_scratch_does_not_scale_with_layers_rank_hidden() {
 
 fn the_naive_budget_is_the_one_that_scales() {
     let extents = Extents::default();
-    let served = package(lora_prologue(LAYERS, RANK, HIDDEN, false));
-    let trivial = package(lora_prologue(1, 1, 1, false));
+    let served = package(bundle_prologue(LAYERS, RANK, HIDDEN, false));
+    let trivial = package(bundle_prologue(1, 1, 1, false));
     let served = naive_bytes(adapter_stage(&served), extents);
     let trivial = naive_bytes(adapter_stage(&trivial), extents);
     assert!(
@@ -118,10 +115,8 @@ fn the_naive_budget_is_the_one_that_scales() {
     );
     let planes = u64::from(LAYERS) * u64::from(RANK) * u64::from(HIDDEN) * 4;
     assert!(
-        served >= planes * 2,
-        "the naive budget carries A and B and a temporary block sized off the \
-         widest of them: at least {} bytes, and it said {served}",
-        planes * 2
+        served >= planes,
+        "the naive budget carries the bundle: at least {planes} bytes, and it said {served}"
     );
 }
 
@@ -135,7 +130,7 @@ fn an_adapter_carrying_prologue_costs_a_lane_a_rounding_error() {
 }
 
 fn the_planes_describe_as_empty() {
-    let package = package(lora_prologue(LAYERS, RANK, HIDDEN, false));
+    let package = package(bundle_prologue(LAYERS, RANK, HIDDEN, false));
     let plan = adapter_stage(&package);
     let descriptors = describe_values(plan, Extents::default()).expect("the descriptor row");
     assert_eq!(
@@ -146,20 +141,20 @@ fn the_planes_describe_as_empty() {
     );
     assert!(
         descriptors.iter().all(|value| value.len == 0),
-        "the three values of an adapter prologue are the sink's own operands \
+        "the value of an adapter prologue is the sink's own operand \
          and nothing this shell launches reads one; every descriptor should \
          say so: {descriptors:?}"
     );
 }
 
 fn a_plane_a_launched_op_also_reads_is_still_carried() {
-    let shared = package(lora_prologue(LAYERS, RANK, HIDDEN, true));
+    let shared = package(bundle_prologue(LAYERS, RANK, HIDDEN, true));
     let shared = scratch_bytes(adapter_stage(&shared), Extents::default()).expect("the scratch");
     let alone = adapter_scratch(LAYERS, RANK, HIDDEN);
     let plane = u64::from(LAYERS) * u64::from(RANK) * u64::from(HIDDEN) * 4;
     assert!(
         shared >= alone + plane,
-        "`A` feeds the sink AND a negate that is launched, so it is a value \
+        "the bundle feeds the sink AND a negate that is launched, so it is a value \
          this fire really does have to carry — {shared} bytes a lane against \
          {alone} when only the sink reads it, and one plane is {plane}"
     );
