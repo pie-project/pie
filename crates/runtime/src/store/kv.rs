@@ -2712,6 +2712,12 @@ impl KvStore {
         }
     }
 
+    /// Whether a slot below the device is in use.
+    pub fn holds_below_device(&self) -> bool {
+        self.host_pool.available() < self.host_pool.capacity() as usize
+            || self.disk_pool.available() < self.disk_pool.capacity() as usize
+    }
+
     /// Whether a reader outside the fleet holds pages here
     /// ([`Self::pin_resident`], [`Self::export`]).
     pub fn readers_hold(&self) -> bool {

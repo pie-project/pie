@@ -981,6 +981,11 @@ impl ResidencyPlanner {
     /// nowhere it is goes now, and what they keep off the device moves
     /// down now, with no waiter's want.
     pub(super) fn sweep_tiers(self: &Arc<Self>) {
+        // Nothing lies where a row could keep it off: cache on the device
+        // alone, and every row lets it there.
+        if !crate::policy::retention::keeps_off_device() && !self.port.holds_below_device() {
+            return;
+        }
         // A move runs on the runtime: called off it, the sweep goes there,
         // or (a planner made off any runtime) waits for the next plan that
         // runs on one.
