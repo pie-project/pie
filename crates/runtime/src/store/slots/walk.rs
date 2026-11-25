@@ -308,6 +308,24 @@ impl SlotPool {
         }
     }
 
+    /// The chunks state could open once the next `segments` the walk takes
+    /// ([`Self::commit_ahead`]'s order) are backed, past what stands open
+    /// ([`Self::free_chunks`]).
+    #[must_use]
+    pub fn commit_room(&self, segments: u32) -> u32 {
+        let limit = self.state_limit();
+        let added: u32 = self
+            .commit_ahead(u64::MAX)
+            .into_iter()
+            .take(segments as usize)
+            .map(|segment| {
+                let range = self.segments.range(segment);
+                range.end.min(limit).saturating_sub(range.start)
+            })
+            .sum();
+        added.min(self.growable_chunks().saturating_sub(self.free_chunks()))
+    }
+
     /// The lowest uncommitted segments to commit so `bytes` of headroom
     /// stand ready, off the fire path; empty when they already do. Never
     /// more than there are.

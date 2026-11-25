@@ -127,8 +127,9 @@ pub struct Need {
     /// The working set less what the device held for this process: what the
     /// weights, the pool and the floor have between them.
     pub ceiling: u64,
-    /// The weights that stay in device memory, streamable ones at the floor
-    /// the weight cache keeps of them.
+    /// The weights that stay in device memory, as a runtime's load holds them
+    /// (`engine::load::Residency::weights_held`): the token-id tables whole,
+    /// routed experts at the floor the weight cache keeps of them.
     pub weights: u64,
     /// One sequence at the context.
     pub pool: u64,
@@ -149,7 +150,7 @@ impl Need {
         caches: bool,
     ) -> Result<Need> {
         let (weights, _) =
-            crate::api::weight_demand(trace, &crate::api::ceiling_budgets(), caches, false)?;
+            crate::api::weight_demand(trace, &crate::api::ceiling_budgets(), caches, true)?;
         let pool = crate::api::sequence_demand(
             trace,
             crate::api::PAGE_SIZE,

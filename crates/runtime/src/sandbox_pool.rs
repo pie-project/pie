@@ -397,7 +397,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
 /// ranges from `floor` up to the main stack, but for the one just below
 /// the stack (its growth room, above where mmap places mappings). Ranges
 /// in the kernel's half (x86_64's vsyscall page) are not the process's.
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace> {
     let mut ranges = Vec::new();
     for line in maps.lines().filter(|line| !line.trim().is_empty()) {
