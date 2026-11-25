@@ -2,10 +2,12 @@
 serves and differentiating it.
 
 Slot 0 of the stanza's banks trains as f32 masters, one slot each. The forward
-reads each master through a straight-through bf16 cast, so training sees the
-exact bytes the bundle will carry to pie. Every other registered bank is zero
-and frozen, which is the identity for every stanza. Checkpoint params stay
-frozen unless a `trainable` glob names them.
+reads each master through a straight-through cast to the dtype the trace
+serves it at (bf16 for every bank), so training sees the exact bytes the
+bundle will carry to pie. Every other registered bank is zero and frozen,
+which is the identity for every stanza. Checkpoint params stay frozen unless
+a `trainable` glob names them; a param the trace serves at f32 (such as
+Qwen3.5's `a_log`) stays f32 whatever the trainer's dtype.
 
 The calls follow Tinker's shape: `forward_backward` accumulates gradients,
 `optim_step` applies them with AdamW and appends one line to `log`.
@@ -32,6 +34,7 @@ from .loss import FUNCTIONS
 from .program import Bank, Program
 
 DTYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
+SERVED = DTYPES | {"f16": torch.float16}
 
 
 class Trainer:
@@ -60,6 +63,7 @@ class Trainer:
         self.program, self.stanza, self.device, self.dtype = program, stanza, device, dtype
         self._dtype = DTYPES[dtype]
         self._interp = Interpreter(program.trace)
+        self._served = {p["name"]: SERVED[p["dtype"]] for p in program.trace["params"] if p["dtype"] in SERVED}
         frozen = checkpoint.load(program, weights, dtype=self._dtype, device=device)
         gen = torch.Generator().manual_seed(seed)
         trained = program.banks_of(stanza) if stanza is not None else []
@@ -68,6 +72,9 @@ class Trainer:
         tuned = sorted(n for n in frozen if any(fnmatch(n, g) for g in trainable or []))
         if trainable and not tuned:
             raise ValueError(f"trainable {trainable} names no checkpoint param")
+        odd = [n for n in [*self._banks, *tuned] if n not in self._served]
+        if odd:
+            raise ValueError(f"param `{odd[0]}`: the trace serves it at a dtype the trainer cannot train")
         self.masters.update({n: frozen.pop(n).float().requires_grad_() for n in tuned})
         self._frozen = frozen
         self._zeros = {
@@ -163,12 +170,16 @@ class Trainer:
                 self.masters[n].copy_(plane.float())
 
     def _params(self, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-        params = {n: t.to(dtype) for n, t in self._frozen.items()}
+        params = {n: t.to(self._at(n, dtype)) for n, t in self._frozen.items()}
         params.update((n, t.to(dtype)) for n, t in self._zeros.items())
         for n, m in self.masters.items():
-            served = (m + (m.to(torch.bfloat16).float() - m).detach()).to(dtype)
+            served = (m + (m.to(self._served[n]).float() - m).detach()).to(self._at(n, dtype))
             params[n] = served[None] if n in self._banks else served
         return params
+
+    def _at(self, name: str, dtype: torch.dtype) -> torch.dtype:
+        """The dtype a param runs at in a `dtype` replay: f32 where the trace serves it so."""
+        return torch.float32 if self._served.get(name) == torch.float32 else dtype
 
     def _logp(self, ids: torch.Tensor, real: torch.Tensor, *, adapted: bool) -> torch.Tensor:
         out = self._interp.hidden(self._params(self._dtype), ids, adapted=adapted, dtype=self._dtype)

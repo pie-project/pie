@@ -36,7 +36,8 @@ DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 
 def load(program: Program, weights: str | os.PathLike, *, dtype: torch.dtype, device: str) -> dict[str, torch.Tensor]:
     """Every checkpoint param of `program` by trace name, read from the
-    safetensors files in `weights`, at `dtype` on `device`."""
+    safetensors files in `weights`, at `dtype` on `device`; a param the trace
+    states f32 stays f32."""
     files = sorted(Path(weights).glob("*.safetensors"))
     if not files:
         raise FileNotFoundError(f"{weights}: no .safetensors files")
@@ -45,6 +46,7 @@ def load(program: Program, weights: str | os.PathLike, *, dtype: torch.dtype, de
         st = safe_open(f, framework="pt")
         where.update((key, st) for key in st.keys())
     shapes = {p["name"]: p["shape"] for p in program.trace["params"] if p["source"] == "Checkpoint"}
+    wide = {p["name"] for p in program.trace["params"] if p["dtype"] == "f32"}
     out = {}
     for entry in program.imports:
         name, op = entry["name"], entry["op"]
@@ -62,7 +64,7 @@ def load(program: Program, weights: str | os.PathLike, *, dtype: torch.dtype, de
             raise ValueError(f"param `{name}`: import op {op!r}; the trainer reads `copy` of one tensor or `expr`")
         if list(t.shape) != want:
             raise ValueError(f"param `{name}`: the checkpoint read is {list(t.shape)}, the trace wants {want}")
-        out[name] = t.to(device=device, dtype=dtype)
+        out[name] = t.to(device=device, dtype=torch.float32 if name in wide else dtype)
     missing = sorted(set(shapes) - set(out))
     if missing:
         raise ValueError(f"param `{missing[0]}`: import.json names no checkpoint tensor for it")
