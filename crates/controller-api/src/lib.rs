@@ -301,7 +301,6 @@ pub struct ReplicateOrder {
     pub keys: Vec<Key>,
     /// Where a worker that holds it serves its pages.
     pub from: String,
-    pub retention: i64,
     /// The table that wants it, for the log.
     pub table: String,
 }

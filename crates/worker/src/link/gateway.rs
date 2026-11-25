@@ -292,7 +292,6 @@ impl WorkerControl for WorkerControlServer {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
-        _retention: i64,
     ) -> Result<u32, String> {
         let pages = runtime::offload::prefill::replicate(keys, from.clone())
             .await

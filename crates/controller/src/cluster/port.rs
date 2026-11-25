@@ -394,8 +394,8 @@ fn decisions_of(shared: &Shared, gateway: GatewayId, courier: bool) -> GatewayDe
 /// Each gateway's view, sent where it changed.
 /// For each working set `replication/workers` names, a copy for each named
 /// worker the directory does not show holding it, from a worker that does.
-/// A copy is kept at retention 0: the worker's own retention decides how
-/// long, not a key the cluster sets. A pool keeps it in host memory.
+/// The worker's own retention decides how long a copy is kept. A pool
+/// keeps it in host memory.
 fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
     let tables = shared.tables.read().unwrap();
     if tables.replicas.is_empty() && tables.replicas_default.is_none() {
@@ -466,7 +466,6 @@ fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
                 worker,
                 keys: group.keys[..pages].to_vec(),
                 from,
-                retention: 0,
                 table: tables::REPLICATION_WORKERS.to_string(),
             })
         })
@@ -1224,10 +1223,10 @@ mod tests {
             .insert((id.clone(), None), vec![WorkerId(9)]);
         let mut orders = orders(&shared(tables, directory));
         orders.sort_by_key(|o| o.worker.0);
-        let asked: Vec<(u64, usize, &str, i64)> = orders
+        let asked: Vec<(u64, usize, &str)> = orders
             .iter()
-            .map(|o| (o.worker.0, o.keys.len(), o.from.as_str(), o.retention))
+            .map(|o| (o.worker.0, o.keys.len(), o.from.as_str()))
             .collect();
-        assert_eq!(asked, [(1, 2, "w0", 0), (9, 3, "w0", 0)]);
+        assert_eq!(asked, [(1, 2, "w0"), (9, 3, "w0")]);
     }
 }

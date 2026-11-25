@@ -606,10 +606,9 @@ fn carry(
                 worker,
                 keys,
                 from,
-                retention,
                 table,
             } = order;
-            match client.replicate(ctx, keys, from, retention).await {
+            match client.replicate(ctx, keys, from).await {
                 Ok(Ok(pages)) => tracing::info!(%group, %worker, table, pages, "replicated"),
                 Ok(Err(why)) => {
                     tracing::warn!(%group, %worker, table, %why, "replication refused")
