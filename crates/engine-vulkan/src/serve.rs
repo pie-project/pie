@@ -536,7 +536,7 @@ impl Serve for Api {
         // segments of the recording its stage cut ([`Kept::replay_cut`]).
         Ok(Shelf {
             recorder: if weights_stream {
-                crate::record::Recorder::refusing("the weights plane streams")
+                crate::record::Recorder::refusing("this load streams weights")
             } else {
                 crate::record::Recorder::new()
             },
@@ -563,6 +563,14 @@ impl Serve for Api {
         // layers do (and the stage they bind with them), and only while the
         // segments it binds stand as they did.
         shelf.recorder.forget();
+    }
+
+    fn refuse_recording(shelf: &mut Shelf, why: &'static str) {
+        shelf.recorder = crate::record::Recorder::refusing(why);
+    }
+
+    fn records_none(shelf: &Shelf) -> Option<&'static str> {
+        shelf.recorder.refused()
     }
 
     fn grown(_shell: &mut Shell<Api>, _arm: usize, _bytes: u64) -> Result<()> {
