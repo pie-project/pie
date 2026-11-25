@@ -1,7 +1,6 @@
 use super::*;
 use crate::inferlet::host::working_set::Cursor;
-use crate::store::kv::KvStoreError;
-use crate::store::kv::page_table::{KvTableError, WorkingSetId};
+use crate::store::kv::page_table::WorkingSetId;
 use crate::store::registry::Stores;
 
 fn cursor(reserved: u32) -> CursorCell {
@@ -337,8 +336,6 @@ struct Flight {
     rs: RsWorkingSetId,
     /// Where the pass's fires are staged from.
     cursor: CursorCell,
-    /// What its first lane reports under, where the device counts.
-    tag: u64,
 }
 
 impl Flight {
@@ -382,7 +379,7 @@ fn in_flight_on(fold: &geometry::Fold, exact: bool, recurrent: bool) -> Flight {
     let failure: PipelineFailure = Arc::new(Mutex::new(None));
     let fires = Arc::new(PendingFireQueue::new());
     let part = recurrent.then_some(rs);
-    let (completion, tag) = submit(&kv, part, &cell, &fires, &failure, fold);
+    let (completion, _) = submit(&kv, part, &cell, &fires, &failure, fold);
     Flight {
         stores,
         fires,
@@ -391,7 +388,6 @@ fn in_flight_on(fold: &geometry::Fold, exact: bool, recurrent: bool) -> Flight {
         kv,
         rs,
         cursor: cell,
-        tag,
     }
 }
 
@@ -687,4 +683,3 @@ async fn a_fold_that_is_never_placed_refuses_the_fork_by_name() -> Anyhow<()> {
 // arrived. A fire behind one that folds by a count the device computes
 // is therefore staged before that count exists.
 
-use crate::scheduler::frame::{FramePlan, FramePolicy, FrameStamp, QueuedFireIds};

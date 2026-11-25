@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
-use super::proc::{PendingBind, Proc, Residency};
+use super::proc::{Proc, Residency};
 use super::reclaim::Reclaim;
 use super::wait::{EntryKey, WaitKind};
 
@@ -2299,10 +2299,8 @@ async fn a_grant_dropped_under_the_planner_lock_does_not_deadlock() {
     }
 }
 
-
-/// The L40S on 3b45462d4: a restore whose guest state (1,058 slots, about
-/// sixteen chunks) and runs past what the state limit leaves, waiting with
-/// nothing evictable. A head whose whole step takes more chunks than state
+/// A restore whose guest state and runs pass what the state limit leaves,
+/// waiting with nothing evictable: a head whose whole step takes more chunks than state
 /// may ever take is refused by name as never fitting alone; one that fits
 /// waits.
 #[test]
