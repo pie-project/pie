@@ -326,9 +326,10 @@ impl Plane {
         registrations: &[ProgramRegistration],
     ) -> Result<u64> {
         let before = self.cache.stats().compilations;
+        let mut jobs = Vec::new();
         for registration in registrations {
             let plan = adopt_launch_package(registration.launch.clone())?;
-            self.cache.compile(
+            let planned = self.cache.plan(
                 context,
                 registration.program_hash,
                 &plan,
@@ -336,6 +337,20 @@ impl Plane {
                 Versions::from_compiler(registration.emitter_version),
                 Target::of(context)?,
             )?;
+            if let compile::Planned::Run(job) = planned {
+                jobs.push(std::sync::Mutex::new(Some(job)));
+            }
+        }
+        let device = compile::CompileDevice::of(context);
+        let threads = device.compile_wide(true);
+        let sharing = compile::Sharing::over(threads);
+        let built = compile::in_parallel(threads, jobs.len(), |at| {
+            let job = jobs[at].lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            job.map(|job| job.run_sharing(&sharing))
+        });
+        let _ = device.compile_wide(false);
+        for built in built.into_iter().flatten() {
+            self.cache.finish(built)?;
         }
         Ok(self.cache.stats().compilations - before)
     }
