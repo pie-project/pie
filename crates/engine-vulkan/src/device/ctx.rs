@@ -217,6 +217,10 @@ pub(crate) struct Core {
     /// them (descriptorBindingStorageBufferUpdateAfterBind): a recording's
     /// pool segments are rebound as they are backed and given back.
     pub(crate) update_after_bind: bool,
+
+    /// [`crate::api::DeviceBoot::verify_fills`].
+    #[cfg(feature = "test-limits")]
+    verify_fills: bool,
     /// The pool's segment buffers and their stand-ins, by raw handle, each
     /// to its segment ([`Context::rebind_segments`]): a kept frame notes each
     /// descriptor that binds one, to write it when the segment changes.
@@ -1449,6 +1453,8 @@ impl Context {
             heap,
             vendor_id: props.vendor_id,
             update_after_bind,
+            #[cfg(feature = "test-limits")]
+            verify_fills: boot.verify_fills,
             segments: Mutex::new(std::collections::HashMap::new()),
             segments_bound: Mutex::new(Vec::new()),
             rebound: Mutex::new(Vec::new()),
@@ -1854,6 +1860,16 @@ impl Context {
         Ok(writes.len() as u64)
     }
 
+    /// Whether each laid or derived fill is held to the fire's own walk
+    /// (`DeviceBoot::verify_fills`): a test's boot alone.
+    #[must_use]
+    pub fn verifies_fills(&self) -> bool {
+        #[cfg(feature = "test-limits")]
+        return self.core.verify_fills;
+        #[cfg(not(feature = "test-limits"))]
+        false
+    }
+
     /// Whether a recording's pool segments are rebound as they change
     /// (update-after-bind storage buffers), else the pool is laid whole.
     #[must_use]
@@ -2238,7 +2254,6 @@ impl Context {
             groups: std::cell::RefCell::new(Vec::new()),
             copies: std::cell::RefCell::new(Vec::new()),
             baked: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
-            trail: std::cell::RefCell::new(Vec::new()),
             picks: std::cell::RefCell::new(std::collections::hash_map::DefaultHasher::new()),
             lay_only: false,
         })
@@ -2601,14 +2616,6 @@ impl Hazards {
     }
 }
 
-/// Whether frames keep what each command carried, rendered
-/// (`PIE_VK_BAKE_TRAIL`): to tell a fill walk that matches no armed family
-/// apart from the nearest one.
-pub(crate) fn trailing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_VK_BAKE_TRAIL").is_some())
-}
-
 pub struct Frame {
     pub(crate) inner: Arc<Inner>,
     open: bool,
@@ -2638,11 +2645,6 @@ pub struct Frame {
     /// Everything the frame's commands carry, hashed: two walks whose
     /// commands hash alike differ only in what their fire blocks hold.
     baked: std::cell::RefCell<std::collections::hash_map::DefaultHasher>,
-
-    /// What each command folded into `baked` carried, rendered, where
-    /// `PIE_VK_BAKE_TRAIL` asks ([`trailing`]): what a fill walk that
-    /// matches no armed family is told apart from the nearest by.
-    trail: std::cell::RefCell<Vec<String>>,
 
     copier: Arc<super::pipelines::Pipeline>,
 
@@ -2921,7 +2923,6 @@ impl Frame {
         self.open = false;
         Fill {
             baked: self.baked.borrow().finish(),
-            trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             image: self.block.borrow_mut().take_image().seal(),
@@ -2931,26 +2932,20 @@ impl Frame {
         }
     }
 
-    /// Folds `what`, a command the frame records, into its hash.
+    /// Folds `what`, a command other than a dispatch, into its hash. It picks
+    /// itself whole: a copy's regions, a zeroed span.
     pub(crate) fn bake(&self, what: &(impl std::hash::Hash + std::fmt::Debug)) {
-        self.bake_named("", what);
+        self.pick(what);
+        self.bake_dispatch(what);
     }
 
-    /// [`Self::bake`], the trail naming the command `name` (a kernel's
-    /// entry point): what reads a parting as more than a key.
-    pub(crate) fn bake_named(&self, name: &str, what: &(impl std::hash::Hash + std::fmt::Debug)) {
+    /// Folds `what`, a dispatch, into its hash (it picks its kernel,
+    /// [`Self::pick`]).
+    pub(crate) fn bake_dispatch(&self, what: &(impl std::hash::Hash + std::fmt::Debug)) {
         if tracing::enabled!(target: "vkbakeall", tracing::Level::TRACE) {
             tracing::trace!(target: "vkbakeall", what = ?what, "bake");
         }
-        // A command other than a dispatch picks itself whole: a copy's
-        // regions, a zeroed span (a dispatch picks its kernel, [`Self::pick`]).
-        if name.is_empty() {
-            self.pick(what);
-        }
         what.hash(&mut *self.baked.borrow_mut());
-        if trailing() {
-            self.trail.borrow_mut().push(format!("{what:?} {name}"));
-        }
     }
 
     /// Folds `what` into the frame's picks: the kernels its dispatches
@@ -3844,7 +3839,6 @@ impl Frame {
             inner: Arc::clone(&self.inner),
             block: std::mem::take(&mut *self.block.borrow_mut()),
             baked: self.baked.borrow().finish(),
-            trail: std::mem::take(&mut *self.trail.borrow_mut()),
             groups: std::mem::take(&mut *self.groups.borrow_mut()),
             copies: std::mem::take(&mut *self.copies.borrow_mut()),
             picks: self.picks.borrow().finish(),
@@ -3888,8 +3882,6 @@ impl Drop for Frame {
 #[derive(Debug)]
 pub struct Fill {
     pub baked: u64,
-    /// What each command carried, rendered ([`trailing`]); empty elsewhere.
-    pub trail: Vec<String>,
     pub groups: Vec<[u32; 3]>,
     pub copies: Vec<[u32; 3]>,
     pub image: super::block::Image,
@@ -3913,8 +3905,6 @@ pub struct Kept {
     block: super::block::FireBlock,
 
     baked: u64,
-
-    trail: Vec<String>,
 
     groups: Vec<[u32; 3]>,
 
@@ -4022,11 +4012,6 @@ impl Kept {
     }
 
     /// What its commands carry, hashed ([`Frame::bake`]).
-    #[must_use]
-    pub fn trail(&self) -> &[String] {
-        &self.trail
-    }
-
     #[must_use]
     pub fn baked(&self) -> u64 {
         self.baked
@@ -4493,7 +4478,6 @@ impl Inner {
             let ns = (span as f64 * period) as u64;
             crate::encode::credit(name, ns);
         }
-        crate::encode::dump_profile();
     }
 }
 

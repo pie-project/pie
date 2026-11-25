@@ -6,7 +6,6 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
         .map_err(|error| format!("the vulkan boot config is not utf-8: {error}"))?
         .parse()
         .map_err(|error| format!("the vulkan boot config is not TOML: {error}"))?;
-    engine_gpu::adapter::refuse_adapter_dir(&doc, "vulkan")?;
     let profiles = profiles(&doc)?;
     Ok(Vulkan::new(
         DeviceBoot {
@@ -24,6 +23,8 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Vulkan, St
             fires_stated: false,
             #[cfg(feature = "test-limits")]
             whole_pool: false,
+            #[cfg(feature = "test-limits")]
+            verify_fills: false,
         },
         contract_for,
     ))
