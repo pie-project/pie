@@ -623,24 +623,18 @@ fn device_rs_plan(
 
 pub enum PendingOp {
     Fire(PendingFire),
-    #[cfg(test)]
-    TestStub,
 }
 
 impl PendingOp {
     pub(crate) fn is_settled(&self) -> bool {
         match self {
             PendingOp::Fire(fire) => fire.completion.is_settled(),
-            #[cfg(test)]
-            PendingOp::TestStub => true,
         }
     }
 
     fn binds(&self, cell: &Arc<Mutex<crate::pipeline::channel::ChannelCell>>) -> bool {
         match self {
             PendingOp::Fire(fire) => fire.cells.iter().any(|bound| Arc::ptr_eq(bound, cell)),
-            #[cfg(test)]
-            PendingOp::TestStub => true,
         }
     }
 
@@ -655,16 +649,12 @@ impl PendingOp {
                 ..
             }) => crate::scheduler::worker::notify_lane_waits(*engine, *lane, completion.clone()),
             PendingOp::Fire(_) => {}
-            #[cfg(test)]
-            PendingOp::TestStub => {}
         }
     }
 
     fn completion_signal(&self) -> OpSignal {
         match self {
             PendingOp::Fire(fire) => OpSignal::Fire(fire.completion.clone()),
-            #[cfg(test)]
-            PendingOp::TestStub => OpSignal::TestReady,
         }
     }
 
@@ -696,8 +686,6 @@ pub(crate) struct FinalizeOutcome {
 
 enum OpSignal {
     Fire(crate::engine::WorkItemCompletion),
-    #[cfg(test)]
-    TestReady,
 }
 
 impl std::future::Future for OpSignal {
@@ -709,15 +697,8 @@ impl std::future::Future for OpSignal {
     ) -> std::task::Poll<()> {
         match self.get_mut() {
             OpSignal::Fire(completion) => std::pin::Pin::new(completion).poll(cx).map(|_| ()),
-            #[cfg(test)]
-            OpSignal::TestReady => std::task::Poll::Ready(()),
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn test_pending_op_stub() -> PendingOp {
-    PendingOp::TestStub
 }
 
 struct FireWs {
@@ -1031,12 +1012,6 @@ pub(crate) fn record_kv_writes(writes: Vec<::engine::KvWrites>) {
     for written in writes {
         held.insert(written.tag, written);
     }
-}
-
-/// What is kept under `tag`, taken.
-#[cfg(test)]
-pub(crate) fn kept_kv_writes(tag: u64) -> Option<::engine::KvWrites> {
-    ReportTag(tag).take()
 }
 
 struct ReportTag(u64);

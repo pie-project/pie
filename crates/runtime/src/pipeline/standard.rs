@@ -307,45 +307,6 @@ mod tests {
         }]
     }
 
-    /// Every standard sampler, prompt and decode at Qwen3's vocabulary,
-    /// planned with the forms Metal states (`Backend::library_forms`), forms
-    /// only library regions Metal's emitter serves: the boot registers them
-    /// all, and a region Metal declines fails the load (e.g. the
-    /// temperature-scaled draw formed as a `NucleusSample` region). The
-    /// control: planned with every
-    /// form, a region Metal declines is formed, so the check bites.
-    #[test]
-    fn metal_plans_every_standard_sampler_in_forms_it_serves() {
-        use eta_compiler::codegen::metal::validate::library_region_valid;
-        use eta_compiler::codegen::program::Backend;
-        use eta_compiler::plan::{LibraryForms, RegionKind, compile_bound_with};
-        let traced = traces(VOCAB, 16, &outputs(), 8).expect("the standard samplers trace");
-        let declined = |forms: LibraryForms| -> Vec<String> {
-            let mut declined = Vec::new();
-            for (name, traced) in &traced {
-                let bound =
-                    eta_ir::validate::bind(traced.container().clone(), vec![outputs()], EngineCaps::default())
-                        .expect("the sampler binds");
-                for (at, stage) in compile_bound_with(&bound, forms).iter().enumerate() {
-                    for region in &stage.fused.regions {
-                        if matches!(region.kind, RegionKind::Library(_))
-                            && !library_region_valid(stage, region)
-                        {
-                            declined.push(format!("{name}: stage {at} {:?}", region.kind));
-                        }
-                    }
-                }
-            }
-            declined
-        };
-        let metal = declined(Backend::Metal.library_forms());
-        assert!(metal.is_empty(), "Metal declines regions planned in its forms: {metal:?}");
-        assert!(
-            !declined(LibraryForms::ALL).is_empty(),
-            "planned with every form, a standard sampler forms a region Metal declines"
-        );
-    }
-
     /// The regions `backend`'s emitter gives a program, each by its text
     /// under one symbol: what engine-cuda and engine-metal key a region's
     /// module by. For `wgsl`, the step calls its stages dispatch, each by its

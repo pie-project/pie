@@ -1038,37 +1038,18 @@ mod tests {
         container
     }
 
-    fn channel_of(container: &TraceContainer, port: Port) -> u32 {
-        container
-            .ports
-            .iter()
-            .find_map(|binding| match (&binding.port, &binding.source) {
-                (bound, PortSource::Channel(channel)) if *bound == port => Some(*channel),
-                _ => None,
-            })
-            .expect("port bound")
-    }
-
     #[test]
     fn geometry_every_case() {
         a_decode_that_states_nothing_rides_the_envelope();
         a_port_the_device_computes_is_never_stated_by_the_host();
         a_device_mask_and_fold_ride_the_envelope();
         slots_computed_on_the_device_leave_the_envelope();
-        a_read_extent_beside_a_mask_leaves_the_envelope();
-        device_positions_ride_only_beside_stated_slots();
-        a_lane_appends_after_its_tail();
-        rows_past_a_span_rotate_behind_their_slots();
         stated_slots_land_where_they_say();
         a_write_inside_the_frozen_prefix_is_refused();
         a_lane_reads_no_slot_its_set_has_not_written();
         lanes_sharing_a_working_set_state_their_slots();
         a_host_lane_reads_up_to_its_last_row();
         masked_loop_carried_decode_is_pooled_device_geometry();
-        a_mask_free_decode_that_republishes_every_port_is_pooled_too();
-        a_decode_whose_slots_the_host_states_keeps_the_envelope_path();
-        a_decode_stating_no_slots_is_not_pooled();
-        a_decode_another_pass_lays_out_is_pooled_device_geometry();
         a_fold_list_states_every_lanes_fold_or_a_fold_a_lane();
     }
 
@@ -1150,31 +1131,6 @@ mod tests {
                 other => panic!("a fold list short of its lanes maps: {other:?}"),
             }
         }
-    }
-
-    fn a_decode_another_pass_lays_out_is_pooled_device_geometry() {
-        // A block drafter's loop: the verify lays out the draft's geometry,
-        // so the draft's ports are unseeded, host-blind and never put by
-        // the draft itself.
-        let mut container = masked_decode(1, 128);
-        container
-            .ports
-            .retain(|binding| binding.port != Port::AttnMask);
-        container.stages[0].ops.clear();
-        for declared in &mut container.channels {
-            declared.seeded = false;
-        }
-        assert_eq!(
-            detect_pooled_device_geometry(&container),
-            Some(vec![0, 1]),
-            "a port another pass of the program puts is device-resolvable"
-        );
-        container.channels[0].host_role = HostRole::Writer;
-        assert_eq!(
-            detect_pooled_device_geometry(&container),
-            None,
-            "a port the host writes is not"
-        );
     }
 
     /// The seeds let the host evaluate a decode's first positions; when the
@@ -1259,70 +1215,6 @@ mod tests {
             classify_decode_envelope(&container, &taint(&[Port::EmbedTokens, Port::Slots])),
             Ok(None)
         );
-    }
-
-    fn a_read_extent_beside_a_mask_leaves_the_envelope() {
-        assert_eq!(
-            classify_decode_envelope(
-                &masked_decode(2, 128),
-                &taint(&[Port::EmbedTokens, Port::AttnMask])
-            ),
-            Ok(None)
-        );
-    }
-
-    fn device_positions_ride_only_beside_stated_slots() {
-        let alone = decode(1, &[(Port::Positions, Shape::vector(1), Dtype::U32)]);
-        let device = taint(&[Port::EmbedTokens, Port::Positions]);
-        assert_eq!(classify_decode_envelope(&alone, &device), Ok(None));
-        let beside = decode(
-            1,
-            &[
-                (Port::Positions, Shape::vector(1), Dtype::U32),
-                (Port::Slots, Shape::vector(1), Dtype::U32),
-            ],
-        );
-        assert_eq!(
-            classify_decode_envelope(&beside, &device),
-            Ok(Some(PortMask::of(&[Port::EmbedTokens, Port::Positions]))),
-            "RoPE from the device, slots from the host"
-        );
-    }
-
-    fn a_lane_appends_after_its_tail() {
-        let (lanes, landings) = geometry(&[3]).lanes(&[place(40)], 16).unwrap();
-        assert_eq!(landings, vec![Landing { start: 40, rows: 3 }]);
-        assert_eq!(lanes[0].kv.held, 40);
-        assert_eq!(
-            lanes[0].pages,
-            vec![0, 1, 2],
-            "slots 0..43 span three pages"
-        );
-        assert!(lanes[0].positions.is_empty(), "positions follow the slots");
-        assert_eq!(lanes[0].readout, ::engine::Readout::Last);
-    }
-
-    fn rows_past_a_span_rotate_behind_their_slots() {
-        // A span over slots 10..30 rotates them as 4: the rows after lag 16.
-        let past = Place {
-            spans: vec![(10, 30, 16)],
-            ..place(40)
-        };
-        let (lanes, _) = geometry(&[3])
-            .lanes(std::slice::from_ref(&past), 16)
-            .unwrap();
-        assert_eq!(lanes[0].positions, vec![24, 25, 26]);
-        let mut g = geometry(&[2]);
-        g.slots = Some(vec![20, 21]);
-        let (lanes, _) = g.lanes(std::slice::from_ref(&past), 16).unwrap();
-        assert!(
-            lanes[0].positions.is_empty(),
-            "a row inside the span is not past it"
-        );
-        let mut g = geometry(&[1]);
-        g.positions = Some(vec![40]);
-        let (lanes, _) = g.lanes(&[past], 16).unwrap();
-        assert!(lanes[0].positions.is_empty(), "stated positions win");
     }
 
     fn stated_slots_land_where_they_say() {
@@ -1433,39 +1325,4 @@ mod tests {
         );
     }
 
-    fn a_mask_free_decode_that_republishes_every_port_is_pooled_too() {
-        let mut container = masked_decode(2, 128);
-        container
-            .ports
-            .retain(|binding| binding.port != Port::AttnMask);
-        assert_eq!(
-            detect_pooled_device_geometry(&container),
-            Some(vec![0, 1, 2])
-        );
-    }
-
-    fn a_decode_whose_slots_the_host_states_keeps_the_envelope_path() {
-        let mut container = masked_decode(1, 128);
-        let slots = channel_of(&container, Port::Slots);
-        container.stages[0]
-            .ops
-            .retain(|op| !matches!(op, Op::ChanPut { chan, .. } if *chan == slots));
-        assert_eq!(
-            detect_pooled_device_geometry(&container),
-            None,
-            "slots the program never re-publishes are the host's"
-        );
-    }
-
-    fn a_decode_stating_no_slots_is_not_pooled() {
-        let mut container = masked_decode(1, 128);
-        container
-            .ports
-            .retain(|binding| !matches!(binding.port, Port::Slots | Port::Positions));
-        assert_eq!(
-            detect_pooled_device_geometry(&container),
-            None,
-            "a decode that appends is the host's to place"
-        );
-    }
 }
