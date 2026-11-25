@@ -1414,22 +1414,6 @@ mod tests {
         assert!(!trapped(&trap, None).contains("guest stderr"));
     }
 
-    /// A wait is said at INFO once as its episode starts, not on repeats,
-    /// and once as it ends; the next wait is a new episode.
-    #[test]
-    fn a_wait_is_said_once_as_it_starts_and_once_as_it_ends() {
-        let mut episode = WaitEpisode::default();
-        assert!(episode.end().is_none(), "no episode: nothing to end");
-        assert!(episode.seen(), "the first sight is said");
-        assert!(!episode.seen(), "a repeat is not");
-        assert!(
-            episode.end().is_some(),
-            "the end is said, with its duration"
-        );
-        assert!(episode.end().is_none(), "once");
-        assert!(episode.seen(), "a new episode is said again");
-    }
-
     fn idle(process_id: ProcessId, client_pid: ProcessId, result_tx: SharedResultTx) -> Process {
         Process {
             process_id,

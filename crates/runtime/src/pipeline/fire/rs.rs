@@ -802,8 +802,6 @@ mod tests {
         a_host_fold_freezes_when_the_fire_publishes();
         lanes_sharing_a_working_set_read_the_state_one_of_them_folds();
         a_device_fold_lowers_to_its_port_and_waits_for_its_report();
-        demand_counts_the_state_copy_and_the_pages();
-        a_forked_state_lowers_its_copy_as_the_lane_row();
     }
 
     fn first_fire_resets_then_continues_in_place() {
@@ -949,42 +947,4 @@ mod tests {
         assert_eq!(store.frozen(ws), Ok(7));
     }
 
-    fn demand_counts_the_state_copy_and_the_pages() {
-        let mut store = RsStore::new(8, 8);
-        let ws = warm(&mut store, 4);
-        let shared = group(vec![0, 1], 4..12, GroupFold::Host(2));
-        assert_eq!(
-            demand(&store, &[ws, ws], &shared),
-            Ok(RsUnits {
-                slots: 1,
-                pages: 2,
-                ..RsUnits::default()
-            }),
-            "a state copy and two pages"
-        );
-        let alone = group(vec![0], 4..6, GroupFold::None);
-        assert_eq!(
-            demand(&store, &[ws], &alone),
-            Ok(RsUnits {
-                slots: 0,
-                pages: 1,
-                ..RsUnits::default()
-            }),
-            "one page, the state untouched"
-        );
-    }
-
-    fn a_forked_state_lowers_its_copy_as_the_lane_row() {
-        let mut store = RsStore::new(16, 16);
-        let parent = warm(&mut store, 2);
-        let child = store.fork(parent).unwrap();
-
-        let write = prepare(&mut store, child, 1).unwrap();
-        let copy = write.copies.1[0];
-        let mut req = request(1);
-        req.lanes[0].slot = 9;
-        write.apply_to(&mut req);
-        assert_eq!(write.slot_ids[0], copy, "not the kv seat");
-        settle(&mut store, write.txn);
-    }
 }

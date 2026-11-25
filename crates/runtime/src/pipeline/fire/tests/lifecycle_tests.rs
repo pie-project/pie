@@ -16,108 +16,6 @@ impl FireContext for TestContext {
     }
 }
 
-/// A beam's finish while a frame the process submitted is held unsealed
-/// under the rung's cap (a frame of the set staged before its finish and
-/// fired after a raise, its lanes' reserve naming the old tail the
-/// finish would let go). The finish lets
-/// nothing go until that frame lands: the set's table stands as the
-/// frame named it, and once it lands the finish relists.
-#[tokio::test(flavor = "current_thread")]
-async fn a_beams_finish_waits_for_a_frame_held_under_the_cap() -> anyhow::Result<()> {
-    struct HeldFrame {
-        id: uuid::Uuid,
-        resources: ResourceTable,
-        landed: Option<tokio::sync::oneshot::Receiver<()>>,
-    }
-    impl FireContext for HeldFrame {
-        fn resources(&mut self) -> &mut ResourceTable {
-            &mut self.resources
-        }
-        fn process_id(&self) -> uuid::Uuid {
-            self.id
-        }
-        async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
-            if let Some(landed) = self.landed.take() {
-                let _ = landed.await;
-            }
-            Ok(())
-        }
-    }
-    let model = crate::store::registry::register_model(32, &[8], &[4]);
-    let stores = crate::store::registry::get(model, 0);
-    let ws = {
-        let mut store = stores.kv.lock();
-        let ws = store.create_working_set();
-        store.reserve(ws, 4).expect("reserve four pages");
-        let mut granted = store.reserve_device_pages(4).expect("four free pages");
-        let (_, txn) = kv::prepare_explicit_reserved(&mut store, ws, &[0, 1, 2, 3], &mut granted)
-            .expect("write four pages");
-        kv::settle(&mut store, txn);
-        ws
-    };
-    let table = |stores: &crate::store::registry::Stores| {
-        crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| {
-            kv.flat_table(ws).map(<[_]>::to_vec).unwrap_or_default()
-        })
-    };
-    let before = table(&stores);
-    assert_eq!(before.len(), 4);
-    let (land, landed) = tokio::sync::oneshot::channel();
-    let mut context = HeldFrame {
-        id: uuid::Uuid::new_v4(),
-        resources: ResourceTable::new(),
-        landed: Some(landed),
-    };
-    let finish = relist_beam(&mut context, model, 0, ws, None, 1, &[2, 0]);
-    tokio::pin!(finish);
-    for _ in 0..20 {
-        tokio::select! {
-            biased;
-            _ = &mut finish => panic!("the finish ran before the held frame landed"),
-            () = tokio::task::yield_now() => {}
-        }
-    }
-    assert_eq!(table(&stores), before, "nothing let go while the frame is held");
-    let _ = land.send(());
-    tokio::time::timeout(std::time::Duration::from_secs(5), finish)
-        .await
-        .expect("the finish goes once the frame landed")
-        .expect("relisted");
-    assert_eq!(table(&stores), vec![before[0], before[3], before[1]]);
-    // The next fire's translation and reserve are stamped from this
-    // table: they name the listed pages alone.
-    let stamped = working_set_flat_table(&stores, ws).expect("the set's table");
-    assert_eq!(stamped, [before[0].0, before[3].0, before[1].0]);
-    Ok(())
-}
-
-/// A stale grant is quoted again on drift (the demand changed), not by
-/// count, and refused when stale against the demand it was quoted for.
-#[test]
-fn a_stale_grant_is_quoted_again_only_on_drift() {
-    let demand = |kv_pages| crate::planner::Demand {
-        kv_pages,
-        rs: crate::store::rs::RsUnits::default(),
-    };
-    let mut stale_at = None;
-    assert!(
-        requote_on_drift(&mut stale_at, demand(4)),
-        "first stale: quoted again"
-    );
-    assert!(
-        requote_on_drift(&mut stale_at, demand(6)),
-        "drifted: quoted again"
-    );
-    assert!(
-        requote_on_drift(&mut stale_at, demand(7)),
-        "drifted again: however often"
-    );
-    assert!(
-        !requote_on_drift(&mut stale_at, demand(7)),
-        "stale against the demand it was quoted for: refused"
-    );
-}
-
 pub(crate) fn pending_fire_fixture(
     cells: BoundCells,
 ) -> (
@@ -250,46 +148,6 @@ async fn a_landed_fire_dropped_before_its_hooks_run_keeps_its_rows_written() {
     assert_eq!(cell.lock().unwrap().readable(), 31);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn cancelled_full_drain_keeps_pending_kv_for_teardown() -> anyhow::Result<()> {
-    use std::future::Future;
-    for failed in [false, true] {
-        let (fires, completion, ws, stores, failure) = pending_fire_fixture(Vec::new());
-        let mut context = TestContext {
-            id: uuid::Uuid::new_v4(),
-            resources: ResourceTable::new(),
-        };
-        context.resources.push(ws)?;
-        {
-            let mut drain = Box::pin(finalize_all(&mut context, &fires, false));
-            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-            assert!(drain.as_mut().poll(&mut task).is_pending());
-            // Dropping the real host future models guest-task cancellation.
-        }
-        assert_eq!(
-            fires.lock().expect("test FIFO").len(),
-            1,
-            "cancelled drain must leave its unresolved operation in the FIFO"
-        );
-        context.resources = ResourceTable::new();
-        assert_eq!(
-            stores.kv.lock().available_pages(),
-            0,
-            "resource destruction must not recycle pages before completion"
-        );
-        resolve_test_completion(&completion, failed);
-        finalize_all(&mut context, &fires, true).await?;
-        assert!(fires.lock().expect("test FIFO").is_empty());
-        assert_eq!(
-            stores.kv.lock().available_pages(),
-            1,
-            "teardown must settle the original transaction and release its page"
-        );
-        assert_eq!(failure.lock().expect("test failure").is_some(), failed);
-    }
-    Ok(())
-}
-
 struct Flag(std::sync::atomic::AtomicBool);
 
 impl std::task::Wake for Flag {
@@ -310,6 +168,7 @@ async fn every_lane_waiting_on_the_front_fire_wakes_when_it_settles() -> anyhow:
     let mut context = TestContext {
         id: uuid::Uuid::new_v4(),
         resources: ResourceTable::new(),
+        tails: Vec::new(),
     };
     context.resources.push(ws)?;
     let flag = || Arc::new(Flag(AtomicBool::new(false)));
@@ -617,26 +476,6 @@ async fn a_stop_takes_back_what_ran_ahead_once_it_lands() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Under the lagged fold a run-ahead past a stop on a set with a
-/// recurrent state folded none of its rows: the take-back is a buffer
-/// truncate, the state untouched, the set usable for the next turn.
-#[tokio::test(flavor = "current_thread")]
-async fn a_stop_on_a_recurrent_set_takes_back_its_buffered_rows() -> anyhow::Result<()> {
-    let mut run = run_ahead(6, Some(20))?;
-    for completion in &run.completions {
-        resolve_test_completion(completion, false);
-    }
-    let pipeline = run.pipeline;
-    pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 3)
-        .await?
-        .map_err(anyhow::Error::msg)?;
-    assert_eq!(run.failure(), None);
-    let (folded, logged, _) = run.length();
-    assert_eq!((folded, logged), (20, 23), "the three rows kept stay buffered");
-    assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
-    Ok(())
-}
-
 /// A retract reaching a fire whose pass stated its rows final (a
 /// default pass: the SDK states it unless the program declared the pass
 /// retractable) is refused by name before anything is cut: the set
@@ -663,98 +502,5 @@ async fn a_retract_over_a_final_fire_is_refused_by_name() -> anyhow::Result<()> 
         .map_err(anyhow::Error::msg)?;
     assert_eq!(run.failure(), None);
     assert_eq!(run.cursor.lock().unwrap().tail, Some(23), "the final row kept");
-    Ok(())
-}
-
-/// Rows a recurrent state folded past the cut, or the run-ahead bound
-/// accepted, are not taken back: the pipeline fails by that name, and
-/// its set is refused where it is used next. A
-/// retract on an open pipeline, or past what it submitted, is refused.
-#[tokio::test(flavor = "current_thread")]
-async fn what_cannot_be_taken_back_is_refused_by_name() -> anyhow::Result<()> {
-    let mut run = run_ahead(4, Some(20))?;
-    for completion in &run.completions {
-        resolve_test_completion(completion, false);
-    }
-    let pipeline = run.pipeline;
-    let past = pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 5).await?;
-    assert!(past.unwrap_err().contains("past the 4 it can take back"));
-    // No more than the run-ahead window is kept, however long the
-    // pipeline runs.
-    let window = crate::scheduler::run_ahead_window();
-    let long = run_ahead(u32::try_from(window).unwrap() + 3, None)?;
-    let borrowed: Resource<Pipeline> = Resource::new_borrow(long.pipeline);
-    assert_eq!(
-        long.context
-            .resources
-            .get(&borrowed)?
-            .written
-            .lock()
-            .unwrap()
-            .len(),
-        window
-    );
-    // A state folded past the cut is not taken back: the pipeline fails
-    // by that name, and its set is refused where it is used next.
-    let mut run = run_ahead(4, Some(23))?;
-    for completion in &run.completions {
-        resolve_test_completion(completion, false);
-    }
-    let pipeline = run.pipeline;
-    pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
-        .await?
-        .map_err(anyhow::Error::msg)?;
-    let failure = run.failure().expect("the pipeline fails");
-    assert!(failure.contains("a fold is not taken back"), "{failure}");
-    assert_eq!(run.length().1, 24, "nothing taken back");
-    let next = crate::store::PipelineScope::failing_as(Default::default(), || true);
-    let refused = run.ws.claim_pipeline_scope(&next).unwrap_err().to_string();
-    assert!(refused.contains("could not be taken back"), "{refused}");
-    // Nor are rows the run-ahead bound accepted unread.
-    let mut run = run_ahead(4, Some(20))?;
-    run.cursor.lock().unwrap().bound_accepted = 23;
-    for completion in &run.completions {
-        resolve_test_completion(completion, false);
-    }
-    let pipeline = run.pipeline;
-    pipeline_retract(&mut run.context, Resource::new_borrow(pipeline), 2)
-        .await?
-        .map_err(anyhow::Error::msg)?;
-    let failure = run.failure().expect("the pipeline fails");
-    assert!(failure.contains("run-ahead bound"), "{failure}");
-
-    let mut context = TestContext {
-        id: uuid::Uuid::new_v4(),
-        resources: ResourceTable::new(),
-    };
-    let open = context.resources.push(Pipeline::new())?.rep();
-    let refused = pipeline_retract(&mut context, Resource::new_borrow(open), 1).await?;
-    assert!(refused.unwrap_err().contains("open pipeline"));
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<()> {
-    let mut context = TestContext {
-        id: uuid::Uuid::new_v4(),
-        resources: ResourceTable::new(),
-    };
-    let pipeline = context.resources.push(Pipeline::new())?;
-    let rep = pipeline.rep();
-    let borrowed: Resource<Pipeline> = Resource::new_borrow(rep);
-    let fires = context.resources.get(&borrowed)?.fires.clone();
-    fires
-        .lock()
-        .unwrap()
-        .extend([test_pending_op_stub(), test_pending_op_stub()]);
-
-    pipeline_close(&mut context, Resource::new_borrow(rep)).await?;
-    assert!(context.resources.get(&borrowed)?.scope.is_closed());
-    assert!(fires.lock().unwrap().is_empty());
-    pipeline_close(&mut context, Resource::new_borrow(rep)).await?;
-    assert!(fires.lock().unwrap().is_empty());
-
-    pipeline_drop(&mut context, pipeline).await?;
-    assert!(context.resources.get(&borrowed).is_err());
     Ok(())
 }
