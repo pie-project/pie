@@ -1,7 +1,8 @@
-//! The choice between the kernels that can serve a decode product, by their
-//! times measured in place (`[rates] product_ns`): the shared table
-//! ([`profile::routes`]) with this backend's candidates, the skinny skeleton
-//! and cuBLASLt's first algorithms ([`crate::linear::gemm::candidates`]).
+//! Host-only: the choice between the kernels that can serve a decode
+//! product, by their times measured in place (`[rates] product_ns`): the
+//! shared table ([`profile::routes`]) with this backend's candidates, the
+//! skinny skeleton and cuBLASLt's first algorithms
+//! ([`crate::linear::gemm::candidates`]).
 //!
 //! A candidate's code is its key in the profile: a hash of the device's
 //! arch, its driver and cuBLASLt, the kernel's own code (a JIT kernel's

@@ -54,7 +54,7 @@ fn the_register_gemm_launches_a_workgroup_a_tile() {
         let fires = rec.0.take();
         assert_eq!(fires.len(), 1);
         let fire = &fires[0];
-        assert!(fire.entrypoint.starts_with("linear_gemm_register"));
+        assert!(fire.entrypoint.starts_with("linear_gemm_register_"));
         assert_eq!(
             fire.groups,
             [n.div_ceil(cols), m.div_ceil(256), 1],

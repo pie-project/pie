@@ -1,4 +1,4 @@
-mod beam_step;
+mod beam;
 mod bounded_measuring;
 mod buffered_fold;
 mod churn;
