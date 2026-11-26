@@ -115,6 +115,14 @@ fn fill_chunks(blocks: u64, concurrent: u64, cap: u64) -> u64 {
 /// The most work items a captured layout's split lays over its replays: for
 /// every live tile count its grid of `grid` items holds a split of,
 /// [`fill_chunks`]'s chunks of it. 0 where no replay splits.
+///
+/// The replays that cut are ones a rung serves: on the PRO 4500 (164
+/// blocks) a lone request of 21 to 31 live tiles in Qwen3-0.6B's 2048-row
+/// rung (1,300 to 2,000 rows over 8 kv heads) splits into 2 to 4 chunks,
+/// one of 33 or 34 tiles in the 4096-row rung into 3. Counting only the
+/// tiles a rung's rows past the rung below it hold lays the same items, so
+/// the partials are the split's price: 47 MiB at 0.6B's 2048 rows, 63 MiB
+/// at its 4096 (and 8B's 2048), 95 MiB at Qwen3-8B's 4096.
 fn split_capacity(grid: u64, heads: u64, concurrent: u64) -> u64 {
     (1..=grid / 2)
         .filter_map(|tiles| {
