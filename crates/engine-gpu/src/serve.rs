@@ -8768,13 +8768,11 @@ impl<B: Serve> Shell<B> {
     /// pixels laid in a fill frame, and the backend's fill from what they
     /// laid. Whether an armed body took it.
     fn fill_once(&mut self, prepared: &mut Prepared<'_, B>) -> Result<bool> {
-        // An arm walk's fill that finds no family is walked again to record
-        // one: the fire's own staged rows stand.
-        let mark = self.arming.then(|| self.handles.len());
-        let rewind = |handles: &Handles<B>| match mark {
-            Some(len) => handles.rewind_to(len),
-            None => handles.rewind(),
-        };
+        // A fill that finds no family leaves the fire's own staged rows
+        // standing: an arm walk's walks again to record one, a serving fire's
+        // walks eagerly, and each reads the handles the fire bound.
+        let mark = self.handles.len();
+        let rewind = |handles: &Handles<B>| handles.rewind_to(mark);
         let walked = self.walk_fill(prepared);
         let walked = match walked {
             Ok(walked) => walked,
