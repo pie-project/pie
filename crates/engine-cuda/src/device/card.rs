@@ -24,8 +24,9 @@ pub struct Integrated {
     pub dedicated: u64,
     /// What the device holds of it now, every process's.
     pub held: u64,
-    /// The bytes Windows can still commit: the device's draw on them, one
-    /// for one.
+    /// The bytes Windows can still commit without growing its paging
+    /// file: the commit left, within the physical memory free. The device
+    /// draws on them one for one.
     pub commit_available: u64,
 }
 
@@ -153,7 +154,9 @@ pub fn integrated() -> Result<Option<Integrated>> {
     Ok(None)
 }
 
-/// The bytes Windows can still commit (`ullAvailPageFile`).
+/// The bytes Windows can still commit (`ullAvailPageFile`), within the
+/// physical memory free (`ullAvailPhys`): a system-managed paging file
+/// grows to back commit past what memory holds, tens of GB of the disk.
 #[cfg(all(feature = "device", windows, feature = "cuda"))]
 fn commit_available() -> Result<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -177,7 +180,7 @@ fn commit_available() -> Result<u64> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(status.ullAvailPageFile)
+    Ok(status.ullAvailPageFile.min(status.ullAvailPhys))
 }
 
 /// The driver's count of the device's own memory, through its management
