@@ -3614,7 +3614,13 @@ async fn bind_suspended_restores_come_back_one_at_a_time() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_parked_process_waiting_to_be_resident_is_restored() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
-    let pool = Arc::new(BindRoomPool::new(8, 0..0, 64));
+    // The restore reads its model's stores: a registered one, as a served
+    // model's are.
+    let model = crate::store::registry::register_model(16, &[8], &[2]);
+    let pool = Arc::new(BindRoomPool {
+        model,
+        ..BindRoomPool::new(8, 0..0, 64)
+    });
     pool.free.lock().extend(0..8);
     let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
     let pid = ProcessId::new_v4();
