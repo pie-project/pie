@@ -1,0 +1,45 @@
+osrt capture of a low shared server (shared-3) and a not-low one (shared-1), probe build 0774fc0ca, Qwen3-0.6B c256 shared,
+default disk, context 2048. nsys -t cuda,osrt --osrt-threshold 10000 (10 us) --osrt-backtrace-threshold 80000, 10 s window
+from 0.5 s before round 6 (covers the round 6->7 and 7->8 boundaries). CPU sampling and context switches could NOT be
+captured: perf_event_open is not available on this box (kernel paranoid level 4, container); nsys status -e says Fail.
+OS-runtime backtraces were captured (calls >= 80 us) but are shallow (2-4 frames; the release build has no frame pointers),
+so they name the wait primitive (parking_lot RawMutex lock_slow, crossbeam channel park, tokio condvar) but not which lock.
+
+tok/s per round:  plain (no nsys)  15737 16208 15385 15467 14272 14883 14588 14778  r5-8 14630
+                  shared-3 (kept)  15745 15443 15420 15187 15076 14871 14880 14461  r5-8 14822 (low)
+                  shared-1         16129 15335 15866 15826 15578 15385 15794 15670  r5-8 15607 (not low)
+                  shared-2         16205 15928 16051 15818 15573 15244 15645 15236  r5-8 15424
+The osrt tracing did not obviously change tok/s (1 of 3 low, as without it).
+
+Correction to the g10 reading: the long pre-prefill stretches come once per round (about 4.3 s apart); the 5 s g10 window
+held two round boundaries on the shared servers and one on private. Per boundary the stretch is 159-268 ms on shared
+(g10: 172-228; g11: 159-268) against 79 ms on the one private boundary seen. One prefill burst (12-17 prefill-carrying steps)
+follows each stretch; no second prefill burst or second stretch inside a round was seen (no sign of a two-wave bind here).
+
+pie-engine-0 (the thread that issues every step launch), from engine.txt:
+                                 shared-3 (low)            shared-1 (not low)
+ ordinary gaps 3-50 ms           62, 740.7 ms in all        8, 90.0 ms in all
+ engine OS waits in those gaps   47% of the gap time        59%
+   futex, mutex lock_slow        111 ms (15%)                9.7 ms (11%)
+   futex, short (<80 us)         238 ms (32%)               43 ms (48%)
+ long stretches (2 each)         427.5 ms                    391.7 ms
+   channel park (waiting for work)  169 ms (40%)            123 ms (31%)
+   mutex lock_slow                  84 ms (20%)              91 ms (23%)
+   CUDA calls on the thread         7-10k calls, 21-36 ms    (similar)
+ whole 10 s window               futex lock_slow >=80 us: 4998 waits, 1200 ms (12%) vs 1855 waits, 632 ms (6%)
+                                 all OS waits 39% vs 30% of the window
+In the gaps the rest of the engine thread's time is outside OS-runtime calls >= 10 us: running, or in shorter waits.
+tokio-rt-worker threads (27): in every gap most of their time is futex (RawMutex lock_slow and the tokio condvar park);
+they are the runtime's worker pool, so idle parking and lock contention are mixed there and cannot be told apart.
+
+Binds per stretch: no per-lane bind or instance-table log line exists at info. CUDA call pattern on the engine thread in each
+long stretch: shared-3 stretch 1: cudaMemsetAsync 1062, cudaMemcpyAsync 1350, cudaEventCreate 2190; stretch 2: 1210 / 1626 / -
+(about 4-6 memsets per newcomer if all 256 bind there; not a direct count).
+Idle-cache drop timing: no drop / reclaim line is logged at info. The info lines that exist: "fresh room refused" (16-24 per
+round from round 5 on, all within one burst 40-175 ms after the round's start) and the probe line (asks queued per round:
+27, 112, 152, 180, 245 in rounds 4-8, queued wait 188-808 ms). A store=debug run would be needed to time the drops.
+
+Tables read: CUPTI_ACTIVITY_KIND_KERNEL, CUPTI_ACTIVITY_KIND_RUNTIME, OSRT_API (start, end, thread, name, callchain id; the
+arguments column was not read), OSRT_CALLCHAINS (symbol names), ThreadNames, StringIds. No TARGET_INFO or environment table.
+Files: shared-3.osrt.txt (per gap, per thread waits and backtraces), shared-3.engine.txt and shared-1.engine.txt (engine thread
+by wait kind), osrt.py and engine.py (the queries).

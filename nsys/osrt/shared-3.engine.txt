@@ -1,0 +1,25 @@
+# shared-3.sqlite: pie-engine-0 (the thread that issues every step launch); window 9.92 s; 659 steps
+whole window: 1 interval(s), 9915.5 ms; engine thread in OS-runtime waits 3887.4 ms (39%)
+    futex: short (<80 us, no backtrace)        n 56405    2493.5 ms   25.1%
+    futex: mutex lock_slow (parking_lot)       n  4998    1200.0 ms   12.1%
+    futex: channel park (crossbeam select)     n   121     169.2 ms    1.7%
+    futex: other                               n    92      15.6 ms    0.2%
+    write                                      n   462       5.9 ms    0.1%
+    pthread_rwlock_wrlock                      n     7       3.2 ms    0.0%
+long pre-prefill stretches (>60 ms): 2 interval(s), 427.5 ms; engine thread in OS-runtime waits 263.9 ms (62%)
+    futex: channel park (crossbeam select)     n   121     169.2 ms   39.6%
+    futex: mutex lock_slow (parking_lot)       n    66      83.9 ms   19.6%
+    futex: short (<80 us, no backtrace)        n   280      10.2 ms    2.4%
+    write                                      n    49       0.6 ms    0.1%
+    futex: other                               n     1       0.1 ms    0.0%
+ordinary gaps 3-50 ms: 62 interval(s), 740.7 ms; engine thread in OS-runtime waits 351.1 ms (47%)
+    futex: short (<80 us, no backtrace)        n  5544     238.2 ms   32.2%
+    futex: mutex lock_slow (parking_lot)       n   457     111.4 ms   15.0%
+    futex: other                               n    12       1.3 ms    0.2%
+    write                                      n    11       0.1 ms    0.0%
+steps themselves (GPU busy): 659 interval(s), 8540.9 ms; engine thread in OS-runtime waits 3240.7 ms (38%)
+    futex: short (<80 us, no backtrace)        n 50243    2226.3 ms   26.1%
+    futex: mutex lock_slow (parking_lot)       n  4485     992.2 ms   11.6%
+    futex: other                               n    79      14.1 ms    0.2%
+    write                                      n   394       5.1 ms    0.1%
+    pthread_rwlock_wrlock                      n     8       3.0 ms    0.0%

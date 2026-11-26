@@ -1,0 +1,201 @@
+# shared-1.sqlite: 692 steps, prefill 28; window 9.98 s; gaps sum 708.3 ms
+
+## long pre-prefill stretch 1: gap 189.3 ms at +3.392 s, next step prefill=1; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9886 calls, 24.6 ms; cudaMemcpyAsync n1641 5.8ms; cudaEventQuery n1906 5.3ms; cudaMemsetAsync n1218 4.6ms; cudaGraphLaunch n7 4.2ms; cudaEventCreateWithFlags n1560 2.0ms; cudaEventDestroy n1889 1.2ms
+   launching thread OS-runtime calls >=10 us: 226 calls, 105.2 ms (55.6% of the gap): futex n219 105.00ms; pthread_rwlock_wrlock n2 0.18ms; write n5 0.06ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 4292 ms over 8151 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n3 189.2ms
+     pie                                  99.9%  pthread_cond_wait n7 189.0ms; write n1 0.0ms
+     cuda-EvtHandlr                       99.8%  poll n17 189.0ms
+     plex-epoch                           99.7%  clock_nanosleep n179 188.6ms
+     tokio-rt-worker                      92.7%  futex n232 149.4ms; epoll_wait n10 25.1ms; writev n19 0.5ms; send n16 0.4ms
+     tokio-rt-worker                      90.3%  futex n336 167.7ms; epoll_wait n42 1.4ms; writev n49 1.1ms; send n24 0.6ms
+     tokio-rt-worker                      90.1%  futex n296 137.0ms; epoll_wait n31 31.9ms; writev n32 0.9ms; recv n15 0.3ms
+     tokio-rt-worker                      89.9%  futex n301 167.8ms; epoll_wait n27 1.0ms; writev n27 0.8ms; recv n18 0.4ms
+     tokio-rt-worker                      89.8%  futex n308 168.5ms; writev n27 0.7ms; epoll_wait n13 0.4ms; recv n11 0.2ms
+     tokio-rt-worker                      89.7%  futex n332 167.1ms; epoll_wait n21 0.8ms; writev n38 0.8ms; send n26 0.5ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+     2546.4 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+     1547.1 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+      189.2 ms  pie poll: start_thread
+      189.0 ms  pie pthread_cond_wait: start_thread
+      188.8 ms  cuda-EvtHandlr poll: start_thread
+      188.6 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+      136.1 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+      123.2 ms  pie-sched-0 epoll_wait: _RNvMNtCs1pQrGqx08xC_3mio4pollNtB2_4Poll4poll
+
+## long pre-prefill stretch 2: gap 202.4 ms at +7.506 s, next step prefill=1; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 11821 calls, 30.0 ms; cudaMemcpyAsync n1370 7.7ms; cudaMemsetAsync n1074 6.9ms; cudaEventQuery n1619 6.2ms; cudaEventRecord n3065 2.8ms; cudaGraphLaunch n2 2.6ms; cudaEventCreateWithFlags n3060 2.1ms
+   launching thread OS-runtime calls >=10 us: 214 calls, 117.8 ms (58.2% of the gap): futex n173 117.26ms; write n41 0.51ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 4522 ms over 6789 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n3 202.3ms
+     pie                                 100.0%  pthread_cond_wait n3 202.3ms; futex n1 0.0ms; write n1 0.0ms
+     cuda-EvtHandlr                       99.9%  poll n8 202.2ms
+     plex-epoch                           99.7%  clock_nanosleep n191 201.8ms
+     tokio-rt-worker                      91.4%  futex n200 182.8ms; writev n24 1.0ms; epoll_wait n15 0.8ms; recv n9 0.2ms
+     tokio-rt-worker                      90.9%  futex n212 181.7ms; writev n20 0.8ms; epoll_wait n12 0.6ms; send n22 0.5ms
+     tokio-rt-worker                      90.1%  futex n229 179.3ms; epoll_wait n22 1.4ms; writev n24 0.9ms; send n11 0.4ms
+     tokio-rt-worker                      90.0%  futex n213 179.7ms; epoll_wait n20 1.3ms; writev n17 0.6ms; recv n12 0.2ms
+     tokio-rt-worker                      89.9%  futex n230 175.1ms; epoll_wait n50 5.4ms; writev n45 0.9ms; send n15 0.3ms
+     tokio-rt-worker                      89.8%  futex n156 177.8ms; epoll_wait n35 1.8ms; writev n28 1.1ms; send n24 0.6ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+     2217.4 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+     2166.7 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+      202.3 ms  pie poll: start_thread
+      202.3 ms  pie pthread_cond_wait: start_thread
+      202.2 ms  cuda-EvtHandlr poll: start_thread
+      201.8 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+      124.7 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+      108.9 ms  pie-sched-0 epoll_wait: _RNvMNtCs1pQrGqx08xC_3mio4pollNtB2_4Poll4poll
+
+## ordinary gap 1: gap 19.6 ms at +3.855 s, next step prefill=0; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9 calls, 0.5 ms; cudaGraphLaunch n1 0.4ms; cudaMemcpyBatchAsync n1 0.0ms; cuLaunchKernelEx n1 0.0ms; cudaMemcpyAsync n2 0.0ms; cudaEventQuery n1 0.0ms; cudaStreamIsCapturing n2 0.0ms
+   launching thread OS-runtime calls >=10 us: 361 calls, 13.1 ms (66.9% of the gap): futex n361 13.15ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 348 ms over 7687 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n1 19.6ms
+     pie-cluster-ple                     100.0%  futex n1 19.6ms
+     cuda-EvtHandlr                       99.9%  poll n3 19.6ms
+     plex-epoch                           99.5%  clock_nanosleep n19 19.6ms
+     pie                                  99.2%  pthread_cond_wait n2 19.5ms; write n1 0.0ms
+     pie-plex                             93.4%  futex n560 18.3ms
+     tokio-rt-worker                      75.4%  futex n380 14.8ms
+     tokio-rt-worker                      72.3%  futex n356 14.2ms
+     tokio-rt-worker                      70.3%  futex n305 12.5ms; epoll_wait n4 1.3ms
+     tokio-rt-worker                      68.9%  futex n317 13.5ms; write n1 0.0ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+       31.1 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+       24.2 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+       19.6 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+       19.6 ms  pie poll: start_thread
+       19.6 ms  cuda-EvtHandlr poll: start_thread
+       19.6 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+       19.5 ms  pie pthread_cond_wait: start_thread
+        3.6 ms  pie-plex futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelINtNtCs8uuN1nrGffB_4core6result6ResultuNtNtCs3B
+
+## ordinary gap 2: gap 17.8 ms at +8.067 s, next step prefill=0; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9 calls, 0.8 ms; cudaGraphLaunch n1 0.7ms; cudaMemcpyBatchAsync n1 0.1ms; cuLaunchKernelEx n1 0.0ms; cudaMemcpyAsync n2 0.0ms; cudaEventQuery n1 0.0ms; cudaStreamIsCapturing n2 0.0ms
+   launching thread OS-runtime calls >=10 us: 321 calls, 10.6 ms (59.7% of the gap): futex n321 10.62ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 329 ms over 6866 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n1 17.8ms
+     pie-cluster-ple                     100.0%  futex n1 17.8ms
+     cuda-EvtHandlr                       99.7%  poll n3 17.7ms
+     plex-epoch                           99.7%  clock_nanosleep n17 17.7ms
+     pie                                  99.3%  pthread_cond_wait n2 17.6ms; write n1 0.0ms
+     pie-plex                             94.4%  futex n462 16.8ms
+     tokio-rt-worker                      74.3%  futex n281 13.2ms; epoll_wait n1 0.0ms
+     tokio-rt-worker                      72.7%  futex n302 12.9ms
+     tokio-rt-worker                      72.6%  futex n271 9.9ms; epoll_wait n1 3.0ms
+     tokio-rt-worker                      72.5%  futex n268 12.9ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+       71.8 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+       21.7 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+       17.8 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+       17.8 ms  pie poll: start_thread
+       17.7 ms  cuda-EvtHandlr poll: start_thread
+       17.7 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+       17.6 ms  pie pthread_cond_wait: start_thread
+        4.2 ms  pie-plex futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelINtNtCs8uuN1nrGffB_4core6result6ResultuNtNtCs3B
+
+## ordinary gap 3: gap 16.1 ms at +8.032 s, next step prefill=0; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9 calls, 0.8 ms; cudaGraphLaunch n1 0.7ms; cudaMemcpyBatchAsync n1 0.1ms; cuLaunchKernelEx n1 0.0ms; cudaMemcpyAsync n2 0.0ms; cudaEventQuery n1 0.0ms; cudaStreamIsCapturing n2 0.0ms
+   launching thread OS-runtime calls >=10 us: 238 calls, 10.1 ms (63.1% of the gap): futex n238 10.14ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 308 ms over 5838 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n1 16.1ms
+     pie-cluster-ple                     100.0%  futex n1 16.1ms
+     cuda-EvtHandlr                       99.6%  poll n3 16.0ms
+     plex-epoch                           99.6%  clock_nanosleep n17 16.0ms
+     pie                                  99.4%  pthread_cond_wait n2 16.0ms; write n1 0.0ms
+     pie-plex                             94.3%  futex n392 15.2ms
+     tokio-rt-worker                      76.0%  futex n267 12.2ms
+     tokio-rt-worker                      75.7%  futex n251 12.2ms
+     tokio-rt-worker                      74.4%  futex n213 12.0ms
+     tokio-rt-worker                      74.2%  futex n218 11.9ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+       93.0 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+       22.1 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+       16.1 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+       16.1 ms  pie poll: start_thread
+       16.0 ms  cuda-EvtHandlr poll: start_thread
+       16.0 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+       16.0 ms  pie pthread_cond_wait: start_thread
+        4.8 ms  pie-plex futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelINtNtCs8uuN1nrGffB_4core6result6ResultuNtNtCs3B
+
+## ordinary gap 4: gap 14.6 ms at +3.822 s, next step prefill=0; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9 calls, 0.5 ms; cudaGraphLaunch n1 0.4ms; cudaMemcpyBatchAsync n1 0.0ms; cudaMemcpyAsync n2 0.0ms; cuLaunchKernelEx n1 0.0ms; cudaEventQuery n1 0.0ms; cudaStreamIsCapturing n2 0.0ms
+   launching thread OS-runtime calls >=10 us: 255 calls, 10.2 ms (70.4% of the gap): futex n255 10.25ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 273 ms over 5697 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n1 14.6ms
+     pie-cluster-ple                     100.0%  futex n1 14.6ms
+     cuda-EvtHandlr                       99.7%  poll n3 14.5ms
+     plex-epoch                           99.6%  clock_nanosleep n15 14.5ms
+     pie                                  99.0%  pthread_cond_wait n2 14.4ms
+     pie-plex                             93.7%  futex n383 13.6ms
+     tokio-rt-worker                      77.2%  futex n268 11.2ms
+     tokio-rt-worker                      74.3%  futex n254 10.8ms
+     tokio-rt-worker                      73.7%  futex n220 10.7ms; write n1 0.0ms
+     tokio-rt-worker                      71.3%  futex n216 10.4ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+       45.2 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+       14.6 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+       14.6 ms  pie poll: start_thread
+       14.5 ms  cuda-EvtHandlr poll: start_thread
+       14.5 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+       14.4 ms  pie pthread_cond_wait: start_thread
+        2.4 ms  pie-plex futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelINtNtCs8uuN1nrGffB_4core6result6ResultuNtNtCs3B
+        1.3 ms  pie-engine-0 futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+
+## ordinary gap 5: gap 7.0 ms at +4.654 s, next step prefill=0; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9 calls, 0.6 ms; cudaGraphLaunch n1 0.5ms; cudaMemcpyBatchAsync n1 0.1ms; cuLaunchKernelEx n1 0.0ms; cudaMemcpyAsync n2 0.0ms; cudaEventQuery n1 0.0ms; cudaStreamIsCapturing n2 0.0ms
+   launching thread OS-runtime calls >=10 us: 67 calls, 3.6 ms (52.0% of the gap): futex n67 3.62ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 159 ms over 1062 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n1 7.0ms
+     plex-epoch                           99.7%  clock_nanosleep n8 6.9ms
+     cuda-EvtHandlr                       99.2%  poll n3 6.9ms
+     pie-plex                             97.9%  futex n65 6.8ms
+     pie                                  97.8%  pthread_cond_wait n2 6.8ms; write n1 0.0ms
+     tokio-rt-worker                      94.7%  futex n33 6.6ms
+     tokio-rt-worker                      92.1%  futex n36 6.4ms
+     tokio-rt-worker                      91.6%  futex n43 6.4ms
+     tokio-rt-worker                      91.2%  futex n51 6.4ms
+     tokio-rt-worker                      89.7%  futex n40 6.2ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+       72.6 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+       52.3 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+        7.0 ms  pie poll: start_thread
+        6.9 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+        6.9 ms  cuda-EvtHandlr poll: start_thread
+        6.8 ms  pie pthread_cond_wait: start_thread
+        4.5 ms  pie-plex futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelINtNtCs8uuN1nrGffB_4core6result6ResultuNtNtCs3B
+        4.2 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+
+## ordinary gap 6: gap 5.9 ms at +8.144 s, next step prefill=0; launching thread: pie-engine-0 (290719021952605)
+   launching thread CUDA calls: 9 calls, 0.7 ms; cudaGraphLaunch n1 0.6ms; cudaMemcpyBatchAsync n1 0.0ms; cuLaunchKernelEx n1 0.0ms; cudaMemcpyAsync n2 0.0ms; cudaEventQuery n1 0.0ms; cudaStreamIsCapturing n2 0.0ms
+   launching thread OS-runtime calls >=10 us: 48 calls, 1.9 ms (32.7% of the gap): futex n48 1.94ms
+   tokio-rt-worker threads with calls in the gap: 27; their futex time 135 ms over 849 calls
+   OS-runtime calls >=10 us overlapping the gap, per thread (time clipped to the gap; % of gap):
+     pie                                 100.0%  poll n1 5.9ms
+     pie-cluster-ple                     100.0%  futex n1 5.9ms
+     plex-epoch                           99.8%  clock_nanosleep n6 5.9ms
+     cuda-EvtHandlr                       99.2%  poll n3 5.9ms
+     pie-plex                             98.2%  futex n60 5.8ms
+     pie                                  97.7%  pthread_cond_wait n2 5.8ms; write n1 0.0ms
+     tokio-rt-worker                      94.2%  futex n13 5.6ms
+     tokio-rt-worker                      92.6%  futex n27 5.5ms
+     tokio-rt-worker                      91.5%  futex n40 5.4ms
+     tokio-rt-worker                      91.3%  futex n30 5.4ms
+   top backtraces (blocking calls, >=80 us), by time in the gap:
+       96.7 ms  tokio-rt-worker futex: _RINvMNtNtNtCscY7dylpXXVj_5tokio7runtime7context6scopedINtB3_6ScopedNtNtB7_9scheduler7ContextE3setNCNCNvNtNtB1
+       12.1 ms  tokio-rt-worker futex: _RNvMs1_NtCs2aEkeQ9cNx7_11parking_lot9raw_mutexNtB5_8RawMutex9lock_slow
+        5.9 ms  pie-cluster-ple futex: _RNvMs_NtNtCsh0g7Hz38UNf_3std6thread6threadNtB4_6Thread4park < _RNCNvMs1_NtNtNtCsh0g7Hz38UNf_3std4sync4mpmc4listINtB7_7ChannelNtNtNtCstJXteXuHSX_10controller7cluster4port5Ev
+        5.9 ms  pie poll: start_thread
+        5.9 ms  plex-epoch clock_nanosleep: _RNvNtNtCsh0g7Hz38UNf_3std6thread9functions5sleep < _RNCNCNvNtCskIUbTqNpHo0_9plex_host7runtime6engine00B7_
+        5.9 ms  cuda-EvtHandlr poll: start_thread
+        5.8 ms  pie pthread_cond_wait: start_thread
+        4.3 ms  tokio-rt-worker epoll_wait: _RNvMNtCs1pQrGqx08xC_3mio4pollNtB2_4Poll4poll
