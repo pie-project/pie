@@ -174,6 +174,28 @@ pub fn family_rates(on: &str) -> Option<(String, profile::rates::Rates)> {
         .next()
 }
 
+/// The dispatch launch cost a committed measured profile of another device
+/// of `on`'s family states (whatever else it states), and the device it
+/// names.
+#[must_use]
+pub fn family_launch(on: &str) -> Option<(String, u64)> {
+    let family = family_of(on)?;
+    SEEDED
+        .iter()
+        .filter(|(name, _)| name.ends_with(profile::shelf::MEASURED_SUFFIX))
+        .filter_map(|(name, text)| {
+            let rates = registry()
+                .parse(text, name, profile::Strict::Measured)
+                .ok()?
+                .tuned
+                .rates;
+            let theirs = rates.measured_on.clone()?;
+            (theirs != on && family_of(&theirs) == Some(family))
+                .then_some((theirs, rates.launch_ns?))
+        })
+        .next()
+}
+
 /// Where a load whose own profile states none of the estimate's rates takes
 /// them from, first that serves: its family's committed profile
 /// ([`family_rates`]), then its driver's stated figures through the spec

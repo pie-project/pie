@@ -551,6 +551,32 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                                 .ok()
                                 .map(f64::from);
                         }
+                        // The dispatch's launch cost a family's committed
+                        // profile states, where one does; none else, said
+                        // (no vendor publishes a per-dispatch figure to
+                        // take in its place).
+                        let launch = match rates.launch_ns {
+                            Some(ns) => format!("launch {ns} ns as stated"),
+                            None => match crate::chip::family_launch(&on) {
+                                Some((from, ns)) => {
+                                    rates.launch_ns = Some(ns);
+                                    format!("launch {ns} ns, `{from}`'s committed figure")
+                                }
+                                None => "no launch cost stated (no profile of this family states \
+                                         one, and no vendor publishes a per-dispatch figure)"
+                                    .to_string(),
+                            },
+                        };
+                        let used = format!(
+                            "{:.1} TFLOP/s bf16, {:.0} GB/s, {launch}",
+                            rates
+                                .gemm_tflops_by_rows
+                                .as_ref()
+                                .and_then(|w| w.last())
+                                .and_then(|(_, c)| c.last())
+                                .map_or(0.0, |&(_, t)| t),
+                            rates.hbm_gbps.unwrap_or(0.0),
+                        );
                         crate::top::choose(
                             &rungs,
                             after_weights,
@@ -561,6 +587,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                             &counts,
                         )
                         .ok()
+                        .map(|(top, estimate)| (top, estimate, used))
                     };
                     let (family, why) = match found {
                         crate::chip::Fallback::Family(from, theirs) => {
@@ -568,7 +595,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                                 "the rates `{from}`'s committed profile states, its family's"
                             );
                             let why = format!("{from} do not weigh this model");
-                            (weigh(theirs).map(|(t, e)| (from, t, e)), why)
+                            (weigh(theirs).map(|(t, e, u)| (from, t, e, u)), why)
                         }
                         crate::chip::Fallback::Spec(line, theirs) => {
                             let why = format!(
@@ -576,25 +603,35 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                                  does not state"
                             );
                             (
-                                weigh(theirs).map(|(t, e)| (format!("the rates {line}"), t, e)),
+                                weigh(theirs)
+                                    .map(|(t, e, u)| (format!("the rates {line}"), t, e, u)),
                                 why,
                             )
                         }
                         crate::chip::Fallback::None(why) => (None, why),
                     };
                     match family {
-                        Some((from, top, estimate)) => {
+                        Some((from, top, estimate, used)) => {
+                            // The line's rates are the ones the estimate
+                            // weighed by, said once: not the profile's, which
+                            // states none.
+                            let gib = after_weights as f64 / f64::from(1u32 << 30);
+                            let by = match top.why {
+                                engine::load::TopWhy::Argmax { eff, live_share } => format!(
+                                    "by the estimate: eff {eff:.3} at a live share of \
+                                     {live_share:.3}"
+                                ),
+                                engine::load::TopWhy::OnlyFeasible => {
+                                    "as the one feasible rung".to_string()
+                                }
+                            };
                             tracing::info!(
                                 "fallback: the roofline `[rates] {key}` (this device's profile \
-                                 states none; a load measures nothing, `pie tune` does): the fire \
-                                 top is weighed by the estimate over {from}: {}",
-                                engine::load::line_of(
-                                    &top,
-                                    top.tokens,
-                                    top.span_bytes,
-                                    after_weights,
-                                    chip.tuned()
-                                )
+                                 states none; a load measures nothing, `pie tune` does): top rung \
+                                 {} {by}; span {} MiB of {gib:.1} GiB live; weighed over {from}; \
+                                 the estimate's rates: {used}",
+                                top.tokens,
+                                top.span_bytes >> 20,
                             );
                             weighed = Some(crate::top::Weighed {
                                 rungs: rungs.clone(),
