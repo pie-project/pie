@@ -667,11 +667,15 @@ impl ResidencyPlanner {
     /// [`FIXED_SETS_PER_WORKING_SET`] fixed sets, beside the copy-on-write
     /// sets kept once for a fire's lanes, and at least one runs. `None`
     /// where the model keeps no fixed state.
+    ///
+    /// A lane copies a set an admitted working set holds, so no more
+    /// copies are written at once than there are seats: the reserve never
+    /// takes more than half the pool, whatever lanes a fire may run.
     pub(super) fn state_seats(&self) -> Option<usize> {
         let (_, total) = self.port.rs_stats();
         (total.slots > 0).then(|| {
-            (total.slots.saturating_sub(self.cow_lanes) / FIXED_SETS_PER_WORKING_SET).max(1)
-                as usize
+            let cow = self.cow_lanes.min(total.slots.div_ceil(2));
+            (total.slots.saturating_sub(cow) / FIXED_SETS_PER_WORKING_SET).max(1) as usize
         })
     }
 

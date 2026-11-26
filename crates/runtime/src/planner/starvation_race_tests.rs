@@ -1582,3 +1582,34 @@ fn a_stalled_process_that_alone_holds_the_pool_fails_instead_of_restarting() {
     );
     drop(terminate(&planner, process));
 }
+
+/// A fire's lanes outnumber the state slots (Metal runs 512): the
+/// copy-on-write reserve takes half the pool, not all of it, so a second
+/// process is admitted beside the first.
+#[test]
+fn a_state_pool_smaller_than_a_fires_lanes_admits_more_than_one_process() {
+    let _schedule = crate::policy::schedule::TEST_LOCK.blocking_read();
+    use futures::FutureExt;
+    for (slots, lanes, seats) in [(8, 512, 4), (7, 512, 3), (8, 2, 6), (1, 512, 1)] {
+        let model = crate::store::registry::register_model(16, &[64], &[slots]);
+        let pool = Arc::new(RacePool {
+            rs_model: Some(model),
+            ..RacePool::new(64)
+        });
+        let planner = ResidencyPlanner::new(pool as Arc<dyn PoolPort>).cow_lanes(lanes);
+        assert_eq!(
+            planner.state_seats(),
+            Some(seats),
+            "{slots} slots, {lanes} lanes"
+        );
+        let pids = [(); 8].map(|_| ProcessId::new_v4());
+        let admitted = pids
+            .iter()
+            .filter(|&&pid| {
+                planner.register(pid);
+                planner.admit(pid).now_or_never().is_some()
+            })
+            .count();
+        assert_eq!(admitted, seats, "{slots} slots, {lanes} lanes");
+    }
+}
