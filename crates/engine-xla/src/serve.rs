@@ -2065,20 +2065,20 @@ impl Shell {
     /// and no fire took yet first of all), programs held in host memory
     /// while `need` more bytes do not fit: the host's free memory beside
     /// what the guest stages' compiles take, and the stated host bound (the
-    /// host tier's kv and the programs together). Waits on the drops it
-    /// needs; with none left to drop, the caller goes ahead. `at` is never
-    /// dropped (the program about to load).
+    /// host tier's kv and the programs together: the worker's resident
+    /// memory, less the drops under way, beside `need`). Waits on the drops
+    /// it needs; with none left to drop, the caller goes ahead. `at` is
+    /// never dropped (the program about to load).
     fn make_host_room(&mut self, need: u64, at: Option<[u8; 32]>) {
         let bound = self.host_bound;
-        let tier = self.host.landed_bytes();
         let fits = |shell: &Shell| {
             let pending = shell.dropper.pending();
             crate::device::available_memory().is_none_or(|free| {
                 free.saturating_add(pending)
                     >= need.saturating_add(crate::guest::run::guest_reserve())
             }) && bound.is_none_or(|bound| {
-                shell.programs_held().saturating_add(pending).saturating_add(tier).saturating_add(need)
-                    <= bound
+                crate::device::resident_bytes()
+                    .is_none_or(|held| held.saturating_sub(pending).saturating_add(need) <= bound)
             })
         };
         let mut dropped = 0u32;

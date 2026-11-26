@@ -1430,18 +1430,18 @@ impl HostRoom {
 
     /// Whether a hold of `hold` fits beside `reserved` under way.
     fn room(&self, reserved: u64, hold: u64) -> bool {
-        match self.stated {
-            Some(stated) => self.held().saturating_add(reserved).saturating_add(hold) <= stated,
-            // the floor, and the room the guest stage compiles running and
-            // waiting take (a loader beside serving held the host to 14.5 GB
-            // free and a registration's sampler stages were refused)
-            None => available_memory().is_none_or(|free| {
-                free.saturating_sub(reserved).saturating_sub(hold)
-                    >= self
-                        .floor
-                        .saturating_add(crate::guest::run::guest_reserve())
-            }),
-        }
+        // the stated room, where stated, and always the host's: the floor,
+        // and the room the guest stage compiles running and waiting take (a
+        // loader beside serving held the host to 14.5 GB free and a
+        // registration's sampler stages were refused)
+        self.stated.is_none_or(|stated| {
+            self.held().saturating_add(reserved).saturating_add(hold) <= stated
+        }) && available_memory().is_none_or(|free| {
+            free.saturating_sub(reserved).saturating_sub(hold)
+                >= self
+                    .floor
+                    .saturating_add(crate::guest::run::guest_reserve())
+        })
     }
 
     /// A load admitted ends; `held`: its program stays in memory. A load

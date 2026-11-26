@@ -756,11 +756,12 @@ impl Shell {
             return;
         }
         let device = std::sync::Arc::clone(&self.device);
-        // the programs' room: what the load states, else what the stated host
-        // bound leaves beside the host tier's kv
-        let stated = self
-            .host_programs
-            .or(self.host_bound.map(|b| b.saturating_sub(self.host.landed_bytes())));
+        // the programs' room (the growth the loader may hold): what the load
+        // states, else what the stated host bound leaves of the worker's
+        // resident memory now, the host tier's kv in it
+        let stated = self.host_programs.or(self.host_bound.map(|b| {
+            b.saturating_sub(crate::device::resident_bytes().unwrap_or(b))
+        }));
         // the room of a compile, the widest of theirs (the guest stages'
         // compile beside them, by their measured needs, is kept too:
         // `guest::run::guest_reserve`, read as it loads)
