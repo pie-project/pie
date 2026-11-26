@@ -345,22 +345,9 @@ async fn fire_probes() {
     println!();
     println!("fires {fires}  tokens {}", s.total_tokens_processed);
     println!(
-        "  inter-fire        {:7.3} ms   = execute {:.3} + post-dispatch-to-fire {:.3}",
-        per(s.fire.inter_fire_us_sum),
-        per(s.fire.execute.total_us_sum),
-        per(s.fire.post_dispatch_to_fire_us_sum),
-    );
-    println!(
-        "    execute         {:7.3} ms   batch-build {:.3}  engine-fire {:.3}",
-        per(s.fire.execute.total_us_sum),
+        "  execute           batch-build {:.3} ms  engine-fire {:.3} ms",
         per(s.fire.execute.batch_build_us_sum),
         per(s.fire.execute.engine_fire_us_sum),
-    );
-    println!(
-        "    accumulate      {:7.3} ms   fire-prepare {:.3}  recv-block {:.3}",
-        per(s.fire.accumulate.accum_loop_us_sum),
-        per(s.fire.pre_dispatch.fire_prepare_us_sum),
-        per(s.fire.recv_block_wait_us_sum),
     );
     let submits = s.host_submit.submits.max(1);
     let sub = |sum: u64| sum as f64 / submits as f64 / 1000.0;
