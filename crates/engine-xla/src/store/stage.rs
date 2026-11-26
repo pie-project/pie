@@ -37,8 +37,15 @@ impl Done {
     }
 
     /// Blocks until the run has completed.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the event is taken whole or not at all"
+    )]
     pub fn wait(&self) -> Result<()> {
-        let mut event = self.0.lock().expect("the stage event poisoned");
+        let mut event = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(event) = event.take() {
             event.wait()?;
         }

@@ -143,8 +143,14 @@ struct Held {
 }
 
 impl Drop for Held {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the counts change whole; a test that panicked holding them leaves the next one its run"
+    )]
     fn drop(&mut self) {
-        let mut holders = HOLDERS.lock().expect("the holders poisoned");
+        let mut holders = HOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         holders.count -= 1;
         holders.alone &= !self.alone;
         // Waiters wait on different conditions (a free share, an empty
@@ -215,6 +221,10 @@ pub fn sole() {
 
 /// Takes the calling test's share, once `free` says the holders leave room
 /// for it, unless it holds one already.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the counts change whole; a test that panicked holding them leaves the next one its run"
+)]
 fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
     HELD.with(|held| {
         let mut held = held.borrow_mut();
@@ -225,9 +235,13 @@ fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
             );
             return;
         }
-        let mut holders = HOLDERS.lock().expect("the holders poisoned");
+        let mut holders = HOLDERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while !free(&holders) {
-            holders = FREED.wait(holders).expect("the holders poisoned");
+            holders = FREED
+                .wait(holders)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         holders.count += 1;
         holders.alone = alone;

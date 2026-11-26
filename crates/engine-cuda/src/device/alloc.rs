@@ -1619,9 +1619,15 @@ fn prefault(at: *mut u8, bytes: usize) {
 
 /// The spans [`Pinned::pageable`] mapped and holds: anonymous memory, which
 /// advice that lets a file's pages go would zero.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "each update of the list is one push or removal, never left half-made by a panic"
+)]
 fn pageable_spans() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
     static SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-    SPANS.lock().expect("the span list poisoned")
+    SPANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether `at` lies in a pageable copy [`Pinned::pageable`] made.

@@ -1358,6 +1358,10 @@ const SERIAL_COMPILER: bool = false;
 
 /// Each of `compiles`' sources `(key, source, ..)` compiled, in their
 /// order, side by side, a thread a core the process may run on.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a slot is written whole after its compile; a compile that panicked is refused by name below and the rest still serve"
+)]
 fn side_by_side(
     compiles: &[(String, String, u32, String)],
     architecture: &str,
@@ -1383,7 +1387,9 @@ fn side_by_side(
                 break;
             };
             let built = compile(source, architecture);
-            *out[at].lock().expect("a compile slot poisoned") = Some(built);
+            *out[at]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
         }
     };
     // Each worker joined here: one that panics leaves its region unbuilt,
@@ -1397,7 +1403,7 @@ fn side_by_side(
     out.into_iter()
         .map(|slot| {
             slot.into_inner()
-                .expect("a compile slot poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .unwrap_or_else(|| {
                     Err(Failure::Retryable {
                         reason: "a region's compile panicked".into(),

@@ -13,10 +13,16 @@ use crate::error::Result;
 /// load's bytes too. `None`, said by name, where the driver does not answer
 /// for this process: the card's own figure is the load's bound, every
 /// byte held on it counted another's.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "each update of the list is one push, never left half-made by a panic"
+)]
 pub fn before_loads(latch: bool) -> Result<Option<u64>> {
     static TAKEN: std::sync::Mutex<Vec<(i32, u64)>> = std::sync::Mutex::new(Vec::new());
     let device = bound()?;
-    let mut taken = TAKEN.lock().expect("the taken devices poisoned");
+    let mut taken = TAKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(&(_, bytes)) = taken.iter().find(|(of, _)| *of == device) {
         return Ok(Some(bytes));
     }

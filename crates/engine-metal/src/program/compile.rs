@@ -300,6 +300,10 @@ struct Fan<'a, T, F> {
 impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
     /// Makes answers until none are left, starting another thread at each
     /// while one is spare and work remains.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a slot is written whole after its compile; a compile that panicked is refused by name and the rest still serve"
+    )]
     fn work<'s>(&'s self, scope: &'s std::thread::Scope<'s, '_>) {
         loop {
             let at = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -313,7 +317,9 @@ impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
                 });
             }
             let made = pooled(|| (self.make)(at));
-            *slot.lock().expect("a compile slot poisoned") = Some(made);
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
         }
     }
 }
@@ -333,6 +339,10 @@ fn pooled<T>(run: impl FnOnce() -> T) -> T {
 
 /// `make` of every index below `count`, on the calling thread and those
 /// `threads` has spare, answered in index order whatever order they ran in.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a slot is written whole after its compile; a compile that panicked is refused by name and the rest still serve"
+)]
 pub(crate) fn in_parallel<T: Send>(
     threads: &Threads,
     count: usize,
@@ -347,7 +357,10 @@ pub(crate) fn in_parallel<T: Send>(
     std::thread::scope(|scope| fan.work(scope));
     fan.slots
         .into_iter()
-        .filter_map(|slot| slot.into_inner().expect("a compile slot poisoned"))
+        .filter_map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
         .collect()
 }
 
@@ -373,6 +386,10 @@ impl Sharing {
     }
 
     /// The module of `key`, and whether this call built it.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the table gains a module whole or not at all; a compile's panic must not take the loads beside it down"
+    )]
     fn module(
         &self,
         key: u64,
@@ -381,7 +398,7 @@ impl Sharing {
         let slot = self
             .modules
             .lock()
-            .expect("the module table poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(key)
             .or_default()
             .clone();

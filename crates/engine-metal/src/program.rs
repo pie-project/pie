@@ -332,6 +332,10 @@ impl Plane {
     /// it (the runtime's prewarm of its standard samplers, before ready): a
     /// later registration of one, its knob values in its channels, finds
     /// every stage built. Returns the region modules this compiled.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a job is taken whole; a compile that panicked is refused by name and the rest still serve"
+    )]
     pub fn prewarm(
         &mut self,
         context: &Context,
@@ -357,7 +361,10 @@ impl Plane {
         let threads = device.compile_wide(true);
         let sharing = compile::Sharing::over(threads);
         let built = compile::in_parallel(&sharing.threads, jobs.len(), |at| {
-            let job = jobs[at].lock().expect("a compile job poisoned").take();
+            let job = jobs[at]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             job.map(|job| job.run_sharing(&sharing))
         });
         let _ = device.compile_wide(false);

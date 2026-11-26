@@ -34,8 +34,15 @@ pub struct StderrTail(Arc<Mutex<String>>);
 const STDERR_TAIL_BYTES: usize = 4096;
 
 impl StderrTail {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the tail is a log's end, read for a panic's message; one torn by a panic is still read"
+    )]
     fn push(&self, text: &str) {
-        let mut tail = self.0.lock().expect("the stderr tail poisoned");
+        let mut tail = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tail.push_str(text);
         if tail.len() <= STDERR_TAIL_BYTES {
             return;
@@ -54,8 +61,15 @@ impl StderrTail {
     }
 
     /// What the guest last wrote to stderr, trimmed; `None` if nothing.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the tail is a log's end, read for a panic's message; one torn by a panic is still read"
+    )]
     pub fn said(&self) -> Option<String> {
-        let tail = self.0.lock().expect("the stderr tail poisoned");
+        let tail = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let said = tail.trim();
         (!said.is_empty()).then(|| said.to_string())
     }

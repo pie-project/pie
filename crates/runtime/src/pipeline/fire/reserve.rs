@@ -162,8 +162,14 @@ impl Drop for Unqueued {
 }
 
 /// `reason` fails the pipeline unless something said why first.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the failure is set whole; this runs in a Drop, where a second panic aborts the worker"
+)]
 pub(super) fn fail_unless_failed(failure: &PipelineFailure, reason: &str) {
-    let mut pipeline = failure.lock().expect("the pipeline failure poisoned");
+    let mut pipeline = failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if pipeline.is_none() {
         *pipeline = Some(reason.to_string());
     }
