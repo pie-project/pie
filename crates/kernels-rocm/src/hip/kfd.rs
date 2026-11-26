@@ -21,7 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const TOPOLOGY: &str = "/sys/class/kfd/kfd/topology/nodes";
-const PROCESSES: &str = "/sys/class/kfd/kfd/proc";
+/// Where KFD lists each process it serves, a directory a pid.
+pub const PROCESSES: &str = "/sys/class/kfd/kfd/proc";
 
 /// HIP's limit on hardware queues a device, where `GPU_MAX_HW_QUEUES` does
 /// not state one (CLR's default).
