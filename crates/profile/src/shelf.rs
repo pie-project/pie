@@ -534,6 +534,22 @@ pub fn merge_committed(
             refused.push(format!("curve {}", curve.name()));
         }
     }
+    // A committed fire term whose key no longer matches, which the home did
+    // not measure again: never carried, as a curve is not.
+    let term_ids = |r: &crate::rates::Rates| -> Vec<(u32, Vec<u32>)> {
+        r.fire_terms
+            .iter()
+            .flatten()
+            .map(crate::curves::FireTerm::id)
+            .collect()
+    };
+    let (terms_kept, terms_now) = (term_ids(&committed), term_ids(&measured));
+    for term in before.fire_terms.iter().flatten() {
+        let id = term.id();
+        if !terms_kept.contains(&id) && !terms_now.contains(&id) {
+            refused.push(format!("fire term {}", term.name()));
+        }
+    }
     if !refused.is_empty() {
         return Err(format!(
             "the committed profile states {}, whose keys no longer match this build (a kernel's \
@@ -549,6 +565,15 @@ pub fn merge_committed(
         "{KERNEL_CURVES}: {} measured, {} carried from the committed profile",
         mine.len(),
         carried.iter().filter(|id| !mine.contains(id)).count()
+    ));
+    report.push(format!(
+        "{}: {} measured, {} carried from the committed profile",
+        crate::rates::FIRE_TERMS,
+        terms_now.len(),
+        terms_kept
+            .iter()
+            .filter(|id| !terms_now.contains(id))
+            .count()
     ));
     let settles_mine: Vec<u32> = measured.dense_settled.iter().map(|d| d.of).collect();
     report.push(format!(

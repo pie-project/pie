@@ -2782,6 +2782,7 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
         product_ns: None,
         workgroups_per_core: None,
         kernel_curves: None,
+        fire_terms: None,
         dense_settled: Vec::new(),
         resident_workgroups: resident,
         // How much slower the device ran than its own measurements said:

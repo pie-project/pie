@@ -1,7 +1,7 @@
 //! A stored measurement's key: what it was measured by and on, and
 //! whether this build on this device still takes it.
 
-use super::{DENSE_SETTLED, KERNEL_CURVES, KEYED, MEASURED_ON, Rates};
+use super::{DENSE_SETTLED, FIRE_TERMS, KERNEL_CURVES, KEYED, MEASURED_ON, Rates};
 
 /// What one stored measurement was measured by, beside the device it was
 /// measured on ([`Rates::measured_on`]): the version of its measuring method
@@ -117,6 +117,7 @@ impl Rates {
         let on = now.on();
         let stored = KEYED.iter().any(|key| self.states(key))
             || self.kernel_curves.is_some()
+            || self.fire_terms.is_some()
             || !self.dense_settled.is_empty();
         if !stored {
             said.push(format!("{what} measurements: none for `{on}`"));
@@ -184,6 +185,31 @@ impl Rates {
                 .over(stale);
             }
         }
+        if let Some(terms) = self.fire_terms.take() {
+            let mut kept = Vec::with_capacity(terms.len());
+            let mut estimates = Vec::new();
+            for term in terms {
+                match term.by.stale(FIRE_TERMS, now) {
+                    None => kept.push(term),
+                    Some(why) => {
+                        said.push(format!(
+                            "{what} fire term {}: not taken as measured, {why}; kept as an \
+                             estimate",
+                            term.name()
+                        ));
+                        estimates.push(term);
+                    }
+                }
+            }
+            self.fire_terms = (!kept.is_empty()).then_some(kept);
+            if !estimates.is_empty() {
+                stale = Rates {
+                    fire_terms: Some(estimates),
+                    ..Rates::default()
+                }
+                .over(stale);
+            }
+        }
         for settled in std::mem::take(&mut self.dense_settled) {
             match now.method(DENSE_SETTLED) {
                 Some(method) if method == settled.method => {
@@ -243,6 +269,23 @@ impl Rates {
                 "curve {}: {from}, its key matches: {}",
                 curve.name(),
                 curve.by.said()
+            ));
+        }
+        for term in self.fire_terms.iter().flatten() {
+            let mine = user
+                .fire_terms
+                .iter()
+                .flatten()
+                .any(|t| t.id() == term.id());
+            let from = if mine {
+                format!("stored ({user_from})")
+            } else {
+                format!("committed ({committed_from})")
+            };
+            said.push(format!(
+                "fire term {}: {from}, its key matches: {}",
+                term.name(),
+                term.by.said()
             ));
         }
         said

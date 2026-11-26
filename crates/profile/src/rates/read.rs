@@ -355,6 +355,89 @@ impl Walk<'_> {
         Some(out)
     }
 
+    /// `rates.fire_terms`: a list of `[kind, [shape], method, [[kernel,
+    /// code], ...], [[rows, ns], ...]]`. An entry in another form (another
+    /// pie's, a kind this one does not read) is skipped alone, by name; the
+    /// list's others are read.
+    pub(super) fn fire_terms(
+        &mut self,
+        value: &Spanned<DeValue<'_>>,
+    ) -> Option<Vec<crate::curves::FireTerm>> {
+        let what = "`rates.fire_terms` is a list of [kind, [shape], method, [[kernel, code], \
+                    ...], [[rows, ns], ...]], a kind's shape its fields, no kind and shape twice";
+        let DeValue::Array(entries) = value.get_ref() else {
+            self.err(
+                value.span().start,
+                format!("{what}, not {}", found(value.get_ref())),
+            );
+            return None;
+        };
+        let mut out: Vec<crate::curves::FireTerm> = Vec::with_capacity(entries.len());
+        for (at, entry) in entries.iter().enumerate() {
+            let before = self.diags.len();
+            if let Some(term) = self.fire_term(entry, &out, what) {
+                out.push(term);
+            } else if self.diags.len() > before {
+                let why: Vec<String> = self.diags.drain(before..).map(|d| d.message).collect();
+                self.skipped_rates.push(format!(
+                    "{}[{at}] ({}; measured again at `pie tune`)",
+                    crate::rates::FIRE_TERMS,
+                    why.join("; ")
+                ));
+            }
+        }
+        Some(out)
+    }
+
+    /// One entry of `rates.fire_terms`, beside `out` (the entries read
+    /// before it): `None` with its complaint where it does not read.
+    fn fire_term(
+        &mut self,
+        entry: &Spanned<DeValue<'_>>,
+        out: &[crate::curves::FireTerm],
+        what: &str,
+    ) -> Option<crate::curves::FireTerm> {
+        let whole = |v: &DeValue<'_>| int(v).and_then(|x| u32::try_from(x).ok());
+        let fields = match entry.get_ref() {
+            DeValue::Array(f) if f.len() == 5 => {
+                let kind = whole(f[0].get_ref());
+                let shape = match f[1].get_ref() {
+                    DeValue::Array(items) => items
+                        .iter()
+                        .map(|item| whole(item.get_ref()))
+                        .collect::<Option<Vec<_>>>(),
+                    _ => None,
+                };
+                match (kind, shape, by_of(&f[2], &f[3])) {
+                    (Some(kind), Some(shape), Some(by))
+                        if crate::curves::FireTerm::shape_of(kind)
+                            .is_some_and(|(_, fields)| fields == shape.len()) =>
+                    {
+                        Some((kind, shape, by, &f[4]))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((kind, shape, by, points)) = fields
+            .filter(|(kind, shape, ..)| out.iter().all(|t| t.kind != *kind || t.shape != *shape))
+        else {
+            self.err(
+                entry.span().start,
+                format!("{what}, not {}", found(entry.get_ref())),
+            );
+            return None;
+        };
+        let curve = self.curve(points, crate::rates::FIRE_TERMS)?;
+        Some(crate::curves::FireTerm {
+            kind,
+            shape,
+            curve,
+            by,
+        })
+    }
+
     /// One entry of `rates.kernel_curves`, beside `out` (the
     /// list's entries read before it): `None` with its complaint where it
     /// does not read.
