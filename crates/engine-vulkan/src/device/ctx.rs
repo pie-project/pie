@@ -250,6 +250,10 @@ pub struct Enabled {
     pub memory_model: bool,
     pub subgroup_size_control: bool,
     pub memory_budget: bool,
+    /// `VK_EXT_device_memory_report` enabled where the device states no
+    /// budget: the driver's allocations are counted as it reports them
+    /// ([`super::report`]).
+    pub memory_report: bool,
 
     pub coopmat: bool,
 }
@@ -292,9 +296,14 @@ impl Core {
     /// What the driver holds for this process in the heap beside every
     /// reservation of this process: its usage less them, where it reports it.
     pub(crate) fn outside(&self) -> u64 {
-        self.budget().map_or(0, |(_, usage)| {
-            usage.saturating_sub(engine_gpu::books::process_reserved())
-        })
+        let reserved = engine_gpu::books::process_reserved();
+        match self.budget() {
+            Some((_, usage)) => usage.saturating_sub(reserved),
+            None if self.features.memory_report => {
+                super::report::live_bytes(self.heap).saturating_sub(reserved)
+            }
+            None => 0,
+        }
     }
 
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
@@ -1233,6 +1242,9 @@ impl Context {
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut fcm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut freport = vk::PhysicalDeviceDeviceMemoryReportFeaturesEXT::default();
+        let report_ext = !memory_budget
+            && has_extension(&device_exts, ash::ext::device_memory_report::NAME);
         let api_13 = props.api_version >= vk::API_VERSION_1_3;
         {
             let mut query = vk::PhysicalDeviceFeatures2::default()
@@ -1244,8 +1256,12 @@ impl Context {
             if coopmat_ext {
                 query = query.push_next(&mut fcm);
             }
-            // SAFETY: the 1.3 and coopmat structs are chained only when the
-            // device reports 1.3 or the extension; all outlive the call.
+            if report_ext {
+                query = query.push_next(&mut freport);
+            }
+            // SAFETY: the 1.3, coopmat and memory-report structs are chained
+            // only when the device reports 1.3 or the extension; all outlive
+            // the call.
             unsafe { instance.get_physical_device_features2(physical, &mut query) };
         }
         // SAFETY: `physical` was enumerated from the live `instance`.
@@ -1271,6 +1287,7 @@ impl Context {
                 && f12.vulkan_memory_model_device_scope == vk::TRUE,
             subgroup_size_control: size_control,
             memory_budget,
+            memory_report: report_ext && freport.device_memory_report == vk::TRUE,
             // PowerVR's shader compiler faults on the coopmat kernels
             // (SIGSEGV in `emitCooperativeMatrixOp`, a C-Series), and its
             // profile tunes the register-tiled ones.
@@ -1336,6 +1353,14 @@ impl Context {
         if memory_budget {
             exts.push(ash::ext::memory_budget::NAME.as_ptr());
         }
+        let mut report_on =
+            vk::PhysicalDeviceDeviceMemoryReportFeaturesEXT::default().device_memory_report(true);
+        let mut report = vk::DeviceDeviceMemoryReportCreateInfoEXT::default()
+            .pfn_user_callback(Some(super::report::reported));
+        if enabled.memory_report {
+            exts.push(ash::ext::device_memory_report::NAME.as_ptr());
+            enable = enable.push_next(&mut report_on);
+        }
         if enabled.coopmat {
             exts.push(ash::khr::cooperative_matrix::NAME.as_ptr());
         }
@@ -1347,10 +1372,15 @@ impl Context {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
-        let create = vk::DeviceCreateInfo::default()
+        let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&exts)
             .push_next(&mut enable);
+        // The driver reports every allocation it makes for this device from
+        // its creation on, its own among them (`device::report`).
+        if enabled.memory_report {
+            create = create.push_next(&mut report);
+        }
         // SAFETY: every feature enabled was reported supported above, every
         // extension named was found in `device_exts`, `family` is a family
         // of `physical`, and all borrowed create structs outlive the call.
@@ -1550,7 +1580,7 @@ impl Context {
     /// process's heap usage (`VK_EXT_memory_budget`).
     #[must_use]
     pub fn measures_outside(&self) -> bool {
-        self.core.features.memory_budget
+        self.core.features.memory_budget || self.core.features.memory_report
     }
 
     /// Where the device shares the host's memory (a ceiling was read at
