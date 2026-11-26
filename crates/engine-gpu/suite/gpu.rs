@@ -144,9 +144,7 @@ struct Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let mut holders = HOLDERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut holders = HOLDERS.lock().expect("the holders poisoned");
         holders.count -= 1;
         holders.alone &= !self.alone;
         // Waiters wait on different conditions (a free share, an empty
@@ -174,6 +172,10 @@ enum Opened {
 
 /// Takes the calling test's hold on the process's devices, unless it holds
 /// one already: shared, or where `sole` every device alone.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the lock guards no state, so a holder that panicked left none half-written"
+)]
 fn open(sole: bool) {
     OPENED.with(|opened| {
         let mut opened = opened.borrow_mut();
@@ -223,13 +225,9 @@ fn take(alone: bool, free: impl Fn(&Holders) -> bool) {
             );
             return;
         }
-        let mut holders = HOLDERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut holders = HOLDERS.lock().expect("the holders poisoned");
         while !free(&holders) {
-            holders = FREED
-                .wait(holders)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            holders = FREED.wait(holders).expect("the holders poisoned");
         }
         holders.count += 1;
         holders.alone = alone;

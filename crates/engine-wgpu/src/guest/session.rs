@@ -525,6 +525,7 @@ impl Session {
         self.pair_group = None;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Context,
         package: &LaunchPackage,

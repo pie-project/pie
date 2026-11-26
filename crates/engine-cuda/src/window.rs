@@ -150,6 +150,7 @@ pub const fn lane_capacity(max_lanes: u32) -> u32 {
 
 impl Slots {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         classes: usize,
         lanes: u64,

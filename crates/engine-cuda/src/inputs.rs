@@ -441,6 +441,10 @@ impl Free {
         }
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the lock guards no state, so a holder that panicked left none half-written"
+    )]
     pub fn give(&self, at: u32) {
         self.bits.fetch_or(1u64 << at, Ordering::Release);
         // Under the lock, so a claim between its failed take and its wait
@@ -458,6 +462,10 @@ impl Free {
     /// unlanded steps hold every one, none can come back until it lands one
     /// itself, and the claim is refused by name at once: the claimant is
     /// running deeper than the `depth` it was laid for.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the lock guards no state, so a holder that panicked left none half-written"
+    )]
     pub fn claim(self: &Arc<Self>, what: &'static str) -> Result<SlotGuard> {
         let mut held = self
             .lock

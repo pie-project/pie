@@ -623,7 +623,7 @@ impl HostTier {
     }
 
     /// The tier's bytes at `offset`, once every job writing them is done.
-    pub fn slice(&self, offset: u64, len: usize) -> Result<&mut [u8]> {
+    pub fn slice(&mut self, offset: u64, len: usize) -> Result<&mut [u8]> {
         let at = self.check(offset, len)?;
         let chunk_bytes = self.chunk_bytes.max(1);
         self.wait_for(

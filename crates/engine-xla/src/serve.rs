@@ -460,6 +460,7 @@ pub struct Shell {
     /// Programs a fire loaded from the disk cache (`load_parked`): what each
     /// parks again as, its shape key, and when a fire last took it, in fires
     /// (`evict`).
+    #[allow(clippy::type_complexity)]
     evictable: std::collections::HashMap<[u8; 32], (Parked, Option<[u8; 32]>, u64)>,
     /// Fires so far, the clock `evictable` is read by.
     fires: u64,
@@ -4416,7 +4417,7 @@ impl Shell {
         &self,
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
-        buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
+        #[allow(clippy::type_complexity)] buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
         (readout_rows, readout_layout, plane_layout): (&[i32], &[(u32, u32)], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,

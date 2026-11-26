@@ -116,6 +116,7 @@ struct Minted {
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         compiled: &Compiled,
         plan: &ExecPlan,

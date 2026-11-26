@@ -1585,6 +1585,7 @@ pub const CURVE_METHOD: u32 = 1;
 /// estimate where given (a test pins it so a point's admission does not
 /// follow the box's clock); a load passes `None`, the ratio its fires
 /// measure as they land.
+#[allow(clippy::too_many_arguments)]
 pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     device: &B::Context,
     tactics: &T,
@@ -1672,6 +1673,7 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
     // `(n, k, [(rows, ns a fire)])` of every tiled kernel's curve the
     // profile states: what a vector kernel is held beaten against beside
     // those timed here.
+    #[allow(clippy::type_complexity)]
     let stated_tiled: Vec<(u32, u32, Vec<(u32, f64)>)> = stated
         .kernel_curves
         .iter()

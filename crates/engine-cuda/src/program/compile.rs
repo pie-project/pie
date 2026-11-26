@@ -1371,6 +1371,7 @@ fn side_by_side(
             .collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
+    #[allow(clippy::type_complexity)]
     let out: Vec<std::sync::Mutex<Option<std::result::Result<Vec<u8>, Failure>>>> = compiles
         .iter()
         .map(|_| std::sync::Mutex::new(None))
@@ -1382,9 +1383,7 @@ fn side_by_side(
                 break;
             };
             let built = compile(source, architecture);
-            *out[at]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
+            *out[at].lock().expect("a compile slot poisoned") = Some(built);
         }
     };
     // Each worker joined here: one that panics leaves its region unbuilt,
@@ -1398,7 +1397,7 @@ fn side_by_side(
     out.into_iter()
         .map(|slot| {
             slot.into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("a compile slot poisoned")
                 .unwrap_or_else(|| {
                     Err(Failure::Retryable {
                         reason: "a region's compile panicked".into(),

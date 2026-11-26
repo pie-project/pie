@@ -142,6 +142,7 @@ impl Shell {
     }
 
     /// The rows the widest fire of `lanes` lanes at `rung` rows stages.
+    #[allow(clippy::too_many_arguments)]
     fn stage_widest(
         &mut self,
         word: u64,
@@ -179,6 +180,7 @@ impl Shell {
         };
         // Every lane at the page bound: its slot's every page, its rows
         // last.
+        #[allow(clippy::type_complexity)]
         let owned: Vec<(Vec<u32>, Vec<u32>, crate::store::Scratch, Option<Masking>)> = rows
             .iter()
             .map(|&n| {

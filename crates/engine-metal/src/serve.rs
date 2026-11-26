@@ -370,10 +370,12 @@ pub struct Shell {
     /// The windowed folds this fire's lanes make, `(window table, copies)`
     /// ([`Pools::fold_window_rows`]): planned as the fire is prepared,
     /// encoded after its forward in its own frame.
+    #[allow(clippy::type_complexity)]
     window_folds: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
     /// The boundary pages' fills from their ring pages, `(window table,
     /// (from, to) bytes, first row, rows)`: encoded before this fire's
     /// forward.
+    #[allow(clippy::type_complexity)]
     window_fills: Vec<(usize, Vec<(u64, u64, u32, u32)>)>,
     /// Own-row pages this fire's lanes took of `Shell::own_top`.
     own_used: u32,

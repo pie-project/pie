@@ -2077,6 +2077,7 @@ impl Shell {
     /// The last fire's capturing lanes' rows, read back from their
     /// readers: each one's source lane, key row and page row (none where no
     /// lane of it captured). A later fire may write its own over them.
+    #[allow(clippy::type_complexity)]
     pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
         self.drain()?;
         let Some(layout) = self.capture.as_ref() else {

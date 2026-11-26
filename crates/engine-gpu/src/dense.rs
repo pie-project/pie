@@ -33,6 +33,7 @@ pub struct Dense {
     /// every plane together (a plane of none of `planes`' shapes).
     by_rows: Vec<(u32, Tactic)>,
     /// Each plane's own `(n, k)` and its `by_rows`, weighed at it alone.
+    #[allow(clippy::type_complexity)]
     planes: Vec<((u32, u32), Vec<(u32, Tactic)>)>,
 }
 
@@ -161,6 +162,7 @@ impl Dense {
     #[must_use]
     pub fn one_row(&self) -> String {
         let said = |t: Tactic| format!("{}.{}.{}", t.vector, u8::from(t.wide), tier_code(t.tier));
+        #[allow(clippy::type_complexity)]
         let mut planes: Vec<&((u32, u32), Vec<(u32, Tactic)>)> = self.planes.iter().collect();
         planes.sort_by_key(|(at, _)| *at);
         if planes.is_empty() {
@@ -217,6 +219,7 @@ impl Dense {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        #[allow(clippy::type_complexity)]
         let mut planes: Vec<&((u32, u32), Vec<(u32, Tactic)>)> = self.planes.iter().collect();
         planes.sort_by_key(|(at, _)| *at);
         let mut out = format!("all[{}]", rows(&self.by_rows));
@@ -583,6 +586,7 @@ fn weigh(
     // Each plane its own pick, by its own curves (a kernel beaten at one
     // plane, an output head's, may win another): a plane no kernel was timed
     // at takes the pick over every plane together.
+    #[allow(clippy::type_complexity)]
     let mut own: Vec<((u32, u32), Vec<(u32, Tactic)>)> = Vec::new();
     for plane @ &(n, k, ..) in planes {
         if own.iter().any(|(at, _)| *at == (n, k)) {
@@ -626,7 +630,7 @@ fn pick(
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
-    incumbent: Option<&dyn Fn(u32) -> Tactic>,
+    #[allow(clippy::type_complexity)] incumbent: Option<&dyn Fn(u32) -> Tactic>,
 ) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
     let curves = rates.kernel_curves.as_deref().ok_or(UNREACHED)?;
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each

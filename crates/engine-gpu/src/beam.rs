@@ -202,6 +202,7 @@ pub struct Staged<'a> {
     pub room: BeamRoom,
     /// Per staged table: its seats' `indptr`, and its indices', write
     /// pages' and write offsets' first words in the store.
+    #[allow(clippy::type_complexity)]
     pub tables: Vec<(&'a [i32], (u32, u32, u32))>,
     /// Whether any staged table is a windowed one (refused).
     pub windowed: bool,

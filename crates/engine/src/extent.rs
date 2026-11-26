@@ -178,7 +178,12 @@ mod tests {
 
     fn fire(
         written: &mut Written,
-        lanes: &[(u32, (u64, u32), Vec<std::ops::Range<u32>>, u32)],
+        #[allow(clippy::type_complexity)] lanes: &[(
+            u32,
+            (u64, u32),
+            Vec<std::ops::Range<u32>>,
+            u32,
+        )],
     ) -> Result<(), String> {
         let mut extents = FireExtents::default();
         for (at, (seat, kv, writes, reach)) in lanes.iter().enumerate() {

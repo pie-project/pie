@@ -510,7 +510,7 @@ impl RsStore {
         ws: RsWorkingSetId,
         alone: bool,
         fold: Option<u32>,
-        writes: Option<std::ops::Range<u32>>,
+        #[allow(clippy::type_complexity)] writes: Option<std::ops::Range<u32>>,
     ) -> Result<(Option<std::ops::Range<u32>>, Option<std::ops::Range<u32>>), RsError> {
         let entry = self.entry(ws)?;
         if !self.window_buffer {
@@ -1839,6 +1839,7 @@ impl RsStore {
     /// Prepares a write of the state (when `write_state`) and of the buffer
     /// `targets`, taking a fresh slot or page for each the set holds none
     /// for or shares, from `reserved` or the pools.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_targets(
         &mut self,
         ws: RsWorkingSetId,

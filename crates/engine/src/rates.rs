@@ -1249,6 +1249,7 @@ impl Measuring {
 /// the engine's estimate and names it. A checked-in profile stating a rate
 /// this pie does not read is refused either way: it is a build's fault, not
 /// a measurement.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_at_load(
     chip: profile::Profile,
     keys: &[&'static str],

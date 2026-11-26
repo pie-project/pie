@@ -65,6 +65,7 @@ pub fn rung_facts(
 /// the kernel the backend picks at its shape (`row_tile`,
 /// [`engine::load::choose_tiled`]); a refusal for no feasible rung names the
 /// binding.
+#[allow(clippy::too_many_arguments)]
 pub fn choose(
     rungs: &[RungFacts],
     live: u64,

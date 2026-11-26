@@ -931,6 +931,7 @@ pub(crate) fn at_load(
             )
             .cloned()
             .collect();
+        #[allow(clippy::type_complexity)]
         let (still, served): (Vec<(u32, u32)>, Vec<(u32, u32)>) =
             lacking.iter().partition(|&&(n, k)| lacks(&with, n, k));
         if !served.is_empty() {

@@ -163,9 +163,7 @@ impl Drop for Unqueued {
 
 /// `reason` fails the pipeline unless something said why first.
 pub(super) fn fail_unless_failed(failure: &PipelineFailure, reason: &str) {
-    let mut pipeline = failure
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut pipeline = failure.lock().expect("the pipeline failure poisoned");
     if pipeline.is_none() {
         *pipeline = Some(reason.to_string());
     }

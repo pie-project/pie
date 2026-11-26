@@ -12,6 +12,7 @@ const CONTEXT: u32 = 320;
 
 /// A prompt and three decodes: each step's logits, the load's records
 /// (fires taken, held) and where they lie.
+#[allow(clippy::type_complexity)]
 pub(crate) fn served(
     context: u32,
 ) -> (Vec<Vec<f32>>, (u64, bool, u64), Option<std::path::PathBuf>) {

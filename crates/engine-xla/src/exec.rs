@@ -102,6 +102,7 @@ pub fn maintain(
     run(device, tracer, &[], None, pools, inputs, false).map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_and_run(
     device: &Device,
     sig: &Signature,

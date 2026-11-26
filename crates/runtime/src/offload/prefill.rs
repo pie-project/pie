@@ -164,6 +164,7 @@ impl Pass {
 /// the pages another worker holds, fetched by key where the directory
 /// names one; then, when enough is left, a peer's prefill of the rest. Any
 /// failure leaves the pass to run here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn before_pass(
     pid: crate::inferlet::process::ProcessId,
     stores: &Stores,

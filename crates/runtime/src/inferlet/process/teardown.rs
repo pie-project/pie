@@ -75,6 +75,7 @@ fn settle_handles(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn defer_resource_teardown(
     process_id: uuid::Uuid,
     resources: wasmtime::component::ResourceTable,

@@ -1837,6 +1837,7 @@ impl PoolPort for RegistryPool {
         // Their state's slots (records, its lists and windows): every slot of
         // every shape a candidate holds empties with it. Read before the
         // pools' locks, as the state store takes the shared pool's itself.
+        #[allow(clippy::type_complexity)]
         let state: Vec<(ProcessId, Vec<(::engine::chunk::ShapeId, Vec<u32>)>)> = pids
             .iter()
             .map(|&pid| {

@@ -2993,6 +2993,7 @@ impl Run<'_> {
     /// renumbered to their places there; `None` for a bank on the device,
     /// or routes that name no expert. The routes are read back to the host,
     /// so a load that stages records no body (`Run::capturable`).
+    #[allow(clippy::type_complexity)]
     fn staged_experts(
         &self,
         codes: Tensor,

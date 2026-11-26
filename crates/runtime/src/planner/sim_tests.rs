@@ -715,6 +715,7 @@ fn pool_check(shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<S
 struct Resolved {
     src: u8,
     dst: u8,
+    #[allow(clippy::type_complexity)]
     slots: Vec<((u32, u64, u64), (u32, u64, u64))>,
 }
 
@@ -3267,6 +3268,10 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
 
 /// Runs `workload` (only the scripts `keep` names, where given) to its end:
 /// the first failure, if any, and what it exercised.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the lock guards no state, so a holder that panicked left none half-written"
+)]
 fn run(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Coverage) {
     install_panic_hook();
     // One run at a time across test threads: two at once share the

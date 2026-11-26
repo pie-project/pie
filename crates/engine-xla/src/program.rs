@@ -1452,6 +1452,7 @@ impl Plane {
     /// lanes fault, the others' passes stand. A pass that lands later
     /// places its fault on `latch`.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::type_complexity)]
     pub(crate) fn fire_guests_with(
         &mut self,
         device: &crate::device::Device,

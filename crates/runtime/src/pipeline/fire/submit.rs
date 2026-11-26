@@ -85,7 +85,7 @@ pub(super) fn set_token(ws: crate::store::kv::page_table::WorkingSetId) -> u64 {
 pub(super) fn advance_cursor(
     cell: &CursorCell,
     tail: Option<u32>,
-    spans: Option<(u32, Vec<(u32, u32, u32)>)>,
+    #[allow(clippy::type_complexity)] spans: Option<(u32, Vec<(u32, u32, u32)>)>,
 ) {
     let mut cursor = cell.lock().unwrap();
     cursor.tail = tail;

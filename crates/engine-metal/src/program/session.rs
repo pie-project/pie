@@ -390,6 +390,7 @@ impl Session {
     }
 
     /// The instance's bind-time tables and rings go in `pooled`'s slots.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         compiled: &Compiled,
         plan: &ExecPlan,
@@ -739,6 +740,7 @@ impl Session {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_output(
         &mut self,
         name: &str,
@@ -1318,6 +1320,7 @@ pub struct EpilogueCheck {
     /// harvest told it, else as its own check reads it (its set is not
     /// staged again before that harvest). If it does not commit, this one
     /// does not either.
+    #[allow(clippy::type_complexity)]
     before: Option<
         Box<(
             std::sync::Arc<std::sync::OnceLock<Option<String>>>,

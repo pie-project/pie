@@ -16,9 +16,7 @@ use crate::error::Result;
 pub fn before_loads(latch: bool) -> Result<Option<u64>> {
     static TAKEN: std::sync::Mutex<Vec<(i32, u64)>> = std::sync::Mutex::new(Vec::new());
     let device = bound()?;
-    let mut taken = TAKEN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut taken = TAKEN.lock().expect("the taken devices poisoned");
     if let Some(&(_, bytes)) = taken.iter().find(|(of, _)| *of == device) {
         return Ok(Some(bytes));
     }

@@ -1600,6 +1600,7 @@ impl Prepared {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_output(
         &mut self,
         name: &str,
@@ -2410,7 +2411,12 @@ impl Batch {
         &mut self,
         view: &Buffer,
         at: u64,
-        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
+        #[allow(clippy::type_complexity)] host: &dyn Fn(
+            u64,
+            u64,
+        ) -> Result<
+            Vec<(u64, u64, std::ptr::NonNull<u8>)>,
+        >,
     ) -> Result<u64> {
         let mut next = at;
         for region in self.regions_mut() {

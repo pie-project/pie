@@ -463,6 +463,7 @@ fn bound_rs_working_sets<C: FireContext>(
 
 /// A working set one lane writes from where its state ends, folding all it
 /// writes, buffers nothing; that lane lands its state as of `snapshots` too.
+#[allow(clippy::too_many_arguments)]
 fn host_rs_plan(
     stores: &crate::store::registry::Stores,
     ids: &[crate::store::rs::RsWorkingSetId],

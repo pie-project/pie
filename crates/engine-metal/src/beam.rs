@@ -87,7 +87,7 @@ pub fn plan(
     staged: &Staged<'_>,
     translation: &dyn Fn(usize) -> Vec<u32>,
     folded: &dyn Fn(usize) -> u32,
-    pool: &mut dyn FnMut(&[u32]) -> Result<(Vec<u32>, Vec<u64>)>,
+    #[allow(clippy::type_complexity)] pool: &mut dyn FnMut(&[u32]) -> Result<(Vec<u32>, Vec<u64>)>,
 ) -> Result<(BeamRecords, Vec<(usize, engine::InstanceId)>)> {
     let mut records = BeamRecords::default();
     let mut faults: Vec<(usize, engine::InstanceId)> = Vec::new();

@@ -40,6 +40,7 @@ pub struct ResidencyPlanner {
     /// The head's need read this pass ([`Self::head_room`]), by the pass,
     /// the head and the pages gathered: the step, the map, the wants and
     /// the stall line read it once a pass, not once each.
+    #[allow(clippy::type_complexity)]
     pub(super) need_cache: parking_lot::Mutex<Option<(u64, EntryKey, u32, Option<RunNeed>)>>,
     /// Events that can change a pass's answer the pool's own counts do not
     /// show: an arrival, a departure, a landing, a policy answer, each a

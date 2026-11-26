@@ -61,10 +61,7 @@ impl HostShare {
     /// A pool's share of this host's room.
     #[must_use]
     pub fn pool(self: &std::sync::Arc<Self>) -> PoolRoom {
-        let mut grants = self
-            .grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self.grants.lock().expect("the share grants poisoned");
         grants.push(Some(Grant {
             ceiling: 0,
             outstanding: 0,
@@ -98,11 +95,7 @@ impl PoolRoom {
         held: u64,
         ceiling_of: impl FnOnce(std::result::Result<i64, String>) -> u64,
     ) -> u64 {
-        let mut grants = self
-            .share
-            .grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self.share.grants.lock().expect("the share grants poisoned");
         let others: i128 = grants
             .iter()
             .enumerate()
@@ -123,11 +116,7 @@ impl PoolRoom {
 
     /// Settles this pool's grant against what it holds once it has moved.
     fn settle(&self, held: u64) {
-        let mut grants = self
-            .share
-            .grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self.share.grants.lock().expect("the share grants poisoned");
         if let Some(grant) = grants[self.slot].as_mut() {
             grant.outstanding = i128::from(grant.ceiling) - i128::from(held);
         }
@@ -136,11 +125,7 @@ impl PoolRoom {
 
 impl Drop for PoolRoom {
     fn drop(&mut self) {
-        let mut grants = self
-            .share
-            .grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self.share.grants.lock().expect("the share grants poisoned");
         grants[self.slot] = None;
     }
 }

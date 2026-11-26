@@ -1024,6 +1024,7 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
 /// `program` on `engine`, the planner's serve played by `serve` (what the
 /// planner would do for it: drop cache or park a resident), counting its
 /// calls in `asked`.
+#[allow(clippy::too_many_arguments)]
 fn waiting_bind<'a>(
     roles: &'a RolesHandle,
     device: &'a Shared,

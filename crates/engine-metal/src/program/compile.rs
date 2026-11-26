@@ -313,9 +313,7 @@ impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
                 });
             }
             let made = pooled(|| (self.make)(at));
-            *slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
+            *slot.lock().expect("a compile slot poisoned") = Some(made);
         }
     }
 }
@@ -349,10 +347,7 @@ pub(crate) fn in_parallel<T: Send>(
     std::thread::scope(|scope| fan.work(scope));
     fan.slots
         .into_iter()
-        .filter_map(|slot| {
-            slot.into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        })
+        .filter_map(|slot| slot.into_inner().expect("a compile slot poisoned"))
         .collect()
 }
 
@@ -386,7 +381,7 @@ impl Sharing {
         let slot = self
             .modules
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("the module table poisoned")
             .entry(key)
             .or_default()
             .clone();

@@ -35,10 +35,7 @@ const STDERR_TAIL_BYTES: usize = 4096;
 
 impl StderrTail {
     fn push(&self, text: &str) {
-        let mut tail = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tail = self.0.lock().expect("the stderr tail poisoned");
         tail.push_str(text);
         if tail.len() <= STDERR_TAIL_BYTES {
             return;
@@ -58,10 +55,7 @@ impl StderrTail {
 
     /// What the guest last wrote to stderr, trimmed; `None` if nothing.
     pub fn said(&self) -> Option<String> {
-        let tail = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tail = self.0.lock().expect("the stderr tail poisoned");
         let said = tail.trim();
         (!said.is_empty()).then(|| said.to_string())
     }

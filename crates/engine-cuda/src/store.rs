@@ -2654,6 +2654,7 @@ mod tests {
         // dense.
         let small = kv_page(28);
         let large = kv_page(36);
+        #[allow(clippy::type_complexity)]
         let cases: [(&str, u64, u64, bool, &[u32], &[u64]); 2] = [
             (
                 "Qwen3-0.6B",

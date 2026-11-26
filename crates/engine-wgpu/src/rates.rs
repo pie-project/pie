@@ -136,6 +136,7 @@ pub fn save_rates(
 /// to `top_rows` (`engine_gpu::rates::shapes_at_load`), saved to the user's
 /// profile under `profiles`, each timed frame under `max_submit` where the
 /// device states one.
+#[allow(clippy::too_many_arguments)]
 pub fn shapes_at_load(
     device: &Context,
     tuning: crate::tuning::Tuning,

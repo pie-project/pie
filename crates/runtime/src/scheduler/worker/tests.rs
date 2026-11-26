@@ -1350,6 +1350,7 @@ const UNSERVED: u64 = 1 << 7;
 struct LaneRefusalEngine {
     sink: Option<::engine::CompletionSink>,
     asynchronous: bool,
+    #[allow(clippy::type_complexity)]
     fired: Arc<std::sync::Mutex<Vec<Vec<(u64, u32)>>>>,
     next: u64,
     /// Lands a frame stopped short after the frame submitted next,

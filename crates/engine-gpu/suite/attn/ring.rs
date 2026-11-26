@@ -586,6 +586,7 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
 /// below its first row and from the fire's slots past it; the fire's rows
 /// from `to` on into fresh buffer slots from `free`. Returns the jobs and
 /// where each unfolded row landed.
+#[allow(clippy::type_complexity)]
 fn fold_jobs(
     lanes: &[Lane],
     to: &[usize],

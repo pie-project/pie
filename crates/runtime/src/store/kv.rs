@@ -313,9 +313,11 @@ pub struct KvStore {
     reclaimable: std::cell::Cell<Option<(Instant, std::time::Duration, u32)>>,
     /// The same for idle cache below the device: see
     /// [`Self::below_device_cache_pages`].
+    #[allow(clippy::type_complexity)]
     below_cached: std::cell::Cell<Option<(Instant, std::time::Duration, (u32, u32))>>,
     /// The same for what of it the retention keys let go, and the keys'
     /// revision it was read under: see [`Self::droppable_below_device`].
+    #[allow(clippy::type_complexity)]
     droppable_below: std::cell::Cell<Option<(Instant, std::time::Duration, u64, (u32, u32))>>,
     /// The reclaim order the last reclaim left: see [`Self::kept_order`].
     order: Option<KeptOrder>,

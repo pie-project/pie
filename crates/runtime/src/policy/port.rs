@@ -291,7 +291,7 @@ fn rows<K, V, R, W>(
     column: usize,
     delta: plex_host::host::ColumnDelta<K, V>,
     key: impl Fn(K) -> Option<R>,
-    value: impl Fn(V) -> W,
+    #[allow(clippy::type_complexity)] value: impl Fn(V) -> W,
 ) -> (Vec<(R, Option<W>)>, Option<Option<W>>) {
     let mut out = Vec::with_capacity(delta.rows.len());
     for (k, row) in delta.rows {

@@ -8390,6 +8390,7 @@ struct StallSnapshot {
     /// Chunks held: the chunk, the slots it holds, and each holder's share
     /// (by its place in `procs`). One resident holding a chunk whole is its
     /// kv; anything else is shared slots.
+    #[allow(clippy::type_complexity)]
     held: Vec<(u32, u32, Vec<(usize, u32)>)>,
     /// The queue's head, by its place in `procs`.
     head: usize,
@@ -8708,6 +8709,7 @@ fn stall_two_long_runs_refused(quiet: bool) -> StallSnapshot {
     }];
     procs.extend(std::iter::repeat_n(SnapProc::resident(), residents));
     let free: Vec<u32> = (0..7).chain(10..17).chain(20..27).collect();
+    #[allow(clippy::type_complexity)]
     let held: Vec<(u32, u32, Vec<(usize, u32)>)> = (0..54u32)
         .filter(|chunk| !free.contains(chunk))
         .enumerate()
@@ -8755,6 +8757,7 @@ fn stall_one_run_refused(quiet: bool) -> StallSnapshot {
     }];
     procs.extend(std::iter::repeat_n(SnapProc::resident(), residents));
     let free: Vec<u32> = vec![4, 5, 8, 9, 20, 21, 22, 23, 40, 41, 42];
+    #[allow(clippy::type_complexity)]
     let held: Vec<(u32, u32, Vec<(usize, u32)>)> = (0..60u32)
         .filter(|chunk| !free.contains(chunk))
         .enumerate()

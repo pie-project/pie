@@ -1621,9 +1621,7 @@ fn prefault(at: *mut u8, bytes: usize) {
 /// advice that lets a file's pages go would zero.
 fn pageable_spans() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
     static SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-    SPANS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    SPANS.lock().expect("the span list poisoned")
 }
 
 /// Whether `at` lies in a pageable copy [`Pinned::pageable`] made.

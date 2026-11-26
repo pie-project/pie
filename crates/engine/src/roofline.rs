@@ -87,6 +87,7 @@ pub struct Constants {
     /// `gemm_by_rows` at its full rate: each point times the fill of the
     /// waves it filled where it was timed, where the backend states them
     /// ([`Constants::with_gemm_waves`]). `gemm_by_rows` stays as measured.
+    #[allow(clippy::type_complexity)]
     pub gemm_full_by_rows: Option<Vec<(u32, Vec<(u32, f64)>)>>,
 }
 

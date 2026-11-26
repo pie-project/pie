@@ -3015,6 +3015,10 @@ mod behind_tests {
     /// none of an engine's behind work, whatever the engine states: never
     /// between the steps of live traffic.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the lock guards no state, so a holder that panicked left none half-written"
+    )]
     fn behind_work_waits_while_a_pipeline_is_open() {
         let _alone = ALONE
             .lock()
@@ -3037,6 +3041,10 @@ mod behind_tests {
     /// no lane: ready turns each lane again once its grace is spent, so an
     /// idle server takes up its behind work.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the lock guards no state, so a holder that panicked left none half-written"
+    )]
     fn ready_turns_the_lanes_again_after_the_warm_run_s_grace() {
         use std::sync::atomic::Ordering::Relaxed;
         let _alone = ALONE
@@ -3067,6 +3075,10 @@ mod behind_tests {
     /// longest recent served step: a request opening inside it pays no
     /// slice; past it, the work runs (a slice at a time).
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the lock guards no state, so a holder that panicked left none half-written"
+    )]
     fn behind_work_waits_a_served_step_after_the_last_pipeline_closes() {
         let _alone = ALONE
             .lock()

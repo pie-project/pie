@@ -204,6 +204,7 @@ mod tests {
     const OWN: &str = "0::/user.slice/user-0.slice/session-1.scope\n";
 
     /// Reads fake files under `/cg`, absent ones `NotFound`.
+    #[allow(clippy::type_complexity)]
     fn files(texts: &[(&str, String)]) -> Box<dyn Fn(&Path) -> std::io::Result<String>> {
         let texts: HashMap<PathBuf, String> = texts
             .iter()

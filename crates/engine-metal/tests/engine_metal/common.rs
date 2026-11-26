@@ -110,6 +110,10 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
 /// parallel threads of one process, and a load beside others that hold the
 /// working set is refused for state-pool room it would have alone. A test
 /// that panicked under it leaves it usable.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the lock guards no state, so a holder that panicked left none half-written"
+)]
 pub(crate) fn one_heavy_load() -> std::sync::MutexGuard<'static, ()> {
     static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
     HEAVY

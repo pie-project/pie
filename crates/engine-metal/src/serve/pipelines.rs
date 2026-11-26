@@ -368,8 +368,10 @@ impl Shell {
         };
         // What the walk fires, each once: (rung, prompt rows, rows read
         // out, form, verb), a prompt of one row the decode forms.
+        #[allow(clippy::type_complexity)]
         let mut fired: std::collections::HashSet<(u32, u32, u32, (bool, bool), usize)> =
             std::collections::HashSet::new();
+        #[allow(clippy::type_complexity)]
         let mut plan: Vec<(u32, u32, u32, (bool, bool), usize)> = Vec::new();
         for shape in &steps.shapes {
             // The arena's rung the shape runs at: its own, or the

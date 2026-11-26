@@ -310,6 +310,10 @@ pub struct Measured {
 
 /// The rates of device `ordinal` under `chip`'s tuning, the kernels' disk
 /// cache under `cache` (`$PIE_HOME/cache`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the lock guards no state, so a holder that panicked left none half-written"
+)]
 pub fn measure(
     ordinal: i32,
     chip: &profile::Profile,

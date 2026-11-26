@@ -295,6 +295,10 @@ pub fn load_paged(fixture: &Fixture, page: u32, context: u32, chunk: Option<u64>
 /// holding this never waits on.
 static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the lock guards no state, so a holder that panicked left none half-written"
+)]
 fn loading() -> std::sync::MutexGuard<'static, ()> {
     crate::gpu::share();
     LOADING

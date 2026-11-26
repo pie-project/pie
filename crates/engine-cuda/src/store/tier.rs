@@ -493,7 +493,7 @@ impl Pools {
         let mut out = Vec::new();
         for (shape, refs) in slots {
             let (bytes, places) = self.tier_places(*shape, refs)?;
-            let tier = self.tier.as_ref().expect("backed above");
+            let tier = self.tier.as_mut().expect("backed above");
             let chunk_bytes = tier.chunk_bytes();
             for (chunk, offset) in places {
                 let len = usize::try_from(bytes).unwrap_or(usize::MAX);
@@ -524,7 +524,7 @@ impl Pools {
                 have: bytes.len() as u64,
             });
         }
-        let tier = self.tier.as_ref().expect("backed above");
+        let tier = self.tier.as_mut().expect("backed above");
         let chunk_bytes = tier.chunk_bytes();
         let mut from = 0usize;
         for ((chunk, offset), len) in spans {

@@ -526,6 +526,7 @@ impl Layout {
                 }
             }
         }
+        #[allow(clippy::type_complexity)]
         let members: Vec<(String, u64, Option<(usize, usize)>)> = self
             .planes
             .iter()
@@ -550,6 +551,7 @@ impl Layout {
 /// bytes a row: members of one key whose spans don't overlap share a slot,
 /// first-fit in the order their spans start, each slot as wide as its
 /// widest member. A member with no span takes a slot of its own.
+#[allow(clippy::type_complexity)]
 fn share_slots(members: &[(String, u64, Option<(usize, usize)>)]) -> (Vec<usize>, Vec<u64>) {
     let mut order: Vec<usize> = (0..members.len()).collect();
     order.sort_by_key(|&at| members[at].2.map_or(0, |span| span.0));

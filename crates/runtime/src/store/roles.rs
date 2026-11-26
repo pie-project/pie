@@ -930,6 +930,7 @@ struct Disk {
     /// The slots of each role shape a disk chunk holds, as a device chunk:
     /// read once, so asking takes no lock (a caller may hold the device's).
     per_chunk: HashMap<SlotRole, u32>,
+    #[allow(clippy::type_complexity)]
     chunks: Arc<std::sync::Mutex<HashMap<SlotRole, BTreeMap<u32, BTreeSet<u32>>>>>,
 }
 

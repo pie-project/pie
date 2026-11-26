@@ -1089,6 +1089,7 @@ impl Pools {
     /// there, and their host runs `(from, len, address)`, one a placement
     /// heap they cross (a chunk, and a slot in it, may cross a heap's end;
     /// the view holds them in one span either way).
+    #[allow(clippy::type_complexity)]
     pub fn span_runs(
         &self,
         id: ShapeId,
@@ -1109,6 +1110,7 @@ impl Pools {
     /// Slot ref `slot` of shape `id`: the buffer it lies in, its byte offset
     /// there, its bytes' host runs `(from, len, address)` (one a heap they
     /// cross) and its bytes.
+    #[allow(clippy::type_complexity)]
     pub fn slot_runs(
         &self,
         id: ShapeId,

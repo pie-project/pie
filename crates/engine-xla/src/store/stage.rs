@@ -38,10 +38,7 @@ impl Done {
 
     /// Blocks until the run has completed.
     pub fn wait(&self) -> Result<()> {
-        let mut event = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut event = self.0.lock().expect("the stage event poisoned");
         if let Some(event) = event.take() {
             event.wait()?;
         }
