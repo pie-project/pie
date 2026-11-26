@@ -756,7 +756,11 @@ impl Shell {
             return;
         }
         let device = std::sync::Arc::clone(&self.device);
-        let stated = self.host_programs;
+        // the programs' room: what the load states, else what the stated host
+        // bound leaves beside the host tier's kv
+        let stated = self
+            .host_programs
+            .or(self.host_bound.map(|b| b.saturating_sub(self.host.landed_bytes())));
         // the room of a compile, the widest of theirs (the guest stages'
         // compile beside them, by their measured needs, is kept too:
         // `guest::run::guest_reserve`, read as it loads)
@@ -956,6 +960,14 @@ impl Shell {
             && let Ok(per_kib) = handle.join()
         {
             self.hold_per_kib = per_kib;
+        }
+        if let Some(bound) = self.host_bound {
+            tracing::info!(
+                bound_gib = bound >> 30,
+                tier_gib = (u64::from(self.host.chunks()) * self.host.chunk_bytes()) >> 30,
+                programs_gib = self.programs_held() >> 30,
+                "xla host bound: the host tier's kv up to its seats, programs what the kv leaves (held at ready); programs yield to kv"
+            );
         }
     }
 

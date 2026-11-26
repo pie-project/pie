@@ -944,6 +944,18 @@ impl Device {
 
     /// [`Device::forget`] by the cache key of a program's text (the blake3
     /// of it): a stage the guest stage cache evicted.
+    /// The text bytes of the programs held in memory, and whether `key`'s
+    /// is one of them.
+    pub fn held_text_bytes(&self) -> u64 {
+        let cache = self.cache.lock().expect("cache lock poisoned");
+        cache.values().map(|p| p.text_bytes as u64).sum()
+    }
+
+    #[must_use]
+    pub fn holds_key(&self, key: &[u8; 32]) -> bool {
+        self.cache.lock().expect("cache lock poisoned").contains_key(key)
+    }
+
     /// Takes `key`'s program out of the cache, the caller its last holder
     /// where nothing else holds it.
     pub fn take_key(&self, key: &[u8; 32]) -> Option<Arc<Program>> {

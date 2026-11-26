@@ -467,6 +467,9 @@ pub struct Shell {
     /// loader behind serving measured one alone (0: none measured).
     hold_per_kib: u64,
     dropper: evict::Dropper,
+    /// The host memory the load may hold (`budget_host`): the host tier's
+    /// kv and the programs held, one sum; programs yield to kv (`evict`).
+    host_bound: Option<u64>,
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
@@ -1352,6 +1355,7 @@ impl Shell {
             fires: 0,
             hold_per_kib: 0,
             dropper: evict::Dropper::default(),
+            host_bound: None,
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
             laddered: false,
@@ -1736,6 +1740,14 @@ impl Shell {
                     .write_slots(&self.device, &self.handles, id, &dsts, &data)?
             }
             Tier::Host => {
+                // the slots landing anew take host memory: programs yield it
+                let new = (dsts.iter())
+                    .filter(|&&slot| self.host.lands_new(shape.tier_offset(chunk, slot)))
+                    .count() as u64
+                    * len;
+                if new > 0 {
+                    self.make_host_room(new, None);
+                }
                 for (at, &slot) in dsts.iter().enumerate() {
                     let bytes = &data[at * len as usize..(at + 1) * len as usize];
                     self.host.write(shape.tier_offset(chunk, slot), bytes)?;
@@ -1801,6 +1813,13 @@ impl Shell {
         // every span inside the tier before any lands
         for &(offset, len) in &spans {
             self.host.read(offset, len)?;
+        }
+        let new: u64 = (spans.iter())
+            .filter(|&&(offset, _)| self.host.lands_new(offset))
+            .map(|&(_, len)| len)
+            .sum();
+        if new > 0 {
+            self.make_host_room(new, None);
         }
         let mut at = 0usize;
         for (offset, len) in spans {
@@ -1967,6 +1986,17 @@ impl Shell {
         self.host_programs = bytes;
     }
 
+    /// The host memory the load may hold, kv tier and programs together
+    /// (`Residency::host_kv_budget`, `budget_host`).
+    pub fn set_host_bound(&mut self, bytes: Option<u64>) {
+        self.host_bound = bytes;
+    }
+
+    /// The host memory the held programs take, by the measured hold.
+    fn programs_held(&self) -> u64 {
+        self.hold_per_kib.saturating_mul(self.device.held_text_bytes()) / 1024
+    }
+
     fn load_parked(
         &mut self,
         shape_key: Option<[u8; 32]>,
@@ -1981,7 +2011,7 @@ impl Shell {
         let Some(parked) = self.parked.remove(&at) else {
             return Ok(None);
         };
-        self.make_host_room(&parked, at);
+        self.make_host_room(self.hold_of(&parked), Some(at));
         let kept = parked.clone();
         let resident = crate::device::resident_bytes();
         let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
@@ -2031,50 +2061,72 @@ impl Shell {
         self.hold_per_kib.saturating_mul(parked.code.len() as u64) / 1024
     }
 
-    /// Parks again, least recently fired first, the programs a fire loaded
-    /// while the host's free memory does not hold `parked`'s beside what the
-    /// guest stages' compiles take (`evict`); waits on the drops it needs.
-    /// With none left to drop, the load goes ahead.
-    fn make_host_room(&mut self, parked: &Parked, at: [u8; 32]) {
-        let need = self.hold_of(parked);
-        let fits = |dropper: &evict::Dropper| {
+    /// Parks again, least recently fired first (a program the loader holds
+    /// and no fire took yet first of all), programs held in host memory
+    /// while `need` more bytes do not fit: the host's free memory beside
+    /// what the guest stages' compiles take, and the stated host bound (the
+    /// host tier's kv and the programs together). Waits on the drops it
+    /// needs; with none left to drop, the caller goes ahead. `at` is never
+    /// dropped (the program about to load).
+    fn make_host_room(&mut self, need: u64, at: Option<[u8; 32]>) {
+        let bound = self.host_bound;
+        let tier = self.host.landed_bytes();
+        let fits = |shell: &Shell| {
+            let pending = shell.dropper.pending();
             crate::device::available_memory().is_none_or(|free| {
-                free.saturating_add(dropper.pending())
+                free.saturating_add(pending)
                     >= need.saturating_add(crate::guest::run::guest_reserve())
+            }) && bound.is_none_or(|bound| {
+                shell.programs_held().saturating_add(pending).saturating_add(tier).saturating_add(need)
+                    <= bound
             })
         };
         let mut dropped = 0u32;
-        while !fits(&self.dropper) {
-            let victim = (self.evictable.iter())
-                .filter(|(key, _)| **key != at)
-                .min_by_key(|(key, (_, _, used))| (*used, **key))
-                .map(|(key, _)| *key);
-            let Some(victim) = victim else {
-                break;
-            };
-            let Some((again, shape, _)) = self.evictable.remove(&victim) else {
+        while !fits(self) {
+            // a fired program by its last fire; one the loader holds and no
+            // fire took, before any
+            let fired = (self.evictable.iter())
+                .filter(|(key, _)| Some(**key) != at)
+                .map(|(key, (_, _, used))| (*used + 1, *key));
+            let loaded = (self.parked.iter())
+                .filter(|(key, p)| Some(**key) != at && self.device.holds_key(&p.code.hash()))
+                .map(|(key, _)| (0, *key));
+            let Some((used, victim)) = loaded.chain(fired).min() else {
                 break;
             };
             let mut held = Vec::new();
-            held.extend(self.traced.remove(&victim));
-            if let Some(shape) = shape {
-                held.extend(self.shaped.remove(&shape));
-            }
-            held.extend(self.device.take_key(&again.code.hash()));
-            let bytes = self.hold_of(&again);
-            self.parked.insert(victim, again);
+            let bytes = if used == 0 {
+                let Some(parked) = self.parked.get(&victim) else {
+                    break;
+                };
+                let bytes = self.hold_of(parked);
+                held.extend(self.device.take_key(&parked.code.hash()));
+                bytes
+            } else {
+                let Some((again, shape, _)) = self.evictable.remove(&victim) else {
+                    break;
+                };
+                held.extend(self.traced.remove(&victim));
+                if let Some(shape) = shape {
+                    held.extend(self.shaped.remove(&shape));
+                }
+                held.extend(self.device.take_key(&again.code.hash()));
+                let bytes = self.hold_of(&again);
+                self.parked.insert(victim, again);
+                bytes
+            };
             self.dropper.drop_later(held, bytes);
             dropped += 1;
         }
-        // the room the drops under way free, before the load takes it
-        while !fits(&self.dropper) && self.dropper.pending() > 0 {
+        // the room the drops under way free, before the caller takes it
+        while !fits(self) && self.dropper.pending() > 0 {
             self.dropper.wait();
         }
         if dropped > 0 {
             tracing::debug!(
                 dropped,
                 need,
-                "xla programs parked again for a fire's load: the host's memory held no more"
+                "xla programs parked again: the host's memory, or its stated bound, held no more"
             );
         }
     }
