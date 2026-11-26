@@ -425,9 +425,22 @@ pub(super) fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engi
             ),
         );
     }
-    ledger.enter(Class::Fire, "inputs", held.inputs);
-    ledger.enter(Class::Fire, "readout rows", held.readout);
-    ledger.enter(Class::Fire, "staged experts", held.experts);
+    // Each run staged in the activation's span past the workspaces, under
+    // its own name: what a flat range's span spare leaves out is entered.
+    let [inputs, readouts, voxels, predicates, experts, arenas, scores, rings] =
+        shell.staged_runs();
+    for (name, bytes) in [
+        ("inputs", inputs),
+        ("readout rows", readouts),
+        ("voxels", voxels),
+        ("predicates", predicates),
+        ("staged experts", experts),
+        ("lane arenas", arenas),
+        ("capture table", scores),
+        ("ring runs", rings),
+    ] {
+        ledger.enter(Class::Fire, name, bytes);
+    }
     // The heaps' chunks are this process's whatever load made them, and a
     // load carves its own cells from them (the readout rows among them),
     // so they are entered whole, less the cells entered by their owners,

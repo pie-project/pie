@@ -1268,6 +1268,17 @@ where
                  stated eager at load, and nothing is recorded or armed while serving"
             );
         }
+        // The device's memory as the load holds it, each owner under its
+        // class, against the device's own count of the reservations.
+        {
+            let books = crate::backend::Context::books(shell.device());
+            tracing::info!(
+                engine = B::KIND,
+                reserved_mib = books.device() >> 20,
+                "ledger: {}",
+                books.ledger()
+            );
+        }
         // What the load itself walked is the load's: serving counts from here.
         shell.recorded_serving();
         shell.eager_serving();
