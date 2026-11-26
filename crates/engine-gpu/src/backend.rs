@@ -153,6 +153,13 @@ pub trait Context<B: Backend> {
     /// measured now; zero where the device does not say.
     fn outside(&self) -> u64;
 
+    /// Whether [`Context::outside`] is measured on this device (the driver
+    /// reports what this process holds of the heap), not zero for want of
+    /// a reading.
+    fn measures_outside(&self) -> bool {
+        false
+    }
+
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
     /// what it has ([`engine::Engine::host_room`]). `None`, the default:

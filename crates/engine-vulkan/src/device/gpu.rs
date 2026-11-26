@@ -107,6 +107,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::outside(self)
     }
 
+    fn measures_outside(&self) -> bool {
+        Context::measures_outside(self)
+    }
+
     fn host_room(&self) -> Option<engine::HostRoom> {
         Context::host_room(self)
     }

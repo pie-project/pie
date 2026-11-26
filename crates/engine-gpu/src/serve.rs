@@ -4673,6 +4673,52 @@ impl<B: Serve> Shell<B> {
         self.unplaced = false;
     }
 
+    /// What this process holds of the device past every reservation,
+    /// settled once the load has armed: each step kind (a decode step, then
+    /// a prompt) fired once more on seat 0, the driver's count read before
+    /// and after each ([`Context::outside`]). Two readings a fire apart
+    /// within one of the pool's chunks (what the ledger counts every class
+    /// in) settle it; else the largest stands, said so
+    /// ([`engine::memory::Outside::settle`]). `None`, said by name, where
+    /// the device does not report what this process holds, or the load
+    /// seats no slot to fire on.
+    pub fn settle_outside(&mut self) -> Result<Option<engine::memory::Outside>> {
+        if !self.device.measures_outside() {
+            tracing::info!(
+                "outside: unmeasured: this device reports no per-process usage (no \
+                 VK_EXT_memory_budget, or a wgpu backend other than Vulkan); budget_device \
+                 bounds what the load reserves alone"
+            );
+            return Ok(None);
+        }
+        if self.held.is_empty() {
+            tracing::info!("outside: unmeasured: no slot to fire on");
+            return Ok(None);
+        }
+        let token = |i: u32| 100 + (i * 7919) % 5000;
+        let prompt: Vec<u32> = (0..32).map(token).collect();
+        let decode = [token(1)];
+        let mut readings = vec![self.device.outside()];
+        for tokens in [&decode[..], &prompt[..]] {
+            self.open(0)?;
+            let word = self
+                .trace
+                .facts
+                .word(&poem_ir::Request::new(tokens.len() as u32, false));
+            self.fire(&[Lane {
+                slot: 0,
+                word,
+                tokens,
+            }])?;
+            readings.push(self.device.outside());
+        }
+        self.open(0)?;
+        Ok(engine::memory::Outside::settle(
+            &readings,
+            self.pools.chunk_bytes().max(1),
+        ))
+    }
+
     /// Opens seat `slot` for a direct fire: its record zeroed on the queue,
     /// nothing held.
     pub fn open(&mut self, slot: u32) -> Result<()> {

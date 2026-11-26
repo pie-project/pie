@@ -23,6 +23,53 @@
 /// reports available. One size, on every backend; each one imports it.
 pub const SAFETY_FLOOR_BYTES: u64 = 64 << 20;
 
+/// What a process holds on its device beyond what its load's ledger
+/// enters (the context, the driver's queues and module images, library
+/// workspaces, graph exec memory), read once it has settled: after arming,
+/// each step kind the load fires fired once more, a reading between each
+/// ([`Outside::settle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outside {
+    /// The process's device bytes the reading takes: the last where two
+    /// readings a fire apart agree within the device's allocation unit,
+    /// else the largest read.
+    pub used: u64,
+    /// The fires the readings were taken across.
+    pub fires: usize,
+    /// Whether the last two readings agreed within the unit.
+    pub settled: bool,
+}
+
+impl Outside {
+    /// Of `readings` taken a fire apart (the first before any fire), the
+    /// process's settled usage: settled where the last two differ by at
+    /// most `unit` bytes, the device's allocation granularity; else the
+    /// largest reading, unsettled. `None` with no reading.
+    #[must_use]
+    pub fn settle(readings: &[u64], unit: u64) -> Option<Outside> {
+        let last = *readings.last()?;
+        let settled = readings
+            .len()
+            .checked_sub(2)
+            .is_some_and(|at| readings[at].abs_diff(last) <= unit);
+        Some(Outside {
+            used: if settled {
+                last
+            } else {
+                readings.iter().copied().max().unwrap_or(last)
+            },
+            fires: readings.len() - 1,
+            settled,
+        })
+    }
+
+    /// What lies outside a ledger whose own entries take `ledgered` bytes.
+    #[must_use]
+    pub fn beyond(&self, ledgered: u64) -> u64 {
+        self.used.saturating_sub(ledgered)
+    }
+}
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::OnceLock;
@@ -321,6 +368,23 @@ pub fn target(floor: u64, ceiling: u64, yield_: f64, pressure: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The settle rule: two readings a fire apart within the unit settle on
+    /// the last; a reading still moving takes the largest, unsettled.
+    #[test]
+    fn outside_settles_on_two_readings_a_fire_apart_within_the_unit() {
+        let unit = 2 << 20;
+        let s = Outside::settle(&[100 << 20, 140 << 20, 141 << 20], unit).unwrap();
+        assert_eq!((s.used, s.fires, s.settled), (141 << 20, 2, true));
+        let moving = Outside::settle(&[100 << 20, 150 << 20, 120 << 20], unit).unwrap();
+        assert_eq!((moving.used, moving.fires, moving.settled), (150 << 20, 2, false));
+        let one = Outside::settle(&[90 << 20], unit).unwrap();
+        assert!(!one.settled && one.used == 90 << 20 && one.fires == 0);
+        assert!(Outside::settle(&[], unit).is_none());
+        assert_eq!(s.beyond(100 << 20), 41 << 20);
+        assert_eq!(s.beyond(200 << 20), 0);
+    }
+
     use super::*;
 
     const FLOOR: u64 = 100 * MIB;

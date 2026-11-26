@@ -1546,6 +1546,13 @@ impl Context {
         self.core.outside()
     }
 
+    /// Whether [`Context::outside`] is measured: the driver reports this
+    /// process's heap usage (`VK_EXT_memory_budget`).
+    #[must_use]
+    pub fn measures_outside(&self) -> bool {
+        self.core.features.memory_budget
+    }
+
     /// Where the device shares the host's memory (a ceiling was read at
     /// bind), the reader of what the host can still give the process, the
     /// bind's reading taken afresh ([`host_ceiling`]).

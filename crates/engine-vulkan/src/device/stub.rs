@@ -50,6 +50,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn measures_outside(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn host_room(&self) -> Option<engine::HostRoom> {
         match self.never {}
     }

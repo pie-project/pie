@@ -182,6 +182,9 @@ pub struct Enabled {
 }
 
 pub(crate) struct Core {
+    /// The adapter the device was asked of: what this process holds of its
+    /// heap is read through it ([`super::memory::process_usage`]).
+    pub(crate) adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) info: wgpu::AdapterInfo,
@@ -713,6 +716,7 @@ impl Context {
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
+            adapter,
             device,
             queue,
             name: info.name.clone(),
@@ -791,16 +795,22 @@ impl Context {
     }
 
     /// What the driver holds for this process beside every reservation:
-    /// wgpu reports none.
+    /// on the Vulkan backend, the device-local heap's usage
+    /// (`VK_EXT_memory_budget`'s `heapUsage`, read through wgpu-hal as its
+    /// budget is) less this process's reservations; zero where the backend
+    /// says nothing ([`Context::measures_outside`]).
     #[must_use]
     pub fn outside(&self) -> u64 {
-        0
+        super::memory::process_usage(&self.core.adapter).map_or(0, |usage| {
+            usage.saturating_sub(engine_gpu::books::process_reserved())
+        })
     }
 
-    /// Whether [`Context::outside`] is measured: never under wgpu.
+    /// Whether [`Context::outside`] is measured: on the Vulkan backend with
+    /// `VK_EXT_memory_budget`; any other backend states no process usage.
     #[must_use]
     pub fn measures_outside(&self) -> bool {
-        false
+        super::memory::process_usage(&self.core.adapter).is_some()
     }
 
     #[must_use]
