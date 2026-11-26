@@ -26,7 +26,21 @@ pub struct Backend {
     /// (`engine::load::check`): `pie tune --check-estimate`. `None` where
     /// the engine offers none.
     pub bench: Option<BenchOf>,
+    /// Time each model's fire terms (`[rates] fire_terms`): `pie tune
+    /// --fire-terms`. `None` where the engine has no fire-terms step yet.
+    pub fire_terms: Option<FireTerms>,
 }
+
+/// `pie tune --fire-terms` for one backend: each model of `models`
+/// (`(artifact, deployment)`, as [`pick_models`] chose them) loaded and its
+/// fire's terms timed at the shapes serving launches them, the entries
+/// joined over the user's profile: the profile to write, as the rates step
+/// gives it.
+pub type FireTerms = fn(
+    &TuneRequest<'_>,
+    models: &[(std::path::PathBuf, String)],
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String>;
 
 /// `pie tune --rates` for one backend.
 pub type Rates =
@@ -69,6 +83,10 @@ pub struct TuneRequest<'a> {
     pub dissect: &'a [u32],
     /// Run the `[rates]` step alone.
     pub rates: bool,
+    /// Run the fire-terms step alone (`--fire-terms`), on the models
+    /// `check` names (every imported artifact the backend serves, where it
+    /// names none).
+    pub fire_terms: bool,
     /// The serving mix the search judges a candidate by (`--mix`).
     pub mix: Mix,
 }
@@ -92,6 +110,7 @@ impl<'a> TuneRequest<'a> {
             check_estimate: false,
             dissect: &[],
             rates: false,
+            fire_terms: false,
             mix: Mix::default(),
         }
     }
@@ -198,6 +217,36 @@ pub fn rates(
         )
     })?;
     step(req, say)
+}
+
+/// `pie tune --fire-terms`: the backend's fire-terms step over the models
+/// the request names, refused by name where the engine has none.
+pub fn fire_terms(
+    backend: &Backend,
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let step = backend.fire_terms.ok_or_else(|| {
+        format!(
+            "`pie tune --fire-terms` times a fire's terms by its engine's fire-terms step, and \
+             engine-{} has none yet",
+            backend.name
+        )
+    })?;
+    let models = if req.check.is_empty() {
+        artifacts(req.artifacts, backend.name)
+    } else {
+        pick_models(backend.name, req)?
+    };
+    if models.is_empty() {
+        return Err(format!(
+            "`pie tune --fire-terms` times the models stamped for {}, and none under {} is; \
+             make one with `pie model import <source>`",
+            backend.name,
+            req.artifacts.display()
+        ));
+    }
+    step(req, &models, say)
 }
 
 /// `pie tune --check-estimate`: the check of the estimate
@@ -732,6 +781,7 @@ pub fn backends() -> Vec<Backend> {
         tune: Some(tune_cuda),
         rates: Some(|req, say| engine_cuda::tune::rates(Some(req.profiles), say)),
         bench: Some(bench_cuda),
+        fire_terms: None,
     });
     #[cfg(feature = "vulkan")]
     out.push(Backend {
@@ -743,6 +793,7 @@ pub fn backends() -> Vec<Backend> {
         tune: Some(tune_vulkan),
         rates: Some(|req, say| engine_vulkan::check::rated(req.profiles, say)),
         bench: Some(bench_vulkan),
+        fire_terms: None,
     });
     #[cfg(feature = "wgpu")]
     out.push(Backend {
@@ -754,6 +805,7 @@ pub fn backends() -> Vec<Backend> {
         tune: None,
         rates: Some(|req, say| engine_wgpu::check::rated(req.profiles, say)),
         bench: Some(bench_wgpu),
+        fire_terms: None,
     });
     #[cfg(feature = "xla")]
     out.push(Backend {
@@ -767,6 +819,7 @@ pub fn backends() -> Vec<Backend> {
         tune: None,
         rates: None,
         bench: None,
+        fire_terms: None,
     });
     #[cfg(feature = "metal")]
     out.push(Backend {
@@ -787,6 +840,7 @@ pub fn backends() -> Vec<Backend> {
         bench: Some(bench_metal),
         #[cfg(not(target_vendor = "apple"))]
         bench: None,
+        fire_terms: None,
     });
     out
 }

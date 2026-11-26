@@ -63,6 +63,14 @@ pub struct TuneArgs {
     #[arg(long, conflicts_with = "check_estimate")]
     pub rates: bool,
 
+    /// Run the fire-terms step alone: time each model's fire terms
+    /// (attention as serving launches it, its matmuls, routed experts,
+    /// per-row pass, scan and a fire's own fixed cost) at the rungs its load
+    /// arms, into `[rates] fire_terms` of the user's profile. Models by name
+    /// or substring; every imported artifact without one.
+    #[arg(long, num_args = 0.., conflicts_with_all = ["check_estimate", "rates"])]
+    pub fire_terms: Option<Vec<String>>,
+
     /// The serving mix a candidate is judged by: four weights for the
     /// prompt and the 1-, 4- and 8-lane decode steps, `prompt,1,4,8`
     /// (scaled to sum to one). A chat server might state `1,4,1,0`, a batch
@@ -140,6 +148,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
     };
     let mut check = args.check.clone();
     check.extend(args.check_estimate.iter().flatten().cloned());
+    check.extend(args.fire_terms.iter().flatten().cloned());
     let req = runtime::engine::profiles::TuneRequest {
         full: args.full,
         check: &check,
@@ -148,6 +157,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         check_estimate: args.check_estimate.is_some(),
         dissect: &args.dissect,
         rates: args.rates,
+        fire_terms: args.fire_terms.is_some(),
         mix,
         ..runtime::engine::profiles::TuneRequest::at(&dir, &artifacts, &cache)
     };
@@ -170,6 +180,15 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             runtime::engine::profiles::rates(&backend, &req, &mut say).map_err(|e| anyhow!(e))?;
         let head = format!(
             "{}: rates measured in {:.0} s\n{}",
+            rated.device, rated.seconds, rated.block
+        );
+        return write_profile(&backend, &args, &dir, &rated.device, &rated.file, head).map(text);
+    }
+    if req.fire_terms {
+        let rated = runtime::engine::profiles::fire_terms(&backend, &req, &mut say)
+            .map_err(|e| anyhow!(e))?;
+        let head = format!(
+            "{}: fire terms measured in {:.0} s\n{}",
             rated.device, rated.seconds, rated.block
         );
         return write_profile(&backend, &args, &dir, &rated.device, &rated.file, head).map(text);
