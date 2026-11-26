@@ -282,7 +282,9 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         );
     }
     let merge_indptr = narrow_all(op, "batch_prefill_merge_indptr", &merge_indptr)?;
-    let o_indptr: Vec<i64> = if split_kv && !direct {
+    // A split layout's rows are laid by the fold's positions, whole or not:
+    // a replay staged whole lands them where the fold would (its window).
+    let o_indptr: Vec<i64> = if split_kv {
         o_indptr
     } else {
         o_indptr

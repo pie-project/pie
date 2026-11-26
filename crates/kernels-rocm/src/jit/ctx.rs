@@ -530,6 +530,12 @@ impl Ctx {
         ArgValue::Ptr(self.stage.get())
     }
 
+    /// The staged row window's address (0: none armed).
+    #[must_use]
+    pub fn stage_at(&self) -> u64 {
+        self.stage.get()
+    }
+
     #[must_use]
     pub fn pad(&self) -> Pad {
         self.pad.get()

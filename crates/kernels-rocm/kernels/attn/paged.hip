@@ -39,6 +39,9 @@ struct Paged {
     const i32* direct;
     void* o_direct;
     float* lse_direct;
+    // The fold's staged row window `(count, start)`, null for none: a
+    // replay staged whole lands its rows by it, as `merge_partials` does.
+    const u32* win;
     void* o;
     float* lse;
     i32 num_qo_heads;
@@ -861,9 +864,14 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
     const long long row = part
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
+    // A replay staged whole lands its rows where the fold would: only the
+    // window's, past its start.
+    const bool whole = !part && p.partition;
+    if (whole && p.win != nullptr && row >= static_cast<long long>(p.win[0])) return;
+    const long long out = whole && p.win != nullptr ? row + static_cast<long long>(p.win[1]) : row;
     void* const o_out = part || !p.partition ? p.o : p.o_direct;
     float* const lse_out = part || !p.partition ? p.lse : p.lse_direct;
-    const long long base = (row * p.num_qo_heads + head) * D;
+    const long long base = (out * p.num_qo_heads + head) * D;
     const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < KS; ++dt) {
@@ -877,7 +885,7 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
                 pack4(o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv);
         }
     }
-    if (quad == 0 && lse_out != nullptr) lse_out[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+    if (quad == 0 && lse_out != nullptr) lse_out[out * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
@@ -1136,9 +1144,14 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     const long long row = part
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
+    // A replay staged whole lands its rows where the fold would: only the
+    // window's, past its start.
+    const bool whole = !part && p.partition;
+    if (whole && p.win != nullptr && row >= static_cast<long long>(p.win[0])) return;
+    const long long out = whole && p.win != nullptr ? row + static_cast<long long>(p.win[1]) : row;
     void* const o_out = part || !p.partition ? p.o : p.o_direct;
     float* const lse_out = part || !p.partition ? p.lse : p.lse_direct;
-    const long long base = (row * p.num_qo_heads + head) * D;
+    const long long base = (out * p.num_qo_heads + head) * D;
     const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < DT; ++dt) {
@@ -1151,7 +1164,7 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
                 pack4(o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv);
         }
     }
-    if (quad == 0 && lse_out != nullptr) lse_out[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+    if (quad == 0 && lse_out != nullptr) lse_out[out * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
 template <int D, bool HND, bool CAUSAL, bool FP8>

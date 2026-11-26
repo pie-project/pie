@@ -41,6 +41,9 @@ struct Args {
     direct: u64,
     o_direct: u64,
     lse_direct: u64,
+    /// The fold's staged row window a replay staged whole lands its rows
+    /// by, as the fold does (null: none).
+    win: u64,
     o: u64,
     lse: u64,
     num_qo_heads: i32,
@@ -60,7 +63,7 @@ struct Args {
     stride_page: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<Args>() == 216);
+const _: () = assert!(core::mem::size_of::<Args>() == 224);
 
 /// The prefill blocks one compute unit of the current device holds at once
 /// for heads `head_dim` wide: HIP's occupancy calculator over the kernel the
@@ -550,6 +553,7 @@ fn prefill_walk(
         args.direct = at(int, info.block_direct_offset);
         args.o_direct = o.ptr;
         args.lse_direct = lse;
+        args.win = ctx.stage_at();
     }
     match &split {
         Some(parts) => {
