@@ -1642,7 +1642,24 @@ impl Shell {
     ) -> Result<()> {
         let chunk = self.pools.layout().chunk_bytes;
         let chunks = match host {
-            Some(bytes) => u32::try_from(bytes / chunk.max(1)).unwrap_or(u32::MAX),
+            // the bound holds the worker's resident memory: the tier is what
+            // it leaves beside what the worker holds now with the largest
+            // program loaded, so the kv fits the bound with every other
+            // program dropped and a fire's program fits beside it; past its
+            // seats the runtime moves kv a tier down, else names tiers_full
+            Some(bound) => {
+                let grew = self.load_largest();
+                let held = crate::device::resident_bytes();
+                let tier = held.map_or(bound, |held| evict::tier_room(bound, held));
+                tracing::info!(
+                    bound_gib = bound >> 30,
+                    tier_mib = tier >> 20,
+                    held_mib = held.unwrap_or(0) >> 20,
+                    largest_load_mib = grew >> 20,
+                    "xla host tier: what budget_host leaves beside the worker's resident memory, the largest program loaded"
+                );
+                u32::try_from(tier / chunk.max(1)).unwrap_or(u32::MAX)
+            }
             None => self.pools.chunks().saturating_sub(2),
         };
         self.host = crate::store::tier::Host::new(chunks, chunk);
@@ -1653,6 +1670,26 @@ impl Shell {
             _ => None,
         };
         Ok(())
+    }
+
+    /// Loads the largest parked program not held (kept held: the loader
+    /// would load it first or later), so the worker's resident memory has
+    /// it in it; answers the resident growth (its first load's own costs
+    /// too), 0 with none to load.
+    fn load_largest(&mut self) -> u64 {
+        let Some(parked) = (self.parked.values())
+            .filter(|p| !self.device.holds_key(&p.code.hash()))
+            .max_by_key(|p| p.code.len())
+        else {
+            return 0;
+        };
+        let (code, sig) = (parked.code.clone(), parked.sig.clone());
+        let before = crate::device::resident_bytes();
+        let loaded = self.device.load_behind(&code, sig);
+        match (loaded, before, crate::device::resident_bytes()) {
+            (Ok(Some(_)), Some(before), Some(after)) => after.saturating_sub(before),
+            _ => 0,
+        }
     }
 
     /// The snapshots a lane lands in one fire (`crate::snapshot`), where
@@ -1746,7 +1783,7 @@ impl Shell {
                     .count() as u64
                     * len;
                 if new > 0 {
-                    self.make_host_room(new, None);
+                    self.make_host_room(new, None)?;
                 }
                 for (at, &slot) in dsts.iter().enumerate() {
                     let bytes = &data[at * len as usize..(at + 1) * len as usize];
@@ -1819,7 +1856,7 @@ impl Shell {
             .map(|&(_, len)| len)
             .sum();
         if new > 0 {
-            self.make_host_room(new, None);
+            self.make_host_room(new, None)?;
         }
         let mut at = 0usize;
         for (offset, len) in spans {
@@ -2011,7 +2048,10 @@ impl Shell {
         let Some(parked) = self.parked.remove(&at) else {
             return Ok(None);
         };
-        self.make_host_room(self.hold_of(&parked), Some(at));
+        if let Err(fault) = self.make_host_room(self.hold_of(&parked), Some(at)) {
+            self.parked.insert(at, parked);
+            return Err(fault);
+        }
         let kept = parked.clone();
         let resident = crate::device::resident_bytes();
         let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
@@ -2067,9 +2107,12 @@ impl Shell {
     /// what the guest stages' compiles take, and the stated host bound (the
     /// host tier's kv and the programs together: the worker's resident
     /// memory, less the drops under way, beside `need`). Waits on the drops
-    /// it needs; with none left to drop, the caller goes ahead. `at` is
-    /// never dropped (the program about to load).
-    fn make_host_room(&mut self, need: u64, at: Option<[u8; 32]>) {
+    /// it needs. With none left to drop, the stated bound is never passed:
+    /// refused by name (the tier is seated so the kv fits it with every
+    /// program dropped, and one program beside: `Shell::seat_tiers`); the
+    /// host's free memory alone short, the caller goes ahead. `at` is never
+    /// dropped (the program about to load).
+    fn make_host_room(&mut self, need: u64, at: Option<[u8; 32]>) -> Result<()> {
         let bound = self.host_bound;
         // with `freed` more bytes on their way out
         let fits_freed = |shell: &Shell, freed: u64| {
@@ -2083,6 +2126,11 @@ impl Shell {
             })
         };
         let fits = |shell: &Shell| fits_freed(shell, 0);
+        let within = |shell: &Shell| {
+            crate::device::resident_bytes().is_none_or(|held| {
+                evict::within_bound(bound, held, shell.dropper.pending(), need)
+            })
+        };
         // the droppable ones: a fired program by its last fire, one the
         // loader holds and no fire took before any (`evict::choose`)
         let candidates: Vec<evict::Droppable> = (self.evictable.iter())
@@ -2135,6 +2183,16 @@ impl Shell {
                 "xla programs parked again: the host's memory, or its stated bound, held no more"
             );
         }
+        if let Some(bound) = bound
+            && !within(self)
+        {
+            return Err(Fault::Ceiling {
+                what: "bytes of the worker's resident memory under budget_host, every program but the one loading dropped",
+                need: crate::device::resident_bytes().unwrap_or(0).saturating_add(need),
+                have: bound,
+            });
+        }
+        Ok(())
     }
 
     pub fn fire_full(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {

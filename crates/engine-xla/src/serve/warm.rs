@@ -962,7 +962,12 @@ impl Shell {
     /// first: 370 programs took the host, then the stages' compiles took the
     /// process past its cgroup's cap before ready).
     pub fn load_parked_programs(&mut self) {
+        // the worker's resident memory before the loader holds any more
+        // programs: what it holds beside the host tier's room since its
+        // seat, the largest program in it (`Shell::seat_tiers`)
+        let mut before = None;
         if !self.behind.begun {
+            before = crate::device::resident_bytes();
             self.behind.begun = true;
             self.load_behind();
         }
@@ -972,10 +977,17 @@ impl Shell {
             self.hold_per_kib = per_kib;
         }
         if let Some(bound) = self.host_bound {
+            // the guest stages built since the tier was seated: the kv the
+            // tier can't land whole beside one program, refused by name
+            // before the bound is passed
+            let tier = u64::from(self.host.chunks()) * self.host.chunk_bytes();
+            let short = before.map(|held| (held + tier).saturating_sub(bound));
             tracing::info!(
                 bound_gib = bound >> 30,
-                tier_gib = (u64::from(self.host.chunks()) * self.host.chunk_bytes()) >> 30,
+                tier_gib = tier >> 30,
                 programs_gib = self.programs_held() >> 30,
+                before_loader_mib = before.unwrap_or(0) >> 20,
+                kv_short_mib = short.unwrap_or(0) >> 20,
                 "xla host bound: the host tier's kv up to its seats, programs what the kv leaves (held at ready); programs yield to kv"
             );
         }

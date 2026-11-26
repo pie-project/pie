@@ -27,8 +27,7 @@ pub(crate) struct Droppable {
 /// (a program load or a host-tier kv landing asks it): least recently
 /// fired first, the loader's untaken ones before any, `keep` never; and
 /// whether that makes room. With no droppable program left short of room,
-/// the caller goes ahead past the room: a fire's program loads, a kv slot
-/// lands (neither is refused for programs held).
+/// the caller refuses past a stated bound ([`within_bound`]).
 pub(crate) fn choose(
     mut held: Vec<Droppable>,
     keep: Option<[u8; 32]>,
@@ -45,6 +44,20 @@ pub(crate) fn choose(
         freed = freed.saturating_add(d.bytes);
     }
     (dropped, fits(freed))
+}
+
+/// Whether `need` more bytes keep the worker's `resident` memory, less the
+/// drops `pending`, within the stated `bound` (none stated: always).
+pub(crate) fn within_bound(bound: Option<u64>, resident: u64, pending: u64, need: u64) -> bool {
+    bound.is_none_or(|bound| resident.saturating_sub(pending).saturating_add(need) <= bound)
+}
+
+/// The host tier's bytes under a stated `bound` on the worker's resident
+/// memory: what it leaves beside the worker's `resident` memory with the
+/// largest program loaded, so the kv fits it with every other program
+/// dropped and one fire's program loads beside it.
+pub(crate) fn tier_room(bound: u64, resident: u64) -> u64 {
+    bound.saturating_sub(resident)
 }
 
 /// Drops evicted programs on a thread of its own and counts the bytes they
@@ -132,7 +145,7 @@ impl Drop for Dropper {
 
 #[cfg(test)]
 mod tests {
-    use super::{Droppable, choose};
+    use super::{Droppable, choose, tier_room, within_bound};
 
     fn key(n: u8) -> [u8; 32] {
         [n; 32]
@@ -171,12 +184,28 @@ mod tests {
     }
 
     #[test]
-    fn with_none_left_to_drop_the_caller_goes_ahead_past_the_room() {
-        // every program dropped and still short: the landing is not refused
+    fn with_none_left_to_drop_the_bound_is_not_passed() {
+        // every program dropped and still short: the caller refuses
         let (dropped, fits) = choose(held(&[(1, 3, 1), (2, 1, 1)]), None, landing);
         assert_eq!(dropped, vec![key(2), key(1)]);
         assert!(!fits);
         let (dropped, fits) = choose(Vec::new(), None, landing);
         assert!(dropped.is_empty() && !fits);
+        // 95 held, 2 freed by drops: 10 more pass 100, refused; 7 do not
+        assert!(!within_bound(Some(100), 95, 2, 10));
+        assert!(within_bound(Some(100), 95, 2, 7));
+        assert!(within_bound(None, 95, 0, u64::MAX));
+    }
+
+    #[test]
+    fn the_seated_tier_fits_the_bound_beside_one_program() {
+        // bound 100, worker holding 25 with the largest program (5) loaded
+        let tier = tier_room(100, 25);
+        assert_eq!(tier, 75);
+        // the tier landed whole, the largest dropped: it loads again
+        assert!(within_bound(Some(100), 25 - 5 + tier, 0, 5));
+        assert!(!within_bound(Some(100), 25 - 5 + tier, 0, 6));
+        // a worker already past the bound seats no tier
+        assert_eq!(tier_room(100, 120), 0);
     }
 }
