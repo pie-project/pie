@@ -333,6 +333,55 @@ fn vulkan(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
     )
 }
 
+/// What this process holds of the device-local heap a load sizes by, as the
+/// driver reports it: `VK_EXT_memory_budget`'s `heapUsage` of the largest
+/// device-local heap, every allocation of the process's in it, the
+/// driver's own among them; `None` off the Vulkan backend or without the
+/// extension.
+#[must_use]
+pub fn process_usage(adapter: &wgpu::Adapter) -> Option<u64> {
+    match adapter.get_info().backend {
+        #[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+        wgpu::Backend::Vulkan => vulkan_usage(adapter),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_vendor = "apple")))]
+fn vulkan_usage(adapter: &wgpu::Adapter) -> Option<u64> {
+    use ash::vk;
+    // SAFETY: the native adapter is only read, and the guard is dropped
+    // before `adapter` is.
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let shared = hal.shared_instance();
+    let caps = hal.physical_device_capabilities();
+    let budgeted = caps.supports_extension(ash::ext::memory_budget::NAME)
+        && caps.properties().api_version >= vk::API_VERSION_1_1
+        && shared.instance_api_version() >= vk::API_VERSION_1_1;
+    if !budgeted {
+        return None;
+    }
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    // SAFETY: as in `vulkan`: the physical device belongs to the live
+    // instance, the extension is supported at Vulkan 1.1, and both structs
+    // outlive the call.
+    unsafe {
+        shared
+            .raw_instance()
+            .get_physical_device_memory_properties2(hal.raw_physical_device(), &mut props);
+    }
+    let memory = props.memory_properties;
+    let count = memory.memory_heap_count as usize;
+    let heap = memory.memory_heaps[..count]
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .max_by_key(|(_, h)| h.size)
+        .map(|(at, _)| at)?;
+    Some(budget.heap_usage[heap])
+}
+
 #[cfg(windows)]
 fn dx12(adapter: &wgpu::Adapter) -> std::result::Result<Reading, String> {
     use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL;

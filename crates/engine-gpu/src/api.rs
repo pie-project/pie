@@ -1280,6 +1280,43 @@ where
                 books.ledger()
             );
         }
+        // What the driver holds past every reservation once the load has
+        // armed, settled over a step of each kind: the pool was sized by its
+        // reading before arming (`Books::outside`), so what it grew by since
+        // is held back of the pool's chunks, and the settled figure is the
+        // load's outside.
+        let settled = shell.settle_outside().map_err(fault)?;
+        // The settle's fires are the load's, as the walks before them: a
+        // fill they walked is no serving fire's.
+        if settled.is_some() {
+            shell.filled_serving();
+        }
+        if let Some(outside) = settled {
+            let chunk = shell.pools().chunk_bytes().max(1);
+            let sized = crate::backend::Context::books(shell.device())
+                .ledger()
+                .bytes(engine::memory::Class::Outside);
+            let grown = outside.used.saturating_sub(sized);
+            let held = grown.div_ceil(chunk) * chunk;
+            caps.chunks.held_bytes = caps.chunks.held_bytes.saturating_add(held);
+            caps.chunks.outside_bytes = outside.used;
+            let mib = |bytes: u64| bytes >> 20;
+            tracing::info!(
+                engine = B::KIND,
+                "outside: {} MiB the driver holds for this process past every reservation, {} \
+                 over {} fires after arming (each step kind once more); {} MiB of it at the \
+                 pool's sizing, so {} MiB ({} chunks) of the pool is held back",
+                mib(outside.used),
+                if outside.settled { "settled" } else { "unsettled, the largest reading taken" },
+                outside.fires,
+                mib(sized),
+                mib(held),
+                held / chunk,
+            );
+            if let Some(unseen) = crate::backend::Context::outside_unseen(shell.device()) {
+                tracing::info!(engine = B::KIND, "outside: {unseen}");
+            }
+        }
         // What the load itself walked is the load's: serving counts from here.
         shell.recorded_serving();
         shell.eager_serving();
