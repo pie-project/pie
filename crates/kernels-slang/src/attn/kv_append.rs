@@ -48,6 +48,7 @@ fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(u32, u32), E
     Ok((head_dim, heads))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append(
     ctx: &Ctx<'_>,
     op: &'static str,

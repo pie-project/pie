@@ -2261,6 +2261,7 @@ impl Func {
         Ok(vs)
     }
 
+    #[allow(clippy::type_complexity)]
     fn emit_while_solid(
         &mut self,
         inits: &[Val],
