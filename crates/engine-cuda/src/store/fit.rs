@@ -324,7 +324,7 @@ pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
     {
         let mib = |bytes: u64| bytes >> 20;
         tracing::info!(
-            "integrated device: capacity {} MiB = min(dedicated {} MiB - held {} MiB, Windows commit available {} MiB), less the driver's {} MiB floor; the system memory the driver lends it is not counted (state [engine.memory] budget_device to size by it)",
+            "integrated device: capacity {} MiB = min(dedicated {} MiB - held {} MiB, Windows commit available within physical memory {} MiB), less the driver's {} MiB floor; the system memory the driver lends it is not counted (state [engine.memory] budget_device to size by it)",
             mib(terms.free()),
             mib(terms.dedicated),
             mib(terms.held),
