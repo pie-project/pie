@@ -2774,9 +2774,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
+    // A split layout's fire staged whole lands its rows where the fold would
+    // land them: past the staged window's start (`maybe_win`, the fold's),
+    // and only the window's rows.
+    const uint32_t* win = split_dropped ? params.maybe_win : nullptr;
+    const uint32_t out_row = o_indptr[request_idx] + (win != nullptr ? win[1] : 0u);
+    const uint32_t qo_len_out =
+        win != nullptr ? min(qo_len, sub_if_greater_or_zero(win[0], uint32_t(o_indptr[request_idx])))
+                       : qo_len;
     DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
                                             (kv_head_idx * group_size) * o_stride_h
-                                      : o + o_indptr[request_idx] * o_stride_n +
+                                      : o + out_row * o_stride_n +
                                             (kv_head_idx * group_size) * o_stride_h;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -3179,7 +3187,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         if ((params.maybe_sinks != nullptr || params.maybe_sinks_f32 != nullptr) && !partition_kv)
           apply_sinks<KTraits>(params, o_frag, m, d, qo_packed_idx_base, kv_head_idx, group_size,
                                lane_idx);
-        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
+        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len_out,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
                                  group_size, lane_idx);
@@ -3195,7 +3203,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                lane_idx);
 
         write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
-                                  qo_len,
+                                  qo_len_out,
 
                                   partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
                                   o_stride_h, group_size, tid);
@@ -3217,8 +3225,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                     lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) *
                             num_qo_heads +
                         qo_head_idx] = math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
-                  } else {
-                    lse[(o_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
+                  } else if (qo_idx < qo_len_out) {
+                    lse[(out_row + qo_idx) * num_qo_heads + qo_head_idx] =
                         math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                   }
                 }

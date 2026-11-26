@@ -155,6 +155,9 @@ struct BatchPrefillPagedParams {
   // PIE: each head's sink logit as f32 (a checkpoint's), applied where
   // `maybe_sinks` is (null: none, or `maybe_sinks` names them).
   float* maybe_sinks_f32;
+  // PIE: the fold's staged row window `(count, start)` a split layout's
+  // fire staged whole lands its rows by, as the fold does (null: none).
+  uint32_t* maybe_win;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

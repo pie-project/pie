@@ -138,6 +138,9 @@ pub struct PrefillPagedParams {
     /// Each head's sink logit as f32, applied where `maybe_sinks` is
     /// (null: none, or `maybe_sinks` names them).
     pub maybe_sinks_f32: DevicePtr,
+    /// The fold's staged row window `(count, start)`: a split layout's fire
+    /// staged whole lands its rows by it, as the fold does (null: none).
+    pub maybe_win: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

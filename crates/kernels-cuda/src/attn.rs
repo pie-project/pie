@@ -434,6 +434,11 @@ fn fa2_prefill_with(
     if let Some(s) = sunk {
         params.maybe_sinks = s.ptr;
     }
+    // A split layout's fire that lands its rows whole lands them by the
+    // fold's row window, as the fold would.
+    if plan.info.split_kv {
+        params.maybe_win = ctx.stage_at();
+    }
     // A split layout's fire that lands its rows whole folds none: the sinks
     // the fold would land, the kernel lands there (bf16 or f32, as the fold
     // reads them).
