@@ -115,6 +115,7 @@ pub fn reset() {
     crate::policy::reset();
     crate::pipeline::reset();
     crate::offload::reset();
+    #[cfg(not(target_arch = "wasm32"))]
     crate::handle::snapshot::reset();
     crate::scheduler::reset();
     crate::planner::reset();
