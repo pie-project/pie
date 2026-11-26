@@ -3883,12 +3883,15 @@ fn golden_staged_experts() {
         };
         let mut shell = load_with(&fixture, &cache, staged());
         let staging = shell.expert_staging().clone();
-        assert_eq!(
-            shell
-                .ledger()
-                .of(engine::memory::Class::Fire, "staged experts"),
-            staging.bytes(),
-            "{model}: the ledger enters the staging as a fire's"
+        // The span lays each staged run to its own alignment (4 KiB), and
+        // the ledger enters the run as laid.
+        let entered = shell
+            .ledger()
+            .of(engine::memory::Class::Fire, "staged experts");
+        assert!(
+            entered >= staging.bytes() && entered - staging.bytes() < 4096,
+            "{model}: the ledger enters the staging as a fire's run: {entered} for {}",
+            staging.bytes()
         );
         let fact = staging
             .fact()
