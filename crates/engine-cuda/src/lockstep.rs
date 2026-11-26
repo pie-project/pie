@@ -379,6 +379,28 @@ impl Group {
     /// the others; the last to come maps every rank's EP buffers into the
     /// others. Each rank then lays its layers' placements on its own device.
     fn meet(&self, rank: usize, shell: &mut crate::serve::Shell) -> Result<(), String> {
+        // The spare a rebalance copies an expert through is laid at load, on
+        // the leader's device where the copies run: the widest expert's
+        // planes of any layer.
+        if rank == 0
+            && let Some(rebalancer) = &self.rebalancer
+            && let Some((ep, _)) = shell.rebalance_view()
+        {
+            let widest = ep
+                .layers()
+                .filter_map(|(layer, ..)| {
+                    ep.planes(layer)
+                        .ok()
+                        .map(|planes| planes.iter().map(|plane| plane.slot_bytes).sum::<u64>())
+                })
+                .max()
+                .unwrap_or(0);
+            rebalancer
+                .lock()
+                .expect("lockstep rebalance lock poisoned")
+                .lay_spare(widest)
+                .map_err(|fault| fault.to_string())?;
+        }
         let shape = shell
             .ep_shape()
             .ok_or("the loaded trace dispatches nothing: it is not an expert-parallel rank's")?;

@@ -124,14 +124,9 @@ impl Context {
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
                 crate::device::held::adopt_stream(ordinal, stream.cast());
-                // The heaps' first chunks, while the load may wait.
+                // The pinned heap's first chunk, while the load may wait.
                 let reserved =
-                    crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned)
-                        .and_then(|()| {
-                            crate::device::held::heap::reserve(
-                                crate::device::held::heap::Kind::Device,
-                            )
-                        });
+                    crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned);
                 if let Err(fault) = reserved {
                     destroy_stream(ordinal, stream.cast());
                     return Err(fault);

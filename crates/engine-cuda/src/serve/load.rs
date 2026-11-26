@@ -771,6 +771,8 @@ impl Shell {
             crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
         crate::device::held::heap_mark();
+        // A load lays its own buffers, whatever this thread served before.
+        crate::device::alloc::loading_from_here();
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.

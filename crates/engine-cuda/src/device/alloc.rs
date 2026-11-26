@@ -5,10 +5,6 @@ use crate::error::{Fault, Result};
 pub struct Buffer {
     ptr: u64,
     bytes: usize,
-    /// The device heap's class this is a cell of, and the device
-    /// (`device::held::heap`).
-    #[cfg_attr(not(feature = "device"), allow(dead_code))]
-    carved: Option<(usize, i32)>,
     /// Another owner's bytes ([`Buffer::over`]): never given back here.
     lent: bool,
     /// Whether a lent run lies where its owner laid it; one that does not
@@ -16,21 +12,59 @@ pub struct Buffer {
     laid: bool,
 }
 
-/// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`,
-/// and the device heap's class when it is a cell of it: small spans are
-/// carved (`device::held::heap`), larger ones are one an earlier drop kept
-/// when its last reader landed, where there is one (`device::held::recycle`).
+thread_local! {
+    /// Whether this thread's load serves: from its first submitted frame on
+    /// ([`serving_from_here`]), no device buffer is made on it.
+    static SERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread's load serves from here: a device buffer asked on it after
+/// is refused by name ([`Buffer::zeroed`]), and one dropped is freed only
+/// once the shell is down (`device::held::deferred`).
+pub fn serving_from_here() {
+    SERVING.set(true);
+}
+
+/// This thread lays a load from here: what it makes is the load's own.
+pub fn loading_from_here() {
+    SERVING.set(false);
+}
+
+/// `f` on this thread as a load's, not a serving step's: a reload of the
+/// weights, a shell made or let go. What it makes is the load's own.
+pub fn as_load<R>(f: impl FnOnce() -> R) -> R {
+    let was = SERVING.replace(false);
+    let out = f();
+    SERVING.set(was);
+    out
+}
+
+/// `bytes` of device memory for a [`Buffer`], given back once in its
+/// `Drop`: the driver's, at load. On a thread whose load serves none is
+/// made: the load sized no room for it, a sizing bug the request that asked
+/// is refused for, by its caller's name.
 #[cfg(feature = "device")]
-fn alloc(bytes: usize) -> Result<(*mut core::ffi::c_void, Option<(usize, i32)>)> {
-    use crate::device::held::heap::{self, Kind};
-    if let Some(class) = heap::class_of(Kind::Device, bytes) {
-        let cell = heap::take(Kind::Device, class)?;
-        return Ok((
-            cell.device as *mut core::ffi::c_void,
-            Some((class, cell.ordinal)),
+#[track_caller]
+fn alloc(bytes: usize) -> Result<*mut core::ffi::c_void> {
+    use crate::device::rt;
+    if SERVING.get() {
+        let at = std::panic::Location::caller();
+        return Err(Fault::program(
+            "device::alloc",
+            format!(
+                "a device buffer of {bytes} bytes was asked by {}:{} after the load was ready: \
+                 the load's walk sized no room for it, so this request is refused (a sizing bug, \
+                 not a shortage)",
+                at.file(),
+                at.line()
+            ),
         ));
     }
-    crate::device::held::recycle::alloc(bytes).map(|ptr| (ptr as *mut core::ffi::c_void, None))
+    let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `base` is a live local the call fills.
+    let code = unsafe { rt::cudaMalloc(&raw mut base, bytes) };
+    crate::device::ctx::check("cudaMalloc", code).map_err(|fault| out_of_room(fault, bytes))?;
+    Ok(base)
 }
 
 #[cfg(feature = "device")]
@@ -118,46 +152,39 @@ unsafe fn landed_zero(at: *mut core::ffi::c_void, len: usize) -> Result<()> {
 }
 
 impl Buffer {
+    #[track_caller]
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         Buffer::zeroed_with(bytes, true)
     }
 
-    /// [`Buffer::zeroed`], never a cell of the device heap, whose chunks
-    /// the process keeps: dropped, it goes to the idle store
-    /// [`crate::device::held::release_idle`] gives back to the driver. For
-    /// a step that lays buffers of many sizes once and is gone before the
-    /// load reads the card (the rates measured at load).
+    /// [`Buffer::zeroed`]: what a step that lays buffers of many sizes once
+    /// and is gone before the load reads the card asks (the rates measured
+    /// at load).
+    #[track_caller]
     pub fn zeroed_apart(bytes: usize) -> Result<Buffer> {
         Buffer::zeroed_with(bytes, false)
     }
 
+    #[track_caller]
     fn zeroed_with(bytes: usize, carve: bool) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer {
                 ptr: 0,
                 bytes: 0,
-                carved: None,
                 lent: false,
                 laid: true,
             });
         }
         #[cfg(feature = "device")]
         {
-            let (base, carved) = if carve {
-                alloc(bytes)?
-            } else {
-                (
-                    crate::device::held::recycle::alloc(bytes)? as *mut core::ffi::c_void,
-                    None,
-                )
-            };
+            let _ = carve;
+            let base = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes;
             // the set lands before any stream is handed the buffer.
             unsafe { landed_zero(base, bytes)? };
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
-                carved,
                 lent: false,
                 laid: true,
             })
@@ -169,12 +196,12 @@ impl Buffer {
         }
     }
 
+    #[track_caller]
     pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer {
                 ptr: 0,
                 bytes: 0,
-                carved: None,
                 lent: false,
                 laid: true,
             });
@@ -183,7 +210,7 @@ impl Buffer {
         {
             use crate::device::rt;
 
-            let (base, carved) = alloc(bytes)?;
+            let base = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
             // `stream` is the one every later read of it is ordered on.
             unsafe {
@@ -195,7 +222,6 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
-                carved,
                 lent: false,
                 laid: true,
             })
@@ -214,7 +240,6 @@ impl Buffer {
         Buffer {
             ptr,
             bytes,
-            carved: None,
             lent: true,
             laid: true,
         }
@@ -265,10 +290,11 @@ impl Buffer {
         self.bytes
     }
 
-    /// Whether this is a cell carved from the device heap's chunks.
+    /// Whether this was carved from a heap: never, now that device buffers
+    /// are the driver's at load.
     #[must_use]
     pub const fn carved(&self) -> bool {
-        self.carved.is_some()
+        false
     }
 
     pub fn at(&self, offset: u64) -> Result<u64> {
@@ -627,18 +653,12 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         #[cfg(feature = "device")]
         if self.ptr != 0 && !self.lent {
-            use crate::device::held::heap::{self, Cell, Kind};
-            match self.carved {
-                Some((class, ordinal)) => heap::give(
-                    Kind::Device,
-                    class,
-                    Cell {
-                        host: 0,
-                        device: self.ptr,
-                        ordinal,
-                    },
-                ),
-                None => crate::device::held::recycle::release(self.ptr, self.bytes),
+            if SERVING.get() {
+                // A free waits on the device: never while its load serves.
+                crate::device::held::deferred::later(self.ptr);
+            } else {
+                // SAFETY: the allocation this buffer owns, freed once.
+                let _ = unsafe { crate::device::rt::cudaFree(self.ptr as *mut core::ffi::c_void) };
             }
         }
     }

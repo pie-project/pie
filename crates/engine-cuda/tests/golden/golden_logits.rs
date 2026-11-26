@@ -3908,17 +3908,11 @@ fn golden_staged_experts() {
         // nothing more of the device.
         let first = staged_steps(&mut shell, trace);
         let free = engine_cuda::device::free_bytes();
-        let heaps = engine_cuda::device::held::heap_bytes();
         let second = staged_steps(&mut shell, trace);
         assert_eq!(
             engine_cuda::device::free_bytes(),
             free,
             "{model}: a staged fire took device memory"
-        );
-        assert_eq!(
-            engine_cuda::device::held::heap_bytes(),
-            heaps,
-            "{model}: a staged fire grew a heap"
         );
         assert_eq!(second, first, "{model}: the second round is the first's");
         for (at, (got, want)) in first.iter().zip(&want).enumerate() {

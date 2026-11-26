@@ -441,32 +441,8 @@ pub(super) fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engi
     ] {
         ledger.enter(Class::Fire, name, bytes);
     }
-    // The heaps' chunks are this process's whatever load made them, and a
-    // load carves its own cells from them (the readout rows among them),
-    // so they are entered whole, less the cells entered by their owners,
-    // and the device held before the load is entered without them.
-    let heaps = crate::device::held::heap_bytes() as u64;
-    let heaps_before = heaps.saturating_sub(crate::device::held::heap_bytes_since() as u64);
-    ledger.enter(
-        Class::Outside,
-        "heap chunks",
-        heaps.saturating_sub(if shell.readout_rows.carved() {
-            held.readout
-        } else {
-            0
-        }),
-    );
-    ledger.enter(
-        Class::Outside,
-        "idle shelf",
-        crate::device::held::kept_bytes() as u64,
-    );
     ledger.enter(Class::Outside, "graph bodies", held.bodies);
-    ledger.enter(
-        Class::Outside,
-        "before the load",
-        held.before.saturating_sub(heaps_before),
-    );
+    ledger.enter(Class::Outside, "before the load", held.before);
     // Where the allocator's own takes are known, the driver's and its
     // libraries' (streams' queues, code objects) are measured as what the
     // device holds past them, the bodies apart; the audit then states only
