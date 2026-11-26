@@ -1,0 +1,211 @@
+# private.sqlite: steps (graph/launch groups holding the decode kernel) 336; window 4.92 s
+# step launch APIs: {'cudaGraphLaunch_v10000': 336}
+# prefill-carrying steps 15, decode-only 321
+# step GPU span us: p50 14080, prefill p50 13243, decode-only p50 14388
+# gaps (us) between step N end and step N+1 first kernel: n 335 sum 323.4 ms p50 236.9 p90 255.7 max 79378.1
+# histogram gap_us: [-1e+09,0): 0, [0,10): 0, [10,25): 0, [25,50): 0, [50,100): 1, [100,250): 295, [250,500): 22, [500,1000): 4, [1000,2500): 5, [2500,5000): 1, [5000,1e+12): 7
+
+# 20 largest gaps
+rank	gap_us	stepN_prefill	stepN1_prefill	stepN_span_us	N1_launch_api	launch_api_start_minus_stepN_end_us	launch_api_dur_us	device_start_minus_launch_api_end_us
+1	79378.1	0	1	3475	cudaGraphLaunch_v10000	78814.7	561.2	2.1
+2	50514.3	0	0	9453	cudaGraphLaunch_v10000	49645.9	867.8	0.5
+3	40675.3	0	0	9462	cudaGraphLaunch_v10000	39990.3	684.0	1.0
+4	24027.9	0	0	9623	cudaGraphLaunch_v10000	23202.2	825.9	-0.1
+5	13885.3	0	0	10621	cudaGraphLaunch_v10000	13505.1	378.1	2.2
+6	13594.1	0	0	9789	cudaGraphLaunch_v10000	12935.3	665.7	-6.9
+7	13160.7	0	0	10119	cudaGraphLaunch_v10000	12759.3	399.3	2.0
+8	3544.3	0	0	10371	cudaGraphLaunch_v10000	3158.5	383.8	2.0
+9	2419.3	0	0	11030	cudaGraphLaunch_v10000	1459.0	958.7	1.6
+10	2059.6	0	0	10530	cudaGraphLaunch_v10000	1536.3	521.9	1.4
+11	1446.7	0	0	11110	cudaGraphLaunch_v10000	736.6	708.2	1.9
+12	1126.8	0	1	3449	cudaGraphLaunch_v10000	-9425.0	856.7	9695.0
+13	1008.4	0	1	3328	cudaGraphLaunch_v10000	-9892.3	617.3	10283.3
+14	945.1	0	1	3461	cudaGraphLaunch_v10000	-15950.0	528.9	16366.3
+15	912.5	0	0	10444	cudaGraphLaunch_v10000	525.6	384.8	2.1
+16	830.6	0	1	3453	cudaGraphLaunch_v10000	-8188.0	589.0	8429.5
+17	540.4	0	0	9151	cudaGraphLaunch_v10000	-11382.3	463.3	11459.4
+18	447.5	0	1	3469	cudaGraphLaunch_v10000	-13120.1	519.9	13047.7
+19	383.8	0	1	3474	cudaGraphLaunch_v10000	-12763.5	500.7	12646.6
+20	383.4	0	1	3552	cudaGraphLaunch_v10000	-13401.3	379.4	13405.3
+
+# host side for the 20 largest gaps: CUDA runtime calls on the thread that launched step N+1, from step N end to step N+1 first kernel (name, start offset from step N end us, duration us)
+gap 1 79378.1 us: 5753 calls covering 11287.4 us; by name: cudaEventQuery_v3020 2288.9; cudaMemcpyAsync_v3020 2142.1; cudaEventCreateWithFlags_v3020 1960.4; cudaMemsetAsync_v3020 1719.4; cudaGraphLaunch_v10000 1638.5; cudaEventRecord_v3020 837.2
+   cudaEventCreateWithFlags_v3020	+8.5	0.4
+   cudaEventRecord_v3020	+9.0	2.3
+   cudaEventQuery_v3020	+13.3	1.2
+   cudaEventCreateWithFlags_v3020	+16.2	0.4
+   cudaEventRecord_v3020	+16.7	0.7
+   cudaEventCreateWithFlags_v3020	+25.1	15.0
+   cudaEventRecord_v3020	+40.4	0.7
+   cudaEventQuery_v3020	+45.9	4.3
+   cudaEventSynchronize_v3020	+54.1	6.2
+   cudaEventCreateWithFlags_v3020	+67.0	0.6
+   cudaEventRecord_v3020	+67.7	0.5
+   cudaEventCreateWithFlags_v3020	+68.8	0.3
+gap 2 50514.3 us: 9 calls covering 1068.5 us; by name: cudaGraphLaunch_v10000 867.8; cudaMemcpyBatchAsync_v13000 91.4; cuLaunchKernelEx 48.4; cudaMemcpyAsync_v3020 30.2; cudaEventQuery_v3020 12.0; cudaStreamIsCapturing_v10000 11.1
+   cudaStreamIsCapturing_v10000	+49218.3	10.0
+   cudaMemcpyBatchAsync_v13000	+49280.6	91.4
+   cudaStreamIsCapturing_v10000	+49373.3	1.1
+   cudaMemcpyAsync_v3020	+49376.5	20.3
+   cuLaunchKernelEx	+49407.6	48.4
+   cudaEventQuery_v3020	+49555.1	12.0
+   cudaMemcpyAsync_v3020	+49568.9	9.9
+   cudaEventRecord_v3020	+49581.0	7.6
+   cudaGraphLaunch_v10000	+49645.9	867.8
+gap 3 40675.3 us: 9 calls covering 847.2 us; by name: cudaGraphLaunch_v10000 684.0; cudaMemcpyBatchAsync_v13000 73.8; cuLaunchKernelEx 38.5; cudaMemcpyAsync_v3020 28.3; cudaEventQuery_v3020 8.6; cudaStreamIsCapturing_v10000 7.6
+   cudaStreamIsCapturing_v10000	+39658.0	6.9
+   cudaMemcpyBatchAsync_v13000	+39700.1	73.8
+   cudaStreamIsCapturing_v10000	+39774.8	0.7
+   cudaMemcpyAsync_v3020	+39776.9	14.5
+   cuLaunchKernelEx	+39800.3	38.5
+   cudaEventQuery_v3020	+39914.9	8.6
+   cudaMemcpyAsync_v3020	+39924.6	13.8
+   cudaEventRecord_v3020	+39940.2	6.4
+   cudaGraphLaunch_v10000	+39990.3	684.0
+gap 4 24027.9 us: 9 calls covering 976.3 us; by name: cudaGraphLaunch_v10000 825.7; cudaMemcpyBatchAsync_v13000 73.4; cuLaunchKernelEx 32.9; cudaMemcpyAsync_v3020 24.8; cudaEventQuery_v3020 7.8; cudaStreamIsCapturing_v10000 5.9
+   cudaStreamIsCapturing_v10000	+22867.1	5.2
+   cudaMemcpyBatchAsync_v13000	+22912.7	73.4
+   cudaStreamIsCapturing_v10000	+22987.3	0.8
+   cudaMemcpyAsync_v3020	+22989.7	15.7
+   cuLaunchKernelEx	+23012.5	32.9
+   cudaEventQuery_v3020	+23130.1	7.8
+   cudaMemcpyAsync_v3020	+23139.3	9.1
+   cudaEventRecord_v3020	+23149.9	5.7
+   cudaGraphLaunch_v10000	+23202.2	825.9
+gap 5 13885.3 us: 9 calls covering 453.5 us; by name: cudaGraphLaunch_v10000 378.1; cudaMemcpyBatchAsync_v13000 32.6; cuLaunchKernelEx 17.9; cudaMemcpyAsync_v3020 12.8; cudaStreamIsCapturing_v10000 4.8; cudaEventQuery_v3020 4.7
+   cudaStreamIsCapturing_v10000	+13345.5	4.4
+   cudaMemcpyBatchAsync_v13000	+13369.6	32.6
+   cudaStreamIsCapturing_v10000	+13402.7	0.4
+   cudaMemcpyAsync_v3020	+13403.8	8.2
+   cuLaunchKernelEx	+13414.8	17.9
+   cudaEventQuery_v3020	+13469.6	4.7
+   cudaMemcpyAsync_v3020	+13475.0	4.6
+   cudaEventRecord_v3020	+13480.3	2.7
+   cudaGraphLaunch_v10000	+13505.1	378.1
+gap 6 13594.1 us: 9 calls covering 846.2 us; by name: cudaGraphLaunch_v10000 658.8; cudaMemcpyBatchAsync_v13000 89.7; cuLaunchKernelEx 39.8; cudaMemcpyAsync_v3020 29.1; cudaEventQuery_v3020 11.3; cudaStreamIsCapturing_v10000 10.7
+   cudaStreamIsCapturing_v10000	+12383.0	9.8
+   cudaMemcpyBatchAsync_v13000	+12457.2	89.7
+   cudaStreamIsCapturing_v10000	+12548.0	0.8
+   cudaMemcpyAsync_v3020	+12551.1	19.2
+   cuLaunchKernelEx	+12581.7	39.8
+   cudaEventQuery_v3020	+12854.5	11.3
+   cudaMemcpyAsync_v3020	+12867.2	9.9
+   cudaEventRecord_v3020	+12879.2	7.0
+   cudaGraphLaunch_v10000	+12935.3	665.7
+gap 7 13160.7 us: 9 calls covering 481.0 us; by name: cudaGraphLaunch_v10000 399.3; cudaMemcpyBatchAsync_v13000 39.4; cuLaunchKernelEx 18.0; cudaMemcpyAsync_v3020 12.0; cudaEventQuery_v3020 5.4; cudaStreamIsCapturing_v10000 3.8
+   cudaStreamIsCapturing_v10000	+12576.0	3.4
+   cudaMemcpyBatchAsync_v13000	+12606.4	39.4
+   cudaStreamIsCapturing_v10000	+12646.7	0.4
+   cudaMemcpyAsync_v3020	+12648.1	7.3
+   cuLaunchKernelEx	+12659.0	18.0
+   cudaEventQuery_v3020	+12720.0	5.4
+   cudaMemcpyAsync_v3020	+12726.4	4.6
+   cudaEventRecord_v3020	+12731.8	3.0
+   cudaGraphLaunch_v10000	+12759.3	399.3
+gap 8 3544.3 us: 9 calls covering 453.4 us; by name: cudaGraphLaunch_v10000 383.8; cudaMemcpyBatchAsync_v13000 29.8; cuLaunchKernelEx 14.0; cudaMemcpyAsync_v3020 12.5; cudaStreamIsCapturing_v10000 6.9; cudaEventQuery_v3020 4.3
+   cudaStreamIsCapturing_v10000	+2997.8	2.1
+   cudaMemcpyBatchAsync_v13000	+3021.0	29.8
+   cudaStreamIsCapturing_v10000	+3051.3	4.7
+   cudaMemcpyAsync_v3020	+3064.5	7.5
+   cuLaunchKernelEx	+3074.6	14.0
+   cudaEventQuery_v3020	+3124.5	4.3
+   cudaMemcpyAsync_v3020	+3129.7	5.0
+   cudaEventRecord_v3020	+3135.4	2.1
+   cudaGraphLaunch_v10000	+3158.5	383.8
+gap 9 2419.3 us: 9 calls covering 1104.5 us; by name: cudaGraphLaunch_v10000 958.7; cudaMemcpyBatchAsync_v13000 68.3; cuLaunchKernelEx 31.8; cudaMemcpyAsync_v3020 24.9; cudaEventQuery_v3020 7.7; cudaStreamIsCapturing_v10000 7.3
+   cudaStreamIsCapturing_v10000	+993.5	6.5
+   cudaMemcpyBatchAsync_v13000	+1057.4	68.3
+   cudaStreamIsCapturing_v10000	+1126.5	0.8
+   cudaMemcpyAsync_v3020	+1128.6	16.7
+   cuLaunchKernelEx	+1153.3	31.8
+   cudaEventQuery_v3020	+1393.2	7.7
+   cudaMemcpyAsync_v3020	+1402.3	8.2
+   cudaEventRecord_v3020	+1412.7	5.9
+   cudaGraphLaunch_v10000	+1459.0	958.7
+gap 10 2059.6 us: 9 calls covering 833.7 us; by name: cudaGraphLaunch_v10000 521.9; cudaMemcpyAsync_v3020 159.8; cudaMemcpyBatchAsync_v13000 85.5; cuLaunchKernelEx 35.7; cudaStreamIsCapturing_v10000 13.1; cudaEventQuery_v3020 11.7
+   cudaStreamIsCapturing_v10000	+883.1	12.4
+   cudaMemcpyBatchAsync_v13000	+956.9	85.5
+   cudaStreamIsCapturing_v10000	+1043.3	0.7
+   cudaMemcpyAsync_v3020	+1046.4	18.5
+   cuLaunchKernelEx	+1075.6	35.7
+   cudaEventQuery_v3020	+1326.8	11.7
+   cudaMemcpyAsync_v3020	+1339.8	141.3
+   cudaEventRecord_v3020	+1486.3	6.0
+   cudaGraphLaunch_v10000	+1536.3	521.9
+gap 11 1446.7 us: 9 calls covering 813.3 us; by name: cudaGraphLaunch_v10000 708.2; cudaMemcpyBatchAsync_v13000 41.6; cuLaunchKernelEx 36.0; cudaMemcpyAsync_v3020 16.5; cudaEventQuery_v3020 5.7; cudaStreamIsCapturing_v10000 3.2
+   cudaStreamIsCapturing_v10000	+509.9	2.8
+   cudaMemcpyBatchAsync_v13000	+547.5	41.6
+   cudaStreamIsCapturing_v10000	+589.6	0.3
+   cudaMemcpyAsync_v3020	+591.2	9.9
+   cuLaunchKernelEx	+604.9	36.0
+   cudaEventQuery_v3020	+694.4	5.7
+   cudaMemcpyAsync_v3020	+701.7	6.5
+   cudaEventRecord_v3020	+709.8	2.3
+   cudaGraphLaunch_v10000	+736.6	708.2
+gap 12 1126.8 us: 121 calls covering 263.7 us; by name: cudaMemcpyAsync_v3020 99.4; cudaEventQuery_v3020 89.5; cudaMemsetAsync_v3020 59.6; cudaEventDestroy_v3020 15.1
+   cudaEventQuery_v3020	+183.2	3.9
+   cudaMemsetAsync_v3020	+501.9	14.5
+   cudaEventQuery_v3020	+518.1	5.4
+   cudaEventDestroy_v3020	+524.0	1.0
+   cudaEventQuery_v3020	+528.6	2.8
+   cudaEventDestroy_v3020	+531.9	0.6
+   cudaEventQuery_v3020	+535.1	2.3
+   cudaEventDestroy_v3020	+537.9	0.4
+   cudaEventQuery_v3020	+540.5	2.9
+   cudaEventDestroy_v3020	+544.0	0.4
+   cudaMemsetAsync_v3020	+565.2	2.7
+   cudaMemsetAsync_v3020	+570.4	2.3
+gap 13 1008.4 us: 0 calls covering 0.0 us; by name: 
+gap 14 945.1 us: 110 calls covering 206.6 us; by name: cudaMemcpyAsync_v3020 80.0; cudaEventQuery_v3020 73.3; cudaMemsetAsync_v3020 40.7; cudaEventDestroy_v3020 12.6
+   cudaEventQuery_v3020	+-0.1	3.1
+   cudaEventDestroy_v3020	+3.3	0.7
+   cudaEventQuery_v3020	+6.1	2.3
+   cudaEventDestroy_v3020	+8.9	0.4
+   cudaEventQuery_v3020	+11.3	2.6
+   cudaEventDestroy_v3020	+14.4	0.5
+   cudaMemsetAsync_v3020	+24.4	1.9
+   cudaMemsetAsync_v3020	+27.3	1.7
+   cudaMemcpyAsync_v3020	+29.2	2.5
+   cudaMemcpyAsync_v3020	+32.4	2.0
+   cudaMemcpyAsync_v3020	+34.9	2.2
+   cudaMemcpyAsync_v3020	+37.2	2.1
+gap 15 912.5 us: 9 calls covering 463.8 us; by name: cudaGraphLaunch_v10000 384.8; cudaMemcpyBatchAsync_v13000 36.0; cuLaunchKernelEx 22.2; cudaMemcpyAsync_v3020 10.7; cudaEventQuery_v3020 4.4; cudaStreamIsCapturing_v10000 3.5
+   cudaStreamIsCapturing_v10000	+364.2	3.1
+   cudaMemcpyBatchAsync_v13000	+389.1	36.0
+   cudaStreamIsCapturing_v10000	+425.7	0.3
+   cudaMemcpyAsync_v3020	+426.7	6.4
+   cuLaunchKernelEx	+436.1	22.2
+   cudaEventQuery_v3020	+494.5	4.4
+   cudaMemcpyAsync_v3020	+499.7	4.3
+   cudaEventRecord_v3020	+504.9	2.2
+   cudaGraphLaunch_v10000	+525.6	384.8
+gap 16 830.6 us: 0 calls covering 0.0 us; by name: 
+gap 17 540.4 us: 0 calls covering 0.0 us; by name: 
+gap 18 447.5 us: 101 calls covering 186.1 us; by name: cudaMemcpyAsync_v3020 83.5; cudaEventQuery_v3020 56.5; cudaMemsetAsync_v3020 35.3; cudaEventDestroy_v3020 10.7
+   cudaMemcpyAsync_v3020	+-2.1	2.7
+   cudaMemcpyAsync_v3020	+1.1	2.1
+   cudaMemcpyAsync_v3020	+3.7	2.2
+   cudaMemcpyAsync_v3020	+6.0	2.1
+   cudaMemcpyAsync_v3020	+8.3	2.3
+   cudaMemsetAsync_v3020	+33.8	2.0
+   cudaEventQuery_v3020	+36.5	2.3
+   cudaEventDestroy_v3020	+39.3	0.3
+   cudaEventQuery_v3020	+42.0	2.3
+   cudaEventDestroy_v3020	+44.8	0.7
+   cudaEventQuery_v3020	+47.6	2.7
+   cudaEventDestroy_v3020	+50.7	0.4
+gap 19 383.8 us: 59 calls covering 129.8 us; by name: cudaMemcpyAsync_v3020 53.4; cudaMemsetAsync_v3020 35.8; cudaEventQuery_v3020 34.8; cudaEventDestroy_v3020 5.8
+   cudaMemsetAsync_v3020	+6.1	4.7
+   cudaMemsetAsync_v3020	+14.6	3.4
+   cudaMemcpyAsync_v3020	+18.8	4.3
+   cudaMemcpyAsync_v3020	+24.8	2.6
+   cudaMemcpyAsync_v3020	+29.4	2.4
+   cudaMemcpyAsync_v3020	+31.9	2.2
+   cudaMemcpyAsync_v3020	+34.3	2.5
+   cudaMemsetAsync_v3020	+82.6	2.4
+   cudaEventQuery_v3020	+85.9	3.3
+   cudaEventDestroy_v3020	+90.0	0.6
+   cudaEventQuery_v3020	+94.1	2.3
+   cudaEventDestroy_v3020	+97.1	0.4
+gap 20 383.4 us: 1 calls covering 1.4 us; by name: cudaEventQuery_v3020 1.4
+   cudaEventQuery_v3020	+138.2	1.4

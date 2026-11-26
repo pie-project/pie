@@ -1,0 +1,17 @@
+Step-gap extracts from the g10 nsys windows (5 s each, covering the end of round 4 and most of round 5).
+Server   tok/s r5 | steps prefill/decode-only | gap sum ms | gaps 1-5 ms | gaps >5 ms | largest gaps (ms)
+shared-2 (low)  15207 | 20 / 291 | 695.3 | 20 | 11 | 228.1, 212.9, 31.3, 29.5, 15.2
+private         15590 | 15 / 321 | 323.4 |  6 |  7 |  79.4, 50.5, 40.7, 24.0, 13.9
+shared-1        15449 | 32 / 304 | 543.1 |  3 |  9 | 184.5, 172.2, 27.7, 20.1, 15.7
+Step = one cudaGraphLaunch group holding the decode kernel (every step was a graph launch); prefill = step holding the
+cutlass gemm_relu 256x128 or the ampere 128x128 64x3 gemm. Gap = first kernel of step N+1 minus last kernel end of step N.
+Host side: in every large gap the next step's cudaGraphLaunch starts late (launch call start minus step N end is
+nearly the whole gap; the call itself takes 0.4-3.3 ms; the device starts within about 2 us of the call returning).
+Ordinary large gaps (3-50 ms): the launching thread makes only 9 CUDA calls (about 1 ms in all): it is not waiting
+on the device in a CUDA call; it is busy or blocked outside CUDA (no OS-runtime trace was captured to tell which).
+Boundary gaps (shared: 2 per window, 170-228 ms; private: 1, 79 ms): each precedes a prefill-carrying step, with
+5.7k (private) to 14k (shared) CUDA calls on the thread (cudaMemcpyAsync, cudaMemsetAsync, cudaEventQuery/Record/
+CreateWithFlags), 11-39 ms of call time; the rest of the gap is outside CUDA calls as well.
+Without the boundary gaps the gap sums are close: shared-2 254 ms, private 244 ms, shared-1 186 ms.
+Tables read: CUPTI_ACTIVITY_KIND_KERNEL, CUPTI_ACTIVITY_KIND_RUNTIME, StringIds (names only); no TARGET_INFO or process
+environment table was read. Files: *.steps.txt (histogram, 20 largest gaps, host calls per gap), steps.py (the query).
