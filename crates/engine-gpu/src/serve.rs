@@ -3114,9 +3114,18 @@ impl<B: Serve> Shell<B> {
 
         // The ledger's capacity is what the device has, measured once the
         // context, the weights and every load-time reservation beside the
-        // pool are up; what the driver holds by then is its own entry.
+        // pool are up; what the driver holds by then is its own entry. The
+        // safety floor stays out of it beside the driver's share: a device
+        // whose room is read of the host's has the floor taken off there
+        // (`host_memory::room`), any other here.
         device.books().outside("driver", device.outside());
-        device.books().settle(chunk, device.capacity());
+        let capacity = device.capacity();
+        let capacity = if device.host_room().is_some() {
+            capacity
+        } else {
+            capacity.saturating_sub(engine::SAFETY_FLOOR_BYTES)
+        };
+        device.books().settle(chunk, capacity);
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
@@ -4741,11 +4750,9 @@ impl<B: Serve> Shell<B> {
     /// the device does not report what this process holds, or the load
     /// seats no slot to fire on.
     pub fn settle_outside(&mut self) -> Result<Option<engine::memory::Outside>> {
-        if !self.device.measures_outside() {
+        if let Some(why) = self.device.outside_unmeasured() {
             tracing::info!(
-                "outside: unmeasured: this device reports no per-process usage (no \
-                 VK_EXT_memory_budget, or a wgpu backend other than Vulkan); budget_device \
-                 bounds what the load reserves alone"
+                "outside: unmeasured: {why}; budget_device bounds what the load reserves alone"
             );
             return Ok(None);
         }

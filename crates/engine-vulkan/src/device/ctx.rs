@@ -238,6 +238,9 @@ pub(crate) struct Core {
     pub(crate) discrete: bool,
     pub(crate) api_version: u32,
     pub(crate) features: Enabled,
+    /// The key the driver reports this device's allocations under
+    /// (`device::report`), where the memory report is on.
+    report_key: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -302,10 +305,10 @@ impl Core {
             // On a device whose heaps are all the host's, every heap the
             // driver allocates in is this process's memory.
             None if self.features.memory_report && self.whose_memory.unified() => {
-                super::report::live_bytes_all().saturating_sub(reserved)
+                super::report::live_bytes_all(self.report_key).saturating_sub(reserved)
             }
             None if self.features.memory_report => {
-                super::report::live_bytes(self.heap).saturating_sub(reserved)
+                super::report::live_bytes(self.report_key, self.heap).saturating_sub(reserved)
             }
             None => 0,
         }
@@ -748,6 +751,8 @@ impl Drop for Core {
             }
             // The instance is the process's (`shared_instance`).
             self.device.destroy_device(None);
+            // The device's last frees are reported: its count goes.
+            super::report::forget(self.report_key);
         }
     }
 }
@@ -1360,8 +1365,12 @@ impl Context {
         }
         let mut report_on =
             vk::PhysicalDeviceDeviceMemoryReportFeaturesEXT::default().device_memory_report(true);
+        // The driver hands the key back with each report, so each device
+        // counts its own.
+        let report_key = super::report::new_key();
         let mut report = vk::DeviceDeviceMemoryReportCreateInfoEXT::default()
-            .pfn_user_callback(Some(super::report::reported));
+            .pfn_user_callback(Some(super::report::reported))
+            .user_data(report_key as *mut core::ffi::c_void);
         if enabled.memory_report {
             exts.push(ash::ext::device_memory_report::NAME.as_ptr());
             enable = enable.push_next(&mut report_on);
@@ -1498,6 +1507,7 @@ impl Context {
             discrete: props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU,
             api_version: props.api_version,
             features: enabled,
+            report_key,
         });
 
         let dummy = Raw::new(
@@ -1581,11 +1591,19 @@ impl Context {
         self.core.outside()
     }
 
-    /// Whether [`Context::outside`] is measured: the driver reports this
-    /// process's heap usage (`VK_EXT_memory_budget`).
+    /// Why [`Context::outside`] is not measured: `None` where the driver
+    /// reports this process's heap usage (`VK_EXT_memory_budget`) or its
+    /// allocations (`VK_EXT_device_memory_report`).
     #[must_use]
-    pub fn measures_outside(&self) -> bool {
-        self.core.features.memory_budget || self.core.features.memory_report
+    pub fn outside_unmeasured(&self) -> Option<String> {
+        let features = &self.core.features;
+        (!features.memory_budget && !features.memory_report).then(|| {
+            format!(
+                "{}'s Vulkan driver states neither VK_EXT_memory_budget nor \
+                 VK_EXT_device_memory_report",
+                self.core.name
+            )
+        })
     }
 
     /// What of the driver's share the memory report does not see: the

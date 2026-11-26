@@ -100,8 +100,8 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::outside(self)
     }
 
-    fn measures_outside(&self) -> bool {
-        Context::measures_outside(self)
+    fn outside_unmeasured(&self) -> Option<String> {
+        Context::outside_unmeasured(self)
     }
 
     fn host_room(&self) -> Option<engine::HostRoom> {

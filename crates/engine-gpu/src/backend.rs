@@ -153,11 +153,11 @@ pub trait Context<B: Backend> {
     /// measured now; zero where the device does not say.
     fn outside(&self) -> u64;
 
-    /// Whether [`Context::outside`] is measured on this device (the driver
-    /// reports what this process holds of the heap), not zero for want of
-    /// a reading.
-    fn measures_outside(&self) -> bool {
-        false
+    /// Why [`Context::outside`] is not measured on this device, said in the
+    /// load's line: `None` where the driver reports what this process holds
+    /// of the heap, so its zero is a reading.
+    fn outside_unmeasured(&self) -> Option<String> {
+        Some("this backend reads no per-process usage of the device".to_string())
     }
 
     /// What of the driver's share no reading of this device's sees, said in
