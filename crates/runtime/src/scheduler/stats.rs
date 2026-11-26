@@ -110,14 +110,6 @@ impl AggregateStats {}
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct FireStats {
-    pub avg_inter_fire_us: u64,
-    pub avg_post_dispatch_to_fire_us: u64,
-    pub avg_recv_block_wait_us: u64,
-    pub inter_fire_us_sum: u64,
-    pub post_dispatch_to_fire_us_sum: u64,
-    pub recv_block_wait_us_sum: u64,
-    pub accumulate: AccumulateStats,
-    pub pre_dispatch: PreDispatchStats,
     pub execute: ExecuteStats,
     pub post_dispatch: PostDispatchStats,
     pub quorum: QuorumStats,
@@ -165,25 +157,17 @@ pub struct QuorumStats {
 }
 
 #[derive(Debug, Default, serde::Serialize)]
-pub struct AccumulateStats {
-    pub avg_accum_loop_us: u64,
-    pub accum_loop_us_sum: u64,
-}
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct PreDispatchStats {
-    pub avg_fire_prepare_us: u64,
-    pub fire_prepare_us_sum: u64,
-}
-
-#[derive(Debug, Default, serde::Serialize)]
 pub struct ExecuteStats {
-    pub avg_total_us: u64,
     pub avg_batch_build_us: u64,
     pub avg_engine_fire_us: u64,
-    pub total_us_sum: u64,
     pub batch_build_us_sum: u64,
     pub engine_fire_us_sum: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PostDispatchStats {
+    pub avg_stats_update_us: u64,
+    pub stats_update_us_sum: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -199,13 +183,6 @@ pub struct HostSubmitStats {
     pub validate_frame_calls: u64,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
-pub struct PostDispatchStats {
-    pub avg_context_tick_us: u64,
-    pub avg_stats_update_us: u64,
-    pub context_tick_us_sum: u64,
-    pub stats_update_us_sum: u64,
-}
 
 pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateStats {
     let mut total_batches = 0u64;
@@ -216,15 +193,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut bubble_hist = [0u64; BUBBLE_HIST_UPPER_US.len()];
     let mut last_latency = 0u64;
     let mut cumulative_latency = 0u64;
-    let mut fire_inter = 0u64;
-    let mut fire_post_dispatch_to_fire = 0u64;
-    let mut fire_recv_block_wait = 0u64;
-    let mut fire_accumulate_accum_loop = 0u64;
-    let mut fire_pre_dispatch_fire_prepare = 0u64;
-    let mut fire_execute_total = 0u64;
     let mut fire_execute_batch_build = 0u64;
     let mut fire_execute_engine_fire = 0u64;
-    let mut fire_post_dispatch_context_tick = 0u64;
     let mut fire_post_dispatch_stats_update = 0u64;
     let mut q_inter_batch_bubble = 0u64;
     let mut q_quorum_latency = 0u64;
@@ -271,15 +241,8 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
         cumulative_latency += s.cumulative_latency_us.load(Relaxed);
         let f = &s.fire;
-        fire_inter += f.inter_fire_us.load(Relaxed);
-        fire_post_dispatch_to_fire += f.post_dispatch_to_fire_us.load(Relaxed);
-        fire_recv_block_wait += f.recv_block_wait_us.load(Relaxed);
-        fire_accumulate_accum_loop += f.accumulate.accum_loop_us.load(Relaxed);
-        fire_pre_dispatch_fire_prepare += f.pre_dispatch.fire_prepare_us.load(Relaxed);
-        fire_execute_total += f.execute.total_us.load(Relaxed);
         fire_execute_batch_build += f.execute.batch_build_us.load(Relaxed);
         fire_execute_engine_fire += f.execute.engine_fire_us.load(Relaxed);
-        fire_post_dispatch_context_tick += f.post_dispatch.context_tick_us.load(Relaxed);
         fire_post_dispatch_stats_update += f.post_dispatch.stats_update_us.load(Relaxed);
         q_inter_batch_bubble += f.quorum.inter_batch_bubble_us.load(Relaxed);
         q_quorum_latency += f.quorum.quorum_latency_us.load(Relaxed);
@@ -320,13 +283,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     }
 
     let avg = |value: u64| value.checked_div(total_batches).unwrap_or(0);
-    let avg_pair = |value: u64| {
-        if total_batches > 1 {
-            value / (total_batches - 1)
-        } else {
-            0
-        }
-    };
     AggregateStats {
         total_batches,
         total_tokens_processed: total_tokens,
@@ -351,32 +307,14 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
             }
         },
         fire: FireStats {
-            avg_inter_fire_us: avg_pair(fire_inter),
-            avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),
-            avg_recv_block_wait_us: avg_pair(fire_recv_block_wait),
-            inter_fire_us_sum: fire_inter,
-            post_dispatch_to_fire_us_sum: fire_post_dispatch_to_fire,
-            recv_block_wait_us_sum: fire_recv_block_wait,
-            accumulate: AccumulateStats {
-                avg_accum_loop_us: avg(fire_accumulate_accum_loop),
-                accum_loop_us_sum: fire_accumulate_accum_loop,
-            },
-            pre_dispatch: PreDispatchStats {
-                avg_fire_prepare_us: avg(fire_pre_dispatch_fire_prepare),
-                fire_prepare_us_sum: fire_pre_dispatch_fire_prepare,
-            },
             execute: ExecuteStats {
-                avg_total_us: avg(fire_execute_total),
                 avg_batch_build_us: avg(fire_execute_batch_build),
                 avg_engine_fire_us: avg(fire_execute_engine_fire),
-                total_us_sum: fire_execute_total,
                 batch_build_us_sum: fire_execute_batch_build,
                 engine_fire_us_sum: fire_execute_engine_fire,
             },
             post_dispatch: PostDispatchStats {
-                avg_context_tick_us: avg(fire_post_dispatch_context_tick),
                 avg_stats_update_us: avg(fire_post_dispatch_stats_update),
-                context_tick_us_sum: fire_post_dispatch_context_tick,
                 stats_update_us_sum: fire_post_dispatch_stats_update,
             },
             quorum: QuorumStats {

@@ -196,60 +196,12 @@ impl Session {
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
                     stats.insert(
-                        format!("{}.fire.inter_fire_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_inter_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.post_dispatch_to_fire_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_post_dispatch_to_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.recv_block_wait_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_recv_block_wait_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.inter_fire_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.inter_fire_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.post_dispatch_to_fire_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.post_dispatch_to_fire_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.recv_block_wait_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.recv_block_wait_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.accumulate.accum_loop_us", model_name),
-                        serde_json::Value::from(inf.fire.accumulate.avg_accum_loop_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.accumulate.accum_loop_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.accumulate.accum_loop_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.pre_dispatch.fire_prepare_us", model_name),
-                        serde_json::Value::from(inf.fire.pre_dispatch.avg_fire_prepare_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.pre_dispatch.fire_prepare_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.pre_dispatch.fire_prepare_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.total_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.avg_total_us),
-                    );
-                    stats.insert(
                         format!("{}.fire.execute.batch_build_us", model_name),
                         serde_json::Value::from(inf.fire.execute.avg_batch_build_us),
                     );
                     stats.insert(
                         format!("{}.fire.execute.engine_fire_us", model_name),
                         serde_json::Value::from(inf.fire.execute.avg_engine_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.total_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.execute.total_us_sum),
                     );
                     stats.insert(
                         format!("{}.fire.execute.batch_build_us_sum", model_name),
@@ -260,16 +212,8 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.engine_fire_us_sum),
                     );
                     stats.insert(
-                        format!("{}.fire.post_dispatch.context_tick_us", model_name),
-                        serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
-                    );
-                    stats.insert(
                         format!("{}.fire.post_dispatch.stats_update_us", model_name),
                         serde_json::Value::from(inf.fire.post_dispatch.avg_stats_update_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.post_dispatch.context_tick_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.post_dispatch.context_tick_us_sum),
                     );
                     stats.insert(
                         format!("{}.fire.post_dispatch.stats_update_us_sum", model_name),
