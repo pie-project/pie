@@ -33,12 +33,6 @@ struct Paged {
     // block of the grid: the blocks past them exit, and the live ones take
     // the unpadded grid's order (`prefill_item`).
     const i32* block_live;
-    // A captured split layout's replay staged whole (`*direct`, null for
-    // none): its blocks write `o_direct` / `lse_direct` as an unsplit walk
-    // does, and the fold leaves (`merge_partials`' skip).
-    const i32* direct;
-    void* o_direct;
-    float* lse_direct;
     void* o;
     float* lse;
     i32 num_qo_heads;
@@ -687,9 +681,8 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
     }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
-    const bool part = p.partition && !(p.direct != nullptr && *p.direct);
-    const int chunk_start = part ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
-    int chunk_end = part ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
+    const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
+    int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
     if (causal) {
         // No key past the tile's last query is seen by any row of it.
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
@@ -858,26 +851,24 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
     if (!row_live) return;
 
     const int num_chunks = (min(kv_len, window_reach(wl, G)) + chunk - 1) / chunk;
-    const long long row = part
+    const long long row = p.partition
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
-    void* const o_out = part || !p.partition ? p.o : p.o_direct;
-    float* const lse_out = part || !p.partition ? p.lse : p.lse_direct;
     const long long base = (row * p.num_qo_heads + head) * D;
     const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < KS; ++dt) {
         const int j = dt * 16 + 4 * quad;
-        if (part) {
-            float* out = static_cast<float*>(o_out) + base + j;
+        if (p.partition) {
+            float* out = static_cast<float*>(p.o) + base + j;
 #pragma unroll
             for (int t = 0; t < 4; ++t) out[t] = o[dt][t] * inv;
         } else {
-            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(o_out) + base + j) =
+            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(p.o) + base + j) =
                 pack4(o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv);
         }
     }
-    if (quad == 0 && lse_out != nullptr) lse_out[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+    if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
@@ -961,9 +952,8 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
-    const bool part = p.partition && !(p.direct != nullptr && *p.direct);
-    const int chunk_start = part ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
-    int chunk_end = part ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
+    const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
+    int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
     if (causal) {
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
@@ -1133,25 +1123,23 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     if (!row_live) return;
 
     const int num_chunks = (min(kv_len, window_reach(wl, G)) + chunk - 1) / chunk;
-    const long long row = part
+    const long long row = p.partition
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
-    void* const o_out = part || !p.partition ? p.o : p.o_direct;
-    float* const lse_out = part || !p.partition ? p.lse : p.lse_direct;
     const long long base = (row * p.num_qo_heads + head) * D;
     const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < DT; ++dt) {
         const int j = dt * 16 + 4 * quad;
-        if (part) {
-            float* out = static_cast<float*>(o_out) + base + j;
+        if (p.partition) {
+            float* out = static_cast<float*>(p.o) + base + j;
             *reinterpret_cast<float4*>(out) = float4{o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv};
         } else {
-            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(o_out) + base + j) =
+            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(p.o) + base + j) =
                 pack4(o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv);
         }
     }
-    if (quad == 0 && lse_out != nullptr) lse_out[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+    if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
@@ -1203,27 +1191,23 @@ __global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const
 // ----------------------------------------------------------------- merge --
 
 // Folds partials: row `pos`'s parts are rows indptr[pos]..indptr[pos+1] of
-// `parts` (f32, [part][heads][D]) with log2-domain lse `part_lse`. Blocks of
-// four wavefronts stride the (row, head) pairs: the wavefronts split the parts, each
+// `parts` (f32, [part][heads][D]) with log2-domain lse `part_lse`. One block
+// of four wavefronts per (row, head): the wavefronts split the parts, each
 // lane owning D/64 columns, and fold through LDS. The window, when staged,
 // caps the rows and offsets them.
 template <int D>
 __global__ __launch_bounds__(256) void merge_partials(const float* __restrict__ parts, const float* __restrict__ part_lse,
                                const i32* __restrict__ indptr, bf16* __restrict__ o,
                                float* __restrict__ lse, int max_rows, const u32* __restrict__ rows_ptr,
-                               int heads, const u32* __restrict__ win, const i32* __restrict__ skip) {
-    // A split layout's replay staged whole wrote the output itself.
-    if (skip != nullptr && *skip) return;
+                               int heads, const u32* __restrict__ win) {
     constexpr int WAVES = 4, C = (D + kWave - 1) / kWave;
     __shared__ float red[WAVES];
     __shared__ float acc_s[WAVES][D];
+    const int pos = blockIdx.x / heads;
+    const int head = blockIdx.x % heads;
     const int staged = rows_ptr != nullptr ? static_cast<int>(*rows_ptr) : max_rows;
     const int rows = win != nullptr ? min(staged, static_cast<int>(win[0])) : staged;
-    // A grid of the device's blocks strides the (row, head) pairs: a launch
-    // with nothing to fold leaves in one wave of them, not one a pair.
-    for (long long item = blockIdx.x; item < static_cast<long long>(rows) * heads; item += gridDim.x) {
-    const int pos = static_cast<int>(item / heads);
-    const int head = static_cast<int>(item % heads);
+    if (pos >= rows) return;
     const long long out_row = (win != nullptr ? static_cast<long long>(win[1]) : 0) + pos;
     const int first = indptr[pos], last = indptr[pos + 1];
     const int wave = threadIdx.x / kWave, l = lane();
@@ -1268,7 +1252,6 @@ __global__ __launch_bounds__(256) void merge_partials(const float* __restrict__ 
         o[(out_row * heads + head) * D + j] = from_f32<bf16>(sum > 0.f ? total / sum : 0.f);
     }
     if (threadIdx.x == 0 && lse != nullptr) lse[out_row * heads + head] = sum > 0.f ? big + log2f(sum) : neg_inf();
-    }
 }
 
 }  // namespace pie::attn
