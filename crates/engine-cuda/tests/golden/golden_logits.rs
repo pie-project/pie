@@ -1455,7 +1455,7 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
         .expect("the segments commit");
     let committed = segments * facts.segment_chunks;
     assert!(
-        4 * parked.len() as u32 < committed,
+        4 * (parked.len() as u32) < committed,
         "{model}: four device chunks a shape in the {committed} committed"
     );
     assert!(
