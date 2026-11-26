@@ -314,8 +314,9 @@ pub fn weight_tier_bytes(trace: &Trace, stated: u64, extra_resident: u64) -> Res
 /// load takes anything. What this process took before its loads
 /// ([`crate::device::own::before_loads`]) is not held before: a stated
 /// budget counts it, and only what other processes and this one's earlier
-/// loads hold lies outside it. `latch` says a load is resolving its one
-/// ceiling, not a reading ahead of it.
+/// loads hold lies outside it; where the driver does not say what this
+/// process took, all the card holds lies outside it, said by name. `latch`
+/// says a load is resolving its one ceiling, not a reading ahead of it.
 pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
     crate::device::card::stated(allowance.budget);
     if latch
@@ -333,7 +334,11 @@ pub fn load_ceiling(allowance: engine::Allowance, latch: bool) -> Result<u64> {
         );
     }
     let (free, total) = device_memory()?;
-    let held = (total - free).saturating_sub(crate::device::own::before_loads(latch)?);
+    // Where what this process holds is unknown, all the card holds is
+    // counted another's: the budget then counts what the load takes from
+    // here, not the context made before it.
+    let own = crate::device::own::before_loads(latch)?.unwrap_or(0);
+    let held = (total - free).saturating_sub(own);
     Ok(elastic::ceiling_of(total, held, allowance))
 }
 
