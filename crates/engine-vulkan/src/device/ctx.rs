@@ -210,6 +210,9 @@ pub(crate) struct Core {
     /// Whose memory the device's is ([`device_memory`]): where it is the
     /// host's, the load states no host tier.
     whose_memory: engine::DeviceMemory,
+    /// A CPU device (`VK_PHYSICAL_DEVICE_TYPE_CPU`: lavapipe, SwiftShader):
+    /// its budget's heap usage is not this process's ([`driver_share`]).
+    cpu: bool,
     /// The largest device-local heap, which device reservations take.
     heap: usize,
     pub(crate) vendor_id: u32,
@@ -297,21 +300,22 @@ impl Core {
     }
 
     /// What the driver holds for this process in the heap beside every
-    /// reservation of this process: its usage less them, where it reports it.
+    /// reservation of this process ([`driver_share`]).
     pub(crate) fn outside(&self) -> u64 {
-        let reserved = engine_gpu::books::process_reserved();
-        match self.budget() {
-            Some((_, usage)) => usage.saturating_sub(reserved),
-            // On a device whose heaps are all the host's, every heap the
-            // driver allocates in is this process's memory.
-            None if self.features.memory_report && self.whose_memory.unified() => {
-                super::report::live_bytes_all(self.report_key).saturating_sub(reserved)
+        let unified = self.whose_memory.unified();
+        let reported = self.features.memory_report.then(|| {
+            if unified {
+                super::report::live_bytes_all(self.report_key)
+            } else {
+                super::report::live_bytes(self.report_key, self.heap)
             }
-            None if self.features.memory_report => {
-                super::report::live_bytes(self.report_key, self.heap).saturating_sub(reserved)
-            }
-            None => 0,
-        }
+        });
+        driver_share(
+            self.budget().map(|(_, usage)| usage),
+            reported,
+            self.cpu,
+            engine_gpu::books::process_reserved(),
+        )
     }
 
     pub(crate) fn fault(&self, call: &'static str, code: vk::Result) -> Fault {
@@ -1050,6 +1054,29 @@ fn device_memory(device: vk::PhysicalDeviceType, mapped: bool) -> engine::Device
     }
 }
 
+/// What the driver holds for this process beside its `reserved` bytes: the
+/// heap's usage as `VK_EXT_memory_budget` reports it (`usage`), else what
+/// `VK_EXT_device_memory_report` counted (`reported`), less `reserved`.
+/// On a CPU device (`cpu`) the budget's usage is not this process's:
+/// lavapipe states it as its heap's size less the host's available memory
+/// (Mesa `src/gallium/frontends/lavapipe/lvp_device.c`,
+/// `lvp_GetPhysicalDeviceMemoryProperties2`), every process's use of the
+/// host, which would leave a load no room under its budget. There only the
+/// report counts. Every other device (an integrated GPU too) reports its
+/// usage per process, as the extension states it.
+pub(crate) fn driver_share(
+    usage: Option<u64>,
+    reported: Option<u64>,
+    cpu: bool,
+    reserved: u64,
+) -> u64 {
+    let held = match usage {
+        Some(usage) if !cpu => Some(usage),
+        _ => reported,
+    };
+    held.map_or(0, |held| held.saturating_sub(reserved))
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn host_ceiling(name: &str, shares_host: bool, memory_budget: bool) -> Result<Option<u64>> {
     if !cfg!(target_os = "android") && (memory_budget || !shares_host) {
@@ -1496,6 +1523,7 @@ impl Context {
             device_local,
             ceiling,
             whose_memory,
+            cpu: props.device_type == vk::PhysicalDeviceType::CPU,
             heap,
             vendor_id: props.vendor_id,
             update_after_bind,
@@ -4644,7 +4672,31 @@ mod tests {
 
     use ash::vk;
 
-    use super::{Context, Ordering, device_memory};
+    use super::{Context, Ordering, device_memory, driver_share};
+
+    /// A device's room under `budget_device` is the budget less what this
+    /// process holds: the driver's usage beside the reservations counts on a
+    /// discrete card and an integrated GPU (both report it per process); on
+    /// a CPU device (lavapipe states the host's whole used memory as its
+    /// usage) it does not, and only what the driver reported counts.
+    #[test]
+    fn a_cpu_devices_heap_usage_is_not_this_processs() {
+        const GIB: u64 = 1 << 30;
+        // Discrete, or integrated (the same rule): 3 GiB in use, 2 GiB of it
+        // reserved by the process.
+        assert_eq!(driver_share(Some(3 * GIB), None, false, 2 * GIB), GIB);
+        assert_eq!(driver_share(Some(3 * GIB), Some(GIB), false, 2 * GIB), GIB);
+        // Lavapipe on a host using 12 GiB, the process holding 64 MiB.
+        assert_eq!(driver_share(Some(12 * GIB), None, true, 64 << 20), 0);
+        // A CPU device whose driver reported its own allocations.
+        assert_eq!(
+            driver_share(Some(12 * GIB), Some(GIB), true, 512 << 20),
+            512 << 20
+        );
+        // No budget reading: the report, else nothing.
+        assert_eq!(driver_share(None, None, false, GIB), 0);
+        assert_eq!(driver_share(None, Some(3 * GIB), false, GIB), 2 * GIB);
+    }
 
     /// The phone (Adreno), an integrated GPU and the Spark share the host's
     /// memory: no host tier there, and a stated one is refused by name. A
