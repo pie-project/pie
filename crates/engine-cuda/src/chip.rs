@@ -1157,11 +1157,6 @@ mod hip {
             want.gemm_turn_from = 3;
             want.gemm_turn_wide_until = 32;
             want.ssm_gdn_wide_from = 512;
-            // The MI300X's own file measured one prefill block a CU; the
-            // MI325X, with none, keeps the default.
-            if device {
-                want.prefill_ctas_per_sm = 1;
-            }
             // The rates are the device's own file's (the norm fold's pricing
             // reads them), not the family's: not what this checks.
             let got = kernels_cuda::tuning::Tuning::of(&profile);

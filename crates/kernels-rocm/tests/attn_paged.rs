@@ -1311,3 +1311,148 @@ fn attn_paged_padded_prefill_replays_as_unpadded() {
         );
     }
 }
+
+/// One captured prefill body of Qwen3-0.6B's heads over a 256-lane carve of
+/// 2048 rows, its layout split, replayed per fire: one request of all the
+/// rows over a long prefix, cut into chunks to fill the device, and 256
+/// requests of eight rows, whose tiles fill it, staged whole (direct). The
+/// chunks are each fire's, staged with it: the whole replay matches its
+/// unpadded eager plan bit for bit (the fold leaves; a fold over the split
+/// replay's stale partials would not), and the cut replay matches the same
+/// plan fired without the graph bit for bit and its eager plan (cut into
+/// fewer chunks, a different summation order) within bf16's rounding.
+#[test]
+fn attn_paged_captured_prefill_splits_per_fire() {
+    const LANES: u32 = 256;
+    const ROWS: u32 = 2048;
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let device = plan::Device::probe(&ctx).unwrap();
+    let c = Case::new(16, 8, 128, 16, false);
+    let kv_lens: Vec<u32> = (0..LANES)
+        .map(|i| if i == 0 { 8048 } else { 8 + (i * 37) % 900 })
+        .collect();
+    let cache = cache(&gpu, &c, &kv_lens, 31);
+    let width = c.q_heads * c.head_dim;
+    let qv: Vec<f32> = values((ROWS * width) as usize, 13, 1.0)
+        .into_iter()
+        .map(round_bf16)
+        .collect();
+    let qdata = gpu.tensor(&qv, ROWS, width, Dtype::Bf16);
+    let indptr = |lens: &[u32]| {
+        let mut v = vec![0i32];
+        for &l in lens {
+            v.push(v.last().unwrap() + l as i32);
+        }
+        v
+    };
+    let (one, many) = (indptr(&[ROWS]), indptr(&vec![8; LANES as usize]));
+    let qcol = gpu.column(&[0; LANES as usize + 1]);
+    let write = |at: &[i32]| {
+        let mut v = at.to_vec();
+        v.resize(LANES as usize + 1, *at.last().unwrap());
+        gpu.write(qcol.ptr, &v);
+    };
+    let plan_of = |at: &[i32], lanes: u32, graph: bool, ws: plan::Workspace| {
+        let n = (at.len() - 1) as u32;
+        plan::plan_prefill(
+            at,
+            &cache.page_indptr[..=n as usize],
+            &[],
+            ROWS,
+            plan::Shape {
+                num_requests: lanes,
+                lane_offset: 0,
+                num_q_heads: c.q_heads,
+                num_kv_heads: c.kv_heads,
+                head_dim: c.head_dim,
+                page_size: c.page_size,
+                hnd_layout: c.hnd,
+            },
+            plan::Live {
+                requests: n,
+                lane_offset: 0,
+                row_offset: 0,
+                rows: ROWS,
+            },
+            None,
+            true,
+            graph,
+            None,
+            &device,
+            plan::Toggles::default(),
+            ws,
+        )
+        .unwrap()
+    };
+    let mut o = gpu.zeros(ROWS, width, Dtype::Bf16);
+    let bytes = (ROWS * width * 2) as usize;
+    let fire = |indptr, built: &plan::PrefillPlan, o: &mut kernels_rocm::Tensor| {
+        let q = RaggedTensor {
+            data: qdata,
+            indptr,
+        };
+        attn::prefill(
+            &ctx,
+            q,
+            built,
+            &cache.pool,
+            None,
+            c.head_dim,
+            c.kv_heads,
+            0.0,
+            o,
+        )
+        .unwrap();
+    };
+    let exact = |tag: &str, got: &[f32], want: &[f32]| {
+        let off = got
+            .iter()
+            .zip(want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(off, 0, "{tag}: {off} of {} values differ", got.len());
+    };
+    let mut eager = Vec::new();
+    for at in [&one, &many] {
+        let n = (at.len() - 1) as u32;
+        let built = plan_of(at, n, false, workspace(&gpu));
+        built.stage(&ctx).unwrap();
+        gpu.fill(o.ptr, 0, bytes);
+        fire(gpu.column(at), &built, &mut o);
+        eprintln!(
+            "eager {n} requests: grid {} split={}",
+            built.info.padded_batch_size, built.info.split_kv
+        );
+        eager.push(gpu.read(&o));
+    }
+    let ws = workspace(&gpu);
+    let (cut, whole) = (plan_of(&one, LANES, true, ws), plan_of(&many, LANES, true, ws));
+    assert_eq!(cut.info, whole.info, "one body's layout for every fire");
+    assert!(cut.info.split_kv && cut.info.block_direct_offset.is_some());
+    // The cut fire, fired as planned without the graph.
+    write(&one);
+    cut.stage(&ctx).unwrap();
+    gpu.fill(o.ptr, 0, bytes);
+    fire(qcol, &cut, &mut o);
+    let cut_walked = gpu.read(&o);
+    let graph = gpu.capture(|| fire(qcol, &cut, &mut o));
+    for (at, built, tag) in [
+        (&many, &whole, "whole"),
+        (&one, &cut, "cut"),
+        (&many, &whole, "whole after a cut"),
+    ] {
+        write(at);
+        built.stage(&ctx).unwrap();
+        gpu.fill(o.ptr, 0, bytes);
+        graph.replay();
+        let got = gpu.read(&o);
+        if tag.starts_with("whole") {
+            exact(&format!("{tag} replay against its eager plan"), &got, &eager[1]);
+        } else {
+            exact(&format!("{tag} replay against its walk"), &got, &cut_walked);
+            close(&format!("{tag} replay against its eager plan"), &got, &eager[0], 1.5e-2);
+        }
+    }
+    eprintln!("captured over {LANES} lanes: grid {} split", cut.info.padded_batch_size);
+}

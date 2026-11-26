@@ -33,6 +33,12 @@ struct Paged {
     // block of the grid: the blocks past them exit, and the live ones take
     // the unpadded grid's order (`prefill_item`).
     const i32* block_live;
+    // A captured split layout's replay staged whole (`*direct`, null for
+    // none): its blocks write `o_direct` / `lse_direct` as an unsplit walk
+    // does, and the fold leaves (`merge_partials`' skip).
+    const i32* direct;
+    void* o_direct;
+    float* lse_direct;
     void* o;
     float* lse;
     i32 num_qo_heads;
@@ -681,8 +687,9 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
     }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
-    const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
-    int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
+    const bool part = p.partition && !(p.direct != nullptr && *p.direct);
+    const int chunk_start = part ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
+    int chunk_end = part ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
     if (causal) {
         // No key past the tile's last query is seen by any row of it.
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
@@ -851,24 +858,26 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
     if (!row_live) return;
 
     const int num_chunks = (min(kv_len, window_reach(wl, G)) + chunk - 1) / chunk;
-    const long long row = p.partition
+    const long long row = part
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
+    void* const o_out = part || !p.partition ? p.o : p.o_direct;
+    float* const lse_out = part || !p.partition ? p.lse : p.lse_direct;
     const long long base = (row * p.num_qo_heads + head) * D;
     const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < KS; ++dt) {
         const int j = dt * 16 + 4 * quad;
-        if (p.partition) {
-            float* out = static_cast<float*>(p.o) + base + j;
+        if (part) {
+            float* out = static_cast<float*>(o_out) + base + j;
 #pragma unroll
             for (int t = 0; t < 4; ++t) out[t] = o[dt][t] * inv;
         } else {
-            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(p.o) + base + j) =
+            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(o_out) + base + j) =
                 pack4(o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv);
         }
     }
-    if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+    if (quad == 0 && lse_out != nullptr) lse_out[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
@@ -952,8 +961,9 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
-    const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
-    int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
+    const bool part = p.partition && !(p.direct != nullptr && *p.direct);
+    const int chunk_start = part ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
+    int chunk_end = part ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
     if (causal) {
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
@@ -1123,23 +1133,25 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     if (!row_live) return;
 
     const int num_chunks = (min(kv_len, window_reach(wl, G)) + chunk - 1) / chunk;
-    const long long row = p.partition
+    const long long row = part
         ? static_cast<long long>(p.o_indptr[req]) + static_cast<long long>(token) * num_chunks + kv_tile
         : static_cast<long long>(p.o_indptr[req]) + token;
+    void* const o_out = part || !p.partition ? p.o : p.o_direct;
+    float* const lse_out = part || !p.partition ? p.lse : p.lse_direct;
     const long long base = (row * p.num_qo_heads + head) * D;
     const float inv = l > 0.f ? KV::unit / l : 0.f;
 #pragma unroll
     for (int dt = 0; dt < DT; ++dt) {
         const int j = dt * 16 + 4 * quad;
-        if (p.partition) {
-            float* out = static_cast<float*>(p.o) + base + j;
+        if (part) {
+            float* out = static_cast<float*>(o_out) + base + j;
             *reinterpret_cast<float4*>(out) = float4{o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv};
         } else {
-            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(p.o) + base + j) =
+            *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(o_out) + base + j) =
                 pack4(o[dt][0] * inv, o[dt][1] * inv, o[dt][2] * inv, o[dt][3] * inv);
         }
     }
-    if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
+    if (quad == 0 && lse_out != nullptr) lse_out[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
@@ -1199,7 +1211,9 @@ template <int D>
 __global__ __launch_bounds__(256) void merge_partials(const float* __restrict__ parts, const float* __restrict__ part_lse,
                                const i32* __restrict__ indptr, bf16* __restrict__ o,
                                float* __restrict__ lse, int max_rows, const u32* __restrict__ rows_ptr,
-                               int heads, const u32* __restrict__ win) {
+                               int heads, const u32* __restrict__ win, const i32* __restrict__ skip) {
+    // A split layout's replay staged whole wrote the output itself.
+    if (skip != nullptr && *skip) return;
     constexpr int WAVES = 4, C = (D + kWave - 1) / kWave;
     __shared__ float red[WAVES];
     __shared__ float acc_s[WAVES][D];
