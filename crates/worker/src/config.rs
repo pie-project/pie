@@ -230,7 +230,7 @@ impl ClusterConfig {
     pub fn policies(&self) -> Vec<String> {
         self.cluster_policies
             .clone()
-            .unwrap_or_else(|| vec![builtins::DEFAULT_CLUSTER_POLICY.to_string()])
+            .unwrap_or_else(|| vec![DEFAULT_CLUSTER_POLICY.to_string()])
     }
 
     fn validate(&self) -> Result<()> {
@@ -727,8 +727,14 @@ pub struct RuntimeConfig {
     pub snapshot_budget: ByteSize,
 }
 
+/// The policies a worker and a controller run when their configuration
+/// names none: `builtins`' names, said here too because a wasm32 worker (the
+/// tab's) links no `builtins`, which builds its components natively.
+const DEFAULT_WORKER_POLICY: &str = "default";
+const DEFAULT_CLUSTER_POLICY: &str = "default-cluster";
+
 fn default_worker_policy() -> String {
-    builtins::DEFAULT_WORKER_POLICY.to_string()
+    DEFAULT_WORKER_POLICY.to_string()
 }
 
 fn default_snapshot_budget() -> ByteSize {
@@ -1137,6 +1143,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The defaults said here are `builtins`' own.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_default_policies_are_the_builtins() {
+        assert_eq!(
+            super::DEFAULT_WORKER_POLICY,
+            builtins::DEFAULT_WORKER_POLICY
+        );
+        assert_eq!(
+            super::DEFAULT_CLUSTER_POLICY,
+            builtins::DEFAULT_CLUSTER_POLICY
+        );
+    }
+
     use super::*;
 
     const MINIMAL_METAL: &str = r#"
