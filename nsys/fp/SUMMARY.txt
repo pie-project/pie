@@ -1,0 +1,38 @@
+Which lock: frame-pointer build of 0774fc0ca (RUSTFLAGS=-Cforce-frame-pointers=yes, separate target dir), Qwen3-0.6B c256
+shared, default disk, context 2048. nsys -t cuda,osrt --osrt-threshold 10000 --osrt-backtrace-threshold 80000
+--osrt-backtrace-stack-size 32768 --backtrace=fp, 10 s window from 0.5 s before round 6. CPU sampling still unavailable here.
+tok/s per round: plain (fp build, no nsys) 15435 15780 15981 15610 14095 14785 15249 15192  r5-8 14830 (low)
+                 capture try 1 (kept)      16041 15667 15757 15602 15280 15008 14844 14809  r5-8 14985 (low)
+Stacks are lock waits >= 80 us with a backtrace (shorter waits carry none); 12 frames, function names only.
+
+pie-engine-0 (the thread that launches every step): 4269 lock waits, 1107 ms in the 10 s window.
+  1039 ms / 3999 waits  parking_lot lock_slow < KvTxnGuard::settle < drop(KvTxnGuard) < WorkItemCompletion::on_settled
+                        (FireEpoch::retire_on) < completion::run_settled < Landed::publish < FrameSettlements::settled < Lane::run
+                        = the KV STORE lock: KvTxnGuard::settle takes with_kv_lock(&stores.kv, "host-other") (pipeline/fire.rs:215).
+                        The engine lane settles each landed fire's kv transaction itself, so it waits on the kv lock before it
+                        can go on to the next launch.
+    48 ms /  159 waits  parking_lot lock_slow < SealOnLanding::landed (promote.rs) < the same completion path; landed takes
+                        with_kv_lock(..., "host-other") (and a std mutex).
+    14 ms /   85 waits  std Mutex lock_contended < RegistryPool::free_chunks / room_gives < ResidencyPlanner::fire_landed
+                        < FireInFlight::drop: the planner pool's std mutex.
+  No CLAIMS (pipeline/coalesce.rs, a std Mutex) frame appears on the engine thread or in any listed stack.
+
+tokio-rt-worker (27 threads; the inferlet processes' submit/finalize side): 124748 lock waits, 35265 ms (summed over threads).
+  Top callers of parking_lot lock_slow (the lock each takes, from the source at 9b444d1fe/0774fc0ca):
+    5793 ms 17504 waits  materialize_channel (inlined callee; likely the kv lock via settle_fold, "host-other")
+    3740 ms 15003        fire::submit::pass_lanes            kv "host-other"
+    3190 ms 14356        fire::kv_demand                     kv "host-other"
+    2512 ms 12683        working_set::grow_pages             kv "host-working-set"
+    1954 ms  9933        submit_pass_stamped (inlined callee)
+    1840 ms  9799        fire::reserve::prepare_reserved     kv "host-other" (prepare_host/explicit_kv_reserved)
+    1800 ms  8513        finalize::settle_fold               kv "host-other"
+    1799 ms  9363        lanes::working_set_flat_table       kv "host-pages"
+    1704 ms  9577        FireEpoch::begin                    kv "fire-epoch"
+    1710 ms   842        ResidencyPlanner::demote_idle_for   the planner's idle_reclaim mutex
+    1188 ms   377        ResidencyPlanner::reclaim_idle_once idle_reclaim mutex
+     928 ms  2588        ResidencyPlanner::grant_now         idle_reclaim mutex
+  So: the contended lock is the kv store's parking_lot mutex, taken under several tags by every submitting process
+  (host-other most, then host-working-set, host-pages, fire-epoch), with the planner's idle_reclaim mutex second;
+  CLAIMS does not show among the waits >= 80 us.
+Tables read: OSRT_API (start, end, thread, name, callchain id; no arguments), OSRT_CALLCHAINS (symbol, depth), ThreadNames,
+StringIds. Files: shared-1.stacks.txt (top 12 stacks per group with wait totals), stacks.py (the query).

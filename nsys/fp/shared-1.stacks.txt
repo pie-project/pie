@@ -1,0 +1,252 @@
+# shared-1.sqlite: OS-runtime waits >= 80 us that carry a backtrace (frame pointers), lock waits only; function names only
+
+## pie-engine-0: lock waits with a backtrace: 4269 waits, 1107.1 ms; distinct stacks 15
+
+[1] 1039.0 ms in 3999 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::pipeline::fire::KvTxnGuard>::settle
+     core[62e902411887be45]::ptr::drop_glue::<runtime[84bd08c7332b6749]::pipeline::fire::KvTxnGuard>
+     <<runtime[84bd08c7332b6749]::engine::completion::WorkItemCompletion>::on_settled<<runtime[84bd08c7332b6749]::pipeline::fire::FireEpoch>::retire_on::{c
+     <runtime[84bd08c7332b6749]::engine::completion::told::{closure#0}::{closure#0} as core[62e902411887be45]::ops::function::FnOnce<()>>::call_once::{shim
+     runtime[84bd08c7332b6749]::engine::completion::run_settled
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+     <std[c60ef17cbf7de79f]::sys::thread::unix::Thread>::new::thread_start
+
+[2] 47.7 ms in 159 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::pipeline::fire::promote::SealOnLanding>::landed
+     <runtime[84bd08c7332b6749]::pipeline::fire::promote::SealOnLanding>::on_landing::{closure#0}
+     <runtime[84bd08c7332b6749]::engine::completion::told::{closure#0}::{closure#0} as core[62e902411887be45]::ops::function::FnOnce<()>>::call_once::{shim
+     runtime[84bd08c7332b6749]::engine::completion::run_settled
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+     <std[c60ef17cbf7de79f]::sys::thread::unix::Thread>::new::thread_start
+     0x79aad6c6568b
+
+[3] 12.4 ms in 76 waits
+     <std[c60ef17cbf7de79f]::sys::sync::mutex::futex::Mutex>::lock_contended
+     <runtime[84bd08c7332b6749]::planner::pool::RegistryPool as runtime[84bd08c7332b6749]::planner::pool::PoolPort>::free_chunks
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::fire_landed
+     <runtime[84bd08c7332b6749]::planner::in_flight::FireInFlight as core[62e902411887be45]::ops::drop::Drop>::drop
+     <<runtime[84bd08c7332b6749]::engine::completion::WorkItemCompletion>::on_settled<<runtime[84bd08c7332b6749]::pipeline::fire::FireEpoch>::retire_on::{c
+     <runtime[84bd08c7332b6749]::engine::completion::told::{closure#0}::{closure#0} as core[62e902411887be45]::ops::function::FnOnce<()>>::call_once::{shim
+     runtime[84bd08c7332b6749]::engine::completion::run_settled
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+
+[4] 1.7 ms in 9 waits
+     <std[c60ef17cbf7de79f]::sys::sync::mutex::futex::Mutex>::lock_contended
+     <runtime[84bd08c7332b6749]::planner::pool::RegistryPool as runtime[84bd08c7332b6749]::planner::pool::PoolPort>::room_gives
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::fire_landed
+     <runtime[84bd08c7332b6749]::planner::in_flight::FireInFlight as core[62e902411887be45]::ops::drop::Drop>::drop
+     <<runtime[84bd08c7332b6749]::engine::completion::WorkItemCompletion>::on_settled<<runtime[84bd08c7332b6749]::pipeline::fire::FireEpoch>::retire_on::{c
+     <runtime[84bd08c7332b6749]::engine::completion::told::{closure#0}::{closure#0} as core[62e902411887be45]::ops::function::FnOnce<()>>::call_once::{shim
+     runtime[84bd08c7332b6749]::engine::completion::run_settled
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+
+[5] 1.6 ms in 2 waits
+     0x79a8ccd77b49
+     0x79a8cbf4655c
+     cuEventDestroy_v2
+     0x79a9fb412a93
+     cudaEventDestroy
+     <alloc[2a0ada2ddd1fabff]::sync::Arc<engine_cuda[b6e7719de7d94171]::device::held::Mark>>::drop_slow
+     engine_cuda[b6e7719de7d94171]::device::held::pool::take
+     <engine_cuda[b6e7719de7d94171]::program::endpoint::Endpoint>::open
+     <engine_cuda[b6e7719de7d94171]::api::Cuda as engine[2d92b8dfaeeeb43d]::engine::Channels>::open
+     runtime[84bd08c7332b6749]::engine::verbs::register_channel
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::register_channel_set
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::execute_control
+
+[6] 1.4 ms in 4 waits
+     0x79a8ccd77b49
+     0x79a8cbdfda74
+     0x79a8cbf837f2
+     cuLaunchHostFunc
+     0x79a9fb4144d3
+     cudaLaunchHostFunc
+     engine_cuda[b6e7719de7d94171]::device::ctx::host_fn_on
+     <engine_cuda[b6e7719de7d94171]::serve::Shell>::settle_step
+     engine_cuda[b6e7719de7d94171]::serve::diag::guarded::<core[62e902411887be45]::result::Result<engine_cuda[b6e7719de7d94171]::serve::settle::Settled, en
+     0x0
+
+[7] 1.1 ms in 8 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::is_resident
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::execute_control
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+     <std[c60ef17cbf7de79f]::sys::thread::unix::Thread>::new::thread_start
+     0x79aad6c6568b
+     start_thread
+     __clone
+
+[8] 0.9 ms in 1 waits
+     0x79a8ccd77b49
+     0x79a8cbf4655c
+     cuEventDestroy_v2
+     0x79a9fb412a93
+     cudaEventDestroy
+     <alloc[2a0ada2ddd1fabff]::sync::Arc<engine_cuda[b6e7719de7d94171]::device::held::Mark>>::drop_slow
+     engine_cuda[b6e7719de7d94171]::device::held::pool::take
+     <engine_cuda[b6e7719de7d94171]::program::session::Session>::stage
+     <engine_cuda[b6e7719de7d94171]::program::Plane>::stage
+     <engine_cuda[b6e7719de7d94171]::serve::enqueue::AirborneFires>::stage
+     <engine_cuda[b6e7719de7d94171]::serve::enqueue::FireCtx>::readback
+     <engine_cuda[b6e7719de7d94171]::serve::Shell as engine[2d92b8dfaeeeb43d]::frame::Shell>::enqueue
+
+[9] 0.5 ms in 4 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::fire_landed
+     <runtime[84bd08c7332b6749]::planner::in_flight::FireInFlight as core[62e902411887be45]::ops::drop::Drop>::drop
+     <<runtime[84bd08c7332b6749]::engine::completion::WorkItemCompletion>::on_settled<<runtime[84bd08c7332b6749]::pipeline::fire::FireEpoch>::retire_on::{c
+     <runtime[84bd08c7332b6749]::engine::completion::told::{closure#0}::{closure#0} as core[62e902411887be45]::ops::function::FnOnce<()>>::call_once::{shim
+     runtime[84bd08c7332b6749]::engine::completion::run_settled
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+     <std[c60ef17cbf7de79f]::sys::thread::unix::Thread>::new::thread_start
+
+[10] 0.2 ms in 1 waits
+     <std[c60ef17cbf7de79f]::sys::sync::mutex::futex::Mutex>::lock_contended
+     <waker[4a5789ed9671cb6]::table::WakerTable>::wake_impl
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish::{closure#0}
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+     <std[c60ef17cbf7de79f]::sys::thread::unix::Thread>::new::thread_start
+     0x79aad6c6568b
+     start_thread
+     __clone
+
+[11] 0.2 ms in 2 waits
+     <std[c60ef17cbf7de79f]::sys::sync::mutex::futex::Mutex>::lock_contended
+     <std[c60ef17cbf7de79f]::sync::poison::mutex::Mutex<[runtime[84bd08c7332b6749]::policy::pressure::Gauge; 2: usize]>>::lock
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::execute_control
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+     <std[c60ef17cbf7de79f]::sys::thread::unix::Thread>::new::thread_start
+     0x79aad6c6568b
+     start_thread
+     __clone
+
+[12] 0.1 ms in 1 waits
+     <parking_lot_core[69f528b62557408a]::word_lock::WordLock>::lock_slow
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::pipeline::fire::KvTxnGuard>::settle
+     core[62e902411887be45]::ptr::drop_glue::<runtime[84bd08c7332b6749]::pipeline::fire::KvTxnGuard>
+     <<runtime[84bd08c7332b6749]::engine::completion::WorkItemCompletion>::on_settled<<runtime[84bd08c7332b6749]::pipeline::fire::FireEpoch>::retire_on::{c
+     <runtime[84bd08c7332b6749]::engine::completion::told::{closure#0}::{closure#0} as core[62e902411887be45]::ops::function::FnOnce<()>>::call_once::{shim
+     runtime[84bd08c7332b6749]::engine::completion::run_settled
+     <runtime[84bd08c7332b6749]::engine::completion::Landed>::publish
+     <runtime[84bd08c7332b6749]::engine::completion::FrameSettlements>::settled
+     <runtime[84bd08c7332b6749]::scheduler::lane::Lane>::run
+     std[c60ef17cbf7de79f]::sys::backtrace::__rust_begin_short_backtrace::<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>
+     <std[c60ef17cbf7de79f]::thread::lifecycle::spawn_unchecked<<runtime[84bd08c7332b6749]::scheduler::lane::Lane>::spawn::{closure#0}, ()>::{closure#1} as
+
+## tokio-rt-worker (all 27): lock waits with a backtrace: 124748 waits, 35265.0 ms; distinct stacks 164
+
+[1] 5792.6 ms in 17504 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::inferlet::host::forward::materialize_channel::{closure#0}
+     runtime[84bd08c7332b6749]::inferlet::host::pie::inferlet::channel::add_to_linker_instance::<runtime[84bd08c7332b6749]::inferlet::process::ctx::Process
+     <wasmtime[5b4a4709b80503c5]::runtime::store::context::StoreContextMut<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>>::wrap_call::<<wa
+     <wasmtime[5b4a4709b80503c5]::runtime::component::instance::Instance>::first_poll::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx, (cor
+     <futures_util[b989b6debc08f651]::stream::futures_unordered::FuturesUnordered<core[62e902411887be45]::pin::Pin<alloc[2a0ada2ddd1fabff]::boxed::Box<dyn 
+     <core[62e902411887be45]::future::poll_fn::PollFn<<wasmtime[5b4a4709b80503c5]::runtime::store::context::StoreContextMut<runtime[84bd08c7332b6749]::infe
+     <runtime[84bd08c7332b6749]::inferlet::process::Process>::run::{closure#0}::{closure#0}
+     0x0
+
+[2] 3740.5 ms in 15003 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::pass_lanes::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[3] 3189.7 ms in 14356 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::pipeline::fire::kv_demand
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[4] 2511.9 ms in 12683 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::inferlet::host::working_set::grow_pages
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[5] 1953.9 ms in 9933 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[6] 1839.5 ms in 9799 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::pipeline::fire::reserve::prepare_reserved
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[7] 1800.1 ms in 8513 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::pipeline::fire::finalize::settle_fold
+     runtime[84bd08c7332b6749]::inferlet::host::forward::materialize_channel::{closure#0}
+     runtime[84bd08c7332b6749]::inferlet::host::pie::inferlet::channel::add_to_linker_instance::<runtime[84bd08c7332b6749]::inferlet::process::ctx::Process
+     <wasmtime[5b4a4709b80503c5]::runtime::store::context::StoreContextMut<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>>::wrap_call::<<wa
+     <wasmtime[5b4a4709b80503c5]::runtime::component::instance::Instance>::first_poll::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx, (cor
+     <futures_util[b989b6debc08f651]::stream::futures_unordered::FuturesUnordered<core[62e902411887be45]::pin::Pin<alloc[2a0ada2ddd1fabff]::boxed::Box<dyn 
+     <core[62e902411887be45]::future::poll_fn::PollFn<<wasmtime[5b4a4709b80503c5]::runtime::store::context::StoreContextMut<runtime[84bd08c7332b6749]::infe
+     <runtime[84bd08c7332b6749]::inferlet::process::Process>::run::{closure#0}::{closure#0}
+     0x0
+
+[8] 1798.7 ms in 9363 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     runtime[84bd08c7332b6749]::pipeline::fire::lanes::working_set_flat_table
+     runtime[84bd08c7332b6749]::pipeline::fire::lanes::map_lane_pages
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[9] 1710.0 ms in 842 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::demote_idle_for
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::grant_now
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[10] 1704.3 ms in 9577 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::pipeline::fire::FireEpoch>::begin
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[11] 1188.1 ms in 377 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::reclaim_idle_once
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::grant_now
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
+
+[12] 927.7 ms in 2588 waits
+     <parking_lot[194bcbbaa4f082fb]::raw_mutex::RawMutex>::lock_slow
+     <runtime[84bd08c7332b6749]::planner::residency_planner::ResidencyPlanner>::grant_now
+     runtime[84bd08c7332b6749]::pipeline::fire::submit::submit_pass_stamped::<runtime[84bd08c7332b6749]::inferlet::process::ctx::ProcessCtx>::{closure#0}
+     0x0
