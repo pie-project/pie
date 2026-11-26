@@ -240,6 +240,11 @@ pub struct Shell {
     /// never arms once lanes name slot refs (it is refused by name, or the
     /// bodies stay as recorded).
     arm_deferred: bool,
+    /// What this worker holds of the device beyond the ledger's own
+    /// entries, settled after arming ([`Shell::settle_outside`]), and what
+    /// the ledger's own entries took then; `None` where the driver does not
+    /// say what the worker holds, or nothing has settled it yet.
+    outside: Option<(engine::memory::Outside, u64)>,
     /// How the load seated its weights ahead of the runtime's first
     /// residency (`filed`, `copied`; `Shell::preseat_weights`), for a
     /// measuring load that seats them again in a range reserved anew.

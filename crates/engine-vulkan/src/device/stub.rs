@@ -50,6 +50,16 @@ impl Context {
     }
 
     #[must_use]
+    pub fn outside_unmeasured(&self) -> Option<String> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn outside_unseen(&self) -> Option<&'static str> {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn host_room(&self) -> Option<engine::HostRoom> {
         match self.never {}
     }

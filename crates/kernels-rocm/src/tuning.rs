@@ -95,6 +95,12 @@ pub struct QmmSplitThinMax(pub u32);
 #[decision(id = "kernel.qmm.split_wide_max", constant(set(8, 16, 32)), default = 16, tune = search)]
 pub struct QmmSplitWideMax(pub u32);
 
+/// Prefill attention CTAs per SM: the grid a split prefill fills, and the
+/// floor a recorded prefill pads its tiles to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
+pub struct PrefillCtasPerSm(pub u32);
+
 /// The most rows the fused skinny bf16 GEMM (GEGLU, soft-capped heads)
 /// serves; past it cuBLAS does. Its tile holds 64; 0 never takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -294,6 +300,7 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitWarpsPerSm>()
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
+        .add::<PrefillCtasPerSm>()
         .add::<GemmSkinnyRows>()
         .add::<GemmSkinnyQuadFrom>()
         .add::<GemmSkinnyDenseRows>()
@@ -462,6 +469,7 @@ tuning! {
     qmm_split_warps_per_sm: u32 = 58, get QmmSplitWarpsPerSm;
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
     qmm_split_wide_max: u32 = 16, get QmmSplitWideMax;
+    prefill_ctas_per_sm: u32 = 2, get PrefillCtasPerSm;
     gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;
     gemm_skinny_quad_from: u32 = 3, get GemmSkinnyQuadFrom;
     gemm_skinny_dense_rows: u32 = 4, get GemmSkinnyDenseRows;

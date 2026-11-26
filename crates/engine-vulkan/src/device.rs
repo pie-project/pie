@@ -7,6 +7,8 @@ pub mod ctx;
 #[cfg(feature = "vulkan")]
 pub mod pipelines;
 #[cfg(feature = "vulkan")]
+pub mod report;
+#[cfg(feature = "vulkan")]
 pub mod spirv;
 
 #[cfg(feature = "vulkan")]

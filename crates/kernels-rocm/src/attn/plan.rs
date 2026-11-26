@@ -246,6 +246,8 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 pub struct Toggles {
     /// The fewest keys a split decode chunk carries; 0 takes 256.
     pub chunk_floor_tokens: u32,
+
+    pub prefill_ctas_per_sm: u32,
 }
 
 impl Toggles {
@@ -253,6 +255,7 @@ impl Toggles {
     pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
             chunk_floor_tokens: tuning.decode_chunk_floor_tokens(),
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
         }
     }
 }
@@ -374,7 +377,7 @@ pub fn plan_prefill(
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
     const OP: &str = "attn.plan_prefill";
-    let _ = (kv_len, toggles);
+    let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
     some_requests(OP, &shape)?;
     window_left(OP, window)?;
@@ -392,7 +395,7 @@ pub fn plan_prefill(
         page_size: shape.page_size,
         enable_cuda_graph,
         window_left: window.map(|w| w - 1),
-        resident_blocks: crate::attn::paged::prefill_resident_blocks(OP, shape.head_dim)?,
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
     let built = sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
@@ -435,7 +438,6 @@ pub fn prefill_graph_float_bytes(
     toggles: Toggles,
 ) -> Result<usize, Error> {
     const OP: &str = "attn.plan_prefill";
-    let _ = toggles;
     window_left(OP, window)?;
     // The live request carries a row: the layout reads the carve's rows
     // (`total_num_rows`), and the live rows only fill its index tables.
@@ -458,7 +460,7 @@ pub fn prefill_graph_float_bytes(
         page_size: page_size.max(1),
         enable_cuda_graph: true,
         window_left: window.map(|w| w - 1),
-        resident_blocks: crate::attn::paged::prefill_resident_blocks(OP, head_dim)?,
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
     Ok(sched_prefill::plan(OP, &req, device, usize::MAX, usize::MAX)?.float_bytes)
 }
@@ -580,9 +582,6 @@ pub struct PrefillPlanInfo {
     /// A captured grid's live work items, one i32 staged each fire: the
     /// prefill lays them in the unpadded grid's order and the rest exit.
     pub block_live_offset: Option<u32>,
-    /// A captured split layout's per-fire flag, one i32: this replay runs
-    /// whole, writing the output, and the fold leaves at entry.
-    pub block_direct_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
 }
