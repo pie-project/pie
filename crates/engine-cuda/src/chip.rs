@@ -141,6 +141,39 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     r
 });
 
+/// The family a device's key names (`stored::Keys`' `on`): its compute
+/// capability's token (`sm_120`, `gfx942`), where it states one.
+#[must_use]
+pub fn family_of(on: &str) -> Option<&str> {
+    on.split_whitespace()
+        .find(|word| word.starts_with("sm_") || word.starts_with("gfx"))
+}
+
+/// The rates a committed measured profile of another device of `on`'s
+/// family states (the first such file, by name), and the device it names:
+/// what a load whose own profile states none of a rate weighs its fire top
+/// by, named, before any figure of its own. None where no committed
+/// measured profile shares the family.
+#[must_use]
+pub fn family_rates(on: &str) -> Option<(String, profile::rates::Rates)> {
+    let family = family_of(on)?;
+    SEEDED
+        .iter()
+        .filter(|(name, _)| name.ends_with(profile::shelf::MEASURED_SUFFIX))
+        .filter_map(|(name, text)| {
+            let file = registry()
+                .parse(text, name, profile::Strict::Measured)
+                .ok()?;
+            let rates = file.tuned.rates;
+            let theirs = rates.measured_on.clone()?;
+            // A file stating none of the estimate's rates (only its product
+            // times or landing) weighs no fire top.
+            let weighs = rates.missing(&profile::rates::KEYS).len() < profile::rates::KEYS.len();
+            (weighs && theirs != on && family_of(&theirs) == Some(family)).then(|| (theirs, rates))
+        })
+        .next()
+}
+
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
@@ -370,6 +403,47 @@ mod tests {
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    /// A device whose own profile states no rate is weighed by a committed
+    /// measured profile of its family's (its compute capability), never its
+    /// own file's, and by none where no device of its family is measured.
+    #[test]
+    fn a_device_takes_its_familys_measured_rates() {
+        let measured: Vec<String> = SEEDED
+            .iter()
+            .filter(|(name, _)| name.ends_with(profile::shelf::MEASURED_SUFFIX))
+            .filter_map(|(name, text)| {
+                let rates = registry()
+                    .parse(text, name, profile::Strict::Measured)
+                    .ok()?
+                    .tuned
+                    .rates;
+                (rates.missing(&profile::rates::KEYS).len() < profile::rates::KEYS.len())
+                    .then_some(rates.measured_on?)
+            })
+            .collect();
+        let Some(theirs) = measured.first() else {
+            return;
+        };
+        let family = family_of(theirs).expect("a measured profile names its family");
+        let sibling = format!("Another Device {family} driver 1");
+        let (from, rates) = family_rates(&sibling).expect("its family's rates");
+        assert_eq!(&from, theirs);
+        assert!(
+            rates.missing(&profile::rates::KEYS).len() < profile::rates::KEYS.len(),
+            "a measured profile states its rates"
+        );
+        assert_eq!(
+            family_rates(theirs).map(|(f, _)| f),
+            None,
+            "never its own file's"
+        );
+        assert_eq!(family_rates("A Device sm_1 driver 1").map(|(f, _)| f), None);
+        assert_eq!(
+            family_of("NVIDIA RTX PRO 4500 Blackwell sm_120 cuda driver 13020"),
+            Some("sm_120")
+        );
     }
 
     #[test]

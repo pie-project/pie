@@ -520,17 +520,67 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 // measures) on a card whose layers state no rate this model is
                 // weighed by: its fire top is the narrowest rung a decode fire
                 // takes, a prompt chunked to it; said by name.
+                // The rule's own estimate over the rates the device's family
+                // states (another device of its compute capability, measured
+                // and committed), named; only where none is stated the
+                // narrowest rung, said why.
                 Err(engine::load::Refused::NoRates { key, .. })
                     if boot.knobs.measuring == engine::rates::Measuring::Skip =>
                 {
-                    let rung = crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
-                    tracing::info!(
-                        "fallback: the roofline `[rates] {key}` (no layer states it; a load \
-                         measures nothing, `pie tune` does): the fire top is {rung}, the narrowest \
-                         rung a decode fire of {fire_lanes} lanes takes, a prompt chunked to it"
-                    );
-                    weighed = None;
-                    rung
+                    use profile::rates::Now as _;
+                    let on = keys.on();
+                    let family = crate::chip::family_rates(&on).and_then(|(from, theirs)| {
+                        let rates = chip.rates().over(theirs);
+                        crate::top::choose(
+                            &rungs,
+                            after_weights,
+                            prompt_rows,
+                            &rates,
+                            crate::top::shape(&chip).ok()?,
+                            device.name(),
+                            &counts,
+                        )
+                        .ok()
+                        .map(|(top, estimate)| (from, top, estimate))
+                    });
+                    match family {
+                        Some((from, top, estimate)) => {
+                            tracing::info!(
+                                "fallback: the roofline `[rates] {key}` (this device's profile \
+                                 states none; a load measures nothing, `pie tune` does): the fire \
+                                 top is weighed by the estimate over the rates `{from}`'s \
+                                 committed profile states, its family's: {}",
+                                engine::load::line_of(
+                                    &top,
+                                    top.tokens,
+                                    top.span_bytes,
+                                    after_weights,
+                                    chip.tuned()
+                                )
+                            );
+                            weighed = Some(crate::top::Weighed {
+                                rungs: rungs.clone(),
+                                estimate,
+                                live: after_weights,
+                                fire_top: top.tokens,
+                            });
+                            top.tokens
+                        }
+                        None => {
+                            let rung =
+                                crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
+                            tracing::info!(
+                                "fallback: the roofline `[rates] {key}` (no layer states it, and no \
+                                 committed profile of a device of this one's family `{}` does; a \
+                                 load measures nothing, `pie tune` does): with no rate to weigh a \
+                                 rung by, the fire top is {rung}, the narrowest rung a decode fire \
+                                 of {fire_lanes} lanes takes, a prompt chunked to it",
+                                crate::chip::family_of(&on).unwrap_or("none stated")
+                            );
+                            weighed = None;
+                            rung
+                        }
+                    }
                 }
                 Err(why) => return Err(refused(Fault::Card(why.to_string()))),
                 Ok((top, estimate)) => {
