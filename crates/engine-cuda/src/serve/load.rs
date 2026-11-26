@@ -863,7 +863,25 @@ impl Shell {
             // A load told its weights are held seats every bank before a
             // fire: its banks' host copy is pageable (`Tier::open`).
             boot.knobs.weights_held,
-            landing,
+            match landing {
+                Some(stated) => crate::weights::Landed::Stated(stated),
+                // A serving load measures nothing (`pie tune` does): the link
+                // the profile states nothing of crosses at the fallback's
+                // figures, named.
+                None if boot.knobs.measuring == engine::rates::Measuring::Skip => {
+                    tracing::info!(
+                        "rates: fallback: `[rates] landing`: nothing timed at load (`pie tune` \
+                         measures it); the weights' pinned ring is sized by the fallback link \
+                         ({:.0} GB/s past {:.0} us, {} KiB copies, a {:.0} GB/s fill)",
+                        crate::weights::LANDING_FALLBACK.copy_gbps,
+                        crate::weights::LANDING_FALLBACK.copy_latency_ns / 1e3,
+                        crate::weights::LANDING_FALLBACK.copy_full_bytes as u64 >> 10,
+                        crate::weights::LANDING_FALLBACK.fill_gbps,
+                    );
+                    crate::weights::Landed::Fallback
+                }
+                None => crate::weights::Landed::Measured,
+            },
         )?;
         if let Some(measured) = weights.landing() {
             match crate::rates::save_landing(boot.knobs.profiles.as_deref(), device.name(), &keys, measured) {

@@ -517,6 +517,30 @@ fn pairings<'a>(
     Ok(out)
 }
 
+/// How a load knows the link its weights cross: the profile's stated
+/// landing, the fallback's (a serving load, which times nothing), or
+/// measured as the ring opens (`pie tune`'s loads).
+#[derive(Clone, Copy, Debug)]
+pub enum Landed {
+    Stated(profile::rates::Landing),
+    Fallback,
+    Measured,
+}
+
+/// The link a load assumes where its profile states no `[rates] landing`
+/// and it times nothing: a PCIe-class copy and fill, its read rates unknown
+/// (0), so the checkpoint walk splits its reads as it learns them, as with
+/// no rates at all.
+pub const LANDING_FALLBACK: profile::rates::Landing = profile::rates::Landing {
+    copy_latency_ns: 10_000.0,
+    copy_gbps: 25.0,
+    copy_full_bytes: 4_194_304.0,
+    fill_gbps: 10.0,
+    read_spawn_ns: 0.0,
+    read_thread_gbps: 0.0,
+    read_whole_gbps: 0.0,
+};
+
 impl Weights {
     #[allow(clippy::too_many_arguments)]
     pub fn resident(
@@ -528,8 +552,13 @@ impl Weights {
         target: StorageTarget,
         decode_dense: bool,
         held: bool,
-        known: Option<profile::rates::Landing>,
+        landed: Landed,
     ) -> Result<Weights> {
+        let known = match landed {
+            Landed::Stated(stated) => Some(stated),
+            Landed::Fallback => Some(LANDING_FALLBACK),
+            Landed::Measured => None,
+        };
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
         } else {
@@ -644,7 +673,11 @@ impl Weights {
                             ring.rates.saturated >> 10,
                             ring.rates.latency * 1e6,
                             ring.rates.fill / 1e9,
-                            if known.is_some() { "from the device's profile" } else { "measured" },
+                            match landed {
+                                Landed::Stated(_) => "from the device's profile",
+                                Landed::Fallback => "the fallback's",
+                                Landed::Measured => "measured",
+                            },
                             opening.elapsed().as_millis(),
                         );
                         Some(ring)
