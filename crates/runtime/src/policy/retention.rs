@@ -27,6 +27,8 @@ pub const ALL_TIERS: u8 = 0b111;
 pub const DEVICE: u8 = 0b001;
 pub const HOST: u8 = 0b010;
 pub const DISK: u8 = 0b100;
+/// The tiers below the device.
+const BELOW: u8 = HOST | DISK;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Table {
@@ -38,6 +40,8 @@ pub struct Table {
     tiers_default: Option<u8>,
     /// The tiers rows that keep KV off the device.
     off_device: usize,
+    /// The tiers rows that let KV sit below the device.
+    below_device: usize,
     /// The owners each install named, oldest first, the last at the table's
     /// revision: no more of them than there are rows, past which all the
     /// owners are read again for no more.
@@ -61,6 +65,7 @@ impl Table {
         default: Option<u8>,
     ) -> Self {
         self.off_device = tiers.values().flatten().filter(|(_, row)| row & DEVICE == 0).count();
+        self.below_device = tiers.values().flatten().filter(|(_, row)| row & BELOW != 0).count();
         self.tiers = tiers;
         self.tiers_default = default;
         self
@@ -149,6 +154,13 @@ pub trait Keys {
         self.tiers_at(owner, at)
     }
 
+    /// Whether any idle cache may sit below the device
+    /// ([`Self::cache_tiers_at`]): `false` where none may, and nothing is
+    /// to be moved down for room.
+    fn cache_may_go_below(&self) -> bool {
+        true
+    }
+
     /// The tiers `owner`'s KV at token `at` may sit on ([`ALL_TIERS`]
     /// unless a row says otherwise).
     fn tiers_at(&self, _owner: Option<ProcessId>, _at: u64) -> u8 {
@@ -225,6 +237,12 @@ impl Keys for Installed {
             .and_then(|owner| table.rows_at(owner, at))
             .or(table.tiers_default)
             .unwrap_or(DEVICE)
+    }
+
+    fn cache_may_go_below(&self) -> bool {
+        CURRENT.read().as_ref().is_some_and(|table| {
+            table.below_device > 0 || table.tiers_default.is_some_and(|row| row & BELOW != 0)
+        })
     }
 
     fn revision(&self) -> Option<u64> {
@@ -337,6 +355,9 @@ pub(crate) fn apply(change: Change) {
             table.off_device += off(&row);
             let stood = put(&mut table.tiers, prefix, row);
             table.off_device -= off(&stood);
+            let below = |row: &Option<u8>| usize::from(row.is_some_and(|row| row & BELOW != 0));
+            table.below_device += below(&row);
+            table.below_device -= below(&stood);
         }
         if let Some(default) = change.key_default {
             table.default = default;
@@ -430,7 +451,7 @@ mod tests {
     /// A table whose tiers default is the device alone (the shipped
     /// default policy's idle cache) holds every owner no row names there.
     #[test]
-    fn rows_that_keep_kv_off_the_device_are_counted_as_they_come_and_go() {
+    fn rows_that_keep_kv_off_the_device_or_let_it_below_are_counted() {
         let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
         let owner = ProcessId::from_u128(0xf6);
         install(None);
@@ -443,8 +464,10 @@ mod tests {
         apply(row(Some(HOST)));
         apply(row(Some(HOST | DISK)));
         assert!(keeps_off_device());
+        assert!(Installed.cache_may_go_below());
         apply(row(None));
         assert!(!keeps_off_device());
+        assert!(!Installed.cache_may_go_below(), "no row lets cache below");
         install(None);
     }
 

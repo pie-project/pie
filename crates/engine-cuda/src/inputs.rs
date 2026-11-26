@@ -49,13 +49,12 @@ fn prefill_float_bytes(
             what: format!(
                 "the prefill workspace grant: the graph form of {rows} rows over {lanes} \
                  lanes ({} query heads over {} kv heads, {} wide, window {:?}, pages of \
-                 {page_size}, {} SMs at {} CTAs an SM) refused: {refused}",
+                 {page_size}, {} SMs) refused: {refused}",
                 facts.q_heads,
                 facts.kv_heads,
                 facts.head_dim,
                 facts.window,
                 device.num_sm,
-                toggles.prefill_ctas_per_sm,
             ),
         })?;
         most = most.max(asked);

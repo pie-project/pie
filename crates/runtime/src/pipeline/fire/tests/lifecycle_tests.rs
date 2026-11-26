@@ -596,3 +596,40 @@ async fn close_and_drop_share_graceful_fifo_drain_semantics() -> anyhow::Result<
     assert!(context.resources.get(&borrowed).is_err());
     Ok(())
 }
+
+/// A settle asked on an engine lane runs off it, in the order asked; one
+/// asked elsewhere runs where it is asked.
+#[test]
+fn a_settle_asked_on_an_engine_lane_runs_off_it_in_order() {
+    use std::sync::{Arc, Mutex};
+    let ran: Arc<Mutex<Vec<(u32, String)>>> = Arc::default();
+    let note = |at: u32, ran: &Arc<Mutex<Vec<(u32, String)>>>| {
+        let ran = Arc::clone(ran);
+        move || {
+            let on = std::thread::current().name().unwrap_or_default().to_string();
+            ran.lock().unwrap().push((at, on));
+        }
+    };
+    let lane = {
+        let ran = Arc::clone(&ran);
+        std::thread::Builder::new()
+            .spawn(move || {
+                crate::scheduler::lane::mark_engine_lane();
+                for at in 0..8 {
+                    super::settled_off_lane(note(at, &ran));
+                }
+            })
+            .unwrap()
+    };
+    lane.join().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while ran.lock().unwrap().len() < 8 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let ran_off: Vec<_> = ran.lock().unwrap().drain(..).collect();
+    assert_eq!(ran_off.iter().map(|(at, _)| *at).collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
+    assert!(ran_off.iter().all(|(_, on)| on == "pie-kv-settle"), "{ran_off:?}");
+    super::settled_off_lane(note(9, &ran));
+    let here = std::thread::current().name().unwrap_or_default().to_string();
+    assert_eq!(*ran.lock().unwrap(), vec![(9, here)], "off a lane: where it is asked");
+}

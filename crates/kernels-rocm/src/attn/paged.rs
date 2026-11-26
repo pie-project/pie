@@ -34,6 +34,13 @@ struct Args {
     kv_tile_indices: u64,
     kv_chunk_size: u64,
     block_valid: u64,
+    /// A captured prefill grid's live work items, staged each fire (null: all).
+    block_live: u64,
+    /// A captured split layout's per-fire whole flag, and the output it
+    /// then writes (null: none).
+    direct: u64,
+    o_direct: u64,
+    lse_direct: u64,
     o: u64,
     lse: u64,
     num_qo_heads: i32,
@@ -53,7 +60,48 @@ struct Args {
     stride_page: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<Args>() == 184);
+const _: () = assert!(core::mem::size_of::<Args>() == 216);
+
+/// The prefill blocks one compute unit of the current device holds at once
+/// for heads `head_dim` wide: HIP's occupancy calculator over the kernel the
+/// width walks (the narrow prefill for 128 and 256, the wide one otherwise;
+/// their masked and selected forms share its body, registers and LDS), read
+/// once a width and device. The split prefill's schedule fills the device
+/// by it (`sched_prefill::split_chunks`).
+pub fn prefill_resident_blocks(op: &'static str, head_dim: u32) -> Result<u32, Error> {
+    let name = if matches!(head_dim, 128 | 256) {
+        format!("::pie::attn::paged_prefill<{head_dim}, false, true, false>")
+    } else {
+        format!("::pie::attn::paged_prefill_wide<{head_dim}, false, true, false>")
+    };
+    resident_blocks(op, &name, 512)
+}
+
+/// The blocks of `threads` threads of `name` (in this file) one compute unit
+/// of the current device holds at once, read once a kernel and device.
+fn resident_blocks(op: &'static str, name: &str, threads: u32) -> Result<u32, Error> {
+    #[cfg(feature = "rocm")]
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashMap<(i32, String), u32>>> = OnceLock::new();
+        let device = crate::jit::device::current()
+            .ok_or_else(|| refuse(op, "HIP would not name the current device"))?;
+        let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = (device, name.to_string());
+        if let Some(&blocks) = seen.lock().expect("the occupancy table").get(&key) {
+            return Ok(blocks);
+        }
+        let blocks = kernel(FILE, name).resident_blocks(threads, 0)?;
+        seen.lock().expect("the occupancy table").insert(key, blocks);
+        Ok(blocks)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (name, threads);
+        Err(refuse(op, "no HIP device to seat the prefill on"))
+    }
+}
 
 /// A learned relative-position bias and Inkling's logit growth, as the
 /// matrix-core walks read it: `bias` f32 `[rows, heads · extent]`.
@@ -154,6 +202,8 @@ struct Partials {
     rows_ptr: u64,
     heads: u32,
     head_dim: u32,
+    /// A staged flag: the fold leaves at entry (null: it always folds).
+    skip: u64,
 }
 
 /// Wavefronts per decode block: as many as four whose partial states, with
@@ -239,6 +289,7 @@ pub fn decode(
         rows_ptr: 0,
         heads: shape.num_q_heads,
         head_dim: shape.head_dim,
+        skip: 0,
     });
     // The blocks past the live work items exit on the staged mask.
     args.block_valid = at(int, info.block_valid_mask_offset);
@@ -488,9 +539,17 @@ fn prefill_walk(
         rows_ptr: at(int, info.total_num_rows_offset),
         heads: shape.num_q_heads,
         head_dim: shape.head_dim,
+        skip: at(int, info.block_direct_offset),
     });
     if info.enable_cuda_graph {
         args.block_valid = at(int, info.block_valid_mask_offset);
+        args.block_live = at(int, info.block_live_offset);
+    }
+    // A split layout's replay staged whole writes the output itself.
+    if split.is_some() && info.block_direct_offset.is_some() {
+        args.direct = at(int, info.block_direct_offset);
+        args.o_direct = o.ptr;
+        args.lse_direct = lse;
     }
     match &split {
         Some(parts) => {
@@ -588,16 +647,23 @@ fn merge(ctx: &Ctx, op: &'static str, parts: &Partials) -> Result<(), Error> {
     if parts.parts == 0 || parts.part_lse == 0 || parts.indptr == 0 {
         return Err(refuse(op, "the split plan staged no partials to fold"));
     }
-    let blocks = parts.max_rows.saturating_mul(parts.heads);
-    if blocks == 0 {
+    let pairs = parts.max_rows.saturating_mul(parts.heads);
+    if pairs == 0 {
         return Ok(());
     }
+    // As many blocks as the device holds at once (or pairs, if fewer): they
+    // stride the (row, head) pairs, so a fold a replay leaves (`skip`) costs
+    // one wave of blocks, not one a pair.
+    let name = format!("::pie::attn::merge_partials<{}>", parts.head_dim);
+    #[cfg(feature = "rocm")]
+    let units = crate::jit::device::multiprocessors()
+        .ok_or_else(|| refuse(op, "HIP would not count the compute units"))?;
+    #[cfg(not(feature = "rocm"))]
+    let units: u32 = 1;
+    let blocks = pairs.min(units.saturating_mul(resident_blocks(op, &name, 256)?));
     ctx.fire(
         op,
-        Fire::at(kernel(
-            FILE,
-            &format!("::pie::attn::merge_partials<{}>", parts.head_dim),
-        ))
+        Fire::at(kernel(FILE, &name))
         .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(parts.parts),
@@ -609,6 +675,7 @@ fn merge(ctx: &Ctx, op: &'static str, parts: &Partials) -> Result<(), Error> {
             ArgValue::Ptr(parts.rows_ptr),
             ArgValue::I32(parts.heads as i32),
             ctx.stage(),
+            ArgValue::Ptr(parts.skip),
         ],
     )
 }

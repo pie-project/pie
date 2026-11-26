@@ -178,6 +178,36 @@ fn requote_on_drift(
     true
 }
 
+/// Runs `settle`, a landed fire's kv settle, off an engine lane: a lane
+/// resolves its fires' completions as they land, and launches its next step
+/// after; settled there, it waited on the kv lock every guest's fire takes,
+/// with the device idle. Nothing the next launch reads comes from a settle
+/// (what it frees is reused only by grants after it), so settles go in the
+/// order they are asked, on one thread of their own. Asked elsewhere, a
+/// settle runs where it is asked.
+fn settled_off_lane(settle: impl FnOnce() + Send + 'static) {
+    type Settle = Box<dyn FnOnce() + Send>;
+    static SETTLER: std::sync::LazyLock<std::sync::Mutex<std::sync::mpsc::Sender<Settle>>> =
+        std::sync::LazyLock::new(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Settle>();
+            crate::rt::thread::Builder::new()
+                .name("pie-kv-settle".to_string())
+                .spawn(move || {
+                    while let Ok(settle) = rx.recv() {
+                        settle();
+                    }
+                })
+                .expect("the settle thread starts");
+            std::sync::Mutex::new(tx)
+        });
+    if !crate::scheduler::lane::on_engine_lane() {
+        return settle();
+    }
+    if let Err(std::sync::mpsc::SendError(settle)) = SETTLER.lock().unwrap().send(Box::new(settle)) {
+        settle();
+    }
+}
+
 /// A kv epoch a fire holds: settled by whoever finishes the fire, or, let go
 /// unsettled, when dropped — at once while the fire was never submitted,
 /// else once the engine has run it ([`Self::retire_on`]). A pending fire
@@ -228,7 +258,9 @@ impl Drop for KvTxnGuard {
         };
         let (model, engine) = (self.model, self.engine);
         match self.submitted.take() {
-            Some(completion) => completion.on_settled(move || Self::settle(model, engine, txn)),
+            Some(completion) => {
+                completion.on_settled(move || settled_off_lane(move || Self::settle(model, engine, txn)));
+            }
             None => Self::settle(model, engine, txn),
         }
     }
@@ -270,7 +302,7 @@ impl FireEpoch {
     /// the wakeup to the pass that finalizes the fire, when a completion
     /// woke one waiter, and held the epoch open until shutdown.)
     fn retire_on(self, completion: &crate::engine::WorkItemCompletion) {
-        completion.on_settled(move || drop(self));
+        completion.on_settled(move || settled_off_lane(move || drop(self)));
     }
 }
 

@@ -23,7 +23,7 @@
 use poem_ir::Request;
 
 use super::{Lane, Seated, Shell};
-use crate::device::{Admission, HostRoom, available_memory};
+use crate::device::{CompileGate, HostRoom};
 use crate::error::Result;
 
 /// One synthetic lane: its word, its rows, and the pages it holds before
@@ -517,6 +517,9 @@ impl Shell {
                                 n as usize
                             ];
                             lanes[0].rows += b % n;
+                            // filling its rung, which takes no rest lane, and
+                            // a row short of it
+                            shapes.push(lanes.clone());
                             lanes[0].rows -= 1;
                             shapes.push(lanes);
                         }
@@ -572,6 +575,24 @@ impl Shell {
             parts.push(("stated", shapes.len()));
             shapes.extend(gaps.unlaid.into_iter().map(|(_, shape)| shape));
         }
+        // Every fire of prompts alone, beside its masked twin: a lane stating
+        // a mask (a beam's rescore, a guest's) stages the plane, a program of
+        // its own. A fire of prompts beside decodes stages it either way.
+        if masks {
+            let twins: Vec<Vec<Want>> = shapes
+                .iter()
+                .filter(|shape| {
+                    !shape.is_empty() && shape.iter().all(|w| w.rows > 1 && !w.masked)
+                })
+                .map(|shape| {
+                    let mut lanes = shape.clone();
+                    lanes[0].masked = true;
+                    lanes
+                })
+                .collect();
+            parts.push(("masked prompts", shapes.len()));
+            shapes.extend(twins);
+        }
         Ok(Some((parts, shapes)))
     }
 
@@ -597,11 +618,13 @@ impl Shell {
                 let fired_part = warm_part(&parts, at);
                 let r = self.warm_fire(shape);
                 // each program it traced, in the order serving meets them:
-                // decode first, by lanes, then drafts, mixed and prompts
-                let use_order = (use_rank(fired_part), shape.len() as u32);
+                // decode first, by lanes, then drafts, mixed and prompts, and
+                // a masked fire's after every plain one's
+                let masked = shape.iter().any(|w| w.masked);
+                let use_order = (masked, use_rank(fired_part), shape.len() as u32);
                 if let Some(deferred) = self.deferred.as_mut() {
                     for d in deferred.iter_mut().skip(before) {
-                        d.order = (use_order.0, use_order.1, d.rows);
+                        d.order = (use_order.0, use_order.1, use_order.2, d.rows);
                     }
                 }
                 if pass == 0 {
@@ -749,6 +772,7 @@ impl Shell {
                 let room = HostRoom::new(stated, floor);
                 let next = std::sync::atomic::AtomicUsize::new(0);
                 let loaded = std::sync::atomic::AtomicUsize::new(0);
+                let loaded_masked = std::sync::atomic::AtomicUsize::new(0);
                 let full = std::sync::atomic::AtomicBool::new(false);
                 // One program's load: its text's bytes, `None` past the queue's
                 // end or with the host full or the loader stopped.
@@ -756,18 +780,24 @@ impl Shell {
                     if stop.load(SeqCst) || full.load(SeqCst) {
                         return None;
                     }
-                    let (key, code, sig, _) = queue.get(next.fetch_add(1, SeqCst))?;
+                    let (key, code, sig, (masked, ..)) = queue.get(next.fetch_add(1, SeqCst))?;
                     // no load beside a guest stage compile measuring its need
                     let _beside = crate::guest::run::load_beside();
                     let Some(reserved) = room.take(code.len()) else {
                         full.store(true, SeqCst);
                         return None;
                     };
-                    let program = device.load_behind(code, sig.clone());
+                    // a traced text whose file does not load (corrupt, or
+                    // gone) is built again here, before ready
+                    let program = match device.load_behind(code, sig.clone()) {
+                        Ok(None) if code.text().is_some() => device.prepare_code(code, sig.clone()),
+                        loaded => loaded,
+                    };
                     room.done(reserved, matches!(program, Ok(Some(_))));
                     match program {
                         Ok(Some(_)) => {
                             loaded.fetch_add(1, SeqCst);
+                            loaded_masked.fetch_add(usize::from(*masked), SeqCst);
                         }
                         Ok(None) => {
                             if let (Some(scope), crate::device::Code::Cached { name, .. }) =
@@ -858,9 +888,13 @@ impl Shell {
                 while batch(knee).is_some() {}
                 let loaded = loaded.load(SeqCst);
                 let left = queue.len().saturating_sub(loaded);
+                let masked = queue.iter().filter(|q| q.3.0).count();
+                let loaded_masked = loaded_masked.load(SeqCst);
                 tracing::info!(
                     loaded,
                     of = queue.len(),
+                    plain_left = (queue.len() - masked).saturating_sub(loaded - loaded_masked),
+                    masked_left = masked.saturating_sub(loaded_masked),
                     s = started.elapsed().as_secs_f64(),
                     stopped = stop.load(SeqCst),
                     host_full = full.load(SeqCst),
@@ -922,7 +956,7 @@ impl Shell {
         }
     }
 
-    /// Compiles what the ladder traced, a thread a core up to 8, and seats
+    /// Compiles what the ladder traced, a thread a core, and seats
     /// each program under its keys; answers how many programs it left out.
     /// A program a record names is parked, loaded behind serving
     /// (`Shell::load_behind`).
@@ -944,26 +978,12 @@ impl Shell {
             });
             index.push(at);
         }
-        // A compile's scratch is ~0.55 GiB a MiB of its text (v5e, Qwen3.6-
-        // 35B-A3B's 9 MiB pf256 programs: 5 GB each; eight v6e ones 108 GB
-        // at once): one is admitted while the host's free memory holds 0.75
-        // GiB a MiB for it and for every compile still running (one that
-        // started may not have taken its memory yet), each at its own text,
-        // not the ladder's longest (at that a v5e host ran Qwen3.6-35B-A3B's
-        // 168-program ladder one compile at a time, 73 compile-minutes past
-        // the hour a round has). A v5e host's 47 GB stopped answering at four
-        // started together.
+        // The room the programs held in host memory leave compiles.
         let need = texts
             .iter()
             .filter(|(c, _)| c.text().is_some())
             .map(|(c, _)| c.need())
             .max()
-            .unwrap_or(0);
-        let least = texts
-            .iter()
-            .filter(|(c, _)| c.text().is_some())
-            .map(|(c, _)| c.need())
-            .min()
             .unwrap_or(0);
         // A compiled program held in host memory takes what its load is
         // measured to take ([`HostRoom`]), and libtpu's allocator keeps what
@@ -973,7 +993,8 @@ impl Shell {
         // beside those under way. The rest are parked: compiled onto the disk
         // cache (not held) where they are not there yet, loaded (~1 s, never
         // compiled) by the first fire that takes their shape. With a disk
-        // cache the ladder holds none it compiles while it compiles: a held
+        // cache the ladder holds none, compiled now or found there (the loader
+        // behind the guest stages takes them, `load_behind`): a held
         // program's memory is a compile's room (Qwen3.6-35B-A3B's v5e ladder
         // held 25 GB of a 47 GB host by its end, its last compiles one at a
         // time); those the free memory holds load once the compiles are done.
@@ -983,19 +1004,12 @@ impl Shell {
         let stated = self.host_programs;
         let host_room = HostRoom::new(stated, 2 * need);
         let parked = std::sync::atomic::AtomicUsize::new(0);
-        // The compiles' room, fixed here: two compiles', or what a stated
-        // programs' room leaves of the free memory. A compile starts once
-        // its own need and every running one's fit in it, woken by a compile
-        // that ends (no poll of the free memory).
-        let admission = Admission::new(match stated {
-            Some(stated) => available_memory().map_or(u64::MAX, |b| b.saturating_sub(stated)),
-            None => 2 * need,
-        });
-        let room = available_memory().map_or(8, |b| b / least.max(1)) as usize;
+        // The compiles running, by what the ones before them grew the process
+        // by (`CompileGate`): as many as the cores, the free memory waiting
+        // for a compile to end where it would not hold another.
+        let admission = CompileGate::default();
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .min(8)
-            .min(room)
             .clamp(1, texts.len().max(1));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let device = &self.device;
@@ -1020,7 +1034,7 @@ impl Shell {
                             parked.fetch_add(1, SeqCst);
                             continue;
                         }
-                        let reserved = if !parks || device.code_on_disk(text) {
+                        let reserved = if !parks {
                             host_room.take(text.len())
                         } else {
                             None
@@ -1034,7 +1048,7 @@ impl Shell {
                         }
                         let program = {
                             // a cached program loads, never compiled
-                            let _admitted = text.text().map(|t| admission.admit(t));
+                            let _admitted = text.text().map(|_| admission.admit());
                             device.prepare_code(text, (*sig).clone())
                         };
                         if let Some(r) = reserved {
@@ -1476,3 +1490,4 @@ fn keep_width(width: &super::LoadWidth, knee: usize) {
         Err(why) => tracing::warn!(%why, "xla loader width not kept: measured again next load"),
     }
 }
+

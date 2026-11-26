@@ -757,6 +757,18 @@ impl Serve for Api {
                 shell.eager_next = true;
                 Plan::Walk { keep: None, split }
             }
+            // A mixed fire of several prompts beside decodes, stated eager at
+            // load by name: the arm walk lays one prompt beside decodes, and
+            // the commands of several prompts bake families of their own
+            // (Qwen3-0.6B: a body per prompt count, 43% more bodies to arm
+            // them, for no serving speed the c64 census could see).
+            Some(_) if shell.armed && {
+                let prompts = prepared.seats.iter().filter(|seat| seat.rows > 1).count();
+                prompts > 1 && prompts < prepared.seats.len()
+            } => {
+                shell.eager_next = true;
+                Plan::Walk { keep: None, split }
+            }
             // Before the load armed its bodies (its settle, its probes) a
             // fire walks as it is, the load's own.
             Some(_) if !shell.armed => Plan::Walk { keep: None, split },

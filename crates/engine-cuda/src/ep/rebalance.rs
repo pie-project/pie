@@ -70,6 +70,20 @@ impl Rebalancer {
         }
     }
 
+    /// Lays the spare an expert's planes are copied through, of
+    /// `expert_bytes`, at load: what a rebalance while serving copies
+    /// through ([`Rebalancer::copy`]) makes nothing.
+    pub fn lay_spare(&mut self, expert_bytes: u64) -> Result<()> {
+        if self
+            .spare
+            .as_ref()
+            .is_none_or(|s| (s.bytes() as u64) < expert_bytes)
+        {
+            self.spare = Some(Buffer::zeroed(expert_bytes as usize)?);
+        }
+        Ok(())
+    }
+
     /// The experts moved since load.
     #[must_use]
     pub fn moved(&self) -> u64 {
@@ -194,14 +208,19 @@ impl Rebalancer {
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         let expert_bytes: u64 = planes[0].iter().map(|p| p.slot_bytes).sum();
-        if self
-            .spare
-            .as_ref()
-            .is_none_or(|s| (s.bytes() as u64) < expert_bytes)
-        {
-            self.spare = Some(Buffer::zeroed(expert_bytes as usize)?);
-        }
-        let spare = self.spare.as_ref().expect("sized above").ptr();
+        let spare = match self.spare.as_ref() {
+            Some(spare) if spare.bytes() as u64 >= expert_bytes => spare.ptr(),
+            laid => {
+                return Err(Fault::program(
+                    "ep::rebalance",
+                    format!(
+                        "an expert's planes take {expert_bytes} bytes and the spare the load laid \
+                         takes {}: the load sized it short, a sizing bug",
+                        laid.map_or(0, Buffer::bytes)
+                    ),
+                ));
+            }
+        };
         let at = |slot: u32, plane: usize, offset: u64| -> u64 {
             if slot == SPARE {
                 return spare + offset;

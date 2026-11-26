@@ -85,19 +85,26 @@ fn a_corrupt_recorded_program_is_built_again() {
     );
     same(&got, "a load mending before ready");
 
-    // its length, corrupt within: dropped behind serving, built next load
+    // its length, corrupt within: dropped behind serving, or built again
+    // there where its text is held, before ready
     let (file, _) = a_recorded_file(&dir);
     let len = std::fs::metadata(&file)
         .expect("the program file is there")
         .len();
-    std::fs::write(&file, vec![0x5a; len as usize]).expect("the program file is overwritten");
+    let corrupt = vec![0x5a; len as usize];
+    std::fs::write(&file, &corrupt).expect("the program file is overwritten");
     assert!(
         loaded_only() > 0,
         "loading behind serving finds the file corrupt"
     );
-    // the record the loader took it by is dropped with the file; others
-    // naming the file find it gone at the next load's ladder
-    assert!(!file.exists(), "the corrupt file is dropped");
+    // the record the loader took it by is dropped with the file, or, where
+    // the loader holds the program's text, the program is built again
+    // before ready; records naming the file find it gone or sound at the
+    // next load's ladder
+    assert!(
+        std::fs::read(&file).map_or(true, |kept| kept != corrupt),
+        "the corrupt file is dropped or built again"
+    );
     // (every record naming the dropped file, mended before ready)
     let (again, (_, hold, _), _) = served(CONTEXT);
     assert!(hold, "the records hold");

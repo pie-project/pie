@@ -345,7 +345,13 @@ impl fmt::Display for Ledger {
             }
             f.write_str(if first { "; " } else { "); " })?;
         }
-        write!(f, "{} of {} MiB", self.held() >> 20, self.capacity >> 20)
+        // The bytes entered, not each class rounded up to whole chunks: the
+        // rounded count ([`Ledger::held`]) is what a pool sizes its room by,
+        // and can pass the capacity where the bytes do not.
+        let entered = Class::ALL
+            .iter()
+            .fold(0u64, |sum, class| sum.saturating_add(self.bytes(*class)));
+        write!(f, "{} of {} MiB", entered >> 20, self.capacity >> 20)
     }
 }
 
