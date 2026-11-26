@@ -1,0 +1,33 @@
+## q06 ns shared seed boot 12.5 ready=1 load=27.83
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 0 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 1 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=0 pass_ms=0 pass_mean_us=0 mindf=572
+## q06 n3 shared seed boot 12.1 ready=1 load=24.23
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 0 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 1 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=0 pass_ms=0 pass_mean_us=0 mindf=572
+## q06 ns shared c256-def-1 boot 12.4 ready=1 load=22.28
+rounds [15652, 15543, 15749, 15943, 15565, 15868, 15190, 15606] pages [(5888, 23139), (11776, 23139), (17664, 23139), (22817, 23139), (22825, 23139), (22818, 23139), (22841, 23139), (22849, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 58 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 1 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=963 pass_ms=319 pass_mean_us=331 mindf=572
+## q06 n3 shared c256-def-1 boot 12.6 ready=1 load=39.56
+rounds [15714, 15933, 16119, 15784, 15101, 15541, 15602, 15458] pages [(5888, 23139), (11776, 23139), (17664, 23139), (22832, 23139), (22810, 23139), (22818, 23139), (22811, 23139), (22830, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 64 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 1 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=1063 pass_ms=361 pass_mean_us=340 mindf=572
+## q06 ns private c256-def-1 boot 12.4 ready=1 load=68.07
+rounds [16340, 15958, 16237, 16049, 16191, 16290, 16051, 16255] pages [(0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 0 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 63 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=1633 pass_ms=49 pass_mean_us=30 mindf=572
+## q06 ns shared c256-def-2 boot 12.3 ready=1 load=44.16
+rounds [15817, 15217, 15556, 15751, 14583, 14752, 13899, 14083] pages [(5888, 23139), (11776, 23139), (17664, 23139), (22817, 23139), (22795, 23139), (22833, 23139), (22841, 23139), (22802, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 42 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 57 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=1017 pass_ms=333 pass_mean_us=327 mindf=572
+## q06 n3 shared c256-def-2 boot 12.5 ready=1 load=44.39
+rounds [15233, 15418, 15941, 16127, 15203, 14837, 15411, 15745] pages [(5888, 23139), (11776, 23139), (17664, 23139), (22832, 23139), (22840, 23139), (22833, 23139), (22811, 23139), (22819, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 45 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 45 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=848 pass_ms=258 pass_mean_us=304 mindf=572
+## q06 ns private c256-def-2 boot 12.0 ready=1 load=35.43
+rounds [15286, 15146, 15765, 15517, 16210, 15851, 15681, 15973] pages [(0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139), (0, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 0 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 90 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=1619 pass_ms=53 pass_mean_us=32 mindf=572
+## q06 ns shared c256-def-3 boot 12.5 ready=1 load=27.83
+rounds [16193, 15982, 15755, 15869, 15356, 14872, 14097, 14373] pages [(5888, 23139), (11776, 23139), (17664, 23139), (22802, 23139), (22825, 23139), (22818, 23139), (22871, 23139), (22774, 23139)]
+failed 0 stalls 0
+   [writes slots] 0 [would post after] 0 [rung is lowered] 0 [rung is raised] 0 [cap came down] 0 [fresh room refused] 72 [evict-phases] 0 [restore-done] 0 [a wait past] 0 [waits at an admission gate] 0 [waits at admission behind] 0 [waits at admission for] 0 [suspend] 64 [demote begins] 0 [demote now] 0 [ ERROR ] 0 [panicked] 0 [BuiltInFire] 0 passes=923 pass_ms=321 pass_mean_us=347 mindf=572
+ALLDONE
