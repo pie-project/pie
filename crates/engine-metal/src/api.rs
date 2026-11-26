@@ -926,6 +926,12 @@ impl Engine for Metal {
             ms = began.elapsed().as_millis() as u64,
             "metal: every pipeline the load dispatches is built before ready"
         );
+        // Not in the ledger: what Metal's driver holds for the process beside
+        // what the device says it allocated (it settles seconds after the
+        // walk). Stated, not measured into `outside_bytes`, not carved.
+        tracing::info!(
+            "metal: Metal's driver holds memory outside budget_device that the device's allocated size does not show; it is not carved from the budget"
+        );
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
