@@ -1513,13 +1513,23 @@ fn configure_execution(wasm_config: &mut wasmtime::Config, runtime: &RuntimeConf
         tables_per_instance: u64::from(CORE_RESOURCES_PER_COMPONENT),
         table_elements: pooling_config.get_table_elements() as u64,
         table_element_bytes: std::mem::size_of::<usize>() as u64,
+        // wasmtime lays its table pool accessible whole, which Windows
+        // commits (`MEM_COMMIT`); elsewhere it is only mapped.
+        tables_committed: cfg!(windows),
     };
     drop(probe);
     let cost = layout.cost();
     let space = sandbox_pool::read_address_space();
     let has = space.as_ref().ok().map_or_else(
         || "an address space not read".to_string(),
-        |space| format!("{} and {}", space.bytes_shown(), space.maps_shown()),
+        |space| {
+            format!(
+                "{}, {} and {}",
+                space.bytes_shown(),
+                space.maps_shown(),
+                space.commit_shown()
+            )
+        },
     );
     let instances = sandbox_pool::size_pool(runtime.wasm_max_instances, space, &cost)?;
     tracing::info!(

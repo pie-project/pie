@@ -263,6 +263,68 @@ pub mod address {
                 protect: u32,
             ) -> *mut std::ffi::c_void;
             pub fn VirtualFree(address: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
+            pub fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
+            pub fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            pub fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                counters: *mut ProcessMemoryCountersEx,
+                size: u32,
+            ) -> i32;
+        }
+
+        /// `MEMORYSTATUSEX`.
+        #[repr(C)]
+        pub struct MemoryStatusEx {
+            pub length: u32,
+            pub memory_load: u32,
+            pub total_phys: u64,
+            pub avail_phys: u64,
+            pub total_page_file: u64,
+            pub avail_page_file: u64,
+            pub total_virtual: u64,
+            pub avail_virtual: u64,
+            pub avail_extended_virtual: u64,
+        }
+
+        /// `PROCESS_MEMORY_COUNTERS_EX`.
+        #[repr(C)]
+        pub struct ProcessMemoryCountersEx {
+            pub cb: u32,
+            pub page_fault_count: u32,
+            pub peak_working_set_size: usize,
+            pub working_set_size: usize,
+            pub quota_peak_paged_pool_usage: usize,
+            pub quota_paged_pool_usage: usize,
+            pub quota_peak_non_paged_pool_usage: usize,
+            pub quota_non_paged_pool_usage: usize,
+            pub pagefile_usage: usize,
+            pub peak_pagefile_usage: usize,
+            pub private_usage: usize,
+        }
+    }
+
+    /// The commit the system can still give (`ullAvailPageFile`) and what
+    /// this process has committed (`PrivateUsage`); `None` where either is
+    /// not read.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn commit() -> Option<(u64, u64)> {
+        // SAFETY: zeroed out-structs of the layouts the calls write, their
+        // lengths stated; the process handle is the pseudo-handle, never
+        // closed.
+        unsafe {
+            let mut status: win::MemoryStatusEx = std::mem::zeroed();
+            status.length = std::mem::size_of::<win::MemoryStatusEx>() as u32;
+            if win::GlobalMemoryStatusEx(&raw mut status) == 0 {
+                return None;
+            }
+            let mut counters: win::ProcessMemoryCountersEx = std::mem::zeroed();
+            let size = std::mem::size_of::<win::ProcessMemoryCountersEx>() as u32;
+            counters.cb = size;
+            if win::K32GetProcessMemoryInfo(win::GetCurrentProcess(), &raw mut counters, size) == 0 {
+                return None;
+            }
+            Some((status.avail_page_file, counters.private_usage as u64))
         }
     }
 

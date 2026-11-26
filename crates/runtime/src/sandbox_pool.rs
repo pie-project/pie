@@ -16,6 +16,11 @@
 //! in maps, before its engines loaded ([`note_maps_before_engines`]): the
 //! part of it that grows with serving, not a copy of all it holds.
 //! Unrecorded, it is left as much again as it holds.
+//!
+//! On Windows wasmtime commits its table pool whole as it lays it
+//! (`VirtualAlloc` with `MEM_COMMIT`): the pool is held to the commit the
+//! system has left once the engines loaded (a CUDA pool under WDDM is
+//! charged there too), less what the process committed before them.
 
 use anyhow::{Result, bail};
 use std::sync::OnceLock;
@@ -27,6 +32,8 @@ struct BeforeEngines {
     mapped: u64,
     /// Memory maps it held, where they are counted.
     maps: Option<u64>,
+    /// Memory it committed, where commit is counted (Windows).
+    committed: Option<u64>,
 }
 
 static BEFORE_ENGINES: OnceLock<BeforeEngines> = OnceLock::new();
@@ -50,6 +57,7 @@ fn held_now() -> Result<BeforeEngines> {
     Ok(BeforeEngines {
         mapped: mapped_now()?,
         maps: None,
+        committed: None,
     })
 }
 
@@ -60,6 +68,7 @@ fn held_now() -> Result<BeforeEngines> {
     Ok(BeforeEngines {
         mapped: space.mapped,
         maps: space.maps.map(|maps| maps.used),
+        committed: space.commit.map(|commit| commit.used),
     })
 }
 
@@ -80,6 +89,11 @@ fn keep_for_the_rest(space: &mut AddressSpace) {
     if let Some(maps) = &mut space.maps {
         maps.reserve = before.and_then(|before| before.maps).unwrap_or(maps.used);
     }
+    if let Some(commit) = &mut space.commit {
+        commit.reserve = before
+            .and_then(|before| before.committed)
+            .unwrap_or(commit.used);
+    }
 }
 
 /// What the pool reserves: per instance, and once for the pool.
@@ -94,6 +108,9 @@ pub(crate) struct PoolCost {
     /// Memory maps one live instance splits off: its stack's guard page and
     /// body, and its memory's image, accessible rest and reserved tail.
     pub instance_maps: u64,
+    /// Memory one instance commits as the pool is laid: its tables, where
+    /// wasmtime commits the table pool whole (Windows); else none.
+    pub instance_commit: u64,
 }
 
 impl PoolCost {
@@ -126,6 +143,9 @@ pub(crate) struct PoolLayout {
     /// The widest table element wasmtime lays a pooled table for: a
     /// function reference, a pointer.
     pub table_element_bytes: u64,
+    /// Whether wasmtime commits the table pool as it lays it: on Windows,
+    /// where an accessible mapping is `MEM_COMMIT`.
+    pub tables_committed: bool,
 }
 
 impl PoolLayout {
@@ -149,6 +169,7 @@ impl PoolLayout {
             instance_bytes: slot.saturating_add(stack).saturating_add(tables),
             pool_bytes: if self.guard_before { guard } else { 0 },
             instance_maps: if self.stack_bytes == 0 { 0 } else { 2 } + 3,
+            instance_commit: if self.tables_committed { tables } else { 0 },
         }
     }
 }
@@ -170,6 +191,39 @@ pub(crate) struct AddressSpace {
     pub limit: Option<u64>,
     /// Memory maps, where the process has a cap on them.
     pub maps: Option<MapCount>,
+    /// Commit, where the pool commits and the system counts it (Windows).
+    pub commit: Option<Commit>,
+}
+
+/// The system's commit as this process may take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Commit {
+    /// What the system can still commit (`ullAvailPageFile`).
+    pub available: u64,
+    /// What this process has committed (`PrivateUsage`).
+    pub used: u64,
+    /// What the rest of the process is left to grow by: what it committed
+    /// before its engines loaded, or, unrecorded, all it commits now.
+    pub reserve: u64,
+}
+
+impl Commit {
+    /// What the pool may commit: what the system has left less the reserve.
+    pub fn pool(&self) -> u64 {
+        self.available.saturating_sub(self.reserve)
+    }
+}
+
+impl std::fmt::Display for Commit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} of commit (the system's {} left, less {} kept for the rest of the process)",
+            brief(self.pool()),
+            brief(self.available),
+            brief(self.reserve)
+        )
+    }
 }
 
 /// This process's memory maps.
@@ -272,10 +326,25 @@ impl AddressSpace {
             .pool_bytes()
             .checked_sub(cost.pool_bytes)
             .map_or(0, |bytes| bytes / cost.instance_bytes.max(1));
-        match self.pool_maps() {
+        let by_maps = match self.pool_maps() {
             Some(maps) if cost.instance_maps > 0 => by_bytes.min(maps / cost.instance_maps),
             _ => by_bytes,
-        }
+        };
+        self.fits_commit(cost).map_or(by_maps, |commit| by_maps.min(commit))
+    }
+
+    /// The most instances the commit left holds, where the pool commits.
+    pub fn fits_commit(&self, cost: &PoolCost) -> Option<u64> {
+        let commit = self.commit?;
+        (cost.instance_commit > 0).then(|| commit.pool() / cost.instance_commit)
+    }
+
+    /// The commit the pool may take, where it is counted.
+    pub fn commit_shown(&self) -> String {
+        self.commit.map_or_else(
+            || "no count of commit".to_string(),
+            |commit| commit.to_string(),
+        )
     }
 }
 
@@ -304,6 +373,12 @@ pub(crate) fn size_pool(
     let fits = space.fits(cost);
     match configured {
         Some(n) if u64::from(n) <= fits => Ok(n),
+        Some(n) if space.fits_commit(cost).is_some_and(|commit| u64::from(n) > commit) => bail!(
+            "[sandbox] max_instances = {n} commits {} of tables as the pool is laid; this process \
+             has {} (it holds {fits} instances)",
+            show(u64::from(n).saturating_mul(cost.instance_commit)),
+            space.commit_shown(),
+        ),
         Some(n) => {
             let needs = cost.bytes(u64::from(n));
             if needs > space.pool_bytes() {
@@ -325,12 +400,14 @@ pub(crate) fn size_pool(
             );
         }
         None if fits == 0 => bail!(
-            "the sandbox pool holds no instance: one needs {} of address space and {} memory maps; \
-             this process has {} and {}",
+            "the sandbox pool holds no instance: one needs {} of address space, {} memory maps \
+             and {} of commit; this process has {}, {} and {}",
             show(cost.bytes(1)),
             cost.instance_maps,
+            show(cost.instance_commit),
             space.bytes_shown(),
             space.maps_shown(),
+            space.commit_shown(),
         ),
         None => Ok(u32::try_from(fits).unwrap_or(u32::MAX)),
     }
@@ -450,6 +527,7 @@ pub(crate) fn parse_maps(maps: &str, floor: Option<u64>) -> Result<AddressSpace>
             max: 0,
             reserve: 0,
         }),
+        commit: None,
     })
 }
 
@@ -488,6 +566,7 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
         reserve: 0,
         limit: address_space_limit(),
         maps: None,
+        commit: None,
     };
     keep_for_the_rest(&mut space);
     space.largest_free = space.largest_free.saturating_sub(space.reserve);
@@ -529,6 +608,11 @@ pub(crate) fn read_address_space() -> Result<AddressSpace> {
         reserve: 0,
         limit: None,
         maps: None,
+        commit: runtime_sys::address::commit().map(|(available, used)| Commit {
+            available,
+            used,
+            reserve: 0,
+        }),
     };
     let mut address = 0usize;
     while let Some(region) = runtime_sys::address::region(address) {
@@ -624,6 +708,7 @@ mod tests {
             tables_per_instance: 16,
             table_elements: 20_000,
             table_element_bytes: 8,
+            tables_committed: false,
         }
     }
 
@@ -639,6 +724,7 @@ mod tests {
             reserve: 30 * GIB,
             limit: None,
             maps: Some(maps(2_000, 65_530, 2_000)),
+            commit: None,
         };
         let error = size_pool(Some(2048), Ok(space), &cost)
             .unwrap_err()
@@ -673,6 +759,39 @@ mod tests {
             error.starts_with("the sandbox pool holds no instance"),
             "{error}"
         );
+
+        // Where the pool commits its tables (Windows), the commit the system
+        // has left bounds it beside the address space, a stated count past
+        // it refused by name.
+        let committed = PoolLayout {
+            tables_committed: true,
+            ..default_layout()
+        }
+        .cost();
+        assert_eq!(committed.instance_commit, 16 * 160 * 1024);
+        let commit = |available| Commit {
+            available,
+            used: 2 * GIB,
+            reserve: GIB,
+        };
+        let short = AddressSpace {
+            largest_free: 4000 * GIB,
+            free: 4800 * GIB,
+            commit: Some(commit(GIB + 100 * committed.instance_commit)),
+            ..space
+        };
+        assert_eq!(size_pool(None, Ok(short), &committed).unwrap(), 100);
+        let error = size_pool(Some(101), Ok(short), &committed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("[sandbox] max_instances = 101 commits"),
+            "{error}"
+        );
+        // Where it commits nothing, no commit bounds it.
+        let roomy = AddressSpace { commit: None, ..short };
+        assert_eq!(roomy.fits(&cost), short.fits(&cost));
+        assert!(short.fits(&cost) > 100);
 
         // Unread, an unset count is refused and a stated one taken.
         let unread = || Err(anyhow::anyhow!("no maps"));
