@@ -264,7 +264,7 @@ fn case(name: &'static str, bytes: &[u8], vocab: u32, binding: Binding) -> Case 
             .shape
             .dims()
             .iter()
-            .take(channel.shape.rank() as usize)
+            .take(channel.shape.rank())
             .product();
         let cells = cells as usize;
         let value = match channel.dtype {
@@ -476,16 +476,19 @@ impl Case {
                 ))
             };
         }
-        let cell = |bytes: &[u8]| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let cell = |bytes: &[u8; 4]| f32::from_le_bytes(*bytes);
         let wrong: Vec<String> = got
-            .chunks_exact(4)
-            .zip(want.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(want.as_chunks::<4>().0)
             .enumerate()
             .filter_map(|(at, (g, w))| {
                 let (g, w) = (cell(g), cell(w));
                 let bound = self.f32_bound(device, w) * steps.max(1) as f32;
                 let off = (g - w).abs();
-                (!(off <= bound)).then(|| {
+                // a NaN is off too
+                off.partial_cmp(&bound).is_none_or(std::cmp::Ordering::is_gt).then(|| {
                     format!(
                         "cell {at}: {g} ({:#010x}) vs {w} ({:#010x}), off {off:e} past {bound:e}",
                         g.to_bits(),

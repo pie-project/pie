@@ -495,9 +495,7 @@ impl<'a> Streams<'a> {
                     return None;
                 }
                 let mut w = *width;
-                let Some(row) = self.output_row(out) else {
-                    return None;
-                };
+                let row = self.output_row(out)?;
                 match w {
                     Some(dim) if dim != row => return None,
                     _ => w = Some(row),

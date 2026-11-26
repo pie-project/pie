@@ -1206,12 +1206,12 @@ pub fn matmul_grouped_strided(
     let alpha = 1.0f32;
     let beta = 0.0f32;
     // Column-major: Y_g^T = W_g (op T) x X_g^T.
-    // SAFETY: `handle` is this context's live cuBLAS handle bound to its stream;
-    // the planes hold what the extents say.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
+        // SAFETY: `handle` is this context's live cuBLAS handle bound to its stream;
+        // the planes hold what the extents say.
         unsafe {
             cublasGemmStridedBatchedEx(
                 handle,

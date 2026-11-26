@@ -851,7 +851,7 @@ pub struct EngineConfig {
 /// uses all of it, and how it is split between weights, state and fires
 /// follows demand at run time. An empty table is the best configuration
 /// for a dedicated machine; each key is a cap for sharing one.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
     /// The most device memory this load takes (`"20GiB"`), per device, for
@@ -920,20 +920,6 @@ pub struct MemoryConfig {
     /// the policy's to state.
     #[serde(rename = "yield")]
     pub yield_share: Option<f64>,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            budget_device: None,
-            kv_device_tokens: None,
-            budget_host: None,
-            budget_disk: None,
-            disk_path: None,
-            disk_persistent: false,
-            yield_share: None,
-        }
-    }
 }
 
 impl MemoryConfig {

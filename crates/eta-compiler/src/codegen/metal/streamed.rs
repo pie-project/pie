@@ -852,7 +852,6 @@ impl Scheduler<'_> {
                 .map(|&(node, _)| {
                     self.ops[node as usize]
                         .reads()
-                        .into_iter()
                         .filter(|&arg| self.alias.resolve(arg) == base)
                         .count()
                 })
@@ -1666,7 +1665,6 @@ pub fn emit_streamed_region(
             };
             let reads_it = op
                 .reads()
-                .into_iter()
                 .filter(|&arg| alias.resolve(arg) == *base)
                 .count();
             if reads_it == 0 {
@@ -1735,7 +1733,6 @@ pub fn emit_streamed_region(
                 // this pass writes.
                 let carried: Vec<(u32, u32, Vec<u32>)> = ops[node as usize]
                     .reads()
-                    .into_iter()
                     .map(|arg| alias.resolve(arg))
                     .filter_map(|value| sunk.get(&value).cloned())
                     .fold(Vec::new(), |mut held, one| {

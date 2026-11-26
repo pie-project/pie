@@ -46,7 +46,7 @@ impl Footprint {
     /// The footprint of `keys`, in key order.
     #[must_use]
     pub fn of(mut keys: Vec<Sized>) -> Footprint {
-        keys.sort_by(|a, b| a.key.cmp(&b.key));
+        keys.sort_by_key(|a| a.key);
         let mut by_name: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
         for slab in &keys {

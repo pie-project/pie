@@ -457,16 +457,16 @@ const ANCHOR_PRODUCTS: &str = "linear.anchor_products";
 fn gemm_ex(handle: cublasHandle_t, call: Call, algo: cublasGemmAlgo_t) -> cublasStatus_t {
     let alpha = 1.0f32;
     let beta = 0.0f32;
-    // SAFETY: `handle` is a live cuBLAS handle (a `Ctx`'s, or the arena's
-    // borrowed one) and `alpha`/`beta` are host f32 locals, as the default
-    // pointer mode and the 32F compute type take. `call` names an `m x k`
-    // act, an `n x k` weight and an `m x n` y, all bf16: the caller's
-    // tensors, or the arena's slabs allocated at those sizes.
     if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
         crate::sizing::counted();
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
+        // SAFETY: `handle` is a live cuBLAS handle (a `Ctx`'s, or the arena's
+        // borrowed one) and `alpha`/`beta` are host f32 locals, as the default
+        // pointer mode and the 32F compute type take. `call` names an `m x k`
+        // act, an `n x k` weight and an `m x n` y, all bf16: the caller's
+        // tensors, or the arena's slabs allocated at those sizes.
         unsafe {
             cublasGemmEx(
                 handle,
@@ -523,13 +523,13 @@ pub(crate) fn act_x_wt_f32(
 /// they are summed.
 fn gemm_ex_f32(handle: cublasHandle_t, call: Call) -> cublasStatus_t {
     let (alpha, beta) = (1.0f32, 0.0f32);
-    // SAFETY: `handle` is a live cuBLAS handle bound to the caller's stream;
-    // the operands are device rows of the call's extents.
     if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
         crate::sizing::counted();
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
+        // SAFETY: `handle` is a live cuBLAS handle bound to the caller's stream;
+        // the operands are device rows of the call's extents.
         unsafe {
             cublasGemmEx(
                 handle,
@@ -815,16 +815,16 @@ fn run_lt(
 ) -> lt::cublasStatus_t {
     let alpha = 1.0f32;
     let beta = 0.0f32;
-    // SAFETY: `lt_handle` is the device's live handle and `plan`'s
-    // descriptors were built for `call`'s `m`, `n` and `k`; `algo` is one of
-    // its heuristics; `alpha`/`beta` are host f32 locals. `ws` is a device slab
-    // of `ws_bytes` (or null and 0) and `stream` live, as `act_x_wt`'s callers
-    // hold. The operands are the caller's `call`, as for `gemm_ex`.
-    let status = if crate::sizing::active() {
+    if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
         crate::sizing::counted();
         lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
+        // SAFETY: `lt_handle` is the device's live handle and `plan`'s
+        // descriptors were built for `call`'s `m`, `n` and `k`; `algo` is one of
+        // its heuristics; `alpha`/`beta` are host f32 locals. `ws` is a device slab
+        // of `ws_bytes` (or null and 0) and `stream` live, as `act_x_wt`'s callers
+        // hold. The operands are the caller's `call`, as for `gemm_ex`.
         unsafe {
             lt::cublasLtMatmul(
                 lt_handle,
@@ -845,8 +845,7 @@ fn run_lt(
                 stream.cast(),
             )
         }
-    };
-    status
+    }
 }
 
 /// [`run_lt`] with cuBLASLt's own `epilogue` landing `y`: a bias (`bias`,
@@ -958,14 +957,14 @@ fn run_lt_epilogue(
     let algo = &algo;
     let alpha = 1.0f32;
     let beta = 0.0f32;
-    // SAFETY: as in `run_lt`, with `desc.0` the descriptor just set up;
-    // `bias`, where the epilogue reads one, is the caller's `n`-long bf16
-    // bias, non-zero by the test above.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
         crate::sizing::counted();
         lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
+        // SAFETY: as in `run_lt`, with `desc.0` the descriptor just set up;
+        // `bias`, where the epilogue reads one, is the caller's `n`-long bf16
+        // bias, non-zero by the test above.
         unsafe {
             lt::cublasLtMatmul(
                 lt_handle,
@@ -994,13 +993,17 @@ fn run_lt_epilogue(
     Ok(true)
 }
 
+/// A product with an epilogue: its `m`, `n` and `k`, its epilogue, whether it
+/// reads a bias and the workspace it was asked within.
+type EpilogueKey = (i32, i32, i32, u32, bool, usize);
+
 struct Device {
     lt: LtCtx,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     /// cuBLASLt's first heuristic for a product with an epilogue, by its
     /// shape, its epilogue ([`epilogue_code`]), whether it reads a bias and
     /// the workspace it was asked within; `None` where it offers none.
-    epilogues: HashMap<(i32, i32, i32, u32, bool, usize), Option<lt::cublasLtMatmulAlgo_t>>,
+    epilogues: HashMap<EpilogueKey, Option<lt::cublasLtMatmulAlgo_t>>,
     /// The cuBLASLt algorithm the routes picked for a plain product, by its
     /// shape (`streamed`): its plan runs it in place of the first.
     lt_picks: HashMap<(i32, i32, i32), lt::cublasLtMatmulHeuristicResult_t>,
@@ -1182,6 +1185,7 @@ struct Candidate {
 // SAFETY: a heuristic result is plain data (an algorithm's opaque words, a
 // status, sizes and a float); nothing in it points anywhere.
 unsafe impl Send for Candidate {}
+// SAFETY: as for `Send`: nothing in it is shared through a pointer.
 unsafe impl Sync for Candidate {}
 
 /// The device and driver every code folds in, besides the profile's own

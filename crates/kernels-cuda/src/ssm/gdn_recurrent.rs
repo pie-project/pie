@@ -412,28 +412,6 @@ pub fn gated_delta_tail(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Four blocks of the fused step where the SM holds them, as on a B200
-    /// (228 KiB) or an A100 (164 KiB); one block of eight warps on a 100 KiB
-    /// SM, which holds two of four; the profile's fewer where it asks
-    /// (A100's three).
-    #[test]
-    fn the_fused_step_seats_what_the_sm_holds() {
-        assert_eq!(fused_seats(Some(233_472), 4), (4, 4));
-        assert_eq!(fused_seats(Some(167_936), 4), (4, 4));
-        assert_eq!(fused_seats(Some(102_400), 4), (8, 1));
-        assert_eq!(fused_seats(Some(102_400), 3), (8, 1));
-        assert_eq!(fused_seats(Some(102_400), 1), (4, 1));
-        assert_eq!(fused_seats(Some(16_384), 4), (4, 1));
-        assert_eq!(fused_seats(None, 4), (4, 4));
-        assert_eq!(fused_seats(Some(167_936), 3), (4, 3));
-        assert_eq!(fused_seats(Some(167_936), 2), (4, 2));
-    }
-}
-
 /// Folds each beam group's fold rows (`carry`'s
 /// planes `[b | a]`, keys, `u`) into its gated-delta state, as a decode step
 /// folds a token and stores it, the state stored once.
@@ -464,7 +442,7 @@ pub fn gated_delta_fold(
     if k_dim > 128
         || !k_dim.is_multiple_of(16)
         || !v_dim.is_multiple_of(16)
-        || v_heads % k_heads.max(1) != 0
+        || !v_heads.is_multiple_of(k_heads.max(1))
     {
         return Err(refuse(
             OP,
@@ -505,4 +483,26 @@ pub fn carry_split_bytes(sms: u32) -> u64 {
 /// The gated delta's group fold kernel ([`gdn_fold`]).
 pub(super) fn fold_kernel() -> &'static crate::jit::Kernel {
     kernel(GDN_RECURRENT, "::pie::ssm::gdn_fold")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Four blocks of the fused step where the SM holds them, as on a B200
+    /// (228 KiB) or an A100 (164 KiB); one block of eight warps on a 100 KiB
+    /// SM, which holds two of four; the profile's fewer where it asks
+    /// (A100's three).
+    #[test]
+    fn the_fused_step_seats_what_the_sm_holds() {
+        assert_eq!(fused_seats(Some(233_472), 4), (4, 4));
+        assert_eq!(fused_seats(Some(167_936), 4), (4, 4));
+        assert_eq!(fused_seats(Some(102_400), 4), (8, 1));
+        assert_eq!(fused_seats(Some(102_400), 3), (8, 1));
+        assert_eq!(fused_seats(Some(102_400), 1), (4, 1));
+        assert_eq!(fused_seats(Some(16_384), 4), (4, 1));
+        assert_eq!(fused_seats(None, 4), (4, 4));
+        assert_eq!(fused_seats(Some(167_936), 3), (4, 3));
+        assert_eq!(fused_seats(Some(167_936), 2), (4, 2));
+    }
 }

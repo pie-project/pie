@@ -59,7 +59,6 @@ impl CaptureRows {
 /// its last `observe` query rows and over the model's `q_heads` (every
 /// rank's), added into its key row: zeroed first where `zero` (the first
 /// layer's capture), else the layers before's.
-
 #[allow(clippy::too_many_arguments)]
 pub fn capture(
     ctx: &Ctx,

@@ -294,13 +294,13 @@ unsafe fn absorb(
     let alpha = 1.0f32;
     let beta = 0.0f32;
 
-    // SAFETY: the handle and the three operands are as this fn's contract
-    // states; `alpha` and `beta` are host f32 locals, matching the default
-    // host pointer mode and the 32F compute type, and outlive the call.
     let status = if crate::sizing::active() {
         // A size-only walk (`crate::sizing`) runs no product.
         cublasStatus_t::CUBLAS_STATUS_SUCCESS
     } else {
+        // SAFETY: the handle and the three operands are as this fn's contract
+        // states; `alpha` and `beta` are host f32 locals, matching the default
+        // host pointer mode and the 32F compute type, and outlive the call.
         unsafe {
             cublasGemmStridedBatchedEx(
                 handle.cast::<cublasContext>(),
