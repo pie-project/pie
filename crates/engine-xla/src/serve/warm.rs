@@ -798,6 +798,15 @@ impl Shell {
                         Ok(None) if code.text().is_some() => device.prepare_code(code, sig.clone()),
                         loaded => loaded,
                     };
+                    // a load that took the loads past a stated room is not kept:
+                    // its program stays parked, and the loader stops
+                    if matches!(program, Ok(Some(_))) && room.past_stated() {
+                        drop(program);
+                        drop(device.take_key(&code.hash()));
+                        full.store(true, SeqCst);
+                        room.done(reserved, false);
+                        return Some(code.len() as u64);
+                    }
                     room.done(reserved, matches!(program, Ok(Some(_))));
                     match program {
                         Ok(Some(_)) => {

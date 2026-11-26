@@ -1360,8 +1360,10 @@ struct RoomState {
     /// The bytes reserved for the loads under way, and how many there are.
     reserved: u64,
     loads: usize,
-    /// The most resident bytes a load alone grew by, per KiB of its text.
+    /// The most resident bytes a load alone grew by, per KiB of its text,
+    /// and in all.
     per_kib: u64,
+    most: u64,
     /// Whether the load under way, if one alone, has stayed alone.
     alone: bool,
 }
@@ -1404,7 +1406,13 @@ impl HostRoom {
         let len = text_len as u64;
         let mut st = self.state.lock().expect("the host room's lock poisoned");
         loop {
-            let hold = (st.per_kib > 0).then(|| st.per_kib.saturating_mul(len) / 1024);
+            // a stated room reserves the most a load was measured to take,
+            // whatever its text: loads side by side then cannot together
+            // pass it on a program's estimate falling short
+            let hold = (st.per_kib > 0).then(|| {
+                let own = st.per_kib.saturating_mul(len) / 1024;
+                if self.stated.is_some() { own.max(st.most) } else { own }
+            });
             let fits = match hold {
                 // unmeasured: alone, where there is room at all
                 None => st.loads == 0 && self.room(0, 0),
@@ -1444,6 +1452,12 @@ impl HostRoom {
         })
     }
 
+    /// Whether what the loads hold passes the stated room (a load measured
+    /// short of what it took).
+    pub(crate) fn past_stated(&self) -> bool {
+        self.stated.is_some_and(|stated| self.held() > stated)
+    }
+
     /// A load admitted ends; `held`: its program stays in memory. A load
     /// that ran alone and stays is measured.
     pub(crate) fn done(&self, r: Reserved, held: bool) {
@@ -1454,8 +1468,9 @@ impl HostRoom {
             && let (Some(before), Some(after)) = (r.resident, resident_bytes())
             && r.text > 0
         {
-            let per_kib = after.saturating_sub(before).saturating_mul(1024) / r.text;
-            st.per_kib = st.per_kib.max(per_kib);
+            let grew = after.saturating_sub(before);
+            st.per_kib = st.per_kib.max(grew.saturating_mul(1024) / r.text);
+            st.most = st.most.max(grew);
         }
         st.loads -= 1;
         st.reserved -= r.bytes;
