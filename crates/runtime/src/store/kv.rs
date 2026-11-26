@@ -1175,6 +1175,9 @@ impl KvStore {
         want: u32,
         keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        if !keys.cache_may_go_below() {
+            return Ok(None);
+        }
         let mut pages = Vec::new();
         let mut disk = self.disk_pool.available();
         for chunk in self.idle_chunks(want, &keys) {
@@ -1606,6 +1609,11 @@ impl KvStore {
         room: usize,
         keys: impl Keys,
     ) -> Result<Option<KvResidencyTxn>, KvStoreError> {
+        // No row lets idle cache below the device: nothing moves down, and
+        // nothing need be walked to find that.
+        if !keys.cache_may_go_below() {
+            return Ok(None);
+        }
         self.prepare_demote_where(room, keys, false)
     }
 
