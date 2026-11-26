@@ -1000,7 +1000,14 @@ pub async fn submit_pass_stamped<C: FireContext>(
         };
         // Only a set that shares maps, waits on, fetches or resumes from
         // what others computed.
-        let attach = if !shares || !cuttable || !keyable || !plain_rows(&full) {
+        // A pass that ends no page past its held rows, and starts inside
+        // one, can map, claim or bring up nothing: no whole page of it is
+        // keyed beyond what the set holds (a decode step mid-page).
+        let page = u64::from(page_size.max(1));
+        let held_rows = u64::from(full.lanes[0].kv.held);
+        let ends_no_page = !held_rows.is_multiple_of(page)
+            && (held_rows + u64::from(keyed)) / page == held_rows / page;
+        let attach = if !shares || !cuttable || !keyable || !plain_rows(&full) || ends_no_page {
             Attach::No
         } else if rs_ws_ids.is_empty() {
             Attach::Kv
@@ -1074,6 +1081,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             rows: supplied,
             keys,
         } = match &pass_slots {
+            // Mapping nothing and keeping no state, a pass needs none of its
+            // keys: the walk over the set's pages under the kv lock is not
+            // taken for it.
+            Some(_) if matches!(attach, Attach::No) && state.is_none() => Supplied::default(),
             Some(slots) => {
                 let folds = fold.of(0).map_or(0, |count| {
                     u64::from(count).min(full.lanes[0].tokens.len() as u64)
