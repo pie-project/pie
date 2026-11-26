@@ -2664,11 +2664,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     DTypeQ* q = params.q;
     IdType* q_indptr = params.q_indptr;
     IdType* o_indptr = params.o_indptr;
-    DTypeO* o = params.o;
-    float* lse = params.lse;
+    // A split layout's fire staged unsplit lands its rows whole.
+    const bool split_dropped = params.partition_kv && params.maybe_split_live != nullptr &&
+                               *params.maybe_split_live == 0;
+    DTypeO* o = split_dropped ? params.maybe_o_whole : params.o;
+    float* lse = split_dropped ? params.maybe_lse_whole : params.lse;
     bool* block_valid_mask = params.block_valid_mask;
     const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
-    const bool partition_kv = params.partition_kv;
+    const bool partition_kv = params.partition_kv && !split_dropped;
     const uint_fastdiv& group_size = params.group_size;
 
     uint32_t* maybe_prefix_len_ptr = nullptr;

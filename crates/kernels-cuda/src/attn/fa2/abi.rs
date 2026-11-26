@@ -128,6 +128,13 @@ pub struct PrefillPagedParams {
     /// (bits 0-30) and whether its rows read both ways (bit 31); null: every
     /// boundary 0 and every row wide (`variants.cuh`).
     pub maybe_mask_origin: DevicePtr,
+    /// A split layout's word saying whether this fire's keys split: 0 runs
+    /// every block over its rows' keys whole, landing them in
+    /// `maybe_o_whole` / `maybe_lse_whole` (the fold then folds none); null:
+    /// the layout's split stands.
+    pub maybe_split_live: DevicePtr,
+    pub maybe_o_whole: DevicePtr,
+    pub maybe_lse_whole: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -480,6 +487,13 @@ pub fn make_prefill_params(
         partials.seq_len = p.total_num_rows;
         partials.num_heads = shape.num_q_heads;
         partials.head_dim = shape.head_dim;
+
+        // A captured split layout's fire of one chunk a tile lands whole.
+        if info.split_live_offset.is_some() {
+            p.maybe_split_live = resolve(int_buf, info.split_live_offset);
+            p.maybe_o_whole = partials.o;
+            p.maybe_lse_whole = partials.lse;
+        }
     }
     if info.enable_cuda_graph {
         p.block_valid_mask = resolve(int_buf, info.block_valid_mask_offset);

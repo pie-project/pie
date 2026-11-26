@@ -403,6 +403,85 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> 
     None
 }
 
+/// The blocks of the masked paged prefill (the arm serving's captured
+/// bodies launch) one multiprocessor holds at `cta_tile_q` rows over bf16
+/// heads `head_dim` wide: the driver's occupancy calculator over the
+/// kernel's registers and its shared storage, else the shared storage alone
+/// (two where two blocks' fit the multiprocessor). `None` where no kernel
+/// exists at that tile.
+#[must_use]
+pub fn prefill_blocks_per_sm(head_dim: u32, cta_tile_q: u32, device: &Device) -> Option<u32> {
+    type Cached = std::sync::Mutex<std::collections::HashMap<(u32, u32, u32, u32), Option<u32>>>;
+    static CACHE: std::sync::OnceLock<Cached> = std::sync::OnceLock::new();
+    let key = (head_dim, cta_tile_q, device.num_sm, device.max_smem_per_sm);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(known) = cache.lock().ok().and_then(|held| held.get(&key).copied()) {
+        return known;
+    }
+    const OP: &str = "attn.plan_prefill";
+    let geometry = PrefillGeometry::derive(
+        OP,
+        head_dim,
+        [head_dim; 2],
+        cta_tile_q,
+        KvWidth::BF16,
+        device,
+    )
+    .ok();
+    let answer = geometry.and_then(|g| {
+        prefill_occupancy(&g).or_else(|| {
+            Some(if device.max_smem_per_sm >= 2 * g.smem_bytes { 2 } else { 1 })
+        })
+    });
+    if let Ok(mut held) = cache.lock() {
+        held.insert(key, answer);
+    }
+    answer
+}
+
+#[cfg(feature = "cuda")]
+fn prefill_occupancy(geometry: &PrefillGeometry) -> Option<u32> {
+    use cudarc::driver::sys as dr;
+
+    const OP: &str = "attn.plan_prefill";
+    let arm = prefill_custom_arm(-1.0);
+    let entrypoint = prefill_symbol(OP, geometry, arm, KvWidth::BF16).ok()?;
+    let resolved = crate::jit::kernel(FILE, &entrypoint).resolve().ok()?;
+    if geometry.smem_bytes > 48 * 1024 {
+        // SAFETY: `resolve` returned a function the cache keeps loaded for
+        // the process, in the context it bound to this thread; a byte count
+        // the device cannot seat comes back as an error code.
+        unsafe {
+            dr::cuFuncSetAttribute(
+                resolved.function,
+                dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(geometry.smem_bytes).unwrap_or(i32::MAX),
+            );
+        }
+    }
+    let mut blocks: core::ffi::c_int = 0;
+    let threads = geometry.block().iter().product::<u32>();
+    // SAFETY: `blocks` is a local out-pointer and `resolved.function` is the
+    // live handle above; the query launches nothing.
+    let code = unsafe {
+        dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            &raw mut blocks,
+            resolved.function,
+            i32::try_from(threads).unwrap_or(i32::MAX),
+            usize::try_from(geometry.smem_bytes).unwrap_or(usize::MAX),
+        )
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    u32::try_from(blocks).ok().filter(|n| *n > 0)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn prefill_occupancy(_geometry: &PrefillGeometry) -> Option<u32> {
+    None
+}
+
 #[must_use]
 pub fn decode_max_grid_size(
     head_dim: u32,

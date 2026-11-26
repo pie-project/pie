@@ -439,6 +439,7 @@ pub fn plan_prefill(
         enable_cuda_graph,
         window_left: window.map(|w| w - 1),
         ctas_per_sm: toggles.prefill_ctas_per_sm,
+        blocks_per_sm: crate::attn::fa2::prefill_blocks_per_sm,
     };
 
     let built = prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
@@ -516,6 +517,7 @@ pub fn prefill_graph_float_bytes(
         enable_cuda_graph: true,
         window_left: window.map(|w| w - 1),
         ctas_per_sm: toggles.prefill_ctas_per_sm,
+        blocks_per_sm: crate::attn::fa2::prefill_blocks_per_sm,
     };
     Ok(prefill::plan(OP, &req, device, usize::MAX, usize::MAX)?.float_bytes)
 }
@@ -650,6 +652,9 @@ pub struct PrefillPlanInfo {
     /// The fire's live lanes, `[first lane, requests]`, as two i32s: a
     /// captured launch reads them at replay.
     pub live_lanes_offset: Option<u32>,
+    /// A captured split layout's word saying whether the fire's keys split
+    /// (0: its rows land whole, the fold folding none).
+    pub split_live_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
 }

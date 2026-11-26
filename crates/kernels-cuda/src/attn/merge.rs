@@ -140,6 +140,23 @@ fn fold_warp(ctx: &Ctx, op: &'static str, split: &Partials, num_sms: u32) -> Res
     )
 }
 
+/// Whether [`fold`] folds `split` a warp a row: a wide batch's rows hold a
+/// few partials each and fold a warp a row; a narrow one's rows hold many,
+/// which the staged merge pipelines. With sinks the warp fold takes every
+/// batch: it lands them in the same pass, which outweighs the staged
+/// merge's edge on a narrow batch.
+fn warp_folds(ctx: &Ctx, split: &Partials, num_sms: u32) -> bool {
+    let pairs = split.max_seq_len.saturating_mul(split.num_heads);
+    ctx.tuning().merge_warp()
+        && split.head_dim.is_multiple_of(64)
+        && (pairs >= num_sms * 8 || split.sinks != 0)
+}
+
+/// Whether [`fold`] lands `split`'s sinks itself (`Ok(true)`).
+pub(crate) fn lands_sinks(ctx: &Ctx, split: &Partials) -> bool {
+    split.sinks != 0 && warp_folds(ctx, split, ctx.multiprocessors().unwrap_or(1).max(1))
+}
+
 /// Folds the split's partials; `Ok(true)` where the fold also scaled the
 /// output by the split's sinks (the warp fold, where the profile takes it),
 /// `Ok(false)` where the caller still owes them.
@@ -163,15 +180,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
     }
 
     let num_sms = ctx.multiprocessors().unwrap_or(1).max(1);
-    // A wide batch's rows hold a few partials each and fold a warp a row; a
-    // narrow one's rows hold many, which the staged merge pipelines.
-    // With sinks the warp fold takes every batch: it lands them in the same
-    // pass, which outweighs the staged merge's edge on a narrow batch.
-    let pairs = split.max_seq_len.saturating_mul(split.num_heads);
-    if ctx.tuning().merge_warp()
-        && head_dim.is_multiple_of(64)
-        && (pairs >= num_sms * 8 || split.sinks != 0)
-    {
+    if warp_folds(ctx, split, num_sms) {
         return fold_warp(ctx, op, split, num_sms).map(|()| split.sinks != 0);
     }
     let unsinked = Partials { sinks: 0, ..*split };

@@ -145,6 +145,13 @@ struct BatchPrefillPagedParams {
   // column `c` is key `boundary + c`, rows of `kv_len - boundary` bits. Null:
   // every boundary 0, every row wide (the mask's bits alone bound it).
   uint32_t* maybe_mask_origin;
+  // PIE: a split layout's fire whose keys run unsplit (`partition_kv` laid,
+  // the staged word 0): each block reads its rows' keys whole and lands them
+  // straight in `maybe_o_whole` / `maybe_lse_whole`, the fold folding none.
+  // Null: the layout's split stands as laid.
+  uint32_t* maybe_split_live;
+  DTypeO* maybe_o_whole;
+  float* maybe_lse_whole;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

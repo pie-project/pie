@@ -3,6 +3,7 @@ mod fa2;
 mod fa2_mask_origin;
 mod fa2_masked;
 mod fa2_masked_sink;
+mod fa2_split_replay;
 mod index;
 mod mla_expand;
 mod mla_fa2;

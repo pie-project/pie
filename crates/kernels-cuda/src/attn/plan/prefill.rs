@@ -18,7 +18,14 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub enable_cuda_graph: bool,
     pub window_left: Option<u32>,
+    /// The blocks a multiprocessor holds of an eager plan's launch (the
+    /// profile's `kernel.sdpa.prefill.ctas_per_sm`).
     pub ctas_per_sm: u32,
+    /// The blocks a multiprocessor holds of the kernel a captured plan's
+    /// launch runs, at `(head_dim, cta_tile_q)`, as the device states them
+    /// (`fa2::prefill_blocks_per_sm`); `None` where it states none, and
+    /// the captured plan then holds `ctas_per_sm`.
+    pub blocks_per_sm: fn(u32, u32, &Device) -> Option<u32>,
 }
 
 impl Request<'_> {
@@ -63,7 +70,6 @@ const fn determine_cta_tile_q(avg_packed_qo_len: u64, head_dim: u32) -> u32 {
 }
 
 fn search_kv_chunk_size(
-    enable_cuda_graph: bool,
     max_batch_size_if_split: u32,
     packed_qo_lens: &[u64],
     effective_kv_lens: &[u64],
@@ -88,7 +94,38 @@ fn search_kv_chunk_size(
             high = mid;
         }
     }
-    (enable_cuda_graph || low < max_kv_len, low)
+    (low < max_kv_len, low)
+}
+
+/// The key chunks a captured fire whose live tiles span `blocks` blocks
+/// (its tiles times the kv heads) splits its keys into, at most `cap`: the
+/// count whose waves over the device's `concurrent` blocks take least, a
+/// chunk count `c` costing `ceil(blocks · c / concurrent) / c` of one
+/// unsplit block's time; ties go to the fewer chunks, and the keys split
+/// only where that beats leaving them whole.
+fn fill_chunks(blocks: u64, concurrent: u64, cap: u64) -> u64 {
+    let concurrent = concurrent.max(1);
+    let waves = |chunks: u64| (blocks.max(1) * chunks).div_ceil(concurrent);
+    let mut best = 1;
+    for chunks in 2..=cap {
+        if waves(chunks) * best < waves(best) * chunks {
+            best = chunks;
+        }
+    }
+    best
+}
+
+/// The most work items a captured layout's split lays over its replays: for
+/// every live tile count its grid of `grid` items holds a split of,
+/// [`fill_chunks`]'s chunks of it. 0 where no replay splits.
+fn split_capacity(grid: u64, heads: u64, concurrent: u64) -> u64 {
+    (1..=grid / 2)
+        .filter_map(|tiles| {
+            let chunks = fill_chunks(tiles * heads.max(1), concurrent, grid / tiles);
+            (chunks > 1).then_some(tiles * chunks)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn graph_tiles(rows: u32, batch: u32, group: u64, head_dim: u32) -> (u32, u64) {
@@ -111,7 +148,15 @@ pub fn partial_rows(tile: u32, num_qo_heads: u32, num_kv_heads: u32) -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
+    /// Whether the layout splits keys: a captured layout's split stands for
+    /// every replay, each fire's own chunks restaged ([`Schedule::split_live`]).
     pub split_kv: bool,
+    /// Whether this fire's keys split: a split layout's fire of one chunk a
+    /// tile lands its rows whole, the fold folding none.
+    pub split_live: bool,
+    /// The work items the partials hold: a captured layout's most over its
+    /// replays ([`split_capacity`]), an eager one's own.
+    pub split_items: u64,
     pub new_batch_size: u32,
     pub padded_batch_size: usize,
     pub cta_tile_q: u32,
@@ -163,30 +208,50 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         })
         .collect();
 
-    // A captured layout splits only where a replay could cut each of the
-    // rows' query tiles' prefixes in two at least: past half the grid in
-    // tiles, one long request's replay takes one chunk a tile (as its eager
-    // plan does, unsplit), and the split layout would only add the partials
-    // and their fold.
-    let (split_kv, kv_chunk_size_in_pages) = if req.enable_cuda_graph
-        && (u64::from(req.total_num_rows) * group)
-            .div_ceil(u64::from(cta_tile_q))
-            .saturating_mul(2)
-            > u64::from(max_batch_size_if_split)
-    {
-        (
-            false,
-            effective_kv_lens.iter().copied().max().unwrap_or(0).max(1),
-        )
-    } else {
-        search_kv_chunk_size(
-            req.enable_cuda_graph,
+    // A captured layout is split wherever a replay can split: each fire
+    // splits its keys into the chunks whose waves over the device's
+    // concurrent blocks (`Request::blocks_per_sm`) take least, as many as
+    // the captured grid holds work items of its live tiles and the keys
+    // hold chunks of the least width ([`fill_chunks`]). The chunks are the
+    // fire's own data, restaged as the plan's tables are; a fire of one
+    // chunk lands its rows whole.
+    let graph_capacity = req.enable_cuda_graph.then(|| {
+        let per_sm = (req.blocks_per_sm)(req.head_dim, cta_tile_q, device)
+            .unwrap_or(req.ctas_per_sm)
+            .max(1);
+        let concurrent = u64::from(per_sm) * u64::from(device.num_sm.max(1));
+        let heads = u64::from(req.num_kv_heads.max(1));
+        let grid = total_num_tiles_q.max(concurrent.div_ceil(heads));
+        (concurrent, grid, split_capacity(grid, heads, concurrent))
+    });
+    let (split_kv, kv_chunk_size_in_pages) = match graph_capacity {
+        Some((concurrent, grid, capacity)) => {
+            let max_kv = effective_kv_lens.iter().copied().max().unwrap_or(0).max(1);
+            let live_tiles: u64 = packed_qo_lens
+                .iter()
+                .map(|&packed| packed.div_ceil(u64::from(cta_tile_q)))
+                .sum::<u64>()
+                .max(1);
+            let cap = (grid / live_tiles).min(max_kv.div_ceil(min_kv_chunk_size));
+            let chunks = if capacity > 0 {
+                fill_chunks(live_tiles * u64::from(req.num_kv_heads), concurrent, cap)
+            } else {
+                1
+            };
+            let pages = if chunks > 1 {
+                max_kv.div_ceil(chunks).max(min_kv_chunk_size)
+            } else {
+                max_kv
+            };
+            (capacity > 0, pages)
+        }
+        None => search_kv_chunk_size(
             max_batch_size_if_split,
             &packed_qo_lens,
             &effective_kv_lens,
             cta_tile_q,
             min_kv_chunk_size,
-        )
+        ),
     };
 
     let mut request_indices = Vec::new();
@@ -221,8 +286,13 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
             o_indptr.last().expect("o_indptr starts with a zero") + qo_len as i64 * merge_step,
         );
     }
+    let live_tiles: u64 = packed_qo_lens
+        .iter()
+        .map(|&packed| packed.div_ceil(u64::from(cta_tile_q)))
+        .sum();
+    let split_live = split_kv && (!req.enable_cuda_graph || new_batch_size > live_tiles);
     let merge_indptr = narrow_all(op, "batch_prefill_merge_indptr", &merge_indptr)?;
-    let o_indptr: Vec<i64> = if split_kv {
+    let o_indptr: Vec<i64> = if split_live {
         o_indptr
     } else {
         o_indptr
@@ -237,12 +307,13 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     // never pass the rows' tiles, so its grid is those tiles: padding it to
     // the split capacity re-pairs the CTAs on the SMs, and a replay ran
     // attention up to a fifth slower than the same plan walked.
-    let padded_batch_size = if req.enable_cuda_graph && split_kv {
-        u64::from(max_batch_size_if_split).max(total_num_tiles_q)
-    } else if req.enable_cuda_graph {
-        total_num_tiles_q
-    } else {
-        new_batch_size
+    let padded_batch_size = match graph_capacity {
+        Some((_, grid, _)) => grid,
+        None => new_batch_size,
+    };
+    let split_items = match graph_capacity {
+        Some((_, _, capacity)) => capacity,
+        None => new_batch_size,
     };
     if new_batch_size > padded_batch_size {
         return Err(refuse(
@@ -262,6 +333,8 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
 
     Ok(Schedule {
         split_kv,
+        split_live,
+        split_items,
         new_batch_size: u32::try_from(new_batch_size)
             .ok()
             .filter(|&n| n <= i32::MAX as u32)
@@ -323,13 +396,14 @@ fn layout(
         let heads = u64::from(req.num_qo_heads);
         let rows = partial_rows(sched.cta_tile_q, req.num_qo_heads, req.num_kv_heads);
         let head_dim = u64::from(req.head_dim);
+        let items = sched.split_items;
         info.v_offset = Some(floats.alloc(
-            (heads * padded as u64 * rows * head_dim * 4) as usize,
+            (heads * items * rows * head_dim * 4) as usize,
             16,
             "batch_prefill_tmp_v",
         )?);
         info.s_offset = Some(floats.alloc(
-            (heads * padded as u64 * rows * 4) as usize,
+            (heads * items * rows * 4) as usize,
             16,
             "batch_prefill_tmp_s",
         )?);
@@ -338,6 +412,9 @@ fn layout(
             16,
             "batch_prefill_merge_indptr",
         )?);
+        if req.enable_cuda_graph {
+            info.split_live_offset = Some(ints.alloc(4, 16, "batch_prefill_split_live")?);
+        }
     }
     if sched.split_kv || req.enable_cuda_graph {
         info.block_valid_mask_offset =
@@ -402,10 +479,23 @@ fn stage(
         "batch_prefill_live_lanes",
     )?;
     if req.enable_cuda_graph {
+        // The rows the fold folds: none where the fire lands them whole.
+        let folded = if sched.split_live {
+            req.qo_indptr[req.live.requests as usize]
+        } else {
+            0
+        };
         staging.put_i32(
             at(info.total_num_rows_offset),
-            req.qo_indptr[req.live.requests as usize],
+            folded,
             "batch_prefill_total_num_rows",
+        )?;
+    }
+    if info.split_live_offset.is_some() {
+        staging.put_i32(
+            at(info.split_live_offset),
+            i32::from(sched.split_live),
+            "batch_prefill_split_live",
         )?;
     }
     if sched.split_kv {
@@ -447,6 +537,21 @@ pub fn plan(
 mod tests {
     use super::*;
 
+    /// The PRO 4500's 164 blocks (82 SMs, two each): Qwen3-0.6B's 2048-row
+    /// fire (256 blocks) splits only past the 95 items its grid holds; a
+    /// fire one tile wide fills the device; one that fills whole waves
+    /// stays whole.
+    #[test]
+    fn a_fire_splits_where_its_waves_take_less() {
+        assert_eq!(fill_chunks(256, 164, 2), 1, "two chunks tie one");
+        assert_eq!(fill_chunks(256, 164, 3), 3);
+        assert_eq!(fill_chunks(128, 164, 4), 1, "one wave either way");
+        assert_eq!(fill_chunks(128, 164, 5), 5);
+        assert_eq!(fill_chunks(8, 164, 20), 20);
+        assert_eq!(fill_chunks(328, 164, 8), 1, "whole waves");
+        assert_eq!(fill_chunks(8, 164, 1), 1, "no room for a second chunk");
+    }
+
     #[test]
     fn the_partials_hold_every_row_the_split_writes() {
         for (q_heads, kv_heads, head_dim) in [(16, 2, 512), (16, 8, 256), (32, 8, 128), (8, 8, 64)]
@@ -481,8 +586,12 @@ mod tests {
                         enable_cuda_graph: graph,
                         window_left: None,
                         ctas_per_sm: 2,
+                        blocks_per_sm: |_, _, _| Some(2),
                     };
                     let sched = schedule("test", &req, &Device::L40S).unwrap();
+                    if !sched.split_live {
+                        continue;
+                    }
                     let laid = layout("test", &req, &sched, usize::MAX, usize::MAX).unwrap();
                     let (Some(v), Some(s)) = (laid.info.v_offset, laid.info.s_offset) else {
                         continue;
