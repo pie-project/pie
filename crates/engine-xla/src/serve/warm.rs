@@ -954,6 +954,61 @@ impl Shell {
         if let Some(handle) = self.behind.handle.take() {
             let _ = handle.join();
         }
+        self.log_outside_pool();
+    }
+
+    /// What the device holds outside the pool and the weights by the
+    /// programs, a class a line, from their compiled memory (what was built
+    /// or loaded so far): the per-execute temp (one reservation, the largest
+    /// loaded program's), the outputs not aliased into an argument (a fire's
+    /// readout plane, a gather's or a beam head's result), the code. The
+    /// numbers the one pool replaces the shares with.
+    fn log_outside_pool(&self) {
+        use std::collections::HashSet;
+        let memories = self.device.memories();
+        let keys_of = |programs: &mut dyn Iterator<Item = &std::sync::Arc<crate::device::Program>>| {
+            programs.filter_map(|p| self.device.key_of(p)).collect::<HashSet<_>>()
+        };
+        let mut fires: HashSet<[u8; 32]> = self.parked.values().map(|p| p.code.hash()).collect();
+        fires.extend(keys_of(&mut self.traced.values().chain(self.shaped.values())));
+        let gathers = keys_of(&mut self.gathers.values());
+        let readouts = keys_of(&mut self.readout_programs.values());
+        let rest: HashSet<[u8; 32]> = (memories.keys())
+            .filter(|k| !fires.contains(*k) && !gathers.contains(*k) && !readouts.contains(*k))
+            .copied()
+            .collect();
+        for (class, keys) in [
+            ("fires", &fires),
+            ("gathers", &gathers),
+            ("readouts", &readouts),
+            ("others", &rest),
+        ] {
+            let measured: Vec<crate::pjrt::CompiledMemory> =
+                keys.iter().filter_map(|k| memories.get(k).copied()).collect();
+            let unaliased = |m: &crate::pjrt::CompiledMemory| m.output.saturating_sub(m.alias);
+            let mut temps: Vec<u64> = measured.iter().map(|m| m.temp).collect();
+            temps.sort_unstable();
+            tracing::info!(
+                class,
+                programs = keys.len(),
+                measured = measured.len(),
+                temp_max_mib = temps.last().copied().unwrap_or(0) >> 20,
+                temp_p50_mib = temps.get(temps.len() / 2).copied().unwrap_or(0) >> 20,
+                unaliased_max_mib = measured.iter().map(unaliased).max().unwrap_or(0) >> 20,
+                unaliased_sum_mib = measured.iter().map(unaliased).sum::<u64>() >> 20,
+                code_max_mib = measured.iter().map(|m| m.code).max().unwrap_or(0) >> 20,
+                code_sum_mib = measured.iter().map(|m| m.code).sum::<u64>() >> 20,
+                "xla outside the pool: a program class's compiled memory"
+            );
+        }
+        let (weights, pool) = self.footprint();
+        tracing::info!(
+            in_use_mib = self.device.bytes_in_use().unwrap_or(0) >> 20,
+            weights_mib = weights >> 20,
+            pool_mib = pool >> 20,
+            reserved_temp_mib = self.device.load_temp() >> 20,
+            "xla outside the pool: the device's memory in use beside the pool and the weights"
+        );
     }
 
     /// Compiles what the ladder traced, a thread a core, and seats
