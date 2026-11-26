@@ -944,6 +944,24 @@ impl Device {
 
     /// [`Device::forget`] by the cache key of a program's text (the blake3
     /// of it): a stage the guest stage cache evicted.
+    /// The text bytes of the programs held in memory, and whether `key`'s
+    /// is one of them.
+    pub fn held_text_bytes(&self) -> u64 {
+        let cache = self.cache.lock().expect("cache lock poisoned");
+        cache.values().map(|p| p.text_bytes as u64).sum()
+    }
+
+    #[must_use]
+    pub fn holds_key(&self, key: &[u8; 32]) -> bool {
+        self.cache.lock().expect("cache lock poisoned").contains_key(key)
+    }
+
+    /// Takes `key`'s program out of the cache, the caller its last holder
+    /// where nothing else holds it.
+    pub fn take_key(&self, key: &[u8; 32]) -> Option<Arc<Program>> {
+        self.cache.lock().expect("cache lock poisoned").remove(key)
+    }
+
     pub fn forget_key(&self, key: &[u8; 32]) {
         self.cache.lock().expect("cache lock poisoned").remove(key);
     }
@@ -1342,8 +1360,10 @@ struct RoomState {
     /// The bytes reserved for the loads under way, and how many there are.
     reserved: u64,
     loads: usize,
-    /// The most resident bytes a load alone grew by, per KiB of its text.
+    /// The most resident bytes a load alone grew by, per KiB of its text,
+    /// and in all.
     per_kib: u64,
+    most: u64,
     /// Whether the load under way, if one alone, has stayed alone.
     alone: bool,
 }
@@ -1386,7 +1406,13 @@ impl HostRoom {
         let len = text_len as u64;
         let mut st = self.state.lock().expect("the host room's lock poisoned");
         loop {
-            let hold = (st.per_kib > 0).then(|| st.per_kib.saturating_mul(len) / 1024);
+            // a stated room reserves the most a load was measured to take,
+            // whatever its text: loads side by side then cannot together
+            // pass it on a program's estimate falling short
+            let hold = (st.per_kib > 0).then(|| {
+                let own = st.per_kib.saturating_mul(len) / 1024;
+                if self.stated.is_some() { own.max(st.most) } else { own }
+            });
             let fits = match hold {
                 // unmeasured: alone, where there is room at all
                 None => st.loads == 0 && self.room(0, 0),
@@ -1412,18 +1438,24 @@ impl HostRoom {
 
     /// Whether a hold of `hold` fits beside `reserved` under way.
     fn room(&self, reserved: u64, hold: u64) -> bool {
-        match self.stated {
-            Some(stated) => self.held().saturating_add(reserved).saturating_add(hold) <= stated,
-            // the floor, and the room the guest stage compiles running and
-            // waiting take (a loader beside serving held the host to 14.5 GB
-            // free and a registration's sampler stages were refused)
-            None => available_memory().is_none_or(|free| {
-                free.saturating_sub(reserved).saturating_sub(hold)
-                    >= self
-                        .floor
-                        .saturating_add(crate::guest::run::guest_reserve())
-            }),
-        }
+        // the stated room, where stated, and always the host's: the floor,
+        // and the room the guest stage compiles running and waiting take (a
+        // loader beside serving held the host to 14.5 GB free and a
+        // registration's sampler stages were refused)
+        self.stated.is_none_or(|stated| {
+            self.held().saturating_add(reserved).saturating_add(hold) <= stated
+        }) && available_memory().is_none_or(|free| {
+            free.saturating_sub(reserved).saturating_sub(hold)
+                >= self
+                    .floor
+                    .saturating_add(crate::guest::run::guest_reserve())
+        })
+    }
+
+    /// Whether what the loads hold passes the stated room (a load measured
+    /// short of what it took).
+    pub(crate) fn past_stated(&self) -> bool {
+        self.stated.is_some_and(|stated| self.held() > stated)
     }
 
     /// A load admitted ends; `held`: its program stays in memory. A load
@@ -1436,8 +1468,9 @@ impl HostRoom {
             && let (Some(before), Some(after)) = (r.resident, resident_bytes())
             && r.text > 0
         {
-            let per_kib = after.saturating_sub(before).saturating_mul(1024) / r.text;
-            st.per_kib = st.per_kib.max(per_kib);
+            let grew = after.saturating_sub(before);
+            st.per_kib = st.per_kib.max(grew.saturating_mul(1024) / r.text);
+            st.most = st.most.max(grew);
         }
         st.loads -= 1;
         st.reserved -= r.bytes;

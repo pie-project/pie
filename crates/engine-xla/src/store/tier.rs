@@ -22,6 +22,10 @@ pub struct Host {
     bytes: Vec<u8>,
     chunks: u32,
     chunk_bytes: u64,
+    /// The slots written so far, by offset, and their bytes: a slot's pages
+    /// stay resident once written (the runtime frees its ref, not them).
+    landed: std::collections::HashSet<u64>,
+    landed_bytes: u64,
 }
 
 impl Host {
@@ -33,6 +37,8 @@ impl Host {
             bytes: vec![0; len],
             chunks: if len == 0 { 0 } else { chunks },
             chunk_bytes,
+            landed: std::collections::HashSet::new(),
+            landed_bytes: 0,
         }
     }
 
@@ -60,7 +66,23 @@ impl Host {
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         let span = self.span(offset, bytes.len() as u64)?;
         self.bytes[span].copy_from_slice(bytes);
+        if self.landed.insert(offset) {
+            self.landed_bytes += bytes.len() as u64;
+        }
         Ok(())
+    }
+
+    /// The bytes of the slots written so far, exactly: what the tier holds
+    /// of the host.
+    #[must_use]
+    pub fn landed_bytes(&self) -> u64 {
+        self.landed_bytes
+    }
+
+    /// Whether a write at `offset` lands a slot not written before.
+    #[must_use]
+    pub fn lands_new(&self, offset: u64) -> bool {
+        !self.landed.contains(&offset)
     }
 
     #[must_use]

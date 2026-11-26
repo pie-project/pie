@@ -756,7 +756,12 @@ impl Shell {
             return;
         }
         let device = std::sync::Arc::clone(&self.device);
-        let stated = self.host_programs;
+        // the programs' room (the growth the loader may hold): what the load
+        // states, else what the stated host bound leaves of the worker's
+        // resident memory now, the host tier's kv in it
+        let stated = self.host_programs.or(self.host_bound.map(|b| {
+            b.saturating_sub(crate::device::resident_bytes().unwrap_or(b))
+        }));
         // the room of a compile, the widest of theirs (the guest stages'
         // compile beside them, by their measured needs, is kept too:
         // `guest::run::guest_reserve`, read as it loads)
@@ -793,6 +798,15 @@ impl Shell {
                         Ok(None) if code.text().is_some() => device.prepare_code(code, sig.clone()),
                         loaded => loaded,
                     };
+                    // a load that took the loads past a stated room is not kept:
+                    // its program stays parked, and the loader stops
+                    if matches!(program, Ok(Some(_))) && room.past_stated() {
+                        drop(program);
+                        drop(device.take_key(&code.hash()));
+                        full.store(true, SeqCst);
+                        room.done(reserved, false);
+                        return Some(code.len() as u64);
+                    }
                     room.done(reserved, matches!(program, Ok(Some(_))));
                     match program {
                         Ok(Some(_)) => {
@@ -901,6 +915,7 @@ impl Shell {
                     hold_per_kib = room.per_kib(),
                     "xla parked programs loaded before ready; {left} programs left parked, each loads on its first fire"
                 );
+                room.per_kib()
             });
         match spawned {
             Ok(handle) => self.behind.handle = Some(handle),
@@ -947,12 +962,34 @@ impl Shell {
     /// first: 370 programs took the host, then the stages' compiles took the
     /// process past its cgroup's cap before ready).
     pub fn load_parked_programs(&mut self) {
+        // the worker's resident memory before the loader holds any more
+        // programs: what it holds beside the host tier's room since its
+        // seat, the largest program in it (`Shell::seat_tiers`)
+        let mut before = None;
         if !self.behind.begun {
+            before = crate::device::resident_bytes();
             self.behind.begun = true;
             self.load_behind();
         }
-        if let Some(handle) = self.behind.handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.behind.handle.take()
+            && let Ok(per_kib) = handle.join()
+        {
+            self.hold_per_kib = per_kib;
+        }
+        if let Some(bound) = self.host_bound {
+            // the guest stages built since the tier was seated: the kv the
+            // tier can't land whole beside one program, refused by name
+            // before the bound is passed
+            let tier = u64::from(self.host.chunks()) * self.host.chunk_bytes();
+            let short = before.map(|held| (held + tier).saturating_sub(bound));
+            tracing::info!(
+                bound_gib = bound >> 30,
+                tier_gib = tier >> 30,
+                programs_gib = self.programs_held() >> 30,
+                before_loader_mib = before.unwrap_or(0) >> 20,
+                kv_short_mib = short.unwrap_or(0) >> 20,
+                "xla host bound: the host tier's kv up to its seats, programs what the kv leaves (held at ready); programs yield to kv"
+            );
         }
     }
 
@@ -1089,6 +1126,22 @@ impl Shell {
         // (`guest::run::guest_reserve`) and loads nothing beside one
         // measuring its need.
         let parked = parked.load(SeqCst);
+        // With no disk cache a program the host does not hold has nowhere to
+        // be loaded again from: its first fire would build it after ready.
+        // Refused by name instead (v6e Qwen3.5's 747 programs hold ~255 GiB
+        // of host memory; its host's cgroup caps 150).
+        if parked > 0 && !parks {
+            return Err(crate::error::Fault::Program {
+                at: "serve::warm",
+                why: format!(
+                    "{parked} of the warm ladder's {} programs do not fit the host's memory \
+                     beside those held ({} GiB) and this load keeps no program cache on disk \
+                     to load them again from: a fire of one would build it after ready",
+                    texts.len(),
+                    host_room.held() >> 30
+                ),
+            });
+        }
         if parked > 0 {
             tracing::warn!(
                 parked,

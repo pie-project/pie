@@ -144,13 +144,6 @@ fn group_room(
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     };
-    let Some(max) = file("memory.max")? else {
-        return Ok(None);
-    };
-    let max = max.trim();
-    if max == "max" {
-        return Ok(None);
-    }
     let number = |name: &str, text: &str| {
         text.parse::<u64>().map_err(|_| {
             format!(
@@ -159,10 +152,24 @@ fn group_room(
             )
         })
     };
-    let max = number("memory.max", max)?;
+    // The group's limit: `memory.max`, where its charges fail, or below it
+    // `memory.high`, where the kernel throttles and reclaims the group hard;
+    // either reads `max` where unset.
+    let mut max: Option<u64> = None;
+    for name in ["memory.max", "memory.high"] {
+        if let Some(text) = file(name)?
+            && text.trim() != "max"
+        {
+            let limit = number(name, text.trim())?;
+            max = Some(max.map_or(limit, |max| max.min(limit)));
+        }
+    }
+    let Some(max) = max else {
+        return Ok(None);
+    };
     let current = file("memory.current")?.ok_or_else(|| {
         format!(
-            "{} states a memory.max and no memory.current",
+            "{} states a memory.max or memory.high and no memory.current",
             dir.display()
         )
     })?;
@@ -247,6 +254,24 @@ mod tests {
             ("/cg/user.slice/memory.current", format!("{}", 11 * GIB)),
         ];
         assert_eq!(read(Some(OWN), &over).unwrap().bytes(), 0);
+    }
+
+    #[test]
+    fn a_cgroups_memory_high_below_its_max_caps_it() {
+        // where the kernel throttles the group, below where its charges fail
+        let texts = [
+            ("/cg/user.slice/memory.max", format!("{}\n", 150 * GIB)),
+            ("/cg/user.slice/memory.high", format!("{}\n", 120 * GIB)),
+            ("/cg/user.slice/memory.current", format!("{}\n", 90 * GIB)),
+        ];
+        assert_eq!(read(Some(OWN), &texts).unwrap().cgroup, Some(30 * GIB));
+        // a high alone, its max unset
+        let high = [
+            ("/cg/user.slice/memory.max", "max\n".to_string()),
+            ("/cg/user.slice/memory.high", format!("{}\n", 120 * GIB)),
+            ("/cg/user.slice/memory.current", format!("{}\n", 90 * GIB)),
+        ];
+        assert_eq!(read(Some(OWN), &high).unwrap().cgroup, Some(30 * GIB));
     }
 
     #[test]
