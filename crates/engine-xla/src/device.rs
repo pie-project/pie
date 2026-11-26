@@ -50,6 +50,9 @@ pub struct Device {
     /// load's own at its seal: the runtime's one temp reservation is the
     /// largest loaded program's, so a later program adds only its excess.
     temp_max: std::sync::atomic::AtomicU64,
+    /// Every program's compiled memory, by its text's hash, as it was built
+    /// or loaded (`Shell::log_outside_pool`).
+    memories: Mutex<HashMap<[u8; 32], crate::pjrt::CompiledMemory>>,
     sealed_temp: std::sync::atomic::AtomicU64,
     ordinal: usize,
     kind: String,
@@ -131,6 +134,7 @@ impl Device {
             misses: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::OnceLock::new(),
             temp_max: std::sync::atomic::AtomicU64::new(0),
+            memories: Mutex::new(HashMap::new()),
             sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: disk_cache(),
@@ -181,6 +185,7 @@ impl Device {
             misses: std::sync::atomic::AtomicU64::new(0),
             live: std::sync::OnceLock::new(),
             temp_max: std::sync::atomic::AtomicU64::new(0),
+            memories: Mutex::new(HashMap::new()),
             sealed_temp: std::sync::atomic::AtomicU64::new(0),
             dump: std::env::var_os("PIE_XLA_DUMP").map(PathBuf::from),
             disk: None,
@@ -501,6 +506,10 @@ impl Device {
         let memory = exe.compiled_memory().unwrap_or_default();
         self.temp_max
             .fetch_max(memory.temp, std::sync::atomic::Ordering::Relaxed);
+        self.memories
+            .lock()
+            .expect("memories lock poisoned")
+            .insert(key, memory);
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
@@ -645,6 +654,10 @@ impl Device {
         let memory = exe.compiled_memory().unwrap_or_default();
         self.temp_max
             .fetch_max(memory.temp, std::sync::atomic::Ordering::Relaxed);
+        self.memories
+            .lock()
+            .expect("memories lock poisoned")
+            .insert(*hash, memory);
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
@@ -996,6 +1009,30 @@ impl Device {
         );
         self.sealed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Every program's compiled memory built or loaded so far, by its
+    /// text's hash.
+    #[must_use]
+    pub fn memories(&self) -> HashMap<[u8; 32], crate::pjrt::CompiledMemory> {
+        self.memories.lock().expect("memories lock poisoned").clone()
+    }
+
+    /// The text hash `program` is held under, where the cache holds it.
+    #[must_use]
+    pub fn key_of(&self, program: &Arc<Program>) -> Option<[u8; 32]> {
+        let cache = self.cache.lock().expect("cache lock poisoned");
+        cache.iter().find(|(_, p)| Arc::ptr_eq(p, program)).map(|(k, _)| *k)
+    }
+
+    /// The device's memory in use now (PJRT's `bytes_in_use`), where it
+    /// reports it.
+    #[must_use]
+    pub fn bytes_in_use(&self) -> Option<u64> {
+        let client = self.client.as_ref()?;
+        let device = client.device(self.ordinal)?;
+        let stats = client.memory_stats(device).ok()?;
+        u64::try_from(stats.bytes_in_use).ok()
     }
 
     /// The largest temp of the load's own programs (those compiled before
