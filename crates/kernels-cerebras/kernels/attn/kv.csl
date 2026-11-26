@@ -35,6 +35,7 @@ param WIN: u16;
 param XHI: u16;
 param PLOG: u16;
 param DIAG: u16;
+param SEATS: u16 = 1; //+seats
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 fn isg(l: u16) bool { return ((KM >> l) & 1) == 1; }
@@ -45,7 +46,8 @@ fn nql(l: u16) u16 { return Qh * dcl(l) + (if (SH == 1) 0 else if (isg(l) and KE
 // ---------------------------------------------------------------- caches
 const NC: u16 = if (!ON or AROW == 2) 0 else if (SH == 1) 2 else K;
 fn cg(c: u16) bool { return if (SH == 1) c == 1 else isg(c); }
-fn cne(c: u16) u16 { return if (cg(c)) NEG else NES; }
+fn cne(c: u16) u16 { return if (cg(c)) NEG else NES; } //-seats
+fn cne(c: u16) u16 { return NEG; }   // (seats: every cache the pool's entries, a seat's window of them) //+seats
 fn cdc(c: u16) u16 { return if (cg(c)) DcG else DcS; }
 fn ckw(c: u16) u16 { return cdc(c) * cne(c); }
 fn cvw(c: u16) u16 { return cne(c) * (cdc(c) + 1); }
@@ -74,7 +76,11 @@ const NC1: u16 = mx(NC, 1);
 var kc = @zeros([sum_kw() + 1]u16);
 var vc = @zeros([sum_vw() + 1]u16);
 var kinv = @zeros([if (NC == 0) 1 else sum_ne()]f32);
-var mref = @zeros([if (NC == 0) 1 else K * Qh]f32);
+var mref = @zeros([if (NC == 0) 1 else K * Qh]f32); //-seats
+var mrefs = @zeros([if (NC == 0) 1 else SEATS * K * Qh]f32);   // a reference a seat //+seats
+var mref: [*]f32 = &mrefs;   // the pass's seat's //+seats
+var wb = @zeros([SEATS]u16);   // each seat's window's first entry, learnt at its position 0 //+seats
+var cw0: u16 = 0;   // the pass's seat's //+seats
 var pv = @zeros([NC1 * DcG]f32);      // the pending entry's raw v a cache
 var pks = @zeros([NC1]f32);           // its |k|^2, |v|^2 partials (this column's)
 var pvs = @zeros([NC1]f32);
@@ -166,7 +172,8 @@ fn posq(pos: u32) void {
 }
 fn cslot(c: u16, pos: u32) u16 {
   posq(pos);
-  return if (cg(c)) q_ent else q_ent % NES;
+  return if (cg(c)) q_ent else q_ent % NES; //-seats
+  return if (cg(c)) q_ent else cw0 + (q_ent - cw0) % NES;   // (seats: a ring within the seat's window) //+seats
 }
 fn cache_reset(c: u16) void {
   var i: u16 = 0;
@@ -177,6 +184,14 @@ fn cache_reset(c: u16) void {
   while (i < cne(c)) : (i += 1) { kinv[eoff(c) + i] = 0.0; if (WIN > 0 and !cg(c)) { spos[soff(c) + i] = 0.0; } }
   pend[c] = 0;
 }
+// (seats) entry e of cache c emptied: a seat's next entry, before its rows write it //+seats
+fn cache_clear(c: u16, e: u16) void { //+seats
+  const dc = cdc(c); //+seats
+  var d: u16 = 0;   // (its keys as they are: an inverse norm 0 scores 0) //+seats
+  while (d <= dc) : (d += 1) { vc[1 + voff(c) + e * (dc + 1) + d] = 0; } //+seats
+  kinv[eoff(c) + e] = 0.0; //+seats
+  if (WIN > 0 and !cg(c)) { spos[soff(c) + e] = 0.0; } //+seats
+} //+seats
 // the new entry of cache c (this row's): k into the keys (f16), v and the two partials pending
 fn cache_put(c: u16, pos: u32, k: [*]f32, v: [*]f32, ks: f32, vs: f32) void {
   const e = cslot(c, pos);
@@ -279,28 +294,44 @@ fn attm(l: u16, comptime g: u16) void {
   const ne: u16 = if (g == 2) cne(c) else if (g == 1) NEG else NES;
   const ihd: f32 = if (isg(l)) IHDG else IHDS;   // (reciprocals: no runtime f32 divide)
   @fmovs(@set_dsd_length(ab_d, AB), fab.fin(pe.q_ym, AB));
-  const pos = @as(u32, ab[QD + 2 * dc]);
+  const pos = @as(u32, ab[QD + 2 * dc]); //-seats
+  // (seats: pos the window's position, 2 seat + its reset above; w0 the window's first entry) //+seats
+  const sw = @as(u32, ab[QD + 2 * dc]); //+seats
+  const pos = sw & 0xffff; //+seats
+  const st = @as(u16, sw >> 17); //+seats
+  const reset = ((sw >> 16) & 1) != 0; //+seats
   s_att = ab[QD + 2 * dc + Qh + 3];
   posq(pos);
+  if (reset) { wb[st] = q_ent; } //+seats
+  const w0: u16 = wb[st]; //+seats
+  cw0 = w0; //+seats
+  mref = @ptrcast([*]f32, &mrefs[st * K * Qh]); //+seats
   const mine = q_row == pe.myrow;
-  if (pos == 0) {
-    if (SH == 0) { cache_reset(c); }
+  if (pos == 0) { //-seats
+  if (reset) {   // a new sequence on the seat: its reference restarts //+seats
+    if (SH == 0) { cache_reset(c); } //-seats
     var hh: u16 = 0;
     while (hh < Qh) : (hh += 1) { mref[l * Qh + hh] = 0.0; }
   }
+  if (SH == 0 and q_row == 0 and (cg(c) or q_ent - w0 < NES)) { cache_clear(c, cslot(c, pos)); } //+seats
   if (SH == 0 and mine) {
     cache_put(c, pos, @ptrcast([*]f32, &ab[QD]), @ptrcast([*]f32, &ab[QD + dc]), ab[QD + 2 * dc + 1 + Qh], ab[QD + 2 * dc + 2 + Qh]);
   }
   @fs2h(@set_dsd_length(xh_d, QD), @set_dsd_length(ab_d, QD));
-  const eseen = @as(u32, q_ent) + 1;
+  const eseen = @as(u32, q_ent) + 1; //-seats
+  const eseen = @as(u32, q_ent - w0) + 1; //+seats
   // RING, a sliding layer: the whole ring every step, unwritten entries masked below
-  const FR: bool = (RING == 1 and WIN == 0 and (if (g == 2) !isg(l) else g == 0));
-  const nseen: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne;
+  const FR: bool = (RING == 1 and WIN == 0 and (if (g == 2) !isg(l) else g == 0)); //-seats
+  const FR: bool = false;   // (seats: a seat's window's entries, never the whole ring) //+seats
+  const nseen: u16 = if (eseen < @as(u32, ne)) @as(u16, eseen) else ne; //-seats
+  const nwe: u16 = if (cg(c)) ne - w0 else NES;   // (seats) the seat's entries: its window's, its ring's //+seats
+  const nseen: u16 = if (eseen < @as(u32, nwe)) @as(u16, eseen) else nwe; //+seats
   const NEl: u16 = if (FR) ne else nseen;
   const nsl: u16 = Qh * NEl + Qh + 2;
   const kb = koff(c);
   const vb = voff(c);
-  const e0 = eoff(c);
+  const e0 = eoff(c); //-seats
+  const e0 = eoff(c) + w0; //+seats
   var apass: u16 = 0;
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
@@ -308,7 +339,8 @@ fn attm(l: u16, comptime g: u16) void {
       pe.kvmv(@ptrcast([*]u16, &kc[1 + kb]), dc, ne, h * dc, h * ne);
       if (!FR) {
         @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
-               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl));
+               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl)); //-seats
+               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne + w0), f32), NEl)); //+seats
       }
       sx[Qh * NEl + h] = ab[QD + 2 * dc + 1 + h];
     }
@@ -330,7 +362,8 @@ fn attm(l: u16, comptime g: u16) void {
       }
     }
     if (WIN > 0 and !cg(c)) {   // entries out of the window (or unwritten) score -1e30
-      const so = soff(c);
+      const so = soff(c); //-seats
+      const so = soff(c) + w0; //+seats
       var e: u16 = 0;
       while (e < NEl) : (e += 1) {
         const sp = spos[so + e];
@@ -349,7 +382,8 @@ fn attm(l: u16, comptime g: u16) void {
       }
     }
     h = 0;
-    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); }
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); } //-seats
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb + w0 * (dc + 1)]), NEl, dc + 1, h * NEl, h * (dc + 1)); } //+seats
     pe.send_y(Qh * (dc + 1));
     @fs2h(@set_dsd_length(xh_d, QD), fab.fin(pe.q_ym, QD));
     @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(pe.q_ym, 1 + Qh));

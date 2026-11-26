@@ -4,7 +4,8 @@
 //! GDN states and conv windows, its first x at a launch (CX's `xs`), its position (CY's `spos`)
 //! and its forced tokens (the head's `nforce`); the head marks
 //! the last `m` passes' tokens as taken by none. Seats ride the own caches' kernels
-//! ([`KernelSet::Own`]) and the token loop, at most `units - 1` of them
+//! ([`KernelSet::Own`]) or the windowed rows' ([`KernelSet::Windows`]: each seat's sliding ring
+//! within its window's entries) and the token loop, at most `units - 1` of them
 //! ([`crate::compile::check::hazard::seats`]).
 //!
 //! The kernels' seat code is in their sources' lines marked `//+seats` (written only for a ring)
@@ -64,13 +65,18 @@ impl Block for Seats {
             return Ok(());
         }
         let (plan, p) = (&prog.plan, &prog.plan.partition);
-        if prog.roles != KernelSet::Own || !plan.contract.token_loop {
+        if !matches!(prog.roles, KernelSet::Own | KernelSet::Windows) || !plan.contract.token_loop {
             return Err(format!(
-                "seats: {m} seats want the own caches' kernels and the token loop ({} here)",
+                "seats: {m} seats want the own caches' or windowed rows' kernels and the token \
+                 loop ({} here)",
                 prog.roles.name()
             ));
         }
         if let Some(e) = crate::compile::check::hazard::seats(m, p.units) {
+            return Err(format!("seats: {e}"));
+        }
+        let pool = p.kv_entries.per_row * p.kv_rows;
+        if let Some(e) = crate::compile::check::hazard::seat_pool(pool) {
             return Err(format!("seats: {e}"));
         }
         if m > MOST {

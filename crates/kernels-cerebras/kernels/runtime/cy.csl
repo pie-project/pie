@@ -223,7 +223,8 @@ task pass_task() void {
       gdn.pass_end();
       seats.next(); //+seats
     } else {
-      pe.tab[0] = pos0 + s;
+      pe.tab[0] = pos0 + s; //-seats
+      seats.at(@ptrcast([*]u32, &pe.tab)); //+seats
       pe.stamp(0);
       kv.pass_start(pe.tab[0]);
       const bus = PLE == 1 and ple.on_bus() and (DIAG & 32) == 0;   // DIAG 32: no PLE words
@@ -242,6 +243,7 @@ task pass_task() void {
         if ((pe.word & 4) != 0) { flush(); }
       }
       if (bus) { ple.post(); }   // (the next pass's, this launch's or the next one's)
+      seats.next(); //+seats
     }
   }
   sys_mod.unblock_cmd_stream();

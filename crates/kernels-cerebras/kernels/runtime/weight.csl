@@ -135,9 +135,12 @@ const att = @import_module("ops/att.csl", .{ .pe = pe, .fab = fab, .math = math,
   .Qh = Qh, .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .HD = HD, .QKN = QKN, .ATTL = ATTL, .SEATS = SEATS }); //+seats
 const gdn = @import_module("ops/gdn.csl", .{ .pe = pe, .fab = fab, .NL = if (MIXK == 0 and GDN == 1) NLG else 0, //+seats
   .DV = DV, .DK = DK, .GDEC = GDEC, .SEATS = SEATS }); //+seats
-const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM, .SH = SH,
-  .AROW = AROW, .KEV = KEV, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PYW, .HDS = HDS, .HDG = HDG,
-  .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG });
+const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM, .SH = SH, //-seats
+  .AROW = AROW, .KEV = KEV, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PYW, .HDS = HDS, .HDG = HDG, //-seats
+  .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG }); //-seats
+const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM, .SH = SH, //+seats
+  .AROW = AROW, .KEV = KEV, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PYW, .HDS = HDS, .HDG = HDG, //+seats
+  .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG, .SEATS = SEATS }); //+seats
 var kvlog_ptr: [*]f32 = &kv.kvlog;
 const swa = @import_module("ops/swa.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 2, .K = K, .KM = KM, .Qh = Qh,
   .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ, .QKN = QKN, .HD = HD, .EPS = EPS });
@@ -241,6 +244,7 @@ fn layer1(l: u16, b: u16) u16 {
   stamp(5 + 9 * l);
   const bd = bg + Hc * 2 * Ic;
   pe.mv16(bd, Ic, Hc, 0);
+  if (PLE == 0 and l + 1 == K and (pe.word & 4) == 0) { pe.post_in(); } //+seats
   send_row(sv2[0]);
   stamp(6 + 9 * l);
   if (PLE == 0) { return bd + Ic * Hc; }
@@ -251,6 +255,7 @@ fn layer1(l: u16, b: u16) u16 {
   pe.xh[0] = @as(@fp16(), sv2[0]);
   stamp(7 + 9 * l);
   pe.mv16(bp + Hc, 1, Hc, 0);
+  if (l + 1 == K and (pe.word & 4) == 0) { pe.post_in(); } //+seats
   send_row(sv2[1]);
   stamp(8 + 9 * l);
   return bp + 2 * Hc;
@@ -261,6 +266,7 @@ fn flush() void {
   pe.send_y(4);
   @fmovs(@set_dsd_length(sv2_d, 1), fab.fin(pe.q_ym, 1));
   pe.y[0] = if ((pe.word & 1) != 0) sv2[0] else 0.0;
+  pe.post_in(); //+seats
   pe.send_x(1);
 }
 

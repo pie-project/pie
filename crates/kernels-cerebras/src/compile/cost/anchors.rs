@@ -15,6 +15,7 @@ pub const ANCHORS: &[Anchor] = &[
         },
         head_moves: true,
         code: &[],
+        attention: 0.0,
     },
     Anchor {
         kernels: KernelSet::Shared,
@@ -27,6 +28,7 @@ pub const ANCHORS: &[Anchor] = &[
         },
         head_moves: true,
         code: SHARED,
+        attention: 0.0,
     },
     Anchor {
         kernels: KernelSet::Windows,
@@ -38,7 +40,8 @@ pub const ANCHORS: &[Anchor] = &[
             head: 66816.0,
         },
         head_moves: false,
-        code: &[],
+        code: WINDOWS,
+        attention: 26796.0,
     },
     Anchor {
         kernels: KernelSet::Experts,
@@ -51,6 +54,7 @@ pub const ANCHORS: &[Anchor] = &[
         },
         head_moves: false,
         code: &[],
+        attention: 0.0,
     },
 ];
 
@@ -84,3 +88,12 @@ const SHARED: &[Code] = &[
         bytes: 224.0,
     },
 ];
+
+/// The windowed rows' weight image (`kv.csl`): a ring of seats' code past what its attention
+/// rows' moving bytes give (the 12B links at 2 seats and 13 entries a row: 168 B).
+const WINDOWS: &[Code] = &[Code {
+    what: "a ring of seats",
+    on: |p: &Plan| p.seats > 1,
+    anchor: false,
+    bytes: 168.0,
+}];

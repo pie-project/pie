@@ -153,7 +153,7 @@ fn even_windows(hl: &HostLayout) -> Vec<(usize, usize)> {
     let Some(s) = hl.seats.as_ref().filter(|s| s.pool > 0 && s.m > 1) else {
         return Vec::new();
     };
-    let rows = hl.rows.max(1) as usize;
+    let rows = hl.pool_rows() as usize;
     let span = s.pool as usize / s.m as usize / rows * rows;
     (0..s.m as usize)
         .map(|j| (j * span, span.min(hl.positions as usize)))
@@ -366,7 +366,7 @@ impl ArtifactModel {
     /// starts again at position 0 (the attention learns a window's first entry there).
     pub fn windows(&mut self, wins: &[(usize, usize)]) -> R<()> {
         let pool = self.hl.seats.as_ref().map_or(0, |s| s.pool as usize);
-        let rows = self.hl.rows.max(1) as usize;
+        let rows = self.hl.pool_rows() as usize;
         if pool == 0 || wins.len() != self.seats() {
             return Err(format!(
                 "artifact: {} windows for {} seats over a pool of {pool}",
@@ -399,7 +399,7 @@ impl ArtifactModel {
     /// The ring's shared KV pool: its positions and rows (none: fixed windows or one seat).
     pub fn pool(&self) -> Option<(usize, usize)> {
         let s = self.hl.seats.as_ref().filter(|s| s.pool > 0 && s.m > 1)?;
-        Some((s.pool as usize, self.hl.rows.max(1) as usize))
+        Some((s.pool as usize, self.hl.pool_rows() as usize))
     }
 
     /// The sequences the program holds at once: its ring's seats (1 without one).

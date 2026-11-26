@@ -211,7 +211,9 @@ fn take(go: u16, i: u16) void {
 // x in: the host's, the handoff's (2 Hc + 1), or (unit 0) the token loop's embedding, scaled
 fn x_in1(s: u32, fl: u32) void {
   if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(xw_d, fab.fin(q_hi, HW)); return; }
-  if (s > 0 and (fl & 4) != 0) {     // the wafer loop's next token (else the host's x)
+  if (s > 0 and (fl & 4) != 0) {     // the wafer loop's next token (else the host's x) //-seats
+  if (s < SEATS) { @fmovs(x_d, @increment_dsd_offset(xs_d, @as(i16, @as(u16, s) * Hc), f32)); }   // a seat's first lap //+seats
+  else if ((fl & 4) != 0) {     // the wafer loop's next token (else the host's x) //+seats
     if (HG == 1) {
       const nfe = @as(u16, rcfg[RQ + 13]);
       if ((fl & 128) != 0) {

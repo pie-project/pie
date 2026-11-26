@@ -30,7 +30,7 @@ pub fn groups_split(py: u32, yc: u32, ra: u32, ga: u32, gw: u32) -> Vec<Vec<u32>
 /// dims (HcA, HcW), attention rows (RA; 128 make the 1024 window an exact ring), scores segment
 /// width (SWA), head group sizes (GA, GW; never across the CY row), units (NU), global KV entries
 /// a KV row (NEG), reduction groups (G2, G2W). Overrides: `NEG`, `G2`, `G2W`, `G3W`, `CAP`,
-/// `LOOP`.
+/// `LOOP`, `SEATS`.
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (px, py, ra) = (pr.need("PX")?, pr.need("PY")?, pr.need("RA")?);
     let (hca, hcw, swa) = (pr.need("HcA")?, pr.need("HcW")?, pr.need("SWA")?);
@@ -58,6 +58,14 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     }
     let groups = groups_split(py, py / 2, ra, pr.need("GA")?, pr.need("GW")?);
     let g2 = pr.need("G2")?;
+    // a ring of seats shares the KV pool, NEG RA: a sequence holds what the others' least
+    // windows (a launch's laps, whole rows) leave
+    let seats = pr.int("SEATS").unwrap_or(1).max(1);
+    let cap = pr.int("CAP").unwrap_or(256);
+    let least = (cap / seats).max(1).div_ceil(ra) * ra;
+    if seats > neg || (seats - 1) * least >= neg * ra {
+        return Err(format!("runs: {seats} seats over {neg} KV entries a row"));
+    }
     let plan = Plan {
         shape: s.clone(),
         partition: Partition {
@@ -105,16 +113,16 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             arrangement: None,
         },
         contract: Contract {
-            positions: neg * ra,
+            positions: neg * ra - (seats - 1) * least,
             rope_levels: 4,
             rope_bits: 3,
-            cap: pr.int("CAP").unwrap_or(256),
+            cap,
             loop_len: pr.need("LOOP")?,
             token_loop: true,
             logit_scale: 1.0,
         },
         levers: pr.levers.clone(),
-        seats: 1,
+        seats,
     };
     // the kernels' shape of it (q heads a segment, the MLP's columns) must hold
     Dims::of(&plan)?;

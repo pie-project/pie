@@ -55,6 +55,8 @@ fn ropec(comptime kd: u16, o: u16, comptime np: u16) void {
 // A pass's start (off the path): the position, the tables.
 fn pass_start(p: u32) void {
   posf = @as(f32, p);
+  // (seats: 2 seat + its reset, 65536 a step, over the window's position) //+seats
+  posf = @as(f32, (2 * pe.tab[1] + (if (p == 0) @as(u32, 1) else 0)) * 65536 + pe.tab[3] + p); //+seats
   if (KVS == 1) { posf1 = @as(f32, p + 1); }
   if (LS != 0xff) { rope_tables(0, p); }
   if (LG != 0xff) { rope_tables(1, p); }

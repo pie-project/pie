@@ -12,7 +12,8 @@
 //!   function (a send still in it would leave on the new colour).
 //! - **Late inputs** ([`late_inputs`]): a ring's input queue re-coloured during a launch to a
 //!   colour another unit (or the head) sends on: nothing holds the next pass's words back.
-//! - **Seats** ([`seats`]): a ring of more seats than the units' hand-offs hold.
+//! - **Seats** ([`seats`]): a ring of more seats than the units' hand-offs hold; ([`seat_pool`]) a
+//!   KV pool of more positions than CY's word to the attention carries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,6 +51,15 @@ pub fn seats(m: u32, units: u32) -> Option<String> {
             "a ring of {m} seats over {units} units: past units - 1, the synchronous hand-offs \
              deadlock"
         )
+    })
+}
+
+/// A ring's KV pool of `pool` positions: CY's word to the attention carries a window's position
+/// in its low 16 bits (2 seat + its reset above), so a position past them reads as another seat's.
+#[must_use]
+pub fn seat_pool(pool: u32) -> Option<String> {
+    (pool > 1 << 16).then(|| {
+        format!("a KV pool of {pool} positions: past the 65536 the attention's seat word holds")
     })
 }
 
@@ -169,6 +179,9 @@ fn bound_words(c: &Code) -> Result<BTreeMap<i64, bool>, String> {
                 let e = &colour[w + 5..];
                 let e = &e[..e.find(']').unwrap_or(e.len())];
                 for (mut env, after) in site_envs(c, &reached, *m, func) {
+                    if ruled_out(&f.body, at, &env) {
+                        continue;
+                    }
                     // (a name of an imported module: `pe.RQ`)
                     let mut flat = e.to_string();
                     for (alias, inst) in &c.modules[*m].aliases {
@@ -182,7 +195,7 @@ fn bound_words(c: &Code) -> Result<BTreeMap<i64, bool>, String> {
                     }
                     let word = eval(&flat, &env)
                         .ok_or_else(|| format!("{func}(): a queue's colour from rcfg[{e}]"))?;
-                    *out.entry(word).or_insert(true) &= after || f.body[at..].contains(SEND_ROW);
+                    *out.entry(word).or_insert(true) &= after || sends_row(c, *m, &f.body[at..]);
                 }
             }
         }
@@ -192,6 +205,61 @@ fn bound_words(c: &Code) -> Result<BTreeMap<i64, bool>, String> {
 
 /// A row partial's send.
 const SEND_ROW: &str = "send_x(";
+
+/// Whether `text` (module `m`'s) sends a row partial: itself, or by a call of a function of the
+/// module that does.
+fn sends_row(c: &Code, m: usize, text: &str) -> bool {
+    text.contains(SEND_ROW)
+        || (c.modules[m].funcs.iter())
+            .filter(|(_, f)| f.body.contains(SEND_ROW))
+            .any(|(n, _)| calls(text, n))
+}
+
+/// Whether `text` calls `name` (unqualified).
+fn calls(text: &str, name: &str) -> bool {
+    text.match_indices(&format!("{name}("))
+        .any(|(i, _)| !text[..i].ends_with(|ch: char| ident(ch) || ch == '.'))
+}
+
+/// Whether the call at `i` of `body` sits in an `if` whose condition is a conjunction with a term
+/// false at `env` (a branch the params rule out).
+fn ruled_out(body: &str, i: usize, env: &BTreeMap<String, i64>) -> bool {
+    let b = body.as_bytes();
+    let mut depth = 0i32;
+    let mut at = i;
+    while at > 0 {
+        at -= 1;
+        match b[at] {
+            b'}' => depth += 1,
+            b'{' if depth > 0 => depth -= 1,
+            b'{' => {
+                let head = body[..at].trim_end();
+                if let Some(h) = head.strip_suffix(')') {
+                    let mut d = 1;
+                    let open = h.char_indices().rev().find(|&(_, ch)| {
+                        d += match ch {
+                            ')' => 1,
+                            '(' => -1,
+                            _ => 0,
+                        };
+                        d == 0
+                    });
+                    if let Some((o, _)) = open {
+                        let cond = &h[o + 1..];
+                        if h[..o].trim_end().ends_with("if")
+                            && !cond.contains(" or ")
+                            && cond.split(" and ").any(|t| eval(t.trim(), env) == Some(0))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
 
 /// The values of `func`'s (module `m`'s) names at each call of it from what a task reaches, and
 /// whether its caller sends a row partial after it.
@@ -203,6 +271,7 @@ fn site_envs(
 ) -> Vec<(BTreeMap<String, i64>, bool)> {
     let (base, params) = (&c.modules[m].env, &c.modules[m].funcs[func].params);
     let mut out = Vec::new();
+    let mut ruled = false;
     for (at, caller) in reached {
         let body = &c.modules[*at].funcs[caller].body;
         for (i, _) in body.match_indices(&format!("{func}(")) {
@@ -217,6 +286,10 @@ fn site_envs(
             if c.resolve(*at, qual, func) != Some((m, func.to_string())) {
                 continue;
             }
+            if ruled_out(body, i, &c.modules[*at].env) {
+                ruled = true;
+                continue;
+            }
             let args = call_args(&body[i..]).unwrap_or_default();
             let mut env = base.clone();
             for (p, a) in params.iter().zip(&args) {
@@ -224,10 +297,10 @@ fn site_envs(
                     env.insert(p.clone(), v);
                 }
             }
-            out.push((env, body[i..].contains(SEND_ROW)));
+            out.push((env, sends_row(c, *at, &body[i..])));
         }
     }
-    if out.is_empty() {
+    if out.is_empty() && !ruled {
         out.push((base.clone(), false));
     }
     out
@@ -1159,6 +1232,8 @@ mod tests {
         assert_eq!(seats(1, 1), None);
         assert_eq!(seats(7, 8), None);
         assert!(seats(8, 8).is_some());
+        assert_eq!(seat_pool(1 << 16), None);
+        assert!(seat_pool((1 << 16) + 1).is_some());
     }
 
     #[test]

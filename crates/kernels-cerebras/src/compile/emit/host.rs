@@ -70,6 +70,13 @@ pub struct SeatsHost {
     /// program of fixed windows (`NE / m` entries a row each), no `sbase`.
     #[serde(default)]
     pub pool: u32,
+    /// The pool's KV rows (a window's first position their multiple); 0: the unit's rows.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rows: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A unit's CX column.
@@ -183,9 +190,19 @@ impl HostLayout {
             seats: (prog.plan.seats > 1).then(|| SeatsHost {
                 m: prog.plan.seats,
                 cy: f.units.iter().flat_map(cy_rects).collect(),
-                pool: p.kv_entries.per_row * p.rows,
+                pool: p.kv_entries.per_row * p.kv_rows,
+                rows: if p.kv_rows == p.rows { 0 } else { p.kv_rows },
             }),
         })
+    }
+
+    /// The rows a ring's windows start at a multiple of: its pool's KV rows (at least 1).
+    #[must_use]
+    pub fn pool_rows(&self) -> u32 {
+        match self.seats.as_ref().map_or(0, |s| s.rows) {
+            0 => self.rows.max(1),
+            r => r,
+        }
     }
 
     /// Every CX row's x offset in the hidden vector, `rows + 1` entries (the runs' dims summed).
