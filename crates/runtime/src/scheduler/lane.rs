@@ -939,8 +939,6 @@ pub(crate) fn turn_behind_after() {
 static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Every lane's control queue, to turn it once the runtime is ready
-/// ([`open_behind`]).
 std::thread_local! {
     /// Set on an engine lane's own thread as it starts.
     static ENGINE_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -957,6 +955,8 @@ pub(crate) fn on_engine_lane() -> bool {
     ENGINE_LANE.with(std::cell::Cell::get)
 }
 
+/// Every lane's control queue, to turn it once the runtime is ready
+/// ([`open_behind`]).
 static LANES: std::sync::Mutex<Vec<crate::rt::channel::Sender<LaneRequest>>> =
     std::sync::Mutex::new(Vec::new());
 
