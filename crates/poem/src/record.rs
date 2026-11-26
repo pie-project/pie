@@ -120,9 +120,10 @@ impl Recorder {
     /// Carries `value` under `key`, in place of what was: a value each layer
     /// adds to and the next reads.
     pub(crate) fn carry(&self, key: &str, value: &Value) {
-        self.once
-            .borrow_mut()
-            .insert(key.to_string(), (value.id, value.over.clone(), value.ty.clone()));
+        self.once.borrow_mut().insert(
+            key.to_string(),
+            (value.id, value.over.clone(), value.ty.clone()),
+        );
     }
 
     /// The platform this trace is recorded for.
@@ -352,7 +353,13 @@ impl Recorder {
 
     /// [`Recorder::output`], with how one entry's width factors
     /// ([`poem_ir::Output::planes`]).
-    pub fn output_in_planes(&self, name: &str, value: &Value, grid: Option<&Value>, planes: &[u32]) {
+    pub fn output_in_planes(
+        &self,
+        name: &str,
+        value: &Value,
+        grid: Option<&Value>,
+        planes: &[u32],
+    ) {
         self.inner.borrow_mut().outputs.push(Output {
             name: name.to_string(),
             value: value.id,

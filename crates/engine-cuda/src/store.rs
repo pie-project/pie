@@ -2,10 +2,10 @@
 pub mod chunks;
 mod host;
 pub use host::{Ring, RingSize};
+mod fit;
 pub mod kv;
 pub mod layout;
 pub mod rs;
-mod fit;
 pub use self::fit::*;
 mod weights;
 pub use self::weights::*;
@@ -464,23 +464,20 @@ impl Pools {
         own_rows_tokens: u32,
     ) -> Result<Pools> {
         let pool = PhysicalPool::open(device, ceiling)?;
-        let layout = lay(
-            trace,
-            &paging,
-            budgets,
-            chunk_bytes,
-            experts,
-            rows,
-        )?;
+        let layout = lay(trace, &paging, budgets, chunk_bytes, experts, rows)?;
         // The pages a fire's own rows take where its lane folds them past
         // what its ring holds (`OwnRows`): at the activation's top, above
         // every carve.
-        let own_pages = layout
-            .ring
-            .as_ref()
-            .map(|ring| &ring.ring)
-            .map(|ring| (2 * own_rows_tokens.div_ceil(ring.page_rows) + 1, ring.page_bytes));
-        let grain = layout.windows.first().map_or(1, |window| window.grain.max(1));
+        let own_pages = layout.ring.as_ref().map(|ring| &ring.ring).map(|ring| {
+            (
+                2 * own_rows_tokens.div_ceil(ring.page_rows) + 1,
+                ring.page_bytes,
+            )
+        });
+        let grain = layout
+            .windows
+            .first()
+            .map_or(1, |window| window.grain.max(1));
         let own_bytes = own_pages.map_or(0, |(pages, bytes)| u64::from(pages) * bytes + grain);
         let carved = activation;
         let activation = activation + own_bytes;
@@ -812,7 +809,10 @@ impl Pools {
     /// Own-row page `page`'s id, as a window-buffer page.
     pub fn own_page_id(&self, page: u32) -> Result<i32> {
         let own = self.own.ok_or_else(|| {
-            Fault::program("store::ring", "an own-row page of a load that keeps no ring")
+            Fault::program(
+                "store::ring",
+                "an own-row page of a load that keeps no ring",
+            )
         })?;
         if page >= own.pages {
             return Err(Fault::Ceiling {
@@ -852,7 +852,10 @@ impl Pools {
     /// Own-row page `page`'s address.
     pub fn own_page_at(&self, page: u32) -> Result<u64> {
         let own = self.own.ok_or_else(|| {
-            Fault::program("store::ring", "an own-row page of a load that keeps no ring")
+            Fault::program(
+                "store::ring",
+                "an own-row page of a load that keeps no ring",
+            )
         })?;
         Ok(self.activation_base() + own.start + u64::from(page) * own.page_bytes)
     }
@@ -879,8 +882,7 @@ impl Pools {
             let slot = *slots.get(piece as usize).ok_or_else(|| {
                 Fault::program("store::ring", "a ring page past its record's pieces")
             })?;
-            let offset = u64::try_from(self.chunks.page_id(Kind::Ring, slot)?)
-                .unwrap_or(0)
+            let offset = u64::try_from(self.chunks.page_id(Kind::Ring, slot)?).unwrap_or(0)
                 * fixed_grain
                 + ring_offset
                 + u64::from(within) * page_bytes;
@@ -1304,12 +1306,19 @@ impl Pools {
 
     /// The pieces a record takes, every shape's.
     fn record_pieces(&self) -> u32 {
-        self.record_shapes().iter().map(|&(_, pieces, _)| pieces).sum()
+        self.record_shapes()
+            .iter()
+            .map(|&(_, pieces, _)| pieces)
+            .sum()
     }
 
     /// The record's rings' pieces: the first of its pieces.
     fn ring_pieces(&self) -> u32 {
-        self.chunks.layout().ring.as_ref().map_or(0, |ring| ring.pieces)
+        self.chunks
+            .layout()
+            .ring
+            .as_ref()
+            .map_or(0, |ring| ring.pieces)
     }
 
     /// Piece `piece` of a record: its shape's kind and slot bytes.
@@ -1473,7 +1482,9 @@ impl Pools {
         }
         // A record of rings and state is named by its rings' first piece;
         // its state's first names it too.
-        if let Some(&state) = pieces.get(self.ring_pieces() as usize).filter(|_| self.ring_pieces() > 0)
+        if let Some(&state) = pieces
+            .get(self.ring_pieces() as usize)
+            .filter(|_| self.ring_pieces() > 0)
         {
             self.record_names.insert(state, key);
         }
@@ -1502,7 +1513,10 @@ impl Pools {
         slots.clear();
         let pieces = self.record_pieces();
         if pieces == 0 {
-            return Err(Fault::program("store::state", "a record named and no fixed shape"));
+            return Err(Fault::program(
+                "store::state",
+                "a record named and no fixed shape",
+            ));
         }
         if !self.chunks.by_refs() {
             for (_, n, _) in self.record_shapes() {
@@ -1632,8 +1646,9 @@ impl Pools {
             let mut column = 0usize;
             for table in &fixed.tables {
                 for (piece, &slot) in table.iter().enumerate() {
-                    out[column * block + lane * table.len() + piece] =
-                        self.chunks.page_id(Kind::Fixed, record[rings + slot as usize])?;
+                    out[column * block + lane * table.len() + piece] = self
+                        .chunks
+                        .page_id(Kind::Fixed, record[rings + slot as usize])?;
                 }
                 column += table.len();
             }
@@ -1710,7 +1725,8 @@ impl Pools {
             .map(|(piece, offset, bytes)| {
                 let (kind, _) = self.piece_kind(piece as usize)?;
                 Ok((
-                    self.chunks.span(kind, record[piece as usize], offset, bytes)?,
+                    self.chunks
+                        .span(kind, record[piece as usize], offset, bytes)?,
                     bytes,
                 ))
             })
@@ -2374,9 +2390,9 @@ fn lay(
     // layer's last folded rows a ring in the lane's record, its unfolded
     // rows in the window buffer.
     let recipe = poem_compiler::chunk::plan_windowed(&view, budgets, &profile, &CudaRings)
-    .map_err(|why| Fault::Unbound {
-        what: format!("a chunk recipe for this load's cache rows: {why}"),
-    })?;
+        .map_err(|why| Fault::Unbound {
+            what: format!("a chunk recipe for this load's cache rows: {why}"),
+        })?;
     let banks: Vec<(usize, u64, u64)> = if experts.is_empty() {
         Vec::new()
     } else {
@@ -2432,7 +2448,11 @@ fn chunks_at(layout: &layout::Layout, paging: &Paging, pages: u64, slots: u32) -
         )
         + layout.chunks_for(
             Kind::Ring,
-            u64::from(slots) * layout.ring.as_ref().map_or(0, |ring| u64::from(ring.pieces)),
+            u64::from(slots)
+                * layout
+                    .ring
+                    .as_ref()
+                    .map_or(0, |ring| u64::from(ring.pieces)),
         );
     u32::try_from(chunks).unwrap_or(u32::MAX)
 }

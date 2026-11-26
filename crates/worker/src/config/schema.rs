@@ -17,10 +17,7 @@ pub struct Field {
 
 /// The tuning keys: each default measured, and part of what the runtime was
 /// tuned against.
-const TUNING: &[&str] = &[
-    "runtime.frame_size",
-    "runtime.frame_dispatch_depth",
-];
+const TUNING: &[&str] = &["runtime.frame_size", "runtime.frame_dispatch_depth"];
 
 struct Parsed {
     name: String,

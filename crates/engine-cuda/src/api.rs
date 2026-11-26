@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use checkpoint::contract::ModelContract;
-use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers, WeightCache};
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
@@ -16,6 +15,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
+use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers, WeightCache};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -722,9 +722,11 @@ impl Engine for Cuda {
         let frames = engine::runahead::Runahead::of(frames_in_flight).frames_in_flight;
         let ring = match host_tier {
             engine::HostTier::Absent => None,
-            engine::HostTier::Seated(stated) => crate::store::staging_ring_for(stated, ranks, frames)
-                .and_then(|size| size.map(crate::store::Ring::pin).transpose())
-                .map_err(fault)?,
+            engine::HostTier::Seated(stated) => {
+                crate::store::staging_ring_for(stated, ranks, frames)
+                    .and_then(|size| size.map(crate::store::Ring::pin).transpose())
+                    .map_err(fault)?
+            }
         };
         if let Some(ring) = &ring {
             let size = ring.size();
@@ -914,10 +916,8 @@ impl Engine for Cuda {
         // The set as the load states it, from its stated facts, with those
         // the arm walk left eager. It is the set the walk
         // took: a fire's stamped shape names the walk's shape.
-        let stated = engine::StepShapes::of(
-            &steps,
-            &engine::StepFacts::stated(&caps, &readout_facts()),
-        );
+        let stated =
+            engine::StepShapes::of(&steps, &engine::StepFacts::stated(&caps, &readout_facts()));
         if let Some(apart) = stated.apart(shell.steps()) {
             return Err(Error::Load(format!(
                 "the load states the step set {} and its arm walk took {}: a fire's stated \
@@ -938,7 +938,9 @@ impl Engine for Cuda {
         // decode wave seats at most `max_lanes` lanes.
         tracing::info!(
             "fire limits: {} lanes, {} rows, {} readouts",
-            caps.limits.max_lanes, caps.limits.max_tokens, caps.limits.max_readouts,
+            caps.limits.max_lanes,
+            caps.limits.max_tokens,
+            caps.limits.max_readouts,
         );
         self.replay = crate::replay::Replay::of(&shell);
         if let Some(sink) = &self.tap_sink {
@@ -1079,10 +1081,7 @@ impl Completion for Cuda {
 }
 
 impl Programs for Cuda {
-    fn adapter(
-        &mut self,
-        registration: &engine::adapter::AdapterRegistration,
-    ) -> EngineResult<()> {
+    fn adapter(&mut self, registration: &engine::adapter::AdapterRegistration) -> EngineResult<()> {
         let planes: Vec<crate::AdapterPlane<'_>> = registration
             .planes
             .iter()
@@ -1331,10 +1330,7 @@ impl Channels for Cuda {
         }))
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         if self.channels.contains_key(&registration.id) {
             return Err(Error::Program(format!(
                 "channel {} is already registered on this engine",
@@ -1395,23 +1391,14 @@ impl Channels for Cuda {
         Ok(())
     }
 
-    fn publish(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         let stream = self.loaded_mut()?.stream();
         self.instance(instance)?
             .publish(channel, cell, stream)
             .map_err(fault)
     }
 
-    fn take(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.instance(instance)?.take(channel).map_err(fault)
     }
 }
@@ -1461,10 +1448,7 @@ impl Pool for Cuda {
 }
 
 impl WeightCache for Cuda {
-    fn set_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<u64> {
         self.loaded_mut()?
             .weight_residency(residency)
             .map_err(fault)
@@ -1478,7 +1462,6 @@ impl WeightCache for Cuda {
         // A reload lays the new weights as a load does.
         crate::device::alloc::as_load(|| self.reload_weights(reload))
     }
-
 }
 
 impl Tiers for Cuda {
@@ -1498,11 +1481,7 @@ impl Tiers for Cuda {
     /// stream) or a host write (behind every move still landing) reaches
     /// only after it; the slot file's moves read inside the call; a move
     /// within the device runs on the main stream, ahead of everything after.
-    fn copy_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
         let host = |domain| matches!(domain, MemoryDomain::HostPinned);
         let device = |domain| {
             matches!(
@@ -1519,8 +1498,7 @@ impl Tiers for Cuda {
         // enqueues it.
         let host_disk = (host(copy.src) && disk(copy.dst)) || (disk(copy.src) && host(copy.dst));
         if host_disk && let Some(sink) = self.landed.clone() {
-            let told: crate::serve::landing::Told =
-                Box::new(move |landing| sink(token, landing));
+            let told: crate::serve::landing::Told = Box::new(move |landing| sink(token, landing));
             self.loaded_mut()?.defer_disk_tell(Some(told));
             let copied = Tiers::copy(self, copy);
             // Not taken (nothing to move, or refused before enqueueing):
@@ -1627,10 +1605,7 @@ impl Tiers for Cuda {
             .map_err(fault)
     }
 
-    fn read(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
     }
 
@@ -1818,9 +1793,9 @@ impl Cuda {
                 self.fire_step(step, at, true).map_err(|error| match error {
                     // Its head's encoder rows ran: the step is not untouched,
                     // so its lanes' refusal refuses the frame.
-                    Error::Lanes(_) if headed => Error::Invalid(format!(
-                        "{error}, after the step's encoder-only head fired"
-                    )),
+                    Error::Lanes(_) if headed => {
+                        Error::Invalid(format!("{error}, after the step's encoder-only head fired"))
+                    }
                     other => other,
                 })
             });
@@ -1884,15 +1859,18 @@ impl Cuda {
                 continue;
             }
             words[at] = shell.adapted_word(words[at]).ok_or_else(|| {
-                Error::lane(u32::try_from(at).unwrap_or(u32::MAX), format!(
-                    "lane {at} is attached to an instance that bound an adapter, and \
+                Error::lane(
+                    u32::try_from(at).unwrap_or(u32::MAX),
+                    format!(
+                        "lane {at} is attached to an instance that bound an adapter, and \
                      this load's model text has no corrected class for its fact word \
                      {:#x}: the text declares no `linear.lora_correct` arm, or the arm's \
                      window is not decided by one fact. A lane that asked for a \
                      correction and got the base model is the one wrong answer this \
                      axis refuses to give",
-                    words[at]
-                ))
+                        words[at]
+                    ),
+                )
             })?;
         }
         // A lane that names slot refs (`Lane::tables`, `Lane::fixed`) is the
@@ -1941,8 +1919,12 @@ impl Cuda {
                 // A record's pieces: its rings' first, then its state's,
                 // named as one record by its first.
                 stated
-                    if stated.iter().all(|(shape, _)| *shape == FIXED || *shape == RING)
-                        && stated.windows(2).all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
+                    if stated
+                        .iter()
+                        .all(|(shape, _)| *shape == FIXED || *shape == RING)
+                        && stated
+                            .windows(2)
+                            .all(|pair| pair[0].0 == RING && pair[1].0 == FIXED) =>
                 {
                     let pieces: Vec<[u32; 2]> = stated
                         .iter()

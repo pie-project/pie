@@ -51,7 +51,9 @@ const SERIAL: &str = "if (threadIdx.x == 0u) ptir_scatter_updates(";
 
 /// Every region of `subject(dtype)` as the CUDA and HIP emitters emit it.
 fn emitted(dtype: Dtype) -> String {
-    let bound = Served::of(16).bind(subject(dtype)).expect("the subject binds");
+    let bound = Served::of(16)
+        .bind(subject(dtype))
+        .expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let mut source = String::new();

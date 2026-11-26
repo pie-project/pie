@@ -74,6 +74,12 @@ mod tests {
         let after = counts();
         assert_eq!(after.built, before.built + 1);
         assert_eq!(after.refused, before.refused);
-        assert_eq!(there, Counts { built: 0, refused: 1 });
+        assert_eq!(
+            there,
+            Counts {
+                built: 0,
+                refused: 1
+            }
+        );
     }
 }

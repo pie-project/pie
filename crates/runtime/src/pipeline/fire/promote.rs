@@ -379,8 +379,7 @@ impl Drop for PromoteGuard {
         let engine = self.engine;
         crate::rt::spawn(async move {
             let settled = crate::scheduler::settle_copies(engine);
-            if let Err(error) =
-                crate::scheduler::abort_once_landed(in_flight, settled, abort).await
+            if let Err(error) = crate::scheduler::abort_once_landed(in_flight, settled, abort).await
             {
                 tracing::error!(
                     engine,
@@ -467,7 +466,10 @@ mod tests {
     #[test]
     fn a_pass_inside_a_page_ends_none_and_one_ending_a_page_is_keyed() {
         assert!(ends_no_page(33, 1, 16), "mid-page decode");
-        assert!(ends_no_page(17, 14, 16), "up to the page's last row but one");
+        assert!(
+            ends_no_page(17, 14, 16),
+            "up to the page's last row but one"
+        );
         assert!(!ends_no_page(47, 1, 16), "ends its page");
         assert!(!ends_no_page(32, 1, 16), "starts on a page");
         assert!(!ends_no_page(0, 300, 16), "a prefill");
@@ -479,7 +481,10 @@ mod tests {
     #[test]
     fn a_pass_that_maps_nothing_and_keeps_no_state_reads_no_keys() {
         assert!(!takes_supply(Attach::No, false));
-        assert!(takes_supply(Attach::No, true), "its checkpoints are named by them");
+        assert!(
+            takes_supply(Attach::No, true),
+            "its checkpoints are named by them"
+        );
         assert!(takes_supply(Attach::Kv, false));
     }
 }

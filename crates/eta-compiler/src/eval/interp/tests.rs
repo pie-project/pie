@@ -245,7 +245,9 @@ fn numeric_contract_argmax_and_topk() {
 fn gumbel_argmax_is_the_draw_it_fuses() {
     use eta_ir::types::Shape;
     let n = 997usize;
-    let x: Vec<f32> = (0..n).map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 9.0).collect();
+    let x: Vec<f32> = (0..n)
+        .map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 9.0)
+        .collect();
     let keep: Vec<bool> = (0..n).map(|i| i % 5 != 3).collect();
     for seed in 0..40u32 {
         let vals = vec![
@@ -293,7 +295,11 @@ fn gumbel_argmax_is_the_draw_it_fuses() {
         };
         let perturbed: Vec<f32> = (0..n)
             .map(|i| {
-                let scaled = if keep[i] { x[i] * (1.0 / 0.7) } else { f32::NEG_INFINITY };
+                let scaled = if keep[i] {
+                    x[i] * (1.0 / 0.7)
+                } else {
+                    f32::NEG_INFINITY
+                };
                 scaled + noise[i]
             })
             .collect();
@@ -340,5 +346,8 @@ fn a_bf16_draw_splits_a_tie_evenly() {
         second += i[0] as u32;
     }
     let share = f64::from(second) / f64::from(trials);
-    assert!((share - 0.5).abs() < 0.03, "token 1 drawn {share:.3} of the time");
+    assert!(
+        (share - 0.5).abs() < 0.03,
+        "token 1 drawn {share:.3} of the time"
+    );
 }

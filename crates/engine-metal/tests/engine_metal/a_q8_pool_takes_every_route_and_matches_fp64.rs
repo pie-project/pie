@@ -1,9 +1,9 @@
 #![cfg(target_vendor = "apple")]
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{DecodePlan, KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
-use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
@@ -173,7 +173,14 @@ fn routes(q8: bool) {
                 .map(|i| if mode == 3 { 0 } else { u8::from(i % 7 != 0) })
                 .collect();
             let mb = upload(&mask);
-            let eb = upload(&mask_words(&vec![u32::from(if mode == 3 { 1 } else { mode }); m]));
+            let eb = upload(&mask_words(&vec![
+                u32::from(if mode == 3 {
+                    1
+                } else {
+                    mode
+                });
+                m
+            ]));
             let plan = DecodePlan {
                 positions: tensor(&po, m, 1, Dtype::I32),
                 request_of_token: tensor(&ow, m, 1, Dtype::I32),

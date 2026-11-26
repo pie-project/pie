@@ -22,10 +22,10 @@ mod route;
 mod select;
 
 pub use grouped::*;
-#[cfg(feature = "rocm")]
-use lt::*;
 #[cfg(all(feature = "rocm", feature = "test-support"))]
 pub use lt::lt_grouped_fires;
+#[cfg(feature = "rocm")]
+use lt::*;
 pub use mlp::*;
 pub use mx::*;
 pub use route::*;

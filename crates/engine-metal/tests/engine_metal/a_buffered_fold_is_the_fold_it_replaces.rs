@@ -69,7 +69,10 @@ fn word(query_len: u32) -> u64 {
 
 /// States `shell`'s model for the helpers below.
 fn serving(shell: Shell, trace: poem::Trace) -> Shell {
-    assert!(shell.state_slot_bytes() > 0, "a recurrent plan has recurrent state");
+    assert!(
+        shell.state_slot_bytes() > 0,
+        "a recurrent plan has recurrent state"
+    );
     assert!(
         shell.buffer_bytes() > 0,
         "the plan reserved no buffered page slab, so nothing below can be true"
@@ -103,7 +106,11 @@ fn ready() -> Option<Shell> {
 }
 
 /// A shell of `trace` over `checkpoint`: eight seats of 128 tokens.
-fn load(trace: poem::Trace, contract: &checkpoint::contract::ModelContract, checkpoint: &std::path::Path) -> Shell {
+fn load(
+    trace: poem::Trace,
+    contract: &checkpoint::contract::ModelContract,
+    checkpoint: &std::path::Path,
+) -> Shell {
     Shell::load(Boot {
         kv_budget: crate::full_pool(&trace, PAGE, 128, 8),
         voxels: None,
@@ -208,7 +215,6 @@ fn spread(a: &[f32], b: &[f32]) -> f32 {
 
 const LOGIT_FLOOR: f32 = 0.05;
 
-
 /// Each state plane `(name, bytes, dtype)` the record lays end to end.
 type Planes = Vec<(String, u64, poem_ir::Dtype)>;
 
@@ -218,9 +224,9 @@ fn planes_of(shell: &Shell) -> Planes {
         .into_iter()
         .map(|(cache, bytes, dtype)| {
             let name = match shell.trace().caches.get(cache as usize) {
-                Some(poem_ir::CacheRow::State { name, .. } | poem_ir::CacheRow::Kv { name, .. }) => {
-                    name.clone()
-                }
+                Some(
+                    poem_ir::CacheRow::State { name, .. } | poem_ir::CacheRow::Kv { name, .. },
+                ) => name.clone(),
                 None => format!("cache {cache}"),
             };
             (name, bytes, dtype)
@@ -255,7 +261,8 @@ fn tell_planes(got: &[u8], want: &[u8], planes: &Planes) {
             let m = v.abs().max(f32::MIN_POSITIVE);
             match dtype {
                 poem_ir::Dtype::Bf16 => {
-                    f32::from_bits(((m.to_bits() >> 16) + 1) << 16) - f32::from_bits((m.to_bits() >> 16) << 16)
+                    f32::from_bits(((m.to_bits() >> 16) + 1) << 16)
+                        - f32::from_bits((m.to_bits() >> 16) << 16)
                 }
                 _ => f32::from_bits(m.to_bits() + 1) - m,
             }
@@ -309,7 +316,11 @@ fn floats(bytes: &[u8], dtype: poem_ir::Dtype) -> Option<Vec<f64>> {
         poem_ir::Dtype::Bf16 => Some(
             bytes
                 .chunks_exact(2)
-                .map(|c| f64::from(f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16)))
+                .map(|c| {
+                    f64::from(f32::from_bits(
+                        u32::from(u16::from_le_bytes([c[0], c[1]])) << 16,
+                    ))
+                })
                 .collect(),
         ),
         _ => None,
@@ -328,7 +339,11 @@ fn distance(a: &[u8], b: &[u8], planes: &Planes, exact: bool) -> Result<f64, Str
         let (x, y) = (&a[at..at + len], &b[at..at + len]);
         match (floats(x, *dtype), floats(y, *dtype)) {
             (Some(x), Some(y)) => {
-                sum += x.iter().zip(&y).map(|(p, q)| (p - q) * (p - q)).sum::<f64>();
+                sum += x
+                    .iter()
+                    .zip(&y)
+                    .map(|(p, q)| (p - q) * (p - q))
+                    .sum::<f64>();
             }
             _ if exact && x != y => {
                 return Err(format!("integer plane {name} ({dtype:?}) differs"));
@@ -356,7 +371,10 @@ fn assert_same_state(got: &[u8], want: &[u8], what: &str, planes: &Planes, scale
             panic!("{what}: {why}");
         }
     };
-    eprintln!("state {d:e} from the fold, against {scale:e} between two folds ({:.1e} of it)", d / scale);
+    eprintln!(
+        "state {d:e} from the fold, against {scale:e} between two folds ({:.1e} of it)",
+        d / scale
+    );
     if d >= scale / 10.0 {
         tell_planes(got, want, planes);
         panic!(
@@ -432,7 +450,10 @@ fn replays_beside_a_fold(mut shell: Shell) {
             };
             answers.push(out);
         }
-        (answers, shell.state_bytes(slot).expect("the slot reads back"))
+        (
+            answers,
+            shell.state_bytes(slot).expect("the slot reads back"),
+        )
     };
     let (alone, alone_state) = run(&mut shell, 0, None);
     let (beside, beside_state) = run(&mut shell, 1, Some(2));
@@ -660,7 +681,13 @@ fn holds_the_contract(mut shell: Shell) {
             .fire_seated(&[seated(7, &prefix, &fold, RsReset::Fresh)])
             .expect("the prefix folds");
         shell
-            .fire_seated(&[seated_at(7, &[junk], &fold, RsReset::Held, prefix.len() as u32)])
+            .fire_seated(&[seated_at(
+                7,
+                &[junk],
+                &fold,
+                RsReset::Held,
+                prefix.len() as u32,
+            )])
             .expect("junk folds alone");
         shell.open(3).expect("slot 3 reopens");
         shell
@@ -672,7 +699,13 @@ fn holds_the_contract(mut shell: Shell) {
             )])
             .expect("the shorter prefix folds");
         shell
-            .fire_seated(&[seated_at(3, &rows, &fold, RsReset::Held, prefix.len() as u32 - 1)])
+            .fire_seated(&[seated_at(
+                3,
+                &rows,
+                &fold,
+                RsReset::Held,
+                prefix.len() as u32 - 1,
+            )])
             .expect("[s_r, junk] folds");
         if r > 0 {
             shell

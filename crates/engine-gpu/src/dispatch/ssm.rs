@@ -105,7 +105,10 @@ impl<B: Backend> Run<'_, B> {
             Some(poem_ir::Def::Cache(row)) => Ok(*row),
             _ => Err(kernels_slang::Error::Backend {
                 op,
-                detail: format!("value {} is read as a recurrent state and is no cache row", id.0),
+                detail: format!(
+                    "value {} is read as a recurrent state and is no cache row",
+                    id.0
+                ),
             }),
         }
     }
@@ -136,7 +139,12 @@ impl<B: Backend> Run<'_, B> {
                 }
         };
         if pool.pool.words != seat.pool.words
-            || !pool.pool.bufs.iter().zip(&seat.pool.bufs).all(|(&a, &b)| same(a, b))
+            || !pool
+                .pool
+                .bufs
+                .iter()
+                .zip(&seat.pool.bufs)
+                .all(|(&a, &b)| same(a, b))
         {
             return Err(kernels_slang::Error::Backend {
                 op,

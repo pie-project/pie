@@ -361,7 +361,6 @@ pub struct Inputs<B: Backend> {
     outgrown: Vec<B::Buffer>,
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct GroupMaskHandles {
     pub q: poem_ir::Selection,
@@ -435,11 +434,7 @@ impl Laid {
         let context = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
         // A row's columns run from its lane's boundary to its own key, at
         // most the context; the plane is one binding, its offsets u32.
-        let mask_plane_bytes = (rows * context)
-            .min(binding)
-            .min(u64::from(u32::MAX))
-            / 4
-            * 4;
+        let mask_plane_bytes = (rows * context).min(binding).min(u64::from(u32::MAX)) / 4 * 4;
         let mask_planes = take(mask_plane_bytes.max(4));
 
         let mask_words = take(rows * 8);
@@ -775,7 +770,8 @@ impl<B: Backend> Inputs<B> {
 
     #[must_use]
     pub fn seat(&self, id: u32) -> Option<(&B::Buffer, u64)> {
-        self.laid.seats
+        self.laid
+            .seats
             .iter()
             .find(|at| at.seat.id == id)
             .map(|at| (&self.store, at.at))
@@ -812,8 +808,10 @@ impl<B: Backend> Inputs<B> {
         valid.resize(valid.len().next_multiple_of(4), 0);
 
         self.store.write(self.laid.tokens, bytes_of(fire.tokens))?;
-        self.store.write(self.laid.positions, bytes_of(fire.positions))?;
-        self.store.write(self.laid.rotations, bytes_of(fire.rotations))?;
+        self.store
+            .write(self.laid.positions, bytes_of(fire.positions))?;
+        self.store
+            .write(self.laid.rotations, bytes_of(fire.rotations))?;
         if fire.readout_rows.len() > rows as usize {
             return Err(Fault::Ceiling {
                 what: "readout rows in one fire",
@@ -830,9 +828,11 @@ impl<B: Backend> Inputs<B> {
                 have: self.laid.window_ints,
             });
         }
-        self.store.write(self.laid.windows, bytes_of(fire.windows))?;
+        self.store
+            .write(self.laid.windows, bytes_of(fire.windows))?;
         self.store.write(self.laid.row_valid, &valid)?;
-        self.store.write(self.laid.slot_ids, bytes_of(fire.slot_ids))?;
+        self.store
+            .write(self.laid.slot_ids, bytes_of(fire.slot_ids))?;
         self.store
             .write(self.laid.request_of_token, bytes_of(fire.request_of_token))?;
         self.store
@@ -866,14 +866,18 @@ impl<B: Backend> Inputs<B> {
         let ring_jobs = match self.laid.ring {
             Some((lanes_at, jobs_at, most, rings)) => {
                 let layer_ints = rings as usize * kernels_slang::attn::ring::LAYER_INTS as usize;
-                if fire.ring_lanes.len() > (crate::ring::LANE_INTS as u32 + self.laid.pieces) as usize * lanes as usize
+                if fire.ring_lanes.len()
+                    > (crate::ring::LANE_INTS as u32 + self.laid.pieces) as usize * lanes as usize
                     || fire.ring_jobs.len() > 1 + 4 * most as usize
                     || fire.ring_layers.len() != layer_ints
                 {
                     return Err(Fault::Ceiling {
                         what: "ints of a fire's windowed lane and fold tables",
-                        need: (fire.ring_lanes.len() + fire.ring_jobs.len() + fire.ring_layers.len()) as u64,
-                        have: u64::from(crate::ring::LANE_INTS as u32 + self.laid.pieces) * u64::from(lanes)
+                        need: (fire.ring_lanes.len()
+                            + fire.ring_jobs.len()
+                            + fire.ring_layers.len()) as u64,
+                        have: u64::from(crate::ring::LANE_INTS as u32 + self.laid.pieces)
+                            * u64::from(lanes)
                             + layer_ints as u64
                             + 1
                             + 4 * u64::from(most),
@@ -887,7 +891,8 @@ impl<B: Backend> Inputs<B> {
                     fire.ring_jobs
                 };
                 self.store.write(jobs_at, bytes_of(fire.ring_layers))?;
-                self.store.write(jobs_at + 4 * layer_ints as u64, bytes_of(jobs))?;
+                self.store
+                    .write(jobs_at + 4 * layer_ints as u64, bytes_of(jobs))?;
                 let room = self.laid.room(jobs_at)?;
                 Some((
                     i32s(
@@ -995,7 +1000,8 @@ impl<B: Backend> Inputs<B> {
         let adapter_routes = match fire.adapter_routes {
             None => None,
             Some(routes) => {
-                self.store.write(self.laid.adapter_routes, bytes_of(routes))?;
+                self.store
+                    .write(self.laid.adapter_routes, bytes_of(routes))?;
                 Some(routes.len() as u32)
             }
         };
@@ -1028,7 +1034,8 @@ impl<B: Backend> Inputs<B> {
                     self.store
                         .write(self.laid.mask_planes + body.len() as u64, &word)?;
                 }
-                self.store.write(self.laid.mask_words, words_of(&staged.words))?;
+                self.store
+                    .write(self.laid.mask_words, words_of(&staged.words))?;
                 self.laid.words_none = 0;
             }
         }

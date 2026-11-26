@@ -1,11 +1,11 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
-use crate::common::{bf16, noise};
 
 /// The device, where it is an Apple10 GPU: the staged tile fills its
 /// operands in that family's register layout and runs nowhere else.

@@ -275,7 +275,6 @@ pub struct Gpu<B: Host> {
     /// What the work behind serving was last said to be doing
     /// ([`Gpu::behind_state`]).
     said_behind: Option<&'static str>,
-
 }
 
 impl<B: Host> Gpu<B> {
@@ -439,7 +438,6 @@ impl<B: Host> Gpu<B> {
             warned_in_fire: false,
             vocab: None,
             said_behind: None,
-
         }
     }
 
@@ -1160,7 +1158,11 @@ where
                 // A fire's staged rs table holds as many carried tokens as
                 // its widest bucket's rows, every lane's summed, a decode
                 // lane's included (`inputs::rs_carry_ints`).
-                replayed_rows: if shell.pools().rs_rows().is_some() { max_tokens } else { 0 },
+                replayed_rows: if shell.pools().rs_rows().is_some() {
+                    max_tokens
+                } else {
+                    0
+                },
                 dispatch_depth: 0,
             },
             has_lora: true,
@@ -1248,7 +1250,9 @@ where
                 "the load's bodies armed before ready, on every arm, smallest first"
             );
         }
-        if let Some(why) = <B as crate::serve::Serve>::records_none(&shell.shelf).filter(|_| B::RECORDS) {
+        if let Some(why) =
+            <B as crate::serve::Serve>::records_none(&shell.shelf).filter(|_| B::RECORDS)
+        {
             tracing::info!(
                 engine = B::KIND,
                 "{why}: every fire runs eager, stated at load, and none is recorded"
@@ -1756,10 +1760,7 @@ where
             .map_err(refusal)
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         let place = self.shell.as_ref().map(place);
         self.programs
             .register_channel(registration, place.as_ref())
@@ -1770,22 +1771,13 @@ where
         self.programs.close_channel(id).map_err(refusal)
     }
 
-    fn publish(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.programs
             .publish(instance, channel, cell)
             .map_err(refusal)
     }
 
-    fn take(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.programs.take(instance, channel).map_err(refusal)
     }
 }
@@ -1836,10 +1828,7 @@ impl<B: Host> engine::WeightCache for Gpu<B>
 where
     Gpu<B>: Send,
 {
-    fn set_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<u64> {
         // This engine holds back none of the chunks it states
         // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
         self.loaded_mut()?
@@ -1870,15 +1859,10 @@ where
     /// be written by anything; told landed from its frame's fence. Every
     /// other copy's sources may go back at once (`Shell::copy_slots_landing`
     /// states why for each kind).
-    fn copy_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
-        let landed = self
-            .landed
-            .clone()
-            .map(|sink| -> Box<dyn FnOnce() + Send> { Box::new(move || sink(token, engine::Landing::Landed)) });
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
+        let landed = self.landed.clone().map(|sink| -> Box<dyn FnOnce() + Send> {
+            Box::new(move || sink(token, engine::Landing::Landed))
+        });
         let copied = self
             .loaded_mut()?
             .copy_slots_landing(copy, landed)
@@ -1897,10 +1881,7 @@ where
         copied
     }
 
-    fn read(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         let read = self.loaded_mut()?.read_tier_slots(slots).map_err(fault);
         self.count_drained();
         read
@@ -2265,9 +2246,9 @@ impl<B: Host> Gpu<B> {
                                 lanes: lanes.clone().map(|at| at as usize).collect(),
                                 reserve: first.reserve.clone(),
                                 folded: first.kv.folded,
-                                appended: self
-                                    .loaded()
-                                    .map_or((u32::MAX, Vec::new()), |shell| shell.beam_appended(attachment.instance)),
+                                appended: self.loaded().map_or((u32::MAX, Vec::new()), |shell| {
+                                    shell.beam_appended(attachment.instance)
+                                }),
                             });
                             None
                         }
@@ -2413,8 +2394,13 @@ impl<B: Host> Gpu<B> {
             // ([`crate::program::device_lanes`], each row in
             // `KvDelta::writable`), or refused already and sunk; any other
             // would land rows in pages not its own.
-            let placed = device[at].as_ref().is_some_and(|placed| placed.have.is_some());
-            let refused = faulted.faulted.iter().any(|fault| fault.lane as usize == at);
+            let placed = device[at]
+                .as_ref()
+                .is_some_and(|placed| placed.have.is_some());
+            let refused = faulted
+                .faulted
+                .iter()
+                .any(|fault| fault.lane as usize == at);
             if lane.list == engine::fire::ListKind::Translation && !placed && !refused {
                 return Err(Error::lane(
                     u32::try_from(at).unwrap_or(u32::MAX),
@@ -2494,7 +2480,10 @@ impl<B: Host> Gpu<B> {
             .enumerate()
             .map(|(at, lane)| {
                 lane.list == engine::fire::ListKind::Translation
-                    && faulted.faulted.iter().any(|fault| fault.lane as usize == at)
+                    && faulted
+                        .faulted
+                        .iter()
+                        .any(|fault| fault.lane as usize == at)
             })
             .collect();
         let seated: Vec<Seated<'_, B>> = submission
@@ -2529,7 +2518,9 @@ impl<B: Host> Gpu<B> {
                     .as_ref()
                     .and_then(|placed| placed.positions.as_deref())
                     .unwrap_or(&lane.positions),
-                slots: device[at].as_ref().and_then(|placed| placed.slots.as_deref()),
+                slots: device[at]
+                    .as_ref()
+                    .and_then(|placed| placed.slots.as_deref()),
 
                 readout: match &lane.readout {
                     Readout::Rows(rows) => Some(rows.as_slice()),
@@ -2623,7 +2614,8 @@ impl<B: Host> Gpu<B> {
             wrote = std::mem::take(&mut prepared.wrote);
             // A lane fed its token on the device is checked once the
             // forward landed, from what the forward embedded.
-            if !prepared.beam_faults.is_empty() || (vocab.is_some() && !prepared.fed_lanes.is_empty())
+            if !prepared.beam_faults.is_empty()
+                || (vocab.is_some() && !prepared.fed_lanes.is_empty())
             {
                 let vocab = vocab.unwrap_or(u32::MAX);
                 let lanes = prepared
@@ -2711,13 +2703,10 @@ impl<B: Host> Gpu<B> {
                 .programs
                 .descriptor_ports(attachment.instance)
                 .and_then(|ports| match ports {
-                    Some(mut ports) => crate::program::device_lanes(
-                        &mut ports,
-                        stated,
-                        first,
-                        attachment.instance,
-                    )
-                    .map(Some),
+                    Some(mut ports) => {
+                        crate::program::device_lanes(&mut ports, stated, first, attachment.instance)
+                            .map(Some)
+                    }
                     None => Ok(None),
                 });
             match resolved {

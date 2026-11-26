@@ -1013,7 +1013,12 @@ fn dispatch_dense(
                 num_heads,
                 page_size: layer.page_size,
                 ratio: 1,
-                splits: latent::splits(ctx.multiprocessors(op)?, o.rows, num_heads, i64::from(window)),
+                splits: latent::splits(
+                    ctx.multiprocessors(op)?,
+                    o.rows,
+                    num_heads,
+                    i64::from(window),
+                ),
                 causal: i32::from(causal),
                 scale_log2: layer.scale_log2(sm_scale),
                 window,

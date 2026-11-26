@@ -29,23 +29,23 @@ fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> boo
         })
 }
 
+mod beam;
 pub mod context;
+mod cuts;
+mod device;
+mod finalize;
 pub mod float;
 pub mod geometry;
 pub mod host_geometry;
 pub mod kv;
-pub mod rs;
-pub mod shadow;
-mod beam;
-mod cuts;
-mod device;
-mod finalize;
 mod lanes;
 mod promote;
 mod reserve;
 mod retract;
 mod rows;
+pub mod rs;
 mod rung;
+pub mod shadow;
 mod submit;
 
 pub(crate) use beam::*;
@@ -203,7 +203,8 @@ fn settled_off_lane(settle: impl FnOnce() + Send + 'static) {
     if !crate::scheduler::lane::on_engine_lane() {
         return settle();
     }
-    if let Err(std::sync::mpsc::SendError(settle)) = SETTLER.lock().unwrap().send(Box::new(settle)) {
+    if let Err(std::sync::mpsc::SendError(settle)) = SETTLER.lock().unwrap().send(Box::new(settle))
+    {
         settle();
     }
 }
@@ -259,7 +260,8 @@ impl Drop for KvTxnGuard {
         let (model, engine) = (self.model, self.engine);
         match self.submitted.take() {
             Some(completion) => {
-                completion.on_settled(move || settled_off_lane(move || Self::settle(model, engine, txn)));
+                completion
+                    .on_settled(move || settled_off_lane(move || Self::settle(model, engine, txn)));
             }
             None => Self::settle(model, engine, txn),
         }
@@ -515,7 +517,10 @@ fn host_rs_plan(
         let beam_end = beam_ends.and_then(|ends| ends.get(at).copied());
         // A beam group folds the rows every live beam shares into its set
         // once (§11.3): to its common slot, never past the rows it has.
-        let fold = match (beam_end, beam_commons.and_then(|commons| commons.get(at).copied())) {
+        let fold = match (
+            beam_end,
+            beam_commons.and_then(|commons| commons.get(at).copied()),
+        ) {
             (Some(_), Some(common)) if common > frozen => {
                 rs::GroupFold::Host(common.min(end).saturating_sub(frozen))
             }
@@ -1005,7 +1010,12 @@ pub(crate) fn record_beam_common(commons: Vec<(::engine::InstanceId, u32)>) {
 
 /// The largest common slot instance `instance`'s beam group has reported.
 fn beam_common_of(instance: ::engine::InstanceId) -> u32 {
-    BEAM_COMMON.lock().unwrap().get(&instance).copied().unwrap_or(0)
+    BEAM_COMMON
+        .lock()
+        .unwrap()
+        .get(&instance)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Forgets the boot's landed records, for [`crate::bootstrap::reset`].

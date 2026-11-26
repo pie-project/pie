@@ -420,7 +420,9 @@ impl CerebrasEngine {
         step: &engine::fire::Step,
     ) -> EngineResult<(Vec<LaneReadout>, StepOutcome)> {
         if self.stream.is_some() {
-            return self.fire_stream(step).map(|read| (read, StepOutcome::committed()));
+            return self
+                .fire_stream(step)
+                .map(|read| (read, StepOutcome::committed()));
         }
         let fire_t0 = std::time::Instant::now();
         self.next_fire = self.next_fire.wrapping_add(1);

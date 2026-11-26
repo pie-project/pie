@@ -177,4 +177,3 @@ fn a_parked_process_alone_holds_no_launch() {
     assert_eq!(b, 224);
     assert!(b < SATURATED);
 }
-

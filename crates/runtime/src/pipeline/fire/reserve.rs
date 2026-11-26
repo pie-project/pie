@@ -200,8 +200,7 @@ pub(super) async fn reserve<C: FireContext>(
             rs: rs_slot_demand(stores, rs_ids, &plan)?,
         };
         let alone = || alone_demands(stores, sets, set_lanes, rs_ids, &plan);
-        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, alone).await?
-        else {
+        let Some(mut grant) = acquire_grant(ctx, pipeline_id, demand, alone).await? else {
             continue;
         };
         let mut leases = Vec::with_capacity(sets.len());

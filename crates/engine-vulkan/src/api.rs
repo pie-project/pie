@@ -20,9 +20,9 @@ use engine_gpu::serve::Landed;
 use engine_gpu::serve::Shell;
 
 use crate::serve::Seats;
-use engine_gpu::settle::{Meet, merged};
 #[cfg(feature = "vulkan")]
 use engine_gpu::settle::Done;
+use engine_gpu::settle::{Meet, merged};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeviceBoot {
@@ -84,7 +84,6 @@ pub type Vulkan = engine_gpu::api::Gpu<Api>;
 
 impl Host for Api {
     const KIND: &'static str = "vulkan";
-
 
     type Programs = crate::program::Plane;
 
@@ -309,21 +308,26 @@ fn run_attachments(gpu: &mut Vulkan, step: &Step, landed: &Landed) -> Vec<engine
         shell, programs, ..
     } = gpu;
     let mut faulted = engine::StepOutcome::committed();
-    each_pass(program_attachments(step), "epilogue", &mut faulted, |attachment| {
-        #[cfg(feature = "vulkan")]
-        let (device, seats) = match shell.as_ref() {
-            Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
-            None => (None, Vec::new()),
-        };
-        programs.fire(
-            attachment.instance,
-            Stage::Epilogue,
+    each_pass(
+        program_attachments(step),
+        "epilogue",
+        &mut faulted,
+        |attachment| {
             #[cfg(feature = "vulkan")]
-            device,
-            #[cfg(feature = "vulkan")]
-            seats,
-        )
-    });
+            let (device, seats) = match shell.as_ref() {
+                Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
+                None => (None, Vec::new()),
+            };
+            programs.fire(
+                attachment.instance,
+                Stage::Epilogue,
+                #[cfg(feature = "vulkan")]
+                device,
+                #[cfg(feature = "vulkan")]
+                seats,
+            )
+        },
+    );
     if let Some(shell) = shell.as_mut() {
         shell.forget_seat(landed);
     }

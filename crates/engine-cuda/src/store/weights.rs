@@ -595,7 +595,11 @@ impl Pools {
     /// core's order and made canonical where it lies, host or device
     /// (`weights::hip::order_fp8_span`); a span holding a NaN code refuses
     /// the load.
-    pub(super) fn lay_fp8(&self, stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64)]) -> Result<()> {
+    pub(super) fn lay_fp8(
+        &self,
+        stream: *mut core::ffi::c_void,
+        spans: &[(u64, u64, u64)],
+    ) -> Result<()> {
         #[cfg(feature = "rocm")]
         {
             crate::weights::order_fp8_spans(stream, spans)

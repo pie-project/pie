@@ -80,15 +80,17 @@ pub(crate) fn sizing_take() -> crate::sizing::Footprint {
             sized
                 .asked
                 .into_iter()
-                .map(|((arena, name, region, scope), asked)| crate::sizing::Sized {
-                    key: SlabKey {
-                        arena,
-                        name,
-                        region,
-                        scope,
+                .map(
+                    |((arena, name, region, scope), asked)| crate::sizing::Sized {
+                        key: SlabKey {
+                            arena,
+                            name,
+                            region,
+                            scope,
+                        },
+                        asked,
                     },
-                    asked,
-                })
+                )
                 .collect(),
         )
     })

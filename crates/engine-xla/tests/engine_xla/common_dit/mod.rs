@@ -690,8 +690,9 @@ impl Rig {
                 capacity: 2,
                 extern_name: Vec::new(),
                 slots: Vec::new(),
-            })
-            .expect("the channel registers");
+            },
+        )
+        .expect("the channel registers");
         id
     }
 

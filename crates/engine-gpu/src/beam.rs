@@ -57,7 +57,11 @@ pub fn lanes_of(package: &LaunchPackage) -> Option<u32> {
         .iter()
         .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)?;
     let channel = package.channels.get(binding.channel as usize)?;
-    let numel = channel.shape.iter().map(|&dim| u64::from(dim)).product::<u64>();
+    let numel = channel
+        .shape
+        .iter()
+        .map(|&dim| u64::from(dim))
+        .product::<u64>();
     u32::try_from(numel).ok()
 }
 
@@ -358,9 +362,16 @@ pub fn plan<'a, B: Backend>(
     let mut trans = Part::of("pool pages beam groups stage in one fire", room.trans);
     let mut rs_lists = Part::of("beam lanes' rs page table runs in one fire", room.rs_lists);
     let mut rs_copies = Part::of("beam lanes' rs copies in one fire", room.rs_copies);
-    let mut rs_bases = Part::of("rs entries beam groups' sets hold in one fire", room.rs_bases);
+    let mut rs_bases = Part::of(
+        "rs entries beam groups' sets hold in one fire",
+        room.rs_bases,
+    );
     let mut commons = Part::of("beam groups' common slots in one fire", room.commons);
-    for plane in staged.planes.iter().chain(rs.iter().flat_map(|rs| rs.planes.iter())) {
+    for plane in staged
+        .planes
+        .iter()
+        .chain(rs.iter().flat_map(|rs| rs.planes.iter()))
+    {
         planes.push(plane)?;
     }
     for group in groups {
@@ -380,7 +391,10 @@ pub fn plan<'a, B: Backend>(
             .iter()
             .map(|&lane| {
                 seat(lane).ok_or_else(|| {
-                    refused(format!("instance {}'s lane {lane} has no seat", group.instance))
+                    refused(format!(
+                        "instance {}'s lane {lane} has no seat",
+                        group.instance
+                    ))
                 })
             })
             .collect::<Result<Vec<Seat>>>()?;
@@ -445,7 +459,10 @@ pub fn plan<'a, B: Backend>(
         for &(indptr, (indices, write_page, write_offset)) in &staged.tables {
             for (beam, at) in seats.iter().enumerate() {
                 let from = indptr.get(at.seat).copied().ok_or_else(|| {
-                    refused(format!("instance {}'s beam {beam} has no seat", group.instance))
+                    refused(format!(
+                        "instance {}'s beam {beam} has no seat",
+                        group.instance
+                    ))
                 })?;
                 let to = indptr.get(at.seat + 1).copied().unwrap_or(from);
                 let (from, to) = (from.max(0) as u32, to.max(0) as u32);
@@ -517,7 +534,9 @@ pub fn plan<'a, B: Backend>(
             // pool pages below the most the step hands out (`backed`).
             let reach = (u64::from(f0) + u64::from(backed) + 1) * u64::from(page);
             let needed = u32::try_from(
-                reach.saturating_sub(u64::from(base)).div_ceil(u64::from(tokens)),
+                reach
+                    .saturating_sub(u64::from(base))
+                    .div_ceil(u64::from(tokens)),
             )
             .unwrap_or(u32::MAX)
             .min(bases_len);
@@ -544,7 +563,11 @@ pub fn plan<'a, B: Backend>(
             };
             let new = &wanted[from..];
             let from = u32::try_from(from).unwrap_or(u32::MAX);
-            append = (rs_bases.push(new)?, bases_at + from, u32::try_from(new.len()).unwrap_or(u32::MAX));
+            append = (
+                rs_bases.push(new)?,
+                bases_at + from,
+                u32::try_from(new.len()).unwrap_or(u32::MAX),
+            );
             let mut kept = held_now.clone();
             kept.truncate(from as usize);
             kept.extend_from_slice(new);
@@ -560,7 +583,10 @@ pub fn plan<'a, B: Backend>(
                     )));
                 }
                 let (header, carried) = (rs.header)(lane).ok_or_else(|| {
-                    refused(format!("instance {}'s beam {beam} has no rs table", group.instance))
+                    refused(format!(
+                        "instance {}'s beam {beam} has no rs table",
+                        group.instance
+                    ))
                 })?;
                 if !carried {
                     return Err(refused(format!(

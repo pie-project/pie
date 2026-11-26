@@ -93,7 +93,9 @@ fn resident_blocks(op: &'static str, name: &str, threads: u32) -> Result<u32, Er
             return Ok(blocks);
         }
         let blocks = kernel(FILE, name).resident_blocks(threads, 0)?;
-        seen.lock().expect("the occupancy table").insert(key, blocks);
+        seen.lock()
+            .expect("the occupancy table")
+            .insert(key, blocks);
         Ok(blocks)
     }
     #[cfg(not(feature = "rocm"))]
@@ -477,7 +479,20 @@ pub fn prefill_selected(
     o: &Tensor,
     sel: PrefillSel,
 ) -> Result<(), Error> {
-    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel), None, None)
+    prefill_walk(
+        ctx,
+        op,
+        q,
+        plan,
+        pool,
+        -1,
+        sm_scale,
+        o,
+        0,
+        Some(sel),
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,7 +613,10 @@ fn prefill_walk(
                 shape.head_dim
             )
         } else {
-            format!("::pie::attn::paged_prefill_wide_masked<{}, {hnd}>", shape.head_dim)
+            format!(
+                "::pie::attn::paged_prefill_wide_masked<{}, {hnd}>",
+                shape.head_dim
+            )
         };
         ctx.fire(
             op,
@@ -663,8 +681,7 @@ fn merge(ctx: &Ctx, op: &'static str, parts: &Partials) -> Result<(), Error> {
     let blocks = pairs.min(units.saturating_mul(resident_blocks(op, &name, 256)?));
     ctx.fire(
         op,
-        Fire::at(kernel(FILE, &name))
-        .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+        Fire::at(kernel(FILE, &name)).apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(parts.parts),
             ArgValue::Ptr(parts.part_lse),

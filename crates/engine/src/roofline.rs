@@ -332,7 +332,12 @@ impl Constants {
         workgroups: u32,
         cores: u32,
     ) -> Result<f64, &'static str> {
-        Ok(wave(work, rate, workgroups, self.full_rate_workgroups(cores)?))
+        Ok(wave(
+            work,
+            rate,
+            workgroups,
+            self.full_rate_workgroups(cores)?,
+        ))
     }
 
     /// A matmul of `m x n x k` reading `bytes` (its weight plane).

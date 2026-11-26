@@ -1720,31 +1720,33 @@ pub use engine_gpu::backend::OnDone;
 fn read_span(core: Arc<Core>, span: Arc<Span>, time: engine_gpu::submit::DeviceTime) {
     let period = f64::from(core.queue.get_timestamp_period());
     let readback = span.readback.clone();
-    readback.slice(0..16).map_async(wgpu::MapMode::Read, move |mapped| {
-        if mapped.is_err() {
-            span.busy.store(false, Ordering::Release);
-            time.unread();
-            return;
-        }
-        let slice = span.readback.slice(0..16);
-        let ticks = match slice.get_mapped_range() {
-            Ok(view) => {
-                let word = |i: usize| {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&view[i * 8..i * 8 + 8]);
-                    u64::from_le_bytes(b)
-                };
-                Some(word(1).saturating_sub(word(0)))
+    readback
+        .slice(0..16)
+        .map_async(wgpu::MapMode::Read, move |mapped| {
+            if mapped.is_err() {
+                span.busy.store(false, Ordering::Release);
+                time.unread();
+                return;
             }
-            Err(_) => None,
-        };
-        span.readback.unmap();
-        span.busy.store(false, Ordering::Release);
-        match ticks {
-            Some(ticks) => time.set((ticks as f64 * period) as u64),
-            None => time.unread(),
-        }
-    });
+            let slice = span.readback.slice(0..16);
+            let ticks = match slice.get_mapped_range() {
+                Ok(view) => {
+                    let word = |i: usize| {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&view[i * 8..i * 8 + 8]);
+                        u64::from_le_bytes(b)
+                    };
+                    Some(word(1).saturating_sub(word(0)))
+                }
+                Err(_) => None,
+            };
+            span.readback.unmap();
+            span.busy.store(false, Ordering::Release);
+            match ticks {
+                Some(ticks) => time.set((ticks as f64 * period) as u64),
+                None => time.unread(),
+            }
+        });
     core.kick();
 }
 

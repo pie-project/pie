@@ -61,11 +61,19 @@ mod tests {
     fn the_lanes_to_the_end_are_what_the_pools_hold_at_their_peak() {
         let none = RsUnits::default();
         let mut to_end = ToEnd::default();
-        assert_eq!(to_end.lanes_to_end(1855, none), None, "nothing learned: absent");
+        assert_eq!(
+            to_end.lanes_to_end(1855, none),
+            None,
+            "nothing learned: absent"
+        );
         to_end.learn((27, none));
         // Started together, each holds 27 at its end: 1855 / 27.
         assert_eq!(to_end.lanes_to_end(1855, none), Some(68));
-        assert_eq!(to_end.lanes_to_end(26, none), Some(0), "not one fits to its end");
+        assert_eq!(
+            to_end.lanes_to_end(26, none),
+            Some(0),
+            "not one fits to its end"
+        );
         // The state pool bounds it where it keeps any.
         let rs = |slots, pages| RsUnits {
             slots,

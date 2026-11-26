@@ -16,8 +16,7 @@ use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::Shape;
 use poem::{
-    Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, fact, ops,
-    trace_hybrid,
+    Dtype, ForwardHybrid, Input, Platform, Request, StateRows, Weight, fact, ops, trace_hybrid,
 };
 use poem_compiler::Budget;
 use poem_ir::Builtin;
@@ -63,8 +62,8 @@ impl ForwardHybrid for Micro {
             &inputs.write_offset(KV_ROW),
         );
         let a = ops::attn::attend(
-            &q, &inputs, KV_ROW, HEADS, HEADS, HEAD_DIM, SM_SCALE, None, None, None, false,
-            None, None, false, false,
+            &q, &inputs, KV_ROW, HEADS, HEADS, HEAD_DIM, SM_SCALE, None, None, None, false, None,
+            None, false, false,
         );
         let o = ops::linear::matmul(&a, &w("o", WIDTH, plane));
         let bank_a = Weight::sym(BANK_A, [SLOTS, RANK, WIDTH], Dtype::Bf16).registered();
@@ -121,7 +120,10 @@ fn bind_through_a_sink(shell: &mut Shell) -> u32 {
                 Op::ChanRead(0),
                 Op::ChanRead(1),
                 Op::ChanRead(2),
-                Op::SinkCall { name: 0, args: vec![0, 1, 2] },
+                Op::SinkCall {
+                    name: 0,
+                    args: vec![0, 1, 2],
+                },
             ],
         }],
         externs: Vec::new(),
@@ -129,7 +131,9 @@ fn bind_through_a_sink(shell: &mut Shell) -> u32 {
     };
     let bound = crate::bound::logits(container, VOCAB).expect("the lora prologue binds");
     let package = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
-    let sink = sink_of(&package).expect("the sink reads").expect("the program has a sink");
+    let sink = sink_of(&package)
+        .expect("the sink reads")
+        .expect("the program has a sink");
     let seeds = [plane(RANK * WIDTH, 7, 0.5), plane(WIDTH * RANK, 13, 0.5)];
     let seats = shell.bank_seats();
     let site = sink.site().expect("the sink names one site or none");
@@ -145,7 +149,10 @@ fn bind_through_a_sink(shell: &mut Shell) -> u32 {
         .map(|(bank, bytes)| AdapterPlane { bank, bytes })
         .collect();
     shell
-        .bind_adapter(AdapterSource::Own { instance: engine::InstanceId(1), planes: &planes })
+        .bind_adapter(AdapterSource::Own {
+            instance: engine::InstanceId(1),
+            planes: &planes,
+        })
         .expect("a load stating no capacity binds a sink's adapter")
         .slot
 }
@@ -162,8 +169,13 @@ fn plane(count: u64, seed: u32, scale: f32) -> Vec<u8> {
 }
 
 fn worst(a: &[f32], b: &[f32]) -> (f32, f32) {
-    let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-    let span = b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
+    let worst = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    let span =
+        b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
     (worst, span)
 }
 
@@ -243,13 +255,22 @@ fn an_adapted_lane_beside_a_plain_one_answers_as_alone() {
             ],
         );
         adapted_fires += 1;
-        assert_eq!(shell.body_stats().tally.hits, hits, "step {step}: the mixed fire replayed a body");
+        assert_eq!(
+            shell.body_stats().tally.hits,
+            hits,
+            "step {step}: the mixed fire replayed a body"
+        );
         for lane in 0..2u32 {
             let token = [tokens[lane as usize][1]];
             let hits = shell.body_stats().tally.hits;
-            let alone = fire(&mut shell, &[(2 + lane, &token, held, adapter_of(lane))]).swap_remove(0);
+            let alone =
+                fire(&mut shell, &[(2 + lane, &token, held, adapter_of(lane))]).swap_remove(0);
             let replayed = shell.body_stats().tally.hits > hits;
-            assert_eq!(replayed, lane == 0, "step {step}: the plain lane alone replays its body");
+            assert_eq!(
+                replayed,
+                lane == 0,
+                "step {step}: the plain lane alone replays its body"
+            );
             adapted_fires += u64::from(lane == 1);
             let (worst, span) = worst(&batched[lane as usize], &alone);
             eprintln!("step {step} lane {lane}: worst {worst} of a span {span}");
@@ -267,7 +288,10 @@ fn an_adapted_lane_beside_a_plain_one_answers_as_alone() {
     }
     let both = fire(
         &mut shell,
-        &[(5, &prompt(1), 0, Some(adapter)), (6, &prompt(1), 0, Some(adapter))],
+        &[
+            (5, &prompt(1), 0, Some(adapter)),
+            (6, &prompt(1), 0, Some(adapter)),
+        ],
     );
     let alone = fire(&mut shell, &[(7, &prompt(1), 0, Some(adapter))]).swap_remove(0);
     adapted_fires += 2;
@@ -282,13 +306,32 @@ fn an_adapted_lane_beside_a_plain_one_answers_as_alone() {
     let with = alone;
     let (moved, span) = worst(&with, &bare);
     eprintln!("the adapter moves the prompt's logits {moved} of a span {span}");
-    assert!(moved > span * 5e-2, "the adapter moves the logits ({moved} of {span})");
+    assert!(
+        moved > span * 5e-2,
+        "the adapter moves the logits ({moved} of {span})"
+    );
 
     eprintln!("census: {:?}", shell.body_stats().tally);
-    assert_eq!(shell.tallied(Tally::Eager), adapted_fires, "every adapted fire is stated eager");
-    assert_eq!(shell.tallied(Tally::Unrecorded), 0, "no fire walked unstated");
-    assert_eq!(shell.tallied(Tally::Compiled), 0, "no serving fire captured a body");
-    assert_eq!(shell.tallied(Tally::BuiltInFire), 0, "no fire built a kernel");
+    assert_eq!(
+        shell.tallied(Tally::Eager),
+        adapted_fires,
+        "every adapted fire is stated eager"
+    );
+    assert_eq!(
+        shell.tallied(Tally::Unrecorded),
+        0,
+        "no fire walked unstated"
+    );
+    assert_eq!(
+        shell.tallied(Tally::Compiled),
+        0,
+        "no serving fire captured a body"
+    );
+    assert_eq!(
+        shell.tallied(Tally::BuiltInFire),
+        0,
+        "no fire built a kernel"
+    );
 }
 
 fn argmax(row: &[f32]) -> u32 {

@@ -429,10 +429,9 @@ pub fn lower(
         let value = &package.values[put.value as usize];
         let n = numel(&value.shape);
         let w = words(value.dtype, n);
-        let fed = package
-            .ports
-            .iter()
-            .any(|p| !p.is_const && p.port == eta_ir::registry::Port::EmbedTokens && p.channel == put.channel);
+        let fed = package.ports.iter().any(|p| {
+            !p.is_const && p.port == eta_ir::registry::Port::EmbedTokens && p.channel == put.channel
+        });
         if carried.contains(&put.channel) && fed {
             layout.fed_out.push((
                 put.channel,
@@ -512,7 +511,8 @@ pub fn lower(
     // The pool, last: aliased to the last result.
     let pool = layout.pooled().then(|| {
         let result = u32::from(layout.out_words > 0);
-        let p = l.f.param(Ty::new(Elem::U32, &[pool_rows.max(1), 128]), Some(result));
+        let p =
+            l.f.param(Ty::new(Elem::U32, &[pool_rows.max(1), 128]), Some(result));
         l.f.pin_row_major(p);
         p
     });

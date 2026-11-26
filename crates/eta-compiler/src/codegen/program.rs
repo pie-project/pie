@@ -196,7 +196,13 @@ fn push_metal(
         }
         Err(error) => (String::new(), Err(error)),
     };
-    out.push(EmittedKernel::new(kind, stage_index, region_index, entry, emitted));
+    out.push(EmittedKernel::new(
+        kind,
+        stage_index,
+        region_index,
+        entry,
+        emitted,
+    ));
 }
 
 fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
@@ -230,9 +236,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
             Some(LibraryOp::NucleusSample) => {
                 crate::codegen::metal::emit_grouped_nucleus(entry, stage, region)
             }
-            Some(LibraryOp::TopK) => {
-                crate::codegen::metal::emit_grouped_topk(entry, stage, region)
-            }
+            Some(LibraryOp::TopK) => crate::codegen::metal::emit_grouped_topk(entry, stage, region),
             _ => crate::codegen::metal::emit_grouped_fused_region(entry, stage, region),
         };
         push_metal(
@@ -463,7 +467,11 @@ mod tests {
         let stages = compile_bound(&bound);
         let singles = stages[0].singleton.regions.len() as u32;
         let kernels = emit_program(Backend::Metal, &stages, &bound);
-        assert!(kernels.iter().all(|kernel| kernel.kind != KernelKind::Singleton));
+        assert!(
+            kernels
+                .iter()
+                .all(|kernel| kernel.kind != KernelKind::Singleton)
+        );
         let grouped: Vec<u32> = kernels
             .iter()
             .filter(|kernel| kernel.kind == KernelKind::Grouped)

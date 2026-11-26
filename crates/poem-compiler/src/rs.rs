@@ -88,32 +88,26 @@ pub fn buffered_convs(trace: &Trace, rs_mamba2: bool) -> impl Iterator<Item = Bu
             Some(Def::Cache(_))
         )
     };
-    trace
-        .nodes
-        .iter()
-        .enumerate()
-        .filter_map(move |(node, n)| {
-            let (x, state, y, chunked) = match &n.op {
-                Operation::Ssm(Ssm::CausalConv1d { x, state, y, .. }) => (*x, *state, *y, false),
-                Operation::Ssm(Ssm::CausalConv1dChunked { x, state, y, .. }) => {
-                    (*x, *state, *y, true)
-                }
-                _ => return None,
-            };
-            if !cached(state) {
-                return None;
-            }
-            let feeds = feeds.get(&y.0).copied().unwrap_or(Feeds::Alone);
-            if feeds == Feeds::Mamba2 && !rs_mamba2 {
-                return None;
-            }
-            Some(BufferedConv {
-                node,
-                x,
-                state,
-                y,
-                chunked,
-                feeds,
-            })
+    trace.nodes.iter().enumerate().filter_map(move |(node, n)| {
+        let (x, state, y, chunked) = match &n.op {
+            Operation::Ssm(Ssm::CausalConv1d { x, state, y, .. }) => (*x, *state, *y, false),
+            Operation::Ssm(Ssm::CausalConv1dChunked { x, state, y, .. }) => (*x, *state, *y, true),
+            _ => return None,
+        };
+        if !cached(state) {
+            return None;
+        }
+        let feeds = feeds.get(&y.0).copied().unwrap_or(Feeds::Alone);
+        if feeds == Feeds::Mamba2 && !rs_mamba2 {
+            return None;
+        }
+        Some(BufferedConv {
+            node,
+            x,
+            state,
+            y,
+            chunked,
+            feeds,
         })
+    })
 }

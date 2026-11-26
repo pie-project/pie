@@ -213,8 +213,7 @@ impl Arena {
                 })
                 .map_or(map, |(_, rung)| rung)
         };
-        let base =
-            pools.activation_base() + self.reserved.saturating_sub(self.top + chosen.bytes);
+        let base = pools.activation_base() + self.reserved.saturating_sub(self.top + chosen.bytes);
         carve(base, chosen, rows)
     }
 
@@ -293,7 +292,12 @@ pub fn carve(base: u64, map: &ArenaMap, rows: poem_compiler::FireRows) -> Result
                 laid,
             });
         }
-        cells.push(Some(Tensor::new(base + rect.offset, rect.rows, rect.width, rect.dtype)));
+        cells.push(Some(Tensor::new(
+            base + rect.offset,
+            rect.rows,
+            rect.width,
+            rect.dtype,
+        )));
     }
     Ok(SlotTable(cells))
 }
@@ -355,7 +359,10 @@ mod tests {
             (1024, map(1500)),
         ]);
         arena.committed = 3000;
-        assert_eq!(arena.rungs(None), vec![(256, 2000), (512, 1000), (1024, 1000)]);
+        assert_eq!(
+            arena.rungs(None),
+            vec![(256, 2000), (512, 1000), (1024, 1000)]
+        );
         // A fire still lays its own rung's carve.
         assert_eq!(arena.carve_of(None, 1024, 1), 1500);
     }
@@ -403,8 +410,12 @@ mod tests {
             live_in: vec![poem_ir::ClassSet::default(); 2],
             bytes: 2 * laid,
         };
-        let refused = carve(0, &map, poem_compiler::FireRows::text_only(64, 2 * MAX_LANES))
-            .expect_err("twice the laid lanes");
+        let refused = carve(
+            0,
+            &map,
+            poem_compiler::FireRows::text_only(64, 2 * MAX_LANES),
+        )
+        .expect_err("twice the laid lanes");
         assert!(
             matches!(refused, Fault::Overcarved { value: 0, rows: 16, need, laid: at } if need == 2 * at),
             "{refused}"

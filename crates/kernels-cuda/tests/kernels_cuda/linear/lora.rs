@@ -69,12 +69,19 @@ fn answers(form: &Form, rank: usize) {
     let routes = t(gpu.up(&ROUTES), ROWS, 1, Dtype::I32);
     let list = t(gpu.up(&[0i32, 2, 4, 2]), 4, 1, Dtype::I32);
 
-    let segmented = Segments { list, count: 2, cap: 2, max_rows: 2 };
+    let segmented = Segments {
+        list,
+        count: 2,
+        cap: 2,
+        max_rows: 2,
+    };
     for segments in [None, Some(segmented)] {
         let mut yt = tensor(gpu.up(&y_raw), ROWS, OUT);
         let ctx = gpu.ctx();
-        gpu.laid(&ctx, |ctx| lora::correct(ctx, xt, at, bt, routes, &mut yt, segments))
-            .expect("the correction fires");
+        gpu.laid(&ctx, |ctx| {
+            lora::correct(ctx, xt, at, bt, routes, &mut yt, segments)
+        })
+        .expect("the correction fires");
         gpu.sync();
         let got: Vec<u16> = gpu.down(yt.ptr, ROWS * OUT);
         let mut moved = 0f64;
@@ -82,11 +89,17 @@ fn answers(form: &Form, rank: usize) {
             let fired = segments.is_none() || [0, 1, 4, 5].contains(&row);
             let Some(ad) = usize::try_from(ROUTES[row]).ok().filter(|_| fired) else {
                 let span = row * OUT..(row + 1) * OUT;
-                assert_eq!(got[span.clone()], y_raw[span], "{what}: row {row} is not corrected");
+                assert_eq!(
+                    got[span.clone()],
+                    y_raw[span],
+                    "{what}: row {row} is not corrected"
+                );
                 continue;
             };
             let down = tab(rank, |r| {
-                let exact = sum(INPUT, |i| a[(ad * rank + r) * INPUT + i] * x[row * INPUT + i]);
+                let exact = sum(INPUT, |i| {
+                    a[(ad * rank + r) * INPUT + i] * x[row * INPUT + i]
+                });
                 f64::from((form.decode)((form.encode)(exact as f32)))
             });
             for n in 0..OUT {
@@ -104,7 +117,10 @@ fn answers(form: &Form, rank: usize) {
                 moved = moved.max(delta.abs());
             }
         }
-        assert!(moved > 0.1, "{what}: the correction moves its rows ({moved})");
+        assert!(
+            moved > 0.1,
+            "{what}: the correction moves its rows ({moved})"
+        );
     }
 }
 

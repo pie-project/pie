@@ -31,11 +31,20 @@ fn a_groups_fold_is_the_carried_steps_commit() {
     let (ba_row, k_row, u_row) = (VH, KH * D / 2, VH * D);
     let planes = [
         CarryPlane { at: 0, row: ba_row },
-        CarryPlane { at: PAGE * ba_row, row: k_row },
-        CarryPlane { at: PAGE * (ba_row + k_row), row: u_row },
+        CarryPlane {
+            at: PAGE * ba_row,
+            row: k_row,
+        },
+        CarryPlane {
+            at: PAGE * (ba_row + k_row),
+            row: u_row,
+        },
     ];
     // The state's slab, then two rs pages; small values, a word apart.
-    let bank_values: Vec<f32> = noise(3, (3 * slab) as usize).iter().map(|v| v * 0.01).collect();
+    let bank_values: Vec<f32> = noise(3, (3 * slab) as usize)
+        .iter()
+        .map(|v| v * 0.01)
+        .collect();
     let (qkv, _) = gpu.up(&noise(5, pitch as usize));
     let (ba, _) = gpu.up(&noise(6, (2 * VH) as usize));
     let (dt, _) = gpu.up(&noise(7, VH as usize));
@@ -111,9 +120,15 @@ fn a_groups_fold_is_the_carried_steps_commit() {
                     }
                 });
                 let got = gpu.down_u32(bank, (3 * slab) as usize);
-                let want_pages: Vec<u32> =
-                    bank_values[slab as usize..].iter().map(|v| v.to_bits()).collect();
-                assert_eq!(&got[slab as usize..], want_pages.as_slice(), "{tier:?} n={n} fold={fold}: the rs pages stay");
+                let want_pages: Vec<u32> = bank_values[slab as usize..]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                assert_eq!(
+                    &got[slab as usize..],
+                    want_pages.as_slice(),
+                    "{tier:?} n={n} fold={fold}: the rs pages stay"
+                );
                 if fold {
                     assert!(
                         gpu.down_f32(y, (VH * D) as usize).iter().all(|&v| v == 7.0),
@@ -124,10 +139,16 @@ fn a_groups_fold_is_the_carried_steps_commit() {
             }
             assert_ne!(
                 state_after[0],
-                bank_values[..slab as usize].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                bank_values[..slab as usize]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
                 "{tier:?} n={n}: the commit moved the state"
             );
-            assert_eq!(state_after[0], state_after[1], "{tier:?} n={n}: the fold is the commit, bit for bit");
+            assert_eq!(
+                state_after[0], state_after[1],
+                "{tier:?} n={n}: the fold is the commit, bit for bit"
+            );
             eprintln!("{tier:?} n={n}: the fold folds as the carried step commits");
         }
     }

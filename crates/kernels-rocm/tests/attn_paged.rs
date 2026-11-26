@@ -313,8 +313,7 @@ fn run_decode(gpu: &Gpu, c: &Case, kv_lens: &[u32], window: Option<u32>, max_gri
         |_, pools, _| {
             let (mut o, mut lse) = (o, lse);
             attn::decode_lse(
-                &ctx, q, &built, &pools[0], window, c.head_dim, 0.0, &mut o, &mut lse,
-                None,
+                &ctx, q, &built, &pools[0], window, c.head_dim, 0.0, &mut o, &mut lse, None,
             )
             .unwrap();
         },
@@ -1007,7 +1006,11 @@ fn attn_paged_masked_prefill() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     let device = plan::Device::probe(&ctx).unwrap();
-    for c in [Case::new(8, 4, 128, 16, false), Case::new(16, 4, 256, 16, false), Case::new(8, 2, 64, 16, false)] {
+    for c in [
+        Case::new(8, 4, 128, 16, false),
+        Case::new(16, 4, 256, 16, false),
+        Case::new(8, 2, 64, 16, false),
+    ] {
         // A causal request over a prefix whose committed run ends at 45, and
         // a wide one that reads only its buffer's bits.
         let qo_lens = [37u32, 5];
@@ -1038,7 +1041,11 @@ fn attn_paged_masked_prefill() {
         let mut indptr: Vec<i64> = Vec::new();
         let mut reads: Vec<Vec<Vec<bool>>> = Vec::new();
         for r in 0..n as usize {
-            let (kv, qo, origin) = (kv_lens[r] as usize, qo_lens[r] as usize, origins[r] as usize);
+            let (kv, qo, origin) = (
+                kv_lens[r] as usize,
+                qo_lens[r] as usize,
+                origins[r] as usize,
+            );
             let width = kv - origin;
             let mut plane = vec![false; qo * width];
             for t in 0..qo {
@@ -1115,7 +1122,18 @@ fn attn_paged_masked_prefill() {
         built.stage(&ctx).unwrap();
         let mask = gpu.upload(&bytes, 1, bytes.len() as u32, Dtype::U8);
         let mut o = gpu.zeros(total, c.q_heads * c.head_dim, Dtype::Bf16);
-        attn::masked(&ctx, q, &built, mask, &cache.pool, None, c.head_dim, 0.0, &mut o).unwrap();
+        attn::masked(
+            &ctx,
+            q,
+            &built,
+            mask,
+            &cache.pool,
+            None,
+            c.head_dim,
+            0.0,
+            &mut o,
+        )
+        .unwrap();
         let got = gpu.read(&o);
         let (hq, hk, d) = (c.q_heads as usize, c.kv_heads as usize, c.head_dim as usize);
         let (g, row, scale) = (hq / hk, hq * d, 1.0 / (d as f64).sqrt());
@@ -1123,7 +1141,9 @@ fn attn_paged_masked_prefill() {
             for t in 0..qo_lens[r] as usize {
                 let at = qo_indptr[r] as usize + t;
                 let qrow = &qv[at * row..(at + 1) * row];
-                let keys: Vec<usize> = (0..kv_lens[r] as usize).filter(|&k| reads[r][t][k]).collect();
+                let keys: Vec<usize> = (0..kv_lens[r] as usize)
+                    .filter(|&k| reads[r][t][k])
+                    .collect();
                 let mut want = vec![0f32; row];
                 for head in 0..hq {
                     let kh = head / g;
@@ -1131,7 +1151,10 @@ fn attn_paged_masked_prefill() {
                         .iter()
                         .map(|&k| {
                             (0..d)
-                                .map(|j| f64::from(qrow[head * d + j]) * f64::from(cache.keys[r][(k * hk + kh) * d + j]))
+                                .map(|j| {
+                                    f64::from(qrow[head * d + j])
+                                        * f64::from(cache.keys[r][(k * hk + kh) * d + j])
+                                })
                                 .sum::<f64>()
                                 * scale
                         })
@@ -1148,7 +1171,10 @@ fn attn_paged_masked_prefill() {
                         want[head * d + j] = (acc / z) as f32;
                     }
                 }
-                let tag = format!("masked prefill d{d} g{g} req {r} token {t} wide {}", wide[r]);
+                let tag = format!(
+                    "masked prefill d{d} g{g} req {r} token {t} wide {}",
+                    wide[r]
+                );
                 close(&tag, &got[at * row..(at + 1) * row], &want, 1.5e-2);
             }
         }
@@ -1427,7 +1453,10 @@ fn attn_paged_captured_prefill_splits_per_fire() {
         eager.push(gpu.read(&o));
     }
     let ws = workspace(&gpu);
-    let (cut, whole) = (plan_of(&one, LANES, true, ws), plan_of(&many, LANES, true, ws));
+    let (cut, whole) = (
+        plan_of(&one, LANES, true, ws),
+        plan_of(&many, LANES, true, ws),
+    );
     assert_eq!(cut.info, whole.info, "one body's layout for every fire");
     assert!(cut.info.split_kv && cut.info.block_direct_offset.is_some());
     // The cut fire, fired as planned without the graph.
@@ -1448,11 +1477,23 @@ fn attn_paged_captured_prefill_splits_per_fire() {
         graph.replay();
         let got = gpu.read(&o);
         if tag.starts_with("whole") {
-            exact(&format!("{tag} replay against its eager plan"), &got, &eager[1]);
+            exact(
+                &format!("{tag} replay against its eager plan"),
+                &got,
+                &eager[1],
+            );
         } else {
             exact(&format!("{tag} replay against its walk"), &got, &cut_walked);
-            close(&format!("{tag} replay against its eager plan"), &got, &eager[0], 1.5e-2);
+            close(
+                &format!("{tag} replay against its eager plan"),
+                &got,
+                &eager[0],
+                1.5e-2,
+            );
         }
     }
-    eprintln!("captured over {LANES} lanes: grid {} split", cut.info.padded_batch_size);
+    eprintln!(
+        "captured over {LANES} lanes: grid {} split",
+        cut.info.padded_batch_size
+    );
 }

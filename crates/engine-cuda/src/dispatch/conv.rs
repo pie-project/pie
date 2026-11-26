@@ -110,15 +110,17 @@ impl Run<'_> {
                 };
                 let frames = conv.pad[0];
                 let pool = self.recurrent(*state);
-                let (clip_lanes, lane_base) = self
-                    .clip_lanes()
-                    .ok_or_else(|| kernels_cuda::Error::Backend {
+                let (clip_lanes, lane_base) =
+                    self.clip_lanes()
+                        .ok_or_else(|| {
+                            kernels_cuda::Error::Backend {
                         op: "conv.conv3d",
                         detail:
                             "a causal convolution with a frame cache needs the fire's clip lane \
                              table, which no lane of it staged"
                                 .to_string(),
-                    })?;
+                    }
+                        })?;
                 let rows = x.rows.saturating_mul(frames);
                 let bytes = u64::from(rows) * u64::from(x.width) * 2;
                 let scratch = self.ctx().scratch(
@@ -266,7 +268,17 @@ impl Run<'_> {
                             "a frame-cache store needs the fire's clip lane table, which no lane                              of it staged"
                                 .to_string(),
                     })?;
-                conv::cache_store(self.ctx(), x, x, &pool, clip_lanes, lane_base, grid, *frames, base)
+                conv::cache_store(
+                    self.ctx(),
+                    x,
+                    x,
+                    &pool,
+                    clip_lanes,
+                    lane_base,
+                    grid,
+                    *frames,
+                    base,
+                )
             }
             Conv::Patchify {
                 x,

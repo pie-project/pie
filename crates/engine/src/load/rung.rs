@@ -311,7 +311,9 @@ impl FireEstimate {
         match self.experts {
             Some((k, e)) if e > 0 => {
                 let handed = u64::from(rows) * u64::from(k.min(e));
-                u32::try_from(handed.div_ceil(u64::from(e))).unwrap_or(u32::MAX).max(1)
+                u32::try_from(handed.div_ceil(u64::from(e)))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
             }
             _ => rows,
         }
@@ -670,7 +672,9 @@ pub fn measured_effs(rungs: &[RungFacts], times: &[f64]) -> Vec<f64> {
         .map(|(r, &t)| (f64::from(r.tokens), t))
         .collect();
     let n = points.len() as f64;
-    let (sx, sy) = points.iter().fold((0.0, 0.0), |(x, y), &(px, py)| (x + px, y + py));
+    let (sx, sy) = points
+        .iter()
+        .fold((0.0, 0.0), |(x, y), &(px, py)| (x + px, y + py));
     let (mx, my) = (sx / n.max(1.0), sy / n.max(1.0));
     let (sxy, sxx) = points.iter().fold((0.0, 0.0), |(xy, xx), &(px, py)| {
         (xy + (px - mx) * (py - my), xx + (px - mx) * (px - mx))
@@ -682,7 +686,11 @@ pub fn measured_effs(rungs: &[RungFacts], times: &[f64]) -> Vec<f64> {
         .iter()
         .map(|r| {
             let rows = f64::from(r.tokens);
-            if rows + crossover > 0.0 { rows / (rows + crossover) } else { 1.0 }
+            if rows + crossover > 0.0 {
+                rows / (rows + crossover)
+            } else {
+                1.0
+            }
         })
         .collect()
 }
@@ -853,5 +861,4 @@ mod tests {
             ]
         );
     }
-
 }

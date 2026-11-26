@@ -8,7 +8,6 @@ use engine_gpu::serve::{Landed, Launch, Plan, Prepared, ReadSpan, Serve, Shell, 
 use crate::device::{Api, Buffer, Context, Frame, Pending, Pipelines};
 use engine_gpu::error::{Fault, Result};
 
-
 /// What the shell keeps of Vulkan's own: the frames kept to replay, and
 /// what each harvested step read out, for readers behind it on the queue.
 pub struct Shelf {
@@ -151,7 +150,12 @@ fn note_fill(
     if shell.device.verifies_fills() {
         shell.shelf.verified.derived += 1;
         let mut parts = Vec::new();
-        if shell.shelf.arm_families.get(&(first_family, arm)).is_some_and(|&held| held != family) {
+        if shell
+            .shelf
+            .arm_families
+            .get(&(first_family, arm))
+            .is_some_and(|&held| held != family)
+        {
             parts.push("family");
         }
         if first.groups != *groups {
@@ -632,8 +636,7 @@ impl Serve for Api {
             && prepared.bindings.rs_snaps.is_none()
             && (prepared.bindings.row_ring.is_some() || shell.row_caches.whole())
             && !split)
-        .then(|| record_key(shell, prepared));
-
+            .then(|| record_key(shell, prepared));
 
         let mut varying = None;
         let replayable = match key.map(|key| shell.shelf.recorder.next(key)) {
@@ -666,17 +669,20 @@ impl Serve for Api {
                 .score_room
                 .as_ref()
                 .map(|(buffer, at)| (buffer, *at));
-            let roomed = recording.kept.bind_room(room, &fill.room_pasts).and_then(|replays| {
-                if replays {
-                    Ok(())
-                } else {
-                    Err(Fault::Unbound {
-                        what: "a recording that copies its score room's rows, replayed at \
+            let roomed = recording
+                .kept
+                .bind_room(room, &fill.room_pasts)
+                .and_then(|replays| {
+                    if replays {
+                        Ok(())
+                    } else {
+                        Err(Fault::Unbound {
+                            what: "a recording that copies its score room's rows, replayed at \
                                another room"
-                            .to_string(),
-                    })
-                }
-            });
+                                .to_string(),
+                        })
+                    }
+                });
             // The fire's own scalars and group counts, where the recording's
             // commands read them.
             let filled = roomed.and_then(|()| recording.kept.stage(&fill.image));
@@ -763,10 +769,12 @@ impl Serve for Api {
             // the commands of several prompts bake families of their own
             // (Qwen3-0.6B: a body per prompt count, 43% more bodies to arm
             // them, for no serving speed the c64 census could see).
-            Some(_) if shell.armed && {
-                let prompts = prepared.seats.iter().filter(|seat| seat.rows > 1).count();
-                prompts > 1 && prompts < prepared.seats.len()
-            } => {
+            Some(_)
+                if shell.armed && {
+                    let prompts = prepared.seats.iter().filter(|seat| seat.rows > 1).count();
+                    prompts > 1 && prompts < prepared.seats.len()
+                } =>
+            {
                 shell.eager_next = true;
                 Plan::Walk { keep: None, split }
             }
@@ -863,16 +871,19 @@ impl Serve for Api {
         );
         // The arm walk's first-arm fill, laid: an arm past it derives its own.
         if !shell.device.verifies_fills() {
-            note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+            note_fill(
+                shell,
+                prepared.arm,
+                family,
+                &groups,
+                &image,
+                layout,
+                launches,
+                &room_pasts,
+            );
         }
-        let laid = crate::record::Fill::new(
-            family,
-            groups,
-            image,
-            layout.to_vec(),
-            launches,
-            room_pasts,
-        );
+        let laid =
+            crate::record::Fill::new(family, groups, image, layout.to_vec(), launches, room_pasts);
         // Verifying, the fire walks for its fill all the same, held to this.
         if shell.device.verifies_fills() {
             shell.shelf.pending_check = Some((shape, laid));
@@ -915,7 +926,11 @@ impl Serve for Api {
             return Ok(false);
         }
         if fill.cuts == 0 {
-            note_picks(shell, picked(prepared.arm, prepared.rung, fill.picks), family);
+            note_picks(
+                shell,
+                picked(prepared.arm, prepared.rung, fill.picks),
+                family,
+            );
         }
         let (groups, image, room_pasts) = (
             std::sync::Arc::new(fill.groups),
@@ -954,18 +969,20 @@ impl Serve for Api {
             }
         }
         if fill.cuts == 0 {
-            note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+            note_fill(
+                shell,
+                prepared.arm,
+                family,
+                &groups,
+                &image,
+                layout,
+                launches,
+                &room_pasts,
+            );
         }
         shell.shelf.recorder.insert_fill(
             shape,
-            crate::record::Fill::new(
-                family,
-                groups,
-                image,
-                layout.to_vec(),
-                launches,
-                room_pasts,
-            ),
+            crate::record::Fill::new(family, groups, image, layout.to_vec(), launches, room_pasts),
         );
         Ok(true)
     }
@@ -1141,7 +1158,16 @@ impl Serve for Api {
                 let room_pasts = std::sync::Arc::new(room_pasts);
                 if uncut && !alone {
                     note_picks(shell, picks, family);
-                    note_fill(shell, prepared.arm, family, &groups, &image, layout, launches, &room_pasts);
+                    note_fill(
+                        shell,
+                        prepared.arm,
+                        family,
+                        &groups,
+                        &image,
+                        layout,
+                        launches,
+                        &room_pasts,
+                    );
                 }
                 let recorder = &mut shell.shelf.recorder;
                 recorder.insert_fill(
@@ -1235,11 +1261,7 @@ impl Serve for Api {
 /// A family's key: what its walk's commands carry, hashed
 /// ([`crate::device::Frame::bake`]), on its arm; where an expert stage cut
 /// it, its shape too (the host steps between its segments are the shape's).
-fn family_key(
-    baked: u64,
-    arm: usize,
-    cut_shape: Option<crate::record::Key>,
-) -> crate::record::Key {
+fn family_key(baked: u64, arm: usize, cut_shape: Option<crate::record::Key>) -> crate::record::Key {
     let mut key = crate::record::KeyBuilder::new();
     key.hashed(&baked);
     key.shown(&arm);

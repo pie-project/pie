@@ -261,7 +261,9 @@ impl Layout {
                     });
                     layout.plane_life.push((node, node));
                     plane_keys.insert((cache, role), layout.planes.len() - 1);
-                    layout.by_role.insert((cache, role), layout.planes.len() - 1);
+                    layout
+                        .by_role
+                        .insert((cache, role), layout.planes.len() - 1);
                     layout.planes.len() - 1
                 }
             };
@@ -398,8 +400,22 @@ impl Layout {
                     // output). This shell's KDA decode step has no carried
                     // form: it replays its rows extended and reads neither.
                     if let Operation::Ssm(Ssm::KdaChunked { mixed, .. }) = &node.op {
-                        plane(&mut layout, cache, Role::Keys, *mixed, at, Some((heads * head_dim, Dtype::Bf16)))?;
-                        plane(&mut layout, cache, Role::U, *y, at, Some((heads * head_dim, Dtype::F32)))?;
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::Keys,
+                            *mixed,
+                            at,
+                            Some((heads * head_dim, Dtype::Bf16)),
+                        )?;
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::U,
+                            *y,
+                            at,
+                            Some((heads * head_dim, Dtype::F32)),
+                        )?;
                     }
                     let elems = u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim);
                     if elems > layout.work_elems {
@@ -408,11 +424,19 @@ impl Layout {
                     }
                 }
                 Operation::Gather(
-                    Gather::NgramIds { ids, state, .. } | Gather::NgramIdsChunked { ids, state, .. },
+                    Gather::NgramIds { ids, state, .. }
+                    | Gather::NgramIdsChunked { ids, state, .. },
                 ) => {
                     // Its own rows' table ids land where the fire's land
                     // (`gather.ngram_ids_committed`): no extended region.
-                    plane(&mut layout, cache_of(trace, *state)?, Role::Ids, *ids, at, None)?;
+                    plane(
+                        &mut layout,
+                        cache_of(trace, *state)?,
+                        Role::Ids,
+                        *ids,
+                        at,
+                        None,
+                    )?;
                 }
                 _ => {}
             }
@@ -611,7 +635,9 @@ impl Layout {
             // A plane no fire extends takes no bytes of the run.
             .map(|(row_bytes, life)| {
                 (
-                    row_bytes.map_or(0, |row_bytes| (rows * row_bytes).max(4).next_multiple_of(256)),
+                    row_bytes.map_or(0, |row_bytes| {
+                        (rows * row_bytes).max(4).next_multiple_of(256)
+                    }),
                     life,
                 )
             })

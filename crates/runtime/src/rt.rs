@@ -1,9 +1,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    #[cfg(not(test))]
-    pub use std::time::Instant;
     #[cfg(test)]
     pub use super::test_clock::Instant;
+    #[cfg(not(test))]
+    pub use std::time::Instant;
     pub use tokio::task::{JoinHandle, spawn, spawn_blocking, yield_now};
 
     pub mod time {

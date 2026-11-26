@@ -172,5 +172,4 @@ mod tests {
             "{refused:?}"
         );
     }
-
 }

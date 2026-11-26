@@ -187,7 +187,6 @@ mod tests {
         ids.iter().map(|&i| WorkerId(i)).collect()
     }
 
-
     #[test]
     fn route_every_case() {
         filters_unhealthy_disconnected_and_model();
@@ -303,7 +302,10 @@ mod tests {
     /// that takes no seat ever is.
     #[test]
     fn a_launch_is_refused_only_with_no_healthy_worker() {
-        let full = handle_with(table(vec![worker(1, "m", Health::Healthy, 255, 4096)]), &[1]);
+        let full = handle_with(
+            table(vec![worker(1, "m", Health::Healthy, 255, 4096)]),
+            &[1],
+        );
         assert_eq!(full.admit(&launch()), AdmissionDecision::Admit);
         let gone = handle_with(table(vec![worker(1, "m", Health::Unreachable, 0, 0)]), &[1]);
         assert_eq!(

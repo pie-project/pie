@@ -11,7 +11,10 @@ fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
     let (_, stores) = pool_with_rungs_of(vec![(256, 2), (2048, 8)]);
     let carrying = |carried| FireRows { own: 5, carried };
     assert_eq!(replay_rung(&stores, 56, carrying(0), 0, 1, false), Ok(5));
-    assert_eq!(replay_rung(&stores, 56, carrying(2048), 2048, 1, false), Ok(2048));
+    assert_eq!(
+        replay_rung(&stores, 56, carrying(2048), 2048, 1, false),
+        Ok(2048)
+    );
     let host = replay_rung(&stores, 56, carrying(2049), 2049, 1, false).unwrap_err();
     assert!(
         host.contains("of 2048 tokens")
@@ -19,7 +22,20 @@ fn a_fire_carrying_past_the_largest_rung_is_refused_by_name() {
             && host.contains("fold what its lanes have written before they write more"),
         "{host}"
     );
-    assert!(replay_rung(&stores, 56, FireRows { own: 4096, carried: 0 }, 0, 1, false).is_ok());
+    assert!(
+        replay_rung(
+            &stores,
+            56,
+            FireRows {
+                own: 4096,
+                carried: 0
+            },
+            0,
+            1,
+            false
+        )
+        .is_ok()
+    );
 }
 
 pub(super) fn pool_of_one_row_rs_pages() -> crate::store::registry::Stores {
@@ -194,8 +210,8 @@ fn a_final_lane_folds_at_fire_and_a_lagged_one_beside_it_carries() {
                 &landings,
             );
             let mut req = lane(start, 1);
-            let plan = host_rs_plan(&stores, &ids, &groups_of, &req, &fold, &[], None, None)
-                .unwrap();
+            let plan =
+                host_rs_plan(&stores, &ids, &groups_of, &req, &fold, &[], None, None).unwrap();
             let frozen_at = lanes_frozen(&stores, &ids, &groups_of, 1, false).unwrap();
             let counted = piece_rows(&req, &[Some((0, 1))], &frozen_at, false);
             let mut store = stores.rs.lock().unwrap();
@@ -220,7 +236,11 @@ fn a_final_lane_folds_at_fire_and_a_lagged_one_beside_it_carries() {
                 .replay_stated
                 .map_or(0, |stated| stated.replayed);
             if *final_rows {
-                assert_eq!(frozen_at, [Some(start)], "step {step}: folded through its first row");
+                assert_eq!(
+                    frozen_at,
+                    [Some(start)],
+                    "step {step}: folded through its first row"
+                );
                 assert_eq!(counted.carried, 0, "step {step}");
                 assert_eq!(req.lanes[0].lane.rs, RsVerb::Fold, "step {step}");
                 assert_eq!(replayed, 0, "step {step}");
@@ -232,16 +252,27 @@ fn a_final_lane_folds_at_fire_and_a_lagged_one_beside_it_carries() {
                 let alone = StepComposition::of([&req.lanes[0].lane]);
                 assert_eq!((alone.treatment, alone.carried), (Treatment::Folds, 0));
             } else {
-                assert_eq!(frozen_at, [Some(10)], "step {step}: nothing read, nothing folded");
+                assert_eq!(
+                    frozen_at,
+                    [Some(10)],
+                    "step {step}: nothing read, nothing folded"
+                );
                 assert_eq!(replayed, step, "step {step}: every row before it carried");
-                assert!(matches!(req.lanes[0].lane.rs, RsVerb::Buffer { .. }), "step {step}");
+                assert!(
+                    matches!(req.lanes[0].lane.rs, RsVerb::Buffer { .. }),
+                    "step {step}"
+                );
                 let alone = StepComposition::of([&req.lanes[0].lane]);
                 assert_eq!(alone.treatment, Treatment::Buffers);
             }
             fired.push(req.lanes[0].lane.clone());
         }
         let mixed = StepComposition::of(&fired);
-        assert_eq!(mixed.treatment, Treatment::Buffers, "step {step}: a mixed step buffers");
+        assert_eq!(
+            mixed.treatment,
+            Treatment::Buffers,
+            "step {step}: a mixed step buffers"
+        );
         assert_eq!(mixed.decode_lanes, 2);
     }
 }

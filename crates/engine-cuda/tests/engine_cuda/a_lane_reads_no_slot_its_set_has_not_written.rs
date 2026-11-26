@@ -79,20 +79,21 @@ fn serve(graphs: Graphs) {
     let word = |rows: u32| trace.facts.word(&Request::new(rows, false));
     let prompt: Vec<u32> = (0..PROMPT).map(|t| (t * 7 + 11) % VOCAB).collect();
     // `(slot, set, readable, tokens, held)`.
-    let fire = |shell: &mut Shell, slot: u32, set: u64, readable: u32, tokens: &[u32], held: u32| {
-        let seated = [Seated {
-            pages: &pages,
-            held: Some(held),
-            set,
-            readable,
-            ..Seated::of(Lane {
-                slot,
-                word: word(tokens.len() as u32),
-                tokens,
-            })
-        }];
-        shell.fire_rows(&seated, &[Readout::Last])
-    };
+    let fire =
+        |shell: &mut Shell, slot: u32, set: u64, readable: u32, tokens: &[u32], held: u32| {
+            let seated = [Seated {
+                pages: &pages,
+                held: Some(held),
+                set,
+                readable,
+                ..Seated::of(Lane {
+                    slot,
+                    word: word(tokens.len() as u32),
+                    tokens,
+                })
+            }];
+            shell.fire_rows(&seated, &[Readout::Last])
+        };
     for slot in 0..2 {
         shell.open(slot).expect("a slot opens");
     }

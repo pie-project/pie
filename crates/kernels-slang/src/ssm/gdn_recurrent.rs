@@ -345,7 +345,19 @@ pub fn gated_delta_carried(
 ) -> Result<(), Error> {
     gated_delta_carried_as(
         "ssm_gdn_carried_r128_bf16",
-        ctx, tactic, qkv, gated, state, carry, planes, k_heads, v_heads, k_dim, v_dim, y, span,
+        ctx,
+        tactic,
+        qkv,
+        gated,
+        state,
+        carry,
+        planes,
+        k_heads,
+        v_heads,
+        k_dim,
+        v_dim,
+        y,
+        span,
     )
 }
 
@@ -384,7 +396,10 @@ pub fn gated_delta_carried_fold(
         k_dim,
         v_dim,
         y,
-        RowSpan { row0: 0, rows: folds },
+        RowSpan {
+            row0: 0,
+            rows: folds,
+        },
     )
 }
 
@@ -450,7 +465,14 @@ fn gated_delta_carried_as(
                 y.arg_mut(),
             ][..],
             &state.piece_args(true),
-            &[stated(OP, carry.lane0)?.arg(), kh, vh, kd, vd, span.row0.arg()],
+            &[
+                stated(OP, carry.lane0)?.arg(),
+                kh,
+                vh,
+                kd,
+                vd,
+                span.row0.arg(),
+            ],
             &carry.page_args(OP)?,
             &ba_plane.args(),
             &k_plane.args(),

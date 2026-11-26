@@ -6,8 +6,8 @@
 //! tokens folded step by step answer.
 
 use engine::fire::{FoldLen, RsReset, RsVerb};
-use engine_metal::serve::Seated;
 use engine_metal::Lane;
+use engine_metal::serve::Seated;
 use poem::Request;
 
 use super::a_scattered_pool_serves_the_same_logits::{fixture_of, load_with};
@@ -16,7 +16,10 @@ const PROMPT: u32 = 20;
 const STEPS: u32 = 24;
 
 fn spread(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 #[test]
@@ -32,14 +35,23 @@ fn an_unfolded_decode_is_the_folded_one() {
     let tokens: Vec<u32> = (0..STEPS).map(|at| (5 + at * 53) % 256).collect();
     let per_page = shell.pool_layout().rs_tokens.max(1);
     let fold = RsVerb::Fold;
-    let fire = |shell: &mut engine_metal::Shell, slot: u32, held: u32, toks: &[u32], rs: &RsVerb, reset: RsReset| {
+    let fire = |shell: &mut engine_metal::Shell,
+                slot: u32,
+                held: u32,
+                toks: &[u32],
+                rs: &RsVerb,
+                reset: RsReset| {
         shell
             .fire_seated(&[Seated {
                 replay_stated: None,
                 held: Some(held),
                 rs,
                 rs_reset: reset,
-                ..Seated::of(Lane { slot, word: word(toks.len() as u32), tokens: toks })
+                ..Seated::of(Lane {
+                    slot,
+                    word: word(toks.len() as u32),
+                    tokens: toks,
+                })
             }])
             .expect("the fire lands")[0]
             .clone()
@@ -75,9 +87,10 @@ fn an_unfolded_decode_is_the_folded_one() {
         let d = spread(&folded, &replayed);
         let scale = folded.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
         let argmax = |v: &[f32]| {
-            v.iter()
-                .enumerate()
-                .fold((0usize, f32::MIN), |best, (at, &x)| if x > best.1 { (at, x) } else { best })
+            v.iter().enumerate().fold(
+                (0usize, f32::MIN),
+                |best, (at, &x)| if x > best.1 { (at, x) } else { best },
+            )
         };
         let (top, top_logit) = argmax(&folded);
         let runner_up = folded
@@ -92,5 +105,8 @@ fn an_unfolded_decode_is_the_folded_one() {
             first = Some(k);
         }
     }
-    assert!(first.is_none(), "an unfolded decode parts from the folded one at step {first:?}: worst {worst} of the logits' scale");
+    assert!(
+        first.is_none(),
+        "an unfolded decode parts from the folded one at step {first:?}: worst {worst} of the logits' scale"
+    );
 }

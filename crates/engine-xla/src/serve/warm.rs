@@ -581,9 +581,7 @@ impl Shell {
         if masks {
             let twins: Vec<Vec<Want>> = shapes
                 .iter()
-                .filter(|shape| {
-                    !shape.is_empty() && shape.iter().all(|w| w.rows > 1 && !w.masked)
-                })
+                .filter(|shape| !shape.is_empty() && shape.iter().all(|w| w.rows > 1 && !w.masked))
                 .map(|shape| {
                     let mut lanes = shape.clone();
                     lanes[0].masked = true;
@@ -759,9 +757,9 @@ impl Shell {
         // the programs' room (the growth the loader may hold): what the load
         // states, else what the stated host bound leaves of the worker's
         // resident memory now, the host tier's kv in it
-        let stated = self.host_programs.or(self.host_bound.map(|b| {
-            b.saturating_sub(crate::device::resident_bytes().unwrap_or(b))
-        }));
+        let stated = self.host_programs.or(self
+            .host_bound
+            .map(|b| b.saturating_sub(crate::device::resident_bytes().unwrap_or(b))));
         // the room of a compile, the widest of theirs (the guest stages'
         // compile beside them, by their measured needs, is kept too:
         // `guest::run::guest_reserve`, read as it loads)
@@ -1543,4 +1541,3 @@ fn keep_width(width: &super::LoadWidth, knee: usize) {
         Err(why) => tracing::warn!(%why, "xla loader width not kept: measured again next load"),
     }
 }
-

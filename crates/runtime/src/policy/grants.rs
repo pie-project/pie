@@ -78,7 +78,10 @@ mod tests {
         let names = |t: &[&str]| t.iter().map(|t| t.to_string()).collect();
         install(
             version,
-            groups.iter().map(|(g, t, id)| (g.to_string(), names(t), *id)).collect(),
+            groups
+                .iter()
+                .map(|(g, t, id)| (g.to_string(), names(t), *id))
+                .collect(),
             default.map(|(t, id)| (names(t), id)),
         );
     }
@@ -103,7 +106,11 @@ mod tests {
         withdraw();
         assert_eq!(granted("g", "acme"), None, "withdrawn: fails closed");
         grants(1, &[("g", &["acme"], 1)], None);
-        assert_eq!(granted("g", "acme"), Some(1), "after a withdrawal any version installs");
+        assert_eq!(
+            granted("g", "acme"),
+            Some(1),
+            "after a withdrawal any version installs"
+        );
         withdraw();
     }
 }

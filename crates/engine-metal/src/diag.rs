@@ -272,7 +272,10 @@ pub fn made(what: &str, bytes: u64) {
         })
         .take(6)
         .collect();
-    eprintln!("[made t_us={t_us} what={what} bytes={bytes} at={}]", frames.join(" < "));
+    eprintln!(
+        "[made t_us={t_us} what={what} bytes={bytes} at={}]",
+        frames.join(" < ")
+    );
 }
 
 #[cfg(test)]
@@ -306,7 +309,12 @@ mod tests {
         assert!(!diag.keepalive);
         let diag: Diagnostics = "alloc-trace".parse().expect("alloc-trace parses");
         assert!(diag.alloc_trace && diag.any());
-        assert!(!"alloc-trace=off".parse::<Diagnostics>().expect("parses").alloc_trace);
+        assert!(
+            !"alloc-trace=off"
+                .parse::<Diagnostics>()
+                .expect("parses")
+                .alloc_trace
+        );
     }
 
     fn an_unknown_word_refuses_by_name() {

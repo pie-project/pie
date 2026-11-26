@@ -144,7 +144,10 @@ pub fn op_work(op: &Op, types: &[ValueType], results: &[ValueType]) -> u64 {
             (Some(a), Some(b)) => {
                 let k = a.shape.last_len().unwrap_or(1) as u64;
                 let elem = super::container::const_elem_size(a.dtype) as u64;
-                let mn = a.shape.rows().saturating_mul(b.shape.last_len().unwrap_or(1) as u64);
+                let mn = a
+                    .shape
+                    .rows()
+                    .saturating_mul(b.shape.last_len().unwrap_or(1) as u64);
                 mn.saturating_mul(k).saturating_mul(elem).max(linear)
             }
             _ => linear,
@@ -362,11 +365,9 @@ impl fmt::Display for ValidateError {
                  may take; its fire would fault every tenant's",
                 stage.name()
             ),
-            StageBytesOverflow { stage } => write!(
-                f,
-                "stage {}: its values' bytes pass a u64",
-                stage.name()
-            ),
+            StageBytesOverflow { stage } => {
+                write!(f, "stage {}: its values' bytes pass a u64", stage.name())
+            }
         }
     }
 }

@@ -562,16 +562,16 @@ pub fn lse_sink() -> Rule {
             pair(false, true),
         ],
         |m| {
-        let Operation::Attn(attn) = m.op("o") else {
-            panic!("the sinked output comes from an attention");
-        };
-        Fused::LseSink {
-            attn: Box::new(attn.clone()),
-            sink: m.value("sink"),
-            head_dim: m.u32("d"),
-            o_out: m.value("o_out"),
-        }
-    },
+            let Operation::Attn(attn) = m.op("o") else {
+                panic!("the sinked output comes from an attention");
+            };
+            Fused::LseSink {
+                attn: Box::new(attn.clone()),
+                sink: m.value("sink"),
+                head_dim: m.u32("d"),
+                o_out: m.value("o_out"),
+            }
+        },
     )
 }
 
@@ -942,7 +942,8 @@ fn qkv_admits(m: &Match) -> bool {
             span == d / 2 || (m.get_f32("eps").is_none() && 2 * span <= d && span > 0)
         })
         && m.get_u32("kv_width").is_none_or(|w| w % d == 0)
-        && m.get_f32("v_eps").is_none_or(|v| Some(v) == m.get_f32("eps"))
+        && m.get_f32("v_eps")
+            .is_none_or(|v| Some(v) == m.get_f32("eps"))
 }
 
 /// A row norm whose output joins the residual stream, optionally scaled and
@@ -1104,8 +1105,10 @@ pub fn residual_add_rmsnorm_matmul() -> Rule {
             p.export("z", &z);
         })
     };
-    Rule::new("fused.residual_add_rmsnorm_matmul", Norm::BOTH.map(chain), |m| {
-        Fused::ResidualAddRmsnormMatmul {
+    Rule::new(
+        "fused.residual_add_rmsnorm_matmul",
+        Norm::BOTH.map(chain),
+        |m| Fused::ResidualAddRmsnormMatmul {
             x: m.value("x"),
             y: m.value("y"),
             y_out: m.value("y_out"),
@@ -1115,8 +1118,8 @@ pub fn residual_add_rmsnorm_matmul() -> Rule {
             out: m.value("out"),
             w: m.value("w"),
             z: m.value("z"),
-        }
-    })
+        },
+    )
 }
 
 /// [`residual_add_rmsnorm_matmul`]'s norm feeding a dense MLP whole

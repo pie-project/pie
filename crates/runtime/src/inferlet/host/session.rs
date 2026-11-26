@@ -219,8 +219,11 @@ impl pie::inferlet::session::Host for ProcessCtx {
         let Some(client_id) = process::get_client_id(process_id).await.ok().flatten() else {
             return Ok(None);
         };
-        match process::away_while(process_id, crate::server::receive_file(client_id, process_id))
-            .await
+        match process::away_while(
+            process_id,
+            crate::server::receive_file(client_id, process_id),
+        )
+        .await
         {
             Ok(data) => Ok(Some(data.to_vec())),
             Err(error) => {
@@ -254,8 +257,11 @@ impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
         let Some(client_id) = process::get_client_id(process_id).await.ok().flatten() else {
             return Ok(None);
         };
-        match process::away_while(process_id, crate::server::receive_file(client_id, process_id))
-            .await
+        match process::away_while(
+            process_id,
+            crate::server::receive_file(client_id, process_id),
+        )
+        .await
         {
             Ok(data) => Ok(Some(data.to_vec())),
             Err(error) => {

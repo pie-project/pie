@@ -20,7 +20,9 @@ fn a_body_on_its_own_stream_takes_its_owners_tile() {
     let gpu = Gpu::open();
     let main = gpu.ctx();
     let laid = gpu
-        .laid(&main, |ctx| ctx.scratch_stream("test", DECODED_WEIGHT, TILE))
+        .laid(&main, |ctx| {
+            ctx.scratch_stream("test", DECODED_WEIGHT, TILE)
+        })
         .expect("the main tile is laid");
 
     let mut body: rt::cudaStream_t = core::ptr::null_mut();

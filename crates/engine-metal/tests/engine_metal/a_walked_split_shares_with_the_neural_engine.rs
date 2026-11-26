@@ -5,11 +5,13 @@
 //! load's split fires land, to the bit, what a load never walked lands.
 #![cfg(target_vendor = "apple")]
 
-use poem_compiler::Budget;
 use engine_metal::chip::{AneMlp, AneProjections};
 use engine_metal::{Lane, Seated, Shell};
+use poem_compiler::Budget;
 
-use super::a_scattered_pool_serves_the_same_logits::{Fixture, Load, Profiles, deployed_fixture, word};
+use super::a_scattered_pool_serves_the_same_logits::{
+    Fixture, Load, Profiles, deployed_fixture, word,
+};
 
 /// A prompt of `rows` rows from an empty seat, its last row read out.
 fn fire(shell: &mut Shell, fixture: &Fixture, rows: u32) -> Vec<f32> {
@@ -61,23 +63,42 @@ fn a_split_load(model: &str, mlp: bool, rows: &[u32]) {
             return;
         }
         shell.open(0).expect("a slot opens");
-        rows.iter().map(|&n| fire(&mut shell, &fixture, n)).collect()
+        rows.iter()
+            .map(|&n| fire(&mut shell, &fixture, n))
+            .collect()
     };
     let mut shell = load();
-    assert!(shell.neural_engine().is_some(), "{model} splits as the device profile states");
+    assert!(
+        shell.neural_engine().is_some(),
+        "{model} splits as the device profile states"
+    );
     shell.warm_pipelines().expect("the walk runs");
     shell.seal_pipelines().expect("the pipelines seal");
     let splits = |shell: &Shell| shell.neural_engine().expect("the split").splits();
     assert_eq!(splits(&shell), 0, "the walk hands nothing over");
     shell.open(0).expect("a slot opens");
     let built = shell.compiled();
-    let shared: Vec<Vec<f32>> = rows.iter().map(|&n| fire(&mut shell, &fixture, n)).collect();
+    let shared: Vec<Vec<f32>> = rows
+        .iter()
+        .map(|&n| fire(&mut shell, &fixture, n))
+        .collect();
     for ((&n, got), want) in rows.iter().zip(&shared).zip(&unwalked) {
-        assert!(got.iter().all(|v| v.is_finite()), "{model} at {n} rows is finite");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "{model} at {n} rows is finite"
+        );
         assert_eq!(got, want, "{model} at {n} rows, walked and never walked");
     }
-    assert_eq!(splits(&shell) > 0, mlp, "the MLPs are handed over where it has any");
-    assert_eq!(shell.take_unbuilt_pipelines(), 0, "a shared fire met an unbuilt pipeline");
+    assert_eq!(
+        splits(&shell) > 0,
+        mlp,
+        "the MLPs are handed over where it has any"
+    );
+    assert_eq!(
+        shell.take_unbuilt_pipelines(),
+        0,
+        "a shared fire met an unbuilt pipeline"
+    );
     shell
         .neural_engine()
         .expect("the split")
@@ -86,13 +107,27 @@ fn a_split_load(model: &str, mlp: bool, rows: &[u32]) {
     let handed = splits(&shell);
     for (&n, shared) in rows.iter().zip(&shared) {
         let alone = fire(&mut shell, &fixture, n);
-        assert!(alone.iter().all(|v| v.is_finite()), "{model} at {n} rows alone is finite");
-        eprintln!("{model} {n} rows, shared against alone: relative RMS {}", rms(shared, &alone));
+        assert!(
+            alone.iter().all(|v| v.is_finite()),
+            "{model} at {n} rows alone is finite"
+        );
+        eprintln!(
+            "{model} {n} rows, shared against alone: relative RMS {}",
+            rms(shared, &alone)
+        );
         assert_ne!(*shared, alone, "{model} at {n} rows was shared");
     }
     assert_eq!(splits(&shell), handed, "a retired split hands nothing over");
-    assert_eq!(shell.take_unbuilt_pipelines(), 0, "a retired fire met an unbuilt pipeline");
-    assert_eq!(shell.compiled(), built, "a fire built a pipeline past the seal");
+    assert_eq!(
+        shell.take_unbuilt_pipelines(),
+        0,
+        "a retired fire met an unbuilt pipeline"
+    );
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "a fire built a pipeline past the seal"
+    );
 }
 
 #[test]
@@ -106,5 +141,9 @@ fn a_walked_split_shares_with_the_neural_engine() {
     // tail past a later procedure (544).
     let tails: Vec<u32> = (256..=288).chain([300, 512, 544, 800]).collect();
     a_split_load("qwen35-d0.8b-u4g64-kv-bf16", true, &tails);
-    a_split_load("gemma4-e4b-mini-l1-u4g64-kv-bf16", false, &[256, 272, 300, 512]);
+    a_split_load(
+        "gemma4-e4b-mini-l1-u4g64-kv-bf16",
+        false,
+        &[256, 272, 300, 512],
+    );
 }

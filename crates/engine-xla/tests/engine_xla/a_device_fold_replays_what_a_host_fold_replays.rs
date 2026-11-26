@@ -79,17 +79,22 @@ fn bind_fold(model: &mut Model) -> InstanceId {
     let bound = eta_ir::validate::bind(container, vec![Vec::new()], engine_caps)
         .expect("the fold program binds");
     let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
-    let program = engine::Programs::register(&mut model.engine, &ProgramRegistration {
+    let program = engine::Programs::register(
+        &mut model.engine,
+        &ProgramRegistration {
             launch,
             ..Default::default()
-        })
-        .expect("the fold program registers");
+        },
+    )
+    .expect("the fold program registers");
     let channels: Vec<ChannelId> = [ROWS, 1]
         .iter()
         .enumerate()
         .map(|(at, &width)| {
             let id = ChannelId((1 << 20) + at as u64);
-            engine::Channels::open(&mut model.engine, &ChannelRegistration {
+            engine::Channels::open(
+                &mut model.engine,
+                &ChannelRegistration {
                     id,
                     shape: vec![width],
                     dtype: ChanDType::Concrete(EtaDtype::U32),
@@ -99,12 +104,15 @@ fn bind_fold(model: &mut Model) -> InstanceId {
                     capacity: 2,
                     extern_name: Vec::new(),
                     slots: Vec::new(),
-                })
-                .expect("the channel registers");
+                },
+            )
+            .expect("the channel registers");
             id
         })
         .collect();
-    engine::Programs::bind(&mut model.engine, &InstanceBinding {
+    engine::Programs::bind(
+        &mut model.engine,
+        &InstanceBinding {
             program,
             channels,
             seeds: Vec::new(),
@@ -123,9 +131,10 @@ fn bind_fold(model: &mut Model) -> InstanceId {
                 ..engine::program::BindExtents::default()
             },
             pair_generation: 0,
-        })
-        .expect("the fold program binds an instance")
-        .id
+        },
+    )
+    .expect("the fold program binds an instance")
+    .id
 }
 
 /// The rs list's shape and the slots a slot ref of it holds.
@@ -149,23 +158,35 @@ struct Set {
 }
 
 impl Set {
-    fn new(model: &mut Model, refs: &mut Refs, slot: u32, rs_tokens: u32, rs_shape: ShapeId) -> Set {
+    fn new(
+        model: &mut Model,
+        refs: &mut Refs,
+        slot: u32,
+        rs_tokens: u32,
+        rs_shape: ShapeId,
+    ) -> Set {
         let mut seq = Seq::new(slot);
         let prompt = seq.lane(model, refs, tokens(7, PROMPT as usize, model.vocab));
         model.fire(vec![prompt]);
         seq.held = PROMPT;
         let pages = (3 * ROWS).div_ceil(rs_tokens) as usize + 1;
         let rs = (0..pages).map(|_| refs.take(rs_shape)).collect();
-        Set {
-            seq,
-            rs,
-        }
+        Set { seq, rs }
     }
 
     /// A buffering lane of `ROWS` rows whose state holds the slots below
     /// `folded`, folding `fold`.
-    fn lane(&mut self, model: &Model, refs: &mut Refs, seed: u64, folded: u32, fold: FoldLen) -> Lane {
-        let mut lane = self.seq.lane(model, refs, tokens(seed, ROWS as usize, model.vocab));
+    fn lane(
+        &mut self,
+        model: &Model,
+        refs: &mut Refs,
+        seed: u64,
+        folded: u32,
+        fold: FoldLen,
+    ) -> Lane {
+        let mut lane = self
+            .seq
+            .lane(model, refs, tokens(seed, ROWS as usize, model.vocab));
         lane.rs = RsVerb::Buffer {
             pages: self.rs.clone(),
             base: PROMPT,
@@ -285,9 +306,12 @@ fn a_kv_only_device_fold_reports_its_count() {
     let instance = bind_fold(&mut model);
     let heard: std::sync::Arc<std::sync::Mutex<Vec<engine::KvWrites>>> = Default::default();
     let into = std::sync::Arc::clone(&heard);
-    engine::Completion::on_complete(&mut model.engine, std::sync::Arc::new(move |_, outcome| {
-        into.lock().expect("heard").extend(outcome.wrote);
-    }));
+    engine::Completion::on_complete(
+        &mut model.engine,
+        std::sync::Arc::new(move |_, outcome| {
+            into.lock().expect("heard").extend(outcome.wrote);
+        }),
+    );
     let mut seq = Seq::new(0);
     let mut lane = |model: &Model, refs: &mut Refs, seed: u64, tag: u64| {
         let mut lane = seq.lane(model, refs, tokens(seed, ROWS as usize, model.vocab));
@@ -311,6 +335,14 @@ fn a_kv_only_device_fold_reports_its_count() {
     let heard = heard.lock().expect("heard");
     let fold = |tag: u64| heard.iter().find(|w| w.tag == tag).map(|w| w.fold);
     assert_eq!(fold(101), Some(Some(N)), "the first fire reports its count");
-    assert_eq!(fold(102), Some(Some(N)), "the second, in flight with it, its own");
-    assert_eq!(fold(103), Some(None), "a lane no program folds reports no count");
+    assert_eq!(
+        fold(102),
+        Some(Some(N)),
+        "the second, in flight with it, its own"
+    );
+    assert_eq!(
+        fold(103),
+        Some(None),
+        "a lane no program folds reports no count"
+    );
 }

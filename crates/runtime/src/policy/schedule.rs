@@ -223,7 +223,11 @@ mod tests {
             hold_default: Some(None),
             ..Change::default()
         });
-        assert_eq!(*current().unwrap(), Table::default(), "a withdrawal leaves no row");
+        assert_eq!(
+            *current().unwrap(),
+            Table::default(),
+            "a withdrawal leaves no row"
+        );
         install(None);
     }
 }

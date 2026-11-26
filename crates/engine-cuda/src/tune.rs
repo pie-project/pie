@@ -76,8 +76,7 @@ pub fn rates(
     ));
     let tuned = engine::rates::tuned(&r);
     let provenance = crate::rates::provenance(&name);
-    let file =
-        engine::rates::saved_text(user_file(profiles, &name).as_deref(), &r, &provenance);
+    let file = engine::rates::saved_text(user_file(profiles, &name).as_deref(), &r, &provenance);
     let block = format!(
         "{tuned}\n[provenance]\n{} = {}\n",
         provenance.0, provenance.1
@@ -469,7 +468,11 @@ pub fn run(
         &provenance,
         &[crate::chip::ARCH],
     )?;
-    let file = engine::rates::keeping_stored(crate::chip::registry(), file, user_file(profiles, &name).as_deref());
+    let file = engine::rates::keeping_stored(
+        crate::chip::registry(),
+        file,
+        user_file(profiles, &name).as_deref(),
+    );
     Ok(Outcome {
         device: name,
         file,
@@ -558,7 +561,11 @@ mod tests {
                 );
             }
             let file = crate::chip::registry()
-                .parse(&user_file(Some(home.path()), gpu).unwrap(), said, profile::Strict::User)
+                .parse(
+                    &user_file(Some(home.path()), gpu).unwrap(),
+                    said,
+                    profile::Strict::User,
+                )
                 .unwrap();
             assert_eq!(file.tuned.rates.launch_ns, Some(launch), "{said}");
             assert_eq!(file.tuned.rates.scan_gelems, Some(scan), "{said}");
@@ -566,7 +573,11 @@ mod tests {
         };
 
         // A load stored its measurements.
-        std::fs::write(&path, engine::rates::saved_text(None, &rates(4321, 7.5), &how)).unwrap();
+        std::fs::write(
+            &path,
+            engine::rates::saved_text(None, &rates(4321, 7.5), &how),
+        )
+        .unwrap();
         assert!(!takes(4321, 7.5, "a load's own save"));
 
         // A tune's file over it.
@@ -586,7 +597,11 @@ mod tests {
             &[crate::chip::ARCH],
         )
         .expect("the tuned file");
-        let kept = engine::rates::keeping_stored(crate::chip::registry(), tuned, user_file(Some(home.path()), gpu).as_deref());
+        let kept = engine::rates::keeping_stored(
+            crate::chip::registry(),
+            tuned,
+            user_file(Some(home.path()), gpu).as_deref(),
+        );
         std::fs::write(&path, kept).unwrap();
         assert!(takes(4321, 7.5, "a tune"), "the tuned decision is there");
 
@@ -594,6 +609,9 @@ mod tests {
         let existing = user_file(Some(home.path()), gpu);
         let rated = engine::rates::saved_text(existing.as_deref(), &rates(1234, 8.5), &how);
         std::fs::write(&path, rated).unwrap();
-        assert!(takes(1234, 8.5, "a rates step"), "the tuned decision stands");
+        assert!(
+            takes(1234, 8.5, "a rates step"),
+            "the tuned decision stands"
+        );
     }
 }

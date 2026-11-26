@@ -1,9 +1,9 @@
 #![cfg(target_vendor = "apple")]
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
-use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
 #[test]
 fn mma_attention_matches_fp64() {

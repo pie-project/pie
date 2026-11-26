@@ -13,8 +13,8 @@ use engine_gpu::store::Pools;
 use engine_gpu::store::layout::INSTANCE;
 
 use crate::serve::GuestRing;
-use engine_gpu::backend::Buffer as _;
 use engine::guest_claims::{Claims, Holder, PairClaim, Run};
+use engine_gpu::backend::Buffer as _;
 use engine_gpu::guest::held::{self, TableLayout, consecutive};
 use engine_gpu::guest::ring::{Berth, PassLayout};
 use engine_gpu::guest::session::{
@@ -915,7 +915,9 @@ impl Session {
         rebound.own.1 = own?;
         // The pair's state moved for every instance on it: the group's.
         if !parked {
-            rebound.pair_runs = self.pair_group.map(|(group, _)| (Holder::Pair(group), pair));
+            rebound.pair_runs = self
+                .pair_group
+                .map(|(group, _)| (Holder::Pair(group), pair));
         }
         Ok(rebound)
     }

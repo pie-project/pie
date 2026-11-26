@@ -339,7 +339,12 @@ pub(crate) fn on_lt(
         ws,
         ws_bytes,
     )
-    .map_err(|why| refuse(op, format!("cuBLASLt's epilogue {why} at M={m} N={n} K={k}")))
+    .map_err(|why| {
+        refuse(
+            op,
+            format!("cuBLASLt's epilogue {why} at M={m} N={n} K={k}"),
+        )
+    })
 }
 
 /// `outs = epi(act . w^T)` on the unfused leg: the plain product into
@@ -708,7 +713,9 @@ fn first_heuristic(
     op_desc: lt::cublasLtMatmulDesc_t,
     plan: &LtPlan,
 ) -> Option<lt::cublasLtMatmulHeuristicResult_t> {
-    heuristics(lt_handle, workspace_bytes, op_desc, plan, 1)?.into_iter().next()
+    heuristics(lt_handle, workspace_bytes, op_desc, plan, 1)?
+        .into_iter()
+        .next()
 }
 
 /// cuBLASLt's first `count` heuristic algorithms for the product, in its own
@@ -1265,7 +1272,8 @@ fn candidates(
         let mut lts = Vec::new();
         if device.lt.ensure()
             && let (Ok(mi), Ok(ni), Ok(ki)) = (i32::try_from(m), i32::try_from(n), i32::try_from(k))
-            && let Some(plan) = build_lt_plan(device.lt.handle, device.lt.workspace_bytes, mi, ni, ki)
+            && let Some(plan) =
+                build_lt_plan(device.lt.handle, device.lt.workspace_bytes, mi, ni, ki)
         {
             lts = heuristics(
                 device.lt.handle,
@@ -1276,7 +1284,10 @@ fn candidates(
             )
             .unwrap_or_default();
         }
-        let skinny = Candidate { code: skinny_code(), serves: Serves::Skinny };
+        let skinny = Candidate {
+            code: skinny_code(),
+            serves: Serves::Skinny,
+        };
         let lt: Vec<Candidate> = lts
             .into_iter()
             .map(|heuristic| Candidate {
@@ -1297,7 +1308,9 @@ fn candidates(
             listed.extend(lt.into_iter().skip(1));
         }
         let listed = Arc::new(listed);
-        device.listed.insert((m, n, k, skinny_first), Arc::clone(&listed));
+        device
+            .listed
+            .insert((m, n, k, skinny_first), Arc::clone(&listed));
         listed
     })
 }

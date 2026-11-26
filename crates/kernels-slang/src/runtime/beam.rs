@@ -145,12 +145,7 @@ pub fn copy_pages(ctx: &Ctx<'_>, records: Records, planes: u32, page: u32) -> Re
 
 /// Runs each of `records.count` beams' rs copies over `planes` planes, a
 /// workgroup a (copy, plane, slot), `page` slots a kv page.
-pub fn copy_rs_rows(
-    ctx: &Ctx<'_>,
-    records: Records,
-    planes: u32,
-    page: u32,
-) -> Result<(), Error> {
+pub fn copy_rs_rows(ctx: &Ctx<'_>, records: Records, planes: u32, page: u32) -> Result<(), Error> {
     if records.count == 0 || planes == 0 || page == 0 {
         return Ok(());
     }

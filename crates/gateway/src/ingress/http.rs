@@ -40,11 +40,7 @@ pub async fn generate(
         resume: None,
     };
 
-    let (handle, rx) = match state
-        .sessions
-        .create(ident, turn)
-        .await
-    {
+    let (handle, rx) = match state.sessions.create(ident, turn).await {
         Ok(pair) => pair,
         Err(e) => {
             return (

@@ -346,7 +346,9 @@ pub(crate) fn on_done(
         fed: fed_rows,
     } = seat;
     let read_layout = layout.clone();
-    let supplies = fed.clone().filter(engine_gpu::settle::FedCheck::reads_beams);
+    let supplies = fed
+        .clone()
+        .filter(engine_gpu::settle::FedCheck::reads_beams);
     let verdict = mirror.clone();
     let land = move |read: Result<Rows, String>| {
         worker.land(Landing {
@@ -428,7 +430,11 @@ mod tests {
             .collect();
         let mut faulted = Worker::new().run_all(jobs);
         faulted.sort_by_key(|fault| fault.lanes.start);
-        assert_eq!(ran.load(std::sync::atomic::Ordering::Acquire), 4, "every pass ran");
+        assert_eq!(
+            ran.load(std::sync::atomic::Ordering::Acquire),
+            4,
+            "every pass ran"
+        );
         let told: Vec<(u32, u64)> = faulted
             .iter()
             .map(|fault| (fault.lanes.start, fault.instance.0))

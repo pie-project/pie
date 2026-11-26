@@ -41,8 +41,8 @@ pub use diagnostics::{PlannerDiagnostics, PlannerQueueEntry};
 pub use error::{ADMISSION_REFUSED, PlannerError, StarveCause, TIERS_FULL};
 pub(crate) use global::reset;
 pub use global::{
-    assign, engine_of, init_planner, place, planner, planner_for, planner_of,
-    planners, lead_result, rekey_holders, release, to_end_facts, wake,
+    assign, engine_of, init_planner, lead_result, place, planner, planner_for, planner_of,
+    planners, rekey_holders, release, to_end_facts, wake,
 };
 pub use grant::{AllocationGrant, Demand};
 pub use in_flight::FireInFlight;

@@ -343,7 +343,11 @@ mod tests {
             (1.0, 2.0, FLOOR),
             (1.0, f64::NAN, CEILING),
         ] {
-            assert_eq!(target(FLOOR, CEILING, yield_, pressure), want, "{yield_} {pressure}");
+            assert_eq!(
+                target(FLOOR, CEILING, yield_, pressure),
+                want,
+                "{yield_} {pressure}"
+            );
         }
         assert_eq!(target(2 * CEILING, CEILING, 1.0, 1.0), CEILING);
     }
@@ -386,5 +390,4 @@ mod tests {
         assert_eq!(rungs(256, 4096), vec![256, 512, 1024, 2048, 4096]);
         assert_eq!(rungs(300, 4096), vec![512, 1024, 2048, 4096]);
     }
-
 }

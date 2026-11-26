@@ -73,7 +73,10 @@ mod tests {
 
     #[test]
     fn a_discrete_device_seats_what_is_stated_or_its_default() {
-        assert_eq!(DeviceMemory::Own.host_tier(None), Ok(HostTier::Seated(None)));
+        assert_eq!(
+            DeviceMemory::Own.host_tier(None),
+            Ok(HostTier::Seated(None))
+        );
         assert_eq!(
             DeviceMemory::Own.host_tier(Some(8 << 30)),
             Ok(HostTier::Seated(Some(8 << 30)))

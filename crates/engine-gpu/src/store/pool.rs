@@ -128,9 +128,8 @@ pub fn sized(
     // binding: chunks past what those bind are not laid. A span near a
     // binding cuts the pool into few segments, and a pool between whole
     // counts of them binds only the lower count's.
-    let total = total.min(
-        spanned_segments(total, act).saturating_mul(binding_chunks(chunk, binding)),
-    );
+    let total =
+        total.min(spanned_segments(total, act).saturating_mul(binding_chunks(chunk, binding)));
     let span_short = || {
         Fault::Residency(format!(
             "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
@@ -185,7 +184,16 @@ pub fn infeasible(
 ) -> Option<&'static str> {
     if rung.widest > binding {
         Some(PAST_ONE_BINDING)
-    } else if sized(rung.left, kv_budget, chunk_bytes, rung.act, least_chunks, binding).is_err() {
+    } else if sized(
+        rung.left,
+        kv_budget,
+        chunk_bytes,
+        rung.act,
+        least_chunks,
+        binding,
+    )
+    .is_err()
+    {
         Some(PAST_THE_POOL)
     } else {
         None
@@ -519,7 +527,11 @@ impl<B: Backend> Pool<B> {
     /// `frame` before any later fire is encoded (the copies land first), or
     /// puts the old table back ([`Pool::restore`]) and drops `frame`, its
     /// copies unsubmitted. Refused with the table as it stood.
-    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<ChunkTable> {
+    pub fn evacuate(
+        &mut self,
+        frame: &mut B::Frame,
+        evacuation: &Evacuation,
+    ) -> Result<ChunkTable> {
         let mut table = self.table.clone();
         table.apply(evacuation).map_err(|why| Fault::Program {
             at: "store::pool::evacuate",

@@ -89,7 +89,14 @@ impl<B: Backend> Run<'_, B> {
                 });
             }
         };
-        Ok((if place == 0 { Space::ArenaA } else { Space::ArenaB }, word))
+        Ok((
+            if place == 0 {
+                Space::ArenaA
+            } else {
+                Space::ArenaB
+            },
+            word,
+        ))
     }
 
     /// The runs of `run`'s rows of `plane` between the pool and `rect` from
@@ -124,9 +131,16 @@ impl<B: Backend> Run<'_, B> {
                     detail: format!("a pool run of {bytes} bytes at {at}, not whole words"),
                 });
             }
-            let pool = (Space::Segment(segment), u32::try_from(at / 4).unwrap_or(u32::MAX));
+            let pool = (
+                Space::Segment(segment),
+                u32::try_from(at / 4).unwrap_or(u32::MAX),
+            );
             let words = u32::try_from(bytes / 4).unwrap_or(u32::MAX);
-            let (from, to) = if into_slab { (arena, pool) } else { (pool, arena) };
+            let (from, to) = if into_slab {
+                (arena, pool)
+            } else {
+                (pool, arena)
+            };
             runs.push(CopyRun { from, to, words });
             done += take;
         }
@@ -250,7 +264,17 @@ impl<B: Backend> Run<'_, B> {
             }
             if let Some(run) = &plan.scatter {
                 let row0 = indptr[r].max(0) as u32;
-                self.rs_runs(op, seat, plane, run, own, row0, true, &mut arenas, &mut runs)?;
+                self.rs_runs(
+                    op,
+                    seat,
+                    plane,
+                    run,
+                    own,
+                    row0,
+                    true,
+                    &mut arenas,
+                    &mut runs,
+                )?;
             }
         }
         // Every lane's runs in one dispatch: however its rows lie in the

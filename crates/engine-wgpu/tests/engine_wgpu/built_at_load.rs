@@ -36,6 +36,10 @@ fn the_bind_walks_builds_are_the_loads_and_any_other_is_counted() {
         "the walk's builds are the load's, and one made before it stays owed"
     );
     let late = build(&shell, "elemwise_norm_layernorm_unscaled_bf16");
-    assert_eq!(shell.built_serving(), late, "a build after the walk is a fire's");
+    assert_eq!(
+        shell.built_serving(),
+        late,
+        "a build after the walk is a fire's"
+    );
     assert!(shell.built_serving().is_empty(), "each is counted once");
 }

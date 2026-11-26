@@ -161,8 +161,15 @@ pub fn compile_wanted(
                     let Some((at, batch, c)) = wanted.get(i) else {
                         break;
                     };
-                    let staged =
-                        stage(device, package, *at, batch.clone(), c, pool_rows, Some(&admission));
+                    let staged = stage(
+                        device,
+                        package,
+                        *at,
+                        batch.clone(),
+                        c,
+                        pool_rows,
+                        Some(&admission),
+                    );
                     if let Ok(mut slot) = built[i].lock() {
                         *slot = Some(staged);
                     }
@@ -593,9 +600,23 @@ impl Stages {
                 let rows = lower::lane_rows(package, at, reads);
                 let carried_most = padded((top as usize / rows.max(1) as usize).max(1));
                 for &lanes in rungs.iter().filter(|&&lanes| lanes <= carried_most) {
-                    wanted.push((at, Batch { lanes, reads: reads.clone() }, carried.to_vec()));
+                    wanted.push((
+                        at,
+                        Batch {
+                            lanes,
+                            reads: reads.clone(),
+                        },
+                        carried.to_vec(),
+                    ));
                 }
-                wanted.push((at, Batch { lanes: 1, reads: reads.clone() }, Vec::new()));
+                wanted.push((
+                    at,
+                    Batch {
+                        lanes: 1,
+                        reads: reads.clone(),
+                    },
+                    Vec::new(),
+                ));
             }
         }
         let mut seen = std::collections::HashSet::new();
@@ -640,7 +661,12 @@ impl Stages {
         let Some(available) = available else {
             return 0;
         };
-        let need = self.map.values().map(|staged| staged.need).max().unwrap_or(0);
+        let need = self
+            .map
+            .values()
+            .map(|staged| staged.need)
+            .max()
+            .unwrap_or(0);
         let mut freed = 0u64;
         while available.saturating_add(freed) < need {
             let Some(victim) = self
@@ -1298,7 +1324,11 @@ pub fn write_cells(
             .map_err(|e| e.to_string())?;
         let whole = pool.take().ok_or("the pool, which another program holds")?;
         let mut outs = device
-            .run(&program, vec![Arg::Donate(whole), Arg::Keep(&at), Arg::Keep(&data)], false)
+            .run(
+                &program,
+                vec![Arg::Donate(whole), Arg::Keep(&at), Arg::Keep(&data)],
+                false,
+            )
             .map_err(|e| e.to_string())?;
         *pool = Some(outs.pop().ok_or("the cells program returned no pool")?);
     }
@@ -1703,4 +1733,3 @@ fn commit(
     }
     (StepOutcome::Committed, left)
 }
-

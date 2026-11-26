@@ -17,9 +17,9 @@ use anyhow::{Result, anyhow};
 pub(crate) use dispatch::{
     TierKind, TierMove, close_channels, copy_tier_tracked, register_channels_bind_classified,
 };
+pub(crate) use lane::open_behind;
 pub use stats::{AggregateStats, HostSubmitStats};
 pub use worker::BatchScheduler;
-pub(crate) use lane::open_behind;
 use worker::SchedulerHandle;
 
 use crate::engine::EngineId;
@@ -243,7 +243,10 @@ pub(crate) async fn read_host_kv(engine_id: usize, slots: Vec<u32>) -> Result<Ve
 }
 
 /// The bytes of host tier slots, shape by shape, in order (CONTRACT-BC 22).
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "the browser has no host or disk tier")
+)]
 pub(crate) async fn read_tier_slots(
     engine_id: usize,
     slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
@@ -253,7 +256,10 @@ pub(crate) async fn read_tier_slots(
         .await
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "the browser has no host or disk tier")
+)]
 pub(crate) async fn write_tier_slots(
     engine_id: usize,
     slots: Vec<(::engine::chunk::ShapeId, Vec<u32>)>,
@@ -583,13 +589,13 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     lora_program: bool,
 ) -> Result<()> {
     let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
-            src: handle.device_domain(),
-            dst: handle.device_domain(),
-            src_page_ids: copy_src,
-            dst_page_ids: copy_dst,
-            moves: Vec::new(),
-            windowed: Vec::new(),
-        });
+        src: handle.device_domain(),
+        dst: handle.device_domain(),
+        src_page_ids: copy_src,
+        dst_page_ids: copy_dst,
+        moves: Vec::new(),
+        windowed: Vec::new(),
+    });
     handle.submit_prebuilt_tracked_with_copy(
         request,
         instance_id,
@@ -608,7 +614,10 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
 /// launch their scheduler posts from fires they settled), every lane summed.
 pub fn lane_waits() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    (lane::LANE_SLEEPS.load(Relaxed), lane::LANE_AWAITS.load(Relaxed))
+    (
+        lane::LANE_SLEEPS.load(Relaxed),
+        lane::LANE_AWAITS.load(Relaxed),
+    )
 }
 
 pub async fn get_stats() -> AggregateStats {
@@ -729,11 +738,17 @@ mod refused_untouched_tests {
         ))
         .context("kv to LocalDisk copy")));
         let error = refused.wait().await.expect_err("refused");
-        assert!(error.downcast_ref::<RefusedUntouched>().is_some(), "{error:#}");
+        assert!(
+            error.downcast_ref::<RefusedUntouched>().is_some(),
+            "{error:#}"
+        );
         let failed = ControlCompletion::new();
         failed.resolve(&Err(anyhow::anyhow!("device lost")));
         let error = failed.wait().await.expect_err("failed");
-        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
+        assert!(
+            error.downcast_ref::<RefusedUntouched>().is_none(),
+            "{error:#}"
+        );
     }
 
     /// A copy down to a full disk tier (the slot file's write failing
@@ -748,6 +763,9 @@ mod refused_untouched_tests {
         .context("kv to LocalDisk copy")));
         let error = full.wait().await.expect_err("refused");
         assert!(error.downcast_ref::<TierBelowFull>().is_some(), "{error:#}");
-        assert!(error.downcast_ref::<RefusedUntouched>().is_none(), "{error:#}");
+        assert!(
+            error.downcast_ref::<RefusedUntouched>().is_none(),
+            "{error:#}"
+        );
     }
 }

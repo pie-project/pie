@@ -215,7 +215,9 @@ impl Buffers {
         let reach = RsScratch::need(Self::rows_ext(max_rows), ext_row_bytes);
         #[cfg(feature = "cuda")]
         let split = kernels_cuda::linear::gemm::multiprocessors()
-            .map(|sms| crate::device::Buffer::zeroed(kernels_cuda::ssm::carry_split_bytes(sms) as usize))
+            .map(|sms| {
+                crate::device::Buffer::zeroed(kernels_cuda::ssm::carry_split_bytes(sms) as usize)
+            })
             .transpose()?;
         #[cfg(not(feature = "cuda"))]
         let split = None;
@@ -738,7 +740,10 @@ pub fn read(trace: &Trace, page_tokens: u32) -> Result<Option<(Planes, Vec<u64>)
             return Ok(None);
         }
         let lone_rows = lone.values().map(|(x, _)| x.0).collect();
-        Ok(Some((Planes(planes, lone_rows, step_gates, corrected, keys_of), widths)))
+        Ok(Some((
+            Planes(planes, lone_rows, step_gates, corrected, keys_of),
+            widths,
+        )))
     }
 }
 
@@ -1323,7 +1328,10 @@ mod tests {
         let (planes, widths) = read(&trace, PAGE)
             .expect("a KDA layer and a lone conv read clean")
             .expect("both buffer planes");
-        assert_eq!(widths, vec![3 * wide + wide + HEADS + wide + 2 * wide, 2 * wide]);
+        assert_eq!(
+            widths,
+            vec![3 * wide + wide + HEADS + wide + 2 * wide, 2 * wide]
+        );
         assert_eq!(
             planes.of(ValueId(lone)),
             Some(Plane {

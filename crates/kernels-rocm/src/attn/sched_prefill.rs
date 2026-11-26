@@ -227,7 +227,9 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
                 .map(|&packed| packed.div_ceil(u64::from(cta_tile_q)))
                 .sum::<u64>()
                 .max(1);
-            let cap = (grid / live_tiles).min(max_kv.div_ceil(min_kv_chunk_size)).max(1);
+            let cap = (grid / live_tiles)
+                .min(max_kv.div_ceil(min_kv_chunk_size))
+                .max(1);
             match split_chunks(live_tiles * heads, max_grid_size, cap) {
                 1 => (true, true, max_kv),
                 chunks => (true, false, max_kv.div_ceil(chunks).max(min_kv_chunk_size)),
@@ -459,7 +461,11 @@ fn stage(
         )?;
         staging.put_i32(
             at(info.block_live_offset),
-            narrow(op, "batch_prefill_block_live", i64::from(sched.new_batch_size))?,
+            narrow(
+                op,
+                "batch_prefill_block_live",
+                i64::from(sched.new_batch_size),
+            )?,
             "batch_prefill_block_live",
         )?;
         if sched.split_kv {

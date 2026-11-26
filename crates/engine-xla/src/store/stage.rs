@@ -67,7 +67,8 @@ impl Ring {
         let zeros = vec![0u8; rows as usize * ROW_WORDS * 4];
         let slots = (0..slots.max(1))
             .map(|_| {
-                let buffer = device.upload_host(dtype::Dtype::U32, rows, ROW_WORDS as u32, &zeros)?;
+                let buffer =
+                    device.upload_host(dtype::Dtype::U32, rows, ROW_WORDS as u32, &zeros)?;
                 let at = buffer.host_pointer()?.cast::<u32>();
                 Ok(Slot {
                     buffer,

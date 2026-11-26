@@ -56,10 +56,7 @@ pub trait WorkerControl {
     /// Take the run `keys` (from token 0) from the worker whose bulk address
     /// is `from`, and keep it: the cluster policy's replication. Answers how
     /// many pages came.
-    async fn replicate(
-        keys: Vec<[u8; 32]>,
-        from: String,
-    ) -> Result<u32, String>;
+    async fn replicate(keys: Vec<[u8; 32]>, from: String) -> Result<u32, String>;
 
     /// `changes` is a JSON object whose `null`s remove names; none closes the
     /// session.

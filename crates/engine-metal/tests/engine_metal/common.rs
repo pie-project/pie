@@ -3,7 +3,6 @@
 
 #![allow(dead_code)]
 
-
 pub(crate) fn bf16(v: f32) -> [u8; 2] {
     let bits = v.to_bits();
     [(bits >> 16) as u8, (bits >> 24) as u8]
@@ -113,5 +112,7 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
 /// that panicked under it leaves it usable.
 pub(crate) fn one_heavy_load() -> std::sync::MutexGuard<'static, ()> {
     static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    HEAVY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    HEAVY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

@@ -256,8 +256,20 @@ fn a_float_lane_past_a_sequence_store_lands_whole() {
     let want = reference(&weights, &req);
     let text = rig.lane(req.text_rows as u32);
     let image = rig.lane(req.image_rows as u32);
-    publish(&mut rig, &text, &req.text, req.timestep, &req.positions[..req.text_rows]);
-    publish(&mut rig, &image, &req.image, req.timestep, &req.positions[req.text_rows..]);
+    publish(
+        &mut rig,
+        &text,
+        &req.text,
+        req.timestep,
+        &req.positions[..req.text_rows],
+    );
+    publish(
+        &mut rig,
+        &image,
+        &req.image,
+        req.timestep,
+        &req.positions[req.text_rows..],
+    );
     let lanes = vec![
         lane(&rig, 0, &image, "image", 0),
         lane(&rig, 1, &text, "text", 0),
@@ -265,7 +277,11 @@ fn a_float_lane_past_a_sequence_store_lands_whole() {
     let attachments = vec![attach(0, image.instance), attach(1, text.instance)];
     let readouts = rig.fire(lanes, attachments, Vec::new());
     assert_eq!(readouts.len(), 2);
-    assert_eq!(readouts[0].values.len(), 150 * WIDTH as usize, "every image row lands");
+    assert_eq!(
+        readouts[0].values.len(),
+        150 * WIDTH as usize,
+        "every image row lands"
+    );
     assert_close(&readouts[0].values, &want.1, "150-row image velocity");
     assert_close(&readouts[1].values, &want.0, "4-row text velocity");
 }

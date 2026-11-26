@@ -19,13 +19,13 @@
 //!   group size   in {32, 64, 128}
 //!   bit width    in {2, 4, 8}
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
 use kernels_metal::linear::qmv;
 use poem_ir::Dtype;
-use crate::common::{bf16, noise};
 
 const K: u32 = 2048; // contraction; a multiple of every group size and pack width
 const N: u32 = 256; // output columns

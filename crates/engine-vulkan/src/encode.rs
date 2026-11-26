@@ -433,11 +433,20 @@ impl Sink<'_> {
                         .flatten()
                         .filter(|&(room, _)| room == slab.buffer)
                         .map(|(_, at)| binding.offset().saturating_sub(at));
-                    let segment = room.is_none().then(|| {
-                        self.segments.get(&ash::vk::Handle::as_raw(slab.buffer)).map(|&at| {
-                            (at, binding.offset() == 0 && binding.extent() == binding.buffer().bytes())
+                    let segment = room
+                        .is_none()
+                        .then(|| {
+                            self.segments
+                                .get(&ash::vk::Handle::as_raw(slab.buffer))
+                                .map(|&at| {
+                                    (
+                                        at,
+                                        binding.offset() == 0
+                                            && binding.extent() == binding.buffer().bytes(),
+                                    )
+                                })
                         })
-                    }).flatten();
+                        .flatten();
                     segments.push(segment);
                     rooms.push(room);
                     // A recording holds neither a pool segment's buffer nor
@@ -689,7 +698,10 @@ impl Sink<'_> {
         // bindings are written once, when it is made.
         let (set, write) = match shared_key {
             Some(key) => self.frame.shared_set_fresh(pipeline.set_layout, key),
-            None => self.frame.descriptor_set(pipeline.set_layout).map(|set| (set, true)),
+            None => self
+                .frame
+                .descriptor_set(pipeline.set_layout)
+                .map(|set| (set, true)),
         }
         .map_err(|fault| Sink::refuse(fire, fault))?;
         // The fire block's set (set 1), the dispatch's place its dynamic
@@ -705,9 +717,12 @@ impl Sink<'_> {
                     self.frame.own_fire_set(layout, binding, buffer, range)
                 }
                 .map_err(|fault| Sink::refuse(fire, fault))?;
-                Some((set, u32::try_from(at).map_err(|_| {
-                    Sink::backend(fire, format!("the fire block's place {at} past a u32"))
-                })?))
+                Some((
+                    set,
+                    u32::try_from(at).map_err(|_| {
+                        Sink::backend(fire, format!("the fire block's place {at} past a u32"))
+                    })?,
+                ))
             }
             _ => None,
         };
@@ -729,7 +744,8 @@ impl Sink<'_> {
                 };
                 if at < 64 && pipeline.segments & (1 << at) != 0 {
                     let bytes = if whole { u64::MAX } else { info.range };
-                    self.frame.rebinds(set, at as u32, segment, info.offset, bytes);
+                    self.frame
+                        .rebinds(set, at as u32, segment, info.offset, bytes);
                 } else {
                     self.frame.pin(format!(
                         "kernel {key} binds pool segment {segment} at binding {at}, which its \

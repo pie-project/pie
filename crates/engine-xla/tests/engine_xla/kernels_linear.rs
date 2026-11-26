@@ -499,4 +499,3 @@ fn the_glu_gemm_kernel_answers_the_host() {
         assert_close(&b.read_f32(y), &want, 2e-2, 2e-2);
     }
 }
-

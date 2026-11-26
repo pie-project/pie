@@ -31,7 +31,11 @@ fn the_rates_step_stays_under_a_simulated_bound() {
     let timer = |frame: Frame| {
         let ns = (frame.commit_timed()? * 1e9) as u64;
         // The frames this timed and any queued ahead of it, by the device.
-        longest.set(longest.get().max(engine_vulkan::encode::take_longest_frame_span_ns()));
+        longest.set(
+            longest
+                .get()
+                .max(engine_vulkan::encode::take_longest_frame_span_ns()),
+        );
         Ok((None, ns))
     };
     // The device's rates the shapes' step reads (its launch and bandwidth

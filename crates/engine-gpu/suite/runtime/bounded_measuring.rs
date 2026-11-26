@@ -70,7 +70,10 @@ fn a_load_with_no_measurement_under_a_stated_bound_runs_no_frame_past_it() {
     let longest = backend::longest_frame_ns();
     backend::watch_frames(false);
     let shell = engine.loaded_mut().expect("loaded");
-    assert!(shell.submit_bound().is_some(), "every serving step is held to the bound");
+    assert!(
+        shell.submit_bound().is_some(),
+        "every serving step is held to the bound"
+    );
     assert!(
         shell.settled().iter().any(|range| range.checked),
         "the load measured its settle"

@@ -994,11 +994,14 @@ impl RingShape {
         let Some(windowed) = recipe.windowed.as_ref() else {
             return Ok(None);
         };
-        let (Some(SlotLayout::Fixed {
-            bytes,
-            pieces_per_ws,
-            ..
-        }), Some(run)) = (windowed.ring_shape(recipe), windowed.ring_run(recipe))
+        let (
+            Some(SlotLayout::Fixed {
+                bytes,
+                pieces_per_ws,
+                ..
+            }),
+            Some(run),
+        ) = (windowed.ring_shape(recipe), windowed.ring_run(recipe))
         else {
             return Err(Fault::program(
                 "store::layout",
@@ -1007,8 +1010,8 @@ impl RingShape {
         };
         let chunk_bytes = recipe.chunk_bytes;
         let page_rows = buffer.tokens.max(1);
-        let pages = u32::try_from(windowed.region.bytes / buffer.slot_bytes.max(1))
-            .unwrap_or(u32::MAX);
+        let pages =
+            u32::try_from(windowed.region.bytes / buffer.slot_bytes.max(1)).unwrap_or(u32::MAX);
         let windows = windowed
             .layers
             .iter()
@@ -1047,7 +1050,9 @@ impl RingShape {
             pieces: (*pieces_per_ws).max(1),
             ring: Ring {
                 pages,
-                per_piece: u32::try_from(run.atoms_per_piece).unwrap_or(u32::MAX).max(1),
+                per_piece: u32::try_from(run.atoms_per_piece)
+                    .unwrap_or(u32::MAX)
+                    .max(1),
                 offset: run.offset,
                 page_bytes: buffer.slot_bytes,
                 page_rows,

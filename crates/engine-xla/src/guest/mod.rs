@@ -62,7 +62,12 @@ pub fn fed_channels(package: &LaunchPackage) -> Vec<(u32, u32, u32)> {
         .filter_map(|p| {
             let decl = package.channels.get(p.channel as usize)?;
             let dtype = eta_exec::concrete_dtype(decl.dtype);
-            let n = decl.shape.iter().map(|&d| d as usize).product::<usize>().max(1);
+            let n = decl
+                .shape
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>()
+                .max(1);
             Some((
                 p.channel,
                 u32::try_from(lower::words(dtype, n)).unwrap_or(u32::MAX),
@@ -85,8 +90,16 @@ pub fn carried_words(package: &LaunchPackage) -> Vec<(u32, u32)> {
                 .flat_map(|s| s.puts.iter())
                 .find(|p| p.channel == c)?;
             let value = &package.values[put.value as usize];
-            let n = value.shape.iter().map(|&d| d as usize).product::<usize>().max(1);
-            Some((c, u32::try_from(lower::words(value.dtype, n)).unwrap_or(u32::MAX)))
+            let n = value
+                .shape
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>()
+                .max(1);
+            Some((
+                c,
+                u32::try_from(lower::words(value.dtype, n)).unwrap_or(u32::MAX),
+            ))
         })
         .collect()
 }
@@ -138,9 +151,10 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
         if decl.capacity != 1
             || decl.host_role != eta_ir::container::HostRole::None
             || decl.extern_dir.is_some()
-            || package.ports.iter().any(|p| {
-                !p.is_const && p.channel == c && p.port != eta_ir::registry::Port::Parents
-            })
+            || package
+                .ports
+                .iter()
+                .any(|p| !p.is_const && p.channel == c && p.port != eta_ir::registry::Port::Parents)
             || package.inputs.contains(&c)
         {
             continue;

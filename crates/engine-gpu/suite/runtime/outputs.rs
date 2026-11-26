@@ -74,12 +74,17 @@ fn bf(x: f32) -> f32 {
 pub(super) fn planes() -> BTreeMap<String, (Vec<u64>, Vec<f32>)> {
     let mut state = 0x5eed_u64;
     let mut unit = move || {
-        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((state >> 40) as f32 / 8_388_608.0) - 1.0
     };
     let mut planes = BTreeMap::new();
     let values = (0..VOCAB * WIDTH).map(|_| bf(unit())).collect();
-    planes.insert("embed".to_string(), (vec![u64::from(VOCAB), u64::from(WIDTH)], values));
+    planes.insert(
+        "embed".to_string(),
+        (vec![u64::from(VOCAB), u64::from(WIDTH)], values),
+    );
     planes
 }
 
@@ -87,7 +92,10 @@ pub(super) fn write(path: &Path, planes: &BTreeMap<String, (Vec<u64>, Vec<f32>)>
     let bytes: Vec<(String, Vec<u64>, Vec<u8>)> = planes
         .iter()
         .map(|(name, (shape, values))| {
-            let raw = values.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+            let raw = values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
             (name.clone(), shape.clone(), raw)
         })
         .collect();
@@ -96,8 +104,10 @@ pub(super) fn write(path: &Path, planes: &BTreeMap<String, (Vec<u64>, Vec<f32>)>
         .map(|(name, shape, raw)| Object::leaf(name, shape.clone(), ztensor::Leaf::BF16, raw))
         .collect();
     let stamp = Stamp::of(backend::NAME, NAME);
-    emit::write(path, &stamp, &BTreeMap::new(), 4096, &objects, |o, p, _| panic!("{o}/{p} is not streamed here"))
-        .expect("the artifact writes");
+    emit::write(path, &stamp, &BTreeMap::new(), 4096, &objects, |o, p, _| {
+        panic!("{o}/{p} is not streamed here")
+    })
+    .expect("the artifact writes");
 }
 
 pub(super) fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
@@ -121,7 +131,11 @@ pub(super) fn output_decls(loaded: &engine::load::Loaded) -> Vec<OutputDecl> {
                 InputAxis::Voxel => Axis::Voxel,
             },
             width: decl.width,
-            dtype: if decl.dtype == poem_ir::Dtype::I32 { EtaDtype::I32 } else { EtaDtype::F32 },
+            dtype: if decl.dtype == poem_ir::Dtype::I32 {
+                EtaDtype::I32
+            } else {
+                EtaDtype::F32
+            },
             layers: decl.layers,
             readout: decl.readout,
         });
@@ -130,7 +144,11 @@ pub(super) fn output_decls(loaded: &engine::load::Loaded) -> Vec<OutputDecl> {
 }
 
 /// `program` registered as `program_hash` against the outputs `decls`.
-pub(super) fn registration_of(decls: &[OutputDecl], program: TraceContainer, program_hash: u64) -> ProgramRegistration {
+pub(super) fn registration_of(
+    decls: &[OutputDecl],
+    program: TraceContainer,
+    program_hash: u64,
+) -> ProgramRegistration {
     let bound = eta_ir::validate::bind(program, vec![decls.to_vec()], EngineCaps::default())
         .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
@@ -149,12 +167,21 @@ pub(super) fn epilogue() -> TraceContainer {
         host_role,
         seeded: false,
     };
-    let output = |index: u16, shape: Shape, dtype: EtaDtype| Op::Output { index, lane: 0, shape, dtype };
+    let output = |index: u16, shape: Shape, dtype: EtaDtype| Op::Output {
+        index,
+        lane: 0,
+        shape,
+        dtype,
+    };
     TraceContainer {
         names: vec!["ids".to_string(), "stack".to_string()],
         channels: vec![
             decl(Shape::matrix(1, 1), EtaDtype::I32, HostRole::Reader),
-            decl(Shape::matrix(LAYERS, WIDTH), EtaDtype::F32, HostRole::Reader),
+            decl(
+                Shape::matrix(LAYERS, WIDTH),
+                EtaDtype::F32,
+                HostRole::Reader,
+            ),
             decl(Shape::matrix(1, 1), EtaDtype::F32, HostRole::Writer),
         ],
         ports: Vec::new(),
@@ -181,11 +208,22 @@ pub(super) const T: f32 = 0.375;
 /// The tokens of a pass.
 pub(super) const ROWS: u32 = 3;
 
-pub(super) const EXTENTS: BindExtents =
-    BindExtents { row_count: 1, token_count: ROWS, sampled_rows: 1, query_len: ROWS, key_len: 1 };
+pub(super) const EXTENTS: BindExtents = BindExtents {
+    row_count: 1,
+    token_count: ROWS,
+    sampled_rows: 1,
+    query_len: ROWS,
+    key_len: 1,
+};
 
 /// A host channel of `shape` cells of `dtype`, `capacity` deep.
-pub(super) fn channel(id: ChannelId, shape: Vec<u32>, dtype: EtaDtype, host_role: HostRole, capacity: u32) -> ChannelRegistration {
+pub(super) fn channel(
+    id: ChannelId,
+    shape: Vec<u32>,
+    dtype: EtaDtype,
+    host_role: HostRole,
+    capacity: u32,
+) -> ChannelRegistration {
     ChannelRegistration {
         id,
         shape,
@@ -272,7 +310,11 @@ pub(super) fn loaded_flight(
         eprintln!("not asked: no device");
         return None;
     }
-    let dir = std::env::temp_dir().join(format!("pie-{}-{tag}-{}", backend::NAME, std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "pie-{}-{tag}-{}",
+        backend::NAME,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     let path = dir.join(format!("{}-{NAME}.zt", backend::NAME));
@@ -295,13 +337,23 @@ pub(super) fn loaded_flight(
                 slots: lanes,
                 ..Budgets::default()
             },
-            residency: Residency { device: crate::gpu::share(), host_kv_budget: host, ..Residency::default() },
+            residency: Residency {
+                device: crate::gpu::share(),
+                host_kv_budget: host,
+                ..Residency::default()
+            },
             ordinal: 0,
             frames_in_flight: frames,
             steps: Default::default(),
         })
         .expect("the miniature loads");
-    Some(Loaded { engine, caps, trace, planes, dir })
+    Some(Loaded {
+        engine,
+        caps,
+        trace,
+        planes,
+        dir,
+    })
 }
 
 /// The miniature loaded, the epilogue registered, and the slots its guests
@@ -318,13 +370,27 @@ pub(super) struct Bound {
 pub(super) fn bound(tag: &str) -> Option<Bound> {
     let mut loaded = loaded(tag, &Outputs)?;
     let decls = output_decls(&loaded.caps);
-    let program = engine::Programs::register(&mut loaded.engine, &registration_of(&decls, epilogue(), 0x0e7))
-        .expect("the program registers");
+    let program = engine::Programs::register(
+        &mut loaded.engine,
+        &registration_of(&decls, epilogue(), 0x0e7),
+    )
+    .expect("the program registers");
     let chunks = &loaded.caps.caps.chunks;
     let slots = Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
-    let t_input = loaded.trace.inputs.iter().position(|input| input.name == "t").expect("the plan reads `t`") as u32;
+    let t_input = loaded
+        .trace
+        .inputs
+        .iter()
+        .position(|input| input.name == "t")
+        .expect("the plan reads `t`") as u32;
     let word = loaded.trace.facts.word(&Request::new(ROWS, false));
-    Some(Bound { loaded, program, slots, t_input, word })
+    Some(Bound {
+        loaded,
+        program,
+        slots,
+        t_input,
+        word,
+    })
 }
 
 impl Bound {
@@ -342,7 +408,8 @@ impl Bound {
         .enumerate()
         .map(|(at, (shape, dtype, host_role))| {
             let id = ChannelId(first + at as u64);
-            self.slots.register(engine, channel(id, shape, dtype, host_role, 2));
+            self.slots
+                .register(engine, channel(id, shape, dtype, host_role, 2));
             id
         })
         .collect();
@@ -354,9 +421,12 @@ impl Bound {
             ..InstanceBinding::default()
         };
         let binding = self.slots.binding(engine, binding, &channels);
-        let instance = engine::Programs::bind(engine, &binding).expect("the instance binds").id;
+        let instance = engine::Programs::bind(engine, &binding)
+            .expect("the instance binds")
+            .id;
         assert!(
-            engine::Channels::publish(engine, instance, 2, &T.to_le_bytes()).expect("the timestep publishes"),
+            engine::Channels::publish(engine, instance, 2, &T.to_le_bytes())
+                .expect("the timestep publishes"),
             "the ring had room"
         );
         (instance, channels, binding)
@@ -364,7 +434,12 @@ impl Bound {
 
     /// One pass of `instance` reading `token` last: its `ids` and `stack`
     /// cells, `t` published again for the next.
-    pub(super) fn pass(&mut self, instance: InstanceId, channels: &[ChannelId], token: u32) -> (i32, Vec<f32>) {
+    pub(super) fn pass(
+        &mut self,
+        instance: InstanceId,
+        channels: &[ChannelId],
+        token: u32,
+    ) -> (i32, Vec<f32>) {
         let engine = &mut self.loaded.engine;
         let lane = Lane {
             slot: 0,
@@ -372,7 +447,10 @@ impl Bound {
             tokens: vec![3, 11, token],
             readout: Readout::Last,
             kv_less: true,
-            inputs: vec![InputFeed { id: self.t_input, channel: channels[2] }],
+            inputs: vec![InputFeed {
+                id: self.t_input,
+                channel: channels[2],
+            }],
             ..Lane::default()
         };
         let mut ticket = engine
@@ -397,15 +475,23 @@ impl Bound {
                 .expect("the channel holds a cell")
         };
         let ids = i32::from_le_bytes(take(0).try_into().expect("one i32"));
-        let stack = take(1).as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
-        engine::Channels::publish(engine, instance, 2, &T.to_le_bytes()).expect("the timestep publishes");
+        let stack = take(1)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        engine::Channels::publish(engine, instance, 2, &T.to_le_bytes())
+            .expect("the timestep publishes");
         (ids, stack)
     }
 
     /// The argmax of embedding row `token`.
     pub(super) fn argmax(&self, token: u32) -> i32 {
         let row = &self.loaded.planes["embed"].1[(token * WIDTH) as usize..][..WIDTH as usize];
-        (0..row.len()).max_by(|&a, &b| row[a].total_cmp(&row[b])).expect("a row") as i32
+        (0..row.len())
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]))
+            .expect("a row") as i32
     }
 }
 
@@ -431,7 +517,10 @@ fn a_guest_reads_lane_layer_and_id_outputs_by_name() {
             );
         }
     }
-    let Bound { loaded: Loaded { engine, dir, .. }, .. } = bound;
+    let Bound {
+        loaded: Loaded { engine, dir, .. },
+        ..
+    } = bound;
     assert_eq!(
         engine.live().tallied(engine::live::Tally::BuiltInFire),
         0,

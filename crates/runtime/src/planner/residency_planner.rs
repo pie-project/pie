@@ -1,13 +1,15 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::Notify;
 
 use crate::store::rs::RsUnits;
 
 use super::departure::Departure;
-use super::grant::{AllocationGrant, Demand, DevicePageReservation, RoomReturns, RsSlotReservation};
+use super::grant::{
+    AllocationGrant, Demand, DevicePageReservation, RoomReturns, RsSlotReservation,
+};
 use super::holdings::{held_page_count, held_rs_units};
 use super::inner::Inner;
 use super::pool::{PoolPort, RunNeed};
@@ -60,7 +62,8 @@ pub struct ResidencyPlanner {
     pub(super) map_cache: parking_lot::Mutex<Option<(u64, Vec<ProcessId>, super::pool::ChunkMap)>>,
     /// The last restriction read of it, by generation and candidates: a
     /// list read again in the same generation is no new restriction.
-    pub(super) restricted_cache: parking_lot::Mutex<Option<(u64, Vec<ProcessId>, super::pool::ChunkMap)>>,
+    pub(super) restricted_cache:
+        parking_lot::Mutex<Option<(u64, Vec<ProcessId>, super::pool::ChunkMap)>>,
     pub(super) pause_due: AtomicBool,
     pub(super) nonresident: AtomicUsize,
     /// Room grants give back as they drop, the queue's length and the drain
@@ -303,7 +306,6 @@ impl ResidencyPlanner {
         }
     }
 
-
     /// The error waiter `key` is refused with where its need could never
     /// fit the device pool, even with nothing else resident: its kv pages
     /// and the pages that free the runs of whole chunks it asks (a bind's,
@@ -348,7 +350,8 @@ impl ResidencyPlanner {
             self.stats.map_cache_hits.fetch_add(1, Ordering::Relaxed);
             return map.clone();
         }
-        let mut all: Vec<ProcessId> = self.with_inner(|inner| inner.procs.keys().copied().collect());
+        let mut all: Vec<ProcessId> =
+            self.with_inner(|inner| inner.procs.keys().copied().collect());
         all.extend(pids.iter().copied());
         all.sort_unstable();
         all.dedup();
@@ -385,9 +388,13 @@ impl ResidencyPlanner {
         self.port.room_changes().hash(&mut hasher);
         self.returns.freed_count().hash(&mut hasher);
         self.returns.epoch().hash(&mut hasher);
-        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats
+            .fires_landed
+            .load(Ordering::Acquire)
+            .hash(&mut hasher);
         self.events.load(Ordering::Acquire).hash(&mut hasher);
-        self.with_inner(|inner| inner.book_print()).hash(&mut hasher);
+        self.with_inner(|inner| inner.book_print())
+            .hash(&mut hasher);
         hasher.finish()
     }
 
@@ -603,7 +610,9 @@ impl ResidencyPlanner {
             let moving: Vec<(ProcessId, Residency)> = inner
                 .procs
                 .iter()
-                .filter(|(_, proc)| matches!(proc.state, Residency::Evicting | Residency::Restoring))
+                .filter(|(_, proc)| {
+                    matches!(proc.state, Residency::Evicting | Residency::Restoring)
+                })
                 .map(|(pid, proc)| (*pid, proc.state))
                 .collect();
             let (plan, blocked) = inner.plan_fields(key);
@@ -620,8 +629,18 @@ impl ResidencyPlanner {
                 inner.parked_moving.iter().copied().collect::<Vec<_>>(),
             ))
         });
-        if let Some((plan, blocked, pid, kind, firing, some_firing, moving, evicting, killing, parked_moving)) =
-            held
+        if let Some((
+            plan,
+            blocked,
+            pid,
+            kind,
+            firing,
+            some_firing,
+            moving,
+            evicting,
+            killing,
+            parked_moving,
+        )) = held
         {
             let quiet = self.with_inner(|inner| inner.nothing_in_flight());
             let held_by = self.held_by_state();
@@ -629,8 +648,10 @@ impl ResidencyPlanner {
             // What the pool's walker awaits and for how long: a walk stuck
             // on a lane op's reply steps nothing, the head's asked
             // compaction or grow never sent.
-            let walk = crate::store::shared::walk_waiting(self.port.locus().1)
-                .map_or_else(|| "nothing".to_string(), |(what, since)| format!("{what} since {since:?} ago"));
+            let walk = crate::store::shared::walk_waiting(self.port.locus().1).map_or_else(
+                || "nothing".to_string(),
+                |(what, since)| format!("{what} since {since:?} ago"),
+            );
             tracing::warn!(
                 %pid,
                 kind,
@@ -717,7 +738,13 @@ impl ResidencyPlanner {
         // that finds no step.
         // A head never refused is tried against the room standing, its
         // want its need.
-        let past = |count: u32| if refused { u64::from(count).saturating_add(1) } else { 0 };
+        let past = |count: u32| {
+            if refused {
+                u64::from(count).saturating_add(1)
+            } else {
+                0
+            }
+        };
         // Refused, it goes again on any chunk more than its refusal left
         // where its placement stands, which reads its own parked parts
         // retaken first: fewer chunks free than its whole need's count can
@@ -732,7 +759,11 @@ impl ResidencyPlanner {
             }
         });
         let want_list = if kv_missing > 0 {
-            u64::from(kv_missing).max(if refused { past(self.port.device_stats().0) } else { 0 })
+            u64::from(kv_missing).max(if refused {
+                past(self.port.device_stats().0)
+            } else {
+                0
+            })
         } else {
             u64::MAX
         };
@@ -759,10 +790,15 @@ impl ResidencyPlanner {
         let (free_chunks, free_pages) = (self.port.free_chunks(), self.port.device_stats().0);
         self.with_inner(|inner| {
             if let Some(waiter) = inner.queue.get_mut(&key) {
-                waiter.wanted = ([want_chunks, want_list, want_swap], [free_chunks, free_pages]);
+                waiter.wanted = (
+                    [want_chunks, want_list, want_swap],
+                    [free_chunks, free_pages],
+                );
             }
         });
-        self.returns.want_chunks.store(want_chunks, Ordering::Release);
+        self.returns
+            .want_chunks
+            .store(want_chunks, Ordering::Release);
         self.returns.want_list.store(want_list, Ordering::Release);
         self.returns.want_swap.store(want_swap, Ordering::Release);
     }
@@ -787,7 +823,10 @@ impl ResidencyPlanner {
 
     /// The host's and the disk's free slots, idle cache's not counted.
     pub(super) fn raw_swap_free(&self) -> u32 {
-        self.port.host_stats().0.saturating_add(self.port.disk_stats().0)
+        self.port
+            .host_stats()
+            .0
+            .saturating_add(self.port.disk_stats().0)
     }
 
     /// The retention table changed: a sweep is wanted at the next plan.
@@ -1387,9 +1426,18 @@ impl ResidencyPlanner {
     pub(super) fn landed(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
-        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
-        self.stats.evictions.load(Ordering::Acquire).hash(&mut hasher);
-        self.stats.restores.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats
+            .fires_landed
+            .load(Ordering::Acquire)
+            .hash(&mut hasher);
+        self.stats
+            .evictions
+            .load(Ordering::Acquire)
+            .hash(&mut hasher);
+        self.stats
+            .restores
+            .load(Ordering::Acquire)
+            .hash(&mut hasher);
         hasher.finish()
     }
 
@@ -1397,7 +1445,10 @@ impl ResidencyPlanner {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
         self.park_down_room().hash(&mut hasher);
-        self.stats.fires_landed.load(Ordering::Acquire).hash(&mut hasher);
+        self.stats
+            .fires_landed
+            .load(Ordering::Acquire)
+            .hash(&mut hasher);
         hasher.finish()
     }
 
@@ -1414,7 +1465,11 @@ impl ResidencyPlanner {
     /// failed is not tried again on the same map: it would fail the same
     /// way until room moves (`park_down_failed`).
     pub(super) fn parked_down_done(self: &Arc<Self>, moved: bool) {
-        let failed_at = if moved { u64::MAX } else { self.park_down_room() };
+        let failed_at = if moved {
+            u64::MAX
+        } else {
+            self.park_down_room()
+        };
         self.park_down_failed.store(failed_at, Ordering::Release);
         self.with_inner(|inner| inner.parked_moving.clear());
         self.parking_down.store(false, Ordering::Release);
@@ -1601,7 +1656,8 @@ impl ResidencyPlanner {
         self.with_inner(|inner| {
             for (pid, proc) in inner.procs.iter_mut().filter(|(pid, proc)| {
                 proc.holder
-                    && only.is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
+                    && only
+                        .is_none_or(|only| only.contains(&crate::policy::schedule::plex_id(**pid)))
             }) {
                 proc.kept = holder_key(*pid);
             }
@@ -2180,7 +2236,9 @@ impl ResidencyPlanner {
                 .filter(|pid| inner.procs.get(pid).is_some_and(|proc| proc.unfired))
                 .count() as u64
         });
-        self.stats.evicted_unfired.fetch_add(unfired, Ordering::Relaxed);
+        self.stats
+            .evicted_unfired
+            .fetch_add(unfired, Ordering::Relaxed);
         for pid in pids {
             self.stats.evictions_started.fetch_add(1, Ordering::Relaxed);
             exec::spawn_evict(self.clone(), pid);
@@ -2251,7 +2309,10 @@ impl ResidencyPlanner {
             // What a finished process held at most and at its prompt: the
             // footprint `pie/lanes-to-end` is read from.
             if let Some(proc) = departed.as_ref().filter(|proc| {
-                proc.admitted && proc.state == Residency::Resident && !proc.respawn && proc.peak.0 > 0
+                proc.admitted
+                    && proc.state == Residency::Resident
+                    && !proc.respawn
+                    && proc.peak.0 > 0
             }) {
                 inner.to_end.learn(proc.peak);
             }
@@ -2381,7 +2442,11 @@ impl ResidencyPlanner {
             return Some(RsSlotReservation::empty());
         }
         let grant = self.port.reserve_rs(need)?;
-        Some(RsSlotReservation::new(grant, self.port.clone(), self.returns.clone()))
+        Some(RsSlotReservation::new(
+            grant,
+            self.port.clone(),
+            self.returns.clone(),
+        ))
     }
 
     pub(super) fn absorb_free(&self, count: u32) -> bool {
@@ -2389,7 +2454,8 @@ impl ResidencyPlanner {
         if pages.is_empty() {
             return false;
         }
-        let reservation = DevicePageReservation::new(pages, self.port.clone(), self.returns.clone());
+        let reservation =
+            DevicePageReservation::new(pages, self.port.clone(), self.returns.clone());
         self.with_inner(|inner| inner.accum.absorb(reservation));
         true
     }
@@ -2417,7 +2483,6 @@ fn holder_head(pid: ProcessId) -> u64 {
         .max()
         .unwrap_or(0)
 }
-
 
 /// What one idle reclaim came to ([`ResidencyPlanner::reclaim_idle_once`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

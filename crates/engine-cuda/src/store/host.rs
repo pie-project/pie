@@ -672,7 +672,9 @@ fn land(jobs: &Receiver<Job>, shared: &Shared, ordinal: i32) {
             } else if let Err(why) = moved {
                 shared.finish(
                     job.id,
-                    Some(format!("a move between the host tier and the slot file failed: {why}")),
+                    Some(format!(
+                        "a move between the host tier and the slot file failed: {why}"
+                    )),
                 );
                 continue;
             }
@@ -714,7 +716,8 @@ fn disk_io(base: usize, mv: &DiskMove) -> std::io::Result<()> {
         // SAFETY: the span lies in the tier's mapping (checked and committed
         // when the move was enqueued), and only this thread moves its bytes
         // now: every job before it touching them is done, none after runs.
-        let tier = unsafe { std::slice::from_raw_parts_mut((base + offset as usize) as *mut u8, len) };
+        let tier =
+            unsafe { std::slice::from_raw_parts_mut((base + offset as usize) as *mut u8, len) };
         let _io = mv.io.lock().expect("the slot file's I/O");
         if mv.to_disk {
             span[lead..lead + len].copy_from_slice(tier);
@@ -872,7 +875,14 @@ mod tests {
     /// A tier of 4 chunks of 64 KiB behind a small ring, and a slot file of
     /// 16 slots of 64 KiB, on the device this thread binds.
     #[cfg(feature = "device")]
-    fn tier_and_file(name: &str) -> (crate::device::Context, super::HostTier, std::sync::Arc<engine::disk::SlotFile>, std::path::PathBuf) {
+    fn tier_and_file(
+        name: &str,
+    ) -> (
+        crate::device::Context,
+        super::HostTier,
+        std::sync::Arc<engine::disk::SlotFile>,
+        std::path::PathBuf,
+    ) {
         let device = crate::device::Context::bind(0, None).expect("a device");
         let ring = super::Ring::pin(staging_ring(64 << 10, 1, 256 << 10)).expect("a ring");
         let tier = super::HostTier::new(64 << 10, 4, ring).expect("a tier");
@@ -917,11 +927,26 @@ mod tests {
             told: Some(Box::new(move |landing| tx.send(landing).unwrap())),
         })
         .unwrap();
-        assert!(enqueued < Duration::from_millis(200), "enqueueing took {enqueued:?}");
-        assert!(next.elapsed() < Duration::from_millis(200), "the next call waited on the disk");
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), engine::Landing::Landed);
-        assert!(began.elapsed() >= Duration::from_millis(1400), "told before the disk was done");
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), engine::Landing::Landed);
+        assert!(
+            enqueued < Duration::from_millis(200),
+            "enqueueing took {enqueued:?}"
+        );
+        assert!(
+            next.elapsed() < Duration::from_millis(200),
+            "the next call waited on the disk"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            engine::Landing::Landed
+        );
+        assert!(
+            began.elapsed() >= Duration::from_millis(1400),
+            "told before the disk was done"
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            engine::Landing::Landed
+        );
         super::DISK_DELAY_MS.store(0, Ordering::Relaxed);
         // Back from the file into another chunk, waited out by the caller.
         let id = tier
@@ -934,7 +959,12 @@ mod tests {
             })
             .unwrap();
         tier.wait_job(id).unwrap();
-        assert!(tier.slice(2 * (64 << 10), 4096).unwrap().iter().all(|&b| b == 0x5a));
+        assert!(
+            tier.slice(2 * (64 << 10), 4096)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0x5a)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

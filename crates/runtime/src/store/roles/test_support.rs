@@ -164,13 +164,6 @@ pub fn bind_instance(
     holder: Option<Holder>,
     registered: impl Fn(ChannelId) -> bool,
 ) -> anyhow::Result<BoundInstance> {
-    let taken = take_bind(
-        roles,
-        engine,
-        binding,
-        registered,
-        holder,
-        |_| true,
-    )?;
+    let taken = take_bind(roles, engine, binding, registered, holder, |_| true)?;
     bind_taken(roles, engine, binding, holder, taken)
 }

@@ -7,12 +7,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Join, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
-use crate::common::fnv;
 
 /// A dense model whose package states q, k and v apart.
 const ROW: &str = "qwen3-0.6b-bf16-kv-bf16";

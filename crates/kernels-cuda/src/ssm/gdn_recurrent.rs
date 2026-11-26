@@ -249,7 +249,11 @@ pub fn gated_delta_carried(
     dtype_dispatch!(OP, gated.ba.dtype, { Bf16 => () });
     dtype_dispatch!(OP, gated.dt_bias.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
-    debug_assert_eq!(gated.a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(
+        gated.a_log.dtype,
+        Dtype::F32,
+        "`{OP}` reads an f32 decay bank"
+    );
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     seated(OP, state, "gdn_step_carried", true, false, false)?;
@@ -269,9 +273,13 @@ pub fn gated_delta_carried(
     let tiles = shape
         .n
         .checked_mul(v_heads * (v_dim / FUSED_BV))
-        .ok_or_else(|| refuse(OP, format!("{} rows of value tiles overflow a grid", shape.n)))?;
-    let (seated_warps, per_sm) =
-        fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
+        .ok_or_else(|| {
+            refuse(
+                OP,
+                format!("{} rows of value tiles overflow a grid", shape.n),
+            )
+        })?;
+    let (seated_warps, per_sm) = fused_seats(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks());
     // A block's warps share one (lane, head)'s buffered rows: they are a
     // whole number of the head's value tiles, so a head of fewer tiles than
     // the seated warps (a narrow head) takes a block of as many as it has.
@@ -295,8 +303,13 @@ pub fn gated_delta_carried(
         .smem_per_sm()
         .map_or(per_sm, |bytes| (bytes / carried_smem).clamp(1, per_sm));
     let seats = sms * resident;
-    let split_room = carry.split != 0 && u64::from(seats) * CARRY_SPLIT_BYTES_PER_BLOCK <= carry_split_bytes(sms);
-    let blocks = if split_room { seats } else { tiles.div_ceil(warps).min(seats) };
+    let split_room = carry.split != 0
+        && u64::from(seats) * CARRY_SPLIT_BYTES_PER_BLOCK <= carry_split_bytes(sms);
+    let blocks = if split_room {
+        seats
+    } else {
+        tiles.div_ceil(warps).min(seats)
+    };
     let entrypoint = format!("::pie::ssm::gdn_step_carried<{warps}, {split_room}>");
     ctx.fire(
         OP,
@@ -373,8 +386,10 @@ pub fn gated_delta_tail(
     let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
     ctx.fire(
         OP,
-        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_tail_corrected<4>"))
-            .apply(Launch::grid([tiles.div_ceil(WARPS), lanes, 1], [32 * WARPS, 1, 1])),
+        Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_tail_corrected<4>")).apply(Launch::grid(
+            [tiles.div_ceil(WARPS), lanes, 1],
+            [32 * WARPS, 1, 1],
+        )),
         &[
             qkv.arg(),
             gates.arg(),
@@ -446,7 +461,11 @@ pub fn gated_delta_fold(
     }
     dtype_dispatch!(OP, dt_bias.dtype, { Bf16 => () });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
-    if k_dim > 128 || !k_dim.is_multiple_of(16) || !v_dim.is_multiple_of(16) || v_heads % k_heads.max(1) != 0 {
+    if k_dim > 128
+        || !k_dim.is_multiple_of(16)
+        || !v_dim.is_multiple_of(16)
+        || v_heads % k_heads.max(1) != 0
+    {
         return Err(refuse(
             OP,
             format!(
@@ -459,8 +478,7 @@ pub fn gated_delta_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     ctx.fire(
         OP,
-        Fire::at(fold_kernel())
-            .apply(Launch::grid([v_heads, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(fold_kernel()).apply(Launch::grid([v_heads, 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
             dt_bias.arg(),

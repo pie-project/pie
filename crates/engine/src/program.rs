@@ -186,8 +186,10 @@ impl GuestState {
     /// plus [`Self::scratch`] times [`Self::scratch_arms`] (at least one).
     #[must_use]
     pub fn instance_bytes(&self) -> u64 {
-        self.resident
-            .saturating_add(self.scratch.saturating_mul(u64::from(self.scratch_arms.max(1))))
+        self.resident.saturating_add(
+            self.scratch
+                .saturating_mul(u64::from(self.scratch_arms.max(1))),
+        )
     }
 
     /// The chunks a piece takes: [`Self::run`], at least one.

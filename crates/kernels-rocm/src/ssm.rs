@@ -142,8 +142,14 @@ pub fn conv1d_fold(
     let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(CONV_FILE, "::pie::attn::ssm_conv1d_fold<::pie::bf16>"))
-            .apply(Launch::grid([channels.div_ceil(FOLD_CONV_BLOCK), 1, 1], [FOLD_CONV_BLOCK, 1, 1])),
+        Fire::at(kernel(
+            CONV_FILE,
+            "::pie::attn::ssm_conv1d_fold<::pie::bf16>",
+        ))
+        .apply(Launch::grid(
+            [channels.div_ceil(FOLD_CONV_BLOCK), 1, 1],
+            [FOLD_CONV_BLOCK, 1, 1],
+        )),
         &[
             rows.arg(),
             stated(OP, channels)?.arg(),
@@ -181,14 +187,18 @@ pub fn gated_delta_fold(
     if !(k_dim <= BLOCK * 8 / CARRIED_BV && v_dim.is_multiple_of(CARRIED_BV)) {
         return Err(refuse(
             OP,
-            format!("a group's fold steps in the carried tile only: key heads of {k_dim} and value heads of {v_dim} do not lie in it"),
+            format!(
+                "a group's fold steps in the carried tile only: key heads of {k_dim} and value heads of {v_dim} do not lie in it"
+            ),
         ));
     }
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, v_heads)?;
     ctx.fire(
         OP,
-        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_fold<16>"))
-            .apply(Launch::grid([v_dim / CARRIED_BV, v_heads, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_fold<16>")).apply(Launch::grid(
+            [v_dim / CARRIED_BV, v_heads, 1],
+            [BLOCK, 1, 1],
+        )),
         &[
             rows.arg(),
             dt_bias.arg(),
@@ -528,7 +538,9 @@ fn conv1d_carried(
     if conv_width > CONV_CARRIED_TAPS {
         return Err(refuse(
             op,
-            format!("a {conv_width}-tap conv, past the {CONV_CARRIED_TAPS} taps the carried step sums"),
+            format!(
+                "a {conv_width}-tap conv, past the {CONV_CARRIED_TAPS} taps the carried step sums"
+            ),
         ));
     }
     seated(op, state, "ssm_conv1d_carried", true, false, false)?;
@@ -1006,7 +1018,11 @@ pub fn gated_delta_carried(
     dtype_dispatch!(OP, gated.ba.dtype, { Bf16 => () });
     dtype_dispatch!(OP, gated.dt_bias.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
-    debug_assert_eq!(gated.a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(
+        gated.a_log.dtype,
+        Dtype::F32,
+        "`{OP}` reads an f32 decay bank"
+    );
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     seated(OP, state, "ssm_gdn_step_carried", true, false, false)?;
@@ -1029,8 +1045,11 @@ pub fn gated_delta_carried(
     if shape.k_dim == CHUNK_HEAD && shape.v_dim == CHUNK_HEAD {
         return ctx.fire(
             OP,
-            Fire::at(kernel(GDN_FILE, "::pie::attn::ssm_gdn_rows_carried<128, 128, 256>"))
-                .apply(Launch::grid([v_heads, n, 1], [FUSED_BLOCK, 1, 1])),
+            Fire::at(kernel(
+                GDN_FILE,
+                "::pie::attn::ssm_gdn_rows_carried<128, 128, 256>",
+            ))
+            .apply(Launch::grid([v_heads, n, 1], [FUSED_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
                 gates.arg(),
@@ -2086,7 +2105,10 @@ pub fn kda_tail(
             KDA_FILE,
             &format!("::pie::attn::ssm_kda_tail_corrected<{head_dim}, {rows}>"),
         ))
-        .apply(Launch::grid([heads, lanes, head_dim / rows], [STEP_BLOCK, 1, 1])),
+        .apply(Launch::grid(
+            [heads, lanes, head_dim / rows],
+            [STEP_BLOCK, 1, 1],
+        )),
         &[
             mixed.arg(),
             f.arg(),
@@ -2136,8 +2158,14 @@ pub fn kda_fold(
     let rows = KDA_TILE_ROWS;
     ctx.fire(
         OP,
-        Fire::at(kernel(KDA_FILE, &format!("::pie::attn::ssm_kda_fold<{head_dim}, {rows}>")))
-            .apply(Launch::grid([heads, head_dim / rows, 1], [STEP_BLOCK, 1, 1])),
+        Fire::at(kernel(
+            KDA_FILE,
+            &format!("::pie::attn::ssm_kda_fold<{head_dim}, {rows}>"),
+        ))
+        .apply(Launch::grid(
+            [heads, head_dim / rows, 1],
+            [STEP_BLOCK, 1, 1],
+        )),
         &[
             state_rows.arg(),
             a_log.arg(),

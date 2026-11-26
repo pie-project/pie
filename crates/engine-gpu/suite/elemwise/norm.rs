@@ -414,13 +414,15 @@ fn the_layernorms_answer_the_reference() {
             .collect();
         let x = gpu.up_f32(&xv);
         let y = gpu.zeros(2 * n);
-        gpu.run(|s| kernels_slang::elemwise::norm::layernorm_no_scale(
-            s,
-            ft(x),
-            eps,
-            ft(y),
-            kernels_slang::ssm::RowSpan::whole(ft(x)),
-        ));
+        gpu.run(|s| {
+            kernels_slang::elemwise::norm::layernorm_no_scale(
+                s,
+                ft(x),
+                eps,
+                ft(y),
+                kernels_slang::ssm::RowSpan::whole(ft(x)),
+            )
+        });
         let want = layernorm_reference(&xv, width, eps, None);
         close(
             &gpu.down_f32(y, n),

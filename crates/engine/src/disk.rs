@@ -94,7 +94,9 @@ impl SlotFile {
         if at % align != 0
             || stage.len() % ALIGN != 0
             || stage.as_ptr().align_offset(ALIGN) != 0
-            || at.checked_add(stage.len() as u64).is_none_or(|end| end > len)
+            || at
+                .checked_add(stage.len() as u64)
+                .is_none_or(|end| end > len)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

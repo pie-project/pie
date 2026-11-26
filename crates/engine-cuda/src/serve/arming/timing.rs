@@ -58,7 +58,10 @@ impl Shell {
                 let (ns, spread) = self.time_decode_body(shape.m)?;
                 times.push((kernel, ns, spread));
             }
-            let entries: Vec<_> = times.iter().map(|&(kernel, ns, spread)| (shape, kernel, ns, spread)).collect();
+            let entries: Vec<_> = times
+                .iter()
+                .map(|&(kernel, ns, spread)| (shape, kernel, ns, spread))
+                .collect();
             decided = std::sync::Arc::new(decided.with(&entries));
             measured.extend(entries);
         }
@@ -151,7 +154,11 @@ pub(super) fn timing_target<'a, R: Copy>(
 /// Rounds a decode body is timed in (`Shell::routes_by_body`): the median
 /// kept, the interquartile range the spread a choice must clear. A rates
 /// step's on CUDA; ROCm's own.
-pub(super) const BODY_ROUNDS: usize = if cfg!(feature = "rocm") { 9 } else { engine::rates::ROUNDS };
+pub(super) const BODY_ROUNDS: usize = if cfg!(feature = "rocm") {
+    9
+} else {
+    engine::rates::ROUNDS
+};
 
 /// Fires a round of a decode body's timing: each replayed and waited on, as
 /// a serving step is.

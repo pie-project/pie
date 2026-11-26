@@ -26,11 +26,12 @@ fn reference(a: &[f32], w: &[f32], bias: Option<&[f32]>, m: usize, n: usize, k: 
     y
 }
 
-
 /// The table that answers the turned kernel wherever it and the skinny
 /// kernel both cover a product: a test of the turned kernel runs under it.
 fn turned_table() -> std::sync::Arc<kernels_rocm::linear::routes::Routes> {
-    std::sync::Arc::new(kernels_rocm::linear::routes::Routes::all(kernels_rocm::linear::routes::Kernel::Turned as u32))
+    std::sync::Arc::new(kernels_rocm::linear::routes::Routes::all(
+        kernels_rocm::linear::routes::Kernel::Turned as u32,
+    ))
 }
 
 #[test]
@@ -403,11 +404,27 @@ fn the_normed_skinny_product_is_the_norm_then_the_product() {
         t.hbm_gbps = 4090;
         t.cached_gbps = cached;
         t.gemm_turn_from = if turn { 2 } else { 0 };
-        let ctx = if turn { gpu.ctx().with_tuning(t).with_routes(turned_table()) } else { gpu.ctx().with_tuning(t) };
-        let x: Vec<f32> = values((m * k) as usize, 41, 1.0).into_iter().map(round_bf16).collect();
-        let y: Vec<f32> = values((m * k) as usize, 42, 1.0).into_iter().map(round_bf16).collect();
-        let nw: Vec<f32> = values(k as usize, 43, 0.5).into_iter().map(round_bf16).collect();
-        let w: Vec<f32> = values((n * k) as usize, 44, 0.05).into_iter().map(round_bf16).collect();
+        let ctx = if turn {
+            gpu.ctx().with_tuning(t).with_routes(turned_table())
+        } else {
+            gpu.ctx().with_tuning(t)
+        };
+        let x: Vec<f32> = values((m * k) as usize, 41, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let y: Vec<f32> = values((m * k) as usize, 42, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let nw: Vec<f32> = values(k as usize, 43, 0.5)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((n * k) as usize, 44, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
         let (xt, yt, nwt, wt) = (
             gpu.tensor(&x, m, k, Dtype::Bf16),
             gpu.tensor(&y, m, k, Dtype::Bf16),
@@ -421,24 +438,47 @@ fn the_normed_skinny_product_is_the_norm_then_the_product() {
         let landed = gpu
             .laid(&ctx, |ctx| {
                 gemm::residual_add_rmsnorm_matmul(
-                    ctx, xt, yt, nwt, plus_one, 1e-6, wt, &mut y_out, &mut folded_normed, &mut z,
+                    ctx,
+                    xt,
+                    yt,
+                    nwt,
+                    plus_one,
+                    1e-6,
+                    wt,
+                    &mut y_out,
+                    &mut folded_normed,
+                    &mut z,
                 )
             })
             .unwrap();
         assert_eq!(landed, folds, "{m}x{n}x{k}: the fold's choice");
         if !folds {
-            assert!(gpu.read(&z).iter().all(|&v| v == 7.0), "{m}x{n}x{k}: nothing lands");
+            assert!(
+                gpu.read(&z).iter().all(|&v| v == 7.0),
+                "{m}x{n}x{k}: nothing lands"
+            );
             continue;
         }
         let sums: Vec<f32> = y.iter().zip(&x).map(|(y, x)| round_bf16(y + x)).collect();
-        assert_eq!(gpu.read(&y_out), sums, "{m}x{n}x{k}: the sum lands as it is");
+        assert_eq!(
+            gpu.read(&y_out),
+            sums,
+            "{m}x{n}x{k}: the sum lands as it is"
+        );
         // The norm then the product apart, on the same kernels: the same bits.
         let mut apart_sum = gpu.zeros(m, k, Dtype::Bf16);
         let mut normed = gpu.zeros(m, k, Dtype::Bf16);
         let mut apart = gpu.zeros(m, n, Dtype::Bf16);
         gpu.laid(&ctx, |ctx| {
             kernels_rocm::elemwise::norm_residual::residual_add_rmsnorm_into(
-                ctx, xt, yt, &mut apart_sum, nwt, plus_one, 1e-6, &mut normed,
+                ctx,
+                xt,
+                yt,
+                &mut apart_sum,
+                nwt,
+                plus_one,
+                1e-6,
+                &mut normed,
             )?;
             gemm::lm_head(ctx, normed, wt, &mut apart)
         })
@@ -454,7 +494,19 @@ fn the_normed_skinny_product_is_the_norm_then_the_product() {
             gpu.read(&apart),
             "{m}x{n}x{k} plus_one={plus_one}: the folded product is the norm's then the product's"
         );
-        let want = reference(&gpu.read(&normed), &w, None, m as usize, n as usize, k as usize);
-        close_abs(&format!("{m}x{n}x{k} against the host"), &gpu.read(&z), &want, 2e-2);
+        let want = reference(
+            &gpu.read(&normed),
+            &w,
+            None,
+            m as usize,
+            n as usize,
+            k as usize,
+        );
+        close_abs(
+            &format!("{m}x{n}x{k} against the host"),
+            &gpu.read(&z),
+            &want,
+            2e-2,
+        );
     }
 }

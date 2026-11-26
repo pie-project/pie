@@ -782,10 +782,12 @@ fn tier_of(number: u32) -> kernels_slang::Tier {
 /// kernel it takes over its range where it replaced the curves' one.
 fn row_tactic(row: [u32; 6]) -> Option<kernels_slang::linear::gemm::Tactic> {
     let [_, _, replaced, vector, wide, tier] = row;
-    (replaced == ROW_REPLACED || replaced == ROW_KEPT).then(|| kernels_slang::linear::gemm::Tactic {
-        tier: tier_of(tier),
-        vector,
-        wide: wide != 0,
+    (replaced == ROW_REPLACED || replaced == ROW_KEPT).then(|| {
+        kernels_slang::linear::gemm::Tactic {
+            tier: tier_of(tier),
+            vector,
+            wide: wide != 0,
+        }
     })
 }
 
@@ -820,7 +822,11 @@ fn nearest<'a>(
     of: u32,
     mine: &[(u32, u32)],
     all: &[(&'static str, &'a profile::curves::DenseSettled)],
-) -> Vec<(&'static str, &'a profile::curves::DenseSettled, Option<usize>)> {
+) -> Vec<(
+    &'static str,
+    &'a profile::curves::DenseSettled,
+    Option<usize>,
+)> {
     let mut near: Vec<_> = all
         .iter()
         .filter(|(_, s)| s.of == of)
@@ -881,7 +887,14 @@ fn kept_row(standing: &crate::dense::Dense, bottom: u32, top: u32) -> [u32; 6] {
         }
     }
     match kernels.as_slice() {
-        [t] => [bottom, top, ROW_KEPT, t.vector, u32::from(t.wide), tier_number(t.tier)],
+        [t] => [
+            bottom,
+            top,
+            ROW_KEPT,
+            t.vector,
+            u32::from(t.wide),
+            tier_number(t.tier),
+        ],
         _ => [bottom, top, ROW_KEPT_UNNAMED, 0, 0, 0],
     }
 }
@@ -1500,7 +1513,6 @@ pub struct Shell<B: Serve> {
 
     adapters: crate::adapter::Slots,
 
-
     held: Vec<u32>,
 
     /// What a dispatch binds the backend had built at the last count
@@ -1939,9 +1951,10 @@ impl<B: Serve> Shell<B> {
                 // the rs planes an rs page holds.
                 Some(crate::inputs::BeamFacts {
                     planes: u32::try_from(2 * rows.kv_rows.len()).unwrap_or(u32::MAX),
-                    rs_planes: rows.rs.as_ref().map_or(0, |rs| {
-                        u32::try_from(rs.plane_at.len()).unwrap_or(u32::MAX)
-                    }),
+                    rs_planes: rows
+                        .rs
+                        .as_ref()
+                        .map_or(0, |rs| u32::try_from(rs.plane_at.len()).unwrap_or(u32::MAX)),
                     frames: u32::try_from(boot.runahead.frames().max(1)).unwrap_or(u32::MAX),
                 }),
             )
@@ -3442,7 +3455,10 @@ impl<B: Serve> Shell<B> {
         let mut stored: Vec<[u32; 6]> = Vec::new();
         for (from, settled) in &taken {
             for &row in &settled.ranges {
-                if stored.iter().all(|have| (have[0], have[1]) != (row[0], row[1])) {
+                if stored
+                    .iter()
+                    .all(|have| (have[0], have[1]) != (row[0], row[1]))
+                {
                     stored.push(row);
                     if *from == "stored" {
                         own.push(row);
@@ -3467,7 +3483,10 @@ impl<B: Serve> Shell<B> {
                 if stored.is_empty() {
                     String::new()
                 } else {
-                    format!(" past the {} ranges the {whence} settle decided", stored.len())
+                    format!(
+                        " past the {} ranges the {whence} settle decided",
+                        stored.len()
+                    )
                 }
             );
             self.say_served("settle skipped", replaced);
@@ -3502,8 +3521,10 @@ impl<B: Serve> Shell<B> {
         };
         let near = self.nearest_settles(of);
         if !left.is_empty() && !near.is_empty() {
-            let layers: Vec<&[[u32; 6]]> =
-                near.iter().map(|(_, settled, _)| settled.ranges.as_slice()).collect();
+            let layers: Vec<&[[u32; 6]]> = near
+                .iter()
+                .map(|(_, settled, _)| settled.ranges.as_slice())
+                .collect();
             let picks = layered(&left, &layers, |tactic| self.tactic_built(tactic));
             for &((bottom, top), tactic, _) in &picks {
                 self.dense = self.dense.with_rows(bottom, top, tactic);
@@ -3521,7 +3542,11 @@ impl<B: Serve> Shell<B> {
                     )
                 })
                 .collect();
-            let own = if stored.is_empty() { String::new() } else { format!("{served_by}, then ") };
+            let own = if stored.is_empty() {
+                String::new()
+            } else {
+                format!("{served_by}, then ")
+            };
             served_by = format!("{own}{}, else the curves'", from.join(", then "));
         }
         if left.is_empty() {
@@ -3753,9 +3778,9 @@ impl<B: Serve> Shell<B> {
     /// pick the load may serve. One not built yet is built by the load's
     /// second bind walk, before ready (`Gpu::load`, `walk_binds`).
     fn tactic_built(&self, tactic: kernels_slang::linear::gemm::Tactic) -> bool {
-        self.dense_planes.iter().all(|&(n, k, ..)| {
-            kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k).is_ok()
-        })
+        self.dense_planes
+            .iter()
+            .all(|&(n, k, ..)| kernels_slang::linear::gemm::entry(B::TARGET, tactic, n, k).is_ok())
     }
 
     /// The dense matmul's tactic at each rung.
@@ -3801,7 +3826,13 @@ impl<B: Serve> Shell<B> {
         }
         let began = std::time::Instant::now();
         // What serving counts of its fires is serving's alone.
-        let counts = (self.recorded, self.unkept, self.walked, self.drained, self.probed);
+        let counts = (
+            self.recorded,
+            self.unkept,
+            self.walked,
+            self.drained,
+            self.probed,
+        );
         let bound_before = B::bound(&self.pipelines);
         let built_before = B::compiled(&self.pipelines);
         let serving = self.dense.clone();
@@ -3822,7 +3853,13 @@ impl<B: Serve> Shell<B> {
         self.walk_only = walk_only;
         (self.split_next, self.split_layers) = split;
         self.dense = serving;
-        (self.recorded, self.unkept, self.walked, self.drained, self.probed) = counts;
+        (
+            self.recorded,
+            self.unkept,
+            self.walked,
+            self.drained,
+            self.probed,
+        ) = counts;
         self.bound += B::bound(&self.pipelines) - bound_before;
         behind.slices += 1;
         behind.longest = behind.longest.max(began.elapsed());
@@ -3954,7 +3991,9 @@ impl<B: Serve> Shell<B> {
                 "dense settle behind serving: a point discarded ({why}); fired again later"
             );
         }
-        if trial.reference && let Some(&ns) = trial.samples[0].last() {
+        if trial.reference
+            && let Some(&ns) = trial.samples[0].last()
+        {
             behind.decode_ns = Some(ns);
             behind.last_range = Some((1, ns));
             return Ok(!behind.left.is_empty());
@@ -4201,7 +4240,9 @@ impl<B: Serve> Shell<B> {
                 .facts
                 .word(&poem_ir::Request::new(trial.per_lane, false))
         };
-        let tokens: Vec<u32> = (0..trial.per_lane).map(|i| 100 + (i * 7919) % 5000).collect();
+        let tokens: Vec<u32> = (0..trial.per_lane)
+            .map(|i| 100 + (i * 7919) % 5000)
+            .collect();
         // Zeros for every guest input a class reads: a settle lane feeds no
         // channel, and a class reading one serves the same kernels whatever
         // the input holds.
@@ -4729,7 +4770,9 @@ impl<B: Serve> Shell<B> {
         let budget = budget.unwrap_or_else(|| {
             let pages =
                 u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
-            let per_list = layout.list.map_or(1, |list| u64::from(list.per_chunk.max(1)));
+            let per_list = layout
+                .list
+                .map_or(1, |list| u64::from(list.per_chunk.max(1)));
             let state = (u64::from(seats) * self.state_slot_bytes()).div_ceil(chunk.max(1));
             // The guest state the device can hold live (the room a guest
             // program binds within): evicted, it has a home.
@@ -5158,9 +5201,10 @@ impl<B: Serve> Shell<B> {
         }
         let mut frame = self.device.frame()?;
         let was = self.pools.evacuate(&mut frame, evacuation)?;
-        let entries = self.row_caches.entries(&self.pools).and_then(|rows| {
-            Ok((rows, self.expert_caches.entries(&self.pools)?))
-        });
+        let entries = self
+            .row_caches
+            .entries(&self.pools)
+            .and_then(|rows| Ok((rows, self.expert_caches.entries(&self.pools)?)));
         match entries {
             Ok((rows, experts)) => Ok(Some(StagedEvacuation {
                 frame,
@@ -5373,7 +5417,10 @@ impl<B: Serve> Shell<B> {
         if !B::RECORDS || lanes == 0 {
             return None;
         }
-        let bucket = self.decode_buckets().into_iter().find(|&bucket| bucket >= lanes)?;
+        let bucket = self
+            .decode_buckets()
+            .into_iter()
+            .find(|&bucket| bucket >= lanes)?;
         (bucket > lanes).then_some(bucket)
     }
 
@@ -5424,7 +5471,10 @@ impl<B: Serve> Shell<B> {
     /// attachment class, a float lane.
     fn eager_kind(&self, prepared: &Prepared<'_, B>) -> bool {
         prepared.descriptor.classes.present_in_order().any(|class| {
-            self.eager_classes.get(class as usize).copied().unwrap_or(false)
+            self.eager_classes
+                .get(class as usize)
+                .copied()
+                .unwrap_or(false)
         }) || prepared.lanes.iter().any(|lane| lane.kv_less)
     }
 
@@ -5671,15 +5721,16 @@ impl<B: Serve> Shell<B> {
                 None => regions.push((from.clone(), Vec::new(), layers.len())),
             }
         }
-        for span in (layout.iter_mut())
-            .filter(|span| span.rows > 0 && (span.seated || span.spanned))
+        for span in
+            (layout.iter_mut()).filter(|span| span.rows > 0 && (span.seated || span.spanned))
         {
             let plane = &self.readouts[span.plane as usize];
-            let (from, layers) = bases[span.plane as usize]
-                .as_ref()
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!("output `{}`, a read plane of no value", plane.output),
-                })?;
+            let (from, layers) =
+                bases[span.plane as usize]
+                    .as_ref()
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!("output `{}`, a read plane of no value", plane.output),
+                    })?;
             let row_bytes = u64::from(plane.width) * elem(plane.dtype);
             let gathered = self.gathers_readout && plane.seam == Kind::Readout;
             let (first, direct) = (span.first, span.direct);
@@ -6307,7 +6358,10 @@ impl<B: Serve> Shell<B> {
                     .iter()
                     .zip(&buffers.plane_at())
                     .map(|(plane, &at)| {
-                        Ok([words(at, "an rs plane's offset")?, words(plane.row_bytes, "an rs row")?])
+                        Ok([
+                            words(at, "an rs plane's offset")?,
+                            words(plane.row_bytes, "an rs row")?,
+                        ])
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let folds_word = laid.rs_folds_word();
@@ -6336,7 +6390,10 @@ impl<B: Serve> Shell<B> {
             &mut |refs: &[u32]| self.pools.kv_pages(refs, None),
             rs_staged.as_ref(),
         )?;
-        let mut appended = self.beam_appended.lock().expect("beam appends lock poisoned");
+        let mut appended = self
+            .beam_appended
+            .lock()
+            .expect("beam appends lock poisoned");
         for (instance, base, entries) in &planned.appended {
             appended.insert(*instance, (*base, entries.clone()));
         }
@@ -6354,7 +6411,13 @@ impl<B: Serve> Shell<B> {
     ) -> Result<()> {
         let store = self.inputs[arm].store();
         for &(cell, word) in &planned.cells {
-            frame.copy(&cell.buffer, cell.at, store, u64::from(word) * 4, cell.bytes)?;
+            frame.copy(
+                &cell.buffer,
+                cell.at,
+                store,
+                u64::from(word) * 4,
+                cell.bytes,
+            )?;
         }
         self.dispatch_beams(frame, arm, planned.steps, planned.copies, planned.planes)?;
         if planned.rs_copies > 0 {
@@ -6373,10 +6436,16 @@ impl<B: Serve> Shell<B> {
         planes: u32,
     ) -> Result<()> {
         let store = self.inputs[arm].store();
-        let kv_planes = self.pools.kv_planes().map_or(0, |(_, planes)| planes.len() as u32);
+        let kv_planes = self
+            .pools
+            .kv_planes()
+            .map_or(0, |(_, planes)| planes.len() as u32);
         {
             let room = self.inputs[arm].laid().beams().ok_or_else(|| {
-                program("serve::beams", "a load that laid no room for beam groups".to_string())
+                program(
+                    "serve::beams",
+                    "a load that laid no room for beam groups".to_string(),
+                )
             })?;
             let sink = B::sink(&self.device, frame, &self.pipelines, &self.handles);
             let whole = self.handles.bind(store, 0, store.bytes())?;
@@ -6414,7 +6483,10 @@ impl<B: Serve> Shell<B> {
     ) -> Result<()> {
         let store = self.inputs[arm].store();
         let room = self.inputs[arm].laid().beams().ok_or_else(|| {
-            program("serve::beams", "a load that laid no room for beam groups".to_string())
+            program(
+                "serve::beams",
+                "a load that laid no room for beam groups".to_string(),
+            )
         })?;
         let sink = B::sink(&self.device, frame, &self.pipelines, &self.handles);
         let whole = self.handles.bind(store, 0, store.bytes())?;
@@ -7434,7 +7506,9 @@ impl<B: Serve> Shell<B> {
                         device.count,
                         Some(to),
                     )
-                    .map_err(|error| program("serve::rs", format!("lane {}: {error}", row.source)))?;
+                    .map_err(|error| {
+                        program("serve::rs", format!("lane {}: {error}", row.source))
+                    })?;
                     // The record holds the rows below the group's fold now.
                     lane_fold.left = (to > from || held.is_some()).then_some(to);
                     lane_fold
@@ -7530,7 +7604,11 @@ impl<B: Serve> Shell<B> {
                         lineage: engine::fire::Lineage::Set,
                     },
                 };
-                let folded = if seated.window.is_some() { seated.folded } else { have };
+                let folded = if seated.window.is_some() {
+                    seated.folded
+                } else {
+                    have
+                };
                 // A fold the device counts: the count its program's `fold`
                 // port holds at the fire, as the recurrent scans take it.
                 let fold = match window.fold {
@@ -7564,7 +7642,8 @@ impl<B: Serve> Shell<B> {
                     .map(|(_, refs)| refs.as_slice())
                 {
                     Some(refs) if seated.refs && seated.window.is_some() => {
-                        self.pools.list_pages(crate::store::Paged::Buffer, refs, None)?
+                        self.pools
+                            .list_pages(crate::store::Paged::Buffer, refs, None)?
                     }
                     _ => Vec::new(),
                 };
@@ -7868,7 +7947,8 @@ impl<B: Serve> Shell<B> {
             Vec::new()
         };
         if let Some(staged) = &ring {
-            let most = crate::ring::most_jobs(self.span.rung_tokens(rung), self.span.rung_tokens(rung));
+            let most =
+                crate::ring::most_jobs(self.span.rung_tokens(rung), self.span.rung_tokens(rung));
             let jobs = u32::try_from(staged.jobs.first().copied().unwrap_or(0)).unwrap_or(0);
             if jobs > most {
                 return Err(Fault::Ceiling {
@@ -8103,9 +8183,15 @@ impl<B: Serve> Shell<B> {
         // the load laid (`inputs::rs_carry_ints`), never by its rows alone:
         // a lane carrying one run of rows takes a span.
         let rs_carry = if rs_active {
-            let page_tokens = self.rs_buffers.as_ref().map_or(1, crate::rs::Buffers::page_tokens);
+            let page_tokens = self
+                .rs_buffers
+                .as_ref()
+                .map_or(1, crate::rs::Buffers::page_tokens);
             let table = carry_table(&rs_plans, page_tokens, &rs_beam)?;
-            let laid = self.inputs.first().map_or(0, |store| store.laid().rs_table_ints().0);
+            let laid = self
+                .inputs
+                .first()
+                .map_or(0, |store| store.laid().rs_table_ints().0);
             if table.len() as u64 > laid {
                 return Err(Fault::Ceiling {
                     what: "ints of the staged rs table a fire's buffered rows take (a header \
@@ -8195,7 +8281,8 @@ impl<B: Serve> Shell<B> {
                 let _ = pages;
                 fold_table[h + 3] = -int(fold_table.len() as u64)? - 1;
                 if let Some(group) = beam_of.get(fold.lane).copied().flatten() {
-                    fold_pages[group] = Some((u32::try_from(fold_table.len()).unwrap_or(u32::MAX), entries));
+                    fold_pages[group] =
+                        Some((u32::try_from(fold_table.len()).unwrap_or(u32::MAX), entries));
                 }
                 fold_table.extend([0i32; RESOLVE_INTS]);
                 fold_table[h + 4] = int(u64::from(to - from))?;
@@ -8241,7 +8328,11 @@ impl<B: Serve> Shell<B> {
                 &seats,
                 &seat_of,
                 rs_carry.as_deref().map(|table| {
-                    (table, &header as &dyn Fn(usize) -> _, &set as &dyn Fn(usize) -> _)
+                    (
+                        table,
+                        &header as &dyn Fn(usize) -> _,
+                        &set as &dyn Fn(usize) -> _,
+                    )
                 }),
                 &fold_pages,
             )?)
@@ -8669,7 +8760,10 @@ impl<B: Serve> Shell<B> {
         };
         let tokens = self.pools.paging().page_size.max(1);
         let (at, held) = self.span.fire_slots(rung)?;
-        let wants: Vec<u32> = seats.iter().map(|seat| seat.rows.div_ceil(tokens)).collect();
+        let wants: Vec<u32> = seats
+            .iter()
+            .map(|seat| seat.rows.div_ceil(tokens))
+            .collect();
         let need: u32 = wants.iter().sum();
         if need > held {
             return Err(Fault::Ceiling {
@@ -8724,7 +8818,14 @@ impl<B: Serve> Shell<B> {
         // rows stand, for a walk of it the pass fills no family for.
         let mark = self.handles.len();
         let place = At::new();
-        let walked = self.walk_into(frame, prepared, false, false, &place, &mut Cursor::new(&place));
+        let walked = self.walk_into(
+            frame,
+            prepared,
+            false,
+            false,
+            &place,
+            &mut Cursor::new(&place),
+        );
         let walked = match walked {
             Ok(walked) => walked,
             Err(fault) => {
@@ -8744,7 +8845,9 @@ impl<B: Serve> Shell<B> {
         let layout = laid?;
         let filled = B::lay_fill(self, frame, prepared, &layout, walked.launches)?;
         if self.arming {
-            self.lay_walk_ns = self.lay_walk_ns.saturating_add(at.elapsed().as_nanos() as u64);
+            self.lay_walk_ns = self
+                .lay_walk_ns
+                .saturating_add(at.elapsed().as_nanos() as u64);
         }
         if filled && self.arming {
             self.laid_walk += 1;
@@ -9416,9 +9519,13 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
         prepared.beam_tail = match self.inputs[prepared.arm].laid().beams() {
             Some(room) if !prepared.beam_faults.is_empty() => {
                 // The fault words, then the common slots right past them.
-                let words = room.faults.1 + u32::try_from(prepared.beam_commons.len()).unwrap_or(u32::MAX);
+                let words =
+                    room.faults.1 + u32::try_from(prepared.beam_commons.len()).unwrap_or(u32::MAX);
                 let within = |word: u32| word >= room.faults.0 && word - room.faults.0 < words;
-                if !(prepared.beam_faults.iter().all(|&(word, _, _)| within(word))
+                if !(prepared
+                    .beam_faults
+                    .iter()
+                    .all(|&(word, _, _)| within(word))
                     && prepared.beam_commons.iter().all(|&(word, _)| within(word)))
                 {
                     return Err(program(
@@ -9507,7 +9614,11 @@ impl<B: Serve> engine::frame::Shell for Shell<B> {
                         "{:?} rung {} rows {:?}",
                         prepared.descriptor.classes,
                         prepared.rung,
-                        prepared.seats.iter().map(|seat| seat.rows).collect::<Vec<_>>()
+                        prepared
+                            .seats
+                            .iter()
+                            .map(|seat| seat.rows)
+                            .collect::<Vec<_>>()
                     );
                     if self.unarmed_named.insert(kind.clone()) {
                         tracing::warn!(
@@ -10580,7 +10691,10 @@ impl<B: Serve> Shell<B> {
         // so a serving beam fire binds nothing.
         for arm in 0..self.inputs.len() {
             let frame = B::bind_frame(&self.device)?;
-            let planes = self.pools.kv_planes().map_or(0, |(_, planes)| planes.len() as u32);
+            let planes = self
+                .pools
+                .kv_planes()
+                .map_or(0, |(_, planes)| planes.len() as u32);
             self.dispatch_beams(&frame, arm, 1, 1, planes.max(1))?;
             if self.rs_buffers.is_some() {
                 self.dispatch_rs_copies(&frame, arm, 1, 1)?;
@@ -10618,10 +10732,7 @@ impl<B: Serve> Shell<B> {
     /// of a stated shape, in the set's order (smallest first across kinds),
     /// and what its allowance leaves is the set's tail from a shape on,
     /// stated eager by its index ([`Shell::eager_shapes_from`]).
-    pub fn record_bodies(
-        &mut self,
-        steps: Option<&engine::StepShapes>,
-    ) -> Result<u64> {
+    pub fn record_bodies(&mut self, steps: Option<&engine::StepShapes>) -> Result<u64> {
         if !B::RECORDS {
             return Ok(0);
         }
@@ -10742,7 +10853,11 @@ impl<B: Serve> Shell<B> {
                     for lanes in pow2_lanes(rows) {
                         let each = rows / lanes;
                         let more = rows % lanes;
-                        shapes.push((0..lanes).map(|at| (class, each + u32::from(at < more))).collect());
+                        shapes.push(
+                            (0..lanes)
+                                .map(|at| (class, each + u32::from(at < more)))
+                                .collect(),
+                        );
                         // Where the class's fires a lane may fall either
                         // side of the rows a lane attention tiles from,
                         // the walked form too: as many lanes, each just
@@ -10758,7 +10873,10 @@ impl<B: Serve> Shell<B> {
         // A prompt beside decodes: one prefill lane and each power of two of
         // decode lanes, at each count of rows the prefills take.
         for &prefill in classes.iter().filter(|&&class| prefilling[class]) {
-            for &decode in classes.iter().filter(|&&class| decoding[class] && class != prefill) {
+            for &decode in classes
+                .iter()
+                .filter(|&&class| decoding[class] && class != prefill)
+            {
                 for &rows in &prefill_rows {
                     // The prompt's own lane counts against the cap.
                     for decodes in pow2_lanes(rows.saturating_sub(1).min(cap.saturating_sub(1))) {
@@ -10777,7 +10895,10 @@ impl<B: Serve> Shell<B> {
             }
         }
         shapes.sort_by_key(|lanes| {
-            (lanes.iter().map(|&(_, rows)| rows).sum::<u32>(), std::cmp::Reverse(lanes.len()))
+            (
+                lanes.iter().map(|&(_, rows)| rows).sum::<u32>(),
+                std::cmp::Reverse(lanes.len()),
+            )
         });
         shapes.dedup();
         // A decode whose token a pass still on the queue writes is fed it on
@@ -10786,7 +10907,9 @@ impl<B: Serve> Shell<B> {
         // reads the fire's own (`FireBindings::row_ring`): another body.
         // Each shape carrying decode lanes is recorded so too.
         let fed_too = !self.row_caches.is_empty() && self.row_caches.by_tokens();
-        let capturing: Vec<bool> = (0..decoding.len()).map(|class| self.captures(class)).collect();
+        let capturing: Vec<bool> = (0..decoding.len())
+            .map(|class| self.captures(class))
+            .collect();
         // Each class's outputs a lane of it may read out, captures apart.
         let readable: Vec<Vec<String>> = (0..decoding.len())
             .map(|class| {
@@ -10805,7 +10928,9 @@ impl<B: Serve> Shell<B> {
         let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, u8)> = shapes
             .into_iter()
             .flat_map(|lanes| {
-                let decodes = lanes.iter().any(|&(class, rows)| rows == 1 && decoding[class]);
+                let decodes = lanes
+                    .iter()
+                    .any(|&(class, rows)| rows == 1 && decoding[class]);
                 let fed = fed_too && decodes;
                 // Every composition buffering its rows too: a decode lane
                 // carrying a row it has not folded, a prompt lane buffering
@@ -11058,7 +11183,10 @@ impl<B: Serve> Shell<B> {
                         format!(
                             "{} lane(s) of classes {:?}, {} rows",
                             lanes.len(),
-                            lanes.iter().map(|&(class, _)| class).collect::<std::collections::BTreeSet<_>>(),
+                            lanes
+                                .iter()
+                                .map(|&(class, _)| class)
+                                .collect::<std::collections::BTreeSet<_>>(),
                             lanes.iter().map(|&(_, rows)| rows).sum::<u32>()
                         )
                     })
@@ -11203,7 +11331,8 @@ impl<B: Serve> Shell<B> {
                 let cost = rss().saturating_sub(ahead).max(on_device);
                 dearest = dearest.max(cost);
                 dearest_device = dearest_device.max(on_device);
-                dearest_cmds = dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
+                dearest_cmds =
+                    dearest_cmds.max(B::command_buffers(self).0.saturating_sub(cmds_ahead));
                 maps_seen = map_count();
                 if let (Some(ahead), Some(after)) = (maps_ahead, maps_seen) {
                     dearest_maps = dearest_maps.max(after.saturating_sub(ahead));
@@ -12012,13 +12141,23 @@ mod settle_row_tests {
         let ranges = std::collections::VecDeque::from([(1, 1), (2, 2), (3, 4)]);
         let cold = layered(&ranges, &[&committed], |_| true);
         let got = |picks: &[((u32, u32), Tactic, usize)]| {
-            picks.iter().map(|&(r, t, at)| (r, t.vector, at)).collect::<Vec<_>>()
+            picks
+                .iter()
+                .map(|&(r, t, at)| (r, t.vector, at))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(got(&cold), [((1, 1), 1, 0), ((2, 2), 4, 0)], "3-4 rows: the curves'");
+        assert_eq!(
+            got(&cold),
+            [((1, 1), 1, 0), ((2, 2), 4, 0)],
+            "3-4 rows: the curves'"
+        );
         // One range decided by the stored settle: the other range is served
         // the committed pick, as before it.
         let left = std::collections::VecDeque::from([(2, 2), (3, 4)]);
-        assert_eq!(got(&layered(&left, &[&stored, &committed], |_| true)), [((2, 2), 4, 1)]);
+        assert_eq!(
+            got(&layered(&left, &[&stored, &committed], |_| true)),
+            [((2, 2), 4, 1)]
+        );
         // A stored row under a changed key serves its range over the
         // committed one's; a kernel not built, and a row naming none, keep
         // the curves' pick.
@@ -12026,9 +12165,15 @@ mod settle_row_tests {
             got(&layered(&ranges, &[&stored, &committed], |_| true)),
             [((1, 1), 8, 0), ((2, 2), 4, 1)]
         );
-        assert_eq!(got(&layered(&ranges, &[&stored, &committed], |t| t.vector != 8)), [((2, 2), 4, 1)]);
+        assert_eq!(
+            got(&layered(&ranges, &[&stored, &committed], |t| t.vector != 8)),
+            [((2, 2), 4, 1)]
+        );
         let unnamed = [[1, 1, ROW_KEPT_UNNAMED, 0, 0, 0]];
-        assert_eq!(got(&layered(&ranges, &[&unnamed, &committed], |_| true)), [((2, 2), 4, 1)]);
+        assert_eq!(
+            got(&layered(&ranges, &[&unnamed, &committed], |_| true)),
+            [((2, 2), 4, 1)]
+        );
     }
 
     /// At a rung of another key (a phone whose available memory moved), the
@@ -12037,15 +12182,14 @@ mod settle_row_tests {
     /// stored first on a tie.
     #[test]
     fn a_stored_range_of_another_key_leaves_the_committed_picks_of_another_key() {
-        let settle = |of, planes: &[(u32, u32)], ranges: &[[u32; 6]]| {
-            profile::curves::DenseSettled {
+        let settle =
+            |of, planes: &[(u32, u32)], ranges: &[[u32; 6]]| profile::curves::DenseSettled {
                 method: 1,
                 of,
                 code: 0,
                 ranges: ranges.to_vec(),
                 planes: planes.to_vec(),
-            }
-        };
+            };
         let mine = [(1024, 2048), (4096, 1024)];
         let row = |bottom, top, vector| [bottom, top, ROW_KEPT, vector, 0, 0];
         let stored = settle(1, &mine, &[row(1, 1, 8)]);
@@ -12062,13 +12206,17 @@ mod settle_row_tests {
         ];
         let near = nearest(9, &mine, &all);
         assert_eq!(
-            near.iter().map(|(_, s, shared)| (s.of, *shared)).collect::<Vec<_>>(),
+            near.iter()
+                .map(|(_, s, shared)| (s.of, *shared))
+                .collect::<Vec<_>>(),
             [(9, None), (1, Some(2)), (2, Some(2)), (3, Some(1))]
         );
         let layers: Vec<&[[u32; 6]]> = near.iter().map(|(_, s, _)| s.ranges.as_slice()).collect();
         let left = std::collections::VecDeque::from([(1, 1), (2, 2), (3, 4), (9, 16)]);
-        let got: Vec<_> =
-            layered(&left, &layers, |_| true).iter().map(|&(r, t, _)| (r, t.vector)).collect();
+        let got: Vec<_> = layered(&left, &layers, |_| true)
+            .iter()
+            .map(|&(r, t, _)| (r, t.vector))
+            .collect();
         assert_eq!(got, [((1, 1), 8), ((2, 2), 4), ((3, 4), 16)]);
     }
 
@@ -12086,7 +12234,11 @@ mod settle_row_tests {
         let row = kept_row(&standing, 5, 8);
         assert_eq!(row[2], ROW_KEPT);
         assert_eq!(row_tactic(row), Some(gemv), "the kept kernel read back");
-        assert_eq!(row_tactic([5, 8, ROW_KEPT_UNNAMED, 0, 0, 0]), None, "the curves' pick");
+        assert_eq!(
+            row_tactic([5, 8, ROW_KEPT_UNNAMED, 0, 0, 0]),
+            None,
+            "the curves' pick"
+        );
         assert_eq!(
             row_tactic([5, 8, ROW_REPLACED, 4, 1, 0]),
             Some(Tactic {

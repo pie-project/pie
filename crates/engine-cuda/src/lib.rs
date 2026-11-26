@@ -25,6 +25,7 @@ pub mod group;
 #[cfg(not(feature = "rocm"))]
 pub mod grouped_decode;
 pub mod inputs;
+pub(crate) mod landing_ring;
 pub mod lockstep;
 pub mod mask;
 pub mod narrow;
@@ -40,7 +41,6 @@ pub mod sizing;
 #[cfg(feature = "rocm")]
 pub mod split_arm;
 pub mod staged_h2d;
-pub(crate) mod landing_ring;
 pub mod store;
 pub mod stored;
 pub mod synth;
@@ -212,8 +212,8 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, QueueMasks, Recording, Seal,
-    Seated, Shell, WeightPin,
+    Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, QueueMasks, Recording,
+    Seal, Seated, Shell, WeightPin,
 };
 
 pub use blob::{

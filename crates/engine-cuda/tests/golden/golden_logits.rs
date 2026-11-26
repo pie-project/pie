@@ -781,7 +781,13 @@ fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             facts
                 .shapes
                 .iter()
-                .map(|s| (s.id.0, s.role, s.slot_bytes, s.slots_per_chunk, s.kind.clone()))
+                .map(|s| (
+                    s.id.0,
+                    s.role,
+                    s.slot_bytes,
+                    s.slots_per_chunk,
+                    s.kind.clone()
+                ))
                 .collect::<Vec<_>>()
         );
     }
@@ -1722,7 +1728,10 @@ fn probe(served: fn(&Fixture, &Path) -> Vec<(u64, u32)>) {
                  {wanted_profile}: the picks may differ, and with them the logits"
             );
         }
-        for line in lines.iter().filter(|line| !line.starts_with("golden profile ")) {
+        for line in lines
+            .iter()
+            .filter(|line| !line.starts_with("golden profile "))
+        {
             let words: Vec<&str> = line.split_whitespace().collect();
             let key = (words[1].to_string(), words[2].to_string());
             match want.get(&key) {
@@ -1807,8 +1816,15 @@ fn within_tolerance() -> bool {
 /// order, by `md5sum`; "none" where there is no file. A cold cache reads as
 /// another configuration.
 fn profile_md5(cache: &Path) -> String {
-    let mut files = vec![picks_path(cache)].into_iter().filter(|p| p.is_file()).collect::<Vec<_>>();
-    let mut dirs = vec![cache.join("profiles"), cache.join("bodies"), cache.join("cover")];
+    let mut files = vec![picks_path(cache)]
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect::<Vec<_>>();
+    let mut dirs = vec![
+        cache.join("profiles"),
+        cache.join("bodies"),
+        cache.join("cover"),
+    ];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -2280,7 +2296,11 @@ fn golden_lagged() {
     let (folded, _) = served_lagged(&fixture, &cache, 0);
     let lags: Vec<u32> = std::env::var("PIE_GOLDEN_LAGS").map_or_else(
         |_| vec![1, 2, 3, 9],
-        |lags| lags.split(',').map(|lag| lag.parse().expect("a lag")).collect(),
+        |lags| {
+            lags.split(',')
+                .map(|lag| lag.parse().expect("a lag"))
+                .collect()
+        },
     );
     for lag in lags {
         let (lagged, unbodied) = served_lagged(&fixture, &cache, lag);
@@ -2306,7 +2326,10 @@ fn golden_lagged() {
                 }
             }
             if std::env::var_os("PIE_GOLDEN_LAG_STEPS").is_some() {
-                println!("lag {lag} step: apart {:e}", apart / scale.max(f32::MIN_POSITIVE));
+                println!(
+                    "lag {lag} step: apart {:e}",
+                    apart / scale.max(f32::MIN_POSITIVE)
+                );
             }
         }
         println!(
@@ -3980,8 +4003,10 @@ fn golden_staged_experts() {
         // first (no rung's span fits beside the banks the weight cache
         // seats), it names the banks it holds beside the fires instead.
         assert!(
-            said.contains(&format!("{} bytes of staged experts", least_staging.bytes()))
-                || said.contains("the weight cache seats the routed bank(s)"),
+            said.contains(&format!(
+                "{} bytes of staged experts",
+                least_staging.bytes()
+            )) || said.contains("the weight cache seats the routed bank(s)"),
             "{model}: and the bytes ({} for {} rows under the least budget), or the banks held \
              beside the fires: {said}",
             least_staging.bytes(),
@@ -4004,7 +4029,12 @@ fn golden_windowed_arms() {
     }
     let cache = cache_dir();
     let models = std::env::var("PIE_GOLDEN_MODELS").map_or_else(
-        |_| vec!["gemma4-e4b-mini-l6".to_string(), "mimo26-flash-mini".to_string()],
+        |_| {
+            vec![
+                "gemma4-e4b-mini-l6".to_string(),
+                "mimo26-flash-mini".to_string(),
+            ]
+        },
         |_| models(),
     );
     for model in models {

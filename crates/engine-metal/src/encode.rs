@@ -83,7 +83,8 @@ pub fn profile_kernels(on: bool) {
 
 #[cfg(target_vendor = "apple")]
 pub(crate) fn profiling() -> bool {
-    crate::diag::on().kernel_profile.on() || PROFILE_FORCED.load(std::sync::atomic::Ordering::Relaxed)
+    crate::diag::on().kernel_profile.on()
+        || PROFILE_FORCED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[must_use]
@@ -309,7 +310,9 @@ impl Sink<'_> {
             // SAFETY: index 0 is the kernel's one `[[threadgroup(0)]]`
             // block; Metal checks the length against the device's limit
             // with the pipeline's own, which the caller sized under.
-            unsafe { encoder.setThreadgroupMemoryLength_atIndex(fire.threadgroup_bytes as usize, 0) };
+            unsafe {
+                encoder.setThreadgroupMemoryLength_atIndex(fire.threadgroup_bytes as usize, 0)
+            };
         }
         if let Some(indirect) = fire.indirect {
             let binding = self.handles.get(indirect.buf).ok_or_else(|| {

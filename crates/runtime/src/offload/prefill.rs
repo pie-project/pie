@@ -480,10 +480,10 @@ async fn read_in_place(
         kv_pages: u32::try_from(n)?,
         ..crate::planner::Demand::default()
     };
-    let crate::planner::Acquired::Granted(mut grant) = planner
-        .acquire(pid, pid, demand)
-        .await
-        .map_err(|error| anyhow::Error::new(error).context("reserving pages to read a peer's into"))?
+    let crate::planner::Acquired::Granted(mut grant) =
+        planner.acquire(pid, pid, demand).await.map_err(|error| {
+            anyhow::Error::new(error).context("reserving pages to read a peer's into")
+        })?
     else {
         bail!("the planner asked the pass to yield before its pages were read");
     };
@@ -1021,10 +1021,7 @@ pub const PROGRAM: &str = "prefill";
 /// full departure, taken while it runs.
 /// Runs the built-in `prefill` program over `tokens`, its set keyed under
 /// the asker's `domain` (whatever scope the program asks).
-async fn run_prefill(
-    domain: Hash256,
-    tokens: &[u32],
-) -> Result<crate::planner::DepartureWatch> {
+async fn run_prefill(domain: Hash256, tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
     use crate::inferlet::program;
     let reference = program::ProgramRef::parse(PROGRAM)?;
     let name = program::resolve(None, &reference)

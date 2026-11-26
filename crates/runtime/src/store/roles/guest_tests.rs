@@ -228,9 +228,7 @@ impl ::engine::Engine for GuestEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -278,10 +276,7 @@ impl ::engine::Programs for GuestEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -328,16 +323,28 @@ impl ::engine::Programs for GuestEngine {
         Ok(())
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
     fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
         Err(::engine::Error::unsupported(self.kind(), "close_instance"))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -351,7 +358,10 @@ impl ::engine::Pool for GuestEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -380,19 +390,28 @@ impl ::engine::Tiers for GuestEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 fn holder(n: u128) -> super::Holder {
     uuid::Uuid::from_u128(n)
@@ -477,7 +496,11 @@ fn a_park_is_said_to_the_engine_before_its_slots_are_another_s() {
             .unwrap()
             .prepare_park(holder(1))
             .expect("the instance parks");
-        assert_eq!(park.parked(), vec![Rebind::Parked { id, kept: false }], "the park names it");
+        assert_eq!(
+            park.parked(),
+            vec![Rebind::Parked { id, kept: false }],
+            "the park names it"
+        );
         if told {
             for rebind in park.parked() {
                 super::rebind(Some(&roles), &mut engine, rebind, |_, _, _| Ok(())).unwrap();
@@ -533,14 +556,28 @@ fn a_pair_run_is_never_another_program_s_while_a_member_may_still_fire() {
     let a1 = bind(&roles, &mut engine, 1).unwrap();
     let _a2 = bind(&roles, &mut engine, 2).unwrap();
     let pair_at = engine.bindings[0].pair.clone();
-    assert_eq!(pair_at, engine.bindings[1].pair, "one pair run for the batch");
+    assert_eq!(
+        pair_at, engine.bindings[1].pair,
+        "one pair run for the batch"
+    );
     // The first member's park in flight; the second parks and lands.
-    let first = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
-    let second = roles.lock().unwrap().prepare_park(holder(2)).expect("it parks");
+    let first = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(1))
+        .expect("it parks");
+    let second = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(2))
+        .expect("it parks");
     roles.lock().unwrap().commit(second);
     // The first's move is taken back: its member is resident again.
     roles.lock().unwrap().abort(first);
-    assert!(roles.lock().unwrap().stale(holder(1)).is_empty(), "nothing moved of {a1:?}");
+    assert!(
+        roles.lock().unwrap().stale(holder(1)).is_empty(),
+        "nothing moved of {a1:?}"
+    );
     // Another program binds: none of its room is the resident pair's.
     let mut other = GuestEngine::new(2 * CHUNK, PAIR);
     other.next = 100;
@@ -557,10 +594,19 @@ fn a_pair_run_is_never_another_program_s_while_a_member_may_still_fire() {
     )
     .unwrap();
     let theirs = &other.bindings[0];
-    disjoint(&[&pair_at, &theirs.pair, &theirs.scratch, &engine.bindings[0].scratch])
-        .expect("the resident member's pair run is its batch's alone");
+    disjoint(&[
+        &pair_at,
+        &theirs.pair,
+        &theirs.scratch,
+        &engine.bindings[0].scratch,
+    ])
+    .expect("the resident member's pair run is its batch's alone");
     // The first member's park lands now: the pair goes back with it.
-    let first = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let first = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(1))
+        .expect("it parks");
     roles.lock().unwrap().commit(first);
     let mine = 2 * CHUNK + slots(PAIR) * SLOT;
     assert_eq!(
@@ -861,7 +907,11 @@ async fn a_long_guest_bind_s_need_drives_the_walk_while_smaller_binds_short_of_r
         ),
         "waits on a commit: {error}"
     );
-    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "its need is counted");
+    assert_eq!(
+        device.lock().unwrap().guest_head(),
+        Some((4, 2)),
+        "its need is counted"
+    );
     let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     let _ = grow.retarget(u64::from(u32::MAX));
     assert_eq!(
@@ -876,12 +926,19 @@ async fn a_long_guest_bind_s_need_drives_the_walk_while_smaller_binds_short_of_r
     for by in 0..5 {
         let error = bind_as(&roles, &mut small_engine, small, 100 + by).expect_err("no room");
         assert!(
-            matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+            matches!(
+                error.downcast_ref::<RolesError>(),
+                Some(RolesError::GuestGrow { .. })
+            ),
             "{error}"
         );
     }
     assert!(small_engine.bindings.is_empty(), "the engine was not asked");
-    assert_eq!(device.lock().unwrap().guest_head(), Some((4, 2)), "its need stands");
+    assert_eq!(
+        device.lock().unwrap().guest_head(),
+        Some((4, 2)),
+        "its need stands"
+    );
 
     // The commit: the long bind binds in the fresh segment, two runs of
     // four, and its need is no longer counted.
@@ -889,7 +946,11 @@ async fn a_long_guest_bind_s_need_drives_the_walk_while_smaller_binds_short_of_r
     bind_as(&roles, &mut long_engine, long, 1).expect("it binds");
     let pieces = pieces_of(&device, &long_engine.bindings[0].scratch);
     assert_eq!(pieces.len(), 2);
-    assert!(pieces.iter().all(|piece| piece.len() == 4 && piece.iter().all(|&(_, s)| s == 1)));
+    assert!(
+        pieces
+            .iter()
+            .all(|piece| piece.len() == 4 && piece.iter().all(|&(_, s)| s == 1))
+    );
     assert_eq!(device.lock().unwrap().guest_head(), None);
 
     // The next segment: the small binds bind.
@@ -898,7 +959,10 @@ async fn a_long_guest_bind_s_need_drives_the_walk_while_smaller_binds_short_of_r
         bind_as(&roles, &mut small_engine, small, 100 + by).expect("room came");
     }
     let demand = device.lock().unwrap().pool().demand();
-    assert_eq!(demand.wanted, demand.live, "no need is counted short any more");
+    assert_eq!(
+        demand.wanted, demand.live,
+        "no need is counted short any more"
+    );
     let _ = before;
 }
 
@@ -921,16 +985,26 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
         let pool = device.lock().unwrap();
         (pool.pool().free_chunks(), pool.pool().free_chunk_runs(4))
     };
-    assert!(free >= 13, "{free} free chunks: the head's 8 and the 4 ahead");
+    assert!(
+        free >= 13,
+        "{free} free chunks: the head's 8 and the 4 ahead"
+    );
     assert_eq!(runs, 0, "none of four adjacent");
     let mut grow = crate::store::shared::SharedGrow::new(0, ENGINE, device.clone());
     let _ = grow.retarget(u64::from(u32::MAX));
-    assert_eq!(grow.live_step_for_test(), None, "the scattered room covers the ahead");
+    assert_eq!(
+        grow.live_step_for_test(),
+        None,
+        "the scattered room covers the ahead"
+    );
 
     let (long, mut long_engine) = runs_of(8, 4, 2, 0);
     let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no run of 4");
     assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestGrow { .. })
+        ),
         "{error}"
     );
     assert_eq!(
@@ -939,7 +1013,11 @@ fn the_walk_commits_for_the_head_s_runs_where_scattered_free_chunks_cover_its_sl
         "the walk commits for the head's runs"
     );
     roles.lock().unwrap().leave_guest_wait(holder(1));
-    assert_eq!(grow.live_step_for_test(), None, "with no head, nothing more");
+    assert_eq!(
+        grow.live_step_for_test(),
+        None,
+        "with no head, nothing more"
+    );
 }
 
 /// A guest bind's wait under `bind_when_resident` for `by`, binding
@@ -1004,13 +1082,34 @@ async fn a_guest_head_at_the_target_is_served_by_the_planner_and_the_next_bind_f
     let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
     let (small, small_engine) = runs_of(10, 1, 1, 2000);
     let small_engine = std::rc::Rc::new(std::cell::RefCell::new(small_engine));
-    let head = waiting_bind(&roles, &device, ENGINE, 1, long, long_engine.clone(), parked.clone(), asked.clone());
-    let behind = waiting_bind(&roles, &device, ENGINE, 2, small, small_engine.clone(), parked, asked.clone());
+    let head = waiting_bind(
+        &roles,
+        &device,
+        ENGINE,
+        1,
+        long,
+        long_engine.clone(),
+        parked.clone(),
+        asked.clone(),
+    );
+    let behind = waiting_bind(
+        &roles,
+        &device,
+        ENGINE,
+        2,
+        small,
+        small_engine.clone(),
+        parked,
+        asked.clone(),
+    );
     tokio::pin!(head);
     tokio::pin!(behind);
     let first = futures::poll!(head.as_mut());
     assert!(asked.get() >= 1, "the planner is asked for the head");
-    assert!(matches!(first, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
+    assert!(
+        matches!(first, std::task::Poll::Ready(Ok(_))),
+        "the head binds in the room it made"
+    );
     behind.await.expect("the bind behind it follows");
     assert_eq!(long_engine.borrow().bindings.len(), 1);
     assert_eq!(small_engine.borrow().bindings.len(), 1);
@@ -1037,12 +1136,28 @@ async fn a_guest_head_waiting_on_a_commit_that_does_not_come_is_served_by_the_pl
     let (long, long_engine) = runs_of(8, 4, 2, 0);
     let long_engine = std::rc::Rc::new(std::cell::RefCell::new(long_engine));
     let prefix = device.lock().unwrap().pool().prefix_segments();
-    let head = waiting_bind(&roles, &device, ENGINE, 1, long, long_engine.clone(), parked, asked.clone());
+    let head = waiting_bind(
+        &roles,
+        &device,
+        ENGINE,
+        1,
+        long,
+        long_engine.clone(),
+        parked,
+        asked.clone(),
+    );
     tokio::pin!(head);
     let polled = futures::poll!(head.as_mut());
     assert!(asked.get() >= 1, "the planner is asked beside the commit");
-    assert!(matches!(polled, std::task::Poll::Ready(Ok(_))), "the head binds in the room it made");
-    assert_eq!(device.lock().unwrap().pool().prefix_segments(), prefix, "no commit came");
+    assert!(
+        matches!(polled, std::task::Poll::Ready(Ok(_))),
+        "the head binds in the room it made"
+    );
+    assert_eq!(
+        device.lock().unwrap().pool().prefix_segments(),
+        prefix,
+        "no commit came"
+    );
 }
 
 /// The pools of `facts` with no host tier below the device.
@@ -1072,14 +1187,21 @@ fn with_no_host_tier_a_park_gives_guest_scratch_back_and_a_restore_takes_it_fres
         }
     }
     assert!(bound.len() >= 2, "{} bound", bound.len());
-    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunk_runs(4),
+        0,
+        "no run of 4 left"
+    );
     let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
     bind_or_leave(&roles, &mut other_engine, other, 999).expect_err("short of a run");
 
     // The first process parks, no host tier below: its scratch comes back.
     let (parked, id) = bound[0];
     park(&roles, parked);
-    assert!(device.lock().unwrap().pool().free_chunk_runs(4) >= 1, "its run of 4 is free");
+    assert!(
+        device.lock().unwrap().pool().free_chunk_runs(4) >= 1,
+        "its run of 4 is free"
+    );
     assert!(!roles.lock().unwrap().holds_guest_state(holder(parked)));
     let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the new bind lands");
 
@@ -1094,7 +1216,11 @@ fn with_no_host_tier_a_park_gives_guest_scratch_back_and_a_restore_takes_it_fres
         .expect("something comes back");
     roles.lock().unwrap().commit(unpark);
     let stale = roles.lock().unwrap().stale(holder(parked));
-    let Some(Rebind::Instance { id: rebound, scratch, .. }) = stale
+    let Some(Rebind::Instance {
+        id: rebound,
+        scratch,
+        ..
+    }) = stale
         .iter()
         .find(|rebind| matches!(rebind, Rebind::Instance { .. }))
         .cloned()
@@ -1127,15 +1253,26 @@ fn a_restore_short_of_its_run_waits_with_its_need_and_lands_once_room_comes() {
     park(&roles, parked);
     let (other, mut other_engine) = runs_of(14, 4, 1, 9000);
     let landed = bind_as(&roles, &mut other_engine, other, 999).expect("the freed run is taken");
-    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 0, "no run of 4 left");
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunk_runs(4),
+        0,
+        "no run of 4 left"
+    );
 
     let error = roles
         .lock()
         .unwrap()
         .prepare_unpark(holder(parked))
         .expect_err("short of its run");
-    assert!(matches!(error, RolesError::UnparkShort(_)), "it waits: {error}");
-    assert_eq!(error.unpark_runs(), Some((4, 1)), "its need, named: {error}");
+    assert!(
+        matches!(error, RolesError::UnparkShort(_)),
+        "it waits: {error}"
+    );
+    assert_eq!(
+        error.unpark_runs(),
+        Some((4, 1)),
+        "its need, named: {error}"
+    );
 
     roles.lock().unwrap().close_instance(landed);
     let unpark = roles
@@ -1167,7 +1304,10 @@ fn a_pair_s_state_is_given_back_only_once_the_fires_naming_it_land() {
     let free = || device.lock().unwrap().pool().free_chunks();
     let before = free();
     let named = roles.lock().unwrap().reading([id]);
-    assert!(named.contains(&Owner::Pair(pair)), "the frame names the pair");
+    assert!(
+        named.contains(&Owner::Pair(pair)),
+        "the frame names the pair"
+    );
     roles.lock().unwrap().close_instance(id);
     assert_eq!(
         free(),
@@ -1243,7 +1383,9 @@ async fn restores_of_a_pair_s_many_holders_wait_once_on_its_move_and_all_land() 
     let Pools { device, roles } = pools(64);
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
     let before = held(&device);
-    let ids: Vec<InstanceId> = (1..=4).map(|by| bind(&roles, &mut engine, by).unwrap()).collect();
+    let ids: Vec<InstanceId> = (1..=4)
+        .map(|by| bind(&roles, &mut engine, by).unwrap())
+        .collect();
     for by in 1..=4 {
         park(&roles, by);
     }
@@ -1316,7 +1458,10 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
     let taken: u64 = held(&device);
     let watch = roles.lock().unwrap().room_watch();
     let unparked = roles.lock().unwrap().prepare_unpark(holder(2));
-    assert!(matches!(unparked, Err(RolesError::PairParked(_))), "the pair moves");
+    assert!(
+        matches!(unparked, Err(RolesError::PairParked(_))),
+        "the pair moves"
+    );
     let woken = tokio::spawn(watch.freed());
     let leaked = roles.lock().unwrap().abandon(moving);
     assert!(leaked > 0, "the slots it took on the device");
@@ -1343,7 +1488,11 @@ async fn an_abandoned_move_ends_leaks_its_slots_by_name_and_frees_its_waiters() 
     }
     roles.lock().unwrap().close_instance(first);
     roles.lock().unwrap().close_instance(second);
-    assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
+    assert_eq!(
+        roles.lock().unwrap().leaked(),
+        leaked,
+        "still out of service"
+    );
 }
 
 /// A failed process's teardown (else pairs of dead processes are left on
@@ -1382,7 +1531,13 @@ fn a_close_the_engine_refuses_still_frees_the_instance_and_its_pair() {
         before,
         "every slot back, the pair freed with its last holder"
     );
-    assert!(roles.lock().unwrap().guest_chunk_slots(&[holder(1)]).is_empty());
+    assert!(
+        roles
+            .lock()
+            .unwrap()
+            .guest_chunk_slots(&[holder(1)])
+            .is_empty()
+    );
 }
 
 /// A load with no host tier (unified memory): two processes' instances
@@ -1462,7 +1617,10 @@ fn a_bind_short_of_a_run_among_scattered_free_chunks_lands_after_a_compaction() 
     let (long, mut long_engine) = runs_of(8, 4, 1, 0);
     let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no run of 4");
     assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::BindShort(_))),
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::BindShort(_))
+        ),
         "at the limit, short of a run: to the planner: {error}"
     );
     roles.lock().unwrap().leave_guest_wait(holder(1));
@@ -1489,7 +1647,11 @@ fn a_bind_short_of_a_run_among_scattered_free_chunks_lands_after_a_compaction() 
                 compactions += 1;
                 let mut pool = device.lock().unwrap();
                 pool.compaction_copied(at, at);
-                assert_eq!(pool.pool().free_chunk_runs(4), 0, "closed until its fire retires");
+                assert_eq!(
+                    pool.pool().free_chunk_runs(4),
+                    0,
+                    "closed until its fire retires"
+                );
                 pool.pool_mut().retire_through(at);
                 epoch += 1;
             }
@@ -1499,7 +1661,10 @@ fn a_bind_short_of_a_run_among_scattered_free_chunks_lands_after_a_compaction() 
     }
     assert_eq!(compactions, 1, "one compaction stands the run");
     assert_eq!(device.lock().unwrap().pool().free_chunk_runs(4), 1);
-    assert!(!device.lock().unwrap().compaction_comes(4, 1), "the run stands: nothing to move");
+    assert!(
+        !device.lock().unwrap().compaction_comes(4, 1),
+        "the run stands: nothing to move"
+    );
     bind_as(&roles, &mut long_engine, long, 1).expect("the run stands: it binds");
 }
 
@@ -1548,14 +1713,21 @@ fn a_restore_of_a_shared_pair_leaves_another_s_instance_parked_where_it_lies_unb
     roles.lock().unwrap().commit(back);
     let stale = roles.lock().unwrap().stale(holder(1));
     assert!(
-        stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == a)),
+        stale
+            .iter()
+            .any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == a)),
         "its own instance is rebound: {stale:?}"
     );
     assert!(
-        !stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
+        !stale
+            .iter()
+            .any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
         "the other's instance, parked where it lies, is not: {stale:?}"
     );
-    assert!(!named_nothing(&stale), "no rebind names an emptied part: {stale:?}");
+    assert!(
+        !named_nothing(&stale),
+        "no rebind names an emptied part: {stale:?}"
+    );
     for rebind in stale {
         roles.lock().unwrap().rebound(super::Owner::of(&rebind));
     }
@@ -1569,7 +1741,9 @@ fn a_restore_of_a_shared_pair_leaves_another_s_instance_parked_where_it_lies_unb
     roles.lock().unwrap().commit(back);
     let stale = roles.lock().unwrap().stale(holder(2));
     assert!(
-        stale.iter().any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
+        stale
+            .iter()
+            .any(|rebind| matches!(rebind, Rebind::Instance { id, .. } if *id == b)),
         "rebound with its own restore: {stale:?}"
     );
     assert!(!named_nothing(&stale), "with its scratch: {stale:?}");
@@ -1607,7 +1781,9 @@ fn rebinds_never_name_an_emptied_guest_part_over_random_park_and_restore_schedul
         let device = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
         let host = host_tier.then(|| {
             Arc::new(Mutex::new(
-                SharedPool::tier(&facts, facts.host_chunks).unwrap().unwrap(),
+                SharedPool::tier(&facts, facts.host_chunks)
+                    .unwrap()
+                    .unwrap(),
             ))
         });
         let roles = Arc::new(Mutex::new(Roles::new(&device, host.as_ref()).unwrap()));
@@ -1668,13 +1844,21 @@ fn rebinds_never_name_an_emptied_guest_part_over_random_park_and_restore_schedul
             }
         }
         if let Some(why) = failed {
-            failures.push(format!("seed {seed}: {why}\n  schedule: {}", schedule.join(" -> ")));
+            failures.push(format!(
+                "seed {seed}: {why}\n  schedule: {}",
+                schedule.join(" -> ")
+            ));
             if failures.len() > 10 {
                 break;
             }
         }
     }
-    assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failing seeds:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// A bind short of room waits for what idle cache gives, its process running
@@ -1690,7 +1874,11 @@ async fn a_bind_takes_idle_cache_s_room_before_its_process_is_suspended() {
         })))
     };
     let did = RefCell::new(Vec::new());
-    let mut gives = vec![BindRoomWait::IdleOut, BindRoomWait::Served, BindRoomWait::Served];
+    let mut gives = vec![
+        BindRoomWait::IdleOut,
+        BindRoomWait::Served,
+        BindRoomWait::Served,
+    ];
     let gives = RefCell::new(&mut gives);
     let bound = super::bind_when_resident(
         holder(7),
@@ -1705,7 +1893,10 @@ async fn a_bind_takes_idle_cache_s_room_before_its_process_is_suspended() {
         |_, _, _| false,
         |_, _, _| {
             did.borrow_mut().push("idle");
-            std::future::ready(Ok(gives.borrow_mut().pop().expect("asked no more once out")))
+            std::future::ready(Ok(gives
+                .borrow_mut()
+                .pop()
+                .expect("asked no more once out")))
         },
         |_, _, _| {
             did.borrow_mut().push("suspend");
@@ -1720,7 +1911,9 @@ async fn a_bind_takes_idle_cache_s_room_before_its_process_is_suspended() {
     assert!(bound.is_ok(), "{bound:?}");
     assert_eq!(
         did.into_inner(),
-        ["bind", "idle", "bind", "idle", "bind", "idle", "suspend", "bind"]
+        [
+            "bind", "idle", "bind", "idle", "bind", "idle", "suspend", "bind"
+        ]
     );
 }
 
@@ -1738,7 +1931,11 @@ async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
             slots: 3,
         })))
     };
-    let (binds, suspends, waits) = (Rc::new(Cell::new(0u32)), Rc::new(Cell::new(0u32)), Rc::new(Cell::new(0u32)));
+    let (binds, suspends, waits) = (
+        Rc::new(Cell::new(0u32)),
+        Rc::new(Cell::new(0u32)),
+        Rc::new(Cell::new(0u32)),
+    );
     let bound = super::bind_when_resident(
         holder(7),
         {
@@ -1747,7 +1944,11 @@ async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
                 binds.set(binds.get() + 1);
                 // Short three times (before the suspend, after the restore,
                 // and once more while it waits), then bound.
-                std::future::ready(if binds.get() <= 3 { Err(short()) } else { Ok(()) })
+                std::future::ready(if binds.get() <= 3 {
+                    Err(short())
+                } else {
+                    Ok(())
+                })
             }
         },
         || std::future::ready(Ok::<(), String>(())),
@@ -1775,8 +1976,16 @@ async fn a_bind_suspended_once_for_room_waits_parked_when_short_again() {
     )
     .await;
     assert!(bound.is_ok(), "{bound:?}");
-    assert_eq!(suspends.get(), 1, "suspended once for its room, never again");
-    assert_eq!(waits.get(), 2, "short again after its restore, it waits parked for room");
+    assert_eq!(
+        suspends.get(),
+        1,
+        "suspended once for its room, never again"
+    );
+    assert_eq!(
+        waits.get(),
+        2,
+        "short again after its restore, it waits parked for room"
+    );
     assert_eq!(binds.get(), 4);
 }
 
@@ -1800,7 +2009,11 @@ fn chunks_kv_filled_and_emptied_take_an_instance_run() {
         kv.push(refs);
     }
     assert!(!kv.is_empty());
-    assert_eq!(device.lock().unwrap().pool().free_chunk_runs(1), 0, "kv holds every chunk");
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunk_runs(1),
+        0,
+        "kv holds every chunk"
+    );
     let (program, mut engine) = runs_of(8, 3, 1, 0);
     let error = bind_as(&roles, &mut engine, program, 1).expect_err("no free run");
     assert!(
@@ -1831,12 +2044,21 @@ fn chunks_kv_filled_and_emptied_take_an_instance_run() {
             segment_chunks: pool.pool().segments().segment_chunks(),
         };
         assert_eq!(map.cheapest_runs(3, runs), Some(Vec::new()));
-        assert_eq!(map.cheapest_runs(3, runs + 1), None, "the map counts no run the pool lacks");
+        assert_eq!(
+            map.cheapest_runs(3, runs + 1),
+            None,
+            "the map counts no run the pool lacks"
+        );
     }
     bind_as(&roles, &mut engine, program, 1).expect("it lands in the chunks kv gave back");
     let piece = &pieces_of(&device, &engine.bindings[0].scratch)[0];
     assert_eq!(piece.len(), 3);
-    assert!(piece.windows(2).all(|w| w[0].0 + 1 == w[1].0 && w[0].1 == w[1].1), "{piece:?}");
+    assert!(
+        piece
+            .windows(2)
+            .all(|w| w[0].0 + 1 == w[1].0 && w[0].1 == w[1].1),
+        "{piece:?}"
+    );
 }
 
 /// With no host tier (unified memory) two processes share a pair, both
@@ -1882,7 +2104,10 @@ fn with_no_host_tier_a_second_restore_waits_for_the_pair_the_first_brings_back()
     }
     roles.lock().unwrap().commit(first_back);
     let pair = rebound_pair(&roles, 1, first);
-    assert!(matches!(pair, ScratchPlace::Chunks { .. } | ScratchPlace::Run { .. }), "{pair:?}");
+    assert!(
+        matches!(pair, ScratchPlace::Chunks { .. } | ScratchPlace::Run { .. }),
+        "{pair:?}"
+    );
     // Once the pair has landed the second comes back, rebound to it.
     let back = roles
         .lock()
@@ -1891,14 +2116,21 @@ fn with_no_host_tier_a_second_restore_waits_for_the_pair_the_first_brings_back()
         .unwrap()
         .expect("it comes back");
     roles.lock().unwrap().commit(back);
-    assert_eq!(rebound_pair(&roles, 2, second), pair, "rebound to where it landed");
+    assert_eq!(
+        rebound_pair(&roles, 2, second),
+        pair,
+        "rebound to where it landed"
+    );
     // Back but not yet rebound, it is no resident's: its restore waits.
     assert_eq!(roles.lock().unwrap().unbound(holder(2)), vec![second]);
     let stale = roles.lock().unwrap().stale(holder(2));
     for rebind in stale {
         roles.lock().unwrap().rebound(Owner::of(&rebind));
     }
-    assert!(roles.lock().unwrap().unbound(holder(2)).is_empty(), "rebound: resident");
+    assert!(
+        roles.lock().unwrap().unbound(holder(2)).is_empty(),
+        "rebound: resident"
+    );
 }
 
 /// A process's instances parked where they lie (no host tier) are unbound
@@ -1911,10 +2143,20 @@ fn an_instance_is_unbound_from_its_park_until_its_rebind() {
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
     let id = bind(&roles, &mut engine, 1).unwrap();
     let other = bind(&roles, &mut engine, 2).unwrap();
-    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "bound where it lies");
+    assert!(
+        roles.lock().unwrap().unbound(holder(1)).is_empty(),
+        "bound where it lies"
+    );
     park(&roles, 1);
-    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "parked where it lies");
-    assert!(roles.lock().unwrap().unbound(holder(2)).is_empty(), "the other stays bound");
+    assert_eq!(
+        roles.lock().unwrap().unbound(holder(1)),
+        vec![id],
+        "parked where it lies"
+    );
+    assert!(
+        roles.lock().unwrap().unbound(holder(2)).is_empty(),
+        "the other stays bound"
+    );
     let back = roles
         .lock()
         .unwrap()
@@ -1923,12 +2165,19 @@ fn an_instance_is_unbound_from_its_park_until_its_rebind() {
         .expect("it comes back");
     assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "moving");
     roles.lock().unwrap().commit(back);
-    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "back, not rebound");
+    assert_eq!(
+        roles.lock().unwrap().unbound(holder(1)),
+        vec![id],
+        "back, not rebound"
+    );
     let stale = roles.lock().unwrap().stale(holder(1));
     for rebind in stale {
         roles.lock().unwrap().rebound(Owner::of(&rebind));
     }
-    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "rebound");
+    assert!(
+        roles.lock().unwrap().unbound(holder(1)).is_empty(),
+        "rebound"
+    );
     roles.lock().unwrap().close_instance(id);
     roles.lock().unwrap().close_instance(other);
 }
@@ -2003,13 +2252,23 @@ fn with_no_host_tier_a_restored_instance_fires_on_its_rebound_place() {
         .unwrap()
         .expect("the first brings the pair back");
     assert!(
-        matches!(roles.lock().unwrap().prepare_unpark(holder(2)), Err(RolesError::PairParked(_))),
+        matches!(
+            roles.lock().unwrap().prepare_unpark(holder(2)),
+            Err(RolesError::PairParked(_))
+        ),
         "the second waits for the pair's move"
     );
     roles.lock().unwrap().commit(first);
-    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![a], "back, not yet rebound");
+    assert_eq!(
+        roles.lock().unwrap().unbound(holder(1)),
+        vec![a],
+        "back, not yet rebound"
+    );
     lane(&roles, &mut engine, 1);
-    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "the first may fire");
+    assert!(
+        roles.lock().unwrap().unbound(holder(1)).is_empty(),
+        "the first may fire"
+    );
     apart(&engine, &[a]).expect("the first fires on its own place");
 
     let second = roles
@@ -2024,12 +2283,23 @@ fn with_no_host_tier_a_restored_instance_fires_on_its_rebound_place() {
         vec![b],
         "back, its engine binding still where it parked: not fit to fire"
     );
-    assert_eq!(fires_on(&engine, b).0, parked_at, "the engine still names its old place");
+    assert_eq!(
+        fires_on(&engine, b).0,
+        parked_at,
+        "the engine still names its old place"
+    );
     lane(&roles, &mut engine, 2);
-    assert!(roles.lock().unwrap().unbound(holder(2)).is_empty(), "the second may fire");
+    assert!(
+        roles.lock().unwrap().unbound(holder(2)).is_empty(),
+        "the second may fire"
+    );
     assert_ne!(fires_on(&engine, b).0, parked_at, "it fires on fresh room");
     apart(&engine, &[a, b]).expect("each fires on its own place");
-    assert_eq!(fires_on(&engine, a).1, fires_on(&engine, b).1, "one pair, where it landed");
+    assert_eq!(
+        fires_on(&engine, a).1,
+        fires_on(&engine, b).1,
+        "one pair, where it landed"
+    );
 }
 
 /// A bind short of room asks for all it takes, not the part that came up
@@ -2046,7 +2316,11 @@ fn a_bind_short_of_room_asks_for_its_scratch_and_its_pair_together() {
     for id in singles.iter().take(3) {
         roles.lock().unwrap().close_instance(*id);
     }
-    assert_eq!(device.lock().unwrap().pool().free_chunks(), 3, "three chunks free");
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunks(),
+        3,
+        "three chunks free"
+    );
     let mut engine = GuestEngine::new(2 * CHUNK, 2 * CHUNK);
     let error = bind(&roles, &mut engine, 1).expect_err("four chunks asked, three free");
     let short = error.downcast_ref::<RolesError>().expect("a roles error");
@@ -2119,9 +2393,14 @@ fn a_restore_needing_three_runs_of_nine_is_seated_in_stretches_of_ten_ten_and_ni
     }
     // Free stretches of 10 (segment 1), 10 (segment 2) and 9 (segment 3).
     let physical = |logical: u32| device.lock().unwrap().pool().physical(logical).unwrap();
-    let stretch = |chunk: u32| (16..26).contains(&chunk) || (32..42).contains(&chunk) || (48..57).contains(&chunk);
+    let stretch = |chunk: u32| {
+        (16..26).contains(&chunk) || (32..42).contains(&chunk) || (48..57).contains(&chunk)
+    };
     for (id, place) in &held {
-        if chunks(place).iter().all(|&logical| stretch(physical(logical))) {
+        if chunks(place)
+            .iter()
+            .all(|&logical| stretch(physical(logical)))
+        {
             roles.lock().unwrap().close_instance(*id);
         }
     }
@@ -2189,7 +2468,11 @@ fn an_unpark_lays_its_runs_of_chunks_before_its_runs_of_slots() {
         for id in [c.1, next, d.1] {
             roles.lock().unwrap().close_instance(id);
         }
-        assert_eq!(device.lock().unwrap().pool().free_chunks(), 3, "c, c + 1 and d free");
+        assert_eq!(
+            device.lock().unwrap().pool().free_chunks(),
+            3,
+            "c, c + 1 and d free"
+        );
         let back = roles
             .lock()
             .unwrap()
@@ -2210,11 +2493,9 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
     use crate::governor::PoolTarget;
     const ENGINE: usize = 69;
     let Pools { device, roles } = pools_of(facts_committed(64, 8, 1));
-    let grow = std::rc::Rc::new(std::cell::RefCell::new(crate::store::shared::SharedGrow::new(
-        0,
-        ENGINE,
-        device.clone(),
-    )));
+    let grow = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::store::shared::SharedGrow::new(0, ENGINE, device.clone()),
+    ));
     let _ = grow.borrow_mut().retarget(u64::from(u32::MAX));
     let (held_program, mut held_engine) = runs_of(13, 4, 2, 5000);
     let victim = bind_as(&roles, &mut held_engine, held_program, 7).expect("a resident");
@@ -2223,7 +2504,10 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
     let mut long_engine = long_engine;
     let error = bind_as(&roles, &mut long_engine, long, 1).expect_err("no room yet");
     assert!(
-        matches!(error.downcast_ref::<RolesError>(), Some(RolesError::GuestGrow { .. })),
+        matches!(
+            error.downcast_ref::<RolesError>(),
+            Some(RolesError::GuestGrow { .. })
+        ),
         "a commit's to wait on first: {error}"
     );
     roles.lock().unwrap().leave_guest_wait(holder(1));
@@ -2307,7 +2591,12 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
     {
         let mut roles = roles.lock().unwrap();
         let item = roles.items.get_mut(&Owner::Instance(id)).expect("bound");
-        let dead: Vec<super::Part> = item.parts.iter().filter(|part| part.dead()).cloned().collect();
+        let dead: Vec<super::Part> = item
+            .parts
+            .iter()
+            .filter(|part| part.dead())
+            .cloned()
+            .collect();
         assert!(!dead.is_empty(), "a scratch part");
         for part in item.parts.iter_mut().filter(|part| part.dead()) {
             part.refs.clear();
@@ -2317,7 +2606,11 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
     }
     let singles = fill_with_singles(&roles);
     assert!(
-        roles.lock().unwrap().unpark_need(holder(1)).contains(&(3, 2)),
+        roles
+            .lock()
+            .unwrap()
+            .unpark_need(holder(1))
+            .contains(&(3, 2)),
         "its need counts the runs its rebind names: {:?}",
         roles.lock().unwrap().unpark_need(holder(1))
     );
@@ -2326,7 +2619,11 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
         matches!(short, Err(RolesError::UnparkShort(_))),
         "no two runs of three: refused, nothing committed: {short:?}"
     );
-    assert_eq!(roles.lock().unwrap().unbound(holder(1)), vec![id], "not bound where it lies");
+    assert_eq!(
+        roles.lock().unwrap().unbound(holder(1)),
+        vec![id],
+        "not bound where it lies"
+    );
     assert_eq!(
         roles.lock().unwrap().unbound_after(holder(1), None),
         vec![id],
@@ -2343,21 +2640,39 @@ fn a_restore_takes_the_runs_its_rebinds_name_before_it_commits() {
         .expect("room stands")
         .expect("its scratch is taken");
     assert!(
-        roles.lock().unwrap().unbound_after(holder(1), Some(&unpark)).is_empty(),
+        roles
+            .lock()
+            .unwrap()
+            .unbound_after(holder(1), Some(&unpark))
+            .is_empty(),
         "committed, every instance its rebinds name is placed"
     );
     roles.lock().unwrap().commit(unpark);
     let stale = roles.lock().unwrap().stale(holder(1));
-    let [Rebind::Instance { id: rebound, scratch, .. }] = stale.as_slice() else {
+    let [
+        Rebind::Instance {
+            id: rebound,
+            scratch,
+            ..
+        },
+    ] = stale.as_slice()
+    else {
         panic!("one rebind of the instance: {stale:?}");
     };
     assert_eq!(*rebound, id);
-    assert_eq!(pieces_of(&device, scratch).len(), 2, "two runs: {scratch:?}");
+    assert_eq!(
+        pieces_of(&device, scratch).len(),
+        2,
+        "two runs: {scratch:?}"
+    );
     for rebind in stale {
         <GuestEngine as ::engine::Programs>::rebind(&mut engine, rebind).unwrap();
         roles.lock().unwrap().rebound(Owner::Instance(id));
     }
-    assert!(roles.lock().unwrap().unbound(holder(1)).is_empty(), "nothing left unbound");
+    assert!(
+        roles.lock().unwrap().unbound(holder(1)).is_empty(),
+        "nothing left unbound"
+    );
 }
 
 /// A restore's need must not read [(1, 1)] while its unpark is refused a
@@ -2372,12 +2687,23 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
     let Pools { device, roles } = pools_of(facts_in(64, 8));
     let mut engine = GuestEngine::new(2 * MIB, 0);
     let id = bind(&roles, &mut engine, 1).expect("a run of slots");
-    let shape = roles.lock().unwrap().shapes.of(SlotRole::Instance).expect("shape").pool;
+    let shape = roles
+        .lock()
+        .unwrap()
+        .shapes
+        .of(SlotRole::Instance)
+        .expect("shape")
+        .pool;
     // Its scratch has no slots now (its rebind's to take).
     {
         let mut roles = roles.lock().unwrap();
         let item = roles.items.get_mut(&Owner::Instance(id)).expect("bound");
-        let dead: Vec<super::Part> = item.parts.iter().filter(|part| part.dead()).cloned().collect();
+        let dead: Vec<super::Part> = item
+            .parts
+            .iter()
+            .filter(|part| part.dead())
+            .cloned()
+            .collect();
         for part in item.parts.iter_mut().filter(|part| part.dead()) {
             part.refs.clear();
         }
@@ -2389,13 +2715,19 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
     let singles_part = {
         let roles = roles.lock().unwrap();
         let device = std::sync::Arc::clone(&roles.device);
-        roles.take(&device, SlotRole::Instance, 1000, false).expect("single slots")
+        roles
+            .take(&device, SlotRole::Instance, 1000, false)
+            .expect("single slots")
     };
     let partial = device.lock().unwrap().pool().partial_free(shape);
     assert!(partial >= 512, "{partial} free single slots in a chunk");
     let singles = fill_with_singles(&roles);
     roles.lock().unwrap().close_instance(singles[0]);
-    assert_eq!(device.lock().unwrap().pool().free_chunks(), 1, "one chunk free");
+    assert_eq!(
+        device.lock().unwrap().pool().free_chunks(),
+        1,
+        "one chunk free"
+    );
     assert_eq!(
         roles.lock().unwrap().unpark_need(holder(1)),
         vec![(1, 1)],
@@ -2405,12 +2737,24 @@ fn a_restore_s_need_and_standing_are_the_placement_of_every_piece_it_takes() {
         roles.lock().unwrap().restore_placement(holder(1), takes).1
     };
     assert!(placed(&[]).stands(), "it stands");
-    let chunk = u64::from(device.lock().unwrap().pool().shape(shape).unwrap().slots_per_chunk);
+    let chunk = u64::from(
+        device
+            .lock()
+            .unwrap()
+            .pool()
+            .shape(shape)
+            .unwrap()
+            .slots_per_chunk,
+    );
     assert!(
         !placed(&[(shape, chunk)]).stands(),
         "its serve's state takes that chunk first: it does not stand"
     );
-    assert_eq!(placed(&[]).free_runs(1), 0, "nor with a pending bind's chunk beside it");
+    assert_eq!(
+        placed(&[]).free_runs(1),
+        0,
+        "nor with a pending bind's chunk beside it"
+    );
     drop(singles_part);
 }
 
@@ -2433,7 +2777,9 @@ fn a_pair_left_behind_by_a_parked_holder_goes_with_its_move_down() {
     roles.lock().unwrap().close_instance(second);
     let left = held(&device) - before;
     let down = roles.lock().unwrap().prepare_park_down(&[holder(1)], true);
-    let txn = down.txn.expect("the pair left behind moves down with its parked holder");
+    let txn = down
+        .txn
+        .expect("the pair left behind moves down with its parked holder");
     roles.lock().unwrap().commit(txn);
     assert!(
         held(&device) - before < left,
@@ -2451,7 +2797,11 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
     let Pools { device, roles } = pools(64);
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
     bind(&roles, &mut engine, 1).unwrap();
-    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let park = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(1))
+        .expect("it parks");
     roles.lock().unwrap().commit(park);
     // Held for its restore: its unpark's pieces and a pending bind's run
     // of one chunk.
@@ -2487,10 +2837,17 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
         .expect("it unparks");
     roles.lock().unwrap().commit(unpark);
     let left = roles.lock().unwrap().claimed(holder(1));
-    assert_eq!(left.len(), 1, "its pending bind's chunk still held: {left:?}");
+    assert_eq!(
+        left.len(),
+        1,
+        "its pending bind's chunk still held: {left:?}"
+    );
     // Its bind takes it, and the reservation is gone.
     bind(&roles, &mut engine, 1).unwrap();
-    assert!(roles.lock().unwrap().claimed(holder(1)).is_empty(), "released once it bound");
+    assert!(
+        roles.lock().unwrap().claimed(holder(1)).is_empty(),
+        "released once it bound"
+    );
     let _ = device;
 }
 
@@ -2505,21 +2862,37 @@ fn a_restore_whose_bind_runs_are_held_for_it_finds_them() {
     let Pools { device, roles } = pools(64);
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
     bind(&roles, &mut engine, 1).unwrap();
-    let park = roles.lock().unwrap().prepare_park(holder(1)).expect("it parks");
+    let park = roles
+        .lock()
+        .unwrap()
+        .prepare_park(holder(1))
+        .expect("it parks");
     roles.lock().unwrap().commit(park);
     assert!(roles.lock().unwrap().reserve_restore(holder(1), &[(1, 1)]));
-    let unpark = roles.lock().unwrap().prepare_unpark(holder(1)).unwrap().expect("it unparks");
+    let unpark = roles
+        .lock()
+        .unwrap()
+        .prepare_unpark(holder(1))
+        .unwrap()
+        .expect("it unparks");
     roles.lock().unwrap().commit(unpark);
     // Every chunk free to others, and one more: only its own held chunk
     // makes the last.
     let others = device.lock().unwrap().pool().free_chunks();
-    let bind_all = [OwnPiece::Chunks { run: 1, pieces: others + 1 }];
+    let bind_all = [OwnPiece::Chunks {
+        run: 1,
+        pieces: others + 1,
+    }];
     assert!(
         !device.lock().unwrap().pool().place(&bind_all).stands(),
         "to any other take the held chunk is not there"
     );
     assert!(
-        roles.lock().unwrap().place_claimed(holder(1), &bind_all).stands(),
+        roles
+            .lock()
+            .unwrap()
+            .place_claimed(holder(1), &bind_all)
+            .stands(),
         "to its own, it is"
     );
 }
@@ -2541,9 +2914,16 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
-        .unwrap()
-        .expect("slots taken");
+    let taken = take_bind(
+        Some(&roles),
+        &mut engine,
+        &binding,
+        |_| false,
+        Some(holder(2)),
+        |_| true,
+    )
+    .unwrap()
+    .expect("slots taken");
     // The only member parks while the bind is on its way.
     park(&roles, 1);
     // Another program binds meanwhile: none of its room is the pair's.
@@ -2565,8 +2945,19 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
     disjoint(&[&pair_at, &theirs.pair, &theirs.scratch])
         .expect("the pair the bind took is no other program's room");
     // The bind lands on the pair as it stands.
-    bind_taken(Some(&roles), &mut engine, &binding, Some(holder(2)), Some(taken)).unwrap();
-    assert_eq!(engine.bindings.last().unwrap().pair, pair_at, "bound on the pair it took");
+    bind_taken(
+        Some(&roles),
+        &mut engine,
+        &binding,
+        Some(holder(2)),
+        Some(taken),
+    )
+    .unwrap();
+    assert_eq!(
+        engine.bindings.last().unwrap().pair,
+        pair_at,
+        "bound on the pair it took"
+    );
 }
 
 /// A bind of a process that is not resident is refused before it takes
@@ -2584,8 +2975,15 @@ fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(4)), |_| false)
-        .expect_err("not resident: no take");
+    let error = take_bind(
+        Some(&roles),
+        &mut engine,
+        &binding,
+        |_| false,
+        Some(holder(4)),
+        |_| false,
+    )
+    .expect_err("not resident: no take");
     assert!(
         matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(4)),
         "{error:#}"
@@ -2611,19 +3009,40 @@ fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
         program: PROGRAM,
         ..InstanceBinding::default()
     };
-    let taken = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(2)), |_| true)
-        .unwrap()
-        .expect("slots taken");
+    let taken = take_bind(
+        Some(&roles),
+        &mut engine,
+        &binding,
+        |_| false,
+        Some(holder(2)),
+        |_| true,
+    )
+    .unwrap()
+    .expect("slots taken");
     assert!(roles.lock().unwrap().binds_on_way(holder(2)), "on its way");
-    bind_taken(Some(&roles), &mut engine, &binding, Some(holder(2)), Some(taken)).unwrap();
+    bind_taken(
+        Some(&roles),
+        &mut engine,
+        &binding,
+        Some(holder(2)),
+        Some(taken),
+    )
+    .unwrap();
     assert!(!roles.lock().unwrap().binds_on_way(holder(2)), "landed");
     // Resident at the first read, parked by the second: the take goes back.
     let before = held(&device);
     let reads = std::cell::Cell::new(0);
-    let error = take_bind(Some(&roles), &mut engine, &binding, |_| false, Some(holder(3)), |_| {
-        reads.set(reads.get() + 1);
-        reads.get() == 1
-    })
+    let error = take_bind(
+        Some(&roles),
+        &mut engine,
+        &binding,
+        |_| false,
+        Some(holder(3)),
+        |_| {
+            reads.set(reads.get() + 1);
+            reads.get() == 1
+        },
+    )
     .expect_err("parked past the take");
     assert!(
         matches!(short_of_wait(&error), Some(RolesError::HolderParked(by)) if *by == holder(3)),

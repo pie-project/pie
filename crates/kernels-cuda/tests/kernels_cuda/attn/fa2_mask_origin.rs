@@ -9,8 +9,8 @@
 use crate::common::attn_ref::{col, pool, ten};
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::{Bf16, I32, I64, U8, U32};
-use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
 use kernels_cuda::attn;
+use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
 

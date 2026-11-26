@@ -307,10 +307,20 @@ mod tests {
             kind: "cuda",
             program: 0xdef,
         };
-        let before = by().into_iter().find(|(at, _)| *at == key).map_or(0, |(_, n)| n);
+        let before = by()
+            .into_iter()
+            .find(|(at, _)| *at == key)
+            .map_or(0, |(_, n)| n);
         counter(key.clone()).fetch_add(1, Ordering::Relaxed);
-        let after = by().into_iter().find(|(at, _)| *at == key).map_or(0, |(_, n)| n);
-        assert_eq!(after, before + 1, "counted under its own engine and program");
+        let after = by()
+            .into_iter()
+            .find(|(at, _)| *at == key)
+            .map_or(0, |(_, n)| n);
+        assert_eq!(
+            after,
+            before + 1,
+            "counted under its own engine and program"
+        );
     }
 
     fn device_classes_and_host_derivable_name_nothing() {

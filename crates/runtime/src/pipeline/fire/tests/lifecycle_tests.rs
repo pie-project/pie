@@ -215,11 +215,7 @@ fn run_ahead(fires: u32, state: Option<u32>) -> anyhow::Result<RunAhead> {
 
 /// [`run_ahead`], the fires `finals` names (from 0) a final pass's
 /// (CONTRACT-BC 25).
-fn run_ahead_stating(
-    fires: u32,
-    state: Option<u32>,
-    finals: &[u32],
-) -> anyhow::Result<RunAhead> {
+fn run_ahead_stating(fires: u32, state: Option<u32>, finals: &[u32]) -> anyhow::Result<RunAhead> {
     let model = crate::store::registry::register_model_with_swap(
         16,
         &[64],
@@ -380,8 +376,7 @@ async fn a_stop_takes_back_what_ran_ahead_once_it_lands() -> anyhow::Result<()> 
     let pipeline = run.pipeline;
     let retract = {
         let context = &mut run.context;
-        let mut retract =
-            Box::pin(pipeline_retract(context, Resource::new_borrow(pipeline), 3));
+        let mut retract = Box::pin(pipeline_retract(context, Resource::new_borrow(pipeline), 3));
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
         for _ in 0..8 {
@@ -470,7 +465,11 @@ async fn a_stop_on_a_recurrent_set_takes_back_its_buffered_rows() -> anyhow::Res
         .map_err(anyhow::Error::msg)?;
     assert_eq!(run.failure(), None);
     let (folded, logged, _) = run.length();
-    assert_eq!((folded, logged), (20, 23), "the three rows kept stay buffered");
+    assert_eq!(
+        (folded, logged),
+        (20, 23),
+        "the three rows kept stay buffered"
+    );
     assert_eq!(run.cursor.lock().unwrap().tail, Some(23));
     Ok(())
 }
@@ -500,7 +499,11 @@ async fn a_retract_over_a_final_fire_is_refused_by_name() -> anyhow::Result<()> 
         .await?
         .map_err(anyhow::Error::msg)?;
     assert_eq!(run.failure(), None);
-    assert_eq!(run.cursor.lock().unwrap().tail, Some(23), "the final row kept");
+    assert_eq!(
+        run.cursor.lock().unwrap().tail,
+        Some(23),
+        "the final row kept"
+    );
     Ok(())
 }
 
@@ -606,7 +609,10 @@ fn a_settle_asked_on_an_engine_lane_runs_off_it_in_order() {
     let note = |at: u32, ran: &Arc<Mutex<Vec<(u32, String)>>>| {
         let ran = Arc::clone(ran);
         move || {
-            let on = std::thread::current().name().unwrap_or_default().to_string();
+            let on = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
             ran.lock().unwrap().push((at, on));
         }
     };
@@ -627,9 +633,22 @@ fn a_settle_asked_on_an_engine_lane_runs_off_it_in_order() {
         std::thread::yield_now();
     }
     let ran_off: Vec<_> = ran.lock().unwrap().drain(..).collect();
-    assert_eq!(ran_off.iter().map(|(at, _)| *at).collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
-    assert!(ran_off.iter().all(|(_, on)| on == "pie-kv-settle"), "{ran_off:?}");
+    assert_eq!(
+        ran_off.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+        (0..8).collect::<Vec<_>>()
+    );
+    assert!(
+        ran_off.iter().all(|(_, on)| on == "pie-kv-settle"),
+        "{ran_off:?}"
+    );
     super::settled_off_lane(note(9, &ran));
-    let here = std::thread::current().name().unwrap_or_default().to_string();
-    assert_eq!(*ran.lock().unwrap(), vec![(9, here)], "off a lane: where it is asked");
+    let here = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        *ran.lock().unwrap(),
+        vec![(9, here)],
+        "off a lane: where it is asked"
+    );
 }

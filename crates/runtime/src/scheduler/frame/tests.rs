@@ -135,8 +135,7 @@ fn processes_over_the_execution_permits_joining_together_all_finish() {
             if let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, now) {
                 let posted: Vec<u64> = waves.iter().flatten().copied().collect();
                 queued.retain(|id| !posted.contains(id));
-                let members: Vec<ProcessId> =
-                    posted.iter().map(|id| lanes[fire_of[id]]).collect();
+                let members: Vec<ProcessId> = posted.iter().map(|id| lanes[fire_of[id]]).collect();
                 policy.on_frame_posted(members.clone(), now);
                 policy.on_frame_retired(members);
                 for id in &posted {
@@ -167,7 +166,10 @@ fn processes_over_the_execution_permits_joining_together_all_finish() {
             );
             let ids: QueuedFireIds = queued.iter().copied().collect();
             assert!(
-                !matches!(plan_in_flight(&mut policy, &ids, now), FramePlan::Dispatch(_)),
+                !matches!(
+                    plan_in_flight(&mut policy, &ids, now),
+                    FramePlan::Dispatch(_)
+                ),
                 "control: held for the gated lanes: {}",
                 policy.debug_summary()
             );
@@ -204,7 +206,10 @@ fn joiners_waiting_on_a_claimant_s_prefix_hold_no_frame() {
         policy.on_fire_enqueued(stamp(claimant, 0, 0, 1), Some(claimant), 1, 16, 1);
         let queued: QueuedFireIds = [1].into_iter().collect();
         assert!(
-            !matches!(plan_in_flight(&mut policy, &queued, Instant::now()), FramePlan::Dispatch(_)),
+            !matches!(
+                plan_in_flight(&mut policy, &queued, Instant::now()),
+                FramePlan::Dispatch(_)
+            ),
             "control: the joiners' open lanes are expected"
         );
         // Each joiner's pass finds the prefix claimed and waits.
@@ -354,15 +359,24 @@ fn od_1_census_seals_with_every_expected_lane_in() {
                 queued.extend(submit(&mut policy, lane, 1));
             }
         }
-        assert_eq!(policy.lanes.values().filter(|lane| lane.awaited).count(), 10);
+        assert_eq!(
+            policy.lanes.values().filter(|lane| lane.awaited).count(),
+            10
+        );
         let ids: QueuedFireIds = queued.iter().copied().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &ids, Instant::now()) else {
-            panic!("straggle={straggle}: every expected lane is in: the frame seals at once\n{}", policy.debug_summary());
+            panic!(
+                "straggle={straggle}: every expected lane is in: the frame seals at once\n{}",
+                policy.debug_summary()
+            );
         };
         let mut sent: Vec<u64> = waves.iter().flatten().copied().collect();
         sent.sort_unstable();
         queued.sort_unstable();
-        assert_eq!(sent, queued, "straggle={straggle}: all 24 lanes' fires in the one seal");
+        assert_eq!(
+            sent, queued,
+            "straggle={straggle}: all 24 lanes' fires in the one seal"
+        );
     }
 }
 
@@ -417,7 +431,10 @@ fn frames_held_under_a_lowered_cap_are_owed_a_raise_and_seal_once_it_comes() {
     }
     let ids: QueuedFireIds = queued.iter().copied().collect();
     let decodes = fires(&settled(&mut policy, &ids));
-    assert!(decodes.iter().all(|id| !prompts.contains(id)), "the prompts are held out");
+    assert!(
+        decodes.iter().all(|id| !prompts.contains(id)),
+        "the prompts are held out"
+    );
     assert_eq!(decodes.len(), 12, "the decodes go");
     policy.on_frame_posted(lanes[6..18].to_vec(), Instant::now());
     policy.on_frame_retired(lanes[6..18].to_vec());
@@ -431,7 +448,10 @@ fn frames_held_under_a_lowered_cap_are_owed_a_raise_and_seal_once_it_comes() {
     }
     let ids: QueuedFireIds = queued.iter().copied().collect();
     let decodes = fires(&settled(&mut policy, &ids));
-    assert!(decodes.iter().all(|id| !prompts.contains(id)), "still held out");
+    assert!(
+        decodes.iter().all(|id| !prompts.contains(id)),
+        "still held out"
+    );
     policy.on_frame_posted(lanes[6..18].to_vec(), Instant::now());
     policy.on_frame_retired(lanes[6..18].to_vec());
     assert_eq!(policy.cut_owed(), 512, "named to the cap's owner");
@@ -501,7 +521,10 @@ fn a_held_frame_whose_raise_is_refused_leaves_with_its_fires() {
     assert_eq!(policy.cut_owed(), 512, "held, owed");
     assert_eq!(policy.refuse_held(lane), vec![7], "its fires, to fail");
     assert_eq!(policy.cut_owed(), 256, "the other's still held");
-    assert!(policy.refuse_held(lane).is_empty(), "nothing held for it after");
+    assert!(
+        policy.refuse_held(lane).is_empty(),
+        "nothing held for it after"
+    );
 }
 
 /// The scheduler's turns meet the walk: the cap lowered 512 -> 256 -> 128
@@ -564,9 +587,16 @@ fn a_cap_raised_back_before_the_hold_is_told_seals_on_the_next_turn() {
         policy.debug_summary()
     );
     assert_eq!(policy.cut_owed(), 512, "owed, told");
-    assert!(again, "the cap moved since the read: the scheduler goes again");
+    assert!(
+        again,
+        "the cap moved since the read: the scheduler goes again"
+    );
     let (sealed, again) = turn(&mut policy, &prompt, || {});
-    assert_eq!(fires(&sealed), vec![2], "sealed under the current cap at once");
+    assert_eq!(
+        fires(&sealed),
+        vec![2],
+        "sealed under the current cap at once"
+    );
     assert!(!again);
     crate::store::shared::owe_cut_rows(ENGINE, 0, None);
 }
@@ -624,7 +654,13 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
                 // park rides the next seal, its lane not expected.
                 if state[at] == 2 && rng.below(4) == 0 {
                     for slot in 0..slots {
-                        policy.on_fire_enqueued(stamp(lane, seq[at], slot, slots), Some(lane), next_id, 1, 1);
+                        policy.on_fire_enqueued(
+                            stamp(lane, seq[at], slot, slots),
+                            Some(lane),
+                            next_id,
+                            1,
+                            1,
+                        );
                         queued.push(next_id);
                         parked_fires.push(next_id);
                         last[at] = next_id;
@@ -640,7 +676,13 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
                 // Some frames are a prompt's (tokens past its row).
                 let tokens = if rng.below(4) == 0 { 8 } else { 1 };
                 for slot in 0..slots {
-                    policy.on_fire_enqueued(stamp(lane, seq[at], slot, slots), Some(lane), next_id, tokens, 1);
+                    policy.on_fire_enqueued(
+                        stamp(lane, seq[at], slot, slots),
+                        Some(lane),
+                        next_id,
+                        tokens,
+                        1,
+                    );
                     queued.push(next_id);
                     last[at] = next_id;
                     next_id += 1;
@@ -724,9 +766,7 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
                     // A park with nothing executing waits on an event
                     // that comes: frames queued and none scheduled is
                     // a silent scheduler.
-                    FramePlan::Park
-                        if policy.has_queued_frames() && !policy.wake_scheduled() =>
-                    {
+                    FramePlan::Park if policy.has_queued_frames() && !policy.wake_scheduled() => {
                         failed = Some(format!(
                             "r{round}: parked with frames queued and no wake scheduled: {}",
                             policy.debug_summary()
@@ -758,7 +798,10 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
             // no lane in flight, and none whose landing was lost with
             // its owner's suspension (not posted since).
             if !policy.prompts_executing.is_subset(&policy.in_flight_lanes)
-                || policy.prompts_executing.iter().any(|lane| lost.contains(lane))
+                || policy
+                    .prompts_executing
+                    .iter()
+                    .any(|lane| lost.contains(lane))
             {
                 failed = Some(format!(
                     "r{round}: prompts held behind {:?} with {:?} in flight, {:?} lost",
@@ -780,13 +823,15 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
                 .all(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete));
             // A parked or blocked owner's complete frame waits only on
             // lanes still expected: with all of them in, it is sealed.
-            let held_for_nobody = all_in && !prompt_lands && policy.lanes.values().any(|lane| {
-                !lane.awaited
-                    && lane.owner.is_some_and(|owner| {
-                        policy.suspended.contains(&owner) || policy.blocked.contains(&owner)
-                    })
-                    && lane.frames.front().is_some_and(PendingFrame::is_complete)
-            });
+            let held_for_nobody = all_in
+                && !prompt_lands
+                && policy.lanes.values().any(|lane| {
+                    !lane.awaited
+                        && lane.owner.is_some_and(|owner| {
+                            policy.suspended.contains(&owner) || policy.blocked.contains(&owner)
+                        })
+                        && lane.frames.front().is_some_and(PendingFrame::is_complete)
+                });
             if held_for_nobody {
                 failed = Some(format!(
                     "r{round}: a complete front frame of a parked owner is held"
@@ -800,19 +845,32 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
                 ));
                 break;
             }
-            if let Some(id) = parked_fires.iter().find(|id| all_in && !prompt_lands && queued.contains(id)) {
-                failed = Some(format!("r{round}: a parked owner's complete fire {id} not dispatched"));
+            if let Some(id) = parked_fires
+                .iter()
+                .find(|id| all_in && !prompt_lands && queued.contains(id))
+            {
+                failed = Some(format!(
+                    "r{round}: a parked owner's complete fire {id} not dispatched"
+                ));
                 break;
             }
         }
         if let Some(why) = failed {
-            failures.push(format!("seed {seed}: {why}\n  schedule: {}", schedule.join(" -> ")));
+            failures.push(format!(
+                "seed {seed}: {why}\n  schedule: {}",
+                schedule.join(" -> ")
+            ));
             if failures.len() > 10 {
                 break;
             }
         }
     }
-    assert!(failures.is_empty(), "{} failing seeds:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failing seeds:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// Each pipeline's fires post in the order it submitted them: one that
@@ -824,13 +882,28 @@ fn a_pipelines_fire_posted_behind_a_later_one_is_refused_by_name() {
     let (a, b) = (pid(), pid());
     assert_eq!(policy.admit_post(a, 5), Ok(()));
     assert_eq!(policy.admit_post(a, 7), Ok(()));
-    assert_eq!(policy.admit_post(b, 6), Ok(()), "another pipeline's order is its own");
+    assert_eq!(
+        policy.admit_post(b, 6),
+        Ok(()),
+        "another pipeline's order is its own"
+    );
     assert_eq!(policy.admit_post(a, 6), Err(7), "6 would post after 7");
-    assert_eq!(policy.admit_post(a, 8), Ok(()), "the refused fire moved nothing");
+    assert_eq!(
+        policy.admit_post(a, 8),
+        Ok(()),
+        "the refused fire moved nothing"
+    );
     let reason = out_of_order(a, 6, 7);
-    assert!(reason.contains("fire 6") && reason.contains("later fire 7"), "{reason}");
+    assert!(
+        reason.contains("fire 6") && reason.contains("later fire 7"),
+        "{reason}"
+    );
     policy.on_lane_leave(a, None, true);
-    assert_eq!(policy.admit_post(a, 1), Ok(()), "a pipeline that left is forgotten");
+    assert_eq!(
+        policy.admit_post(a, 1),
+        Ok(()),
+        "a pipeline that left is forgotten"
+    );
 }
 
 /// Lanes that read out several rows each (a verified draft block) share
@@ -841,7 +914,16 @@ fn a_wave_reads_out_no_more_than_the_engine_carves() {
     let mut policy = FramePolicy::new(1, 64, 4096, None).with_max_wave_readouts(8);
     let lanes: Vec<ProcessId> = (0..3).map(|_| pid()).collect();
     for (at, &lane) in lanes.iter().enumerate() {
-        policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5, 5, 0);
+        policy.on_fire_reading(
+            stamp(lane, 0, 0, 1),
+            Some(lane),
+            10 + at as u64,
+            5,
+            1,
+            5,
+            5,
+            0,
+        );
     }
     let mut sealed_ids = Vec::new();
     for _ in 0..3 {
@@ -880,11 +962,10 @@ fn a_burst_of_cut_prefills_seals_its_pieces_step_by_step() {
     let mut ids = Vec::new();
     for (at, &lane) in lanes.iter().enumerate() {
         let mut seq = 0u64;
-        let framed =
-            crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, 2, || {
-                seq += 1;
-                seq
-            });
+        let framed = crate::pipeline::fire::piece_frames(Some(stamp(lane, 0, 0, 1)), 2, 2, || {
+            seq += 1;
+            seq
+        });
         assert_eq!(
             framed,
             vec![Some(stamp(lane, 0, 0, 2)), Some(stamp(lane, 0, 1, 2))],
@@ -910,11 +991,10 @@ fn a_burst_of_cut_prefills_seals_its_pieces_step_by_step() {
     }
 
     let mut seq = 0u64;
-    let three =
-        crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 4, 0, 1)), 3, 2, || {
-            seq += 1;
-            seq
-        });
+    let three = crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 4, 0, 1)), 3, 2, || {
+        seq += 1;
+        seq
+    });
     assert_eq!(
         three,
         vec![
@@ -925,8 +1005,7 @@ fn a_burst_of_cut_prefills_seals_its_pieces_step_by_step() {
         "a third piece opens the next frame, alone"
     );
 
-    let shared =
-        crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, 2, || 0);
+    let shared = crate::pipeline::fire::piece_frames(Some(stamp(lanes[0], 9, 1, 2)), 3, 2, || 0);
     assert_eq!(
         shared,
         vec![None, None, Some(stamp(lanes[0], 9, 1, 2))],
@@ -956,8 +1035,7 @@ fn seals_complete_lanes_and_orders_waves_by_slot() {
 }
 
 fn incomplete_lane_holds_the_seal_until_it_completes() {
-    let mut policy =
-        FramePolicy::new(2, 64, 4096, None);
+    let mut policy = FramePolicy::new(2, 64, 4096, None);
     let (fast, slow) = (pid(), pid());
     policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
     policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);
@@ -1045,7 +1123,11 @@ fn a_fire_racing_the_suspend_seals_alone_without_rejoining_the_wait_set() {
     };
     let mut sent = fires(&FramePlan::Dispatch(waves));
     sent.sort_unstable();
-    assert_eq!(sent, vec![200, 300, 301], "one frame: the straggler rides it");
+    assert_eq!(
+        sent,
+        vec![200, 300, 301],
+        "one frame: the straggler rides it"
+    );
 
     policy.on_process_resume(victim);
     policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
@@ -1111,7 +1193,11 @@ fn graceful_close_releases_the_wait() {
     policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
     let queued: QueuedFireIds = [92].into_iter().collect();
     let next = plan(&mut policy, &queued, Instant::now());
-    assert_eq!(fires(&next), vec![92], "the frame seals past computing lane a");
+    assert_eq!(
+        fires(&next),
+        vec![92],
+        "the frame seals past computing lane a"
+    );
     assert!(
         policy.debug_summary().contains("sealed past"),
         "the stall dump names lane a sealed past: {}",
@@ -1120,7 +1206,10 @@ fn graceful_close_releases_the_wait() {
     policy.on_lane_leave(a, None, false);
     let empty = QueuedFireIds::default();
     assert!(
-        !matches!(plan(&mut policy, &empty, Instant::now()), FramePlan::Dispatch(_)),
+        !matches!(
+            plan(&mut policy, &empty, Instant::now()),
+            FramePlan::Dispatch(_)
+        ),
         "nothing is left to seal once a closes"
     );
 }
@@ -1136,8 +1225,7 @@ fn no_prompt_waits_for_a_lane_off_a_prompt() {
     policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
     policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1);
     let queued: QueuedFireIds = [92, 93].into_iter().collect();
-    let mut sealed =
-        fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()));
+    let mut sealed = fires(&policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()));
     sealed.sort_unstable();
     assert_eq!(
         sealed,
@@ -1148,7 +1236,10 @@ fn no_prompt_waits_for_a_lane_off_a_prompt() {
     policy.on_fire_enqueued(stamp(b, 2, 0, 1), Some(b), 94, 1, 1);
     let queued: QueuedFireIds = [94].into_iter().collect();
     assert!(
-        !matches!(plan_in_flight(&mut policy, &queued, Instant::now()), FramePlan::Dispatch(_)),
+        !matches!(
+            plan_in_flight(&mut policy, &queued, Instant::now()),
+            FramePlan::Dispatch(_)
+        ),
         "with no prompt to ride, b's decode waits for a's next pass"
     );
 }

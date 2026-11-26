@@ -63,7 +63,10 @@ impl Model {
         let fixture = fixture(name, None);
         let shell = load(&fixture, CONTEXT)?;
         assert!(shell.serves_rs_verbs(), "{name}: the shell buffers rs rows");
-        assert!(shell.state_slot_bytes() > 0, "{name}: a recurrent plan has state");
+        assert!(
+            shell.state_slot_bytes() > 0,
+            "{name}: a recurrent plan has state"
+        );
         let rs = shell.pools().rs_rows().expect("the pool lays an rs list");
         eprintln!(
             "{name}: {} rs bytes a slot of {} tokens, {} state bytes a record",
@@ -112,9 +115,15 @@ impl Model {
             .shape(FIXED)
             .expect("a recurrent pool lays out records");
         let refs: Vec<u32> = (0..pieces)
-            .map(|p| fixed.seat_ref(slot * pieces + p).expect("the seat's record"))
+            .map(|p| {
+                fixed
+                    .seat_ref(slot * pieces + p)
+                    .expect("the seat's record")
+            })
             .collect();
-        self.shell.state_bytes(&refs).expect("the record reads back")
+        self.shell
+            .state_bytes(&refs)
+            .expect("the record reads back")
     }
 
     fn open(&mut self, slot: u32) {
@@ -139,7 +148,14 @@ impl Model {
         self.shell.fire_seated(&seated).expect("the fire runs")
     }
 
-    fn one(&mut self, slot: u32, tokens: &[u32], rs: &RsVerb, reset: RsReset, held: u32) -> Vec<f32> {
+    fn one(
+        &mut self,
+        slot: u32,
+        tokens: &[u32],
+        rs: &RsVerb,
+        reset: RsReset,
+        held: u32,
+    ) -> Vec<f32> {
         self.fire(&[(slot, tokens, rs, reset, held)]).remove(0)
     }
 
@@ -175,7 +191,11 @@ impl Model {
             let (gv, wv) = (words(g), words(w));
             let apart = gv.iter().zip(&wv).filter(|(x, y)| x != y).count();
             if plane.integer {
-                eprintln!("plane {} (integers): {apart} of {} apart", plane.name, gv.len());
+                eprintln!(
+                    "plane {} (integers): {apart} of {} apart",
+                    plane.name,
+                    gv.len()
+                );
                 continue;
             }
             let (gv, wv) = (f32s(&gv), f32s(&wv));
@@ -264,7 +284,9 @@ fn f32s(words: &[u32]) -> Vec<f32> {
 }
 
 fn window(seed: u32) -> Vec<u32> {
-    (0..WINDOW as u32).map(|at| (seed + at * 37) % 256).collect()
+    (0..WINDOW as u32)
+        .map(|at| (seed + at * 37) % 256)
+        .collect()
 }
 
 fn spread(a: &[f32], b: &[f32]) -> f32 {
@@ -291,7 +313,10 @@ fn assert_answers(got: &[f32], want: &[f32], other: &[f32], what: &str) {
     // The logit nearest its room: (index, apart, room).
     let mut nearest = (0usize, 0f32, f32::INFINITY);
     for (at, ((&g, &w), &o)) in got.iter().zip(want).zip(other).enumerate() {
-        assert!(g.is_finite() && w.is_finite() && o.is_finite(), "{what}: logit {at} is not finite");
+        assert!(
+            g.is_finite() && w.is_finite() && o.is_finite(),
+            "{what}: logit {at} is not finite"
+        );
         let room = bf16_gap(g.abs().max(w.abs())) + (w - o).abs();
         let apart = (g - w).abs();
         if apart > 0.0 && apart / room > nearest.1 / nearest.2 {
@@ -339,10 +364,16 @@ fn holds_the_contract(mut m: Model, name: &str) {
 
     m.open(0);
     let zeroed = m.state(0);
-    assert!(zeroed.iter().all(|byte| *byte == 0), "an opened slot's state is zero");
+    assert!(
+        zeroed.iter().all(|byte| *byte == 0),
+        "an opened slot's state is zero"
+    );
     let reference = m.one(0, &tokens, &fold, fresh, 0);
     let folded = m.state(0);
-    assert_ne!(folded, zeroed, "a fold over {WINDOW} tokens left the state untouched");
+    assert_ne!(
+        folded, zeroed,
+        "a fold over {WINDOW} tokens left the state untouched"
+    );
 
     // Claim 1: a buffering fire leaves the state, and answers the fold's logits.
     m.open(1);
@@ -367,11 +398,17 @@ fn holds_the_contract(mut m: Model, name: &str) {
     m.open(2);
     m.one(2, &tokens[..j as usize], &fold, fresh, 0);
     let folded_j = m.state(2);
-    assert_ne!(folded_j, folded, "folds of {j} and {k} leave the same state");
+    assert_ne!(
+        folded_j, folded,
+        "folds of {j} and {k} leave the same state"
+    );
     let scale = m
         .distance(&folded_j, &folded, false)
         .expect("integer planes are not counted");
-    assert!(scale > 0.0, "the folds of {j} and {k} differ in their float planes");
+    assert!(
+        scale > 0.0,
+        "the folds of {j} and {k} differ in their float planes"
+    );
     m.open(3);
     let (a, b) = (m.buffer(0, 0), m.buffer(0, j));
     m.one(3, &tokens, &a, fresh, 0);
@@ -445,7 +482,11 @@ fn holds_the_contract(mut m: Model, name: &str) {
         scale,
     );
     let state = m.state(1);
-    m.assert_untouched(&state, &zeroed, &format!("{name} claim 6: the buffering peer folded"));
+    m.assert_untouched(
+        &state,
+        &zeroed,
+        &format!("{name} claim 6: the buffering peer folded"),
+    );
     assert_answers(
         &beside[0],
         &paired[0],
@@ -493,17 +534,29 @@ fn holds_the_contract(mut m: Model, name: &str) {
             &format!("{name} claim 9: round {r}, the window's junk row against its fold"),
         );
         if r > 0 {
-            m.one(2, &steps[r as usize - 1..r as usize], &fold, held, k + r - 1);
+            m.one(
+                2,
+                &steps[r as usize - 1..r as usize],
+                &fold,
+                held,
+                k + r - 1,
+            );
             let (got, want) = (m.state(0), m.state(2));
             m.assert_same_state(
                 &got,
                 &want,
-                &format!("{name} claim 9: round {r}, s_{} folded through the discard path", r - 1),
+                &format!(
+                    "{name} claim 9: round {r}, s_{} folded through the discard path",
+                    r - 1
+                ),
                 scale,
             );
         }
     }
-    eprintln!("{name}: every claim holds over {} state bytes", folded.len());
+    eprintln!(
+        "{name}: every claim holds over {} state bytes",
+        folded.len()
+    );
     // Every fire above (buffering lanes, replays, folds beside them, the
     // windows of an MTP verify) took only pipelines the load's walks named:
     // the committed recurrences and convs and the buffered rows' copies

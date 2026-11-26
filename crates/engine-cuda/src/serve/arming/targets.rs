@@ -40,7 +40,12 @@ pub(super) struct Targets {
     pub(super) unfireable: Vec<String>,
 }
 
-pub(super) fn unfireable_line(deployment: &Deployment, what: &str, at: &str, note: Option<&str>) -> String {
+pub(super) fn unfireable_line(
+    deployment: &Deployment,
+    what: &str,
+    at: &str,
+    note: Option<&str>,
+) -> String {
     let (note, comma) = match note {
         Some(note) => (note, ", "),
         None => ("", ""),
@@ -57,7 +62,8 @@ pub(super) fn decode_keys(deployment: &Deployment, bucket: u32, into: &mut Targe
     }
     let lanes = bucket.min(deployment.ceiling);
     for class in deployment.decoders.iter().copied() {
-        into.targets.push((bucket, BodySynth::Decode { lanes, class }));
+        into.targets
+            .push((bucket, BodySynth::Decode { lanes, class }));
     }
 }
 
@@ -195,12 +201,20 @@ pub(super) fn wide_keys(deployment: &Deployment, point: u32, into: &mut Targets)
 /// turn (each decoding class's where none prompts); a decoding lane takes a
 /// row and the bucket's other rows spread over the prompting lanes. `None`
 /// where fewer than two lanes result.
-pub(super) fn wide_lanes(deployment: &Deployment, point: u32, classes: &[usize]) -> Option<Vec<LaneRows>> {
+pub(super) fn wide_lanes(
+    deployment: &Deployment,
+    point: u32,
+    classes: &[usize],
+) -> Option<Vec<LaneRows>> {
     let seats = deployment.seats.min(deployment.max_lanes).min(point) as usize;
     let decodes = |class: &usize| deployment.decoding.contains(*class);
     let mut lanes: Vec<usize> = classes.iter().copied().take(seats).collect();
     let prompting: Vec<usize> = lanes.iter().copied().filter(|c| !decodes(c)).collect();
-    let fill = if prompting.is_empty() { lanes.clone() } else { prompting };
+    let fill = if prompting.is_empty() {
+        lanes.clone()
+    } else {
+        prompting
+    };
     while lanes.len() < seats && !fill.is_empty() {
         lanes.push(fill[(lanes.len() - classes.len().min(seats)) % fill.len()]);
     }
@@ -443,8 +457,7 @@ impl Shell {
     /// a buffering step with a prompt's rows at its rung's alone
     /// ([`Shell::buffered_rung`]).
     pub(super) fn buckets_of(&self, shape: &engine::StepShape) -> Vec<u32> {
-        if shape.treatment == engine::Treatment::Buffers && shape.kind != engine::StepKind::Decode
-        {
+        if shape.treatment == engine::Treatment::Buffers && shape.kind != engine::StepKind::Decode {
             return self.bucket_for(shape.rung).into_iter().collect();
         }
         let buckets = &self.budget.buckets;
@@ -469,7 +482,11 @@ impl Shell {
     /// prompting lane may replay buffered rows ahead of its own (a decoding
     /// lane replays its carried rows in its decode step's own kernels,
     /// `dispatch::ssm`). A tower's and an idle step's buffer none.
-    pub(super) fn rs_bodies(&self, target: &BodySynth, treatment: engine::Treatment) -> Vec<record::RsBody> {
+    pub(super) fn rs_bodies(
+        &self,
+        target: &BodySynth,
+        treatment: engine::Treatment,
+    ) -> Vec<record::RsBody> {
         if treatment == engine::Treatment::Folds {
             return vec![record::RsBody::Folds];
         }
@@ -582,9 +599,7 @@ impl Shell {
             let missing: Vec<u32> = self
                 .buckets_of(shape)
                 .into_iter()
-                .filter(|&bucket| {
-                    self.walked.get(&(shape.treatment, bucket)) != Some(&true)
-                })
+                .filter(|&bucket| self.walked.get(&(shape.treatment, bucket)) != Some(&true))
                 .collect();
             if !missing.is_empty() {
                 tracing::info!(

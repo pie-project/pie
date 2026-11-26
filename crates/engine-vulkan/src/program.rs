@@ -528,7 +528,10 @@ impl Plane {
     /// ([`engine_gpu::program::Programs::resolve_rebind`]): each resolved
     /// against `pools`' moved table, then every moved session's runs
     /// claimed as one. Refused with nothing changed.
-    pub fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
+    pub fn resolve_rebind(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+    ) -> Result<Rebound, Refusal> {
         #[cfg(feature = "vulkan")]
         {
             let program = Refusal::fault;
@@ -574,7 +577,11 @@ impl Plane {
             if let Some(library) = &self.library {
                 library.claim_moved(&moved).map_err(program)?;
             }
-            Ok(Rebound { sessions, cells, beams })
+            Ok(Rebound {
+                sessions,
+                cells,
+                beams,
+            })
         }
         #[cfg(not(feature = "vulkan"))]
         {
@@ -647,7 +654,8 @@ impl Plane {
                         .takings
                         .group(pair, *pair_generation)
                         .map(|group| (group, *pair_generation));
-                    if let Err(fault) = seat.session.retarget(pools, instance, scratch, pair, group) {
+                    if let Err(fault) = seat.session.retarget(pools, instance, scratch, pair, group)
+                    {
                         self.takings.give(pair, *pair_generation);
                         return Err(Refusal::fault(fault));
                     }
@@ -791,7 +799,8 @@ impl Plane {
             what: "instance",
             id: instance.0,
         })?;
-        for channel in engine_gpu::program::descriptor_channels(&seat.plan, seat.geometry, seat.device)
+        for channel in
+            engine_gpu::program::descriptor_channels(&seat.plan, seat.geometry, seat.device)
         {
             let ring = &seat.inst.channels[channel as usize];
             seat.landing.wait((channel, ring.head()), &seat.faulted);
@@ -954,11 +963,17 @@ impl Plane {
             .iter()
             .find(|binding| binding.port == Port::Parents && !binding.is_const)
             .ok_or_else(|| {
-                Refusal::Program(format!("instance {instance} keeps a beam group and binds no parents"))
+                Refusal::Program(format!(
+                    "instance {instance} keeps a beam group and binds no parents"
+                ))
             })?;
         #[cfg(feature = "vulkan")]
         if let Some(cell) = seat.session.kept_cell(binding.channel) {
-            return Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Cell(cell))));
+            return Ok(Some((
+                state,
+                beam.layout(),
+                engine_gpu::beam::Parents::Cell(cell),
+            )));
         }
         let parents = engine_gpu::guest::defer::parents(
             instance,
@@ -967,7 +982,11 @@ impl Plane {
             &seat.landing,
             &seat.faulted,
         )?;
-        Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Host(parents))))
+        Ok(Some((
+            state,
+            beam.layout(),
+            engine_gpu::beam::Parents::Host(parents),
+        )))
     }
 
     pub fn publish(
@@ -1242,11 +1261,10 @@ impl Plane {
             }
             let inputs = PassInputs::none();
             let mut runner =
-                crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats)
-                    .deferred(
-                        frame,
-                        engine_gpu::program::read_at_fire(seat.geometry, seat.device),
-                    );
+                crate::guest::run::OnDevice::new(device, &mut seat.session, widen, seats).deferred(
+                    frame,
+                    engine_gpu::program::read_at_fire(seat.geometry, seat.device),
+                );
             let outcome = eta_exec::step_with(
                 &mut seat.inst,
                 &seat.plan,

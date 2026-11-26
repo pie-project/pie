@@ -205,7 +205,11 @@ const STORES: Cache = Cache {
         }
         sets.into_values().collect()
     },
-    page: || store_registry::all_for_model(0).first().map_or(1, |s| s.kv_page_size),
+    page: || {
+        store_registry::all_for_model(0)
+            .first()
+            .map_or(1, |s| s.kv_page_size)
+    },
     rooms: || {
         let mut rooms = [(0u64, 0u64); 3];
         for stores in store_registry::all_for_model(0) {
@@ -688,7 +692,11 @@ impl Port {
         // seat-to-end); the lanes absent (not 0) until learned.
         let (lanes, spread) = crate::planner::to_end_facts();
         let lanes = lanes.map(|n| Value::Int(i64::try_from(n).unwrap_or(i64::MAX)));
-        self.host.attr(Subject::Worker(WORKER.to_string()), "pie/lanes-to-end", lanes);
+        self.host.attr(
+            Subject::Worker(WORKER.to_string()),
+            "pie/lanes-to-end",
+            lanes,
+        );
         self.host.attr(
             Subject::Worker(WORKER.to_string()),
             "pie/starts-spread",
@@ -892,7 +900,11 @@ pub(crate) mod testing {
             worker.step_ns,
         );
         for (attr, value) in &worker.attrs {
-            host.attr(Subject::Worker(WORKER.to_string()), attr, Some(value.clone()));
+            host.attr(
+                Subject::Worker(WORKER.to_string()),
+                attr,
+                Some(value.clone()),
+            );
         }
         host.load(name, component).expect("the policy loads");
         let mut port = Port {
@@ -1058,7 +1070,12 @@ mod tests {
         ));
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("arrived {pid}")), "{saw:?}");
-        assert!(process(pid, &saw).unwrap().ends_with("priority=Value::Int(1)"), "{saw:?}");
+        assert!(
+            process(pid, &saw)
+                .unwrap()
+                .ends_with("priority=Value::Int(1)"),
+            "{saw:?}"
+        );
 
         port.apply(Event::PropsChanged(
             pid,
@@ -1066,8 +1083,16 @@ mod tests {
             vec!["priority".into()],
         ));
         let saw = seen(&mut port);
-        assert!(has(&saw, &format!("hint process:{pid} priority")), "{saw:?}");
-        assert!(process(pid, &saw).unwrap().ends_with("priority=Value::Int(7)"), "{saw:?}");
+        assert!(
+            has(&saw, &format!("hint process:{pid} priority")),
+            "{saw:?}"
+        );
+        assert!(
+            process(pid, &saw)
+                .unwrap()
+                .ends_with("priority=Value::Int(7)"),
+            "{saw:?}"
+        );
         assert!(!saw.iter().any(|l| l.contains("tier")));
 
         // A process the policy never heard of has no props to change.
@@ -1113,9 +1138,15 @@ mod tests {
         ));
         let saw = seen(&mut port);
         assert_eq!(hints(&saw), ["tool", "tool-eta-ms"]);
-        assert!(has(&saw, "has session:t/chat tool-eta-ms=Value::Int(5000)"), "{saw:?}");
+        assert!(
+            has(&saw, "has session:t/chat tool-eta-ms=Value::Int(5000)"),
+            "{saw:?}"
+        );
 
-        port.apply(Event::SessionProps(session(), props(json!({"tool": "grep"}))));
+        port.apply(Event::SessionProps(
+            session(),
+            props(json!({"tool": "grep"})),
+        ));
         assert!(hints(&seen(&mut port)).is_empty(), "nothing changed");
         port.apply(Event::SessionProps(session(), props(json!({"tool": null}))));
         assert_eq!(hints(&seen(&mut port)), ["tool"]);
@@ -1130,17 +1161,28 @@ mod tests {
     fn the_call_about_a_process_exit_still_reads_it() {
         let mut port = port(NO_CACHE);
         let id = arrive(&mut port, "t", None);
-        port.apply(Event::PropsChanged(id, props(json!({"a": 1})), vec!["a".into()]));
+        port.apply(Event::PropsChanged(
+            id,
+            props(json!({"a": 1})),
+            vec!["a".into()],
+        ));
         seen(&mut port);
         port.apply(Event::Exited(id, Outcome::Completed));
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("exited {id}")), "{saw:?}");
         let of = process(id, &saw).expect("the call about its exit reads it");
-        assert!(of.contains("tenant=t ") && of.contains("state=ProcessState::Exited"), "{of}");
+        assert!(
+            of.contains("tenant=t ") && of.contains("state=ProcessState::Exited"),
+            "{of}"
+        );
         let saw = seen(&mut port);
         assert_eq!(process(id, &saw), None, "the next call does not");
         assert!(has(&saw, &format!("has process:{id} a=none")), "{saw:?}");
-        port.apply(Event::PropsChanged(id, props(json!({"a": 2})), vec!["a".into()]));
+        port.apply(Event::PropsChanged(
+            id,
+            props(json!({"a": 2})),
+            vec!["a".into()],
+        ));
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("has process:{id} a=none")), "{saw:?}");
     }
@@ -1162,16 +1204,22 @@ mod tests {
         port.apply(rest.clone());
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("retained {id}")), "{saw:?}");
-        let set =
-            format!("working-set {id} owner= session=chat tokens=640 folded=Value::Int(512)");
+        let set = format!("working-set {id} owner= session=chat tokens=640 folded=Value::Int(512)");
         assert!(has(&saw, &set), "{saw:?}");
         let frozen = format!("has working-set:{id} pico/frozen-tokens=Value::Int(512)");
         assert!(has(&saw, &frozen), "{saw:?}");
 
-        port.apply(Event::HandleProps(id, props(json!({"a": 1})), vec!["a".into()]));
+        port.apply(Event::HandleProps(
+            id,
+            props(json!({"a": 1})),
+            vec!["a".into()],
+        ));
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("hint working-set:{id} a")), "{saw:?}");
-        assert!(has(&saw, &format!("has working-set:{id} a=Value::Int(1)")), "{saw:?}");
+        assert!(
+            has(&saw, &format!("has working-set:{id} a=Value::Int(1)")),
+            "{saw:?}"
+        );
 
         // Lent to a process, it is out of the policy's reach.
         port.apply(Event::HandleLent(id));
@@ -1216,7 +1264,11 @@ mod tests {
         let uncached = arrive(&mut port, "t", None);
         port.apply(Event::Cached(gone, 32));
         port.apply(Event::Cached(gone, 0));
-        assert_eq!(port.procs[&gone].cached_tokens, Some(32), "what its fires mapped in");
+        assert_eq!(
+            port.procs[&gone].cached_tokens,
+            Some(32),
+            "what its fires mapped in"
+        );
         assert_eq!(port.procs[&live].cached_tokens, None, "it never looked");
         CACHED.lock().unwrap().extend([(gone, 4), (live, 2)]);
 
@@ -1225,13 +1277,19 @@ mod tests {
         let saw = seen(&mut port);
         assert!(has(&saw, &format!("exited {gone}")) && has(&saw, &format!("retained {gone}")));
         assert!(has(&saw, &format!("exited {uncached}")));
-        assert!(!has(&saw, &format!("retained {uncached}")), "nothing of it outlives it");
+        assert!(
+            !has(&saw, &format!("retained {uncached}")),
+            "nothing of it outlives it"
+        );
         let set = |id, owner: &str, session, tokens| {
             format!("working-set {id} owner={owner} session={session} tokens={tokens} folded=none")
         };
         assert!(has(&saw, &set(gone, "", "t/chat", 64)), "{saw:?}");
         assert!(has(&saw, &set(live, &live.to_string(), "", 32)), "{saw:?}");
-        assert!(!saw.iter().any(|l| l.starts_with(&format!("working-set {uncached}"))));
+        assert!(
+            !saw.iter()
+                .any(|l| l.starts_with(&format!("working-set {uncached}")))
+        );
 
         CACHED.lock().unwrap().retain(|(owner, _)| *owner != live);
         port.apply(Event::CacheEmptied(live, By::Client));
@@ -1244,16 +1302,32 @@ mod tests {
         port.apply(Event::CacheEmptied(gone, By::Host));
         let saw = seen(&mut port);
         let evicted = format!("evicted {gone} by By::Host");
-        assert_eq!(saw.iter().filter(|l| **l == evicted).count(), 1, "once: {saw:?}");
-        let listed = |id| saw.iter().any(|l| l.starts_with(&format!("working-set {id}")));
-        assert!(!listed(gone) && listed(live), "the live one's stands: {saw:?}");
+        assert_eq!(
+            saw.iter().filter(|l| **l == evicted).count(),
+            1,
+            "once: {saw:?}"
+        );
+        let listed = |id| {
+            saw.iter()
+                .any(|l| l.starts_with(&format!("working-set {id}")))
+        };
+        assert!(
+            !listed(gone) && listed(live),
+            "the live one's stands: {saw:?}"
+        );
         // It ends with its owner, once.
         port.apply(Event::Exited(live, Outcome::Completed));
         let saw = seen(&mut port);
         let evicted = saw.iter().filter(|l| l.starts_with("evicted ")).count();
         assert_eq!(evicted, 1, "{saw:?}");
-        assert!(!saw.iter().any(|l| l.starts_with("working-set ")), "{saw:?}");
-        assert!(!seen(&mut port).iter().any(|l| l.starts_with("evicted ")), "said once");
+        assert!(
+            !saw.iter().any(|l| l.starts_with("working-set ")),
+            "{saw:?}"
+        );
+        assert!(
+            !seen(&mut port).iter().any(|l| l.starts_with("evicted ")),
+            "said once"
+        );
         CACHED.lock().unwrap().clear();
     }
 
@@ -1297,7 +1371,11 @@ mod tests {
                     loaded.push(builtin.name);
                 }
                 Err(why) => {
-                    assert!(why.contains("which this host cannot enact"), "{}: {why}", builtin.name);
+                    assert!(
+                        why.contains("which this host cannot enact"),
+                        "{}: {why}",
+                        builtin.name
+                    );
                     let mut columns = COLUMNS.map(String::from).to_vec();
                     columns.retain(|c| !SUPPORTED.contains(&c.as_str()));
                     let cluster = Host::new(Config {
@@ -1312,7 +1390,10 @@ mod tests {
             }
         }
         for worker in ["default", "noop"] {
-            assert!(loaded.contains(&worker), "{worker} is a worker's: {loaded:?}");
+            assert!(
+                loaded.contains(&worker),
+                "{worker} is a worker's: {loaded:?}"
+            );
         }
         assert!(!loaded.contains(&"default-cluster"), "{loaded:?}");
     }
@@ -1340,7 +1421,10 @@ mod tests {
             host.run(true);
             let spent = started.elapsed();
             let stats = host.stats();
-            assert_eq!((stats.calls, stats.deadlines, stats.commits), (calls, calls, 0));
+            assert_eq!(
+                (stats.calls, stats.deadlines, stats.commits),
+                (calls, calls, 0)
+            );
             assert!(spent < deadline * 20, "cut off in {spent:?}");
             let default = host.poll_delta().schedule_priority.default;
             assert_eq!(default, None, "its row is discarded");

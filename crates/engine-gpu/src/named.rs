@@ -477,8 +477,7 @@ impl<B: Serve> Serve for Named<B> {
         _at: &crate::rates::ForBound,
     ) -> Result<crate::rates::BoundTimes> {
         Err(crate::error::Fault::Unbound {
-            what: "a submit bound's timing on a naming load, which runs nothing on a device"
-                .into(),
+            what: "a submit bound's timing on a naming load, which runs nothing on a device".into(),
         })
     }
 

@@ -451,8 +451,16 @@ pub(super) fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engi
     }
     // Each run staged in the activation's span past the workspaces, under
     // its own name: what a flat range's span spare leaves out is entered.
-    let [inputs, readouts, voxels, predicates, experts, arenas, scores, rings] =
-        shell.staged_runs();
+    let [
+        inputs,
+        readouts,
+        voxels,
+        predicates,
+        experts,
+        arenas,
+        scores,
+        rings,
+    ] = shell.staged_runs();
     for (name, bytes) in [
         ("inputs", inputs),
         ("readout rows", readouts),

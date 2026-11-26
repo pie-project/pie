@@ -198,7 +198,11 @@ async fn compact_lists(
     for &pid in &plan.readers {
         let handles = crate::inferlet::process::residency::kv_suspend_handles(pid, model, engine);
         let fence = FenceGuard::raise(handles, pid, (model, engine));
-        if fence.handles.iter().all(|handle| handle.active_leases() == 0) {
+        if fence
+            .handles
+            .iter()
+            .all(|handle| handle.active_leases() == 0)
+        {
             fenced.insert(pid);
             fences.push(fence);
         }
@@ -459,7 +463,8 @@ impl Drop for FenceGuard {
             return;
         }
         let (model, engine) = self.locus;
-        for handle in crate::inferlet::process::residency::kv_suspend_handles(self.pid, model, engine)
+        for handle in
+            crate::inferlet::process::residency::kv_suspend_handles(self.pid, model, engine)
         {
             handle.unfence();
         }
@@ -671,7 +676,11 @@ impl MoveGuard {
     }
 
     /// Submits every copy of the move, then waits for them all.
-    async fn copy(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
+    async fn copy(
+        &mut self,
+        planner: &ResidencyPlanner,
+        pid: ProcessId,
+    ) -> Result<(), CopyFailure> {
         // Every device chunk the copies read or write is fenced until they
         // land: no evacuation moves it, no segment holding it is released,
         // no compaction or raise takes it (a copy queued against a chunk
@@ -698,7 +707,11 @@ impl MoveGuard {
         copied
     }
 
-    async fn copy_fenced(&mut self, planner: &ResidencyPlanner, pid: ProcessId) -> Result<(), CopyFailure> {
+    async fn copy_fenced(
+        &mut self,
+        planner: &ResidencyPlanner,
+        pid: ProcessId,
+    ) -> Result<(), CopyFailure> {
         let mut waits = Vec::new();
         for copy in self.txn.as_ref().expect("move present").copies() {
             tracing::debug!(pid = %pid, copy = %copy.label(), count = copy.device.len(), "planner: residency copy");
@@ -755,7 +768,11 @@ impl<'a> MovingOut<'a> {
 
     fn of_all(planner: &'a ResidencyPlanner, pids: &[ProcessId]) -> Self {
         let mut map = planner.port.chunk_occupants(pids);
-        map.merge(planner.port.parked_occupants(super::residency_planner::SWEEP));
+        map.merge(
+            planner
+                .port
+                .parked_occupants(super::residency_planner::SWEEP),
+        );
         let chunks: Vec<u32> = map
             .held
             .iter()
@@ -794,15 +811,21 @@ impl CopyFailure {
     fn of(label: &str, step: &str, error: &anyhow::Error) -> Self {
         Self {
             message: format!("{label} {step}: {error:#}"),
-            untouched: error
-                .chain()
-                .any(|cause| cause.downcast_ref::<crate::scheduler::RefusedUntouched>().is_some()),
-            tier_full: error
-                .chain()
-                .any(|cause| cause.downcast_ref::<crate::scheduler::TierBelowFull>().is_some()),
-            landing_failed: error
-                .chain()
-                .any(|cause| cause.downcast_ref::<crate::scheduler::LandingFailed>().is_some()),
+            untouched: error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::scheduler::RefusedUntouched>()
+                    .is_some()
+            }),
+            tier_full: error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::scheduler::TierBelowFull>()
+                    .is_some()
+            }),
+            landing_failed: error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::scheduler::LandingFailed>()
+                    .is_some()
+            }),
         }
     }
 }
@@ -1227,7 +1250,13 @@ fn instances_of(told: &[::engine::Rebind]) -> Vec<::engine::InstanceId> {
 /// in place (`Rebind::Parked { kept: true }`), as before the move. One the
 /// engine refuses is said by name; the process fails at its next fire on
 /// the engine's own refusal rather than run on slots it believes parked.
-async fn undo_parks(engine: usize, model: usize, pid: ProcessId, told: Vec<::engine::Rebind>, down: bool) {
+async fn undo_parks(
+    engine: usize,
+    model: usize,
+    pid: ProcessId,
+    told: Vec<::engine::Rebind>,
+    down: bool,
+) {
     if told.is_empty() {
         return;
     }
@@ -1239,7 +1268,8 @@ async fn undo_parks(engine: usize, model: usize, pid: ProcessId, told: Vec<::eng
         let mut result = Ok(());
         for id in ids {
             if let Err(error) =
-                crate::scheduler::rebind_slots(engine, ::engine::Rebind::Parked { id, kept: true }).await
+                crate::scheduler::rebind_slots(engine, ::engine::Rebind::Parked { id, kept: true })
+                    .await
             {
                 result = Err(format!("park {id:?} again: {error:#}"));
                 break;
@@ -1382,7 +1412,12 @@ async fn restore(
             // restore head the pass that sent this one found short (waiting
             // on this one in flight) may stand now. Planned on that, not on
             // this restore's landing, or that head's wake is lost.
-            if planner.returns.waiters.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            if planner
+                .returns
+                .waiters
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
                 planner.poke();
             }
             roles.flatten()
@@ -1675,9 +1710,15 @@ mod abandon_tests {
                 ..::engine::InstanceBinding::default()
             };
             ids.push(
-                bind_instance(Some(&roles), &mut engine, &binding, Some(holder(by)), |_| false)
-                    .unwrap()
-                    .id,
+                bind_instance(
+                    Some(&roles),
+                    &mut engine,
+                    &binding,
+                    Some(holder(by)),
+                    |_| false,
+                )
+                .unwrap()
+                .id,
             );
         }
         for by in [1, 2] {
@@ -1696,15 +1737,22 @@ mod abandon_tests {
             rs: None,
             roles: Some(unpark),
         };
-        settle_or_abandon(model, 0, Vec::new(), async {
-            Err(anyhow::anyhow!("the device was lost"))
-        }, txn)
+        settle_or_abandon(
+            model,
+            0,
+            Vec::new(),
+            async { Err(anyhow::anyhow!("the device was lost")) },
+            txn,
+        )
         .await;
         let leaked = roles.lock().unwrap().leaked();
         assert!(leaked > 0, "the slots it took, leaked");
         let planner = super::super::global::planner_for(model, 0).expect("the planner");
         assert_eq!(
-            planner.stats.leaked_role_slots.load(std::sync::atomic::Ordering::Relaxed),
+            planner
+                .stats
+                .leaked_role_slots
+                .load(std::sync::atomic::Ordering::Relaxed),
             leaked,
             "counted in the status"
         );
@@ -1722,6 +1770,10 @@ mod abandon_tests {
         for id in ids {
             roles.lock().unwrap().close_instance(id);
         }
-        assert_eq!(roles.lock().unwrap().leaked(), leaked, "still out of service");
+        assert_eq!(
+            roles.lock().unwrap().leaked(),
+            leaked,
+            "still out of service"
+        );
     }
 }

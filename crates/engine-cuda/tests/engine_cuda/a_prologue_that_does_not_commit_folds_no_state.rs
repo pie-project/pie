@@ -198,11 +198,7 @@ fn fire(
         pages: &pages,
         held: Some(held),
         reports: 10 + u64::from(slot),
-        ..Seated::of(Lane {
-            slot,
-            word,
-            tokens,
-        })
+        ..Seated::of(Lane { slot, word, tokens })
     }];
     // A lane whose prologue does not commit is faulted where its step is
     // told, the rest of the fire served.

@@ -22,7 +22,9 @@ fn a_decode_whose_keys_grow_past_its_pages_replays_its_recording() {
     shell.record_bodies(None).expect("the load arms its bodies");
     shell.serving = true;
     let prompt = 20u32;
-    shell.fire_seated(&[lane(0, prompt as usize)]).expect("the prompt fires");
+    shell
+        .fire_seated(&[lane(0, prompt as usize)])
+        .expect("the prompt fires");
     let mut held = prompt;
     // The first decodes of the armed body.
     for _ in 0..4 {

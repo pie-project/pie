@@ -456,7 +456,11 @@ pub fn emit_streamed_topk(
     if small {
         // The register lists' length: k rounded up to a power of two (the
         // shuffle merge's bitonic runs).
-        let _ = writeln!(source, "  constexpr uint kKP = {}u;", topk.imm.next_power_of_two());
+        let _ = writeln!(
+            source,
+            "  constexpr uint kKP = {}u;",
+            topk.imm.next_power_of_two()
+        );
     }
     source.push_str(if small { SMALL_BODY } else { BODY });
     source.push_str("}\n");

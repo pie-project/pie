@@ -308,7 +308,9 @@ pub fn resolve_at_load(
         }
     };
     let mut tuned = chip.tuned().clone();
-    tuned.timed.push(profile::rates::RESIDENT_WORKGROUPS.to_string());
+    tuned
+        .timed
+        .push(profile::rates::RESIDENT_WORKGROUPS.to_string());
     Ok((chip.with_tuned(tuned), resident))
 }
 
@@ -1478,7 +1480,7 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
                     out,
                     kernels_slang::ssm::RowSpan::whole(a),
                 )
-                    .map_err(fault("rates: matmul"))
+                .map_err(fault("rates: matmul"))
             };
             let timed = rig.frame(timer, 1, &fire, &nothing);
             rig.past_bound.borrow_mut().take();
@@ -1523,7 +1525,7 @@ pub fn time_kernels<B: Serve, T: Tactics + ?Sized>(
                         out,
                         kernels_slang::ssm::RowSpan::whole(a),
                     )
-                        .map_err(fault("rates: matmul"))
+                    .map_err(fault("rates: matmul"))
                 };
                 let timed = rig.frame(timer, 1, &fire, &nothing);
                 let past_bound = rig.past_bound.borrow_mut().take().is_some();
@@ -1805,11 +1807,11 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
             // to them all is the kernel's at the plane. Refused at every
             // slice, its curve stops there.
             let round = |rig: &mut Rig<'_, B>,
-                             timed: &mut Vec<Timed>,
-                             samples: &mut Vec<Vec<f64>>,
-                             m: u32,
-                             live: &[usize],
-                             say: &mut dyn FnMut(&str)|
+                         timed: &mut Vec<Timed>,
+                         samples: &mut Vec<Vec<f64>>,
+                         m: u32,
+                         live: &[usize],
+                         say: &mut dyn FnMut(&str)|
              -> Result<()> {
                 for &t in live {
                     // A slice's time, carried, while a wider one is tried.
@@ -2060,9 +2062,9 @@ pub fn measure_shapes<B: Serve, T: Tactics + ?Sized>(
                     .iter()
                     .copied()
                     .chain(
-                        c.points
-                            .iter()
-                            .map(|&(m, ns, _)| (m, gemm_flops(m, n, k) / (ns - launch).max(1.0) / 1e3)),
+                        c.points.iter().map(|&(m, ns, _)| {
+                            (m, gemm_flops(m, n, k) / (ns - launch).max(1.0) / 1e3)
+                        }),
                     )
                     .collect(),
                 stop: c.stop,
@@ -2812,7 +2814,10 @@ pub fn measure_saying<B: Serve, T: Tactics + ?Sized>(
     ] {
         if rates.states(key) {
             let by = crate::stored::by(B::TARGET, key, fired)?;
-            tracing::info!("rates: measured `{key}`, stored under its key: {}", by.said());
+            tracing::info!(
+                "rates: measured `{key}`, stored under its key: {}",
+                by.said()
+            );
             keyed.push((key.to_string(), by));
         }
     }
@@ -2876,7 +2881,7 @@ fn elementwise<B: Serve>(rig: &mut Rig<'_, B>, timer: Timer<'_, B>, launch: f64)
             normed,
             kernels_slang::ssm::RowSpan::whole(x),
         )
-            .map_err(fault("rates: rmsnorm"))?;
+        .map_err(fault("rates: rmsnorm"))?;
         kernels_slang::linear::glu::swiglu(sink, packed, width, y).map_err(fault("rates: swiglu"))
     })?;
     engine::rates::rate_from(
@@ -2932,7 +2937,7 @@ fn warm<B: Serve>(
                 y,
                 kernels_slang::ssm::RowSpan::whole(act),
             )
-                .map_err(fault("rates: matmul"))
+            .map_err(fault("rates: matmul"))
         };
         let nothing = |_: &mut B::Frame| Ok(());
         // The walk admitted this size under its own estimate and worst
@@ -3005,7 +3010,9 @@ fn warm_at<B: Serve>(
 ) -> Result<Option<engine::rates::Warmed>> {
     let (m, n, k) = (side, side, side);
     let act = rig.operand(m, k, Dtype::Bf16)?;
-    let planes = rig.planes_most.map_or(weights_at(n, k), |most| weights_at(n, k).min(most));
+    let planes = rig
+        .planes_most
+        .map_or(weights_at(n, k), |most| weights_at(n, k).min(most));
     let weights = (0..planes)
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
@@ -3022,7 +3029,8 @@ fn warm_at<B: Serve>(
             w,
             y,
             kernels_slang::ssm::RowSpan::whole(act),
-        ).map_err(fault("rates: matmul"))
+        )
+        .map_err(fault("rates: matmul"))
     };
     let planes = u32::try_from(weights.len()).unwrap_or(u32::MAX);
     let nothing = |_: &mut B::Frame| Ok(());
@@ -3145,7 +3153,9 @@ fn matmul<B: Serve>(
     launch: f64,
 ) -> Result<f64> {
     let act = rig.operand(m, k, Dtype::Bf16)?;
-    let planes = rig.planes_most.map_or(weights_at(n, k), |most| weights_at(n, k).min(most));
+    let planes = rig
+        .planes_most
+        .map_or(weights_at(n, k), |most| weights_at(n, k).min(most));
     let weights = (0..planes)
         .map(|_| rig.operand(n, k, Dtype::Bf16))
         .collect::<Result<Vec<Tensor>>>()?;
@@ -3185,7 +3195,8 @@ fn matmul_on<B: Serve>(
             w,
             y,
             kernels_slang::ssm::RowSpan::whole(act),
-        ).map_err(fault("rates: matmul"))
+        )
+        .map_err(fault("rates: matmul"))
     };
     // A curve's point (its planes' touch shared) to a small device budget;
     // a rate of the device's own, settled over repeated rounds.
@@ -3284,7 +3295,9 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
     let page_indptr = rig.words(&[0, pages], 2, 1, Dtype::U32)?;
     // Each fire reads the next of these q / k / v sets, past the last-level
     // cache, as a served fire reads each layer's kv cold.
-    let most = rig.planes_most.map_or(ATTN_SETS_MOST, |most| most.min(ATTN_SETS_MOST));
+    let most = rig
+        .planes_most
+        .map_or(ATTN_SETS_MOST, |most| most.min(ATTN_SETS_MOST));
     let sets = (0..engine::rates::attn_sets_at(s, PAGE).min(most))
         .map(|_| {
             let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
@@ -3518,7 +3531,8 @@ fn copy_and_launch<B: Serve>(
             w,
             y,
             kernels_slang::ssm::RowSpan::whole(act),
-        ).map_err(fault("rates: matmul"))
+        )
+        .map_err(fault("rates: matmul"))
     };
     let nothing = |_: &mut B::Frame| Ok(());
     // The launch is what a dispatch adds inside one submission: its chains
@@ -3543,7 +3557,9 @@ fn copy_and_launch<B: Serve>(
         match launch_gap(rig, tactic, timer, (act, w, y), n) {
             Ok(gap) => gaps.push((n, gap)),
             Err(why) if rig.past_bound.borrow_mut().take().is_some() && !gaps.is_empty() => {
-                say(&format!("[rates]: launch chain of {n} past the bound, skipped ({why})"));
+                say(&format!(
+                    "[rates]: launch chain of {n} past the bound, skipped ({why})"
+                ));
             }
             Err(why) => return Err(why),
         }
@@ -3592,7 +3608,7 @@ fn launch_gap<B: Serve>(
             into,
             kernels_slang::ssm::RowSpan::whole(from),
         )
-            .map_err(fault("rates: matmul"))
+        .map_err(fault("rates: matmul"))
     };
     let one = |sink: &kernels_slang::Ctx<'_>| {
         kernels_slang::linear::gemm::matmul(
@@ -3603,7 +3619,7 @@ fn launch_gap<B: Serve>(
             wide_y,
             kernels_slang::ssm::RowSpan::whole(wide),
         )
-            .map_err(fault("rates: matmul"))
+        .map_err(fault("rates: matmul"))
     };
     let wall = |count: u32, fire: &dyn Fn(&kernels_slang::Ctx<'_>) -> Result<()>| {
         rig.frame(timer, count, fire, &nothing)?;
@@ -3736,7 +3752,8 @@ pub fn gemm_rate<B: Serve>(
             w,
             y,
             kernels_slang::ssm::RowSpan::whole(act),
-        ).map_err(fault("rates: matmul"))
+        )
+        .map_err(fault("rates: matmul"))
     })?;
     Ok(2.0 * f64::from(m) * f64::from(n) * f64::from(k) / ns as f64)
 }
@@ -4057,12 +4074,10 @@ pub fn read_clock_until<B: Serve>(
     }))
 }
 
-
 /// `engine::rates::warmed` over this crate's faults.
 pub fn warmed(read: impl FnMut() -> Result<ClockRead>) -> Result<ClockRead> {
     engine::rates::warmed(read)
 }
-
 
 /// The fires a warm-up rotation's next frame holds of `left`: as many as fit
 /// under `bound` at `per_fire` ns a fire (the slowest the rotation measured)
@@ -4100,7 +4115,6 @@ mod admission_tests {
         // Nothing estimates a fire under a bound: none.
         assert_eq!(rotation_fires(Some(BOUND), None, 1.4, 8), 0);
     }
-
 }
 
 #[cfg(test)]

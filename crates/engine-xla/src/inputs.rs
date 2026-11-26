@@ -37,7 +37,14 @@ impl Inputs {
         Self::default()
     }
 
-    fn root(&mut self, handles: &Handles, dtype: Dtype, rows: u32, width: u32, word: u32) -> Tensor {
+    fn root(
+        &mut self,
+        handles: &Handles,
+        dtype: Dtype,
+        rows: u32,
+        width: u32,
+        word: u32,
+    ) -> Tensor {
         self.shapes.push((dtype, rows, width));
         handles.root(Root {
             source: Source::Staged { word },
@@ -88,7 +95,8 @@ impl Inputs {
     ) -> Tensor {
         let word = self.image.len() as u32;
         let (whole, tail) = bytes.as_chunks::<4>();
-        self.image.extend(whole.iter().map(|w| u32::from_le_bytes(*w)));
+        self.image
+            .extend(whole.iter().map(|w| u32::from_le_bytes(*w)));
         if !tail.is_empty() {
             let mut last = [0u8; 4];
             last[..tail.len()].copy_from_slice(tail);

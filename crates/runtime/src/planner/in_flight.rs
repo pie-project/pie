@@ -63,7 +63,13 @@ impl ResidencyPlanner {
         // evicted for, the next bind-suspended restore): they plan now, not
         // when this fire lands, and not never where its landing is quiet
         // ([`Self::head_refused_on_room_unmoved`]).
-        if eligible && self.returns.waiters.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        if eligible
+            && self
+                .returns
+                .waiters
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
             self.poke();
         }
         FireInFlight {

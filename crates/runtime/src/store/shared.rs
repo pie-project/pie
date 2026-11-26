@@ -181,9 +181,7 @@ fn rung_gate(engine: usize) -> &'static RungGate {
 pub fn owe_cut_rows(engine: usize, rows: u32, by: Option<uuid::Uuid>) {
     let gate = rung_gate(engine);
     *gate.owed_by.lock().unwrap() = by.filter(|_| rows > 0);
-    let was = gate
-        .owed
-        .swap(rows, std::sync::atomic::Ordering::AcqRel);
+    let was = gate.owed.swap(rows, std::sync::atomic::Ordering::AcqRel);
     if rows > 0 && rows != was {
         ask_walk(engine);
     }
@@ -224,7 +222,9 @@ pub fn owed_cut_rows(engine: usize) -> u32 {
 /// (`engine::Error::Placement`): `engine`'s pool moves it down, its walk
 /// asked to look now. A pool that keeps no chunks moves nothing.
 pub fn evacuate_refused(engine: usize, chunks: &[u32]) {
-    if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared) {
+    if let Some(shared) =
+        crate::store::registry::try_get(0, engine).and_then(|stores| stores.shared)
+    {
         shared.lock().unwrap().refuse_chunks(chunks);
     }
     ask_walk(engine);
@@ -1289,16 +1289,19 @@ impl SharedPool {
             engine: None,
             replay: Arc::new(
                 facts
-                .act_chunks
-                .iter()
-                .enumerate()
-                .map(|(at, &(tokens, _))| {
-                    (
-                        tokens,
-                        facts.rung_replay(at).cloned().unwrap_or_else(|| rows_only(tokens)),
-                    )
-                })
-                .collect(),
+                    .act_chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &(tokens, _))| {
+                        (
+                            tokens,
+                            facts
+                                .rung_replay(at)
+                                .cloned()
+                                .unwrap_or_else(|| rows_only(tokens)),
+                        )
+                    })
+                    .collect(),
             ),
             rs_compact: facts.rs_compact,
             rs_scratch_per_fire: facts.rs_scratch_per_fire,
@@ -2366,7 +2369,6 @@ impl SharedPool {
         self.rs_compact
     }
 
-
     /// Every activation rung's tokens, ascending.
     #[must_use]
     pub fn rungs(&self) -> Vec<u32> {
@@ -2615,7 +2617,12 @@ impl SharedPool {
             return false;
         };
         let below = self.pool.total_chunks() - self.pool.act_chunks(rung);
-        if !self.pool.compacting() && self.pool.plan_compaction_below(run, pieces, below).is_none() {
+        if !self.pool.compacting()
+            && self
+                .pool
+                .plan_compaction_below(run, pieces, below)
+                .is_none()
+        {
             return false;
         }
         self.compact_raise = Some(rung);
@@ -2680,8 +2687,13 @@ impl SharedPool {
     /// the free chunks the planner must make for them.
     #[must_use]
     pub fn refusals_stuck(&self, chunks: &[u32]) -> u32 {
-        u32::try_from(chunks.iter().filter(|chunk| self.refused_stuck.contains(chunk)).count())
-            .unwrap_or(u32::MAX)
+        u32::try_from(
+            chunks
+                .iter()
+                .filter(|chunk| self.refused_stuck.contains(chunk))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 
     /// Whether any of `chunks` still waits for its move down, or is being
@@ -2735,7 +2747,8 @@ impl SharedPool {
         self.compact_for = None;
         // The engine refused the move of refused chunks: they wait for the
         // next step, never dropped while a fire waits on them.
-        self.refused.extend(std::mem::take(&mut self.refused_moving));
+        self.refused
+            .extend(std::mem::take(&mut self.refused_moving));
     }
 
     /// The walk's next grow step toward `goal` mapped segments, `None`

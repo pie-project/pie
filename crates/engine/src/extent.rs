@@ -200,7 +200,10 @@ mod tests {
 
     fn a_lane_reads_what_its_set_wrote_and_no_further() {
         let mut written = Written::default();
-        assert_eq!(fire(&mut written, &[(0, kv(7, 10), vec![10..12], 12)]), Ok(()));
+        assert_eq!(
+            fire(&mut written, &[(0, kv(7, 10), vec![10..12], 12)]),
+            Ok(())
+        );
         let past = fire(&mut written, &[(0, kv(7, 10), vec![12..13], 20)]);
         assert!(past.is_err_and(|why| why.contains("reads 20 slot(s)")));
     }
@@ -210,14 +213,23 @@ mod tests {
         let gap = fire(&mut written, &[(0, kv(7, 10), vec![15..16], 16)]);
         assert!(gap.is_err_and(|why| why.contains("slots 15..16")));
         // A rewind writes inside what it holds.
-        assert_eq!(fire(&mut written, &[(0, kv(7, 10), vec![4..6], 10)]), Ok(()));
+        assert_eq!(
+            fire(&mut written, &[(0, kv(7, 10), vec![4..6], 10)]),
+            Ok(())
+        );
     }
 
     fn a_fire_behind_one_in_flight_reads_what_that_one_wrote() {
         let mut written = Written::default();
-        assert_eq!(fire(&mut written, &[(3, kv(7, 10), vec![10..11], 11)]), Ok(()));
+        assert_eq!(
+            fire(&mut written, &[(3, kv(7, 10), vec![10..11], 11)]),
+            Ok(())
+        );
         // Staged before the first settled: the runtime still states 10.
-        assert_eq!(fire(&mut written, &[(3, kv(7, 10), vec![11..12], 12)]), Ok(()));
+        assert_eq!(
+            fire(&mut written, &[(3, kv(7, 10), vec![11..12], 12)]),
+            Ok(())
+        );
         assert_eq!(written.len(), 1);
         // The runtime caught up: nothing past it to keep.
         assert_eq!(fire(&mut written, &[(3, kv(7, 12), vec![], 12)]), Ok(()));
@@ -226,10 +238,7 @@ mod tests {
 
     fn lanes_of_one_set_read_the_union_of_their_writes() {
         let mut written = Written::default();
-        let siblings = [
-            (0, kv(7, 4), vec![6..8], 8),
-            (1, kv(7, 4), vec![4..6], 6),
-        ];
+        let siblings = [(0, kv(7, 4), vec![6..8], 8), (1, kv(7, 4), vec![4..6], 6)];
         assert_eq!(fire(&mut written, &siblings), Ok(()));
         // Another set's writes fill no gap of this one's.
         let strangers = [

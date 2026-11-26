@@ -1266,7 +1266,11 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                     kv_close(
                         &format!("{tag} fp8={fp8} v"),
                         &v[at..at + d_],
-                        &if v_norm { normed(vs, None) } else { vs.to_vec() },
+                        &if v_norm {
+                            normed(vs, None)
+                        } else {
+                            vs.to_vec()
+                        },
                         1.0,
                         1e-2,
                     );

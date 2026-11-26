@@ -19,7 +19,12 @@ impl Shape {
     fn of(facts: &ChunkFacts, role: SlotRole, chunk: u32) -> Option<Shape> {
         let shape = facts.shapes.iter().find(|shape| shape.role == role)?;
         let (id, per_chunk, slot_bytes) = (shape.id, shape.slots_per_chunk, shape.slot_bytes);
-        Some(Shape { id, per_chunk, slot_bytes, next: chunk * per_chunk })
+        Some(Shape {
+            id,
+            per_chunk,
+            slot_bytes,
+            next: chunk * per_chunk,
+        })
     }
 
     /// The slots `footprint` takes: the next ones, adjacent, from the next
@@ -31,7 +36,11 @@ impl Shape {
         }
         let first = self.next;
         self.next += footprint.slots;
-        assert_eq!(first / self.per_chunk, (self.next - 1) / self.per_chunk, "a test's items fit one chunk");
+        assert_eq!(
+            first / self.per_chunk,
+            (self.next - 1) / self.per_chunk,
+            "a test's items fit one chunk"
+        );
         (first..self.next).collect()
     }
 }
@@ -47,7 +56,10 @@ pub struct Slots {
     /// bytes.
     chunks: (u32, u64),
     /// Each (program, extents) pair's state, taken at its first bind.
-    pairs: Vec<((engine::program::ProgramId, engine::program::BindExtents), ScratchPlace)>,
+    pairs: Vec<(
+        (engine::program::ProgramId, engine::program::BindExtents),
+        ScratchPlace,
+    )>,
 }
 
 impl Slots {
@@ -69,27 +81,60 @@ impl Slots {
         if bytes == 0 {
             return ScratchPlace::None;
         }
-        let shape = self.instance.as_mut().expect("guest state needs an instance shape");
+        let shape = self
+            .instance
+            .as_mut()
+            .expect("guest state needs an instance shape");
         let slots = bytes.div_ceil(shape.slot_bytes);
         if slots * 2 <= u64::from(shape.per_chunk) {
             let slots = u32::try_from(slots).expect("a run inside a chunk");
-            let taken = shape.take(&Footprint { bytes, slots, contiguous: true });
-            return ScratchPlace::Run { first: taken[0], slots };
+            let taken = shape.take(&Footprint {
+                bytes,
+                slots,
+                contiguous: true,
+            });
+            return ScratchPlace::Run {
+                first: taken[0],
+                slots,
+            };
         }
         let run = run.max(1);
-        assert!(u64::from(run) * self.chunks.1 >= bytes, "a state of {bytes} bytes in one run of {run} chunks");
+        assert!(
+            u64::from(run) * self.chunks.1 >= bytes,
+            "a state of {bytes} bytes in one run of {run} chunks"
+        );
         assert!(self.chunks.0 > run, "the test's chunks hold a run of {run}");
         self.chunks.0 -= run;
-        ScratchPlace::Chunks { run, pieces: vec![self.chunks.0] }
+        ScratchPlace::Chunks {
+            run,
+            pieces: vec![self.chunks.0],
+        }
     }
 
     /// Registers `registration` over the channel slots its ring facts state.
-    pub fn register(&mut self, engine: &mut (impl engine::Channels + ?Sized), registration: ChannelRegistration) {
-        let slots = match engine::Channels::ring_facts(engine, &registration).expect("the channel's ring facts") {
-            Some(facts) => self.channel.as_mut().expect("ring facts need a channel shape").take(&facts.footprint),
+    pub fn register(
+        &mut self,
+        engine: &mut (impl engine::Channels + ?Sized),
+        registration: ChannelRegistration,
+    ) {
+        let slots = match engine::Channels::ring_facts(engine, &registration)
+            .expect("the channel's ring facts")
+        {
+            Some(facts) => self
+                .channel
+                .as_mut()
+                .expect("ring facts need a channel shape")
+                .take(&facts.footprint),
             None => Vec::new(),
         };
-        engine::Channels::open(engine, &ChannelRegistration { slots, ..registration }).expect("the channel registers");
+        engine::Channels::open(
+            engine,
+            &ChannelRegistration {
+                slots,
+                ..registration
+            },
+        )
+        .expect("the channel registers");
     }
 
     /// `binding` over the slots its program's facts state: its tables', and
@@ -111,12 +156,21 @@ impl Slots {
             .filter(|ring| !registered.contains(&binding.channels[ring.channel as usize]))
             .map(|ring| RingSlots {
                 channel: ring.channel,
-                slots: self.channel.as_mut().expect("ring facts need a channel shape").take(&ring.footprint),
+                slots: self
+                    .channel
+                    .as_mut()
+                    .expect("ring facts need a channel shape")
+                    .take(&ring.footprint),
             })
             .collect();
         // Its state and its pair's, the pair's taken once.
-        let state = engine::Programs::guest_state(engine, binding.program, &binding.extents, binding.geometry)
-            .expect("the program's guest state");
+        let state = engine::Programs::guest_state(
+            engine,
+            binding.program,
+            &binding.extents,
+            binding.geometry,
+        )
+        .expect("the program's guest state");
         let scratch = self.state(state.instance_bytes(), state.run);
         let key = (binding.program, binding.extents);
         let pair = match self.pairs.iter().find(|(held, _)| *held == key) {
@@ -127,6 +181,12 @@ impl Slots {
                 place
             }
         };
-        InstanceBinding { instance_slots, ring_slots, scratch, pair, ..binding }
+        InstanceBinding {
+            instance_slots,
+            ring_slots,
+            scratch,
+            pair,
+            ..binding
+        }
     }
 }

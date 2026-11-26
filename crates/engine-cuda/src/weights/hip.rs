@@ -77,7 +77,11 @@ pub(super) fn canonical_fp8(
 }
 
 /// The first e4m3 plane [`canonical_fp8`] orders, to name a refusal by.
-fn spans_param(trace: &Trace, index: &BTreeMap<&str, usize>, tier: Option<&crate::experts::Tier>) -> usize {
+fn spans_param(
+    trace: &Trace,
+    index: &BTreeMap<&str, usize>,
+    tier: Option<&crate::experts::Tier>,
+) -> usize {
     trace
         .params
         .iter()
@@ -95,7 +99,10 @@ fn spans_param(trace: &Trace, index: &BTreeMap<&str, usize>, tier: Option<&crate
 /// whole 16-row strips at a time through one device staging span of at
 /// most [`FP8_STAGED`] bytes (a bank needs no bank-sized buffer). A span
 /// holding a NaN code (0x7f, 0xff: numbers to e4m3fnuz) refuses the load.
-pub(crate) fn order_fp8_spans(stream: *mut core::ffi::c_void, spans: &[(u64, u64, u64)]) -> Result<()> {
+pub(crate) fn order_fp8_spans(
+    stream: *mut core::ffi::c_void,
+    spans: &[(u64, u64, u64)],
+) -> Result<()> {
     let Some(widest_k) = spans.iter().map(|&(_, _, k)| k).max() else {
         return Ok(());
     };

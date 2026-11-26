@@ -8,9 +8,7 @@ impl ::engine::Engine for PanickingEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -25,10 +23,7 @@ impl ::engine::Engine for PanickingEngine {
         Err(engine::Error::Load("no model".into()))
     }
 
-    fn submit(
-        &mut self,
-        _frame: &engine::FrameSubmission,
-    ) -> engine::Result<engine::FrameTicket> {
+    fn submit(&mut self, _frame: &engine::FrameSubmission) -> engine::Result<engine::FrameTicket> {
         panic!("the shape of an interpreter reading lane zero of an empty cell");
     }
 
@@ -61,10 +56,7 @@ impl ::engine::Programs for PanickingEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -72,11 +64,20 @@ impl ::engine::Programs for PanickingEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
-    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+    fn bind(
+        &mut self,
+        _binding: &::engine::InstanceBinding,
+    ) -> ::engine::Result<::engine::BoundInstance> {
         Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
     }
 
@@ -84,8 +85,14 @@ impl ::engine::Programs for PanickingEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_instance"))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -99,7 +106,10 @@ impl ::engine::Pool for PanickingEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -128,19 +138,28 @@ impl ::engine::Tiers for PanickingEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 /// A control the lane refuses or drops (a panic on the copy, the
 /// reply lost) tells what waits on it: else a residency move's copy
@@ -253,7 +272,10 @@ fn refused_frame(requests: Vec<Box<PendingRequest>>, chunks: &[u32]) -> PendingL
 }
 
 fn refused_batch(fires: &[u64], chunks: &[u32]) -> PendingLaunchBatch {
-    refused_frame(fires.iter().map(|&fire| refused_request(fire)).collect(), chunks)
+    refused_frame(
+        fires.iter().map(|&fire| refused_request(fire)).collect(),
+        chunks,
+    )
 }
 
 /// A frame refused for where state lies must not go again from requests
@@ -281,10 +303,15 @@ fn a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with() 
     // Fire 9 rode the frame, but a refused lane took it out (failed
     // alone) before the placement refusal: it is in no step.
     let gone = refused_request(9);
-    gone.completion.reject_unsubmitted("engine: lane 2 refused".to_string());
+    gone.completion
+        .reject_unsubmitted("engine: lane 2 refused".to_string());
     let mut batch = refused_frame(built.into_iter().take(2).collect(), &[2057]);
     assert!(
-        batch.requests.iter().all(|request| request.request.lanes.iter().all(|lane| lane.tokens.is_empty())),
+        batch.requests.iter().all(|request| request
+            .request
+            .lanes
+            .iter()
+            .all(|lane| lane.tokens.is_empty())),
         "the build moved the lanes into the steps"
     );
     batch.requests.push(gone);
@@ -299,9 +326,17 @@ fn a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with() 
         engine,
     ));
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0].requests.len(), 2, "the fire failed alone goes nowhere again");
+    assert_eq!(
+        held[0].requests.len(),
+        2,
+        "the fire failed alone goes nowhere again"
+    );
     let mut pending = PendingQueue::default();
-    assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+    assert!(BatchScheduler::release_held(
+        &mut held,
+        &mut pending,
+        engine
+    ));
     let again: Vec<Box<PendingRequest>> = std::mem::take(&mut pending.items)
         .into_iter()
         .map(|item| match item {
@@ -311,13 +346,24 @@ fn a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with() 
         .collect();
     for (request, lanes) in again.iter().zip(&before) {
         assert!(!request.completion.is_settled(), "none failed");
-        assert_eq!(&lanes_of(request), lanes, "every lane, page and token it was built with");
+        assert_eq!(
+            &lanes_of(request),
+            lanes,
+            "every lane, page and token it was built with"
+        );
     }
-    let (frame, _) =
-        batch::build_frame_submission(vec![again], refused_limits(), 16, &SchedulerStats::default());
+    let (frame, _) = batch::build_frame_submission(
+        vec![again],
+        refused_limits(),
+        16,
+        &SchedulerStats::default(),
+    );
     assert!(!frame.steps.is_empty());
     assert!(
-        frame.steps.iter().all(|step| step.submission.validate().is_ok()),
+        frame
+            .steps
+            .iter()
+            .all(|step| step.submission.validate().is_ok()),
         "the engine takes the fire it goes again as"
     );
 
@@ -360,9 +406,16 @@ fn a_frame_refused_for_placement_goes_again_with_every_lane_it_was_built_with() 
         &[vec![11, 12]],
     );
     assert!(progress && fired);
-    assert!(laneless_completion.is_settled(), "the fire with no lanes fails alone");
+    assert!(
+        laneless_completion.is_settled(),
+        "the fire with no lanes fails alone"
+    );
     assert_eq!(posted.len(), 1);
-    assert_eq!(posted[0].requests.len(), 1, "only the fire beside it is posted");
+    assert_eq!(
+        posted[0].requests.len(),
+        1,
+        "only the fire beside it is posted"
+    );
     lane.shutdown();
 }
 
@@ -403,7 +456,11 @@ fn a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none() {
         })
     };
     // No pool here: nothing is pending its move, so they go again.
-    assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+    assert!(BatchScheduler::release_held(
+        &mut held,
+        &mut pending,
+        engine
+    ));
     assert_eq!(pending.len(), 3, "fired again");
     assert!(unsettled(&pending), "none failed");
     assert!(
@@ -419,7 +476,12 @@ fn a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none() {
     assert!(held[0].solo, "a runtime bug: its fires go again alone");
     let mut pending = PendingQueue::default();
     BatchScheduler::release_held(&mut held, &mut pending, engine);
-    assert!(pending.items.iter().all(|item| matches!(item, QueuedItem::Launch(launch) if launch.solo)));
+    assert!(
+        pending
+            .items
+            .iter()
+            .all(|item| matches!(item, QueuedItem::Launch(launch) if launch.solo))
+    );
     assert!(unsettled(&pending));
     // One refused alone again fails, alone.
     let alone = refused_batch(&[4], &[2057]);
@@ -427,7 +489,10 @@ fn a_launch_refused_for_placement_is_fired_again_after_the_move_failing_none() {
     let mut flight = VecDeque::from([alone]);
     retire(&mut flight, &mut held, &mut refused_once);
     assert!(held.is_empty());
-    assert!(completion.is_settled(), "the one the engine still refuses alone fails");
+    assert!(
+        completion.is_settled(),
+        "the one the engine still refuses alone fails"
+    );
 }
 
 #[test]
@@ -527,7 +592,9 @@ fn a_held_fire_holds_its_pipeline_s_later_ones() {
     let mut held = vec![batch(7), batch(8)];
     let mut pending = PendingQueue::default();
     for (fire, pipeline) in [(9, one), (10, other), (11, one)] {
-        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(request(fire, pipeline))));
+        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(request(
+            fire, pipeline,
+        ))));
     }
     let fires = |pending: &PendingQueue| -> Vec<u64> {
         pending
@@ -540,7 +607,11 @@ fn a_held_fire_holds_its_pipeline_s_later_ones() {
     };
     BatchScheduler::hold_behind(&mut held, &mut pending);
     assert_eq!(fires(&pending), [10], "another pipeline's goes meanwhile");
-    assert!(BatchScheduler::release_held(&mut held, &mut pending, engine));
+    assert!(BatchScheduler::release_held(
+        &mut held,
+        &mut pending,
+        engine
+    ));
     assert!(held.is_empty());
     assert_eq!(fires(&pending), [7, 8, 9, 11, 10]);
     assert_eq!(pending.out_of_order(), None);
@@ -570,7 +641,11 @@ fn a_control_brought_forward_leaves_a_cut_pass_s_pieces_in_order() {
             fires: 2,
         }),
     ));
-    assert!(BatchScheduler::rotate_launch_for_wave_work(&mut pending, false, true));
+    assert!(BatchScheduler::rotate_launch_for_wave_work(
+        &mut pending,
+        false,
+        true
+    ));
     assert!(matches!(
         pending.front(),
         Some(QueuedItem::CloseChannels { .. })
@@ -578,7 +653,11 @@ fn a_control_brought_forward_leaves_a_cut_pass_s_pieces_in_order() {
     assert_eq!(pending.out_of_order(), None);
     let mut cache = ScanCache::default();
     let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
-    assert_eq!(scan.untracked, [9], "the first piece goes, its pass's last behind it");
+    assert_eq!(
+        scan.untracked,
+        [9],
+        "the first piece goes, its pass's last behind it"
+    );
 }
 
 fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
@@ -622,7 +701,7 @@ fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
             crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
                     fire_stamps: Vec::new(),
-        lane_sets: Vec::new(),
+                    lane_sets: Vec::new(),
                     shapes: None,
                     submission: ::engine::Step {
                         lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
@@ -673,9 +752,7 @@ impl ::engine::Engine for ExhaustedEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -690,10 +767,7 @@ impl ::engine::Engine for ExhaustedEngine {
         Err(engine::Error::Load("no model".into()))
     }
 
-    fn submit(
-        &mut self,
-        _frame: &engine::FrameSubmission,
-    ) -> engine::Result<engine::FrameTicket> {
+    fn submit(&mut self, _frame: &engine::FrameSubmission) -> engine::Result<engine::FrameTicket> {
         self.submits.fetch_add(1, Ordering::Relaxed);
         Err(engine::Error::Exhausted {
             resource: "guest channel cells",
@@ -731,10 +805,7 @@ impl ::engine::Programs for ExhaustedEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -742,11 +813,20 @@ impl ::engine::Programs for ExhaustedEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
-    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+    fn bind(
+        &mut self,
+        _binding: &::engine::InstanceBinding,
+    ) -> ::engine::Result<::engine::BoundInstance> {
         Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
     }
 
@@ -754,8 +834,14 @@ impl ::engine::Programs for ExhaustedEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_instance"))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -769,7 +855,10 @@ impl ::engine::Pool for ExhaustedEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -798,19 +887,28 @@ impl ::engine::Tiers for ExhaustedEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
     let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -826,7 +924,7 @@ fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
         crate::engine::FrameFire {
             steps: vec![crate::engine::StepFire {
                 fire_stamps: Vec::new(),
-        lane_sets: Vec::new(),
+                lane_sets: Vec::new(),
                 shapes: None,
                 submission: ::engine::Step {
                     lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
@@ -868,7 +966,6 @@ fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
     let (_engine, _channels) = lane.shutdown();
 }
 
-
 /// Why [`LaneFaultEngine`]'s faulting lane faulted.
 const GUARD: &str = "guest epilogue faulted: stage 0: guard";
 
@@ -890,9 +987,7 @@ impl ::engine::Engine for LaneFaultEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -907,10 +1002,7 @@ impl ::engine::Engine for LaneFaultEngine {
         Err(engine::Error::Load("no model".into()))
     }
 
-    fn submit(
-        &mut self,
-        frame: &engine::FrameSubmission,
-    ) -> engine::Result<engine::FrameTicket> {
+    fn submit(&mut self, frame: &engine::FrameSubmission) -> engine::Result<engine::FrameTicket> {
         if self.lost {
             return Err(engine::Error::Device("the device is lost".into()));
         }
@@ -988,10 +1080,7 @@ impl ::engine::Programs for LaneFaultEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -999,11 +1088,20 @@ impl ::engine::Programs for LaneFaultEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
-    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+    fn bind(
+        &mut self,
+        _binding: &::engine::InstanceBinding,
+    ) -> ::engine::Result<::engine::BoundInstance> {
         Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
     }
 
@@ -1011,8 +1109,14 @@ impl ::engine::Programs for LaneFaultEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_instance"))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -1026,7 +1130,10 @@ impl ::engine::Pool for LaneFaultEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -1055,19 +1162,28 @@ impl ::engine::Tiers for LaneFaultEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 /// One step of fires, a lane each, each the pass of its own instance
 /// of `instances`; and the fires' completions.
@@ -1085,7 +1201,7 @@ fn step_of(
     let fire = crate::engine::FrameFire {
         steps: vec![crate::engine::StepFire {
             fire_stamps: Vec::new(),
-        lane_sets: Vec::new(),
+            lane_sets: Vec::new(),
             shapes: None,
             submission: ::engine::Step {
                 lanes: (0..lanes)
@@ -1123,8 +1239,8 @@ fn fire_and_settle(
     std::result::Result<(), String>,
     Vec<std::result::Result<(), String>>,
 ) {
-    let answer = within("the launch is answered", lane.fire(fire, false))
-        .expect("the launch is answered");
+    let answer =
+        within("the launch is answered", lane.fire(fire, false)).expect("the launch is answered");
     let answer = match answer {
         Ok(frame) => within("the frame settles", frame).map_err(|error| format!("{error:#}")),
         Err(error) => Err(error.message),
@@ -1203,8 +1319,8 @@ fn a_refused_submit_fails_every_fire_of_its_frame() {
         Arc::new(SchedulerStats::default()),
     );
     let (fire, completions) = step_of(&[100, 101, 102, 103]);
-    let answer = within("the launch is answered", lane.fire(fire, false))
-        .expect("the launch is answered");
+    let answer =
+        within("the launch is answered", lane.fire(fire, false)).expect("the launch is answered");
     let Err(why) = answer else {
         panic!("a lost device refuses the frame");
     };
@@ -1248,9 +1364,7 @@ impl ::engine::Engine for LaneRefusalEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -1265,10 +1379,7 @@ impl ::engine::Engine for LaneRefusalEngine {
         Err(engine::Error::Load("no model".into()))
     }
 
-    fn submit(
-        &mut self,
-        frame: &engine::FrameSubmission,
-    ) -> engine::Result<engine::FrameTicket> {
+    fn submit(&mut self, frame: &engine::FrameSubmission) -> engine::Result<engine::FrameTicket> {
         let id = ::engine::FrameId(self.next);
         self.next += 1;
         let sink = self.sink.clone().expect("a sink before the first submit");
@@ -1376,10 +1487,7 @@ impl ::engine::Programs for LaneRefusalEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -1387,11 +1495,20 @@ impl ::engine::Programs for LaneRefusalEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_program"))
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
-    fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+    fn bind(
+        &mut self,
+        _binding: &::engine::InstanceBinding,
+    ) -> ::engine::Result<::engine::BoundInstance> {
         Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
     }
 
@@ -1399,8 +1516,14 @@ impl ::engine::Programs for LaneRefusalEngine {
         Err(::engine::Error::unsupported(self.kind(), "close_instance"))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -1414,7 +1537,10 @@ impl ::engine::Pool for LaneRefusalEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -1443,19 +1569,28 @@ impl ::engine::Tiers for LaneRefusalEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 /// A frame of steps of fires, a lane each, each the pass of its own
 /// instance: step `s` is `steps[s]`, `(instance, unserved)` a fire. A
@@ -1502,7 +1637,7 @@ fn frame_of_lanes(
             .collect();
         fire.steps.push(crate::engine::StepFire {
             fire_stamps: Vec::new(),
-        lane_sets: Vec::new(),
+            lane_sets: Vec::new(),
             shapes: None,
             submission: ::engine::Step {
                 lanes: fires.iter().map(|(_, lane)| lane.clone()).collect(),
@@ -1522,7 +1657,10 @@ fn frame_of_lanes(
             terminal_cells: completions.iter().map(|c| c.terminal_cell_ptr()).collect(),
             completions: completions.clone(),
             member_lanes: (0..=lanes).collect(),
-            instances: fires.iter().map(|&(id, _)| ::engine::InstanceId(id)).collect(),
+            instances: fires
+                .iter()
+                .map(|&(id, _)| ::engine::InstanceId(id))
+                .collect(),
         });
         all.push(completions);
     }
@@ -1592,16 +1730,13 @@ fn fire_refusing_frame(
         let answer = within("the launch is answered", lane.fire(fire, false))
             .expect("the launch is answered");
         let answer = match answer {
-            Ok(frame) => {
-                within("the frame settles", frame).map_err(|error| format!("{error:#}"))
-            }
+            Ok(frame) => within("the frame settles", frame).map_err(|error| format!("{error:#}")),
             Err(error) => Err(error.message),
         };
         let results = flat
             .iter()
             .map(|completion| {
-                within("the fire settles", completion.clone())
-                    .map_err(|error| format!("{error:#}"))
+                within("the fire settles", completion.clone()).map_err(|error| format!("{error:#}"))
             })
             .collect();
         (answer, results)
@@ -1632,9 +1767,18 @@ fn one_refused_lane_fails_its_own_fire_alone(asynchronous: bool) {
         asynchronous,
         &[&[(100, false), (101, false), (102, true), (103, false)]],
     );
-    assert_eq!(frame, Ok(()), "the frame is not failed by one lane's refusal");
-    let why = fires[0][2].as_ref().expect_err("the refused lane's fire fails");
-    assert!(why.contains("reads a mask in no arm"), "by the engine's reason: {why}");
+    assert_eq!(
+        frame,
+        Ok(()),
+        "the frame is not failed by one lane's refusal"
+    );
+    let why = fires[0][2]
+        .as_ref()
+        .expect_err("the refused lane's fire fails");
+    assert!(
+        why.contains("reads a mask in no arm"),
+        "by the engine's reason: {why}"
+    );
     assert!(why.contains("lane 2"), "naming its lane: {why}");
     for at in [0, 1, 3] {
         assert_eq!(fires[0][at], Ok(()), "fire {at} commits");
@@ -1663,8 +1807,15 @@ fn a_lane_refused_past_the_first_step_stops_the_frame_there(asynchronous: bool) 
         ],
     );
     assert_eq!(frame, Ok(()));
-    assert!(fires[0].iter().all(Result::is_ok), "the first step commits: {fires:?}");
-    assert!(refused(&fires[1][1]), "the refused fire fails: {:?}", fires[1][1]);
+    assert!(
+        fires[0].iter().all(Result::is_ok),
+        "the first step commits: {fires:?}"
+    );
+    assert!(
+        refused(&fires[1][1]),
+        "the refused fire fails: {:?}",
+        fires[1][1]
+    );
     assert_eq!(fires[1][0], Ok(()));
     assert_eq!(fires[1][2], Ok(()));
     assert_eq!(
@@ -1690,15 +1841,14 @@ fn a_split_launch_landing_out_of_order_is_refused_by_name() {
     let (_frame, fires, fed) = fire_refusing_landing(
         true,
         true,
-        &[
-            &[(100, false), (101, false)],
-            &[(100, false), (101, true)],
-        ],
+        &[&[(100, false), (101, false)], &[(100, false), (101, true)]],
     );
     assert_eq!(fed.len(), 2, "the engine fired both frames: {fed:?}");
     assert!(refused(&fires[1][1]), "{:?}", fires[1][1]);
     for fired in [&fires[0][0], &fires[0][1], &fires[1][0]] {
-        let why = fired.as_ref().expect_err("no fire takes an out-of-order frame's tokens");
+        let why = fired
+            .as_ref()
+            .expect_err("no fire takes an out-of-order frame's tokens");
         assert!(
             why.contains("settled its engine frame 1 of 2 while frame 0 was expected"),
             "named: {why}"
@@ -1728,8 +1878,7 @@ fn a_row_placed_outside_its_writable_slots_fails_its_own_fire_alone() {
             placed(102, 15),
             placed(103, 16),
         ]];
-        let (frame, fires, fed) =
-            fire_refusing_frame(asynchronous, false, frame_of_lanes(&steps));
+        let (frame, fires, fed) = fire_refusing_frame(asynchronous, false, frame_of_lanes(&steps));
         assert_eq!(frame, Ok(()), "the frame is not failed by one lane's write");
         let below = fires[0][1]
             .as_ref()
@@ -1758,7 +1907,6 @@ fn a_row_placed_outside_its_writable_slots_fails_its_own_fire_alone() {
         );
     }
 }
-
 
 fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
     crate::rt::block_on(async { crate::rt::time::timeout(Duration::from_secs(10), wait).await })

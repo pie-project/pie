@@ -187,7 +187,10 @@ impl OrderedSemaphore {
         self.wake_downstream();
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "no policy runs in the browser"))]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "no policy runs in the browser")
+    )]
     pub(crate) fn regrant(&self) {
         {
             let mut state = self.lock();

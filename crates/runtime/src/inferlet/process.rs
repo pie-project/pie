@@ -375,7 +375,6 @@ pub fn seats() -> (usize, usize) {
     (running, live - running)
 }
 
-
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
 static PROCESS_INSTANTIATE_US: AtomicU64 = AtomicU64::new(0);
@@ -453,7 +452,11 @@ pub fn init_admission(max_concurrent: Option<usize>) {
     // waiting at an earlier one. Only the first gate, prewarm, holds below
     // the floor. With no count stated it counts nothing: over-demand is the
     // planner's contention to settle.
-    let prewarm = Some(OrderedSemaphore::new("prewarm", limit.unwrap_or(usize::MAX / 2), true));
+    let prewarm = Some(OrderedSemaphore::new(
+        "prewarm",
+        limit.unwrap_or(usize::MAX / 2),
+        true,
+    ));
     const STAGED_COHORTS: usize = 1;
     let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
         gates
@@ -551,7 +554,10 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     drop(drained);
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "no policy runs in the browser"))]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser")
+)]
 pub(crate) fn regrant_admission() {
     for gate in [&PREWARM_ADMISSION, &BIND_ADMISSION, &ADMISSION] {
         if let Some(Some(semaphore)) = gate.get() {
@@ -1141,13 +1147,15 @@ impl Process {
                     let text = trapped(&call_err, store.data().stderr_said());
                     // A planner error in the trap's chain leads the text
                     // with its code, found by type.
-                    Err(match call_err
-                        .chain()
-                        .find_map(|cause| cause.downcast_ref::<crate::planner::PlannerError>())
-                    {
-                        Some(error) => error.lead(text),
-                        None => text,
-                    })
+                    Err(
+                        match call_err
+                            .chain()
+                            .find_map(|cause| cause.downcast_ref::<crate::planner::PlannerError>())
+                        {
+                            Some(error) => error.lead(text),
+                            None => text,
+                        },
+                    )
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
@@ -1494,7 +1502,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod blocked_tests {
     use super::*;
@@ -1520,7 +1527,10 @@ mod blocked_tests {
             "plan: pages another pass computes",
         ];
         let told = |pid: ProcessId| {
-            crate::scheduler::worker::OWNERS_BLOCKED.lock().unwrap().contains(&pid)
+            crate::scheduler::worker::OWNERS_BLOCKED
+                .lock()
+                .unwrap()
+                .contains(&pid)
         };
         for stage in kinds {
             assert!(blocks_on_planner(stage), "{stage}");
@@ -1537,7 +1547,10 @@ mod blocked_tests {
             assert!(told(pid), "{stage}: a parked wait parks its process");
             waiting.abort();
             let _ = waiting.await;
-            assert!(!PARKED.lock().unwrap().contains_key(&pid), "{stage}: unparked as it ends");
+            assert!(
+                !PARKED.lock().unwrap().contains_key(&pid),
+                "{stage}: unparked as it ends"
+            );
             // Pending but parked nowhere (a lock, a microsecond's turn):
             // nothing.
             let brief = ProcessId::new_v4();
@@ -1566,8 +1579,15 @@ mod blocked_tests {
             FramePolicy::parked_owner_frame_goes_at_once_by(ProcessId::new_v4(), true),
             "suspended between waits: its complete frame waits on no boundary"
         );
-        for request in ["bind", "bind: the lane's bind", "bind: register the program"] {
-            assert!(!blocks_on_planner(request), "{request} is the engine's lane, no wait on the planner");
+        for request in [
+            "bind",
+            "bind: the lane's bind",
+            "bind: register the program",
+        ] {
+            assert!(
+                !blocks_on_planner(request),
+                "{request} is the engine's lane, no wait on the planner"
+            );
         }
     }
 }

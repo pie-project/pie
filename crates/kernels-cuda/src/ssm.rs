@@ -19,8 +19,7 @@ mod mamba2;
 
 pub use conv1d::conv1d_fold;
 pub use conv1d::{
-    causal_conv1d, causal_conv1d_carried, causal_conv1d_chunked, short_conv,
-    short_conv_chunked,
+    causal_conv1d, causal_conv1d_carried, causal_conv1d_chunked, short_conv, short_conv_chunked,
 };
 pub use dyn_conv::dyn_conv;
 
@@ -51,7 +50,8 @@ impl FoldKernel {
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
 pub use gdn_prep::gdn_gates;
 pub use gdn_recurrent::{
-    GdnGated, carry_split_bytes, gated_delta, gated_delta_carried, gated_delta_fold, gated_delta_tail,
+    GdnGated, carry_split_bytes, gated_delta, gated_delta_carried, gated_delta_fold,
+    gated_delta_tail,
 };
 pub use kda::{kda, kda_carried, kda_chunked, kda_fold, kda_tail};
 pub use mamba2::{Mamba2, mamba2, mamba2_carried, mamba2_chunked, mamba2_fold, mamba2_tail};

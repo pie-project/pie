@@ -183,7 +183,10 @@ pub fn mamba2_tail(
     }
     let xb = xbc.width - m.groups * state_dim;
     if !xb.is_multiple_of(8) {
-        return Err(refuse(OP, format!("a {xb}-wide `x | B` row the tail copies in 16-byte runs")));
+        return Err(refuse(
+            OP,
+            format!("a {xb}-wide `x | B` row the tail copies in 16-byte runs"),
+        ));
     }
     ctx.fire(
         OP,
@@ -299,8 +302,7 @@ pub fn mamba2_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, m.heads)?;
     ctx.fire(
         OP,
-        Fire::at(fold_kernel())
-            .apply(Launch::grid([m.heads, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(fold_kernel()).apply(Launch::grid([m.heads, 1, 1], [BLOCK, 1, 1])),
         &[
             rows.arg(),
             m.a_log.arg(),

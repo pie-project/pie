@@ -511,9 +511,7 @@ pub fn choose_shaped(
     rates: &profile::rates::Rates,
     device: &str,
     counts: &Counts,
-    shape: impl FnOnce(
-        crate::roofline::Constants,
-    ) -> Result<crate::roofline::Constants, &'static str>,
+    shape: impl FnOnce(crate::roofline::Constants) -> Result<crate::roofline::Constants, &'static str>,
 ) -> Result<(TopRung, FireEstimate), Refused> {
     let refused = |key| Refused::NoRates {
         device: device.to_owned(),
@@ -675,7 +673,8 @@ mod tests {
         };
         let err = choose(&rungs, 1 << 33, u32::MAX, &rates, "Card X", &counts()).unwrap_err();
         assert!(
-            err.to_string().contains("`[rates] attn_tflops_by_keys` is unstated"),
+            err.to_string()
+                .contains("`[rates] attn_tflops_by_keys` is unstated"),
             "{err}"
         );
     }

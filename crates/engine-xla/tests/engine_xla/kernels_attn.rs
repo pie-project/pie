@@ -372,7 +372,11 @@ impl Fire {
         let cap = pool.capacity(lane) as i32;
         let en = self.enabled[r];
         let wide = !causal || en == 2;
-        let hi = if wide { self.held(lane).min(cap) } else { (qpos + 1).min(cap) };
+        let hi = if wide {
+            self.held(lane).min(cap)
+        } else {
+            (qpos + 1).min(cap)
+        };
         let lo = if window > 0 && qpos >= window as i32 {
             qpos - window as i32 + 1
         } else {
@@ -1670,9 +1674,8 @@ fn prefill_masked_case(maps: (PageMap, PageMap)) {
         .run(|ctx| {
             let read = low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
             assert!(read.is_some(), "a tall append is read fresh");
-            let call = arbiter::prefill(
-                qr, &plan, &kv, None, d as u32, kvh as u32, scale, o, 1000,
-            )?;
+            let call =
+                arbiter::prefill(qr, &plan, &kv, None, d as u32, kvh as u32, scale, o, 1000)?;
             low::attend_fresh(ctx, call, kv, read)
         })
         .unwrap()
@@ -2695,8 +2698,14 @@ fn a_wide_prefill_reads_its_lanes_keys_without_a_plane() {
     let mask_ones = b.u8(rows as u32, stride, &ones.mask);
     let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
     let qr = ragged(&mut b, &runs, qt);
-    let (kt, vt) = (b.bf16(rows as u32, w as u32, &k), b.bf16(rows as u32, w as u32, &v));
-    let (kt2, vt2) = (b.bf16(rows as u32, w as u32, &k2), b.bf16(rows as u32, w as u32, &v2));
+    let (kt, vt) = (
+        b.bf16(rows as u32, w as u32, &k),
+        b.bf16(rows as u32, w as u32, &v),
+    );
+    let (kt2, vt2) = (
+        b.bf16(rows as u32, w as u32, &k2),
+        b.bf16(rows as u32, w as u32, &v2),
+    );
     let pt = b.i32(rows as u32, 1, &page);
     let ot = b.i32(rows as u32, 1, &off);
     let wq = (qh * d) as u32;
@@ -2707,13 +2716,17 @@ fn a_wide_prefill_reads_its_lanes_keys_without_a_plane() {
         .run(|ctx| {
             low::kv_append(ctx, kt, vt, &kv, pt, ot)?;
             let read = low::kv_append(ctx, kt2, vt2, &twin, pt, ot)?;
-            let call = arbiter::masked(qr, &plan, plan.mask, None, false, d as u32, scale, o_new, 1)?;
-            low::attend_fresh(ctx, call, kv, read)?;
             let call =
-                arbiter::masked(qr, &plan_ones, mask_ones, None, false, d as u32, scale, o_ones, 1)?;
+                arbiter::masked(qr, &plan, plan.mask, None, false, d as u32, scale, o_new, 1)?;
+            low::attend_fresh(ctx, call, kv, read)?;
+            let call = arbiter::masked(
+                qr, &plan_ones, mask_ones, None, false, d as u32, scale, o_ones, 1,
+            )?;
             low::attend_fresh(ctx, call, kv, read)?;
             // No fresh rows handed over: the walk, bounded by `kv_len`.
-            let call = arbiter::masked(qr, &plan, plan.mask, None, false, d as u32, scale, o_walk, 1)?;
+            let call = arbiter::masked(
+                qr, &plan, plan.mask, None, false, d as u32, scale, o_walk, 1,
+            )?;
             low::attend(ctx, call, kv)
         })
         .unwrap()
@@ -2812,11 +2825,14 @@ fn a_wide_lanes_causal_windowed_rows_read_no_later_key() {
     let qt = b.bf16(rows as u32, (qh * d) as u32, &q);
     let qr = ragged(&mut b, &runs, qt);
     let wq = (qh * d) as u32;
-    let outs: Vec<Tensor> = (0..4).map(|_| b.zeros(Dtype::Bf16, rows as u32, wq)).collect();
+    let outs: Vec<Tensor> = (0..4)
+        .map(|_| b.zeros(Dtype::Bf16, rows as u32, wq))
+        .collect();
     if !b
         .run(|ctx| {
             for (o, pool) in [(outs[0], kv), (outs[1], kv_twin)] {
-                let call = arbiter::prefill(qr, &plan, &pool, Some(64), d as u32, kvh as u32, 0.1, o, 1)?;
+                let call =
+                    arbiter::prefill(qr, &plan, &pool, Some(64), d as u32, kvh as u32, 0.1, o, 1)?;
                 low::attend(ctx, call, pool)?;
             }
             for (o, pool) in [(outs[2], kv), (outs[3], kv_twin)] {
@@ -2852,11 +2868,15 @@ fn a_wide_lanes_causal_windowed_rows_read_no_later_key() {
             .all(|(x, y)| x.to_bits() == y.to_bits())
     };
     assert!(
-        (0..rows).filter(|&r| early(r)).all(|r| same(&now, &now_twin, r)),
+        (0..rows)
+            .filter(|&r| early(r))
+            .all(|r| same(&now, &now_twin, r)),
         "a causal windowed row of a wide lane read a key past its own position"
     );
     assert!(
-        (0..rows).filter(|&r| early(r)).any(|r| !same(&before, &before_twin, r)),
+        (0..rows)
+            .filter(|&r| early(r))
+            .any(|r| !same(&before, &before_twin, r)),
         "flag 2 and a plane of ones read the later key"
     );
 }

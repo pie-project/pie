@@ -146,16 +146,24 @@ fn one_program_driving_eight_lanes_settles_every_step() {
     let table = planes["embed"].1.clone();
     let (tx, heard) = mpsc::channel::<(StepDone, StepOutcome)>();
     let tx = Mutex::new(tx);
-    engine::Completion::on_complete(&mut engine, Arc::new(move |at, outcome| {
-        let _ = tx.lock().expect("the sink's sender").send((at, outcome));
-    }));
+    engine::Completion::on_complete(
+        &mut engine,
+        Arc::new(move |at, outcome| {
+            let _ = tx.lock().expect("the sink's sender").send((at, outcome));
+        }),
+    );
     let asynchronous = engine::Completion::asynchronous(&engine);
 
-    let program = engine::Programs::register(&mut engine, &registration_of(&output_decls(&caps), sampler(), 0x0e8))
-        .expect("the sampler registers");
-    let from_host =
-        engine::Programs::register(&mut engine, &registration_of(&output_decls(&caps), hosted(), 0x0e9))
-            .expect("the hosted sampler registers");
+    let program = engine::Programs::register(
+        &mut engine,
+        &registration_of(&output_decls(&caps), sampler(), 0x0e8),
+    )
+    .expect("the sampler registers");
+    let from_host = engine::Programs::register(
+        &mut engine,
+        &registration_of(&output_decls(&caps), hosted(), 0x0e9),
+    )
+    .expect("the hosted sampler registers");
     let chunks = &caps.caps.chunks;
     let mut slots = Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
     let seeds: Vec<u32> = (0..LANES).map(|lane| (lane * 5 + 3) % VOCAB).collect();
@@ -292,13 +300,17 @@ fn one_program_driving_eight_lanes_settles_every_step() {
         }
     }
     let mut last = last.expect("frames were fired");
-    engine.settle_frame(&mut last).expect("the last frame settles");
+    engine
+        .settle_frame(&mut last)
+        .expect("the last frame settles");
     let mut seen: Vec<(StepDone, StepOutcome)> = heard.try_iter().collect();
     for id in &fired {
         while asynchronous && !seen.iter().any(|(at, _)| at.frame == *id) {
-            let told = heard.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|_| {
-                panic!("frame {id:?}: no completion two minutes on; the step hung")
-            });
+            let told = heard
+                .recv_timeout(Duration::from_secs(120))
+                .unwrap_or_else(|_| {
+                    panic!("frame {id:?}: no completion two minutes on; the step hung")
+                });
             seen.push(told);
         }
     }

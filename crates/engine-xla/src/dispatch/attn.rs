@@ -73,12 +73,14 @@ impl Run<'_> {
             // A capturing lane's rows lie in its reading program's guest
             // region (`poem_ir::Dim::Capturing`); this backend lays none
             // yet, so a capturing fire is refused by name.
-            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => Err(kernels_xla::Error::Backend {
-                op: "attn.score_capture",
-                detail: "this backend does not yet lay a capturing lane's score rows in its \
+            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => {
+                Err(kernels_xla::Error::Backend {
+                    op: "attn.score_capture",
+                    detail: "this backend does not yet lay a capturing lane's score rows in its \
                          reading program's guest region"
-                    .to_string(),
-            }),
+                        .to_string(),
+                })
+            }
             Attn::Voxel {
                 q,
                 k,
@@ -406,11 +408,16 @@ impl Run<'_> {
             } => {
                 let stated = self.group_mask(*q_indptr, *kv_indptr);
                 let mask = match (mask, stated) {
-                    (poem_ir::RaggedMask::Stated, Some(stated)) => attn::ragged::RaggedMask::Custom {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
-                    },
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        }
+                    }
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(_),
+                    ) => {
                         return Err(kernels_xla::Error::Backend {
                             op: "attn.ragged",
                             detail: "a lane states an attention mask over an attention its model states \

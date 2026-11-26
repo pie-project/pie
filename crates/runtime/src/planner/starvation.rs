@@ -84,7 +84,10 @@ impl ResidencyPlanner {
                 let head = inner.unmet_head().map(|(_, head)| head.pid);
                 head.is_some_and(|head| {
                     inner.evicted_for_by(head, pid)
-                        || inner.procs.get(&pid).is_some_and(|proc| proc.restored_past.contains(&head))
+                        || inner
+                            .procs
+                            .get(&pid)
+                            .is_some_and(|proc| proc.restored_past.contains(&head))
                 })
             });
             if protected {
@@ -167,7 +170,11 @@ impl ResidencyPlanner {
                     continue;
                 };
                 match &mut waiter.kind {
-                    WaitKind::Allocation { outcome, notify: wake, .. } if outcome.is_none() => {
+                    WaitKind::Allocation {
+                        outcome,
+                        notify: wake,
+                        ..
+                    } if outcome.is_none() => {
                         *outcome = Some(Err(tiers));
                         notify.push(wake.clone());
                     }
@@ -207,11 +214,19 @@ impl ResidencyPlanner {
     /// it stays on the device, as a pick's does). With the census: each
     /// tier's free room, the victim's need on each, and the last plan's
     /// end and the checks that kept the victim from its picks.
-    pub(super) fn victim_room(self: &Arc<Self>, victim: ProcessId) -> (bool, String, super::reclaim::Reclaim) {
+    pub(super) fn victim_room(
+        self: &Arc<Self>,
+        victim: ProcessId,
+    ) -> (bool, String, super::reclaim::Reclaim) {
         let (model, engine) = self.port.locus();
-        let quote = crate::inferlet::process::residency::kv_reclaim_quotes(&[victim], model, engine, u32::MAX)
-            .pop()
-            .flatten();
+        let quote = crate::inferlet::process::residency::kv_reclaim_quotes(
+            &[victim],
+            model,
+            engine,
+            u32::MAX,
+        )
+        .pop()
+        .flatten();
         let pages = match quote {
             Some(ReclaimQuote::Pages(pages)) => pages,
             _ => 0,
@@ -221,7 +236,10 @@ impl ResidencyPlanner {
         let guest = self.port.guest_pages_of(victim);
         let guest_device = self.port.guest_device_pages_of(victim);
         let resident = self.with_inner(|inner| {
-            inner.procs.get(&victim).is_some_and(|proc| proc.state == Residency::Resident)
+            inner
+                .procs
+                .get(&victim)
+                .is_some_and(|proc| proc.state == Residency::Resident)
         });
         // Its move takes below its kv pages and the guest state it still
         // holds on the device (live parts park to the host, else the disk
@@ -235,7 +253,9 @@ impl ResidencyPlanner {
         let held = held_page_count(victim, model, engine);
         let swapped = super::holdings::swapped_page_count(victim, model, engine);
         let checks = self.with_inner(|inner| {
-            let head = inner.unmet_head().map(|(_, head)| (head.pid, inner.procs.get(&head.pid).map(|proc| proc.rank())));
+            let head = inner
+                .unmet_head()
+                .map(|(_, head)| (head.pid, inner.procs.get(&head.pid).map(|proc| proc.rank())));
             let plan = inner
                 .last_plan
                 .as_ref()
@@ -253,8 +273,10 @@ impl ResidencyPlanner {
                 head.and_then(|(_, rank)| rank),
                 proc.map(|proc| proc.unfired),
                 inner.unfired_protects(victim),
-                proc.zip(head_pid).map(|(proc, head)| proc.restored_past.contains(&head)),
-                proc.zip(head_pid).map(|(proc, head)| proc.last_resort_for == Some(head)),
+                proc.zip(head_pid)
+                    .map(|(proc, head)| proc.restored_past.contains(&head)),
+                proc.zip(head_pid)
+                    .map(|(proc, head)| proc.last_resort_for == Some(head)),
                 head_pid.map(|head| inner.evicted_for_by(head, victim)),
                 inner.bind_served(victim),
                 inner.host_swap_blocked.contains(&victim),
@@ -276,11 +298,19 @@ impl ResidencyPlanner {
             self.port.free_chunks(),
             room.pages,
             room.rs,
-            if room.rs.covers(rs) { "goes" } else { "stays on the device (no host rows)" },
+            if room.rs.covers(rs) {
+                "goes"
+            } else {
+                "stays on the device (no host rows)"
+            },
         );
         let expected = super::reclaim::Reclaim {
             pages,
-            rs: if room.rs.covers(rs) { rs } else { crate::store::rs::RsUnits::default() },
+            rs: if room.rs.covers(rs) {
+                rs
+            } else {
+                crate::store::rs::RsUnits::default()
+            },
         };
         (fits, census, expected)
     }
@@ -289,7 +319,11 @@ impl ResidencyPlanner {
     /// the stalled head, as the victim set's picks are ([`Self::victim_room`]):
     /// evicted for it, its restore waits until that head is served. Whether
     /// its eviction began.
-    fn suspend_for_head(self: &Arc<Self>, victim: ProcessId, expected: super::reclaim::Reclaim) -> bool {
+    fn suspend_for_head(
+        self: &Arc<Self>,
+        victim: ProcessId,
+        expected: super::reclaim::Reclaim,
+    ) -> bool {
         let wake = self.with_inner(|inner| {
             let head = inner.unmet_head().map(|(_, head)| head.pid);
             let queued = inner.queue.values().any(|waiter| {

@@ -104,7 +104,11 @@ impl Guest {
 
     /// Fresh `Channel` slots for a ring of `registration`, where the runtime
     /// would copy it back to on a restore.
-    pub fn ring(&mut self, engine: &mut dyn Engine, registration: &ChannelRegistration) -> Vec<u32> {
+    pub fn ring(
+        &mut self,
+        engine: &mut dyn Engine,
+        registration: &ChannelRegistration,
+    ) -> Vec<u32> {
         engine
             .channels()
             .expect("the engine holds channels")
@@ -211,9 +215,7 @@ impl Guest {
     /// registered one.
     pub fn bind(&mut self, engine: &mut dyn Engine, binding: InstanceBinding) -> BoundInstance {
         let engine = engine.programs().expect("the engine runs programs");
-        let facts = engine
-            .facts(binding.program)
-            .expect("the program's facts");
+        let facts = engine.facts(binding.program).expect("the program's facts");
         let named: Vec<ChannelId> = binding.channels.clone();
         let (instance_slots, ring_slots) =
             self.slots(&facts, |channel| named.get(channel as usize).is_some());

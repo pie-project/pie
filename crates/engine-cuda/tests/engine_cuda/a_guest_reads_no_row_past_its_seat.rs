@@ -4,8 +4,8 @@
 //! no seat wrote.
 
 use engine::{ChannelId, ProgramRegistration};
-use engine_cuda::device::{Buffer, Context};
 use engine_cuda::ProgramPlane;
+use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -157,7 +157,11 @@ fn a_guest_reads_no_row_past_its_seat() {
         panic!("a read past the seat's rows fired: {fired:?}");
     };
     assert!(why.contains("`logits`"), "{why}");
-    assert_eq!(taken(&mut plane, instance), None, "a refused fire put a cell");
+    assert_eq!(
+        taken(&mut plane, instance),
+        None,
+        "a refused fire put a cell"
+    );
     // Seated with both rows, the same program reads both: the sentinel is
     // what the refused fire would have read.
     seat(&mut plane, 2);
@@ -193,7 +197,11 @@ fn a_guest_reads_no_row_past_its_seat() {
         panic!("a read past the seated lanes fired: {fired:?}");
     };
     assert!(why.contains("`logits`"), "{why}");
-    assert_eq!(taken(&mut plane, instance), None, "a refused fire put a cell");
+    assert_eq!(
+        taken(&mut plane, instance),
+        None,
+        "a refused fire put a cell"
+    );
     seat(&mut plane, 2);
     let fired = plane.fire(&context, instance).expect("the fire runs");
     assert!(matches!(fired, Fired::Committed), "{fired:?}");

@@ -8,11 +8,11 @@
     )
 )]
 
-pub(crate) mod beam;
 pub mod adapter;
 pub mod ane;
 pub mod api;
 pub mod arena;
+pub(crate) mod beam;
 pub mod boot;
 pub mod chip;
 pub mod chunks;
@@ -33,7 +33,6 @@ pub mod mapping;
 pub mod mask;
 pub mod program;
 pub mod rates;
-pub mod top;
 pub mod rs;
 pub mod run;
 mod scratch;
@@ -41,6 +40,7 @@ pub mod serve;
 pub mod settle;
 pub mod store;
 pub mod stored;
+pub mod top;
 pub mod tune;
 pub mod weights;
 pub mod window;
@@ -65,7 +65,7 @@ pub use run::{
     StructSlot, WeightRow, WeightTable,
 };
 pub use scratch::Scratch;
-pub use serve::{Top, Attached, Boot, Enqueued, Landed, Lane, Prepared, Seated, Shell, StepView};
+pub use serve::{Attached, Boot, Enqueued, Landed, Lane, Prepared, Seated, Shell, StepView, Top};
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};

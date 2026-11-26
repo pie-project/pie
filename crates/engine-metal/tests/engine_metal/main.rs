@@ -1,26 +1,27 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
-mod common;
-mod a_lagged_window_fold_serves_the_folded_logits;
-mod a_guest_over_two_lanes_reads_each_lanes_own_row;
 mod a_buffered_fold_is_the_fold_it_replaces;
 mod a_column_cut_of_a_bank_multiplies_as_its_copy;
 mod a_copied_window_is_one_encode_over_the_same_rows;
-mod a_load_measuring_nothing_admits_its_own_pool;
-mod a_load_walks_every_readout_tier_its_set_states;
-mod a_refused_lane_is_refused_alone;
 mod a_fenced_frame_lands_both_sides;
 mod a_gate_and_an_up_apart_land_what_they_land_packed;
+mod a_guest_over_two_lanes_reads_each_lanes_own_row;
+mod a_lagged_window_fold_serves_the_folded_logits;
+mod a_load_measuring_nothing_admits_its_own_pool;
+mod a_load_walks_every_readout_tier_its_set_states;
 mod a_parked_lane_serves_the_never_parked_logits;
 mod a_prompt_scan_lands_its_snapshots;
+mod a_q8_pool_takes_every_route_and_matches_fp64;
+mod a_refused_lane_is_refused_alone;
 mod a_scattered_pool_serves_the_same_logits;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;
 mod a_verify_walk_is_the_committed_walk;
 mod a_walked_split_shares_with_the_neural_engine;
 mod an_adapter_in_slots_is_one_landing_through_the_table;
-mod an_operator_declared_adapter_is_refused;
 mod an_airborne_pass_samples_its_own_row;
+mod an_operator_declared_adapter_is_refused;
+mod common;
 mod each_checked_in_profile_runs_its_familys_old_tuning;
 mod every_catalog_deployment_dispatches;
 mod every_unit_compiles;
@@ -43,7 +44,6 @@ mod the_packed_kv_reads;
 mod the_partial_rope_turns_only_the_rotary_pairs;
 mod the_prompt_conv_matches_a_running_reference;
 mod the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder;
-mod a_q8_pool_takes_every_route_and_matches_fp64;
 mod the_ragged_attention_answers_its_host_reference;
 mod the_register_routed_mlp_answers_the_per_route_path;
 mod the_register_rows_match_affine_dots;
@@ -79,7 +79,9 @@ pub(crate) fn guest_places(
     extents: &eta_exec::Extents,
     nth: u32,
 ) -> (engine::ScratchPlace, engine::ScratchPlace) {
-    let state = shell.guest_state(program, extents).expect("the program's guest state");
+    let state = shell
+        .guest_state(program, extents)
+        .expect("the program's guest state");
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
     let chunks_of = |bytes: u64| -> u32 {
@@ -104,12 +106,17 @@ pub(crate) fn guest_places(
         }
         engine::ScratchPlace::Chunks {
             run: state.run,
-            pieces: (0..chunks_of(bytes) / state.run).map(|k| chunk + k * state.run).collect(),
+            pieces: (0..chunks_of(bytes) / state.run)
+                .map(|k| chunk + k * state.run)
+                .collect(),
         }
     };
     let pair_at = layout.free_chunk() + 8;
     let own_at = pair_at + chunks_of(state.per_pair) + nth * chunks_of(state.instance_bytes());
-    let places = (place(state.instance_bytes(), own_at), place(state.per_pair, pair_at));
+    let places = (
+        place(state.instance_bytes(), own_at),
+        place(state.per_pair, pair_at),
+    );
     let end = own_at + chunks_of(state.instance_bytes());
     shell
         .commit_segments(end.div_ceil(layout.segment_chunks.max(1)))

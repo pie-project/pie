@@ -21,6 +21,7 @@
 //!       written codes bit-for-bit — the production self-consistency property.
 //!       (The sdpa READ path is `the_packed_kv_decode_reads` and is not exercised here.)
 
+use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use engine_metal::store::kv::Paging;
@@ -28,7 +29,6 @@ use engine_metal::store::pool_demand;
 use kernels_metal::attn;
 use kernels_metal::{KvPool, Tensor};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
-use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits};
 
 /// Packed bytes for one head at codec block `block`: `block/2` nibble bytes plus
 /// one inline fp16 scale (130 at block 256, 66 at 128).
@@ -167,7 +167,6 @@ const PAGES: u64 = 1;
 
 #[test]
 fn the_kv_write_round_trips() {
-
     // ---- (A) allocation at head_dim 256 (the shipping flagship) -------------
     // The packed cache is sized per head from the head_dim the trace row now
     // carries (a head packs to `head_dim/2 + 2` bytes), not `width * element`.
@@ -363,7 +362,6 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
 fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
     use engine_metal::store::Rows;
     use engine_metal::store::kv::{Facts, SpaceFacts};
-
 
     let paging = Paging::of(PAGE_SIZE, PAGE_SIZE, 0, PAGES).expect("paging");
 

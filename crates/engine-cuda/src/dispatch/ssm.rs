@@ -395,7 +395,14 @@ impl Run<'_> {
                     *state_dim,
                     &mut self.tensor(*y),
                 )?;
-                self.mamba2_tail(self.tensor(*xbc), false, [*xbc, dt_id], m, *state, *state_dim)?;
+                self.mamba2_tail(
+                    self.tensor(*xbc),
+                    false,
+                    [*xbc, dt_id],
+                    m,
+                    *state,
+                    *state_dim,
+                )?;
                 Ok(())
             }
             Ssm::KdaChunked {
@@ -616,15 +623,22 @@ impl Run<'_> {
                     y,
                     ..
                 }) if first(*state) => {
-                    let gated = self.gdn_gated(*gates).ok_or_else(|| kernels_cuda::Error::Backend {
-                        op: "ssm.gated_delta",
-                        detail: format!(
-                            "a beam group's fold over a step whose gates (value {}) no gate \
+                    let gated = self.gdn_gated(*gates).ok_or_else(|| {
+                        kernels_cuda::Error::Backend {
+                            op: "ssm.gated_delta",
+                            detail: format!(
+                                "a beam group's fold over a step whose gates (value {}) no gate \
                              prep forms, so its rows' gates cannot be read back",
-                            gates.0
-                        ),
+                                gates.0
+                            ),
+                        }
                     })?;
-                    self.gated_delta_group_fold(gated, *state, (*k_heads, *v_heads, *k_dim, *v_dim), *y)?;
+                    self.gated_delta_group_fold(
+                        gated,
+                        *state,
+                        (*k_heads, *v_heads, *k_dim, *v_dim),
+                        *y,
+                    )?;
                 }
                 Operation::Fused(Fused::GdnStep {
                     qkv,
@@ -761,8 +775,7 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "ssm.gated_delta";
-        let Some((carry, folds, groups)) =
-            self.rs_group_folds(OP, &self.gdn_planes(OP, ba, y)?)?
+        let Some((carry, folds, groups)) = self.rs_group_folds(OP, &self.gdn_planes(OP, ba, y)?)?
         else {
             return Ok(());
         };
@@ -966,7 +979,11 @@ impl Run<'_> {
             return Ok(());
         }
         let pool = self.recurrent_absolute(state);
-        let carry = self.rs_carry(OP, &self.rs_step_planes(OP, &[f, b], mixed, Some(y))?, &pool)?;
+        let carry = self.rs_carry(
+            OP,
+            &self.rs_step_planes(OP, &[f, b], mixed, Some(y))?,
+            &pool,
+        )?;
         let [mixed_rows, f_rows, b_rows] = rows;
         kernels_cuda::ssm::kda_tail(
             self.ctx(),
@@ -1165,7 +1182,7 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
-            self.gated_delta_tail(
+        self.gated_delta_tail(
             qkv_ext,
             gates_ext,
             gates,
@@ -1214,7 +1231,7 @@ impl Run<'_> {
             state_dim,
             &mut y_ext,
         )?;
-            self.mamba2_tail(xbc_ext, true, [xbc, dt], m, state, state_dim)?;
+        self.mamba2_tail(xbc_ext, true, [xbc, dt], m, state, state_dim)?;
         self.rs_land(op, y_ext, y)?;
         self.rs_layer_done();
         Ok(())
@@ -1279,7 +1296,7 @@ impl Run<'_> {
                 &mut y_ext,
             )?;
         }
-            self.kda_tail(
+        self.kda_tail(
             [mixed_ext, f_ext, b_ext],
             true,
             [mixed, f, b, y],
@@ -1293,7 +1310,6 @@ impl Run<'_> {
         Ok(())
     }
 }
-
 
 /// The group folds a fire over `trace`'s recurrent steps can launch ahead
 /// of its body ([`Run::fold_groups_ahead`]), each kind once: a load makes

@@ -255,7 +255,11 @@ impl Plane {
     /// one pair (one set there let a beam read another beam's cells).
     fn instance_sets(&self, program: &Program, extents: &Extents) -> Result<Vec<u64>> {
         let scratch = Session::scratch_for(&program.compiled, extents)?;
-        Ok(if scratch == 0 { Vec::new() } else { vec![scratch] })
+        Ok(if scratch == 0 {
+            Vec::new()
+        } else {
+            vec![scratch]
+        })
     }
 
     /// What an instance of `program_id` at `extents` and its pair hold in
@@ -271,9 +275,14 @@ impl Plane {
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        let pair: Vec<u64> = self.pair_sets(program, extents)?.iter().map(|s| s.2).collect();
+        let pair: Vec<u64> = self
+            .pair_sets(program, extents)?
+            .iter()
+            .map(|s| s.2)
+            .collect();
         let instance = self.instance_sets(program, extents)?;
-        let state = guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?);
+        let state =
+            guest::guest_state(&pair, &instance, self.resident_of(program), room_of(pools)?);
         // A place lies in one run of a segment's chunks: a run past a segment
         // can never be opened, compaction or not, so it is refused here by
         // name rather than asked of the pool (where a restore would wait on
@@ -302,7 +311,8 @@ impl Plane {
     /// (`engine::GuestState::resident`): its beam group's state, laid in
     /// 16-byte steps (the state's ulong runs).
     fn resident_of(&self, program: &Program) -> u64 {
-        self.beam_of(program).map_or(0, |layout| layout.bytes().next_multiple_of(16))
+        self.beam_of(program)
+            .map_or(0, |layout| layout.bytes().next_multiple_of(16))
     }
 
     #[must_use]
@@ -345,7 +355,10 @@ impl Plane {
         let threads = device.compile_wide(true);
         let sharing = compile::Sharing::over(threads);
         let built = compile::in_parallel(&sharing.threads, jobs.len(), |at| {
-            let job = jobs[at].lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let job = jobs[at]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             job.map(|job| job.run_sharing(&sharing))
         });
         let _ = device.compile_wide(false);
@@ -629,7 +642,10 @@ impl Plane {
             }
             if state.run == 0 {
                 let slots = u32::try_from(bytes.div_ceil(slot)).unwrap_or(u32::MAX);
-                let place = engine::ScratchPlace::Run { first: slot_at, slots };
+                let place = engine::ScratchPlace::Run {
+                    first: slot_at,
+                    slots,
+                };
                 slot_at += slots;
                 return place;
             }
@@ -652,7 +668,8 @@ impl Plane {
         };
         let scratch = take(state.instance_bytes());
         self.bind(
-            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch, &pair, 0,
+            context, program_id, seeds, extents, geometry, device, channels, pooled, &scratch,
+            &pair, 0,
         )
     }
 
@@ -678,8 +695,11 @@ impl Plane {
             .find(|held| held.program == program && held.extents == extents)
         {
             Some(held) if held.place == *place => {
-                let now: Vec<u64> =
-                    pools.guest_pieces(place)?.iter().map(|piece| piece.global).collect();
+                let now: Vec<u64> = pools
+                    .guest_pieces(place)?
+                    .iter()
+                    .map(|piece| piece.global)
+                    .collect();
                 now != held.laid_at
             }
             _ => false,
@@ -729,7 +749,11 @@ impl Plane {
         };
         bound.pair = pair;
         for stage in 0..bound.session.stages() {
-            let Some(key) = bound.session.prepared(stage).and_then(launch::Prepared::batch_key) else {
+            let Some(key) = bound
+                .session
+                .prepared(stage)
+                .and_then(launch::Prepared::batch_key)
+            else {
                 continue;
             };
             let set = self.batches.get(&(pair, stage, 0)).map(launch::Batch::key);
@@ -808,13 +832,15 @@ impl Plane {
     /// out, those pending over the frames in flight and the prompt's own
     /// page. `None` for any other program.
     fn beam_of(&self, program: &Program) -> Option<BeamLayout> {
-        let binding = program
+        let binding =
+            program.plan.package.ports.iter().find(|binding| {
+                binding.port == eta_ir::registry::Port::Parents && !binding.is_const
+            })?;
+        let channel = program
             .plan
             .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)?;
-        let channel = program.plan.package.channels.get(binding.channel as usize)?;
+            .channels
+            .get(binding.channel as usize)?;
         let lanes = u32::try_from(ChannelShape::of(channel).numel).ok()?;
         let (pages, frames) = self.beam_bounds;
         let cap = lanes
@@ -837,12 +863,16 @@ impl Plane {
         let Some(layout) = self.beam_of(program) else {
             return Ok(None);
         };
-        let address = bound.beam.as_ref().and_then(|beam| beam.address_at(0)).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!("instance {id} states parents and holds no beam state"),
-            )
-        })?;
+        let address = bound
+            .beam
+            .as_ref()
+            .and_then(|beam| beam.address_at(0))
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("instance {id} states parents and holds no beam state"),
+                )
+            })?;
         Ok(Some((address, layout)))
     }
 
@@ -874,10 +904,15 @@ impl Plane {
         }
         let mut header = [0u8; 16];
         let state = bound.beam.as_ref().ok_or_else(|| {
-            Fault::program("program::beam_list", format!("instance {id} holds no beam state"))
+            Fault::program(
+                "program::beam_list",
+                format!("instance {id} holds no beam state"),
+            )
         })?;
         state.read(0, &mut header)?;
-        let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+        let word = |at: usize| {
+            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+        };
         if word(0) == 0 {
             return Err(Fault::program(
                 "program::beam_list",
@@ -1028,8 +1063,10 @@ impl Plane {
                 continue;
             }
             for arm in 0..self.arms {
-                self.batches
-                    .insert((pair, stage, arm), launch::Batch::plan(prepared, self.lanes, &empty)?);
+                self.batches.insert(
+                    (pair, stage, arm),
+                    launch::Batch::plan(prepared, self.lanes, &empty)?,
+                );
             }
         }
         Ok(())
@@ -1046,7 +1083,10 @@ impl Plane {
             .map(|held| (held.program, held.extents, held.place.clone()))
             .ok_or_else(|| Fault::program("program::plane", format!("no pair {pair}")))?;
         let program = self.programs.get(&program_id).ok_or_else(|| {
-            Fault::program("program::plane", format!("pair {pair} names program {program_id}, which is gone"))
+            Fault::program(
+                "program::plane",
+                format!("pair {pair} names program {program_id}, which is gone"),
+            )
         })?;
         let sets = self.pair_sets(program, &extents)?;
         let sizes: Vec<u64> = sets.iter().map(|set| set.2).collect();
@@ -1056,7 +1096,8 @@ impl Plane {
             held.laid_at = laid_at;
         }
         let bytes: Vec<u64> = pieces.iter().map(|piece| piece.bytes).collect();
-        for (&(stage, arm, stated), (at, offset)) in sets.iter().zip(guest::places(&sizes, &bytes)?) {
+        for (&(stage, arm, stated), (at, offset)) in sets.iter().zip(guest::places(&sizes, &bytes)?)
+        {
             let Some(batch) = self.batches.get_mut(&(pair, stage, arm)) else {
                 continue;
             };
@@ -1085,7 +1126,10 @@ impl Plane {
             .get(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
         let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program("program::plane", format!("instance {id} names a program that is gone"))
+            Fault::program(
+                "program::plane",
+                format!("instance {id} names a program that is gone"),
+            )
         })?;
         let resident = self.resident_of(program);
         let sizes = guest::with_resident(resident, &self.instance_sets(program, &bound.extents)?);
@@ -1098,7 +1142,9 @@ impl Plane {
         let beam = match (resident > 0).then(|| laid.next()).flatten() {
             Some((at, offset)) => {
                 let piece = &pieces[at];
-                let layout = self.beam_of(program).expect("a resident state is a beam group's");
+                let layout = self
+                    .beam_of(program)
+                    .expect("a resident state is a beam group's");
                 Some(held::Held::in_pool(
                     pools,
                     piece.view.clone(),
@@ -1235,10 +1281,17 @@ impl Plane {
                 } else {
                     &bound.scratch_place
                 };
-                Ok((Holder::Instance(id.0), own_runs(pools, &bound.held, scratch)?))
+                Ok((
+                    Holder::Instance(id.0),
+                    own_runs(pools, &bound.held, scratch)?,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
-        for held in self.pairs.iter().filter(|held| !self.claims.members(held.id).is_empty()) {
+        for held in self
+            .pairs
+            .iter()
+            .filter(|held| !self.claims.members(held.id).is_empty())
+        {
             moved.push((Holder::Pair(held.id), pair_runs(pools, &held.place)?));
         }
         self.claims.claim_all(&moved)?;
@@ -1469,7 +1522,9 @@ impl Plane {
     /// ([`Session::runs_ahead`]).
     #[must_use]
     pub fn runs_ahead(&self, id: InstanceId) -> bool {
-        self.instances.get(&id).is_some_and(|bound| bound.session.runs_ahead())
+        self.instances
+            .get(&id)
+            .is_some_and(|bound| bound.session.runs_ahead())
     }
 
     #[must_use]
@@ -1625,12 +1680,7 @@ impl Plane {
             .is_some_and(|program| program.plan.prologue_runs())
     }
 
-    pub fn fire(
-        &mut self,
-        context: &Context,
-        id: InstanceId,
-        at: Attach,
-    ) -> Result<Fired> {
+    pub fn fire(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
         let bound = self
             .instances
             .get_mut(&id)
@@ -1689,9 +1739,13 @@ impl Plane {
             let scratch = bound.scratch.first().cloned();
             encoded.push((
                 id,
-                bound
-                    .session
-                    .encode_stages(&mut frame, &program.compiled, &program.plan, at, scratch)?,
+                bound.session.encode_stages(
+                    &mut frame,
+                    &program.compiled,
+                    &program.plan,
+                    at,
+                    scratch,
+                )?,
             ));
         }
         frame.commit()?;
@@ -1702,7 +1756,9 @@ impl Plane {
                 Ok(launched) => {
                     let bound = self.instances.get_mut(&id).expect("encoded above");
                     let program = self.programs.get(&bound.program_id).expect("encoded above");
-                    bound.session.verdict_of_launched(&program.plan, &launched, at)?
+                    bound
+                        .session
+                        .verdict_of_launched(&program.plan, &launched, at)?
                 }
             };
             fired.push((id, verdict));
@@ -1834,21 +1890,27 @@ impl Plane {
                         if group.len() > 1
                             && !crate::encode::profiling()
                             && rings_disjoint(rings)
-                            && stage.regions.iter().all(|region| region.form == compile::Form::Streamed)
+                            && stage
+                                .regions
+                                .iter()
+                                .all(|region| region.form == compile::Form::Streamed)
                         {
                             frame.concurrent_pass()?;
                             let encoder = frame.encoder();
                             for region in stage.regions.iter() {
                                 let mut steps = 0usize;
                                 for prepared in group.iter() {
-                                    steps = steps.max(prepared.bind_streamed(&encoder, region)?.0.len());
+                                    steps = steps
+                                        .max(prepared.bind_streamed(&encoder, region)?.0.len());
                                 }
                                 for step in 0..steps {
                                     for prepared in group.iter() {
                                         let (dispatches, threads) =
                                             prepared.bind_streamed(&encoder, region)?;
                                         if let Some(&word) = dispatches.get(step) {
-                                            launch::dispatch_streamed_step(&encoder, word, threads, region);
+                                            launch::dispatch_streamed_step(
+                                                &encoder, word, threads, region,
+                                            );
                                         }
                                     }
                                     frame.level();
@@ -2074,11 +2136,7 @@ struct OwnSlots {
 /// scratch's pieces. The pair's state is its group's, claimed apart
 /// ([`Claims::claim_with_pair`]), and a registered channel's ring the
 /// channel's, not claimed. One pool byte space: segment [`POOL`].
-fn own_runs(
-    pools: &Pools,
-    held: &OwnSlots,
-    scratch: &engine::ScratchPlace,
-) -> Result<Vec<Run>> {
+fn own_runs(pools: &Pools, held: &OwnSlots, scratch: &engine::ScratchPlace) -> Result<Vec<Run>> {
     use crate::store::layout::{CHANNEL, INSTANCE};
     let run = |start: u64, bytes: u64| Run {
         segment: POOL,
@@ -2146,7 +2204,7 @@ mod tests {
     /// The slots instance `nth` of `facts` takes: its tables from logical
     /// chunk 1, its rings from chunk 2, each instance's apart.
 
-/// A contract case's logits as the engine seats them
+    /// A contract case's logits as the engine seats them
     /// (`eta_compiler::contract::Case::seats`): `values`, `rows` rows of
     /// the vocabulary, laid in a bf16 plane where the case's seats put each
     /// row (one lane's seat holding every row, or a lane a row, laid last
@@ -2169,7 +2227,10 @@ mod tests {
             }
         };
         let rows = values.len() / vocab;
-        let len = (0..rows).map(|row| row_at(row) + vocab).max().unwrap_or(vocab);
+        let len = (0..rows)
+            .map(|row| row_at(row) + vocab)
+            .max()
+            .unwrap_or(vocab);
         let mut laid = vec![0x7fc0u16; len];
         for row in 0..rows {
             for (at, x) in values[row * vocab..][..vocab].iter().enumerate() {
@@ -2198,7 +2259,7 @@ mod tests {
         buffer
     }
 
-/// A seat the program reads nothing at is refused by name at the fire,
+    /// A seat the program reads nothing at is refused by name at the fire,
     /// never dropped: beam's step reads its logits at lane 0, `rows` rows,
     /// so lanes 1.. of those rows are its rows (the LaneARow cases), and a
     /// seat at lane `rows` is past every row it reads.
@@ -2221,7 +2282,8 @@ mod tests {
             launch: eta_compiler::codegen::launch::build(&case.bound, &stages),
             ..Default::default()
         };
-        let pools = crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
+        let pools =
+            crate::store::Pools::guests_only(&context, CHUNK, GUEST_CHUNKS).expect("a pool");
         let mut plane = Plane::new();
         plane.set_flight(1, 1, case.rows);
         let program = plane.register(&context, &registration).expect("compiles");
@@ -2300,7 +2362,6 @@ mod tests {
             .collect();
         (instance, rings)
     }
-
 }
 /// Whether no two of `ids` move the same end of one shared ring at the
 /// epilogue: each member reads the ring's cursor as it is encoded and the
@@ -2352,8 +2413,14 @@ mod rings_tests {
     #[test]
     fn members_sharing_a_ring_are_not_disjoint() {
         assert!(super::rings_disjoint(&[vec![1, 2], vec![3], vec![]]));
-        assert!(super::rings_disjoint(&[vec![1, 1], vec![2]]), "a member's own ring twice");
-        assert!(!super::rings_disjoint(&[vec![1, 2], vec![2, 3]]), "two members share ring 2");
+        assert!(
+            super::rings_disjoint(&[vec![1, 1], vec![2]]),
+            "a member's own ring twice"
+        );
+        assert!(
+            !super::rings_disjoint(&[vec![1, 2], vec![2, 3]]),
+            "two members share ring 2"
+        );
     }
 }
 

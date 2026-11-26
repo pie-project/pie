@@ -237,8 +237,7 @@ impl Fault {
     /// the step's lane that row is of.
     #[must_use]
     pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
-        if let Self::Mask { lane, .. }
-            | Self::MaskRows { lane, .. } = &mut self
+        if let Self::Mask { lane, .. } | Self::MaskRows { lane, .. } = &mut self
             && let Some(row) = rows.get(*lane as usize)
         {
             *lane = row.source;
@@ -452,7 +451,11 @@ impl fmt::Display for Fault {
                 "the plan names {what}, which this shell binds no seat for"
             ),
             Self::Residency(why) => write!(f, "{why}"),
-            Self::Unprepared { file, entrypoint, stamp } => write!(
+            Self::Unprepared {
+                file,
+                entrypoint,
+                stamp,
+            } => write!(
                 f,
                 "this fire meets pipeline `{entrypoint}` of `{file}` ({stamp}), which the load \
                  did not build before ready: a load builds every pipeline its rungs dispatch, so \

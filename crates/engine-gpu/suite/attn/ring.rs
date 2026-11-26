@@ -96,13 +96,17 @@ impl Geometry {
 
     /// Element of row `r` of slot `unit`, its keys or its values.
     fn slot_at(&self, unit: u32, r: usize, values: bool) -> usize {
-        2 * unit as usize * self.slot_words + if values { PAGE * self.row } else { 0 } + r * self.row
+        2 * unit as usize * self.slot_words
+            + if values { PAGE * self.row } else { 0 }
+            + r * self.row
     }
 
     /// Element of ring place `place` of lane `lane`, its keys or values.
     fn ring_at(&self, lane: usize, place: usize, values: bool) -> usize {
         let unit = self.record0 + lane * PIECES + PIECE;
-        2 * (unit * self.piece_words + RING_AT) + if values { self.r * self.row } else { 0 } + place * self.row
+        2 * (unit * self.piece_words + RING_AT)
+            + if values { self.r * self.row } else { 0 }
+            + place * self.row
     }
 }
 
@@ -194,9 +198,7 @@ fn admits(l: usize, p: usize, c: usize) -> bool {
 /// its mask where it states one (its own key always).
 fn keys_of(w: usize, l: usize, lane: &Lane, p: usize) -> Vec<usize> {
     ((p + 1).saturating_sub(w)..=p)
-        .filter(|&kp| {
-            !lane.masked || kp < lane.folded || kp == p || admits(l, p, kp - lane.folded)
-        })
+        .filter(|&kp| !lane.masked || kp < lane.folded || kp == p || admits(l, p, kp - lane.folded))
         .collect()
 }
 
@@ -282,8 +284,8 @@ fn stage(gpu: &mut Gpu, g: &Geometry, lanes: &[Lane], laid: &Laid, to: &[usize])
                 0,
                 lane.folded as i32,
             ]
-                .into_iter()
-                .chain(laid.records[l * PIECES..][..PIECES].iter().copied())
+            .into_iter()
+            .chain(laid.records[l * PIECES..][..PIECES].iter().copied())
         })
         .collect();
     let rows: usize = lanes.iter().map(|lane| lane.rows).sum();
@@ -358,7 +360,12 @@ fn high(pool: &KvPool) -> KvPool {
     const SEG: u32 = 1 << 30;
     let mut moved = *pool;
     moved.pool = Segments {
-        bufs: [kernels_slang::ABSENT, kernels_slang::ABSENT, kernels_slang::ABSENT, pool.pool.bufs[0]],
+        bufs: [
+            kernels_slang::ABSENT,
+            kernels_slang::ABSENT,
+            kernels_slang::ABSENT,
+            pool.pool.bufs[0],
+        ],
         words: SEG,
     };
     moved.origin = [pool.origin[0] + 3 * SEG, pool.origin[1] + 3 * SEG];
@@ -375,23 +382,83 @@ fn high(pool: &KvPool) -> KvPool {
 /// starting inside a page and on one.
 fn decodes() -> Vec<Lane> {
     vec![
-        Lane { folded: 50, base: 48, first: 55, rows: 1, masked: false },
-        Lane { folded: 20, base: 16, first: 20, rows: 1, masked: false },
-        Lane { folded: 0, base: 0, first: 3, rows: 1, masked: false },
-        Lane { folded: 70, base: 64, first: 81, rows: 1, masked: true },
-        Lane { folded: 120, base: 112, first: 120, rows: 1, masked: true },
+        Lane {
+            folded: 50,
+            base: 48,
+            first: 55,
+            rows: 1,
+            masked: false,
+        },
+        Lane {
+            folded: 20,
+            base: 16,
+            first: 20,
+            rows: 1,
+            masked: false,
+        },
+        Lane {
+            folded: 0,
+            base: 0,
+            first: 3,
+            rows: 1,
+            masked: false,
+        },
+        Lane {
+            folded: 70,
+            base: 64,
+            first: 81,
+            rows: 1,
+            masked: true,
+        },
+        Lane {
+            folded: 120,
+            base: 112,
+            first: 120,
+            rows: 1,
+            masked: true,
+        },
     ]
 }
 
 fn prefills() -> Vec<Lane> {
     vec![
-        Lane { folded: 50, base: 48, first: 55, rows: 37, masked: false },
-        Lane { folded: 64, base: 64, first: 64, rows: 40, masked: false },
-        Lane { folded: 0, base: 0, first: 0, rows: 21, masked: false },
-        Lane { folded: 70, base: 64, first: 75, rows: 9, masked: true },
+        Lane {
+            folded: 50,
+            base: 48,
+            first: 55,
+            rows: 37,
+            masked: false,
+        },
+        Lane {
+            folded: 64,
+            base: 64,
+            first: 64,
+            rows: 40,
+            masked: false,
+        },
+        Lane {
+            folded: 0,
+            base: 0,
+            first: 0,
+            rows: 21,
+            masked: false,
+        },
+        Lane {
+            folded: 70,
+            base: 64,
+            first: 75,
+            rows: 9,
+            masked: true,
+        },
         // Carrying nothing and folding most of its rows: its table starts
         // past its first row, at the folded index after the fire.
-        Lane { folded: 30, base: 96, first: 30, rows: 80, masked: false },
+        Lane {
+            folded: 30,
+            base: 96,
+            first: 30,
+            rows: 80,
+            masked: false,
+        },
     ]
 }
 
@@ -457,17 +524,44 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                 };
                 // Split (decode), its LSE, and the pool past 8 GiB of words.
                 for (splitting, with_lse, past) in [(false, false, false), (!tiled, true, true)] {
-                    let kv = if past { high(&staged.pool) } else { staged.pool };
+                    let kv = if past {
+                        high(&staged.pool)
+                    } else {
+                        staged.pool
+                    };
                     let (o, l) = (gpu.zeros(n), gpu.up_f32(&vec![0.0; rows * QH]));
                     let lse = with_lse.then(|| t(l, rows, QH, Dtype::F32));
                     let ot = t(o, rows, QH * hd, Dtype::Bf16);
                     let (win, scale) = (Some(g.w as u32), (1.0 / (hd as f64).sqrt()) as f32);
                     gpu.run(|c| {
                         if tiled {
-                            sdpa::prefill(c, tactic, qt, &staged.tables, &kv, win, hd as u32, scale, ot, lse)
+                            sdpa::prefill(
+                                c,
+                                tactic,
+                                qt,
+                                &staged.tables,
+                                &kv,
+                                win,
+                                hd as u32,
+                                scale,
+                                ot,
+                                lse,
+                            )
                         } else {
                             let split = splitting.then_some(split);
-                            sdpa::decode(c, tactic, qt, &staged.tables, &kv, win, hd as u32, scale, ot, lse, split)
+                            sdpa::decode(
+                                c,
+                                tactic,
+                                qt,
+                                &staged.tables,
+                                &kv,
+                                win,
+                                hd as u32,
+                                scale,
+                                ot,
+                                lse,
+                                split,
+                            )
                         }
                     });
                     let label = format!(
@@ -475,7 +569,11 @@ fn a_windowed_layer_reads_its_ring_buffer_and_fire_rows_under_one_mask() {
                     );
                     close(&gpu.down(o, n), &want_o, &label);
                     if with_lse {
-                        close(&gpu.down_f32(l, rows * QH), &want_l, &format!("{label}: lse"));
+                        close(
+                            &gpu.down_f32(l, rows * QH),
+                            &want_l,
+                            &format!("{label}: lse"),
+                        );
                     }
                 }
             }
@@ -503,7 +601,10 @@ fn fold_jobs(
             if r < lane.first {
                 (table[(r - lane.base) / PAGE], (r - lane.base) % PAGE)
             } else {
-                (table[buffered + (r - lane.first) / PAGE], (r - lane.first) % PAGE)
+                (
+                    table[buffered + (r - lane.first) / PAGE],
+                    (r - lane.first) % PAGE,
+                )
             }
         };
         // Rows a wider ring would take too: this ring drops them.
@@ -523,7 +624,12 @@ fn fold_jobs(
             }
             let (unit, row) = source(r);
             let at = dst.unwrap_or(0);
-            jobs.extend([unit as i32, row as i32, at as i32, ((r - from) % PAGE) as i32]);
+            jobs.extend([
+                unit as i32,
+                row as i32,
+                at as i32,
+                ((r - from) % PAGE) as i32,
+            ]);
             moved.push((l, r, at, (r - from) % PAGE));
         }
     }
@@ -597,7 +703,10 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
         }
         let got: Vec<f64> = after.iter().map(|x| f64::from(*x)).collect();
         let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
-        assert_eq!(wrong, 0, "ring of {rows}: {wrong} pool elements differ from the fold's rows");
+        assert_eq!(
+            wrong, 0,
+            "ring of {rows}: {wrong} pool elements differ from the fold's rows"
+        );
     }
 }
 
@@ -651,7 +760,8 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
         put(&mut pool, g.slot_at(1, i, false), k);
         put(&mut pool, g.slot_at(1, i, true), v);
     }
-    let own: Vec<(Vec<f64>, Vec<f64>)> = (0..2).map(|l| (row_of(700 + l), row_of(800 + l))).collect();
+    let own: Vec<(Vec<f64>, Vec<f64>)> =
+        (0..2).map(|l| (row_of(700 + l), row_of(800 + l))).collect();
     for (l, unit) in [(0usize, 5u32), (1, 7)] {
         put(&mut pool, g.slot_at(unit, 0, false), &own[l].0);
         put(&mut pool, g.slot_at(unit, 0, true), &own[l].1);
@@ -661,7 +771,14 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
     let mut lanes_table = Vec::new();
     for l in 0..2usize {
         let shift = firsts[l] - folded - 8;
-        lanes_table.extend([folded as i32, 48, firsts[l] as i32, folded as i32, shift as i32, 48]);
+        lanes_table.extend([
+            folded as i32,
+            48,
+            firsts[l] as i32,
+            folded as i32,
+            shift as i32,
+            48,
+        ]);
         lanes_table.extend(record);
     }
     let indices = [1u32, 5, 1, 3, 7];
@@ -721,7 +838,10 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
     for l in 0..2usize {
         let lin = folded + 8;
         let start = lin + 1 - W;
-        assert!(start < folded && firsts[l] + 1 - W > start, "the lineage starts earlier");
+        assert!(
+            start < folded && firsts[l] + 1 - W > start,
+            "the lineage starts earlier"
+        );
         let mut keys: Vec<(&[f64], &[f64])> = (start..folded)
             .map(|r| (anc[r].0.as_slice(), anc[r].1.as_slice()))
             .collect();
@@ -778,7 +898,19 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
         let o = gpu.zeros(n);
         let ot = t(o, 2, QH * hd, Dtype::Bf16);
         gpu.run(|c| {
-            sdpa::decode(c, tactic, qt, &tables, &kv, Some(W as u32), hd as u32, scale as f32, ot, None, None)
+            sdpa::decode(
+                c,
+                tactic,
+                qt,
+                &tables,
+                &kv,
+                Some(W as u32),
+                hd as u32,
+                scale as f32,
+                ot,
+                None,
+                None,
+            )
         });
         close(
             &gpu.down(o, n),
@@ -788,7 +920,18 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
         let o = gpu.zeros(n);
         let ot = t(o, 2, QH * hd, Dtype::Bf16);
         gpu.run(|c| {
-            sdpa::prefill(c, tactic, qt, &tables, &kv, Some(W as u32), hd as u32, scale as f32, ot, None)
+            sdpa::prefill(
+                c,
+                tactic,
+                qt,
+                &tables,
+                &kv,
+                Some(W as u32),
+                hd as u32,
+                scale as f32,
+                ot,
+                None,
+            )
         });
         close(
             &gpu.down(o, n),

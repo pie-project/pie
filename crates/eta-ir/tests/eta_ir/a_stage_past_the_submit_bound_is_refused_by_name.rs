@@ -65,8 +65,13 @@ fn within(submit: Option<SubmitBound>) -> Budget {
 #[test]
 fn a_stage_past_the_submit_bound_is_refused_by_name() {
     // A sampler's scatter: a vocabulary's base, a few slots. It fits.
-    let small = bind_within(scatter(151_936, 16), vec![], EngineCaps::default(), within(Some(PHONE)))
-        .expect("a vocabulary scatter of 16 slots fits 2 s");
+    let small = bind_within(
+        scatter(151_936, 16),
+        vec![],
+        EngineCaps::default(),
+        within(Some(PHONE)),
+    )
+    .expect("a vocabulary scatter of 16 slots fits 2 s");
     let footprint = footprints(&small).unwrap()[0];
     assert_eq!(footprint.launches, 1, "only the scatter launches");
     assert!(footprint.work >= 151_936 * 4 * 16);
@@ -93,6 +98,12 @@ fn a_stage_past_the_submit_bound_is_refused_by_name() {
 
     // A device stating no bound holds the stage to none.
     assert!(
-        bind_within(scatter(1 << 20, 1 << 20), vec![], EngineCaps::default(), within(None)).is_ok()
+        bind_within(
+            scatter(1 << 20, 1 << 20),
+            vec![],
+            EngineCaps::default(),
+            within(None)
+        )
+        .is_ok()
     );
 }

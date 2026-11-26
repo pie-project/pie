@@ -1,11 +1,11 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::linear::moe::{self, RoutedScratch};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
-use crate::common::{bf16, noise};
 
 const LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,

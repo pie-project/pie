@@ -133,7 +133,12 @@ impl Run<'_> {
                     key,
                     offset,
                     wide,
-                    tight: Tensor::new(crate::device::handles::NIL, rows, width, poem_ir::Dtype::I32),
+                    tight: Tensor::new(
+                        crate::device::handles::NIL,
+                        rows,
+                        width,
+                        poem_ir::Dtype::I32,
+                    ),
                     read: true,
                     written: false,
                 });
@@ -146,7 +151,10 @@ impl Run<'_> {
     fn mint_copy(&self, plan: &mut CopyPlan) -> Result<(), KernelError> {
         for slot in &mut plan.slots {
             let bytes = u64::from(slot.tight.rows) * row_bytes(slot.tight);
-            let Some(handle) = self.copy_room(slot.offset, bytes).map_err(crate::error::kernel)? else {
+            let Some(handle) = self
+                .copy_room(slot.offset, bytes)
+                .map_err(crate::error::kernel)?
+            else {
                 return Err(overflowed(plan.bytes));
             };
             slot.tight.buf = handle;
@@ -174,8 +182,8 @@ impl Run<'_> {
     /// `Serve::copies` read the same table, so a copied window without one
     /// is a mis-carved fire, refused by name.
     fn gathered_rows(&self, region: &Region) -> Result<Tensor, kernels_metal::Error> {
-        self.window()
-            ?.gathered
+        self.window()?
+            .gathered
             .as_ref()
             .map(|gathered| gathered.rows)
             .ok_or_else(|| kernels_metal::Error::Backend {

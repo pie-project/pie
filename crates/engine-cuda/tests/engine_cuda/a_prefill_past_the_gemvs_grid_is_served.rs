@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
-use crate::common::fnv;
 
 const TOP_K: u32 = 4;
 const WIDE: u32 = 16_400;

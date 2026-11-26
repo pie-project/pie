@@ -17,7 +17,12 @@ pub(super) fn read_shelf(shelf: &Shelf, slots: &[u32]) -> Vec<u8> {
 }
 
 /// Writes `bytes`, as [`read_shelf`] lays them out, into `slots` of `shelf`.
-pub(super) fn write_shelf(shelf: &Shelf, slots: &[u32], bytes: &[u8], what: &'static str) -> Result<()> {
+pub(super) fn write_shelf(
+    shelf: &Shelf,
+    slots: &[u32],
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<()> {
     let slot_bytes: u64 = shelf.planes.iter().sum();
     let need = slots.len() as u64 * slot_bytes;
     if bytes.len() as u64 != need {
@@ -96,7 +101,11 @@ pub(super) struct DiskTell(pub(super) Option<crate::serve::landing::Told>);
 
 impl std::fmt::Debug for DiskTell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "DiskTell(pending)" } else { "DiskTell(none)" })
+        f.write_str(if self.0.is_some() {
+            "DiskTell(pending)"
+        } else {
+            "DiskTell(none)"
+        })
     }
 }
 
@@ -541,7 +550,11 @@ impl Pools {
     /// for the shape: where a copy to or from a tier reads or writes it.
     pub fn slot_span(&mut self, shape: engine::chunk::ShapeId, slot: u32) -> Result<u64> {
         let kind = Self::kind_of(shape)?;
-        let bytes = self.chunks.layout().shape(kind).map_or(0, |shape| shape.slot_bytes);
+        let bytes = self
+            .chunks
+            .layout()
+            .shape(kind)
+            .map_or(0, |shape| shape.slot_bytes);
         self.seat_pages(kind, [u64::from(slot)])?;
         self.chunks.span(kind, slot, 0, bytes)
     }
@@ -788,7 +801,10 @@ impl Pools {
         let file = match keep {
             None => engine::disk::SlotFile::open(dir, &name, chunk, budget),
             Some(load) => {
-                let layout = format!("cuda {load} chunk {chunk} division {:?}", self.disk_division());
+                let layout = format!(
+                    "cuda {load} chunk {chunk} division {:?}",
+                    self.disk_division()
+                );
                 engine::disk::SlotFile::open_kept(dir, &name, chunk, budget, &layout)
             }
         }

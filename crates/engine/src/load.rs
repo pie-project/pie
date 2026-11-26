@@ -17,7 +17,8 @@ pub use rung::{
     measured_effs, model_class, pick, scored, shape_table, top_rung,
 };
 pub use top::{
-    Counts, Kept, Refused, choose, choose_shaped, choose_tiled, estimate, line_of, measured_line, rectangle,
+    Counts, Kept, Refused, choose, choose_shaped, choose_tiled, estimate, line_of, measured_line,
+    rectangle,
 };
 
 /// The lanes one fire may carry on the CUDA shell `pie serve` loads (its

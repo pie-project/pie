@@ -159,7 +159,6 @@ impl KeyBuilder {
     }
 }
 
-
 /// Entries under keys, the stalest dropped past a count.
 struct Held<T> {
     by_key: HashMap<Key, T>,
@@ -195,7 +194,6 @@ pub(crate) struct Recorder {
 
     /// Each fire shape's fill, under the shape's key.
     fills: Held<Fill>,
-
 
     recorded: std::cell::Cell<u64>,
     filled: std::cell::Cell<u64>,
@@ -339,4 +337,3 @@ impl Recorder {
         (self.recorded.get(), self.filled.get())
     }
 }
-

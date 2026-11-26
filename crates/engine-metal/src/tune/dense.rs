@@ -369,9 +369,14 @@ fn measure_at(
             // launch, so the fastest is the kernel's, and two measuring
             // boots agree on it where a median moves with the device's
             // state (engine-gpu's curve rule).
-            let times = time_rounds(device, &pipelines, &handles, &live, ROUNDS, |sink, c, copy| {
-                launch(sink, &forced[c], copy)
-            })?;
+            let times = time_rounds(
+                device,
+                &pipelines,
+                &handles,
+                &live,
+                ROUNDS,
+                |sink, c, copy| launch(sink, &forced[c], copy),
+            )?;
             let mut row = vec![None; candidates.len()];
             let mut spread = vec![None; candidates.len()];
             for (c, (t, lo, hi, _)) in live.iter().zip(times) {
@@ -409,9 +414,14 @@ fn measure_at(
                 }
                 let m = out.points[at].rows;
                 let launch = launch_at(m);
-                let again = time_rounds(device, &pipelines, &handles, &[c], RETIME_ROUNDS, |sink, c, copy| {
-                    launch(sink, &forced[c], copy)
-                })?;
+                let again = time_rounds(
+                    device,
+                    &pipelines,
+                    &handles,
+                    &[c],
+                    RETIME_ROUNDS,
+                    |sink, c, copy| launch(sink, &forced[c], copy),
+                )?;
                 if let (Some(&(_, lo, ..)), Some(old)) = (again.first(), out.points[at].times[c]) {
                     out.points[at].times[c] = Some(old.min(lo));
                 }
@@ -489,7 +499,10 @@ fn fit_at(
             weight: weight(grid, shapes, p.rows),
             times: p.times.clone(),
             spread: profile::tune::pooled(
-                p.spread.iter().flatten().map(|range| range * RANGE_TO_ERROR),
+                p.spread
+                    .iter()
+                    .flatten()
+                    .map(|range| range * RANGE_TO_ERROR),
             ),
         })
         .collect();
@@ -743,12 +756,13 @@ fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, Strin
         let picks: Vec<Vec<usize>> = at
             .iter()
             .map(|p| {
-                let Some(best) = (0..p.times.len())
-                    .filter(|&c| p.times[c].is_some())
-                    .min_by(|&a, &b| {
-                        let t = |c: usize| p.times[c].unwrap_or(f64::INFINITY);
-                        t(a).total_cmp(&t(b))
-                    })
+                let Some(best) =
+                    (0..p.times.len())
+                        .filter(|&c| p.times[c].is_some())
+                        .min_by(|&a, &b| {
+                            let t = |c: usize| p.times[c].unwrap_or(f64::INFINITY);
+                            t(a).total_cmp(&t(b))
+                        })
                 else {
                     return Vec::new();
                 };
@@ -762,8 +776,7 @@ fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, Strin
                 match range(best) {
                     Some((lo, hi)) => (0..p.times.len())
                         .filter(|&c| {
-                            c == best
-                                || range(c).is_some_and(|(clo, chi)| clo <= hi && lo <= chi)
+                            c == best || range(c).is_some_and(|(clo, chi)| clo <= hi && lo <= chi)
                         })
                         .collect(),
                     None => vec![best],
@@ -831,9 +844,16 @@ fn winners(measured: &Measured, today: &kernels_metal::Tuning) -> (String, Strin
          by their timed rounds, settled by a neighbour or the profile); the profile's ladder \
          runs at {:.3}x them",
         rungs.len(),
-        if won_cost > 0.0 { today_cost / won_cost } else { 1.0 }
+        if won_cost > 0.0 {
+            today_cost / won_cost
+        } else {
+            1.0
+        }
     );
-    (format!("[\n{}\n  {{ use = \"tile\" }},\n]", rungs.join("\n")), said)
+    (
+        format!("[\n{}\n  {{ use = \"tile\" }},\n]", rungs.join("\n")),
+        said,
+    )
 }
 
 /// `chip` with `kernel.dense` stated by this model's own bf16 shapes,
@@ -863,19 +883,19 @@ pub(crate) fn at_load(
     let name = device.name().to_string();
     let family = device.family();
     let candidates = candidates(family);
-    let stated: Vec<profile::curves::KernelCurve> = chip
-        .rates()
-        .kernel_curves
-        .clone()
-        .unwrap_or_default();
+    let stated: Vec<profile::curves::KernelCurve> =
+        chip.rates().kernel_curves.clone().unwrap_or_default();
     let top = *LOAD_ROWS.last().expect("rows");
     let lacks = |curves: &[profile::curves::KernelCurve], n: u32, k: u32| {
-        candidates.iter().filter(|d| runs_shape(**d, n, k)).any(|d| {
-            let (kind, key) = curve_id(*d);
-            !curves
-                .iter()
-                .any(|c| c.id() == (kind, key, n, k) && c.serves(top))
-        })
+        candidates
+            .iter()
+            .filter(|d| runs_shape(**d, n, k))
+            .any(|d| {
+                let (kind, key) = curve_id(*d);
+                !curves
+                    .iter()
+                    .any(|c| c.id() == (kind, key, n, k) && c.serves(top))
+            })
     };
     let lacking: Vec<(u32, u32)> = shapes
         .iter()
@@ -903,7 +923,11 @@ pub(crate) fn at_load(
     } else {
         let with: Vec<profile::curves::KernelCurve> = curves
             .iter()
-            .chain(stale.iter().filter(|s| !curves.iter().any(|c| c.id() == s.id())))
+            .chain(
+                stale
+                    .iter()
+                    .filter(|s| !curves.iter().any(|c| c.id() == s.id())),
+            )
             .cloned()
             .collect();
         let (still, served): (Vec<(u32, u32)>, Vec<(u32, u32)>) =
@@ -931,14 +955,22 @@ pub(crate) fn at_load(
         chip = chip.with_tuned(tuned);
     } else if !lacking.is_empty() {
         let began = std::time::Instant::now();
-        let measured =
-            match measure_at(device, &chip, device.cores(), &lacking, &LOAD_ROWS, &mut |_| {}) {
-                Ok(m) => m,
-                Err(why) => {
-                    tracing::warn!("{name}: kernel.dense not measured: {why}; the profile's route serves");
-                    return Ok(chip);
-                }
-            };
+        let measured = match measure_at(
+            device,
+            &chip,
+            device.cores(),
+            &lacking,
+            &LOAD_ROWS,
+            &mut |_| {},
+        ) {
+            Ok(m) => m,
+            Err(why) => {
+                tracing::warn!(
+                    "{name}: kernel.dense not measured: {why}; the profile's route serves"
+                );
+                return Ok(chip);
+            }
+        };
         if let Some((body, n, first)) = measured.wrong.first() {
             return Err(format!(
                 "kernel.dense at load: `{body}` answered wrongly at {n} points; first at {first}"
@@ -983,10 +1015,13 @@ pub(crate) fn at_load(
         .iter()
         .copied()
         .filter(|&(n, k)| {
-            candidates.iter().filter(|d| runs_shape(**d, n, k)).all(|d| {
-                let (kind, key) = curve_id(*d);
-                curves.iter().any(|c| c.id() == (kind, key, n, k))
-            })
+            candidates
+                .iter()
+                .filter(|d| runs_shape(**d, n, k))
+                .all(|d| {
+                    let (kind, key) = curve_id(*d);
+                    curves.iter().any(|c| c.id() == (kind, key, n, k))
+                })
         })
         .collect();
     if fitted.is_empty() {
@@ -1000,7 +1035,8 @@ pub(crate) fn at_load(
         fitted.len(),
         ladder
             .bytes()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b))
+                .wrapping_mul(0x100_0000_01b3))
     );
     let spec = Dense::spec();
     let base = chip

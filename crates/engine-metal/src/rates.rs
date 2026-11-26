@@ -42,7 +42,6 @@ use kernels_metal::{KvPool, PrefillPlan, StateMap, Tensor, Tuning, attn, ssm};
 use poem_ir::Dtype;
 use profile::rates::Rates;
 
-
 /// The rates this backend's estimate weighs a fire by, of
 /// `profile::rates::KEYS` (every one): what its load measures where its
 /// chip's profile states none.
@@ -604,14 +603,23 @@ pub fn at_load(
     // behind serving: a timing lays buffers of its own, and nothing is laid
     // after ready); only what no layer states is measured here, those keys
     // alone.
-    engine::rates::resolve_at_load(chip, &KEYS, save, None, max_submit, measuring, engine::rates::StaleRates::Served, |_max_submit, stated| {
-        let lacked = stated.missing(&KEYS);
-        Ok(engine::rates::Measured {
-            rates: measure_keys(device, measure_chip, &lacked, &mut |_| {})?,
-            unsettled: false,
-            throttled: None,
-        })
-    })
+    engine::rates::resolve_at_load(
+        chip,
+        &KEYS,
+        save,
+        None,
+        max_submit,
+        measuring,
+        engine::rates::StaleRates::Served,
+        |_max_submit, stated| {
+            let lacked = stated.missing(&KEYS);
+            Ok(engine::rates::Measured {
+                rates: measure_keys(device, measure_chip, &lacked, &mut |_| {})?,
+                unsettled: false,
+                throttled: None,
+            })
+        },
+    )
 }
 
 /// `device`'s rates under the kernel tuning of `profile` (the profile a
@@ -685,7 +693,11 @@ pub fn measure_keys(
     let mut gemm = Vec::new();
     let mut few_row = None;
     let mut per_core = None;
-    let gemms = ["gemm_tflops_by_rows", "few_row_tflops", "workgroups_per_core"];
+    let gemms = [
+        "gemm_tflops_by_rows",
+        "few_row_tflops",
+        "workgroups_per_core",
+    ];
     let widths: &[u32] = if gemms.iter().any(|key| want(key)) {
         &engine::rates::GEMM_WIDTHS
     } else {
@@ -762,7 +774,8 @@ pub fn measure_keys(
             let rate = bench.matmul_flops(m, n, w, &narrow, &touched, gap)?;
             let flops = engine::rates::gemm_flops(m, n, w);
             let groups = u32::try_from(groups).map_err(|e| e.to_string())?;
-            per_core = engine::rates::workgroups_per_core(groups, cores, flops / rate, flops / full);
+            per_core =
+                engine::rates::workgroups_per_core(groups, cores, flops / rate, flops / full);
             say(&format!(
                 "  bf16 matmul {m} x {n} x {w}, {groups} workgroups over {cores} cores: \
                  {:.4} TFLOP/s against {:.4} at full width, {:.2} workgroups a core",

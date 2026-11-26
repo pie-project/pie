@@ -138,10 +138,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // A serving load on a device whose profile states its fire top
     // (`engine.fire_rows`, from a measured sweep) takes it; else the rule
     // weighs it below. A check's load lays its rungs as it asks.
-    let stated_top = (boot.budget.max_tokens == 0
-        && boot.knobs.every_rung.is_none()
-        && engine.fire_rows > 0)
-        .then_some(engine.fire_rows);
+    let stated_top =
+        (boot.budget.max_tokens == 0 && boot.knobs.every_rung.is_none() && engine.fire_rows > 0)
+            .then_some(engine.fire_rows);
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = lattice_top;
         // only where it at least halves the fire: a trunk of few value heads seats enough lanes that the
@@ -338,7 +337,13 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // Each byte charged once: what the card holds now (this process's
     // context and kernel modules among it; no weight has landed yet), the
     // weight tier to come, and the driver's floor.
-    let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
+    let room_line = room_line(
+        boot.allowance,
+        ceiling,
+        total - free,
+        weight_tier,
+        after_weights,
+    );
     tracing::info!("{room_line}");
     let (banks, banks_said) = room::beside(boot, after_weights)?;
     let after_weights = after_weights - banks;
@@ -583,7 +588,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         Some(quiet) => {
             let agreed = quiet.least(tokens)?;
             if agreed != tokens {
-                tracing::info!("the group's ranks agree on a fire top of {agreed}: this rank's own was {tokens}");
+                tracing::info!(
+                    "the group's ranks agree on a fire top of {agreed}: this rank's own was {tokens}"
+                );
             }
             agreed
         }
@@ -866,10 +873,15 @@ impl Shell {
             landing,
         )?;
         if let Some(measured) = weights.landing() {
-            match crate::rates::save_landing(boot.knobs.profiles.as_deref(), device.name(), &keys, measured) {
-                Ok(Some(path)) => tracing::info!(
-                    "how this machine lands weights, measured, saved to {path}"
-                ),
+            match crate::rates::save_landing(
+                boot.knobs.profiles.as_deref(),
+                device.name(),
+                &keys,
+                measured,
+            ) {
+                Ok(Some(path)) => {
+                    tracing::info!("how this machine lands weights, measured, saved to {path}")
+                }
                 Ok(None) => {}
                 Err(why) => tracing::warn!("the landing's rates were not saved: {why}"),
             }
@@ -1832,8 +1844,7 @@ impl Shell {
             scores,
             rings,
         ] = self.staged_runs();
-        let staged =
-            inputs + readouts + voxels + predicates + experts + arenas + scores + rings;
+        let staged = inputs + readouts + voxels + predicates + experts + arenas + scores + rings;
         self.pools
             .hold_activation_at(self.inputs_at, staged, false)?;
         let base = self.pools.activation_base() + self.inputs_at;

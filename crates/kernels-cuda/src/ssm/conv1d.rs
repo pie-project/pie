@@ -434,7 +434,10 @@ fn conv1d_carried(
         && bias.is_none_or(|b| aligned16(b.ptr))
         && aligned16(state.conv_slab.ptr)
         && carry.plane_off.iter().all(|off| off.is_multiple_of(16))
-        && carry.plane_stride.iter().all(|stride| stride.is_multiple_of(16))
+        && carry
+            .plane_stride
+            .iter()
+            .all(|stride| stride.is_multiple_of(16))
         && keys.is_none_or(|(off, len)| off % CONV_VEC == 0 && len % CONV_VEC == 0);
     let mut args = vec![
         x.arg(),
@@ -508,8 +511,10 @@ pub fn conv1d_fold(
     let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
     ctx.fire(
         OP,
-        Fire::at(fold_kernel())
-            .apply(Launch::grid([channels.div_ceil(BLOCK), 1, 1], [BLOCK, 1, 1])),
+        Fire::at(fold_kernel()).apply(Launch::grid(
+            [channels.div_ceil(BLOCK), 1, 1],
+            [BLOCK, 1, 1],
+        )),
         &[
             rows.arg(),
             stated(OP, channels)?.arg(),

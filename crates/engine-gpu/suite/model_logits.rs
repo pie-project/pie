@@ -334,7 +334,14 @@ pub fn load_with(
         chunk_bytes: chunk,
         ..crate::gpu::device_boot()
     };
-    load_on(fixture, page, context, &device, residency, engine::runahead::Runahead::F1)
+    load_on(
+        fixture,
+        page,
+        context,
+        &device,
+        residency,
+        engine::runahead::Runahead::F1,
+    )
 }
 
 /// [`load`] as the engine raises a served load: one whose programs it
@@ -365,7 +372,14 @@ fn load_alone(
         chunk_bytes: chunk,
         ..crate::gpu::device_boot()
     };
-    load_booted(fixture, page, context, &device, residency, engine::runahead::Runahead::F1)
+    load_booted(
+        fixture,
+        page,
+        context,
+        &device,
+        residency,
+        engine::runahead::Runahead::F1,
+    )
 }
 
 /// [`load_with`] on the device `device` boots, running ahead by `runahead`
@@ -397,7 +411,7 @@ fn load_booted(
             runahead,
             ..boot(fixture, page, context, device, residency)
         })
-            .unwrap_or_else(|why| panic!("the shell loads: {why}")),
+        .unwrap_or_else(|why| panic!("the shell loads: {why}")),
     )
 }
 
@@ -597,8 +611,9 @@ fn every_fire_is_served_from_what_the_load_built() {
                 "{model}: {what} built a pipeline the load's walks did not name"
             );
         };
-        let lane =
-            |slot: u32, held: u32, rows: usize| seat(&fixture.trace, slot, held, &tokens[held as usize..][..rows]);
+        let lane = |slot: u32, held: u32, rows: usize| {
+            seat(&fixture.trace, slot, held, &tokens[held as usize..][..rows])
+        };
         let rungs: Vec<u32> = shell
             .pool_chunk_facts()
             .act_chunks
@@ -615,7 +630,12 @@ fn every_fire_is_served_from_what_the_load_built() {
                         continue;
                     }
                     let seated: Vec<Seated<'_>> = (0..lanes).map(|l| lane(l, held, rows)).collect();
-                    fire(&mut shell, &seated, built, &format!("{lanes} x {rows} rows at rung {rung}"));
+                    fire(
+                        &mut shell,
+                        &seated,
+                        built,
+                        &format!("{lanes} x {rows} rows at rung {rung}"),
+                    );
                 }
             }
         }
@@ -627,7 +647,12 @@ fn every_fire_is_served_from_what_the_load_built() {
         drop(shell);
         let mut shell = load(&fixture, CONTEXT).expect("loaded before");
         let built = shell.compiled();
-        let per_page = shell.pools().rs_rows().expect("a hybrid's rs list").tokens.max(1);
+        let per_page = shell
+            .pools()
+            .rs_rows()
+            .expect("a hybrid's rs list")
+            .tokens
+            .max(1);
         shell.open(0).expect("the slot opens");
         let buffer = |folded: u32, fold: u32| RsVerb::Buffer {
             pages: vec![0; 8u32.div_ceil(per_page) as usize],
@@ -636,12 +661,21 @@ fn every_fire_is_served_from_what_the_load_built() {
             fold: FoldLen::Host(fold),
             lineage: Lineage::Set,
         };
-        for (held, rows, rs) in [(0u32, 4usize, RsVerb::Fold), (4, 2, buffer(4, 0)), (6, 1, buffer(4, 2))] {
+        for (held, rows, rs) in [
+            (0u32, 4usize, RsVerb::Fold),
+            (4, 2, buffer(4, 0)),
+            (6, 1, buffer(4, 2)),
+        ] {
             let seated = [Seated {
                 rs: &rs,
                 ..lane(0, held, rows)
             }];
-            fire(&mut shell, &seated, built, &format!("{rows} row(s) held {held} under {rs:?}"));
+            fire(
+                &mut shell,
+                &seated,
+                built,
+                &format!("{rows} row(s) held {held} under {rs:?}"),
+            );
         }
     }
 }
@@ -674,11 +708,17 @@ fn a_decodes_bodies_replay_their_logits_across_buckets_and_a_yield() {
             if segments.growth != engine::chunk::Growth::Fixed && segments.committed > 1 {
                 let committed = segments.committed;
                 shell.release_segments(1).expect("the top segments go back");
-                shell.commit_segments(committed).expect("the segments commit again");
+                shell
+                    .commit_segments(committed)
+                    .expect("the segments commit again");
             }
         }
         assert_eq!(decode(&mut shell, 1), first.0, "round {round}: one lane");
-        assert_eq!(decode(&mut shell, wide), first.1, "round {round}: {wide} lanes");
+        assert_eq!(
+            decode(&mut shell, wide),
+            first.1,
+            "round {round}: {wide} lanes"
+        );
     }
 }
 
@@ -1235,7 +1275,16 @@ fn windowed_prompt() -> Vec<u32> {
 /// [`load_with`] at a context of 1024 under a device `budget` where stated.
 fn load_budget(fixture: &Fixture, page: u32, budget: Option<u64>) -> Option<Shell> {
     let device = engine::Allowance { budget };
-    load_with(fixture, page, 1024, None, engine::load::Residency { device, ..Default::default() })
+    load_with(
+        fixture,
+        page,
+        1024,
+        None,
+        engine::load::Residency {
+            device,
+            ..Default::default()
+        },
+    )
 }
 
 /// One seat-addressed lane prefilling `prompt` in fires of 64 rows and
@@ -1304,7 +1353,11 @@ fn a_windowed_layer_answers_what_one_dense_fire_does() {
         return;
     };
     let want = dense_rows(&fixture, PAGE, &prompt, &tokens);
-    near(&format!("{MODEL}: ring + buffer against one dense fire"), &rows, &want);
+    near(
+        &format!("{MODEL}: ring + buffer against one dense fire"),
+        &rows,
+        &want,
+    );
 }
 
 /// A deep windowed model through its rings, held to the same model with
@@ -1319,15 +1372,26 @@ fn same_cut_check(model: &str, layers: Option<u32>, page: u32, budget: Option<u6
     );
     let window = poem_exec::store::kv::declared_window(&windowed.trace).unwrap_or(0);
     let prompt = windowed_prompt();
-    assert!(window as usize > prompt.len() + steps, "{model}: a window past the rows");
+    assert!(
+        window as usize > prompt.len() + steps,
+        "{model}: a window past the rows"
+    );
     let plain = narrowed(model, layers, "None", "-plain");
-    assert_eq!(poem_exec::store::kv::declared_window(&plain.trace), None, "{model}: no window left");
+    assert_eq!(
+        poem_exec::store::kv::declared_window(&plain.trace),
+        None,
+        "{model}: no window left"
+    );
     let Some((rows, tokens)) = windowed_rows(&windowed, page, budget, &prompt, steps, None) else {
         return;
     };
-    let (want, _) = windowed_rows(&plain, page, budget, &prompt, steps, Some(&tokens))
-        .expect("loaded before");
-    near(&format!("{model}: ring + buffer against plain attention, fire for fire"), &rows, &want);
+    let (want, _) =
+        windowed_rows(&plain, page, budget, &prompt, steps, Some(&tokens)).expect("loaded before");
+    near(
+        &format!("{model}: ring + buffer against plain attention, fire for fire"),
+        &rows,
+        &want,
+    );
 }
 
 /// Windowed layers beside full ones, the buffer's slot the kv page.
@@ -1362,7 +1426,10 @@ fn narrowed(model: &str, layers: Option<u32>, rule: &str, variant: &str) -> Fixt
         "        d, kv_heads, win = geometry(m, at.reading)\n",
         "        d, _, win = geometry(m, at.reading)\n",
     ] {
-        assert!(forward.contains(stated), "{model}'s forward reads its geometry: {stated:?}");
+        assert!(
+            forward.contains(stated),
+            "{model}'s forward reads its geometry: {stated:?}"
+        );
         forward = forward.replace(stated, &format!("{stated}        win = {rule}\n"));
     }
     let narrowed = poem_compiler::catalog::replacing(model, "forward", &forward)
@@ -1393,8 +1460,14 @@ impl RingRefs {
         let layout = shell.pool_layout();
         let first = 1 + layout.seat_chunks();
         let refs = RingRefs {
-            fixed: layout.fixed.expect("a windowed load holds records").per_chunk,
-            buffer: layout.buffer.expect("a windowed load holds a window buffer").per_chunk,
+            fixed: layout
+                .fixed
+                .expect("a windowed load holds records")
+                .per_chunk,
+            buffer: layout
+                .buffer
+                .expect("a windowed load holds a window buffer")
+                .per_chunk,
             first,
             pieces: layout.pieces,
         };
@@ -1434,7 +1507,11 @@ struct RingLane<'a> {
     device: bool,
 }
 
-fn fire_rings(shell: &mut Shell, trace: &Trace, lanes: &[(&RingLane<'_>, &[u32])]) -> Vec<Vec<f32>> {
+fn fire_rings(
+    shell: &mut Shell,
+    trace: &Trace,
+    lanes: &[(&RingLane<'_>, &[u32])],
+) -> Vec<Vec<f32>> {
     let tables: Vec<Vec<(engine::chunk::ShapeId, Vec<u32>)>> = lanes
         .iter()
         .map(|(lane, _)| vec![(engine_gpu::store::layout::WINDOW, lane.table.clone())])
@@ -1548,7 +1625,11 @@ fn a_stop_truncate_leaves_the_ring_untouched() {
     let mut next = argmax(&last[0]);
     let mut tokens = Vec::new();
     for step in 0..5 {
-        let got = fire_rings(&mut shell, &fixture.trace, &[(&buffered(folded + step), &[next][..])]);
+        let got = fire_rings(
+            &mut shell,
+            &fixture.trace,
+            &[(&buffered(folded + step), &[next][..])],
+        );
         tokens.push(next);
         next = argmax(&got[0]);
     }
@@ -1557,7 +1638,11 @@ fn a_stop_truncate_leaves_the_ring_untouched() {
     let mut rows = Vec::new();
     let mut fed = (tokens[1] + 7) % 256;
     for step in 0..4 {
-        let got = fire_rings(&mut shell, &fixture.trace, &[(&buffered(folded + 2 + step), &[fed][..])]);
+        let got = fire_rings(
+            &mut shell,
+            &fixture.trace,
+            &[(&buffered(folded + 2 + step), &[fed][..])],
+        );
         tokens.push(fed);
         rows.push(got[0].clone());
         fed = argmax(&got[0]);
@@ -1628,7 +1713,10 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
         slots: from.iter().copied().zip(to.iter().copied()).collect(),
         runs: Vec::new(),
     };
-    for (k, id) in [LIST, FIXED, engine_gpu::store::layout::RS].into_iter().enumerate() {
+    for (k, id) in [LIST, FIXED, engine_gpu::store::layout::RS]
+        .into_iter()
+        .enumerate()
+    {
         let k = k as u32;
         let shape: SlotShape = facts
             .shapes
@@ -1649,11 +1737,18 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
         };
         for (t, tier) in [host, disk].into_iter().enumerate() {
             let t = t as u32;
-            let (from, into) = (refs(1 + 4 * k + 2 * t, false), refs(2 + 4 * k + 2 * t, true));
-            let held: Vec<Vec<u8>> = (0..m).map(|i| pattern(100 + 16 * k + 4 * t + i, bytes)).collect();
+            let (from, into) = (
+                refs(1 + 4 * k + 2 * t, false),
+                refs(2 + 4 * k + 2 * t, true),
+            );
+            let held: Vec<Vec<u8>> = (0..m)
+                .map(|i| pattern(100 + 16 * k + 4 * t + i, bytes))
+                .collect();
             for (&slot, bytes) in from.iter().zip(&held) {
                 let (buffer, at) = shell.pools().slot_place(id, slot).expect("a slot's place");
-                buffer.write_shared(at, bytes).expect("the slot takes its bytes");
+                buffer
+                    .write_shared(at, bytes)
+                    .expect("the slot takes its bytes");
             }
             let parked = refs(if tier == host { 48 + 3 * k } else { 2 + 3 * k }, true);
             shell
@@ -1674,7 +1769,10 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
                 let (buffer, at) = shell.pools().slot_place(id, slot).expect("a slot's place");
                 let mut got = vec![0u8; bytes as usize];
                 buffer.read(at, &mut got).expect("the slot reads");
-                assert!(got == held[i], "shape {id} slot {i} device -> {tier:?} -> device");
+                assert!(
+                    got == held[i],
+                    "shape {id} slot {i} device -> {tier:?} -> device"
+                );
             }
         }
     }
@@ -1718,7 +1816,11 @@ fn fill(shell: &mut Shell, pattern: u32) {
         for at in [0, bytes - 4] {
             let mut word = [0u8; 4];
             buffer.read(at, &mut word).expect("the fill reads back");
-            assert_eq!(u32::from_le_bytes(word), pattern, "the fill lands at byte {at}");
+            assert_eq!(
+                u32::from_le_bytes(word),
+                pattern,
+                "the fill lands at byte {at}"
+            );
         }
     }
 }
@@ -1746,7 +1848,14 @@ fn a_hybrid_miniature_over_a_poisoned_pool_answers_finite() {
 
 /// The poisoned-pool test's rounds of `same` lanes of one `len`-row prompt and
 /// `others` lanes of other prompts, over zeroes and over poison.
-fn poisoned_case(shell: &mut Shell, trace: &Trace, model: &str, len: u32, same: usize, others: usize) {
+fn poisoned_case(
+    shell: &mut Shell,
+    trace: &Trace,
+    model: &str,
+    len: u32,
+    same: usize,
+    others: usize,
+) {
     const STEPS: usize = 3;
     let lanes = same + others;
     let case = format!("{model} {same}x{len}+{others}");
@@ -1768,33 +1877,34 @@ fn poisoned_case(shell: &mut Shell, trace: &Trace, model: &str, len: u32, same: 
             );
         }
     };
-    let round = |shell: &mut Shell, pattern: u32, seat_of: &dyn Fn(usize) -> u32| -> Vec<Vec<f32>> {
-        fill(shell, pattern);
-        for lane in 0..lanes {
-            shell.open(seat_of(lane)).expect("the seat opens");
-        }
-        let seated: Vec<Seated<'_>> = (0..lanes)
-            .map(|lane| seat(trace, seat_of(lane), 0, &prompts[lane]))
-            .collect();
-        let got = shell.fire_seated(&seated).expect("the prefill lands");
-        check("prefill", &got);
-        let mut held: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
-        let mut fed: Vec<Vec<u32>> = got.iter().map(|row| vec![argmax(row)]).collect();
-        let mut rows = got;
-        for step in 0..STEPS {
-            let seated: Vec<Seated<'_>> = (0..lanes)
-                .map(|lane| seat(trace, seat_of(lane), held[lane], &fed[lane]))
-                .collect();
-            let got = shell.fire_seated(&seated).expect("the decode lands");
-            check(&format!("decode {step}"), &got);
+    let round =
+        |shell: &mut Shell, pattern: u32, seat_of: &dyn Fn(usize) -> u32| -> Vec<Vec<f32>> {
+            fill(shell, pattern);
             for lane in 0..lanes {
-                held[lane] += 1;
-                fed[lane] = vec![argmax(&got[lane])];
+                shell.open(seat_of(lane)).expect("the seat opens");
             }
-            rows.extend(got);
-        }
-        rows
-    };
+            let seated: Vec<Seated<'_>> = (0..lanes)
+                .map(|lane| seat(trace, seat_of(lane), 0, &prompts[lane]))
+                .collect();
+            let got = shell.fire_seated(&seated).expect("the prefill lands");
+            check("prefill", &got);
+            let mut held: Vec<u32> = prompts.iter().map(|p| p.len() as u32).collect();
+            let mut fed: Vec<Vec<u32>> = got.iter().map(|row| vec![argmax(row)]).collect();
+            let mut rows = got;
+            for step in 0..STEPS {
+                let seated: Vec<Seated<'_>> = (0..lanes)
+                    .map(|lane| seat(trace, seat_of(lane), held[lane], &fed[lane]))
+                    .collect();
+                let got = shell.fire_seated(&seated).expect("the decode lands");
+                check(&format!("decode {step}"), &got);
+                for lane in 0..lanes {
+                    held[lane] += 1;
+                    fed[lane] = vec![argmax(&got[lane])];
+                }
+                rows.extend(got);
+            }
+            rows
+        };
     let zeroes = round(shell, 0, &|lane| lane as u32);
     let fresh = round(shell, POISON, &|lane| lane as u32);
     // Each lane on a seat another lane (or none) held.
@@ -1831,7 +1941,9 @@ fn a_device_counted_fold_folds_what_its_count_says() {
     let prompt: Vec<u32> = (0..600u32).map(|at| (at * 29 + 3) % 256).collect();
     let last = ring_prefill(&mut shell, &fixture.trace, &record, &prompt);
     let table = |upto: u32, base: u32| -> Vec<u32> {
-        (0..(upto - base).div_ceil(PAGE)).map(|k| refs.slot(0, k)).collect()
+        (0..(upto - base).div_ceil(PAGE))
+            .map(|k| refs.slot(0, k))
+            .collect()
     };
     let mut folded = prompt.len() as u32;
     let mut next = argmax(&last[0]);

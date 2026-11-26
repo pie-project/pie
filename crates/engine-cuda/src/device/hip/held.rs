@@ -65,10 +65,15 @@ pub(crate) fn forget_stream(stream: usize) {
             }
             let mut fresh: rt::Event = core::ptr::null_mut();
             // SAFETY: writes the new event.
-            let made = unsafe { rt::hipEventCreateWithFlags(&raw mut fresh, rt::hipEventDisableTiming) };
+            let made =
+                unsafe { rt::hipEventCreateWithFlags(&raw mut fresh, rt::hipEventDisableTiming) };
             // A slot whose event could not be made again is left with none:
             // the next stage that reaches it takes a fresh slot ahead of it.
-            *event = if made == 0 { fresh } else { core::ptr::null_mut() };
+            *event = if made == 0 {
+                fresh
+            } else {
+                core::ptr::null_mut()
+            };
             *recorded_on = 0;
         }
     }

@@ -20,6 +20,7 @@ pub const METHOD: u32 = 1;
 /// under on `platform` (the device's arch, driver and cuBLASLt).
 #[must_use]
 pub fn code(platform: &str, fingerprint: &str) -> u32 {
-    let hash = crate::source::fnv1a64(format!("{platform}|{fingerprint}|method {METHOD}").as_bytes());
+    let hash =
+        crate::source::fnv1a64(format!("{platform}|{fingerprint}|method {METHOD}").as_bytes());
     (hash ^ (hash >> 32)) as u32
 }

@@ -1076,7 +1076,11 @@ impl Walk<'_, '_> {
     /// Reads `source` straight into the bytes of `dest`, where both are
     /// dense runs and `dest` lies in a buffer this walk owns: no copy of
     /// the read is made first. False (nothing read) where they are not.
-    fn read_extent_into(&mut self, source: &SourceExtent, dest: &DestExtent) -> Result<bool, Error> {
+    fn read_extent_into(
+        &mut self,
+        source: &SourceExtent,
+        dest: &DestExtent,
+    ) -> Result<bool, Error> {
         if !source.stride.is_dense() || !dest.stride.has_dense_destination() {
             return Ok(false);
         }

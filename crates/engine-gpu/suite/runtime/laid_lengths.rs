@@ -16,7 +16,9 @@ const LENGTHS: [u32; 4] = [17, 19, 23, 27];
 pub fn serve(shell: &mut Shell, trace: &poem_ir::Trace) -> Vec<Vec<f32>> {
     let mut rows = Vec::new();
     for (seat, &length) in LENGTHS.iter().enumerate() {
-        let tokens: Vec<u32> = (0..length).map(|at| (at * 37 + 11 + seat as u32) % 256).collect();
+        let tokens: Vec<u32> = (0..length)
+            .map(|at| (at * 37 + 11 + seat as u32) % 256)
+            .collect();
         let got = shell
             .fire_seated(&[Seated {
                 held: Some(0),
@@ -66,7 +68,11 @@ fn an_unwalked_length_replays_its_family_with_a_laid_fill() {
     shell.laid_serving();
     shell.serving = true;
     let got = serve(&mut shell, &fixture.trace);
-    assert_eq!(shell.recorded_serving(), 0, "a fire after ready recorded a body");
+    assert_eq!(
+        shell.recorded_serving(),
+        0,
+        "a fire after ready recorded a body"
+    );
     if <crate::backend::Api as engine_gpu::serve::Serve>::RECORDS {
         assert_eq!(
             shell.unkept_serving(),

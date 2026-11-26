@@ -295,14 +295,28 @@ fn unassigned_ref(engine_idx: usize, frame: &crate::engine::FrameFire) -> Option
             .map(|roles| roles.lock().unwrap().fire_slots_of(id))
             .unwrap_or_default()
     };
-    let named: Vec<Vec<Vec<(String, crate::store::slots::ShapeId, crate::store::slots::Slot)>>> = frame
+    let named: Vec<
+        Vec<
+            Vec<(
+                String,
+                crate::store::slots::ShapeId,
+                crate::store::slots::Slot,
+            )>,
+        >,
+    > = frame
         .steps
         .iter()
         .map(|step| {
             let mut seen = std::collections::BTreeSet::new();
             step.instances
                 .iter()
-                .map(|&id| if seen.insert(id) { instance_slots(id) } else { Vec::new() })
+                .map(|&id| {
+                    if seen.insert(id) {
+                        instance_slots(id)
+                    } else {
+                        Vec::new()
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -469,7 +483,10 @@ fn refuse_lanes(
             }
             tracing::warn!(%reason, "a fire's lanes were refused; it fails alone");
             if let Some(cell) = fire.terminal_cells.get(member) {
-                completion::settle(std::slice::from_ref(cell), completion::TERMINAL_OUTCOME_FAILED);
+                completion::settle(
+                    std::slice::from_ref(cell),
+                    completion::TERMINAL_OUTCOME_FAILED,
+                );
             }
             if let Some(completion) = fire.completions.get(member) {
                 completion.reject_unsubmitted(reason.clone());
@@ -551,13 +568,14 @@ fn strip_members(
             .map(|at| u32::try_from(at).unwrap_or(u32::MAX));
     }
     step.lanes = kept_lanes;
-    step.attachments.retain_mut(|attachment| match keep(attachment.lane) {
-        Some(lane) => {
-            attachment.lane = lane;
-            true
-        }
-        None => false,
-    });
+    step.attachments
+        .retain_mut(|attachment| match keep(attachment.lane) {
+            Some(lane) => {
+                attachment.lane = lane;
+                true
+            }
+            None => false,
+        });
     step.media.retain_mut(|media| match keep(media.lane) {
         Some(lane) => {
             media.lane = lane;
@@ -706,8 +724,7 @@ pub(crate) static LANE_SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// The requests an engine lane found waiting at once after a slice of what
 /// its engine measures behind serving (`Engine::measure_behind`): each
 /// arrived while the slice ran, and waited at most its length.
-pub(crate) static BEHIND_WAITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BEHIND_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Every lane's submissions to its engine, all engines together: a point an
 /// engine times behind serving that sees it move ran beside other work.
@@ -853,8 +870,7 @@ pub(crate) fn give_behind(stores: &crate::store::registry::Stores, taken: Behind
 static BEHIND_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a lane said its behind work waits for a live process.
-static BEHIND_SAID_LIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BEHIND_SAID_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Every lane turned once ([`LaneRequest::Behind`]) once the runtime is
 /// ready: where the last live process's pipeline parked or closed, so a lane
@@ -902,7 +918,15 @@ pub(crate) fn note_step(ns: u64) {
 /// steps; none before any step is served).
 #[must_use]
 pub(crate) fn behind_grace() -> std::time::Duration {
-    std::time::Duration::from_nanos(STEPS_SEEN.lock().unwrap().iter().copied().max().unwrap_or(0))
+    std::time::Duration::from_nanos(
+        STEPS_SEEN
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
+    )
 }
 
 /// The last pipeline parked or closed: the lanes are turned once the grace
@@ -936,8 +960,7 @@ pub(crate) fn turn_behind_after() {
 }
 
 /// Whether a lane said its behind work waits for ready.
-static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 std::thread_local! {
     /// Set on an engine lane's own thread as it starts.
@@ -997,7 +1020,12 @@ pub(crate) fn reset() {
     for count in [&LANE_SLEEPS, &BEHIND_WAITS, &SUBMITS, &LANE_AWAITS] {
         count.store(0, Relaxed);
     }
-    for flag in [&BEHIND_OPEN, &BEHIND_SAID_LIVE, &BEHIND_PENDING, &BEHIND_SAID_EARLY] {
+    for flag in [
+        &BEHIND_OPEN,
+        &BEHIND_SAID_LIVE,
+        &BEHIND_PENDING,
+        &BEHIND_SAID_EARLY,
+    ] {
         flag.store(false, Relaxed);
     }
 }
@@ -1299,12 +1327,21 @@ impl Lane {
         let taken = engine
             .behind_need()
             .filter(|need| alone || !need.long)
-            .map(|need| stores.as_ref().map(|stores| take_behind(stores, need)).unwrap_or_default());
+            .map(|need| {
+                stores
+                    .as_ref()
+                    .map(|stores| take_behind(stores, need))
+                    .unwrap_or_default()
+            });
         let others = || SUBMITS.load(std::sync::atomic::Ordering::Acquire);
         let behind = ::engine::BehindServing {
             others: &others,
             arrived,
-            seats: Some(taken.as_ref().map_or(&[][..], |taken| taken.seats.as_slice())),
+            seats: Some(
+                taken
+                    .as_ref()
+                    .map_or(&[][..], |taken| taken.seats.as_slice()),
+            ),
             step: Some(behind_grace()).filter(|step| !step.is_zero()),
         };
         let fired = engine.measure_behind(&behind);
@@ -1338,8 +1375,7 @@ impl Lane {
         // The pool's instance and channel slots, looked up at the first
         // fire (the stores are registered before any process runs).
         let roles = std::cell::OnceCell::new();
-        let mut landed_instances: HashMap<::engine::FrameId, Vec<LandingReads>> =
-            HashMap::new();
+        let mut landed_instances: HashMap<::engine::FrameId, Vec<LandingReads>> = HashMap::new();
         let broker = crate::engine::CompletionBroker::new();
         let settlements = crate::engine::completion::FrameSettlements::new();
         let inline_faults: InlineFaults = Arc::default();
@@ -1354,18 +1390,20 @@ impl Lane {
             // runtime gives its source slots back only then.
             let landed = broker.clone();
             if let Some(tiers) = engine.tiers() {
-                tiers.on_landed(std::sync::Arc::new(move |token: u64, landing: ::engine::Landing| {
-                    // A copy that failed leaves its data at its source: its
-                    // completion settles failed, never landed, and the move
-                    // waiting on it is taken back (`planner::exec`).
-                    tell_landing(&landed, engine_idx, token, landing);
-                    // The scheduler retires the copy's completion on its next
-                    // turn: woken now, not at its idle backstop, so the move
-                    // waiting on it commits (and its pages come back) at once.
-                    if let Ok(handle) = crate::scheduler::scheduler_handle(engine_idx) {
-                        let _ = handle.nudge();
-                    }
-                }));
+                tiers.on_landed(std::sync::Arc::new(
+                    move |token: u64, landing: ::engine::Landing| {
+                        // A copy that failed leaves its data at its source: its
+                        // completion settles failed, never landed, and the move
+                        // waiting on it is taken back (`planner::exec`).
+                        tell_landing(&landed, engine_idx, token, landing);
+                        // The scheduler retires the copy's completion on its next
+                        // turn: woken now, not at its idle backstop, so the move
+                        // waiting on it commits (and its pages come back) at once.
+                        if let Ok(handle) = crate::scheduler::scheduler_handle(engine_idx) {
+                            let _ = handle.nudge();
+                        }
+                    },
+                ));
             }
             let asynchronous = crate::engine::verbs::settles_asynchronously(engine.as_mut());
             if let Some(completion) = engine.completion()
@@ -1437,13 +1475,17 @@ impl Lane {
                             || !crate::pipeline::none_active()
                     };
                     let behind = || Self::measure_behind(engine_idx, &mut engine, &arrived);
-                    match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake, behind) {
+                    match Self::next_request(&launch_rx, &control_rx, &mut lane_turn, awake, behind)
+                    {
                         Ok(request) => request,
                         Err(()) => break,
                     }
                 }
             };
-            if matches!(request, LaneRequest::Launch { .. } | LaneRequest::Landed { .. }) {
+            if matches!(
+                request,
+                LaneRequest::Launch { .. } | LaneRequest::Landed { .. }
+            ) {
                 settled_at = Some(parks.count());
             }
             let work = match &request {
@@ -1627,7 +1669,10 @@ impl Lane {
                 // no more, and goes back as their closes come.
                 if let Some(roles) = roles.get_or_init(|| roles_of(engine_idx)).as_ref() {
                     let mut roles = roles.lock().unwrap();
-                    for (_, reads) in landed_instances.drain().flat_map(|(_, steps)| steps).flatten()
+                    for (_, reads) in landed_instances
+                        .drain()
+                        .flat_map(|(_, steps)| steps)
+                        .flatten()
                     {
                         roles.landed(&reads);
                     }
@@ -1674,7 +1719,9 @@ impl Lane {
         std::mem::forget(engine);
         drop(channels);
         let mut turn = LaneTurn::default();
-        while let Ok(request) = Self::next_request(launch_rx, control_rx, &mut turn, || false, || None) {
+        while let Ok(request) =
+            Self::next_request(launch_rx, control_rx, &mut turn, || false, || None)
+        {
             if let LaneRequest::Shutdown { response } = request {
                 let _ = response.send((None, ChannelJoin::new()));
                 return;
@@ -1783,7 +1830,10 @@ impl Lane {
             // here to its first step's landing.
             match &submit_result {
                 Ok(ticket) if asynchronous => {
-                    SUBMITTED_AT.lock().unwrap().insert(ticket.id.0, submit_start);
+                    SUBMITTED_AT
+                        .lock()
+                        .unwrap()
+                        .insert(ticket.id.0, submit_start);
                 }
                 Ok(_) => note_step(submit_start.elapsed().as_nanos() as u64),
                 Err(_) => {}
@@ -1869,9 +1919,11 @@ impl Lane {
                 for attachment in &step.attachments {
                     let deferred = asynchronous.then_some(&mut *woken);
                     let instance = attachment.instance;
-                    if let Err(error) = crate::store::roles::pump(roles, instance, Pump::Out, || {
-                        channels.pump_out_with(engine.as_mut(), instance, deferred)
-                    }) {
+                    if let Err(error) =
+                        crate::store::roles::pump(roles, instance, Pump::Out, || {
+                            channels.pump_out_with(engine.as_mut(), instance, deferred)
+                        })
+                    {
                         return Err(format!("channel take: {error}"));
                     }
                 }
@@ -1988,8 +2040,8 @@ impl Lane {
                 ..
             } => {
                 let operation = plan.label();
-                let submitted =
-                    backend(engine).and_then(|engine| copy_settled_on_landing(engine, broker, plan));
+                let submitted = backend(engine)
+                    .and_then(|engine| copy_settled_on_landing(engine, broker, plan));
                 match submitted {
                     Ok(completion) => LaneCommit::AsyncControl {
                         result: Ok(completion),
@@ -2003,11 +2055,9 @@ impl Lane {
             }
             QueuedItem::PrepareProgram { program, response } => {
                 // Its host codegen ran off this thread before it was sent.
-                let prepared =
-                    backend(engine).and_then(|engine| {
-                        Ok(serve(engine, Engine::programs, "prepare_program")?
-                            .prepare(&program)?)
-                    });
+                let prepared = backend(engine).and_then(|engine| {
+                    Ok(serve(engine, Engine::programs, "prepare_program")?.prepare(&program)?)
+                });
                 let _ = response.send(prepared);
                 LaneCommit::None
             }
@@ -2219,7 +2269,9 @@ impl Lane {
                 }
             }
             QueuedItem::CopyTracked { plan, completion } => {
-                match backend(engine).and_then(|engine| copy_settled_on_landing(engine, broker, plan)) {
+                match backend(engine)
+                    .and_then(|engine| copy_settled_on_landing(engine, broker, plan))
+                {
                     Ok(native_completion) => LaneCommit::AsyncControl {
                         result: Ok(native_completion),
                     },
@@ -2245,8 +2297,10 @@ impl Lane {
                             .and_then(|pool| pool.commit_span(segments)),
                         PoolOp::Rung { from, to } => serve(engine, Engine::pool, "set_rung")
                             .and_then(|pool| pool.set_rung(from, to)),
-                        PoolOp::ReleaseSpan(segments) => serve(engine, Engine::pool, "release_span")
-                            .and_then(|pool| pool.release_span(segments)),
+                        PoolOp::ReleaseSpan(segments) => {
+                            serve(engine, Engine::pool, "release_span")
+                                .and_then(|pool| pool.release_span(segments))
+                        }
                         PoolOp::Evacuate(evacuation) => serve(engine, Engine::pool, "evacuate")
                             .and_then(|pool| pool.evacuate(&evacuation)),
                         PoolOp::SettleCopies => serve(engine, Engine::tiers, "settle_copies")
@@ -2254,14 +2308,14 @@ impl Lane {
                         PoolOp::CheckTable(runtime) => serve(engine, Engine::pool, "chunk_table")
                             .and_then(|pool| pool.chunk_table())
                             .and_then(|table| {
-                            match crate::store::shared::programs::table_apart(
-                                table.as_slice(),
-                                &runtime,
-                            ) {
-                                Some(apart) => Err(::engine::Error::Program(apart)),
-                                None => Ok(()),
-                            }
-                        }),
+                                match crate::store::shared::programs::table_apart(
+                                    table.as_slice(),
+                                    &runtime,
+                                ) {
+                                    Some(apart) => Err(::engine::Error::Program(apart)),
+                                    None => Ok(()),
+                                }
+                            }),
                         PoolOp::Rebind(rebind) => crate::store::roles::rebind(
                             roles_of(engine_idx).as_ref(),
                             &mut **engine,
@@ -2314,10 +2368,12 @@ impl Lane {
                         .and_then(|weights| weights.uses())
                         .map(|uses| serde_json::to_vec(&uses).unwrap_or_default())
                         .map_err(Into::into),
-                    HostKvOp::BeamList(instance, beam) => serve(engine, Engine::programs, "beam_list")
-                        .and_then(|programs| programs.beam_list(instance, beam))
-                        .map(|list| list.iter().flat_map(|page| page.to_le_bytes()).collect())
-                        .map_err(Into::into),
+                    HostKvOp::BeamList(instance, beam) => {
+                        serve(engine, Engine::programs, "beam_list")
+                            .and_then(|programs| programs.beam_list(instance, beam))
+                            .map(|list| list.iter().flat_map(|page| page.to_le_bytes()).collect())
+                            .map_err(Into::into)
+                    }
                     HostKvOp::ReloadWeights(checkpoint) => {
                         serve(engine, Engine::weights, "reload_weights")
                             .and_then(|weights| weights.reload(&::engine::Reload { checkpoint }))
@@ -2334,12 +2390,11 @@ impl Lane {
                 LaneCommit::None
             }
             QueuedItem::CloseInstance { id, .. } => {
-                let closed = backend(engine)
-                    .and_then(|engine| {
-                        serve(engine, Engine::programs, "close_instance")
-                            .and_then(|programs| programs.close(id))
-                            .map_err(anyhow::Error::from)
-                    });
+                let closed = backend(engine).and_then(|engine| {
+                    serve(engine, Engine::programs, "close_instance")
+                        .and_then(|programs| programs.close(id))
+                        .map_err(anyhow::Error::from)
+                });
                 let shared = crate::store::registry::try_get(0, engine_idx).and_then(|s| s.shared);
                 close_books(
                     id,
@@ -2524,14 +2579,11 @@ fn copy_settled_on_landing(
             serve(engine, Engine::tiers, "copy_kv").and_then(|tiers| tiers.copy_kv(&plan)),
         ),
         PreLaunchCopy::State(plan) => crate::engine::verbs::settled(
-            serve(engine, Engine::tiers, "copy_state")
-                .and_then(|tiers| tiers.copy_state(&plan)),
+            serve(engine, Engine::tiers, "copy_state").and_then(|tiers| tiers.copy_state(&plan)),
         ),
         PreLaunchCopy::Slots(plan) => {
             let landing = broker.landing_completion(waker::FIRST_COMPLETION_EPOCH);
-            if serve(engine, Engine::tiers, "copy_slots")?
-                .copy_landing(&plan, landing.wait_id())?
-            {
+            if serve(engine, Engine::tiers, "copy_slots")?.copy_landing(&plan, landing.wait_id())? {
                 Ok(SubmissionCompletion::ready())
             } else {
                 Ok(landing)
@@ -2566,9 +2618,7 @@ mod landing_tests {
         }
 
         fn measured_at_load(&self) -> Vec<String> {
-
             Vec::new()
-
         }
 
         fn skips_measuring(&self) -> bool {
@@ -2627,11 +2677,20 @@ mod landing_tests {
             Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
-        fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-            Err(::engine::Error::unsupported(self.kind(), "register_program"))
+        fn register(
+            &mut self,
+            _registration: &::engine::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "register_program",
+            ))
         }
 
-        fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        fn bind(
+            &mut self,
+            _binding: &::engine::InstanceBinding,
+        ) -> ::engine::Result<::engine::BoundInstance> {
             Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
         }
 
@@ -2639,8 +2698,14 @@ mod landing_tests {
             Err(::engine::Error::unsupported(self.kind(), "close_instance"))
         }
 
-        fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+        fn adapter(
+            &mut self,
+            _registration: &::engine::adapter::AdapterRegistration,
+        ) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "register_adapter",
+            ))
         }
     }
 
@@ -2654,7 +2719,10 @@ mod landing_tests {
         }
 
         fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "release_segments",
+            ))
         }
 
         fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -2682,19 +2750,28 @@ mod landing_tests {
             *self.sink.lock().unwrap() = Some(sink);
         }
 
-        fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        fn read(
+            &mut self,
+            _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        ) -> ::engine::Result<Vec<u8>> {
             Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
         }
 
-        fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+        fn write(
+            &mut self,
+            _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+            _bytes: &[u8],
+        ) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "write_tier_slots",
+            ))
         }
 
         fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
             Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
         }
     }
-
 
     fn park() -> PreLaunchCopy {
         PreLaunchCopy::Slots(SlotCopy {
@@ -2722,9 +2799,12 @@ mod landing_tests {
             tokens: Arc::clone(&tokens),
         };
         let told = broker.clone();
-        <LateCopies as ::engine::Tiers>::on_landed(&mut engine, Arc::new(move |token, landing| {
-            tell_landing(&told, 0, token, landing);
-        }));
+        <LateCopies as ::engine::Tiers>::on_landed(
+            &mut engine,
+            Arc::new(move |token, landing| {
+                tell_landing(&told, 0, token, landing);
+            }),
+        );
         (Box::new(engine), tokens, sink)
     }
 
@@ -2749,7 +2829,6 @@ mod landing_tests {
             "{error:#}"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -2758,10 +2837,10 @@ mod behind_tests {
 
     /// The behind tests read the process-wide pipeline count: one at a time.
     static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use ::engine::Engine;
     use ::engine::chunk::SlotCopy;
     use ::engine::fire::{FrameSubmission, FrameTicket};
     use ::engine::load::{LoadRequest, Loaded};
-    use ::engine::Engine;
 
     /// An engine with work left behind serving, counting the slices it ran.
     struct Pending(Arc<std::sync::atomic::AtomicUsize>);
@@ -2795,7 +2874,10 @@ mod behind_tests {
             true
         }
 
-        fn measure_behind(&mut self, _behind: &::engine::BehindServing<'_>) -> ::engine::Result<bool> {
+        fn measure_behind(
+            &mut self,
+            _behind: &::engine::BehindServing<'_>,
+        ) -> ::engine::Result<bool> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(true)
         }
@@ -2829,7 +2911,10 @@ mod behind_tests {
             Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
         }
 
-        fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
+        fn finish(
+            &mut self,
+            _prepared: ::engine::Prepared,
+        ) -> ::engine::Result<::engine::ProgramId> {
             Err(::engine::Error::unsupported(self.kind(), "finish_program"))
         }
 
@@ -2837,11 +2922,20 @@ mod behind_tests {
             Err(::engine::Error::unsupported(self.kind(), "close_program"))
         }
 
-        fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-            Err(::engine::Error::unsupported(self.kind(), "register_program"))
+        fn register(
+            &mut self,
+            _registration: &::engine::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "register_program",
+            ))
         }
 
-        fn bind(&mut self, _binding: &::engine::InstanceBinding) -> ::engine::Result<::engine::BoundInstance> {
+        fn bind(
+            &mut self,
+            _binding: &::engine::InstanceBinding,
+        ) -> ::engine::Result<::engine::BoundInstance> {
             Err(::engine::Error::unsupported(self.kind(), "bind_instance"))
         }
 
@@ -2849,8 +2943,14 @@ mod behind_tests {
             Err(::engine::Error::unsupported(self.kind(), "close_instance"))
         }
 
-        fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+        fn adapter(
+            &mut self,
+            _registration: &::engine::adapter::AdapterRegistration,
+        ) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "register_adapter",
+            ))
         }
     }
 
@@ -2864,7 +2964,10 @@ mod behind_tests {
         }
 
         fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "release_segments",
+            ))
         }
 
         fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -2885,12 +2988,22 @@ mod behind_tests {
             Ok(true)
         }
 
-        fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+        fn read(
+            &mut self,
+            _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        ) -> ::engine::Result<Vec<u8>> {
             Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
         }
 
-        fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+        fn write(
+            &mut self,
+            _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+            _bytes: &[u8],
+        ) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(
+                self.kind(),
+                "write_tier_slots",
+            ))
         }
 
         fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
@@ -2898,20 +3011,24 @@ mod behind_tests {
         }
     }
 
-
     /// While a process has work outstanding (a pipeline open), the lane runs
     /// none of an engine's behind work, whatever the engine states: never
     /// between the steps of live traffic.
     #[test]
     fn behind_work_waits_while_a_pipeline_is_open() {
-        let _alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _alone = ALONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         open_behind();
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut engine: Option<EngineBox> = Some(Box::new(Pending(Arc::clone(&ran))));
         let live = crate::pipeline::Pipeline::new();
         assert!(!crate::pipeline::none_active(), "an open pipeline is live");
         let sliced = Lane::measure_behind(usize::MAX, &mut engine, &|| false);
-        assert!(sliced.is_none(), "no slice while a process has work outstanding");
+        assert!(
+            sliced.is_none(),
+            "no slice while a process has work outstanding"
+        );
         assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(live);
     }
@@ -2922,7 +3039,9 @@ mod behind_tests {
     #[test]
     fn ready_turns_the_lanes_again_after_the_warm_run_s_grace() {
         use std::sync::atomic::Ordering::Relaxed;
-        let _alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _alone = ALONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         BEHIND_OPEN.store(false, Relaxed);
         BEHIND_PENDING.store(true, Relaxed);
         note_step(60_000_000);
@@ -2931,10 +3050,16 @@ mod behind_tests {
         LANES.lock().unwrap().push(tx);
         let opened = crate::pipeline::opened();
         open_behind();
-        assert!(matches!(rx.try_recv(), Ok(LaneRequest::Behind)), "ready's own turn");
+        assert!(
+            matches!(rx.try_recv(), Ok(LaneRequest::Behind)),
+            "ready's own turn"
+        );
         let again = rx.recv_timeout(std::time::Duration::from_secs(30));
         if crate::pipeline::none_active() && crate::pipeline::opened() == opened {
-            assert!(matches!(again, Ok(LaneRequest::Behind)), "the turn after the grace");
+            assert!(
+                matches!(again, Ok(LaneRequest::Behind)),
+                "the turn after the grace"
+            );
         }
     }
 
@@ -2943,7 +3068,9 @@ mod behind_tests {
     /// slice; past it, the work runs (a slice at a time).
     #[test]
     fn behind_work_waits_a_served_step_after_the_last_pipeline_closes() {
-        let _alone = ALONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _alone = ALONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         open_behind();
         note_step(60_000_000);
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2963,9 +3090,7 @@ mod behind_tests {
         }
         // Past it, a slice runs: wait for the grace to be spent, not for a
         // fixed time.
-        let spent = || {
-            crate::pipeline::idle_for().is_some_and(|idle| idle >= behind_grace())
-        };
+        let spent = || crate::pipeline::idle_for().is_some_and(|idle| idle >= behind_grace());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !spent() && crate::pipeline::none_active() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));

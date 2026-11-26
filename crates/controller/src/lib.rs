@@ -437,7 +437,8 @@ fn start_cluster(
     routing: watch::Receiver<RoutingTable>,
     directory: watch::Receiver<DirectoryView>,
 ) -> Result<Arc<cluster::Host>> {
-    cluster::Host::start(programs, cluster::call_deadline(), routing, directory).context("load the cluster policies")
+    cluster::Host::start(programs, cluster::call_deadline(), routing, directory)
+        .context("load the cluster policies")
 }
 
 /// Publishes the directory whenever a report changed it, at most every

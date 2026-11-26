@@ -50,7 +50,7 @@ pub use registry::{
     Program, Registry,
 };
 pub use scratch::{
-    ALIGN as SCRATCH_ALIGN, DUMMY_BYTES as SCRATCH_DUMMY_BYTES, Area as ScratchArea, Keeps, Launch,
+    ALIGN as SCRATCH_ALIGN, Area as ScratchArea, DUMMY_BYTES as SCRATCH_DUMMY_BYTES, Keeps, Launch,
     Launches, Layout, Lifetime, MAX_BYTES as SCRATCH_MAX_BYTES, POISON as SCRATCH_POISON,
     SELECT_RESERVE, TemporaryNeed, TemporaryRefused, TooLarge, describe_launched, launch_areas,
     lay_out, layout, layout_reusing, most_alive, read_only_unlaunched, region_rows,

@@ -663,7 +663,12 @@ impl Streamed {
                 continue;
             };
             let Some(plane) = layers.iter().find_map(|(_, banks)| {
-                shape.planes.iter().zip(banks).find(|(_, p)| **p == param).map(|(plane, _)| plane)
+                shape
+                    .planes
+                    .iter()
+                    .zip(banks)
+                    .find(|(_, p)| **p == param)
+                    .map(|(plane, _)| plane)
             }) else {
                 continue;
             };
@@ -830,7 +835,6 @@ impl Streamed {
     }
 }
 
-
 /// What one fire's walk reads the streamed weights through.
 #[derive(Debug, Default)]
 pub struct Fire {
@@ -929,5 +933,4 @@ fn packed_rows(bytes: &mut [u8]) {
 }
 
 #[cfg(test)]
-mod packed {
-}
+mod packed {}

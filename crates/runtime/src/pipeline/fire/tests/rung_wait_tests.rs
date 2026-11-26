@@ -61,8 +61,8 @@ async fn a_few_rows_staged_under_a_wide_cap_hold_the_rung_until_they_settle() {
     assert_eq!(crate::store::shared::fire_cap(ENGINE), u32::MAX);
 
     // A two-row pass is cut and its fire staged under that cap.
-    let ask = super::ask_rung(&stores, ENGINE, pid, pid, 2, 2)
-        .expect("two rows ask whatever the cap");
+    let ask =
+        super::ask_rung(&stores, ENGINE, pid, pid, 2, 2).expect("two rows ask whatever the cap");
     assert_eq!(ask.wait(2).await, Ok(()));
     let fire = crate::engine::completion::WorkItemCompletion::new(1, 1);
     ask.until_settled(&fire);
@@ -229,8 +229,8 @@ async fn a_bind_waiting_in_the_planner_takes_the_span_back_and_the_rung_rises_af
     ));
     crate::planner::init_planner(model, ENGINE, planner);
     let planner = crate::planner::planner_for(model, ENGINE).expect("installed");
-    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
-        .with_live_lanes(|| 1);
+    let grow =
+        crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone()).with_live_lanes(|| 1);
     // kv takes every chunk below the span; a pass asks the largest rung.
     let _kv = {
         let mut pool = shared.lock().unwrap();
@@ -287,8 +287,8 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
     let _schedule = crate::policy::schedule::TEST_LOCK.read().await;
     let (model, stores) = super::unfolded_tests::pool_with_rungs_of(vec![(1, 2), (512, 8)]);
     let shared = stores.shared.clone().expect("a shared pool");
-    let grow = crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone())
-        .with_live_lanes(|| 1);
+    let grow =
+        crate::store::shared::SharedGrow::new(model, ENGINE, shared.clone()).with_live_lanes(|| 1);
     let planner = crate::planner::ResidencyPlanner::new(std::sync::Arc::new(
         crate::planner::RegistryPool::new(model, 0, false).with_shared_grow(grow.clone()),
     ));
@@ -328,13 +328,19 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
         kv_pages: 2,
         rs: crate::store::rs::RsUnits::default(),
     };
-    assert!(planner.grant_now(pid, demand).is_none(), "idle cache is pinned");
+    assert!(
+        planner.grant_now(pid, demand).is_none(),
+        "idle cache is pinned"
+    );
     grow.walk_rung().await;
     assert_eq!(cap(), u32::MAX, "no waiter is queued");
     {
         let ask = planner.wait_bind_room(pid, 1, 2, 0);
         tokio::pin!(ask);
-        assert!(futures::poll!(ask.as_mut()).is_pending(), "idle cache is pinned");
+        assert!(
+            futures::poll!(ask.as_mut()).is_pending(),
+            "idle cache is pinned"
+        );
         passes().await;
         assert!(futures::poll!(ask.as_mut()).is_pending());
         // The reader's end has idle cache found out asked again.
@@ -349,7 +355,10 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
     {
         let ask = planner.wait_bind_room(pid, 1, 2, 0);
         tokio::pin!(ask);
-        assert!(futures::poll!(ask.as_mut()).is_pending(), "idle cache is pinned");
+        assert!(
+            futures::poll!(ask.as_mut()).is_pending(),
+            "idle cache is pinned"
+        );
         grow.walk_rung().await;
         assert_eq!(cap(), u32::MAX, "a pass asks idle cache first");
         passes().await;
@@ -360,7 +369,8 @@ async fn the_rung_comes_down_for_a_waiter_only_once_idle_cache_is_out() {
     crate::store::shared::set_fire_cap_for_test(ENGINE, u32::MAX);
     {
         let mut pool = shared.lock().unwrap();
-        pool.pool_mut().wait(crate::store::roles::GUEST_WAITER, list, 2);
+        pool.pool_mut()
+            .wait(crate::store::roles::GUEST_WAITER, list, 2);
         pool.set_guest_head(Some((2, 1)));
     }
     planner.pages_freed();

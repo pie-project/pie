@@ -863,7 +863,12 @@ fn row_split_max(
         .nodes
         .iter()
         .filter_map(|&node| plan.ops.get(node as usize))
-        .filter(|op| matches!(op.tag, tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN))
+        .filter(|op| {
+            matches!(
+                op.tag,
+                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+            )
+        })
         .filter_map(|op| op.args.first().copied());
     let width = reduced
         .chain(region.inputs.iter().copied())
@@ -877,7 +882,11 @@ fn row_split_max(
         .div_ceil(super::compile::MAX_BLOCK_THREADS * 4)
         .next_power_of_two();
     let held = (device_units() / rows.max(1)).clamp(1, passes);
-    let most = if argmaxes { held.min(LANE_SAMPLER_BLOCKS) } else { held };
+    let most = if argmaxes {
+        held.min(LANE_SAMPLER_BLOCKS)
+    } else {
+        held
+    };
     1u32 << (31 - most.leading_zeros())
 }
 
@@ -897,10 +906,8 @@ fn splits(plan: &LaunchStagePlan, region: &LaunchRegion, rows: u32) -> Option<u3
         .nodes
         .first()
         .and_then(|&node| plan.ops.get(node as usize))?;
-    (rows == 1
-        && selects(plan, region)
-        && eta_compiler::codegen::cuda::order::top_k_splits(op.imm))
-    .then(|| eta_compiler::codegen::cuda::order::top_k_split_blocks(op.imm))
+    (rows == 1 && selects(plan, region) && eta_compiler::codegen::cuda::order::top_k_splits(op.imm))
+        .then(|| eta_compiler::codegen::cuda::order::top_k_split_blocks(op.imm))
 }
 
 fn selects(plan: &LaunchStagePlan, region: &LaunchRegion) -> bool {
@@ -1101,7 +1108,11 @@ impl Prepared {
             .zip(&rows_of)
             .map(|(region, &rows)| row_split_max(plan, &descriptors, region, rows))
             .collect();
-        let phases = plan.fused.iter().map(|region| region.phases.max(1)).collect();
+        let phases = plan
+            .fused
+            .iter()
+            .map(|region| region.phases.max(1))
+            .collect();
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
@@ -1538,7 +1549,10 @@ impl Prepared {
         let Some(&(at, held)) = self.row_tables.get(slot as usize) else {
             return Err(Fault::program(
                 "program::launch",
-                format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
+                format!(
+                    "slot {slot} is past the {} this stage's outputs take",
+                    self.pitch
+                ),
             ));
         };
         // Every pointer the table holds is written: the stage reads all
@@ -1558,9 +1572,7 @@ impl Prepared {
         }
         let first = lane as usize * self.row_words as usize + at as usize;
         self.row_pointers_host[first..first + rows.len()].copy_from_slice(rows);
-        let table = self.cells
-            + self.cell_at[6] as u64
-            + first as u64 * size_of::<u64>() as u64;
+        let table = self.cells + self.cell_at[6] as u64 + first as u64 * size_of::<u64>() as u64;
         let mode = if bf16 {
             INTRINSIC_STORAGE_ROW_POINTERS
         } else {
@@ -1587,7 +1599,10 @@ impl Prepared {
         if slot >= self.pitch {
             return Err(Fault::program(
                 "program::launch",
-                format!("slot {slot} is past the {} this stage's outputs take", self.pitch),
+                format!(
+                    "slot {slot} is past the {} this stage's outputs take",
+                    self.pitch
+                ),
             ));
         }
         if lane >= self.lanes {
@@ -1702,7 +1717,8 @@ impl Prepared {
             // the fire's lanes' rows (they wait on one another), meeting at
             // its word of its lane's barrier line.
             let most = self.row_split_most.get(at).copied().unwrap_or(1).max(1);
-            let held = (device_units() / self.filled.saturating_mul(region_rows).max(1)).clamp(1, most);
+            let held =
+                (device_units() / self.filled.saturating_mul(region_rows).max(1)).clamp(1, most);
             let split = 1u32 << (31 - held.leading_zeros());
             if split > 1 {
                 let need = u64::from(self.filled) * lane_span(1);
@@ -1950,8 +1966,7 @@ impl Prepared {
 /// barrier, so it never runs on more than these hold at once.
 /// The queue masks the load states ([`crate::serve::Knobs::queue_masks`]),
 /// held for [`device_units`]: the process's, so the first load's.
-static QUEUE_MASKS: std::sync::OnceLock<crate::serve::QueueMasks> =
-    std::sync::OnceLock::new();
+static QUEUE_MASKS: std::sync::OnceLock<crate::serve::QueueMasks> = std::sync::OnceLock::new();
 
 /// States the process's queue masks, ahead of any sampler laid
 /// ([`device_units`]). They are the process's start's, so a later load's
@@ -2016,7 +2031,9 @@ pub fn device_units() -> u32 {
             #[cfg(feature = "rocm")]
             {
                 let _ = units;
-                kernels_cuda::hip::multiprocessors(device.unsigned_abs()).unwrap_or(1).max(1)
+                kernels_cuda::hip::multiprocessors(device.unsigned_abs())
+                    .unwrap_or(1)
+                    .max(1)
             }
             #[cfg(not(feature = "rocm"))]
             units
@@ -2038,7 +2055,11 @@ pub fn device_units() -> u32 {
 pub fn queue_units(units: u32, agent: u32, hsa: Option<&str>, global: Option<&str>) -> u32 {
     fn indices(list: &str) -> Option<Vec<u32>> {
         let mut out = Vec::new();
-        for part in list.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        for part in list
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
             match part.split_once('-') {
                 Some((a, b)) => {
                     let (a, b): (u32, u32) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
@@ -2054,7 +2075,11 @@ pub fn queue_units(units: u32, agent: u32, hsa: Option<&str>, global: Option<&st
     }
     let mut held: Vec<bool> = vec![true; units as usize];
     if let Some(hsa) = hsa.map(str::trim).filter(|mask| !mask.is_empty()) {
-        for entry in hsa.split(';').map(str::trim).filter(|entry| !entry.is_empty()) {
+        for entry in hsa
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
             let Some((agents, list)) = entry.split_once(':') else {
                 return 1;
             };
@@ -2081,7 +2106,9 @@ pub fn queue_units(units: u32, agent: u32, hsa: Option<&str>, global: Option<&st
             *on &= digit >> (unit % 4) & 1 == 1;
         }
     }
-    u32::try_from(held.iter().filter(|&&on| on).count()).unwrap_or(1).max(1)
+    u32::try_from(held.iter().filter(|&&on| on).count())
+        .unwrap_or(1)
+        .max(1)
 }
 
 pub fn launch(
@@ -2461,7 +2488,8 @@ mod tests {
     /// gather buffers with it however few blocks it runs on.
     #[test]
     fn the_lane_arenas_hold_every_launch_s_lanes() {
-        let (stage, _) = shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
+        let (stage, _) =
+            shipped::compiled(&shipped::all(shipped::QWEN_VOCAB)[0].1, shipped::QWEN_VOCAB);
         let stage = &stage[0];
         let region = stage
             .fused

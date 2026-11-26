@@ -7,10 +7,10 @@
 //! served, else the instance would read its ring where it no longer lies.
 
 use crate::common_two_axis::{Rig, WIDTH, Weights, assert_close, frame, trace};
-use engine::{Channels, Engine, Programs};
 use engine::chunk::SlotRole;
 use engine::fire::Attachment;
 use engine::program::Rebind;
+use engine::{Channels, Engine, Programs};
 use engine_cuda::program::Endpoint;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;

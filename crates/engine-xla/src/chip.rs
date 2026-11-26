@@ -374,7 +374,6 @@ mod tests {
         assert_eq!(registry().check(), Vec::<String>::new());
     }
 
-
     #[test]
     fn the_checked_in_profiles_hold_together() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");

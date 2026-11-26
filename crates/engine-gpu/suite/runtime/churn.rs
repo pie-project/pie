@@ -97,7 +97,9 @@ fn armed_bodies_replay_across_segment_churn() {
         if step % 2 == 0 {
             shell.commit_segments(most).expect("the segments commit");
         } else {
-            shell.release_segments(least).expect("the segments are given back");
+            shell
+                .release_segments(least)
+                .expect("the segments are given back");
         }
     });
     assert_eq!(

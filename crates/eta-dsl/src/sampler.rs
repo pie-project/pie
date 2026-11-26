@@ -103,7 +103,12 @@ pub fn standard() -> Vec<(String, Shape)> {
         ("", "", false, None),
         ("penalized ", "", true, None),
         ("", " + top logprobs", false, Some(STANDARD_TOP_LOGPROBS)),
-        ("penalized ", " + top logprobs", true, Some(STANDARD_TOP_LOGPROBS)),
+        (
+            "penalized ",
+            " + top logprobs",
+            true,
+            Some(STANDARD_TOP_LOGPROBS),
+        ),
     ];
     extras
         .iter()
@@ -212,7 +217,14 @@ pub fn prefill(
     g0: &Channel,
     carried_on: Option<&(Channel, Option<(Channel, Channel)>)>,
 ) {
-    prefill_with(vocab, knobs, LogprobsMode::RawLogprobs, slots, g0, carried_on);
+    prefill_with(
+        vocab,
+        knobs,
+        LogprobsMode::RawLogprobs,
+        slots,
+        g0,
+        carried_on,
+    );
 }
 
 /// [`prefill`], its logprobs scored as `mode` says.

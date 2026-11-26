@@ -34,7 +34,12 @@ fn main() {
     for dep in ["compat", "Cargo.toml", "Cargo.lock"] {
         println!("cargo:rerun-if-changed={}", inferlets.join(dep).display());
     }
-    for dep in ["cluster-defaults", "worker-defaults", "Cargo.toml", "Cargo.lock"] {
+    for dep in [
+        "cluster-defaults",
+        "worker-defaults",
+        "Cargo.toml",
+        "Cargo.lock",
+    ] {
         println!("cargo:rerun-if-changed={}", policies.join(dep).display());
     }
     for dep in [
@@ -84,7 +89,9 @@ fn main() {
         inputs.push(root.join(dep));
     }
     let source = source_fingerprint(&root, &inputs);
-    let mut generated = format!("/// What the built-ins are built from, by content.\npub const SOURCE: &str = {source:?};\n");
+    let mut generated = format!(
+        "/// What the built-ins are built from, by content.\npub const SOURCE: &str = {source:?};\n"
+    );
     // Inferlets are WASI 0.3 components as built. PLEX 1.1 policies are
     // core modules carrying their component type, made components here: a
     // policy imports only the contract, no WASI.
@@ -152,7 +159,10 @@ fn source_fingerprint(root: &Path, inputs: &[PathBuf]) -> String {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if path.file_name().is_some_and(|n| n == "target" || n == ".git") {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == ".git")
+                {
                     continue;
                 }
                 walk.push(path);
@@ -164,7 +174,11 @@ fn source_fingerprint(root: &Path, inputs: &[PathBuf]) -> String {
     let mut keyed: Vec<(String, PathBuf)> = files
         .into_iter()
         .map(|p| {
-            let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
             (rel, p)
         })
         .collect();

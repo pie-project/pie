@@ -30,8 +30,16 @@ fn events(running: &[ProcessId], waiting: &[ProcessId], exits: &[ProcessId]) -> 
         .iter()
         .flat_map(|&pid| [Event::Arrived(pid, Arrival::default()), Event::Started(pid)])
         .collect();
-    events.extend(waiting.iter().map(|&pid| Event::Arrived(pid, Arrival::default())));
-    events.extend(exits.iter().map(|&pid| Event::Exited(pid, Outcome::Completed)));
+    events.extend(
+        waiting
+            .iter()
+            .map(|&pid| Event::Arrived(pid, Arrival::default())),
+    );
+    events.extend(
+        exits
+            .iter()
+            .map(|&pid| Event::Exited(pid, Outcome::Completed)),
+    );
     events
 }
 
@@ -70,7 +78,10 @@ fn past_the_lanes_to_the_end_a_start_is_held_and_the_running_run_on() {
     assert!(!held(a) && !held(b), "the running are not held");
     assert!(held(c) && held(d), "the waiting wait for a lane to finish");
     // One that arrives after the policy's last call is held by the default.
-    assert!(held(ProcessId::from_u128(0x5eff)), "the hold's default is true");
+    assert!(
+        held(ProcessId::from_u128(0x5eff)),
+        "the hold's default is true"
+    );
 }
 
 /// A lane finishes: the oldest waiting one is let go, first come, first
@@ -107,11 +118,17 @@ fn spread_starts_go_one_a_step() {
     let _alone = alone();
     let [a, b, c, d, e] = pids::<5>(0x5e30);
     let hour = 3_600_000_000_000;
-    run(&worker(2, true, Some(hour)), events(&[a, b], &[c, d, e], &[a, b]));
+    run(
+        &worker(2, true, Some(hour)),
+        events(&[a, b], &[c, d, e], &[a, b]),
+    );
     assert!(!held(c), "the oldest starts");
     assert!(held(d) && held(e), "the rest a step apart");
     // Not spread: both freed lanes start at once.
-    run(&worker(2, false, Some(hour)), events(&[a, b], &[c, d, e], &[a, b]));
+    run(
+        &worker(2, false, Some(hour)),
+        events(&[a, b], &[c, d, e], &[a, b]),
+    );
     assert!(!held(c) && !held(d));
     assert!(held(e));
 }

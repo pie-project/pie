@@ -136,7 +136,10 @@ pub enum RegisterError {
     Overflow(&'static str),
     /// The program's channel cells ([`Pricing::channel_bytes`]) take more
     /// than an instance's state room holds, where they are laid.
-    ChannelsPastRoom { bytes: u64, room: u64 },
+    ChannelsPastRoom {
+        bytes: u64,
+        room: u64,
+    },
 }
 
 impl fmt::Display for RegisterError {
@@ -701,7 +704,10 @@ mod budget_tests {
         TraceContainer {
             stages: vec![StageProgram {
                 stage: Stage::Prologue,
-                ops: vec![Op::Const(Literal::F32(0.5)), Op::Broadcast { value: 0, shape }],
+                ops: vec![
+                    Op::Const(Literal::F32(0.5)),
+                    Op::Broadcast { value: 0, shape },
+                ],
             }],
             ..TraceContainer::default()
         }
@@ -743,7 +749,14 @@ mod budget_tests {
         assert_eq!(registry.inner.len(), 0, "a refused program is not held");
 
         let fits = registry
-            .register(broadcast(Shape::vector(4096)), vec![], EngineCaps::default(), budget, None, None)
+            .register(
+                broadcast(Shape::vector(4096)),
+                vec![],
+                EngineCaps::default(),
+                budget,
+                None,
+                None,
+            )
             .expect("a 16 KiB prologue registers");
         assert_eq!(fits.bound.budget, Some(budget));
     }
@@ -783,7 +796,9 @@ mod tenant_tests {
     }
 
     fn held(registry: &mut Registry, n: u32) -> bool {
-        registry.inner.contains(&eta_ir::container_hash(&program(n)))
+        registry
+            .inner
+            .contains(&eta_ir::container_hash(&program(n)))
     }
 
     /// One tenant registering program after program churns only its own
@@ -792,10 +807,20 @@ mod tenant_tests {
     #[test]
     fn one_tenant_churns_only_its_own_share_of_the_registry() {
         let mut registry = Registry::new(NonZeroUsize::new(4).unwrap());
-        let (a, b): (Tenant, Tenant) = (Some(uuid::Uuid::from_u128(1)), Some(uuid::Uuid::from_u128(2)));
+        let (a, b): (Tenant, Tenant) = (
+            Some(uuid::Uuid::from_u128(1)),
+            Some(uuid::Uuid::from_u128(2)),
+        );
         let register = |registry: &mut Registry, n: u32, tenant: Tenant| {
             registry
-                .register(program(n), vec![], EngineCaps::default(), ROOM, tenant, None)
+                .register(
+                    program(n),
+                    vec![],
+                    EngineCaps::default(),
+                    ROOM,
+                    tenant,
+                    None,
+                )
                 .expect("registers");
         };
         for n in 1..=4 {
@@ -810,7 +835,10 @@ mod tenant_tests {
         for n in 5..1005 {
             register(&mut registry, n, a);
         }
-        assert!(held(&mut registry, 100) && held(&mut registry, 101), "b's share stands");
+        assert!(
+            held(&mut registry, 100) && held(&mut registry, 101),
+            "b's share stands"
+        );
         assert!(held(&mut registry, 1003) && held(&mut registry, 1004));
         assert_eq!(registry.inner.len(), 4);
         // The runtime's own programs (no tenant) are a tenant like any other.
@@ -874,28 +902,34 @@ mod register_tests {
             }],
             ..TraceContainer::default()
         };
-        let err = register_with(bad.encode(), vec![], EngineCaps::default(), ROOM, None, None)
-            .unwrap_err();
+        let err = register_with(
+            bad.encode(),
+            vec![],
+            EngineCaps::default(),
+            ROOM,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, RegisterError::Bind(ValidateError::Body { .. })),
             "{err}"
         );
         assert!(err.to_string().contains('5'), "{err}");
         let good = TraceContainer::default();
-        let hash = register_with(good.encode(), vec![], EngineCaps::default(), ROOM, None, None)
-            .expect("a valid program registers after a refused one")
-            .hash;
+        let hash = register_with(
+            good.encode(),
+            vec![],
+            EngineCaps::default(),
+            ROOM,
+            None,
+            None,
+        )
+        .expect("a valid program registers after a refused one")
+        .hash;
         assert!(super::lookup(hash).is_some());
     }
 }
 
 #[cfg(test)]
-mod row_extent_tests {
-    
-    
-    
-    
-    
-    
-
-}
+mod row_extent_tests {}

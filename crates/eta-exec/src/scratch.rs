@@ -4,7 +4,7 @@ pub use eta_compiler::codegen::temporary::TemporaryNeed;
 mod lifetime;
 
 pub use lifetime::{
-    Keeps, Launch, Launches, describe_launched, lay_out, launch_areas, read_only_unlaunched,
+    Keeps, Launch, Launches, describe_launched, launch_areas, lay_out, read_only_unlaunched,
     region_rows, value_lifetimes,
 };
 
@@ -32,10 +32,7 @@ pub const SELECT_RESERVE: u64 = eta_compiler::codegen::wgsl::SELECT_WORDS as u64
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TooLarge {
-    Bound {
-        bytes: u64,
-        limit: u64,
-    },
+    Bound { bytes: u64, limit: u64 },
 
     Overflow,
 }
@@ -310,9 +307,8 @@ fn place(
         candidates.sort_unstable();
         candidates.dedup();
         let fits = |at: u64| {
-            near.iter().all(|&(start, end, one)| {
-                end <= at || at + span <= start || (one && start == at)
-            })
+            near.iter()
+                .all(|&(start, end, one)| end <= at || at + span <= start || (one && start == at))
         };
         let offset = candidates
             .iter()
@@ -461,7 +457,11 @@ mod tests {
         let short = [desc(16)];
         let whole = whole_value_temporaries(&short).unwrap();
         assert_eq!(whole, 16 * 16);
-        assert_eq!(stage_temporaries(&short, &[]), Ok(whole), "none published: the rule");
+        assert_eq!(
+            stage_temporaries(&short, &[]),
+            Ok(whole),
+            "none published: the rule"
+        );
         let select = TemporaryNeed {
             fixed: 51_200,
             per_row: None,
@@ -500,7 +500,10 @@ mod tests {
             above_whole: true,
             ..TemporaryNeed::default()
         };
-        assert_eq!(stage_temporaries(&short, &[past]), Err(TemporaryRefused::Overflow));
+        assert_eq!(
+            stage_temporaries(&short, &[past]),
+            Err(TemporaryRefused::Overflow)
+        );
     }
 
     fn life(def: u32, last: u32) -> Lifetime {
@@ -589,7 +592,9 @@ mod tests {
                     class_last: class,
                 });
             }
-            let places = layout_reusing(&descriptors, &lifetimes, 0, 0).unwrap().values;
+            let places = layout_reusing(&descriptors, &lifetimes, 0, 0)
+                .unwrap()
+                .values;
             let span = |i: usize| align_up(descriptors[i].device_bytes()).unwrap();
             for i in 0..count {
                 for j in 0..count {
@@ -657,18 +662,26 @@ mod tests {
                 .filter(|&i| !lifetimes[i].dead)
                 .map(|i| {
                     let at = laid.values[i];
-                    (at, at + descriptors[i].device_bytes(), lifetimes[i], lifetimes[i].reusable)
+                    (
+                        at,
+                        at + descriptors[i].device_bytes(),
+                        lifetimes[i],
+                        lifetimes[i].reusable,
+                    )
                 })
                 .collect();
-            items.extend(areas.iter().zip(&laid.areas).map(|(area, &first)| {
-                (first - area.reserve, first + area.bytes, area.life, true)
-            }));
+            items.extend(
+                areas.iter().zip(&laid.areas).map(|(area, &first)| {
+                    (first - area.reserve, first + area.bytes, area.life, true)
+                }),
+            );
             for (x, &(start, end, life, ours)) in items.iter().enumerate() {
                 assert!(start >= DUMMY_BYTES && end <= laid.total, "{laid:?}");
                 for &(s, e, them, theirs) in &items[x + 1..] {
                     // A value that may go unwritten in part takes no bytes
                     // any item held before it.
-                    let fresh = (!theirs && them.def > life.last) || (!ours && life.def > them.last);
+                    let fresh =
+                        (!theirs && them.def > life.last) || (!ours && life.def > them.last);
                     if overlap(life, them) || fresh {
                         assert!(end <= s || e <= start, "{items:?}");
                     }

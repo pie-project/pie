@@ -521,7 +521,7 @@ impl Sink<'_> {
         let group = self
             .pipelines
             .bind_group(core, &pipeline, &keyed, uniform_bytes, rebased.as_deref())
-        .map_err(|fault| Sink::refuse(fire, fault))?;
+            .map_err(|fault| Sink::refuse(fire, fault))?;
         // The scalars in this frame's slot, the group reading them there.
         let mut offsets: Vec<u32> = Vec::with_capacity(1);
         if pipeline.uniform.is_some() {

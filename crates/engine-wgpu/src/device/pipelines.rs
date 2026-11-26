@@ -761,8 +761,15 @@ fn build_rebased(
     let binding = declared.uniform.map_or(declared.bindings, |at| at + 1);
     let wgsl = rebase_wgsl(&pipeline.wgsl, &declared.names, binding)
         .map_err(|why| shader(format!("no rebased twin: {why}")))?;
-    let (twin, layout) = pipeline_of(core, layouts, pipeline.name, &declared, Some(binding), &wgsl)
-        .map_err(shader)?;
+    let (twin, layout) = pipeline_of(
+        core,
+        layouts,
+        pipeline.name,
+        &declared,
+        Some(binding),
+        &wgsl,
+    )
+    .map_err(shader)?;
     let bytes = 16 * u32::try_from(declared.bindings.div_ceil(4).max(1)).unwrap_or(u32::MAX);
     Ok(Arc::new(Rebased {
         pipeline: twin,

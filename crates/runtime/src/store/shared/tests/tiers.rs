@@ -402,7 +402,10 @@ fn with_no_host_tier_an_evicted_set_s_state_parks_on_disk_and_frees_the_device()
     let sets = HashSet::from([ws]);
     let held = s.suspendable(&sets);
     assert!(!held.is_zero(), "its state holds device slots");
-    assert!(s.prepare_suspend(&sets).is_none(), "no disk tier: it stays on the device");
+    assert!(
+        s.prepare_suspend(&sets).is_none(),
+        "no disk tier: it stays on the device"
+    );
 
     let file = Arc::new(DiskFile(Mutex::new((0..8).collect())));
     s.set_disk(&shared, file.clone());
@@ -413,27 +416,45 @@ fn with_no_host_tier_an_evicted_set_s_state_parks_on_disk_and_frees_the_device()
     assert!(plan.shared.is_empty(), "nothing to a host tier");
     let to_disk: usize = plan.disk.iter().map(|(_, pairs)| pairs.len()).sum();
     let named: usize = device_refs.iter().map(|(_, refs)| refs.len()).sum();
-    assert_eq!(to_disk, named, "every device slot of its state copied to disk");
+    assert_eq!(
+        to_disk, named,
+        "every device slot of its state copied to disk"
+    );
     for (shape, pairs) in &plan.disk {
         let device = &device_refs.iter().find(|(at, _)| at == shape).unwrap().1;
-        assert!(pairs.iter().all(|(from, _)| device.contains(from)), "by shape");
+        assert!(
+            pairs.iter().all(|(from, _)| device.contains(from)),
+            "by shape"
+        );
     }
     let taken = 8 - crate::store::roles::DiskSlots::free_chunks(&*file);
     assert!(taken > 0, "disk chunks of its shapes opened");
     let freed = s.commit_suspend(txn);
     assert_eq!(freed, held, "its device slots come free");
-    assert!(s.private_slot_refs(&sets).is_empty(), "nothing of it on the device");
+    assert!(
+        s.private_slot_refs(&sets).is_empty(),
+        "nothing of it on the device"
+    );
     assert!(s.disk_rows() > 0);
     assert_eq!(s.swapped_units(&sets), held, "parked, counted as swapped");
 
     let swapped = s.swapped_units(&sets);
     let mut grant = s.reserve(swapped).expect("device room to come back");
     let txn = s.prepare_restore(&sets, &mut grant).expect("it comes back");
-    let back: usize = txn.copy_plan().disk.iter().map(|(_, pairs)| pairs.len()).sum();
+    let back: usize = txn
+        .copy_plan()
+        .disk
+        .iter()
+        .map(|(_, pairs)| pairs.len())
+        .sum();
     assert_eq!(back, named, "read back from the disk");
     s.commit_restore(txn);
     assert_eq!(s.disk_rows(), 0, "no disk row held");
-    assert_eq!(crate::store::roles::DiskSlots::free_chunks(&*file), 8, "its disk chunks given back");
+    assert_eq!(
+        crate::store::roles::DiskSlots::free_chunks(&*file),
+        8,
+        "its disk chunks given back"
+    );
     assert_eq!(s.suspendable(&sets), held, "on the device again");
 }
 
@@ -452,7 +473,12 @@ fn rs_and_role_disk_takes_and_kv_run_together_without_deadlock() {
     assert!(tiers.host.is_none() && tiers.disk_slots > 0);
     let shared: Shared = Arc::new(Mutex::new(SharedPool::new(&facts, 256).unwrap()));
     let stores = crate::store::registry::shared_stores(&shared, &tiers, 16, 4096);
-    let disk = stores.rs.lock().unwrap().disk_slots().expect("the rs store parks on disk");
+    let disk = stores
+        .rs
+        .lock()
+        .unwrap()
+        .disk_slots()
+        .expect("the rs store parks on disk");
     let ws = {
         let mut s = stores.rs.lock().unwrap();
         let ws = s.create_working_set(RsGeometry {
@@ -544,10 +570,11 @@ fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
     let spread: HashSet<usize> = kept.iter().map(|page| page.0 as usize / spc).collect();
     assert_eq!(spread.len(), 3, "pages in each of three chunks");
     let free_before = shared.lock().unwrap().pool().free_chunks();
-    let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&seed, None, 0, &(0..96).collect::<Vec<_>>())
-        .chunks(16)
-        .map(|page| page.iter().map(|h| Some(*h)).collect())
-        .collect();
+    let tokens: Vec<Vec<Option<Hash256>>> =
+        chain_slots(&seed, None, 0, &(0..96).collect::<Vec<_>>())
+            .chunks(16)
+            .map(|page| page.iter().map(|h| Some(*h)).collect())
+            .collect();
     let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
     let mut bytes = Bytes::default();
     for (at, page) in kept.iter().enumerate() {
@@ -563,9 +590,18 @@ fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
     // Two chunks wanted: the emptiest two empty into the third.
     let plan = kv.plan_list_compaction(2, &|_, _| true).expect("a plan");
     assert_eq!((plan.chunks.len(), plan.pages), (2, 3), "{plan:?}");
-    assert!(plan.readers.is_empty() && plan.parked.is_empty(), "idle cache: no reader");
+    assert!(
+        plan.readers.is_empty() && plan.parked.is_empty(),
+        "idle cache: no reader"
+    );
     // Not more than the free slots elsewhere take.
-    assert!(kv.plan_list_compaction(3, &|_, _| true).unwrap().chunks.len() == 2);
+    assert!(
+        kv.plan_list_compaction(3, &|_, _| true)
+            .unwrap()
+            .chunks
+            .len()
+            == 2
+    );
     let txn = kv.prepare_relocate(&plan, &HashSet::new()).expect("a move");
     // Pinned as a move's: a second plan finds nothing more to move.
     assert!(kv.plan_list_compaction(1, &|_, _| true).is_none());
@@ -599,7 +635,11 @@ fn a_list_compaction_frees_whole_chunks_of_scattered_pages() {
             panic!("resident");
         };
         chunks_now.insert(page.0 as usize / spc);
-        assert_eq!(bytes.device(LIST, page.0), Some(900 + at as u64), "page {at}");
+        assert_eq!(
+            bytes.device(LIST, page.0),
+            Some(900 + at as u64),
+            "page {at}"
+        );
     }
     assert_eq!(chunks_now.len(), 1, "every page in one chunk");
 }
@@ -617,7 +657,10 @@ fn a_whole_chunk_opens_from_what_holds_its_pages_alone() {
     let list = shared.lock().unwrap().list().unwrap();
     let mut kv = KvStore::with_pool(ShapePool::shared(&shared, list), 0, 0, seed);
     let tiers = Tiers::of(&facts).unwrap();
-    let host = tiers.host.as_ref().map(|host| ShapePool::shared(host, list));
+    let host = tiers
+        .host
+        .as_ref()
+        .map(|host| ShapePool::shared(host, list));
     kv.set_tiers(list.id, host, tiers.disk_slots);
     kv.set_page_size(16);
     kv.set_keeps(true);
@@ -649,25 +692,43 @@ fn a_whole_chunk_opens_from_what_holds_its_pages_alone() {
             .collect();
         let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
         keys_of.push((entry, keys.clone()));
-        let backings = halves[entry].iter().map(|&page| KvPageBacking::Resident(page)).collect();
+        let backings = halves[entry]
+            .iter()
+            .map(|&page| KvPageBacking::Resident(page))
+            .collect();
         assert!(kv.import_cached_at(&[], tokens, keys, backings));
     }
     let fire = kv.begin_fire();
     kv.settle(fire);
-    assert_eq!(kv.reclaim_chunks(1, |_| 0), 2 * per_chunk, "the two that share its chunk");
+    assert_eq!(
+        kv.reclaim_chunks(1, |_| 0),
+        2 * per_chunk,
+        "the two that share its chunk"
+    );
     kv.retire_idle();
     assert_eq!(free(), left + 2, "and both their chunks open");
     for (entry, keys) in &keys_of {
-        assert_eq!(!kv.cached_run(keys).is_empty(), *entry >= 2, "entry {entry}");
+        assert_eq!(
+            !kv.cached_run(keys).is_empty(),
+            *entry >= 2,
+            "entry {entry}"
+        );
     }
     // Moved down a tier instead, one chunk's pages alone: the rest stay.
-    let txn = kv.prepare_demote_chunks(1, |_| 0).unwrap().expect("the host has room");
+    let txn = kv
+        .prepare_demote_chunks(1, |_| 0)
+        .unwrap()
+        .expect("the host has room");
     assert_eq!(txn.page_count(), per_chunk);
     assert_eq!(kv.commit_suspend(txn).unwrap(), per_chunk);
     kv.retire_idle();
     assert_eq!(free(), left + 3);
     for (entry, keys) in keys_of {
         let kept = kv.cached_run_any_tier(&keys).len();
-        assert_eq!(kept, if entry >= 2 { per_chunk } else { 0 }, "entry {entry}");
+        assert_eq!(
+            kept,
+            if entry >= 2 { per_chunk } else { 0 },
+            "entry {entry}"
+        );
     }
 }

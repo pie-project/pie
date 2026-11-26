@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Tiers, WeightCache};
 use engine::adapter::AdapterRegistration;
 use engine::caps::DeviceFacts;
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -10,6 +9,7 @@ use engine::fire::{FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle};
+use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Tiers, WeightCache};
 use eta_ir::container::HostRole;
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, World};
@@ -268,9 +268,7 @@ impl Group {
                                         (&error, &lanes),
                                         (Error::Lanes(these), Some(first)) if these == first
                                     );
-                                    tracing::warn!(
-                                        "tensor-parallel rank {rank} refused: {error}"
-                                    );
+                                    tracing::warn!("tensor-parallel rank {rank} refused: {error}");
                                 }
                                 Ok(_) => {
                                     heard += 1;
@@ -445,10 +443,9 @@ impl Engine for Group {
         let tickets = self.each(move |rank| rank.submit(&frame))?;
         // Ranks fire one frame: a frame one rank stopped short where another
         // did not has its ranks apart.
-        if tickets
-            .iter()
-            .any(|ticket| ticket.steps.len() != tickets[0].steps.len() || ticket.refused != tickets[0].refused)
-        {
+        if tickets.iter().any(|ticket| {
+            ticket.steps.len() != tickets[0].steps.len() || ticket.refused != tickets[0].refused
+        }) {
             let why = "the tensor-parallel ranks stopped one frame at different steps";
             self.poison_with(why);
             return Err(Error::Device(why.to_string()));
@@ -644,10 +641,7 @@ impl Channels for Group {
         }
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         let registered = self.on(0, |rank| Channels::open(&mut *rank, registration))?;
         if registration.host_role == HostRole::None {
             for rank in 1..self.ranks.len() {
@@ -674,20 +668,11 @@ impl Channels for Group {
         self.lead(move |rank| Channels::close(&mut *rank, id))
     }
 
-    fn publish(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.on(0, |rank| rank.publish(instance, channel, cell))
     }
 
-    fn take(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.on(0, |rank| rank.take(instance, channel))
     }
 }
@@ -755,15 +740,8 @@ impl Tiers for Group {
     /// inside the call count down here, the others from their own sinks
     /// ([`Tiers::on_landed`]), and whichever brings the count to nothing
     /// tells it.
-    fn copy_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
-        self.landing
-            .lock()
-            .unwrap()
-            .insert(token, self.ranks.len());
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
+        self.landing.lock().unwrap().insert(token, self.ranks.len());
         let copy = copy.clone();
         let answers = match self.each(move |rank| rank.copy_landing(&copy, token)) {
             Ok(answers) => answers,
@@ -824,10 +802,7 @@ impl Tiers for Group {
     }
 
     /// Rank after rank: each holds its own share of every slot.
-    fn read(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         let mut out = Vec::new();
         for rank in 0..self.ranks.len() {
             out.extend(self.on(rank, |shell| Tiers::read(&mut *shell, slots))?);
@@ -924,7 +899,6 @@ impl WeightCache for Group {
             }))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

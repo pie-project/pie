@@ -52,7 +52,14 @@ fn the_dense_matmuls_answer_the_reference() {
     // (rows, columns, contraction, tier, vector rows a workgroup (0 tiled),
     // the wide tile)
     let mut cases = vec![
-        (3usize, 21usize, 60usize, kernels_slang::Tier::Baseline, 4u32, false),
+        (
+            3usize,
+            21usize,
+            60usize,
+            kernels_slang::Tier::Baseline,
+            4u32,
+            false,
+        ),
         (2, 22, 61, kernels_slang::Tier::Baseline, 4, false),
         // The plain vector kernel past four rows.
         (9, 22, 61, kernels_slang::Tier::Baseline, 16, false),
@@ -102,7 +109,9 @@ fn the_dense_matmuls_answer_the_reference() {
             &|g, o| {
                 let y = t(o[0].0, m, n, Dtype::Bf16);
                 let tactic = Tactic { tier, vector, wide };
-                g.run(|c| gemm::matmul(c, tactic, xt, wt, y, kernels_slang::ssm::RowSpan::whole(xt)));
+                g.run(|c| {
+                    gemm::matmul(c, tactic, xt, wt, y, kernels_slang::ssm::RowSpan::whole(xt))
+                });
             },
         );
     }

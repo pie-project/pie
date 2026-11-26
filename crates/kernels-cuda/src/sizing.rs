@@ -61,7 +61,10 @@ impl Footprint {
     /// takes them.
     #[must_use]
     pub fn placed(&self) -> Vec<(crate::jit::SlabKey, usize)> {
-        self.keys.iter().map(|slab| (slab.key, slab.asked)).collect()
+        self.keys
+            .iter()
+            .map(|slab| (slab.key, slab.asked))
+            .collect()
     }
 }
 

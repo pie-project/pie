@@ -142,7 +142,11 @@ impl Stepping {
                 .map_or(0, |argument| {
                     wgsl::temporary_bytes(tag, u64::from(argument.len), u64::from(argument.rows))
                 });
-            let reserve = if wgsl::selects(tag) { SELECT_RESERVE } else { 0 };
+            let reserve = if wgsl::selects(tag) {
+                SELECT_RESERVE
+            } else {
+                0
+            };
             (bytes > 0 || reserve > 0).then_some(Keeps { reserve, bytes })
         };
         Launches {

@@ -4,12 +4,10 @@ pub mod lane_table;
 
 pub use compile::{
     COMPILER_VERSION, ChannelSink, ChannelSlot, CompiledStage, Dimension, LibraryForms, LibraryOp,
-    NodeIndex,
-    NormalizedStage, PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region, RegionKind,
-    RegionPartition, ScheduleTemplate, StageSignature, SymbolicExtent, SymbolicType, ValueDomain,
-    compile_bound, compile_bound_with, compile_stage, compile_stage_at, debug_stage_plan,
-    library_op_for_tag,
-    stage_identity,
+    NodeIndex, NormalizedStage, PartitionKind, PlanMetrics, REGION_PLAN_VERSION, Region,
+    RegionKind, RegionPartition, ScheduleTemplate, StageSignature, SymbolicExtent, SymbolicType,
+    ValueDomain, compile_bound, compile_bound_with, compile_stage, compile_stage_at,
+    debug_stage_plan, library_op_for_tag, stage_identity,
 };
 pub(crate) use compile::{StageIndex, direct_topk, readout_plane, row_views};
 pub use lane_table::{LANE_TABLE_ABI_VERSION, LaneChannelSlot, LaneRecord, LaneTableHeader};

@@ -80,7 +80,10 @@ pub fn profiles() -> &'static std::path::Path {
         // A suite built on another machine (a phone's) has no such path:
         // `PIE_SUITE_TMPDIR` states one.
         let root = std::env::var_os("PIE_SUITE_TMPDIR")
-            .map_or_else(|| env!("CARGO_TARGET_TMPDIR").into(), std::path::PathBuf::from)
+            .map_or_else(
+                || env!("CARGO_TARGET_TMPDIR").into(),
+                std::path::PathBuf::from,
+            )
             .join(format!("pie-{}-profiles", crate::backend::NAME));
         #[cfg(target_os = "linux")]
         for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
@@ -258,7 +261,9 @@ fn share_bytes() -> Option<u64> {
 /// `model_logits::loading`, which a test holding a share waits on.
 pub fn share() -> engine::Allowance {
     open(false);
-    take(false, |holders| !holders.alone && holders.count < SHARES - 1);
+    take(false, |holders| {
+        !holders.alone && holders.count < SHARES - 1
+    });
     engine::Allowance {
         budget: share_bytes(),
     }

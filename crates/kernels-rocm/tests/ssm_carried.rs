@@ -96,7 +96,10 @@ fn near(got: &[f32], want: &[f32], tol: f32, what: &str) {
         .iter()
         .zip(want)
         .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
-    assert!(off <= tol * scale.max(1e-6), "{what}: off by {off} of {scale}");
+    assert!(
+        off <= tol * scale.max(1e-6),
+        "{what}: off by {off} of {scale}"
+    );
 }
 
 /// KDA: twelve decodes of one lane, each carrying every row before it
@@ -124,7 +127,12 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
     let row = |base: u64, j: usize, width: usize, elem: usize| base + (j * width * elem) as u64;
     let dt_t = Tensor::new(dt_bias, 1, wide as u32, Dtype::F32);
     // Planes: forget, beta, keys, corrected values.
-    let planes = [wide as u64 * 2, u64::from(H) * 2, wide as u64 * 2, wide as u64 * 4];
+    let planes = [
+        wide as u64 * 2,
+        u64::from(H) * 2,
+        wide as u64 * 2,
+        wide as u64 * 4,
+    ];
     let a_t = Tensor::new(a_log, 1, H, Dtype::F32);
     for floor in [0.0f32, -5.0] {
         // The plain step, a row a fire, folding each.
@@ -182,10 +190,19 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 .expect("the carried KDA step fires");
                 gpu.sync();
                 if j + 1 < T {
-                    assert_eq!(gpu.down::<f32>(slab, stride), seed, "a decode committing nothing keeps the state");
+                    assert_eq!(
+                        gpu.down::<f32>(slab, stride),
+                        seed,
+                        "a decode committing nothing keeps the state"
+                    );
                 }
             }
-            near(&gpu.down::<f32>(y, T * wide), &want_y, 2e-3, "the carried decodes' rows");
+            near(
+                &gpu.down::<f32>(y, T * wide),
+                &want_y,
+                2e-3,
+                "the carried decodes' rows",
+            );
             near(
                 &gpu.down::<f32>(slab, stride),
                 &want_slabs[commit as usize - 1],
@@ -256,7 +273,11 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 let want: Vec<u16> = gpu.down(page.row(2, j as u32), wide);
                 assert_eq!(got, want, "row {j}'s keys");
             }
-            assert_eq!(gpu.down::<f32>(slab, stride), want_slabs[c - 1], "the tail keeps the state");
+            assert_eq!(
+                gpu.down::<f32>(slab, stride),
+                want_slabs[c - 1],
+                "the tail keeps the state"
+            );
         }
     }
 }
@@ -309,7 +330,16 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
         let mut out = Tensor::new(row(y, j, INNER), 1, INNER as u32, Dtype::Bf16);
         let pool = pool(slab, STRIDE, slots);
         match carry {
-            None => ssm::mamba2(&gpu.ctx(), args.0, args.1, args.2, m, &pool, N as u32, &mut out),
+            None => ssm::mamba2(
+                &gpu.ctx(),
+                args.0,
+                args.1,
+                args.2,
+                m,
+                &pool,
+                N as u32,
+                &mut out,
+            ),
             Some(carry) => ssm::mamba2_carried(
                 &gpu.ctx(),
                 args.0,
@@ -332,7 +362,11 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
         step(&mut gpu, slab, y, j, None);
         want_slabs.push(gpu.down::<f32>(slab, STRIDE));
     }
-    let want_y: Vec<f32> = gpu.down::<u16>(y, T * INNER).into_iter().map(from_bf16).collect();
+    let want_y: Vec<f32> = gpu
+        .down::<u16>(y, T * INNER)
+        .into_iter()
+        .map(from_bf16)
+        .collect();
     for commit in [T as i32 - 4, T as i32] {
         // Planes: step sizes, `x | B`.
         let page = Page::new(&mut gpu, &[HEADS as u64 * 2, XB as u64 * 2], None);
@@ -352,7 +386,11 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
         gpu.sync();
         for j in 0..T {
             let got: Vec<u16> = gpu.down(page.row(1, j as u32), XB);
-            assert_eq!(got, xbc_raw[j * WIDTH..j * WIDTH + XB].to_vec(), "row {j}'s `x | B`");
+            assert_eq!(
+                got,
+                xbc_raw[j * WIDTH..j * WIDTH + XB].to_vec(),
+                "row {j}'s `x | B`"
+            );
         }
         let slab = gpu.up(&seed);
         let y = gpu.up(&vec![0u8; T * INNER * 2]);
@@ -361,10 +399,18 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
             let carry = page.carry(&mut gpu, j as u32, j as u32, c);
             step(&mut gpu, slab, y, j, Some(&carry));
             if j + 1 < T {
-                assert_eq!(gpu.down::<f32>(slab, STRIDE), seed, "a decode committing nothing keeps the state");
+                assert_eq!(
+                    gpu.down::<f32>(slab, STRIDE),
+                    seed,
+                    "a decode committing nothing keeps the state"
+                );
             }
         }
-        let got: Vec<f32> = gpu.down::<u16>(y, T * INNER).into_iter().map(from_bf16).collect();
+        let got: Vec<f32> = gpu
+            .down::<u16>(y, T * INNER)
+            .into_iter()
+            .map(from_bf16)
+            .collect();
         near(&got, &want_y, 2e-2, "the carried decodes' rows");
         near(
             &gpu.down::<f32>(slab, STRIDE),
@@ -410,7 +456,6 @@ pub fn to_bf16(x: f32) -> u16 {
     let rounding = 0x7fff + ((b >> 16) & 1);
     (b.wrapping_add(rounding) >> 16) as u16
 }
-
 
 pub struct Lcg(u64);
 

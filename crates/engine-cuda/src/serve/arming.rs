@@ -1,7 +1,7 @@
 mod targets;
 use self::targets::*;
-mod synthetic;
 mod golden;
+mod synthetic;
 mod timing;
 use engine::fire::{Mask, Masking, RsReset, RsVerb};
 
@@ -99,7 +99,13 @@ struct Treatment {
 
 /// Where the allowance ranks a composition (`Shell::rule_rank`), the least
 /// kept first.
-type Rank = (usize, u32, core::cmp::Reverse<Option<u64>>, core::cmp::Reverse<usize>, u8);
+type Rank = (
+    usize,
+    u32,
+    core::cmp::Reverse<Option<u64>>,
+    core::cmp::Reverse<usize>,
+    u8,
+);
 
 /// A composition captured during arming and held: its rank by the user's
 /// rule, its key, where it came from, and what it weighed.
@@ -333,7 +339,8 @@ impl Shell {
         // no arming fire carries one: their kernels are made here.
         if self.buffers.is_some() {
             for fold in crate::dispatch::ssm::group_folds(&self.trace) {
-                fold.load().map_err(|error| Fault::from(crate::error::kernel(error)))?;
+                fold.load()
+                    .map_err(|error| Fault::from(crate::error::kernel(error)))?;
             }
         }
         let armed = self.arm_lattice(false);
@@ -415,7 +422,10 @@ impl Shell {
                 }
             }
             let launches = kernels_cuda::sizing::launches() - launched;
-            let entry = self.walked_launches.entry((*bucket, target.to_string())).or_insert(0);
+            let entry = self
+                .walked_launches
+                .entry((*bucket, target.to_string()))
+                .or_insert(0);
             *entry = (*entry).max(launches);
         }
         // The voxel walk is a plain fire: no recurrent treatment.
@@ -693,7 +703,11 @@ impl Shell {
         (
             treatment.shape,
             bucket,
-            core::cmp::Reverse(self.walked_launches.get(&(bucket, target.to_string())).copied()),
+            core::cmp::Reverse(
+                self.walked_launches
+                    .get(&(bucket, target.to_string()))
+                    .copied(),
+            ),
             core::cmp::Reverse(classes.len()),
             kind,
         )
@@ -767,7 +781,8 @@ impl Shell {
                 st.weighed[given.at].0 =
                     st.weighed[given.at].0.saturating_sub(given.weight as usize);
                 st.weighed[given.at].1 = st.weighed[given.at].1.saturating_sub(1);
-                st.given_back.push((given.bucket, given.target, given.treatment));
+                st.given_back
+                    .push((given.bucket, given.target, given.treatment));
             }
         }
         let spent = self.cache.body_stats();
@@ -944,7 +959,8 @@ impl Shell {
                     st.weighed[given.at].0 =
                         st.weighed[given.at].0.saturating_sub(given.weight as usize);
                     st.weighed[given.at].1 = st.weighed[given.at].1.saturating_sub(1);
-                    st.given_back.push((given.bucket, given.target, given.treatment));
+                    st.given_back
+                        .push((given.bucket, given.target, given.treatment));
                 }
                 if !st.held.iter().any(|held| Some(&held.key) == key.as_ref()) {
                     return Ok(());

@@ -42,22 +42,41 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
     };
     let (key, kernels, weighed_at_load) = read(&mut first);
     assert!(!weighed_at_load, "a boot weighs nothing before ready");
-    assert!(first.engine.measures_behind(), "the settle is left behind serving");
+    assert!(
+        first.engine.measures_behind(),
+        "the settle is left behind serving"
+    );
     let shell = first.engine.loaded_mut().expect("loaded");
-    let rows: Vec<u32> = shell.settled().iter().map(|r| r.top).chain([1, 2, 4]).collect();
+    let rows: Vec<u32> = shell
+        .settled()
+        .iter()
+        .map(|r| r.top)
+        .chain([1, 2, 4])
+        .collect();
     let served: Vec<_> = rows.iter().map(|&r| shell.dense_tactics_at(r)).collect();
     let built = shell.compiled();
-    assert!(measure_behind(&mut first.engine) > 0, "the settle ran behind serving");
+    assert!(
+        measure_behind(&mut first.engine) > 0,
+        "the settle ran behind serving"
+    );
     let shell = first.engine.loaded_mut().expect("loaded");
-    assert_eq!(shell.compiled(), built, "a trial builds nothing: the load built what it weighs");
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "a trial builds nothing: the load built what it weighs"
+    );
     assert!(
         shell.settled().iter().any(|range| range.checked),
         "the settle weighed its ranges behind serving"
     );
     let after: Vec<_> = rows.iter().map(|&r| shell.dense_tactics_at(r)).collect();
-    assert_eq!(after, served, "the settle behind serving changes nothing this load serves");
+    assert_eq!(
+        after, served,
+        "the settle behind serving changes nothing this load serves"
+    );
     drop(first);
-    let mut second = loaded_boot("settle-key", &Outputs, 4, boot()).expect("the device opened once");
+    let mut second =
+        loaded_boot("settle-key", &Outputs, 4, boot()).expect("the device opened once");
     let (again, kernels_again, weighed_again) = read(&mut second);
     let pending = second.engine.measures_behind();
     drop(second);
@@ -67,8 +86,14 @@ fn a_measured_boot_and_the_next_name_the_same_kernels_under_one_settle_key() {
         "the boot that read its curves names what the boot that timed them named"
     );
     assert_eq!(again, key, "one settle key");
-    assert!(!weighed_again, "the stored settle is taken: nothing weighed again");
-    assert!(!pending, "the next boot reads the stored settle: nothing left behind serving");
+    assert!(
+        !weighed_again,
+        "the stored settle is taken: nothing weighed again"
+    );
+    assert!(
+        !pending,
+        "the next boot reads the stored settle: nothing left behind serving"
+    );
 }
 
 /// A boot whose 1-row range an earlier one decided times one decode step of
@@ -95,16 +120,31 @@ fn a_boot_with_the_one_row_range_decided_times_a_decode_step_first() {
         shell.behind_status().map_or(1, |(_, stored, _)| stored)
     };
     while stored(&mut first) == 0 {
-        assert!(first.engine.measure_behind(&behind).expect("measuring behind"));
+        assert!(
+            first
+                .engine
+                .measure_behind(&behind)
+                .expect("measuring behind")
+        );
     }
     drop(first);
-    let mut second = loaded_boot("settle-limit", &Outputs, 4, boot()).expect("the device opened once");
+    let mut second =
+        loaded_boot("settle-limit", &Outputs, 4, boot()).expect("the device opened once");
     assert!(second.engine.measures_behind(), "wider ranges are left");
-    assert!(second.engine.measure_behind(&behind).expect("measuring behind"));
+    assert!(
+        second
+            .engine
+            .measure_behind(&behind)
+            .expect("measuring behind")
+    );
     let need = second.engine.behind_need().expect("a point is next");
     drop(second);
     let _ = std::fs::remove_dir_all(&profiles);
-    assert_eq!((need.lanes, need.tokens), (1, 1), "one decode step, before any wider point");
+    assert_eq!(
+        (need.lanes, need.tokens),
+        (1, 1),
+        "one decode step, before any wider point"
+    );
 }
 
 /// The host cover's key as a load states it, at two widest rungs and lane
@@ -125,7 +165,10 @@ fn a_cover_is_keyed_alike_at_every_rung() {
         let shell = loaded.engine.loaded_mut().expect("loaded");
         let budget = (shell.budget().max_tokens, shell.budget().max_lanes);
         let rungs = shell.dense_picks().entries().len();
-        let key = loaded.engine.cover_fingerprint().expect("the load keys its host cover");
+        let key = loaded
+            .engine
+            .cover_fingerprint()
+            .expect("the load keys its host cover");
         seen.push((budget, rungs, key));
         drop(loaded);
     }
@@ -133,7 +176,10 @@ fn a_cover_is_keyed_alike_at_every_rung() {
     let [(narrow, few, at_narrow), (wide, many, at_wide)] = &seen[..] else {
         panic!("two loads");
     };
-    assert!(narrow.0 < wide.0 && narrow.1 < wide.1 && few < many, "{narrow:?} {wide:?} {few} {many}");
+    assert!(
+        narrow.0 < wide.0 && narrow.1 < wide.1 && few < many,
+        "{narrow:?} {wide:?} {few} {many}"
+    );
     assert_eq!(at_narrow, at_wide, "one cover key");
 }
 
@@ -163,7 +209,12 @@ fn a_settle_point_overlapped_by_a_fire_is_not_stored() {
         step: None,
     };
     let mut slices = 0;
-    while slices < 64 && loaded.engine.measure_behind(&behind).expect("measuring behind") {
+    while slices < 64
+        && loaded
+            .engine
+            .measure_behind(&behind)
+            .expect("measuring behind")
+    {
         slices += 1;
     }
     let shell = loaded.engine.loaded_mut().expect("loaded");
@@ -219,7 +270,12 @@ fn a_settle_slice_yields_to_an_arrival_before_it_fires() {
         step: None,
     };
     let mut slices = 0;
-    while slices < 32 && loaded.engine.measure_behind(&behind).expect("measuring behind") {
+    while slices < 32
+        && loaded
+            .engine
+            .measure_behind(&behind)
+            .expect("measuring behind")
+    {
         slices += 1;
     }
     let shell = loaded.engine.loaded_mut().expect("loaded");
@@ -228,7 +284,10 @@ fn a_settle_slice_yields_to_an_arrival_before_it_fires() {
         "no range was weighed: {:?}",
         shell.settled()
     );
-    assert!(shell.behind_status().is_some(), "the settle is still pending");
+    assert!(
+        shell.behind_status().is_some(),
+        "the settle is still pending"
+    );
     drop(loaded);
     let stored = walk(&profiles)
         .iter()

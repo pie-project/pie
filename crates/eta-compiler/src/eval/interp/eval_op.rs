@@ -27,7 +27,13 @@ pub fn eval_op(
     let operands = op.operands();
     let effect = op.is_effectful() || matches!(op, Op::Output { .. });
     let bf16 = |id: &ValueId| vals[*id as usize].dtype() == Dtype::Bf16;
-    let casts_to_bf16 = matches!(op, Op::Cast { dtype: Dtype::Bf16, .. });
+    let casts_to_bf16 = matches!(
+        op,
+        Op::Cast {
+            dtype: Dtype::Bf16,
+            ..
+        }
+    );
     if effect || !(casts_to_bf16 || operands.iter().any(bf16)) {
         return eval_wide(op, vals, ty_of, inputs, names);
     }

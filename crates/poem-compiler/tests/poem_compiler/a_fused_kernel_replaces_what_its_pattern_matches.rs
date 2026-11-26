@@ -1307,8 +1307,18 @@ fn a_residual_norm_read_elsewhere_too_folds_into_its_first_product() {
         NORM_PRODUCT,
     );
     let ops = ops(&fused);
-    assert_eq!(ops.iter().filter(|op| **op == "fused.residual_add_rmsnorm_matmul").count(), 1, "{ops:?}");
-    assert_eq!(ops.iter().filter(|op| **op == "linear.matmul").count(), 1, "{ops:?}");
+    assert_eq!(
+        ops.iter()
+            .filter(|op| **op == "fused.residual_add_rmsnorm_matmul")
+            .count(),
+        1,
+        "{ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| **op == "linear.matmul").count(),
+        1,
+        "{ops:?}"
+    );
     assert!(!ops.contains(&"fused.residual_add_rmsnorm"), "{ops:?}");
 }
 
@@ -1335,6 +1345,10 @@ fn a_residual_norm_before_a_dense_mlp_folds_with_it() {
     );
     assert_eq!(
         ops(&fused),
-        ["fused.residual_add_rmsnorm_matmul_swiglu_matmul", "elemwise.act", "elemwise.act"]
+        [
+            "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+            "elemwise.act",
+            "elemwise.act"
+        ]
     );
 }

@@ -255,9 +255,17 @@ pub fn residual_add_rmsnorm_matmul_swiglu(
     h: &mut Tensor,
 ) -> Result<bool, Error> {
     const OP: &str = "fused.residual_add_rmsnorm_matmul_swiglu_matmul";
-    if [x.dtype, y.dtype, weight.dtype, gate_up.dtype, y_out.dtype, out.dtype, h.dtype]
-        .iter()
-        .any(|&d| d != Dtype::Bf16)
+    if [
+        x.dtype,
+        y.dtype,
+        weight.dtype,
+        gate_up.dtype,
+        y_out.dtype,
+        out.dtype,
+        h.dtype,
+    ]
+    .iter()
+    .any(|&d| d != Dtype::Bf16)
         || x.rows != y.rows
         || x.rows != h.rows
         || x.width != y.width

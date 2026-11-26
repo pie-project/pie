@@ -22,12 +22,12 @@
 //! Signed-nibble convention under test: OFFSET-BINARY (store q+8 -> [1..15],
 //! unpack (nibble-8)*scale).
 
+use crate::common::{bf16_bits_to_f32, f32_to_bf16_bits};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::attn::kv_codec;
 use poem_ir::Dtype;
-use crate::common::{bf16_bits_to_f32, f32_to_bf16_bits};
 
 const BLOCK: usize = 256;
 
@@ -282,7 +282,6 @@ fn the_kv_codec_round_trips() {
 
     const ROWS: usize = 64;
 
-
     // (1)+(2): round-trip vs the host quantize_rowmajor reference, f32. The codec
     // block IS the head_dim — each row is one whole block — so this proves the
     // codec at block 256 AND block 128.
@@ -454,5 +453,4 @@ fn the_kv_codec_round_trips() {
             "a 300-element (non-multiple-of-256) tensor must be refused by the codec"
         );
     }
-
 }

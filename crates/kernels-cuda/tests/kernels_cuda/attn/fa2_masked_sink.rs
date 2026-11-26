@@ -48,7 +48,9 @@ fn fire(
     let (k, _) = lcg.row(cells * width);
     let (v, _) = lcg.row(cells * width);
     let (q_raw, _) = lcg.row(rows * qw);
-    let sinks: Vec<u16> = (0..qh).map(|h| to_bf16(0.5 * (h % 7) as f32 - 1.0)).collect();
+    let sinks: Vec<u16> = (0..qh)
+        .map(|h| to_bf16(0.5 * (h % 7) as f32 - 1.0))
+        .collect();
 
     let mut gpu = Gpu::open();
     let ids = col(&mut gpu, &pages, I32);
@@ -115,8 +117,10 @@ fn fire(
     }
     plan.stage(&ctx).expect("the plan uploads");
     let mask = masked.then_some(mask_t);
-    attn::prefill_lse_sink(&ctx, qt, &plan, &kvp, window, d, kvh, scale, o, lse, sink_t, mask)
-        .unwrap_or_else(|e| panic!("{heads:?} {window:?} masked {masked}: {e}"));
+    attn::prefill_lse_sink(
+        &ctx, qt, &plan, &kvp, window, d, kvh, scale, o, lse, sink_t, mask,
+    )
+    .unwrap_or_else(|e| panic!("{heads:?} {window:?} masked {masked}: {e}"));
     gpu.sync();
     (
         gpu.down::<u16>(o_at, rows * qw),
@@ -130,7 +134,11 @@ fn a_maskless_request_in_the_masked_sinked_prefill_lands_the_plain_bytes() {
     // window and short of it (the golden probe's MiMo script: 37 rows, then
     // 250 over 40).
     let reqs: &[(usize, usize)] = &[(37, 0), (250, 40), (250, 293)];
-    for (heads, window) in [([64, 8, 128], Some(128)), ([64, 8, 128], None), ([16, 4, 64], Some(100))] {
+    for (heads, window) in [
+        ([64, 8, 128], Some(128)),
+        ([64, 8, 128], None),
+        ([16, 4, 64], Some(100)),
+    ] {
         for one in reqs {
             let plain = fire(heads, std::slice::from_ref(one), window, false);
             let masked = fire(heads, std::slice::from_ref(one), window, true);

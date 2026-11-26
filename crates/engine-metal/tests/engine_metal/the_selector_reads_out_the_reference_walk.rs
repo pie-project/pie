@@ -1,5 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -7,7 +8,6 @@ use kernels_metal::sampling;
 use kernels_metal::sampling::selector_walk;
 use kernels_metal::tensor::RaggedTensor;
 use poem_ir::Dtype;
-use crate::common::{bf16_bytes, bf16_round};
 
 const K: u32 = 16;
 const RANK: u32 = 256;

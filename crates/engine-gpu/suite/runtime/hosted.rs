@@ -74,8 +74,11 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
         return;
     };
     let table = planes["embed"].1.clone();
-    let program = engine::Programs::register(&mut engine, &registration_of(&output_decls(&caps), reader(), 0x4057))
-        .expect("the reader registers");
+    let program = engine::Programs::register(
+        &mut engine,
+        &registration_of(&output_decls(&caps), reader(), 0x4057),
+    )
+    .expect("the reader registers");
     let chunks = &caps.caps.chunks;
     let mut slots =
         super::slots::Slots::of(chunks, chunks.segment_chunks - 1, chunks.segment_chunks - 2);
@@ -137,7 +140,11 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
     // the program reads the rows where the replay left them.
     for (round, base) in [(0u32, 0u32), (1, 5)] {
         let tokens: Vec<Vec<u32>> = (0..4)
-            .map(|lane| (0..ROWS).map(|k| (base + lane * 3 + k * 7) % WIDTH).collect())
+            .map(|lane| {
+                (0..ROWS)
+                    .map(|k| (base + lane * 3 + k * 7) % WIDTH)
+                    .collect()
+            })
             .collect();
         for readout in [Readout::Last, Readout::None] {
             let before = engine.shell_mut().expect("loaded").readout_tally();
@@ -212,7 +219,11 @@ fn each_lane_hosts_what_it_reads_out_and_a_program_reads_its_rows_on_the_device(
             // Each hosted row is copied into the seat; the program's row too
             // where it reads the arm's seat, and nowhere where it reads the
             // span.
-            let copied = if <backend::Api as Serve>::READS_SPAN { 3 } else { 4 };
+            let copied = if <backend::Api as Serve>::READS_SPAN {
+                3
+            } else {
+                4
+            };
             assert!(
                 seated == copied * u64::from(WIDTH) * 2 || seated == copied * u64::from(WIDTH) * 4,
                 "{what}: {seated} bytes copied into the seat, {copied} rows of {WIDTH}"

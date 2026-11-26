@@ -825,7 +825,9 @@ impl Session {
         } else {
             rebound.own.1 = own;
             // The pair's state moved for every instance on it: the group's.
-            rebound.pair_runs = self.pair_group.map(|(group, _)| (Holder::Pair(group), pair));
+            rebound.pair_runs = self
+                .pair_group
+                .map(|(group, _)| (Holder::Pair(group), pair));
         }
         Ok(rebound)
     }
@@ -1519,7 +1521,11 @@ mod tests {
         let heaps = read(4096, 2 * HEAP as usize / 4);
         // A's `a` and B's `a` stand; B's copy landed in its own heap.
         assert_eq!(heaps[..4], values(1.0), "{heaps:x?}");
-        assert_eq!(heaps[16..24], [values(5.0), values(5.0)].concat(), "{heaps:x?}");
+        assert_eq!(
+            heaps[16..24],
+            [values(5.0), values(5.0)].concat(),
+            "{heaps:x?}"
+        );
         assert!(
             heaps[4..16]
                 .iter()

@@ -88,7 +88,11 @@ impl Run {
 
 impl fmt::Display for Run {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "bytes {}..{} of segment {}", self.start, self.end, self.segment)
+        write!(
+            f,
+            "bytes {}..{} of segment {}",
+            self.start, self.end, self.segment
+        )
     }
 }
 
@@ -299,7 +303,8 @@ impl Held {
     /// which holds none.
     fn insert(&mut self, holder: Holder, merged: Vec<Run>) {
         for run in &merged {
-            self.runs.insert((run.segment, run.start), (run.end, holder));
+            self.runs
+                .insert((run.segment, run.start), (run.end, holder));
         }
         if !merged.is_empty() {
             self.by_holder.insert(holder, merged);
@@ -521,7 +526,11 @@ impl Claims {
             }
             let listed: std::collections::HashSet<Holder> =
                 claims.iter().map(|&(holder, _)| holder).collect();
-            for (holder, runs) in held.by_holder.iter().filter(|(holder, _)| !listed.contains(holder)) {
+            for (holder, runs) in held
+                .by_holder
+                .iter()
+                .filter(|(holder, _)| !listed.contains(holder))
+            {
                 tracing::debug!(target: TARGET, %holder, runs = %show(runs), "evacuation leaves unlisted");
             }
             tracing::debug!(
@@ -676,7 +685,9 @@ mod tests {
     #[test]
     fn an_overlap_is_refused_by_name() {
         let claims = Claims::default();
-        claims.claim(7, &[run(0, 1000, 2000)]).expect("the first claim");
+        claims
+            .claim(7, &[run(0, 1000, 2000)])
+            .expect("the first claim");
         for over in [
             run(0, 500, 1001),
             run(0, 1999, 2500),
@@ -693,9 +704,15 @@ mod tests {
             assert_eq!(overlap.held, run(0, 1000, 2000));
             let error = crate::Error::from(overlap);
             assert!(matches!(error, crate::Error::Claimed(_)), "{error}");
-            assert!(error.to_string().contains("instance 7's run at 1000..2000"), "{error}");
+            assert!(
+                error.to_string().contains("instance 7's run at 1000..2000"),
+                "{error}"
+            );
         }
-        assert!(claims.held(Holder::Instance(9)).is_empty(), "a refused claim holds nothing");
+        assert!(
+            claims.held(Holder::Instance(9)).is_empty(),
+            "a refused claim holds nothing"
+        );
     }
 
     /// A rebind replaces what the instance held in one step: it may move
@@ -712,15 +729,27 @@ mod tests {
         claims
             .claim(1, &[run(0, 2048, 6144), run(1, 0, 64)])
             .expect("a move over its own run");
-        assert_eq!(claims.held(Holder::Instance(1)), vec![run(0, 2048, 6144), run(1, 0, 64)]);
-        claims.claim(3, &[run(0, 0, 2048)]).expect("what it moved off is free");
+        assert_eq!(
+            claims.held(Holder::Instance(1)),
+            vec![run(0, 2048, 6144), run(1, 0, 64)]
+        );
+        claims
+            .claim(3, &[run(0, 0, 2048)])
+            .expect("what it moved off is free");
         // Onto another's run: refused, the old claim kept whole.
         claims
             .claim(1, &[run(0, 10000, 10100), run(1, 4096, 8192)])
             .expect_err("onto the second's run");
-        assert_eq!(claims.held(Holder::Instance(1)), vec![run(0, 2048, 6144), run(1, 0, 64)]);
-        claims.claim(4, &[run(1, 0, 1)]).expect_err("still held by the first");
-        claims.claim(4, &[run(1, 4096, 8192)]).expect("the refused target took nothing");
+        assert_eq!(
+            claims.held(Holder::Instance(1)),
+            vec![run(0, 2048, 6144), run(1, 0, 64)]
+        );
+        claims
+            .claim(4, &[run(1, 0, 1)])
+            .expect_err("still held by the first");
+        claims
+            .claim(4, &[run(1, 4096, 8192)])
+            .expect("the refused target took nothing");
     }
 
     fn pair(pair: u64, taking: u64, runs: &[Run]) -> PairClaim {
@@ -739,20 +768,36 @@ mod tests {
     fn a_solo_move_of_a_held_pair_is_refused() {
         let claims = Claims::default();
         let at = [run(0, 1000, 2000)];
-        claims.claim_with_pair(1, &[run(0, 0, 100)], &pair(50, 7, &at)).expect("first");
-        claims.claim_with_pair(2, &[run(0, 100, 200)], &pair(50, 7, &at)).expect("second");
+        claims
+            .claim_with_pair(1, &[run(0, 0, 100)], &pair(50, 7, &at))
+            .expect("first");
+        claims
+            .claim_with_pair(2, &[run(0, 100, 200)], &pair(50, 7, &at))
+            .expect("second");
         let refused = claims
             .claim_with_pair(1, &[run(0, 300, 400)], &pair(50, 7, &[run(0, 5000, 6000)]))
             .expect_err("a solo move with member 2 bound");
         let Refusal::Pinned(pinned) = &refused else {
             panic!("{refused}")
         };
-        assert_eq!((pinned.pair, pinned.mover, pinned.members.clone()), (50, 1, vec![2]));
+        assert_eq!(
+            (pinned.pair, pinned.mover, pinned.members.clone()),
+            (50, 1, vec![2])
+        );
         assert_eq!(pinned.held, at.to_vec());
         assert_eq!(pinned.wanted, vec![run(0, 5000, 6000)]);
         let message = crate::Error::from(refused).to_string();
-        assert!(message.contains("pair 50") && message.contains("[2]") && message.contains("instance 1's"), "{message}");
-        assert_eq!(claims.held(Holder::Instance(1)), vec![run(0, 0, 100)], "its own runs as they stood");
+        assert!(
+            message.contains("pair 50")
+                && message.contains("[2]")
+                && message.contains("instance 1's"),
+            "{message}"
+        );
+        assert_eq!(
+            claims.held(Holder::Instance(1)),
+            vec![run(0, 0, 100)],
+            "its own runs as they stood"
+        );
         assert_eq!(claims.held(Holder::Pair(50)), at.to_vec());
         claims.release(2);
         assert_eq!(
@@ -760,7 +805,8 @@ mod tests {
             Ok(Joined::Fresh),
             "alone on it, the member moves it"
         );
-        claims.claim(3, &[run(0, 1000, 2000)]).expect("what it moved off is free");
+        claims
+            .claim(3, &[run(0, 1000, 2000)])
+            .expect("what it moved off is free");
     }
-
 }

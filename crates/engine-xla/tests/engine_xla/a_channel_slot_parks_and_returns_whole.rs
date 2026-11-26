@@ -17,7 +17,10 @@ fn a_channel_slot_parks_and_returns_whole() {
     let mut model = Model::load_with("qwen3-micro-text", None, 256, 7, None);
     let device = model.loaded.caps.device.domain;
     let facts = model.loaded.caps.chunks.clone();
-    let shape = facts.shape(CHANNEL).expect("the pool states Channel slots").clone();
+    let shape = facts
+        .shape(CHANNEL)
+        .expect("the pool states Channel slots")
+        .clone();
     assert_eq!(shape.slot_bytes, 1024, "a Channel slot is 1 KiB");
     assert!(facts.host_chunks > 0, "a host tier");
     let mut refs = Refs::of(&model);
@@ -27,14 +30,17 @@ fn a_channel_slot_parks_and_returns_whole() {
     engine::Tiers::write(&mut model.engine, &[(CHANNEL, vec![h1])], &bytes)
         .expect("the host slot writes");
     let copy = |model: &mut Model, src, dst, slots: Vec<(u32, u32)>| {
-        engine::Tiers::copy(&mut model.engine, &SlotCopy {
+        engine::Tiers::copy(
+            &mut model.engine,
+            &SlotCopy {
                 shape: CHANNEL,
                 src,
                 dst,
                 slots,
                 runs: Vec::new(),
-            })
-            .expect("the Channel slots move");
+            },
+        )
+        .expect("the Channel slots move");
     };
     copy(&mut model, MemoryDomain::HostPinned, device, vec![(h1, d1)]);
     copy(&mut model, device, device, vec![(d1, d2)]);

@@ -1575,7 +1575,11 @@ impl Shell {
             if !seated.kv_less {
                 let reach = have.saturating_add(row.rows);
                 let set = (seated.set, seated.readable);
-                match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
+                match ports
+                    .as_ref()
+                    .map(|ports| ports.slots(rows_here))
+                    .transpose()?
+                {
                     Some(Some(slots)) => extents.lane(
                         &self.written,
                         source,
@@ -1677,10 +1681,7 @@ impl Shell {
         let mut ring_buffers: Vec<u64> = Vec::new();
         let ringed = self.pools.ring_window();
         if let Some((window, page)) = ringed {
-            ring_work.page_bytes = self
-                .pools
-                .ring()
-                .map_or(0, |(_, ring)| ring.page_bytes);
+            ring_work.page_bytes = self.pools.ring().map_or(0, |(_, ring)| ring.page_bytes);
             let planes = self.pools.ring_planes();
             let keys: Vec<u32> = seat_sources
                 .iter()
@@ -1752,8 +1753,7 @@ impl Shell {
                         self.pools.window_slot(slot)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let alone =
-                    !stated || keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
+                let alone = !stated || keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
                 if !alone && folded + fold > seat.have {
                     return Err(Fault::program(
                         "serve::ring",
@@ -1933,7 +1933,8 @@ impl Shell {
         let moves = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
         let rs_lands = shape.map_or(moves, |shape| shape.treatment == engine::Treatment::Buffers);
         debug_assert_eq!(
-            rs_lands, moves,
+            rs_lands,
+            moves,
             "a fire stamped {shape:?} whose lanes {} buffer rows",
             if moves { "do" } else { "do not" }
         );
@@ -1944,10 +1945,7 @@ impl Shell {
             .lanes()
             .iter()
             .zip(&rs_replays)
-            .any(|(row, replay)| {
-                *replay > 0
-                    && !self.decoding.contains(row.class as usize)
-            });
+            .any(|(row, replay)| *replay > 0 && !self.decoding.contains(row.class as usize));
         // A decoding lane carrying more than a chunk of rows (a beam lane's
         // run-ahead) splits its carried reads, in a body of its own: a
         // fire at the natural lag keeps the plain grid.
@@ -1981,7 +1979,11 @@ impl Shell {
             let mut ext = 0u32;
             for (fire_lane, (verb, row)) in rs_moves.iter().zip(composition.lanes()).enumerate() {
                 let begin = ext;
-                ext += if in_run(fire_lane) { rs_replays[fire_lane] } else { 0 } + row.rows;
+                ext += if in_run(fire_lane) {
+                    rs_replays[fire_lane]
+                } else {
+                    0
+                } + row.rows;
                 let RsMove::Scatter { pages, at, .. } = verb else {
                     rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
                         ext: begin,
@@ -1998,11 +2000,20 @@ impl Shell {
                 // row (its tokens then count from that page), laid beside
                 // the beams' sets' pages (`PageWork::bases`).
                 let (page_off, skip) = if group_of[row.source as usize].is_some() {
-                    (kernels_cuda::runtime::channel::RsLane::ROWS | beam_row[row.source as usize], 0)
+                    (
+                        kernels_cuda::runtime::channel::RsLane::ROWS
+                            | beam_row[row.source as usize],
+                        0,
+                    )
                 } else {
                     let tokens = buffers.page_tokens().max(1);
                     let reads = &rs_reads[fire_lane];
-                    let first = reads.iter().map(|span| span.start).chain([*at]).min().unwrap_or(0);
+                    let first = reads
+                        .iter()
+                        .map(|span| span.start)
+                        .chain([*at])
+                        .min()
+                        .unwrap_or(0);
                     let reach = reads
                         .iter()
                         .map(|span| span.end)
@@ -2162,8 +2173,8 @@ impl Shell {
                     self.pools.seat_kv_pages(&whole[..backed as usize])?;
                 }
             }
-            let windowed =
-                (0..device_geometries.len()).any(|table| self.pools.geometry_window(table).is_some());
+            let windowed = (0..device_geometries.len())
+                .any(|table| self.pools.geometry_window(table).is_some());
             let planes = self.pools.page_planes();
             let pools = &self.pools;
             // A hybrid's beams: their rs page tables as this fire
@@ -2173,15 +2184,23 @@ impl Shell {
                     lanes: &rs_lanes,
                     order: &rs_order,
                     page_tokens: buffers.page_tokens(),
-                    base: &|source| rs_bases.get(source).copied().flatten().map(|(base, _)| base),
-                    set: &|source| {
+                    base: &|source| {
                         rs_bases
                             .get(source)
                             .copied()
                             .flatten()
-                            .map_or_else(|| Ok(Vec::new()), |(_, pages)| {
-                                pages.iter().map(|&page| buffers.slot(pools, page)).collect()
-                            })
+                            .map(|(base, _)| base)
+                    },
+                    set: &|source| {
+                        rs_bases.get(source).copied().flatten().map_or_else(
+                            || Ok(Vec::new()),
+                            |(_, pages)| {
+                                pages
+                                    .iter()
+                                    .map(|&page| buffers.slot(pools, page))
+                                    .collect()
+                            },
+                        )
                     },
                     planes: buffers.page_planes()?,
                 }),
@@ -2231,9 +2250,11 @@ impl Shell {
             rs_body,
         );
         let copies_here = copies
-            && key.classes.rungs().iter().all(|(class, _)| {
-                !self.wide.contains(*class as usize)
-            });
+            && key
+                .classes
+                .rungs()
+                .iter()
+                .all(|(class, _)| !self.wide.contains(*class as usize));
         let staged = crate::mask::stage(&masks, reads_masks)
             .map_err(|fault| fault.of_rows(composition.lanes()))?;
         let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
@@ -2305,7 +2326,6 @@ impl Shell {
             }
         };
         super::btrace::mark("windows_of");
-
 
         let totals = poem_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
         // The widened table, as `segmentation` holds it: what a body was
@@ -2399,37 +2419,38 @@ impl Shell {
         // Why a fire of a load that records bodies walks its plan, for the
         // warning it raises (`Bodies::eager_unbodied`).
         let unbodied =
-            (records_bodies && !arming && !stated_eager && !(bodied && readouts_fit && lanes_fit)).then(|| {
-                let why = if tapped {
-                    "it is tapped"
-                } else if !snapshots_fit {
-                    "it takes more snapshots than a body holds"
-                } else if !Self::keyable_units(&self.compiled) {
-                    "the plan's units key no body"
-                } else if !world {
-                    "its expert group is not whole"
-                } else if self.cache.body_refused(&key) {
-                    "its body was refused when it was captured"
-                } else if !bodied {
-                    "its admitted set cannot be cut to a body"
-                } else if !readouts_fit {
-                    "it reads out more rows than its bucket's body carries"
-                } else {
-                    "it has more lanes than a body's window table holds"
-                };
-                if bodied && !readouts_fit {
-                    format!(
-                        "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
+            (records_bodies && !arming && !stated_eager && !(bodied && readouts_fit && lanes_fit))
+                .then(|| {
+                    let why = if tapped {
+                        "it is tapped"
+                    } else if !snapshots_fit {
+                        "it takes more snapshots than a body holds"
+                    } else if !Self::keyable_units(&self.compiled) {
+                        "the plan's units key no body"
+                    } else if !world {
+                        "its expert group is not whole"
+                    } else if self.cache.body_refused(&key) {
+                        "its body was refused when it was captured"
+                    } else if !bodied {
+                        "its admitted set cannot be cut to a body"
+                    } else if !readouts_fit {
+                        "it reads out more rows than its bucket's body carries"
+                    } else {
+                        "it has more lanes than a body's window table holds"
+                    };
+                    if bodied && !readouts_fit {
+                        format!(
+                            "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
                          {last_rows} last rows under {max_lanes} lanes, {verified} verified \
                          rows, {every_row} every row, lane ceiling {lane_ceiling})",
-                        readout_rows.len(),
-                        composition.lane_count(),
-                        readout_ceiling,
-                    )
-                } else {
-                    format!("{key}: {why}")
-                }
-            });
+                            readout_rows.len(),
+                            composition.lane_count(),
+                            readout_ceiling,
+                        )
+                    } else {
+                        format!("{key}: {why}")
+                    }
+                });
         let bodied = bodied && readouts_fit && lanes_fit;
         let readout_live = readout_rows.len() as u32;
         if bodied {

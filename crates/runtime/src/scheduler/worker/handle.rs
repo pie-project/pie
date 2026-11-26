@@ -403,7 +403,8 @@ impl SchedulerHandle {
         // this bind.
         let settle = move || crate::pipeline::fire::settle_process_fires(pid);
         let (registered, _, bound) = crate::store::roles::bind_when_resident(
-            pid, lane_bind, resident, grown, room, fits, idle, suspend, planned, leave, waiting, settle,
+            pid, lane_bind, resident, grown, room, fits, idle, suspend, planned, leave, waiting,
+            settle,
         )
         .await?;
         Ok((registered, bound))

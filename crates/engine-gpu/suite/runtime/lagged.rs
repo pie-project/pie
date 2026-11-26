@@ -41,7 +41,14 @@ struct Served {
     unkept: u64,
 }
 
-fn fire(shell: &mut Shell, trace: &poem_ir::Trace, tokens: &[u32], rs: &RsVerb, reset: RsReset, held: u32) -> Vec<f32> {
+fn fire(
+    shell: &mut Shell,
+    trace: &poem_ir::Trace,
+    tokens: &[u32],
+    rs: &RsVerb,
+    reset: RsReset,
+    held: u32,
+) -> Vec<f32> {
     let seated = [Seated {
         rs,
         rs_reset: reset,
@@ -64,9 +71,17 @@ fn served(lag: u32) -> Option<Served> {
     // The bodies armed before the load serves, as an engine's load arms them:
     // a serving fire fills one and replays it, recording nothing.
     shell.record_bodies(None).expect("the load arms its bodies");
-    let _ = (shell.recorded_serving(), shell.unkept_serving(), shell.eager_serving());
+    let _ = (
+        shell.recorded_serving(),
+        shell.unkept_serving(),
+        shell.eager_serving(),
+    );
     shell.serving = true;
-    let page = shell.pools().rs_rows().expect("the pool lays an rs list").tokens;
+    let page = shell
+        .pools()
+        .rs_rows()
+        .expect("the pool lays an rs list")
+        .tokens;
     shell.open(0).expect("slot 0 opens");
     let prompt: Vec<u32> = (0..PROMPT).map(|t| (t * 7 + 11) % 1000).collect();
     // A lagged lane's prompt folds all but its last `lag` rows: the prompt
@@ -83,14 +98,28 @@ fn served(lag: u32) -> Option<Served> {
             lineage: Lineage::Set,
         }
     };
-    let mut steps = vec![fire(&mut shell, &fixture.trace, &prompt, &verb, RsReset::Fresh, 0)];
+    let mut steps = vec![fire(
+        &mut shell,
+        &fixture.trace,
+        &prompt,
+        &verb,
+        RsReset::Fresh,
+        0,
+    )];
     let (mut fed, mut folded) = (PROMPT, PROMPT - unfolded);
     // The prompt's own recordings are not the decodes'.
     let _ = (shell.recorded_serving(), shell.unkept_serving());
     for at in 0..STEPS {
         let token = (fed * 7 + 11) % 1000;
         if lag == 0 {
-            steps.push(fire(&mut shell, &fixture.trace, &[token], &RsVerb::Fold, RsReset::Held, fed));
+            steps.push(fire(
+                &mut shell,
+                &fixture.trace,
+                &[token],
+                &RsVerb::Fold,
+                RsReset::Held,
+                fed,
+            ));
             fed += 1;
             folded += 1;
             continue;
@@ -110,7 +139,14 @@ fn served(lag: u32) -> Option<Served> {
             fold: FoldLen::Host(fold),
             lineage: Lineage::Set,
         };
-        steps.push(fire(&mut shell, &fixture.trace, &[token], &verb, RsReset::Held, fed));
+        steps.push(fire(
+            &mut shell,
+            &fixture.trace,
+            &[token],
+            &verb,
+            RsReset::Held,
+            fed,
+        ));
         fed = end;
         folded += fold;
     }
@@ -125,7 +161,14 @@ fn served(lag: u32) -> Option<Served> {
             fold: FoldLen::Host(PROMPT / 2),
             lineage: Lineage::Set,
         };
-        fire(&mut shell, &fixture.trace, &prompt, &verb, RsReset::Fresh, 0);
+        fire(
+            &mut shell,
+            &fixture.trace,
+            &prompt,
+            &verb,
+            RsReset::Fresh,
+            0,
+        );
     }
     Some(Served {
         steps,
@@ -141,7 +184,11 @@ fn a_lagged_lane_answers_the_folding_lane() {
     };
     let lags: Vec<u32> = std::env::var("PIE_GOLDEN_LAGS").map_or_else(
         |_| vec![1, 2, 3, 9],
-        |lags| lags.split(',').map(|lag| lag.parse().expect("a lag")).collect(),
+        |lags| {
+            lags.split(',')
+                .map(|lag| lag.parse().expect("a lag"))
+                .collect()
+        },
     );
     for lag in lags {
         let lagged = served(lag).expect("the shell loaded once");
@@ -158,7 +205,10 @@ fn a_lagged_lane_answers_the_folding_lane() {
             worst = worst.max(apart / scale.max(f32::MIN_POSITIVE));
             moved += usize::from(got != want);
             if std::env::var_os("PIE_GOLDEN_LAG_STEPS").is_some() {
-                println!("lag {lag} step: apart {:e}", apart / scale.max(f32::MIN_POSITIVE));
+                println!(
+                    "lag {lag} step: apart {:e}",
+                    apart / scale.max(f32::MIN_POSITIVE)
+                );
             }
             if argmax(got) != argmax(want) {
                 let mut sorted = want.clone();

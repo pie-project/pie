@@ -23,7 +23,11 @@ fn fire(
 ) -> Vec<f32> {
     let facts = shell.trace().facts.clone();
     let word = facts.word(&Request::new(tokens.len() as u32, mask.is_some()));
-    let mut s = Seated::of(Lane { slot: 0, word, tokens });
+    let mut s = Seated::of(Lane {
+        slot: 0,
+        word,
+        tokens,
+    });
     s.pages = &pages[..(held as usize + tokens.len()).div_ceil(16)];
     s.held = Some(held);
     s.folded = folded;
@@ -53,12 +57,21 @@ fn a_mask_reads_from_the_committed_boundary() {
     let _ = fire(shell, &pages, &prompt, 0, 0, None);
     // Committed through 3: columns are keys 3..8, the buffer 3, 4, 5, then
     // the two rows; column 1 (key 4) hidden.
-    let from_boundary = Masking::Extent(Mask { runs: vec![0, 1, 1, 3], total: 5 });
+    let from_boundary = Masking::Extent(Mask {
+        runs: vec![0, 1, 1, 3],
+        total: 5,
+    });
     let got = fire(shell, &pages, &rows, 6, 3, Some(&from_boundary));
     // Nothing committed: the same keys, the committed three admitted.
-    let from_zero = Masking::Extent(Mask { runs: vec![0, 4, 1, 3], total: 8 });
+    let from_zero = Masking::Extent(Mask {
+        runs: vec![0, 4, 1, 3],
+        total: 8,
+    });
     let want = fire(shell, &pages, &rows, 6, 0, Some(&from_zero));
-    assert_eq!(got, want, "the boundary's columns read what the whole mask reads");
+    assert_eq!(
+        got, want,
+        "the boundary's columns read what the whole mask reads"
+    );
     let open = fire(shell, &pages, &rows, 6, 0, None);
     assert_ne!(got, open, "key 4 is hidden");
     eprintln!("a mask from the committed boundary reads what the whole mask reads, bit for bit");

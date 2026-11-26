@@ -49,7 +49,9 @@ fn every_head_output_states_a_depth() {
                 heads += 1;
             }
             (Some(_), None, None) => panic!("`{}` reads drafts out and states no depth", row.name),
-            (None, _, Some(depth)) => panic!("`{}` states depth {depth} and drafts nothing", row.name),
+            (None, _, Some(depth)) => {
+                panic!("`{}` states depth {depth} and drafts nothing", row.name)
+            }
             _ => {}
         }
     }

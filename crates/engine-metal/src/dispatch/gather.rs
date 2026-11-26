@@ -274,7 +274,10 @@ impl Run<'_> {
                 self.tensor(*y)?,
             ),
             Gather::ConcatCols { xs, y } => {
-                let xs = xs.iter().map(|x| self.tensor(*x)).collect::<crate::run::Ran<Vec<_>>>()?;
+                let xs = xs
+                    .iter()
+                    .map(|x| self.tensor(*x))
+                    .collect::<crate::run::Ran<Vec<_>>>()?;
                 gather::concat_cols(self.ctx(), &xs, self.tensor(*y)?)
             }
             Gather::SplitQkvPadded { .. } => Err(kernels_metal::Error::Unsupported {

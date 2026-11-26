@@ -163,7 +163,10 @@ fn split_case(name: &'static str, vocab: u32) -> Case {
             value: 1,
             shape: Shape::vector(vocab),
         },
-        Op::Reshape { value: 2, shape: row },
+        Op::Reshape {
+            value: 2,
+            shape: row,
+        },
         Op::Cast {
             value: 3,
             dtype: Dtype::Bf16,
@@ -178,14 +181,23 @@ fn split_case(name: &'static str, vocab: u32) -> Case {
             value: 7,
             dtype: Dtype::Bf16,
         },
-        Op::Broadcast { value: 8, shape: row },
+        Op::Broadcast {
+            value: 8,
+            shape: row,
+        },
         Op::ReduceMax(4),
-        Op::Broadcast { value: 10, shape: row },
+        Op::Broadcast {
+            value: 10,
+            shape: row,
+        },
         Op::Sub(4, 11),
         Op::Exp(12),
         Op::ReduceSum(13),
         Op::Log(14),
-        Op::Broadcast { value: 15, shape: row },
+        Op::Broadcast {
+            value: 15,
+            shape: row,
+        },
         Op::Sub(12, 16),
         Op::Add(9, 17),
         Op::Reshape {
@@ -263,7 +275,9 @@ fn case(name: &'static str, bytes: &[u8], vocab: u32, binding: Binding) -> Case 
             ChanDType::Concrete(Dtype::U32) => {
                 Value::U32((0..cells).map(|k| (k as u32) % 3).collect())
             }
-            ChanDType::Concrete(Dtype::Bool) => Value::Bool((0..cells).map(|k| k % 5 == 0).collect()),
+            ChanDType::Concrete(Dtype::Bool) => {
+                Value::Bool((0..cells).map(|k| k % 5 == 0).collect())
+            }
             other => panic!("{name}: channel {index} of {other:?}"),
         };
         seeds.push((index as u32, value));
@@ -405,13 +419,16 @@ impl Case {
     #[must_use]
     pub fn f32_bound(&self, device: Accuracy, cell: f32) -> f32 {
         let host = Accuracy::HOST;
-        let ulp = |x: f64| -> f64 { 2f64.powi(x.abs().max(f64::from(f32::MIN_POSITIVE)).log2().floor() as i32 - 23) };
+        let ulp = |x: f64| -> f64 {
+            2f64.powi(x.abs().max(f64::from(f32::MIN_POSITIVE)).log2().floor() as i32 - 23)
+        };
         let unit = 2f64.powi(-24);
         let levels = f64::from(self.vocab.max(2)).log(32.0).ceil();
         let depth = 5.0 * levels;
         let exp = f64::from(device.exp_ulps + host.exp_ulps) * 2f64.powi(-23);
         let sum = exp + 2.0 * depth * unit;
-        let log = f64::from(device.log_ulps + host.log_ulps) * ulp(f64::from(self.vocab).ln()) + sum;
+        let log =
+            f64::from(device.log_ulps + host.log_ulps) * ulp(f64::from(self.vocab).ln()) + sum;
         (log + 6.0 * ulp(f64::from(cell))) as f32
     }
 
@@ -442,14 +459,21 @@ impl Case {
             ));
         }
         let floats = matches!(
-            self.bound.container.channels.get(channel as usize).map(|c| c.dtype),
+            self.bound
+                .container
+                .channels
+                .get(channel as usize)
+                .map(|c| c.dtype),
             Some(ChanDType::Concrete(Dtype::F32))
         );
         if !floats {
             return if got == want {
                 Ok(())
             } else {
-                Err(format!("{}: channel {channel}: {got:02x?} != {want:02x?}", self.name))
+                Err(format!(
+                    "{}: channel {channel}: {got:02x?} != {want:02x?}",
+                    self.name
+                ))
             };
         }
         let cell = |bytes: &[u8]| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -461,13 +485,23 @@ impl Case {
                 let (g, w) = (cell(g), cell(w));
                 let bound = self.f32_bound(device, w) * steps.max(1) as f32;
                 let off = (g - w).abs();
-                (!(off <= bound)).then(|| format!("cell {at}: {g} ({:#010x}) vs {w} ({:#010x}), off {off:e} past {bound:e}", g.to_bits(), w.to_bits()))
+                (!(off <= bound)).then(|| {
+                    format!(
+                        "cell {at}: {g} ({:#010x}) vs {w} ({:#010x}), off {off:e} past {bound:e}",
+                        g.to_bits(),
+                        w.to_bits()
+                    )
+                })
             })
             .collect();
         if wrong.is_empty() {
             Ok(())
         } else {
-            Err(format!("{}: channel {channel}: {}", self.name, wrong.join("; ")))
+            Err(format!(
+                "{}: channel {channel}: {}",
+                self.name,
+                wrong.join("; ")
+            ))
         }
     }
 
@@ -663,10 +697,8 @@ pub fn near_tie(
                     })
                     .collect()
             });
-            let edge = nucleus.is_some_and(|n| {
-                excl.iter()
-                    .any(|&(x, y)| nucleus_edge(x, y, n, drift_max))
-            });
+            let edge = nucleus
+                .is_some_and(|n| excl.iter().any(|&(x, y)| nucleus_edge(x, y, n, drift_max)));
             let clause = if !diffuse {
                 None
             } else if gap <= bound {
@@ -719,7 +751,8 @@ pub fn exclusive_mass(row: &[f32], temperature: f32, token: usize) -> f64 {
 pub fn nucleus_edge(a: f64, b: f64, nucleus: Nucleus, drift_max: f32) -> bool {
     let p = f64::from(nucleus.top_p);
     let flipped = (a < p) != (b < p);
-    let reach = a.max(b) * ((2.0 * f64::from(drift_max) / f64::from(nucleus.temperature)).exp() - 1.0);
+    let reach =
+        a.max(b) * ((2.0 * f64::from(drift_max) / f64::from(nucleus.temperature)).exp() - 1.0);
     flipped && (a - b).abs() <= reach
 }
 
@@ -736,7 +769,10 @@ mod tests {
         let cases = beam_stage();
         let w2 = &cases[2];
         let scores = |words: [u32; 2]| -> Vec<u8> {
-            words.iter().flat_map(|w| f32::from_bits(*w).to_le_bytes()).collect()
+            words
+                .iter()
+                .flat_map(|w| f32::from_bits(*w).to_le_bytes())
+                .collect()
         };
         let want = scores([0xC11A_7966, 0xC11A_7966]);
         let float = w2
@@ -747,15 +783,27 @@ mod tests {
             .position(|c| matches!(c.dtype, ChanDType::Concrete(Dtype::F32)))
             .expect("a score channel") as u32;
         let near = scores([0xC11A_7965, 0xC11A_7965]);
-        assert_eq!(w2.agrees(float, &near, &want, Accuracy::METAL_PRECISE, 1), Ok(()));
+        assert_eq!(
+            w2.agrees(float, &near, &want, Accuracy::METAL_PRECISE, 1),
+            Ok(())
+        );
         let bound = w2.f32_bound(Accuracy::METAL_PRECISE, f32::from_bits(0xC11A_7966));
         assert!(bound < 1e-4, "the bound is rounding, not slack: {bound:e}");
-        let far = scores([0xC11A_7966, (f32::from_bits(0xC11A_7966) + 4.0 * bound).to_bits()]);
-        assert!(w2.agrees(float, &far, &want, Accuracy::METAL_PRECISE, 1).is_err());
+        let far = scores([
+            0xC11A_7966,
+            (f32::from_bits(0xC11A_7966) + 4.0 * bound).to_bits(),
+        ]);
+        assert!(
+            w2.agrees(float, &far, &want, Accuracy::METAL_PRECISE, 1)
+                .is_err()
+        );
         let ids = w2.readers[0];
         let id = 51_616u32.to_le_bytes().to_vec();
         let off = 51_617u32.to_le_bytes().to_vec();
-        assert!(w2.agrees(ids, &off, &id, Accuracy::METAL_PRECISE, 1).is_err());
+        assert!(
+            w2.agrees(ids, &off, &id, Accuracy::METAL_PRECISE, 1)
+                .is_err()
+        );
         assert_eq!(w2.agrees(ids, &id, &id, Accuracy::METAL_PRECISE, 1), Ok(()));
     }
 
@@ -765,7 +813,11 @@ mod tests {
     fn the_beam_step_answers_what_it_answered() {
         let cases = beam_stage();
         let w2 = &cases[0];
-        assert_eq!(cases[2].expected(), w2.expected(), "the seats are the backend's alone");
+        assert_eq!(
+            cases[2].expected(),
+            w2.expected(),
+            "the seats are the backend's alone"
+        );
         assert_eq!((w2.rows, w2.readers.as_slice()), (2, &[2u32, 3, 4, 5][..]));
         let rows = w2.expected();
         let words = |bytes: &[u8]| -> Vec<u32> {
@@ -804,8 +856,15 @@ mod tests {
         assert!(parting.tie, "{parting:?}");
         assert_eq!(parting.drift_max, 3.0 * step);
         assert_eq!(parting.diffuse, Some(true));
-        assert!(parting.ranks.iter().all(|rank| *rank > 0), "{:?}", parting.ranks);
-        assert!(!near_tie(0.40, &[5, 7], Drift::Rows { a: &a, b: &b }, None).tie, "past twice the drift");
+        assert!(
+            parting.ranks.iter().all(|rank| *rank > 0),
+            "{:?}",
+            parting.ranks
+        );
+        assert!(
+            !near_tie(0.40, &[5, 7], Drift::Rows { a: &a, b: &b }, None).tie,
+            "past twice the drift"
+        );
 
         // The decision's pair alone moving past every other entry: structured.
         let mut c = a.clone();
@@ -817,8 +876,19 @@ mod tests {
         assert!(!concentrated.tie, "{concentrated:?}");
         assert_eq!(concentrated.ranks, vec![0, 0]);
 
-        let stated = near_tie(0.092, &[5, 7], Drift::Depth { top: 14.0625, steps: 1.0 }, None);
-        assert_eq!((stated.bound, stated.diffuse, stated.tie), (0.125, None, true));
+        let stated = near_tie(
+            0.092,
+            &[5, 7],
+            Drift::Depth {
+                top: 14.0625,
+                steps: 1.0,
+            },
+            None,
+        );
+        assert_eq!(
+            (stated.bound, stated.diffuse, stated.tie),
+            (0.125, None, true)
+        );
     }
 
     /// Seed 12's parting (Qwen3-0.6B on Vulkan, top-p T 0.6 p 0.95, token
@@ -829,15 +899,27 @@ mod tests {
     /// flip on a mass move the drift cannot reach is not.
     #[test]
     fn a_nucleus_edge_crossed_on_rounding_is_a_tie_by_its_own_clause() {
-        let seed12 = Nucleus { temperature: 0.6, top_p: 0.95 };
+        let seed12 = Nucleus {
+            temperature: 0.6,
+            top_p: 0.95,
+        };
         assert!(nucleus_edge(0.952_162, 0.947_712, seed12, 0.218_75));
-        assert!(!nucleus_edge(0.952_162, 0.951_000, seed12, 0.218_75), "kept by neither");
-        assert!(!nucleus_edge(0.99, 0.90, seed12, 0.001), "past what the drift moves");
+        assert!(
+            !nucleus_edge(0.952_162, 0.951_000, seed12, 0.218_75),
+            "kept by neither"
+        );
+        assert!(
+            !nucleus_edge(0.99, 0.90, seed12, 0.001),
+            "past what the drift moves"
+        );
 
         // Three tokens at T 1: token 2's mass above it is 0.952 in one path
         // (dropped at p 0.95) and 0.9475 in the other (kept); token 1 moves
         // more than either contested token, so the drift is diffuse.
-        let nucleus = Nucleus { temperature: 1.0, top_p: 0.95 };
+        let nucleus = Nucleus {
+            temperature: 1.0,
+            top_p: 0.95,
+        };
         let logits = |probs: [f64; 3]| probs.map(|p| p.ln() as f32).to_vec();
         let a = logits([0.900, 0.052, 0.048]);
         let b = logits([0.890, 0.0575, 0.0525]);
@@ -845,8 +927,16 @@ mod tests {
         assert_eq!(parting.clause, Some(Clause::NucleusEdge), "{parting:?}");
         assert!(parting.tie);
         assert_eq!(Clause::NucleusEdge.name(), "nucleus-edge");
-        assert!((parting.excl[1].0 - 0.952).abs() < 1e-6 && (parting.excl[1].1 - 0.9475).abs() < 1e-6);
-        assert_eq!(near_tie(1.0, &[0, 2], Drift::Rows { a: &a, b: &b }, None).clause, None);
-        assert_eq!(near_tie(0.01, &[0, 2], Drift::Rows { a: &a, b: &b }, Some(nucleus)).clause, Some(Clause::Gap));
+        assert!(
+            (parting.excl[1].0 - 0.952).abs() < 1e-6 && (parting.excl[1].1 - 0.9475).abs() < 1e-6
+        );
+        assert_eq!(
+            near_tie(1.0, &[0, 2], Drift::Rows { a: &a, b: &b }, None).clause,
+            None
+        );
+        assert_eq!(
+            near_tie(0.01, &[0, 2], Drift::Rows { a: &a, b: &b }, Some(nucleus)).clause,
+            Some(Clause::Gap)
+        );
     }
 }

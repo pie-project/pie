@@ -81,12 +81,10 @@ impl Program {
     /// The lanes of a beam group, where the program states each beam's parent
     /// (`Port::Parents`, `[lanes]` u32 in a channel).
     fn beam_lanes(&self) -> Option<u32> {
-        let binding = self
-            .plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)?;
+        let binding =
+            self.plan.package.ports.iter().find(|binding| {
+                binding.port == eta_ir::registry::Port::Parents && !binding.is_const
+            })?;
         let channel = self.plan.package.channels.get(binding.channel as usize)?;
         Some(ChannelShape::of(channel).numel as u32)
     }
@@ -394,7 +392,11 @@ impl PairRoom {
         self.beam.map_or(0, |beam| {
             launch::SPAN_ALIGN
                 + beam.at
-                + kernels_cuda::runtime::channel::beam_state_words(beam.lanes, beam.cap, beam.frames) * 4
+                + kernels_cuda::runtime::channel::beam_state_words(
+                    beam.lanes,
+                    beam.cap,
+                    beam.frames,
+                ) * 4
         })
     }
 
@@ -788,17 +790,20 @@ impl Plane {
         let held = self.held(program_id)?;
         let place = slots.place(&held, span)?;
         let scratch_piece = piece_at(&slots.scratch, room.place_bytes(), span)?;
-        let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.place_bytes());
+        let own = own_runs(
+            &held,
+            &place,
+            &slots.scratch,
+            scratch_piece,
+            room.place_bytes(),
+        );
         let id = InstanceId(self.next_instance);
         if engine::guest_claims::saying() {
             engine::guest_claims::say(
                 "cuda: bind claims",
                 format_args!(
                     "instance={} program={} instance_refs={:?} pair_generation={}",
-                    id.0,
-                    program_id,
-                    slots.instance,
-                    slots.pair_generation,
+                    id.0, program_id, slots.instance, slots.pair_generation,
                 ),
             );
         }
@@ -868,9 +873,7 @@ impl Plane {
         // the pair's slots is.
         let (resident, scratch) = room.lay(scratch_piece);
         let mut clears = vec![(&slots.scratch, scratch_piece, room.place_bytes())];
-        if batch.bound == 0
-            || batch.pair != slots.pair
-            || batch.generation != slots.pair_generation
+        if batch.bound == 0 || batch.pair != slots.pair || batch.generation != slots.pair_generation
         {
             let base = piece_at(&slots.pair, batch.room.bytes(), span)?;
             batch.pair = slots.pair.clone();
@@ -964,8 +967,16 @@ impl Plane {
                 format_args!(
                     "instances={} parked={:?} kept={:?} closing={:?}",
                     self.instances.len(),
-                    self.instances.iter().filter(|(_, bound)| bound.parked).map(|(id, _)| id.0).collect::<Vec<_>>(),
-                    self.instances.iter().filter(|(_, bound)| bound.kept).map(|(id, _)| id.0).collect::<Vec<_>>(),
+                    self.instances
+                        .iter()
+                        .filter(|(_, bound)| bound.parked)
+                        .map(|(id, _)| id.0)
+                        .collect::<Vec<_>>(),
+                    self.instances
+                        .iter()
+                        .filter(|(_, bound)| bound.kept)
+                        .map(|(id, _)| id.0)
+                        .collect::<Vec<_>>(),
                     self.closing.iter().map(|id| id.0).collect::<Vec<_>>(),
                 ),
             );
@@ -1046,12 +1057,19 @@ impl Plane {
                     }
                 };
                 if claimed {
-                    moved.push((Holder::Pair(batch.claim), vec![device_run(base, batch.room.bytes())]));
+                    moved.push((
+                        Holder::Pair(batch.claim),
+                        vec![device_run(base, batch.room.bytes())],
+                    ));
                 }
                 batches.push((*program_id, at, Some(base)));
             }
         }
-        Ok(Rebase { moved, instances, batches })
+        Ok(Rebase {
+            moved,
+            instances,
+            batches,
+        })
     }
 
     /// Claims what `rebase` names, in one step: refused by name, and
@@ -1121,16 +1139,12 @@ impl Plane {
             }
             _ => Vec::new(),
         };
-if engine::guest_claims::saying() {
+        if engine::guest_claims::saying() {
             engine::guest_claims::say(
                 "cuda: park",
                 format_args!(
                     "instance={} kept={} was_parked={} was_kept={} instance_refs={:?}",
-                    id.0,
-                    kept,
-                    bound.parked,
-                    bound.kept,
-                    bound.slots.instance,
+                    id.0, kept, bound.parked, bound.kept, bound.slots.instance,
                 ),
             );
         }
@@ -1180,7 +1194,13 @@ if engine::guest_claims::saying() {
         // state is its group's: joined as it stands, laid anew at a new
         // taking, and never moved by this member alone while another is
         // bound on it. One closed while a fire of it flies holds nothing.
-        let own = own_runs(&held, &place, &slots.scratch, scratch_piece, room.place_bytes());
+        let own = own_runs(
+            &held,
+            &place,
+            &slots.scratch,
+            scratch_piece,
+            room.place_bytes(),
+        );
         if engine::guest_claims::saying() {
             engine::guest_claims::say(
                 "cuda: rebind claims",
@@ -1205,7 +1225,10 @@ if engine::guest_claims::saying() {
                 .programs
                 .get(&program_id)
                 .and_then(|program| {
-                    program.batches.iter().find(|batch| batch.extents == extents)
+                    program
+                        .batches
+                        .iter()
+                        .find(|batch| batch.extents == extents)
                 })
                 .map(|batch| batch.claim)
                 .ok_or_else(|| {
@@ -1241,7 +1264,9 @@ if engine::guest_claims::saying() {
             bound.session.poison();
             return Err(Fault::program(
                 "program::plane",
-                format!("instance {id}'s rings could not all be rebound, and it is failed: {fault}"),
+                format!(
+                    "instance {id}'s rings could not all be rebound, and it is failed: {fault}"
+                ),
             ));
         }
         // The score seats a fire bound inside the rows move with them.
@@ -1382,7 +1407,9 @@ if engine::guest_claims::saying() {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_output(name, lane, base, storage, width, row_stride, row_offset, rows)
+            .bind_output(
+                name, lane, base, storage, width, row_stride, row_offset, rows,
+            )
     }
 
     /// Instance `id`'s fire seats `lanes` lanes ([`Session::seat_lanes`]).

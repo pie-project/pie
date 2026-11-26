@@ -754,7 +754,9 @@ impl<'c, B: Backend> Run<'c, B> {
         ids: [ValueId; N],
     ) -> ([Tensor; N], kernels_slang::ssm::RowSpan) {
         let bound = ids.map(|id| self.rowed(id));
-        let (row0, rows) = bound.first().map_or((0, 0), |&(_, row0, rows)| (row0, rows));
+        let (row0, rows) = bound
+            .first()
+            .map_or((0, 0), |&(_, row0, rows)| (row0, rows));
         if bound.iter().all(|&(_, at, _)| at == row0) {
             return (
                 bound.map(|(t, _, _)| t),
@@ -1213,7 +1215,10 @@ impl<'c, B: Backend> Run<'c, B> {
         };
         // The fire's row the window's ids start at: a stage is laid by the
         // fire's rows, each region's in its own.
-        let first = match (&self.window().gathered, &self.values[ids_value.0 as usize].ty) {
+        let first = match (
+            &self.window().gathered,
+            &self.values[ids_value.0 as usize].ty,
+        ) {
             (None, Ty::Tensor { shape, .. }) if shape.first() == Some(&Dim::Tokens) => {
                 self.window().span.row_offset
             }
@@ -1284,9 +1289,13 @@ impl<'c, B: Backend> Run<'c, B> {
 
     /// A score capture's normalisers' room, where the trace captures.
     pub fn score_stats(&self) -> Option<Tensor> {
-        Some(self.scratch.score_stats(self.handles)?.unwrap_or_else(|fault| {
-            panic!("the score normalisers' room this load reserved does not mint: {fault}")
-        }))
+        Some(
+            self.scratch
+                .score_stats(self.handles)?
+                .unwrap_or_else(|fault| {
+                    panic!("the score normalisers' room this load reserved does not mint: {fault}")
+                }),
+        )
     }
 
     /// The fire's capturing lanes: the rows of a capture.

@@ -76,7 +76,10 @@ pub(super) fn retracted_ends(
 
 /// Which of the last `fires` fires (counted from the end, 1 the last) is
 /// the latest whose pass stated its rows final, if any.
-pub(super) fn final_fire(written: &std::collections::VecDeque<WrittenFire>, fires: usize) -> Option<usize> {
+pub(super) fn final_fire(
+    written: &std::collections::VecDeque<WrittenFire>,
+    fires: usize,
+) -> Option<usize> {
     written
         .iter()
         .rev()
@@ -173,13 +176,18 @@ pub async fn pipeline_retract<C: FireContext>(
 }
 
 /// Returns once kv set `ws` is in no move, waiting on each move's end.
-pub(super) async fn kv_out_of_move(stores: &crate::store::registry::Stores, ws: crate::store::kv::page_table::WorkingSetId) {
+pub(super) async fn kv_out_of_move(
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) {
     loop {
-        let ended = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.moves_ended());
+        let ended =
+            crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.moves_ended());
         let notified = ended.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if !crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.set_in_move(ws)) {
+        if !crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| kv.set_in_move(ws))
+        {
             return;
         }
         notified.await;
@@ -191,7 +199,10 @@ pub(super) async fn kv_out_of_move(stores: &crate::store::registry::Stores, ws: 
 /// accepted rows past the cut), then its recurrent state's buffer or its
 /// windows' head (refused where a fold reached past the cut), then its KV.
 /// Under the lagged fold none of these touches a folded row.
-pub(super) async fn take_back(stores: &crate::store::registry::Stores, end: &SetStart) -> Result<(), String> {
+pub(super) async fn take_back(
+    stores: &crate::store::registry::Stores,
+    end: &SetStart,
+) -> Result<(), String> {
     let cut = u32::try_from(end.start).unwrap_or(u32::MAX);
     end.cursor.lock().unwrap().take_back(cut)?;
     if let Some(rs) = end.rs {

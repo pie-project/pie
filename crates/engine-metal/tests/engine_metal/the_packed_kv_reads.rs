@@ -32,12 +32,12 @@
 //! index or scale shows up as a large deviation (a bug to surface, not a tolerance
 //! to loosen).
 
+use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, mask_words};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::attn::{self, DecodePlan, PrefillPlan};
 use kernels_metal::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
-use crate::common::{bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, mask_words};
 
 const KV_HEADS: usize = 2;
 const Q_HEADS: usize = 4; // gqa = 2
@@ -629,7 +629,6 @@ fn the_packed_kv_tiled_reads() {
             }
         }
     }
-
 }
 
 fn decode_bf16_pool(rig: &mut Rig, head_dim: usize) -> (KvPool, u32) {
@@ -782,7 +781,6 @@ fn the_packed_kv_decode_reads() {
 
     // The codec block IS the head_dim; prove the packed decode at 256 AND 128.
     for &head_dim in &HEAD_DIMS {
-
         // ---- CASE 1: realistic random K/V (off-grid) ----------------------------
         // Off-grid Gaussians with modest spikes: quantization is lossy (the FYI quant
         // number is meaty) and the isolate deviation is bounded by bf16 STORAGE
@@ -848,5 +846,4 @@ fn the_packed_kv_decode_reads() {
          offset/parity/scale/index bug), not a tolerance to loosen"
         );
     }
-
 }

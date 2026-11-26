@@ -151,7 +151,11 @@ pub fn compile_stage_at(bound: &BoundTrace, stage_index: usize) -> CompiledStage
     compile_stage_with(bound, stage_index, LibraryForms::ALL)
 }
 
-fn compile_stage_with(bound: &BoundTrace, stage_index: usize, forms: LibraryForms) -> CompiledStage {
+fn compile_stage_with(
+    bound: &BoundTrace,
+    stage_index: usize,
+    forms: LibraryForms,
+) -> CompiledStage {
     let mut normalized = normalize_stage(bound, stage_index);
     localize_stage(bound, &mut normalized);
     let signature = stage_signature(bound, &normalized);

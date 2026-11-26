@@ -9,8 +9,8 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, Step};
 use crate::load::{LoadRequest, Loaded, Reload, Reloaded};
 use crate::program::{
-    BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts, ProgramId,
-    ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
+    BindExtents, BoundInstance, FireFacts, GuestState, InstanceBinding, InstanceId, ProgramFacts,
+    ProgramId, ProgramRegistration, ReadoutFacts, Rebind, RingFacts,
 };
 use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -603,10 +603,7 @@ pub trait Channels: Engine {
         Ok(None)
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> Result<RegisteredChannel>;
+    fn open(&mut self, registration: &ChannelRegistration) -> Result<RegisteredChannel>;
 
     /// Closes channel `id`. With no instance bound on it, the channel and
     /// its endpoint are released now. With an instance still bound on it,
@@ -810,11 +807,7 @@ pub trait Tiers: Engine {
     /// Writes `bytes`, laid out as [`Tiers::read`] returns
     /// them, into host tier slots `slots`; a later [`Tiers::copy`]
     /// from the host tier reads them.
-    fn write(
-        &mut self,
-        slots: &[(crate::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> Result<()>;
+    fn write(&mut self, slots: &[(crate::chunk::ShapeId, Vec<u32>)], bytes: &[u8]) -> Result<()>;
 
     fn copy_kv(&mut self, copy: &KvCopy) -> Result<()>;
 

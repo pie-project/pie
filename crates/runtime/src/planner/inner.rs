@@ -75,8 +75,7 @@ pub(super) struct Inner {
     pub(super) long_waits: Vec<super::wait::LongWait>,
     /// The head held unserved on something in flight: since when, on what
     /// room, and whether that was said ([`super::ResidencyPlanner::tick`]).
-    pub(super) held_in_flight:
-        Option<(super::wait::EntryKey, u64, crate::rt::Instant, bool)>,
+    pub(super) held_in_flight: Option<(super::wait::EntryKey, u64, crate::rt::Instant, bool)>,
     /// How the last eviction plan ended, for the stall dump: the head it
     /// planned for, where it stopped, whether the room below was short,
     /// and the candidates its quote found unhostable.
@@ -119,9 +118,9 @@ impl Inner {
         let pid = self.queue.get(&head).map(|waiter| waiter.pid);
         // An entry served and gone from the queue: the last end, where it
         // was this entry's.
-        let own = pid.and_then(|pid| self.ends.get(&pid)).or_else(|| {
-            self.last_plan.as_ref().filter(|end| end.head.1 == head.1)
-        });
+        let own = pid
+            .and_then(|pid| self.ends.get(&pid))
+            .or_else(|| self.last_plan.as_ref().filter(|end| end.head.1 == head.1));
         let plan = match own {
             Some(end) => format!(
                 "ended={:?}{} host_short={} unhostable={}",
@@ -140,7 +139,9 @@ impl Inner {
             .procs
             .iter()
             .filter_map(|(pid, proc)| {
-                proc.rebind_waiting.as_ref().map(|unbound| format!("{pid}: {unbound}"))
+                proc.rebind_waiting
+                    .as_ref()
+                    .map(|unbound| format!("{pid}: {unbound}"))
             })
             .collect();
         // Rung raises waiting for room (capped frames' and rises'): each
@@ -424,11 +425,8 @@ impl Inner {
         // evicted-for head): built on every call it was a scan and a set of
         // the whole queue each time, and this runs many times a pass.
         let waiting = std::cell::OnceCell::<HashSet<ProcessId>>::new();
-        let waiting = || {
-            waiting.get_or_init(|| {
-                self.queue.values().map(|waiter| waiter.pid).collect()
-            })
-        };
+        let waiting =
+            || waiting.get_or_init(|| self.queue.values().map(|waiter| waiter.pid).collect());
         // Its head served: no unmet waiter of its, and resident. A restore
         // head leaves the queue while its restore runs and comes back if
         // its unpark is short: read by its queue alone, it looks served
@@ -449,15 +447,12 @@ impl Inner {
         // once for it each time it arrives.
         let unserved = |head: ProcessId| {
             waiting().contains(&head)
-                || self
-                    .procs
-                    .get(&head)
-                    .is_some_and(|proc| {
-                        proc.state != Residency::Resident
-                            || (proc.unfired && !proc.idle)
-                            || proc.bind_waiting
-                            || Self::in_request(proc)
-                    })
+                || self.procs.get(&head).is_some_and(|proc| {
+                    proc.state != Residency::Resident
+                        || (proc.unfired && !proc.idle)
+                        || proc.bind_waiting
+                        || Self::in_request(proc)
+                })
         };
         let passed = |head: ProcessId| self.passed.iter().any(|&(_, pid)| pid == head);
         // Its head a binder still in its request: between two binds it
@@ -501,7 +496,10 @@ impl Inner {
             self.queue.values().any(|other| {
                 other.pid != pid
                     && !matches!(other.kind, WaitKind::Restore { .. })
-                    && self.procs.get(&other.pid).is_some_and(|proc| proc.rank() < rank)
+                    && self
+                        .procs
+                        .get(&other.pid)
+                        .is_some_and(|proc| proc.rank() < rank)
             })
         };
         // The oldest restore passed over for the head it was evicted for:
@@ -552,9 +550,7 @@ impl Inner {
                     .and_then(|waiter| self.procs.get(&waiter.pid))
                     .is_some_and(|proc| !proc.seated);
                 if restore < allocation
-                    && (admits_new
-                        || self.fleet_stalled()
-                        || self.eviction_unfundable())
+                    && (admits_new || self.fleet_stalled() || self.eviction_unfundable())
                 {
                     restore
                 } else {
@@ -615,12 +611,18 @@ impl Inner {
                 // binds, it was moved for the next one at once (the Metal
                 // mix's seed 25: a beam's verify each step). A head waiting
                 // on room itself is never held behind: the restore goes.
-                if let Some(proc) = self.queue.get(&key).and_then(|waiter| self.procs.get(&waiter.pid))
+                if let Some(proc) = self
+                    .queue
+                    .get(&key)
+                    .and_then(|waiter| self.procs.get(&waiter.pid))
                     && let Some(head) = proc.evicted_for
                     && let Some(at) = self.procs.get(&head)
                     && at.binds_served > 0
                     && Self::in_request(at)
-                    && !self.queue.values().any(|waiter| waiter.pid == head && waiter.is_unmet())
+                    && !self
+                        .queue
+                        .values()
+                        .any(|waiter| waiter.pid == head && waiter.is_unmet())
                 {
                     return None;
                 }
@@ -789,7 +791,10 @@ impl Inner {
                 && proc.admitted
                 && !proc.idle
                 && !proc.held
-                && !self.queue.values().any(|waiter| waiter.pid == *pid && waiter.is_unmet())
+                && !self
+                    .queue
+                    .values()
+                    .any(|waiter| waiter.pid == *pid && waiter.is_unmet())
         })
     }
 
@@ -952,10 +957,9 @@ impl Inner {
     /// A head no move serves while such a one holds its room
     /// is passed over ([`super::ResidencyPlanner::stuck_head`]).
     pub(super) fn unfired_protects(&self, pid: ProcessId) -> bool {
-        self
-                .procs
-                .get(&pid)
-                .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
+        self.procs
+            .get(&pid)
+            .is_some_and(|proc| proc.unfired && !proc.bind_waiting)
             && (!self
                 .queue
                 .values()
@@ -1025,12 +1029,17 @@ impl Inner {
         }
         let mut print = one((self.next_id, self.accum.len(), self.bind_restoring));
         for (key, waiter) in &self.queue {
-            print = print
-                .rotate_left(5)
+            print = print.rotate_left(5)
                 ^ one((key, waiter.pid, waiter.is_unmet(), waiter.kind_name()));
         }
-        let evicting = self.evicting.keys().fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
-        let moving = self.parked_moving.iter().fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
+        let evicting = self
+            .evicting
+            .keys()
+            .fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
+        let moving = self
+            .parked_moving
+            .iter()
+            .fold(0u64, |sum, pid| sum.wrapping_add(one(pid)));
         let procs = self.procs.iter().fold(0u64, |sum, (pid, proc)| {
             sum.wrapping_add(one((
                 pid,
@@ -1134,5 +1143,8 @@ pub(super) enum RestoreGate {
     /// Its role slots are short of `need`, `(run, pieces)` runs of whole
     /// chunks: it goes again where they stand free, and (`fund`) room is
     /// made for it ([`Step::EvictForRoles`](super::plan)).
-    Evict { need: (u32, u32), fund: bool },
+    Evict {
+        need: (u32, u32),
+        fund: bool,
+    },
 }

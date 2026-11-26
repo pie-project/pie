@@ -96,7 +96,10 @@ impl Room {
     }
 }
 
-pub fn source_for(yields: Yield, source: impl FnOnce() -> Result<Source, String>) -> Result<Option<Source>, String> {
+pub fn source_for(
+    yields: Yield,
+    source: impl FnOnce() -> Result<Source, String>,
+) -> Result<Option<Source>, String> {
     if !yields.yields() {
         return Ok(None);
     }
@@ -148,7 +151,8 @@ pub fn yield_for(configured: Option<Yield>, unified_memory: bool, room: Room) ->
         ),
         None => (
             Yield::NONE,
-            "engine.memory.yield = 0: separate device memory, the pool holds its budget".to_string(),
+            "engine.memory.yield = 0: separate device memory, the pool holds its budget"
+                .to_string(),
         ),
     }
 }
@@ -411,7 +415,11 @@ mod tests {
         let mut governor = Governor::new(LIMITS, Yield::NONE);
         assert_eq!(governor.tick(1.0), LIMITS.hard_limit, "yield 0: the budget");
         let mut governor = Governor::new(LIMITS, share(1.0));
-        assert_eq!(governor.tick(1.0), LIMITS.floor, "yield 1, pressure 1: the floor");
+        assert_eq!(
+            governor.tick(1.0),
+            LIMITS.floor,
+            "yield 1, pressure 1: the floor"
+        );
         let mut governor = Governor::new(LIMITS, share(0.5));
         assert_eq!(governor.tick(0.5), 100 * MIB + 675 * MIB, "in between");
     }
@@ -454,7 +462,10 @@ mod tests {
         );
         let none = || Err("nothing reads it on this platform (windows)".to_string());
         let refused = source_for(share(1.0), none).expect_err("refused");
-        assert!(refused.ends_with("nothing reads it on this platform (windows)"), "{refused}");
+        assert!(
+            refused.ends_with("nothing reads it on this platform (windows)"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -472,13 +483,21 @@ mod tests {
             "engine.memory.yield = 1: unified memory, the pool and the host share RAM"
         );
         let (yields, line) = yield_for(Some(Yield::NONE), true, Room::Unread);
-        assert_eq!(yields, Yield::NONE, "a configured 0 is kept on unified memory");
+        assert_eq!(
+            yields,
+            Yield::NONE,
+            "a configured 0 is kept on unified memory"
+        );
         assert_eq!(line, "engine.memory.yield = 0: as configured");
         let (yields, line) = yield_for(Some(share(0.5)), false, Room::Unread);
         assert_eq!(yields, share(0.5));
         assert_eq!(line, "engine.memory.yield = 0.5: as configured");
         let (yields, _) = yield_for(None, false, Room::Unread);
-        assert_eq!(yields, Yield::NONE, "separate device memory: the default stays 0");
+        assert_eq!(
+            yields,
+            Yield::NONE,
+            "separate device memory: the default stays 0"
+        );
     }
 
     /// Where an engine reads the host's room itself, the unset yield reacts
@@ -490,14 +509,25 @@ mod tests {
     fn a_room_reading_engine_yields_only_to_the_rest_of_the_system() {
         let (yields, line) = yield_for(None, true, Room::BesideOwn);
         assert_eq!(yields, Yield::FULL);
-        assert!(line.contains("discounts this process's own memory"), "{line}");
+        assert!(
+            line.contains("discounts this process's own memory"),
+            "{line}"
+        );
         let (yields, line) = yield_for(None, true, Room::Undiscounted);
-        assert_eq!(yields, Yield::NONE, "no discount: the room reader alone holds the pool");
+        assert_eq!(
+            yields,
+            Yield::NONE,
+            "no discount: the room reader alone holds the pool"
+        );
         assert!(line.contains("cannot discount"), "{line}");
         let (yields, _) = yield_for(Some(share(0.5)), true, Room::Undiscounted);
         assert_eq!(yields, share(0.5), "a configured yield is kept");
         let (yields, _) = yield_for(None, false, Room::BesideOwn);
-        assert_eq!(yields, Yield::NONE, "separate device memory: the default stays 0");
+        assert_eq!(
+            yields,
+            Yield::NONE,
+            "separate device memory: the default stays 0"
+        );
     }
 
     #[test]

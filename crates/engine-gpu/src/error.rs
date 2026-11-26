@@ -275,8 +275,7 @@ impl Fault {
     /// the step's lane that row is of.
     #[must_use]
     pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
-        if let Self::Mask { lane, .. }
-            | Self::MaskRows { lane, .. } = &mut self
+        if let Self::Mask { lane, .. } | Self::MaskRows { lane, .. } = &mut self
             && let Some(row) = rows.get(*lane as usize)
         {
             *lane = row.source;
@@ -638,11 +637,20 @@ mod tests {
         // Each axis against its own count: z takes fewer here.
         assert!(matches!(
             workgroups("k", [1, 1, 65], limit),
-            Err(Fault::Workgroups { axis: 'z', count: 65, limit: 64, .. })
+            Err(Fault::Workgroups {
+                axis: 'z',
+                count: 65,
+                limit: 64,
+                ..
+            })
         ));
         assert!(matches!(
             workgroups("k", [u32::MAX, 1, 1], limit),
-            Err(Fault::Workgroups { axis: 'x', count: u32::MAX, .. })
+            Err(Fault::Workgroups {
+                axis: 'x',
+                count: u32::MAX,
+                ..
+            })
         ));
     }
 

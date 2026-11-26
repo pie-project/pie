@@ -63,11 +63,14 @@ fn register(model: &mut Model, name: &str) -> Result<engine::program::ProgramId,
     .map_err(|e| format!("bind: {e:?}"))?;
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
-    engine::Programs::register(&mut model.engine, &ProgramRegistration {
+    engine::Programs::register(
+        &mut model.engine,
+        &ProgramRegistration {
             launch,
             ..Default::default()
-        })
-        .map_err(|e| e.to_string())
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[test]

@@ -354,8 +354,12 @@ fn a_guests_state_reads_zero_when_its_slots_change_owner() {
     };
     let foreign = |shell: &Shell, place: &engine::ScratchPlace, bytes: u64| {
         let bytes = vec![0xA5u8; usize::try_from(bytes).expect("bytes")];
-        engine_cuda::device::alloc::stage_raw(shell.stream(), span_of(shell, place, bytes.len() as u64), &bytes)
-            .expect("another owner writes the slots");
+        engine_cuda::device::alloc::stage_raw(
+            shell.stream(),
+            span_of(shell, place, bytes.len() as u64),
+            &bytes,
+        )
+        .expect("another owner writes the slots");
     };
     let zero = |shell: &mut Shell, place: &engine::ScratchPlace, bytes: u64| {
         shell.drain().expect("the device drains");
@@ -531,7 +535,9 @@ fn a_parked_instance_s_shed_room_is_another_s_and_its_unpark_claims_again() {
     fire(&mut shell, word, &tokens, &attach(a));
     shell.drain().expect("the device drains");
 
-    shell.park_program(a, true).expect("A parks, its tables kept in place");
+    shell
+        .park_program(a, true)
+        .expect("A parks, its tables kept in place");
     let (b, _) = bind(&mut shell, &mut guest, &scratch, &pair, 2);
     let b = b.expect("B binds on the scratch and pair A's park gave back, no overlap");
 
@@ -649,13 +655,22 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
         &shell.program_facts(program).expect("the program's facts"),
         |_| false,
     );
-    let a = bind(&mut shell, a_slots.0.clone(), a_slots.1.clone(), &scratch, &pair, 1)
-        .expect("A binds");
+    let a = bind(
+        &mut shell,
+        a_slots.0.clone(),
+        a_slots.1.clone(),
+        &scratch,
+        &pair,
+        1,
+    )
+    .expect("A binds");
     let before = fire(&mut shell, word, &tokens, &attach(a));
     shell.drain().expect("the device drains");
     let put = argmax(&mut shell, a);
 
-    shell.park_program(a, true).expect("A parks, its tables kept in place");
+    shell
+        .park_program(a, true)
+        .expect("A parks, its tables kept in place");
     // A's tables' chunk onto the last chunk backed: the chunk that lay
     // there takes the bytes A's tables left.
     let tables = a_slots.0[0] / per_chunk;
@@ -674,14 +689,26 @@ fn an_evacuation_moves_a_kept_park_s_claim_and_tables() {
         &shell.program_facts(program).expect("the program's facts"),
         |_| false,
     );
-    let refused = bind(&mut shell, a_slots.0.clone(), c_rings.1.clone(), &c_scratch, &c_pair, 4);
-    let why = refused.expect_err("an instance at A's refs overlaps A's kept tables where they moved");
+    let refused = bind(
+        &mut shell,
+        a_slots.0.clone(),
+        c_rings.1.clone(),
+        &c_scratch,
+        &c_pair,
+        4,
+    );
+    let why =
+        refused.expect_err("an instance at A's refs overlaps A's kept tables where they moved");
     assert!(
         why.to_string().contains(&format!("instance {}", a.0)),
         "refused naming A: {why}"
     );
     // In the chunk now lying on A's old bytes: free of A.
-    let displaced: Vec<u32> = a_slots.0.iter().map(|&r| onto * per_chunk + r % per_chunk).collect();
+    let displaced: Vec<u32> = a_slots
+        .0
+        .iter()
+        .map(|&r| onto * per_chunk + r % per_chunk)
+        .collect();
     let (b_scratch, b_pair) = guest.places((program, "b"), &state);
     let b = bind(&mut shell, displaced, c_rings.1, &b_scratch, &b_pair, 5)
         .expect("B binds on the bytes A's tables left, no stale claim");
@@ -807,18 +834,27 @@ fn a_pair_whose_members_are_all_parked_is_laid_again_where_a_move_left_it() {
     shell.drain().expect("the device drains");
     let wanted = put(&mut shell, a);
 
-    shell.park_program(a, false).expect("A parks: every member of its pair parked");
+    shell
+        .park_program(a, false)
+        .expect("A parks: every member of its pair parked");
     // The pair's chunk onto the last chunk of state backed, then another
     // chunk onto the bytes it left: the old bytes are another chunk's.
     let held = first / per_chunk;
     let last = committed.min(facts.state_chunks() + 1) - 1;
     let other = last - 1;
-    assert!(held != last && held != other, "the pair's chunk is not a test's spare");
+    assert!(
+        held != last && held != other,
+        "the pair's chunk is not a test's spare"
+    );
     shell
-        .evacuate(&engine::chunk::Evacuation { moves: vec![(held, last)] })
+        .evacuate(&engine::chunk::Evacuation {
+            moves: vec![(held, last)],
+        })
         .expect("the pair's chunk moves while every member is parked");
     shell
-        .evacuate(&engine::chunk::Evacuation { moves: vec![(other, held)] })
+        .evacuate(&engine::chunk::Evacuation {
+            moves: vec![(other, held)],
+        })
         .expect("another chunk moves onto the bytes it left");
 
     // B joins the pair at its taking; A comes back at it.
@@ -848,8 +884,15 @@ fn a_pair_whose_members_are_all_parked_is_laid_again_where_a_move_left_it() {
     shell.drain().expect("the device drains");
     assert_eq!(got_b, want, "B's logits are A's before the move");
     assert_eq!(got_a, want, "A's logits are its own before the move");
-    assert_eq!(b_put, wanted, "B's epilogue reads the pair where the move left it");
-    assert_eq!(put(&mut shell, a), wanted, "A's epilogue reads the pair where the move left it");
+    assert_eq!(
+        b_put, wanted,
+        "B's epilogue reads the pair where the move left it"
+    );
+    assert_eq!(
+        put(&mut shell, a),
+        wanted,
+        "A's epilogue reads the pair where the move left it"
+    );
     for instance in [a, b] {
         shell
             .close_program_instance(instance)
@@ -961,8 +1004,15 @@ fn an_evacuation_refused_late_moves_nothing() {
     };
     let before = span(&shell);
     let refused = shell.evacuate_with(&evacuation, &[(vec![u32::MAX - 1], 64)]);
-    assert!(refused.is_err(), "a channel with no span refuses the evacuation");
-    assert_eq!(span(&shell), before, "the refused evacuation left the table");
+    assert!(
+        refused.is_err(),
+        "a channel with no span refuses the evacuation"
+    );
+    assert_eq!(
+        span(&shell),
+        before,
+        "the refused evacuation left the table"
+    );
     assert_eq!(read(&mut shell), marked, "and A's bytes where they lay");
 
     shell

@@ -1,7 +1,7 @@
 use crate::rt::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::stats::SchedulerStats;
@@ -123,7 +123,6 @@ struct LaneState {
     /// settles the lane submits nothing, so no frame waits on it.
     waits_on: Option<WorkItemCompletion>,
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GateVerdict {
@@ -311,7 +310,6 @@ impl FramePolicy {
             }
         }
     }
-
 
     /// Waves read out no more than `readouts` rows (the engine refuses a
     /// fire past them), a fire that alone reads more still taking a wave of
@@ -885,8 +883,7 @@ impl FramePolicy {
     /// rather than by a wait of its own.
     #[cfg(test)]
     pub(crate) fn parked_owner_frame_goes_at_once_by(owner: ProcessId, suspend: bool) -> bool {
-        let mut policy =
-            Self::new(1, 64, 4096, None);
+        let mut policy = Self::new(1, 64, 4096, None);
         let other = ProcessId::new_v4();
         let stamp = |lane, seq| FrameStamp {
             lane,
@@ -945,8 +942,9 @@ impl FramePolicy {
                 lane.own_submit = true;
             }
         }
-        self.lanes
-            .retain(|_, lane| lane.awaited || (lane.parked && !lane.own_submit) || !lane.frames.is_empty());
+        self.lanes.retain(|_, lane| {
+            lane.awaited || (lane.parked && !lane.own_submit) || !lane.frames.is_empty()
+        });
     }
 
     /// Parks `owner`'s lanes: none is awaited, what arrived of an
@@ -1110,8 +1108,10 @@ blocked={} pending_slots={} watchdog={:?}",
                 lane.owner,
                 lane.awaited,
                 lane.frames.len(),
-                lane.owner.is_some_and(|owner| self.suspended.contains(&owner)),
-                lane.owner.is_some_and(|owner| self.blocked.contains(&owner)),
+                lane.owner
+                    .is_some_and(|owner| self.suspended.contains(&owner)),
+                lane.owner
+                    .is_some_and(|owner| self.blocked.contains(&owner)),
                 lane.awaited && !lane.parked,
             );
         }

@@ -46,11 +46,7 @@ pub fn tell_when_landed(stream: *mut core::ffi::c_void, told: Told) -> Result<()
     event.record(stream)?;
     let ordinal = crate::device::ctx::current()?;
     let sent = Sent(event);
-    tell_after(
-        ordinal,
-        Box::new(move || sent.settle()),
-        told,
-    )
+    tell_after(ordinal, Box::new(move || sent.settle()), told)
 }
 
 /// How a move whose wait answered `settled` ended.

@@ -12,11 +12,11 @@ use crate::hip::{lt, sys};
 use crate::jit::{Ctx, aligned16, kernel, refuse};
 
 use super::dense_batch::dense_batch_bf16;
-use super::routes::{Kernel, Kind, Shape};
-use super::skinny;
 use super::gemv::{
     SkinnyEpilogue, gemv_bf16, skinny_bf16, skinny_f32, skinny_swiglu_bf16, skinnyt, turn_fits,
 };
+use super::routes::{Kernel, Kind, Shape};
+use super::skinny;
 
 /// Up to eight rows the skinny kernels always take a small weight.
 const SKINNY_SMALL: i32 = 8;
@@ -61,7 +61,9 @@ pub(crate) fn act_x_wt_normed(
         return Ok(false);
     }
     match route(ctx, Kind::Normed, m, n, k, w, vector_operands(w, norm.x, y)) {
-        Route::Skinny => super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
+        Route::Skinny => {
+            super::gemv::skinny_norm_bf16(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store)
+        }
         Route::Turn => super::gemv::skinnyt_norm(ctx, w, y, m, n, k, norm, SkinnyEpilogue::Store),
         _ => Ok(false),
     }
@@ -83,7 +85,15 @@ pub(crate) fn act_x_wt_swiglu_normed(
         return Ok(false);
     }
     let (i, e) = (intermediate, SkinnyEpilogue::Swiglu);
-    match route(ctx, Kind::NormedGated, m, 2 * intermediate, k, gate_up, vector_operands(gate_up, norm.x, h)) {
+    match route(
+        ctx,
+        Kind::NormedGated,
+        m,
+        2 * intermediate,
+        k,
+        gate_up,
+        vector_operands(gate_up, norm.x, h),
+    ) {
         Route::Skinny => super::gemv::skinny_norm_bf16(ctx, gate_up, h, m, i, k, norm, e),
         Route::Turn => super::gemv::skinnyt_norm(ctx, gate_up, h, m, i, k, norm, e),
         _ => Ok(false),
@@ -119,8 +129,16 @@ fn route(ctx: &Ctx, kind: Kind, m: i32, rows: i32, k: i32, w: u64, vectors: bool
     if apart != Route::Skinny {
         return Route::Turn;
     }
-    let shape = Shape { kind, rows: rows.unsigned_abs(), k: k.unsigned_abs(), m: m.unsigned_abs() };
-    match ctx.routes().map(|routes| super::routes::pick(routes, shape, w)) {
+    let shape = Shape {
+        kind,
+        rows: rows.unsigned_abs(),
+        k: k.unsigned_abs(),
+        m: m.unsigned_abs(),
+    };
+    match ctx
+        .routes()
+        .map(|routes| super::routes::pick(routes, shape, w))
+    {
         Some(Kernel::Turned) => Route::Turn,
         Some(Kernel::Skinny) | None => Route::Skinny,
     }
@@ -298,7 +316,15 @@ pub(crate) fn act_x_wt_swiglu(
     if m <= 0 || intermediate <= 0 || k <= 0 {
         return Ok(false);
     }
-    let way = route(ctx, Kind::Gated, m, 2 * intermediate, k, gate_up, vector_operands(gate_up, act, h));
+    let way = route(
+        ctx,
+        Kind::Gated,
+        m,
+        2 * intermediate,
+        k,
+        gate_up,
+        vector_operands(gate_up, act, h),
+    );
     if way == Route::Turn {
         skinnyt(
             ctx,
@@ -328,7 +354,8 @@ fn batch_on(ctx: &Ctx, m: i32, n: i32, k: i32) -> bool {
     let t = ctx.tuning();
     let weight = i64::from(n) * i64::from(k);
     (t.dense_batch_from() as i32..=t.dense_batch_until() as i32).contains(&m)
-        && (i64::from(t.dense_batch_weight_mi()) << 20..=i64::from(t.dense_batch_weight_max_mi()) << 20)
+        && (i64::from(t.dense_batch_weight_mi()) << 20
+            ..=i64::from(t.dense_batch_weight_max_mi()) << 20)
             .contains(&weight)
 }
 
@@ -358,7 +385,9 @@ pub(crate) fn act_x_wt_live(
             lib.pick(t).ok_or_else(|| {
                 refuse(
                     op,
-                    format!("the profile's live-row tile {t} is not in hipBLASLt's grouped library"),
+                    format!(
+                        "the profile's live-row tile {t} is not in hipBLASLt's grouped library"
+                    ),
                 )
             })
         })
@@ -410,4 +439,3 @@ pub(crate) fn act_x_wt_live(
     }
     Ok(true)
 }
-

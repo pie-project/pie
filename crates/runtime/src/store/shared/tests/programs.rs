@@ -410,9 +410,7 @@ impl ::engine::Engine for SetEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -460,18 +458,24 @@ impl ::engine::Programs for SetEngine {
         &mut self,
         _registration: &::engine::program::ProgramRegistration,
     ) -> ::engine::Result<::engine::ProgramCompile> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "prepare_program"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "prepare_program",
+        ))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "finish_program"))
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "finish_program",
+        ))
     }
 
     fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "close_program"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "close_program",
+        ))
     }
 
     fn standing_after(&self, binding: &::engine::InstanceBinding) -> ::engine::Result<u64> {
@@ -504,30 +508,54 @@ impl ::engine::Programs for SetEngine {
         Ok(self.total(self.live.values().copied()))
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "register_program",
+        ))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "register_adapter",
+        ))
     }
 }
 
 impl ::engine::Pool for SetEngine {
     fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "chunk_table"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "chunk_table",
+        ))
     }
 
     fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "commit_segments"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "commit_segments",
+        ))
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "release_segments"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "evacuate"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "evacuate",
+        ))
     }
 }
 
@@ -549,22 +577,40 @@ impl ::engine::Tiers for SetEngine {
     }
 
     fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_slots"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "copy_slots",
+        ))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "read_tier_slots"))
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "read_tier_slots",
+        ))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_kv"))
+        Err(::engine::Error::unsupported(
+            ::engine::Engine::kind(self),
+            "copy_kv",
+        ))
     }
 }
-
 
 fn binding(program: ProgramId) -> ::engine::InstanceBinding {
     ::engine::InstanceBinding {
@@ -608,7 +654,8 @@ async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the
     let mut engine = SetEngine::with(&[(PROGRAM, SET), (ProgramId(9), 63 * CHUNK)]);
 
     // Backed first: the span widens by the set while the bind is held.
-    let total = <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(PROGRAM)).unwrap();
+    let total =
+        <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(PROGRAM)).unwrap();
     let added = shared.lock().unwrap().standing_added(total);
     assert_eq!(added, SET);
     let open = ProgramOpen::new(&shared, key(PROGRAM), added).unwrap();

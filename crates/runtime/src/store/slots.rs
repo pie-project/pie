@@ -59,15 +59,15 @@ use state::key::Hash256;
 
 pub use super::segments::{ChunkMove, Evacuation, SegmentError, SegmentState, Segments};
 
-mod claims;
-mod sizes;
-mod rung;
-mod compaction;
-mod census;
-mod holdings;
 mod acquire;
-mod release;
+mod census;
 mod chunks;
+mod claims;
+mod compaction;
+mod holdings;
+mod release;
+mod rung;
+mod sizes;
 mod span;
 mod walk;
 
@@ -79,12 +79,21 @@ pub type ShapeId = u16;
 /// `run` whole chunks, or one run of `slots` slots of `shape` in a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnPiece {
-    Chunks { run: u32, pieces: u32 },
-    Slots { shape: ShapeId, slots: u32 },
+    Chunks {
+        run: u32,
+        pieces: u32,
+    },
+    Slots {
+        shape: ShapeId,
+        slots: u32,
+    },
     /// `slots` single slots of `shape`, as [`SlotPool::acquire`] takes them:
     /// the shape's partly filled chunks first, then free chunks opened
     /// lowest first ([`SlotPool::opens_for`]).
-    Take { shape: ShapeId, slots: u64 },
+    Take {
+        shape: ShapeId,
+        slots: u64,
+    },
 }
 
 /// Who holds what [`SlotPool::place`] takes on its scratch copy.
@@ -269,7 +278,9 @@ pub enum SlotError {
     /// first's destination. Refused whoever planned them.
     #[error("a run of {run} chunk(s) from physical chunk {first} would lie across a segment's end")]
     RunAcrossSegment { first: u32, run: u32 },
-    #[error("chunk moves would split the run of {run} chunk(s) from logical chunk {head} at its chunk {at}")]
+    #[error(
+        "chunk moves would split the run of {run} chunk(s) from logical chunk {head} at its chunk {at}"
+    )]
     SplitsRun { head: u32, run: u32, at: u32 },
     /// A claim named a chunk that cannot be taken whole as it stands.
     #[error("chunk {chunk} cannot be claimed: {why}")]
@@ -605,7 +616,11 @@ impl Clone for PoisonTap {
 #[cfg(feature = "test-slot-fill")]
 impl std::fmt::Debug for PoisonTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() { "PoisonTap(tapped)" } else { "PoisonTap(none)" })
+        f.write_str(if self.0.is_some() {
+            "PoisonTap(tapped)"
+        } else {
+            "PoisonTap(none)"
+        })
     }
 }
 

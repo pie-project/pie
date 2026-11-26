@@ -131,7 +131,15 @@ impl<'a> Execution<'a> {
                 (None, false) => Residency::Arena(&mut owned_backing),
             };
             match sink {
-                Some(sink) => walk::run(plan, snapshot_dir, residency, sink, progress, consume, reads)?,
+                Some(sink) => walk::run(
+                    plan,
+                    snapshot_dir,
+                    residency,
+                    sink,
+                    progress,
+                    consume,
+                    reads,
+                )?,
                 None => {
                     walk::run(
                         plan,

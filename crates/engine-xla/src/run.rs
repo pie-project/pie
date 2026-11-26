@@ -245,7 +245,10 @@ pub struct Run<'c> {
     staged: std::cell::RefCell<Vec<StagedGroup>>,
 }
 
-type StagedGroup = ((u32, ValueId, (u32, u32)), Vec<(usize, kernels_xla::hlo::Val)>);
+type StagedGroup = (
+    (u32, ValueId, (u32, u32)),
+    Vec<(usize, kernels_xla::hlo::Val)>,
+);
 
 /// A tile-ordered routed result: its value, the routes value it was sorted
 /// on, the span `(lane_offset, lanes)` it was cut on, and its rows.

@@ -56,9 +56,8 @@ pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32
 #[must_use]
 pub fn few_rows_grid(m: u32, n: u32, k: u32) -> Option<u32> {
     let (n, k) = (i32::try_from(n).ok()?, i32::try_from(k).ok()?);
-    ((2..=FEW_ROWS).contains(&m) && n > 0 && k > 0 && k % 8 == 0).then(|| {
-        crate::linear::gemv::rows_blocks(n, k) * crate::linear::gemv::rows_cluster(n, k)
-    })
+    ((2..=FEW_ROWS).contains(&m) && n > 0 && k > 0 && k % 8 == 0)
+        .then(|| crate::linear::gemv::rows_blocks(n, k) * crate::linear::gemv::rows_cluster(n, k))
 }
 
 /// The waves cuBLASLt's first heuristic algorithm fills on the current
@@ -87,7 +86,8 @@ pub fn waves(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<f
     if stated >= 1.0 {
         return Some(stated);
     }
-    let tiles = f64::from(m.div_ceil(t.rows)) * f64::from(n.div_ceil(t.cols)) * f64::from(t.split_k);
+    let tiles =
+        f64::from(m.div_ceil(t.rows)) * f64::from(n.div_ceil(t.cols)) * f64::from(t.split_k);
     let sms = f64::from(multiprocessors()?);
     Some((tiles / sms).min(1.0))
 }

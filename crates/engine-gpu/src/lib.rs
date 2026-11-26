@@ -3,12 +3,12 @@
 //! in each backend crate, which instantiates these types with its own.
 
 pub mod adapter;
-pub mod host_memory;
 pub mod api;
 pub mod arena;
 pub mod backend;
 pub mod beam;
 pub mod books;
+pub mod check;
 pub mod chunks;
 pub mod clock;
 pub mod decoded;
@@ -18,6 +18,7 @@ pub mod error;
 pub mod experts;
 pub mod guest;
 pub mod handles;
+pub mod host_memory;
 pub mod inputs;
 pub mod kernel_profile;
 pub mod mask;
@@ -37,7 +38,6 @@ pub mod settle;
 pub mod store;
 pub mod stored;
 pub mod submit;
-pub mod check;
 pub mod top;
 pub mod tuning;
 pub mod weight_store;

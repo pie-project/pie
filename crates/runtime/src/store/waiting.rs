@@ -216,7 +216,14 @@ pub(crate) fn reset() {
     *WAITING.lock().unwrap() = Waiting::default();
     WATCHED.store(false, Ordering::Release);
     REFRESHING.store(false, Ordering::Release);
-    for count in [&REFRESHES, &LOOKUPS, &REPORTS, &LOOKUP_NS, &LOCK_NS, &LOCK_NS_MAX] {
+    for count in [
+        &REFRESHES,
+        &LOOKUPS,
+        &REPORTS,
+        &LOOKUP_NS,
+        &LOCK_NS,
+        &LOCK_NS_MAX,
+    ] {
         count.store(0, Ordering::Relaxed);
     }
 }

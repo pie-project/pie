@@ -255,7 +255,11 @@ mod transfers {
 
     impl<'a, A> Waiting<'a, A> {
         fn new(transfers: &'a Transfers<A>) -> Self {
-            transfers.state.lock().expect("kv transfers lock poisoned").waiting += 1;
+            transfers
+                .state
+                .lock()
+                .expect("kv transfers lock poisoned")
+                .waiting += 1;
             Self(transfers)
         }
     }
@@ -351,7 +355,6 @@ mod transfers {
             // Closing collected b's end; its read, had it stayed, finds it.
             transfers.wait(1, b).await.unwrap();
         }
-
     }
 }
 

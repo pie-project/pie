@@ -140,4 +140,3 @@ fn speed() {
         eprintln!("SPEED {name} {kind} {n}: {tps:.1} tok/s");
     }
 }
-

@@ -233,7 +233,9 @@ pub fn conv1d_carried(
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d_carried";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "ssm_conv1d_carried_bf16" });
-    conv1d_carried_as(entry, ctx, x, weight, state, carry, x_plane, conv_width, dilation, y, span)
+    conv1d_carried_as(
+        entry, ctx, x, weight, state, carry, x_plane, conv_width, dilation, y, span,
+    )
 }
 
 /// A beam group's fold (`BEAM-PAGE-LISTS.md` §11.3): each of `carry`'s
@@ -267,7 +269,10 @@ pub fn conv1d_carried_fold(
         conv_width,
         dilation,
         y,
-        RowSpan { row0: 0, rows: folds },
+        RowSpan {
+            row0: 0,
+            rows: folds,
+        },
     )
 }
 

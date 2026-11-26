@@ -757,7 +757,10 @@ mod tests {
                 );
                 let made = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Held(keys)));
                 let named = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Most));
-                assert!(before <= made && made <= named, "{rows} rows at {keys} keys");
+                assert!(
+                    before <= made && made <= named,
+                    "{rows} rows at {keys} keys"
+                );
                 before = made;
             }
         }

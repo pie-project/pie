@@ -60,7 +60,10 @@ pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Resul
             || at.slot_stride != ring.slot_stride
             || pool.pool != first.pool
         {
-            return Err(refuse(OP, "the layers one fold moves share a pool and a record table"));
+            return Err(refuse(
+                OP,
+                "the layers one fold moves share a pool and a record table",
+            ));
         }
         if pool.page_stride[0] != pool.page_stride[1] || pool.keys.dtype != Dtype::Bf16 {
             return Err(refuse(
@@ -70,7 +73,10 @@ pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Resul
         }
         let row_elems = pool.seq_stride;
         if row_elems == 0 || !row_elems.is_multiple_of(2) {
-            return Err(refuse(OP, format!("a {row_elems}-element row is no whole words")));
+            return Err(refuse(
+                OP,
+                format!("a {row_elems}-element row is no whole words"),
+            ));
         }
         let row_words = u32::try_from(row_elems / 2)
             .map_err(|_| refuse(OP, "a row's words pass the shader's int"))?;

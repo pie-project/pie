@@ -598,7 +598,10 @@ pub enum RaggedMask {
     /// attending its whole group. Only an attention the model states so reads
     /// a lane's mask: a lane's mask over any other is refused.
     Stated,
-    RelativeBias { table: ValueId, max_len: u32 },
+    RelativeBias {
+        table: ValueId,
+        max_len: u32,
+    },
 }
 
 impl Part for RaggedMask {

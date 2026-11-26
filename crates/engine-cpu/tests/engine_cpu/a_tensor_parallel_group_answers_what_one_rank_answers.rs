@@ -189,7 +189,11 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
             "the row is the layers' mass over the keys the lane holds: {mass}"
         );
         let page = PAGE as usize;
-        assert_eq!(pages.len(), context / page, "one mass a page of the context");
+        assert_eq!(
+            pages.len(),
+            context / page,
+            "one mass a page of the context"
+        );
         for (at, sum) in pages.iter().enumerate() {
             let want: f32 = scores[at * page..(at + 1) * page].iter().sum();
             assert!(

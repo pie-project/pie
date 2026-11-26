@@ -72,8 +72,18 @@ fn beam_program(vocab: u32) -> TraceContainer {
             decl(Shape::vector(BEAMS), EtaDtype::I32, HostRole::Writer, false),
             decl(Shape::vector(BEAMS), EtaDtype::U32, HostRole::None, true),
             decl(Shape::vector(BEAMS), EtaDtype::U32, HostRole::None, true),
-            decl(Shape::matrix(BEAMS, CELLS), EtaDtype::Bool, HostRole::Writer, false),
-            decl(Shape::matrix(BEAMS, vocab), EtaDtype::F32, HostRole::Reader, false),
+            decl(
+                Shape::matrix(BEAMS, CELLS),
+                EtaDtype::Bool,
+                HostRole::Writer,
+                false,
+            ),
+            decl(
+                Shape::matrix(BEAMS, vocab),
+                EtaDtype::F32,
+                HostRole::Reader,
+                false,
+            ),
         ],
         ports: vec![
             PortBinding {
@@ -213,7 +223,9 @@ impl Rig {
     /// frame; each lane's readout where it reads one.
     fn fire(&mut self, lanes: Vec<Lane>, instance: Option<InstanceId>) -> Vec<Vec<f32>> {
         let mut ticket = self.submit(lanes, instance);
-        self.engine.settle_frame(&mut ticket).expect("the frame settles");
+        self.engine
+            .settle_frame(&mut ticket)
+            .expect("the frame settles");
         ticket.steps[0]
             .readouts
             .iter()
@@ -313,9 +325,12 @@ fn answers_the_host_path(frames: u8) {
     let asynchronous = engine::Completion::asynchronous(&engine);
     let (tx, heard) = mpsc::channel();
     let tx = Mutex::new(tx);
-    engine::Completion::on_complete(&mut engine, Arc::new(move |at, outcome| {
-        let _ = tx.lock().expect("the sink's sender").send((at, outcome));
-    }));
+    engine::Completion::on_complete(
+        &mut engine,
+        Arc::new(move |at, outcome| {
+            let _ = tx.lock().expect("the sink's sender").send((at, outcome));
+        }),
+    );
 
     // Chunks of the test's own above the committed ones: the guest's two,
     // then the kv pages.
@@ -431,12 +446,15 @@ fn answers_the_host_path(frames: u8) {
     let bound = eta_ir::validate::bind(beam_program(width), vec![outputs], EngineCaps::default())
         .expect("the beam program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
-    let program = engine::Programs::register(&mut rig.engine, &ProgramRegistration {
+    let program = engine::Programs::register(
+        &mut rig.engine,
+        &ProgramRegistration {
             program_hash: 0xbea3_9e0,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
-        })
-        .expect("the beam program registers");
+        },
+    )
+    .expect("the beam program registers");
     let channels: Vec<ChannelId> = bound
         .container
         .channels
@@ -535,7 +553,9 @@ fn answers_the_host_path(frames: u8) {
     // way (two frames in flight).
     for _ in 0..STEPS {
         let mut ticket = rig.submit(device_lanes(), Some(instance));
-        rig.engine.settle_frame(&mut ticket).expect("the frame settles");
+        rig.engine
+            .settle_frame(&mut ticket)
+            .expect("the frame settles");
     }
     for (step, want) in want.iter().enumerate() {
         let got = rig.logits(instance);
@@ -594,7 +614,9 @@ fn answers_the_host_path(frames: u8) {
             shape: None,
         }))
         .expect("the frame fires");
-    rig.engine.settle_frame(&mut ticket).expect("the frame settles");
+    rig.engine
+        .settle_frame(&mut ticket)
+        .expect("the frame settles");
     let outcome = (0..600)
         .find_map(|_| {
             rig.heard
@@ -605,7 +627,12 @@ fn answers_the_host_path(frames: u8) {
         })
         .expect("the step that refused a lane tells its outcome");
     let lanes: Vec<u32> = outcome.faulted.iter().map(|fault| fault.lane).collect();
-    assert_eq!(lanes, vec![0], "the attachment's lane alone faults: {:?}", outcome.faulted);
+    assert_eq!(
+        lanes,
+        vec![0],
+        "the attachment's lane alone faults: {:?}",
+        outcome.faulted
+    );
     let why = format!("{:?}", outcome.faulted[0]);
     assert!(why.contains("describes 2"), "{why}");
     // A step whose guest pass is recorded to land later leaves its rows on
@@ -613,9 +640,15 @@ fn answers_the_host_path(frames: u8) {
     // there, and the one-frame run compares them.
     let readouts = &ticket.steps[0].readouts;
     if readouts.iter().all(|readout| readout.values.is_empty()) {
-        assert!(asynchronous, "a step settled inside submit reads its rows out");
+        assert!(
+            asynchronous,
+            "a step settled inside submit reads its rows out"
+        );
     } else {
-        let got = &readouts.last().expect("the neighbour reads its logits").values;
+        let got = &readouts
+            .last()
+            .expect("the neighbour reads its logits")
+            .values;
         let apart = got
             .iter()
             .zip(&alone[0])
@@ -660,8 +693,7 @@ fn answers_the_host_path(frames: u8) {
         "after the refused lane, the device path's set answers {apart} apart: it wrote there"
     );
 
-    engine::Programs::close(&mut rig.engine, instance)
-        .expect("the instance closes");
+    engine::Programs::close(&mut rig.engine, instance).expect("the instance closes");
 }
 
 /// One frame in flight: each pass runs behind its forward inside `submit`.

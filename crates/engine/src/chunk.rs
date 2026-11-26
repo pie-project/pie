@@ -602,7 +602,10 @@ impl ChunkFacts {
     /// pool.
     pub fn validate(&self) -> Result<()> {
         let invalid = |what: String| Err(Error::Invalid(format!("chunk facts: {what}")));
-        let replays = self.shapes.iter().any(|shape| shape.role == SlotRole::RsBuffer);
+        let replays = self
+            .shapes
+            .iter()
+            .any(|shape| shape.role == SlotRole::RsBuffer);
         if replays && !self.act_chunks.is_empty() && self.act_replay.is_empty() {
             return invalid(
                 "this engine states no rs scratch model for its rungs (act_replay), and its \

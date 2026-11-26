@@ -666,7 +666,14 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         slots.sort_unstable();
         slots.dedup();
-        let lanes = self.ctx().table.get(&this)?.bindings.state.as_ref().map(|s| s.lanes.clone());
+        let lanes = self
+            .ctx()
+            .table
+            .get(&this)?
+            .bindings
+            .state
+            .as_ref()
+            .map(|s| s.lanes.clone());
         if !slots.is_empty()
             && let Some(lanes) = lanes
             && self.shares_nothing(&lanes)?
@@ -688,7 +695,12 @@ impl ProcessCtx {
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
-        if pass.bindings.state.as_ref().is_some_and(|state| state.parents.is_some()) {
+        if pass
+            .bindings
+            .state
+            .as_ref()
+            .is_some_and(|state| state.parents.is_some())
+        {
             return Ok(Err(FINAL_BEAMS.to_string()));
         }
         pass.bindings.final_rows = true;
@@ -1021,8 +1033,8 @@ impl ProcessCtx {
                     state.fold,
                     state.parents,
                 ]
-                    .iter()
-                    .any(Option::is_some)
+                .iter()
+                .any(Option::is_some)
             {
                 return Ok(Err(
                     "this pass's lanes read no kv cache: each fire folds one slot of their \
@@ -1291,8 +1303,7 @@ impl ProcessCtx {
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
-                    if let Err(e) = c.validate_attachment(&attached[i], writes(i), extern_binding)
-                    {
+                    if let Err(e) = c.validate_attachment(&attached[i], writes(i), extern_binding) {
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
@@ -1359,12 +1370,14 @@ impl ProcessCtx {
                             && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
                     }),
                 };
-                let bound =
-                    match host_geometry::classify(program, spec.device_geometry_port_mask, spec.kind)
-                    {
-                        Ok(bound) => bound,
-                        Err(lacks) => return Ok(Err(lacks.refusal(prog.hash))),
-                    };
+                let bound = match host_geometry::classify(
+                    program,
+                    spec.device_geometry_port_mask,
+                    spec.kind,
+                ) {
+                    Ok(bound) => bound,
+                    Err(lacks) => return Ok(Err(lacks.refusal(prog.hash))),
+                };
                 if let Some(qo_indptr) = &bound.devgeo {
                     tracing::info!(
                         "device-carried decode ({} lane(s), {} row(s)) re-publishes \
@@ -1652,7 +1665,13 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         let (instance, scheduler, kv_rep, rs_rep) = {
             let pass = self.ctx().table.get(&this)?;
-            if pass.bindings.state.as_ref().and_then(|state| state.parents).is_none() {
+            if pass
+                .bindings
+                .state
+                .as_ref()
+                .and_then(|state| state.parents)
+                .is_none()
+            {
                 return Ok(Err(
                     "adopt-beam: the pass binds no parents (it runs no beam group)".to_string(),
                 ));
@@ -1669,13 +1688,15 @@ impl ProcessCtx {
             )
         };
         let Some(kv_rep) = kv_rep else {
-            return Ok(Err("adopt-beam: the pass's lanes name no working set".to_string()));
+            return Ok(Err(
+                "adopt-beam: the pass's lanes name no working set".to_string()
+            ));
         };
-        let kv: crate::store::kv::working_set::KvWorkingSet =
-            self.ctx()
-                .table
-                .get(&Resource::<crate::store::kv::working_set::KvWorkingSet>::new_borrow(kv_rep))?
-                .clone();
+        let kv: crate::store::kv::working_set::KvWorkingSet = self
+            .ctx()
+            .table
+            .get(&Resource::<crate::store::kv::working_set::KvWorkingSet>::new_borrow(kv_rep))?
+            .clone();
         let bytes = match scheduler
             .host_kv(crate::scheduler::worker::HostKvOp::BeamList(instance, beam))
             .await
@@ -1689,12 +1710,13 @@ impl ProcessCtx {
             .collect();
         let stores = crate::store::registry::get(kv.model, kv.engine);
         let page = stores.kv_page_size.max(1);
-        let folded = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
-            s.folded(kv.id)
-        }) {
-            Ok(folded) => u32::try_from(folded).unwrap_or(u32::MAX),
-            Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
-        };
+        let folded =
+            match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+                s.folded(kv.id)
+            }) {
+                Ok(folded) => u32::try_from(folded).unwrap_or(u32::MAX),
+                Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+            };
         let f0 = folded / page;
         if end <= f0 * page {
             return Ok(Err(format!(
@@ -1710,27 +1732,31 @@ impl ProcessCtx {
             )));
         };
         let order = order.to_vec();
-        if let Err(error) =
-            crate::pipeline::fire::relist_beam(
-                self,
-                kv.model,
-                kv.engine,
-                kv.id,
-                Some(kv.suspend_handle()),
-                u64::from(f0),
-                &order,
-            )
-            .await
+        if let Err(error) = crate::pipeline::fire::relist_beam(
+            self,
+            kv.model,
+            kv.engine,
+            kv.id,
+            Some(kv.suspend_handle()),
+            u64::from(f0),
+            &order,
+        )
+        .await
         {
             return Ok(Err(format!("adopt-beam: kv: {error}")));
         }
         if let Some(rs_rep) = rs_rep {
-            let rs: crate::store::rs::working_set::RsWorkingSet =
-                self.ctx()
-                    .table
-                    .get(&Resource::<crate::store::rs::working_set::RsWorkingSet>::new_borrow(rs_rep))?
-                    .clone();
-            if let Err(error) = stores.rs.lock().unwrap().relist_beam(rs.id, f0, page, &order, end) {
+            let rs: crate::store::rs::working_set::RsWorkingSet = self
+                .ctx()
+                .table
+                .get(&Resource::<crate::store::rs::working_set::RsWorkingSet>::new_borrow(rs_rep))?
+                .clone();
+            if let Err(error) = stores
+                .rs
+                .lock()
+                .unwrap()
+                .relist_beam(rs.id, f0, page, &order, end)
+            {
                 return Ok(Err(format!("adopt-beam: recurrent rows: {error}")));
             }
         }
@@ -2018,7 +2044,11 @@ mod tests {
                 }
                 id
             };
-            let kv = context.ctx().table.push(KvWorkingSet::new(model, 0, id, 16))?.rep();
+            let kv = context
+                .ctx()
+                .table
+                .push(KvWorkingSet::new(model, 0, id, 16))?
+                .rep();
             Ok(context
                 .ctx()
                 .table
@@ -2057,18 +2087,28 @@ mod tests {
             let ws = lane(&mut context, shared)?;
             let pass = context.ctx().table.push(ForwardPass::default())?.rep();
             bind(&mut context, pass, ws)?;
-            let none = context.core_checkpoints(Resource::new_borrow(pass), Vec::new()).await?;
+            let none = context
+                .core_checkpoints(Resource::new_borrow(pass), Vec::new())
+                .await?;
             assert_eq!(none, Ok(()), "asking none is no fault");
-            let asked = context.core_checkpoints(Resource::new_borrow(pass), vec![16]).await?;
+            let asked = context
+                .core_checkpoints(Resource::new_borrow(pass), vec![16])
+                .await?;
             assert_eq!(asked, want, "shared: {shared}");
         }
         // The ask first, then the state: refused at the state.
         let ws = lane(&mut context, false)?;
         let pass = context.ctx().table.push(ForwardPass::default())?.rep();
-        let asked = context.core_checkpoints(Resource::new_borrow(pass), vec![16]).await?;
+        let asked = context
+            .core_checkpoints(Resource::new_borrow(pass), vec![16])
+            .await?;
         assert_eq!(asked, Ok(()), "no lane bound yet");
         let bound = context
-            .core_state(Resource::new_borrow(pass), vec![Resource::new_borrow(ws)], geom())
+            .core_state(
+                Resource::new_borrow(pass),
+                vec![Resource::new_borrow(ws)],
+                geom(),
+            )
             .await?;
         assert_eq!(bound, refused);
         Ok(())
@@ -2096,11 +2136,19 @@ mod tests {
         };
         // The SDK's default: stated, so final.
         let stated = context.ctx().table.push(ForwardPass::default())?.rep();
-        assert_eq!(context.core_final_rows(Resource::new_borrow(stated)).await?, Ok(()));
+        assert_eq!(
+            context
+                .core_final_rows(Resource::new_borrow(stated))
+                .await?,
+            Ok(())
+        );
         assert!(final_of(&mut context, stated)?, "a default pass is final");
         // `retractable`: nothing sent, so lagged.
         let retractable = context.ctx().table.push(ForwardPass::default())?.rep();
-        assert!(!final_of(&mut context, retractable)?, "a retractable pass is not");
+        assert!(
+            !final_of(&mut context, retractable)?,
+            "a retractable pass is not"
+        );
         // A beam's pass binds `parents`: refused by name, left lagged.
         let beam = context.ctx().table.push(ForwardPass::default())?.rep();
         {

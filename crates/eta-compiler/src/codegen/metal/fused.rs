@@ -444,7 +444,9 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, o0: &str) {
         "    device int* am_out = reinterpret_cast<device int*>({o0});"
     );
     source.push_str("    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {\n");
-    source.push_str("      const device bfloat* am_src = logits + ulong(row_indices[am_row_base + am_r]);\n");
+    source.push_str(
+        "      const device bfloat* am_src = logits + ulong(row_indices[am_row_base + am_r]);\n",
+    );
     source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
     source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
     source.push_str("      const uint am_w = m3_threads;\n");

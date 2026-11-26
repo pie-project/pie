@@ -1433,7 +1433,10 @@ impl Run<'_> {
                         | poem_ir::RaggedMask::Stated,
                         None,
                     ) => kernels_cuda::attn::ragged::RaggedMask::None,
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(_),
+                    ) => {
                         return Err(kernels_cuda::Error::Backend {
                             op: "attn.ragged",
                             detail: STATED_ONLY.to_string(),
@@ -1484,7 +1487,10 @@ impl Run<'_> {
 impl Run<'_> {
     /// The fire's mask bits an attention applies, where its op reads them
     /// (the plan binds each request's offset and word).
-    pub(crate) fn applied_masks(&self, mask: Option<poem_ir::ValueId>) -> Option<kernels_cuda::Tensor> {
+    pub(crate) fn applied_masks(
+        &self,
+        mask: Option<poem_ir::ValueId>,
+    ) -> Option<kernels_cuda::Tensor> {
         mask.map(|mask| self.tensor(mask))
     }
 

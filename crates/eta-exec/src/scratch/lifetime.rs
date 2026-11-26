@@ -6,9 +6,7 @@ use eta_compiler::plan::{Dimension, RegionKind, is_row_vector, same_rows, value_
 use eta_ir::op::tags;
 use eta_ir::types::MAX_RANK;
 
-use super::{
-    Area, Layout, Lifetime, TooLarge, reusing_with,
-};
+use super::{Area, Layout, Lifetime, TooLarge, reusing_with};
 use crate::extent::{Extents, Unresolvable, ValueDesc, describe, element_bytes};
 
 /// Nodes of a stage an engine runs together. A node may lie in several
@@ -517,7 +515,10 @@ mod tests {
     /// Each of `launched` a launch of its own, the rest of `plan` idle.
     fn each_alone<'a>(plan: &LaunchStagePlan, launched: &'a [u32]) -> Launches<'a> {
         Launches {
-            each: launched.iter().map(|node| Launch::of_node(node, None)).collect(),
+            each: launched
+                .iter()
+                .map(|node| Launch::of_node(node, None))
+                .collect(),
             idle: (0..plan.ops.len() as u32)
                 .filter(|node| !launched.contains(node))
                 .collect(),
@@ -593,5 +594,4 @@ mod tests {
         assert_ne!(laid.values[4], laid.values[1]);
         assert_ne!(laid.values[3], laid.values[1]);
     }
-
 }

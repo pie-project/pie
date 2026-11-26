@@ -618,12 +618,23 @@ mod tests {
         )
         .expect("the tuned file");
         let registry = crate::chip::registry();
-        let read = |text: &str| registry.parse(text, "kept", profile::Strict::User).expect("reads");
-        let kept = read(&engine::rates::keeping_stored(registry, tuned.clone(), Some(&stored)));
+        let read = |text: &str| {
+            registry
+                .parse(text, "kept", profile::Strict::User)
+                .expect("reads")
+        };
+        let kept = read(&engine::rates::keeping_stored(
+            registry,
+            tuned.clone(),
+            Some(&stored),
+        ));
         assert!(kept.entries.contains_key(DECISION), "the tuned decision");
         assert_eq!(kept.tuned.rates.launch_ns, Some(4321));
         assert_eq!(kept.tuned.rates.dense_settled, rates.dense_settled);
         assert_eq!(kept.tuned.rates.measured_on, rates.measured_on);
-        assert_eq!(engine::rates::keeping_stored(registry, tuned.clone(), None), tuned);
+        assert_eq!(
+            engine::rates::keeping_stored(registry, tuned.clone(), None),
+            tuned
+        );
     }
 }

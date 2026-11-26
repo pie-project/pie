@@ -247,7 +247,11 @@ pub(crate) fn export(cache_dir: &Path, out: &Path) -> std::io::Result<Vec<String
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
         if path.extension().is_some() {
@@ -276,7 +280,14 @@ mod tests {
     fn loads_differing_only_by_the_weight_pin_key_their_own_records() {
         let dir = std::env::temp_dir().join(format!("pie-bodies-pin-{}", std::process::id()));
         let at = |pin| {
-            let shape = bodies_shape("zt:1", "trace", &"profile", (16, 4096, 8), &None::<u32>, pin);
+            let shape = bodies_shape(
+                "zt:1",
+                "trace",
+                &"profile",
+                (16, 4096, 8),
+                &None::<u32>,
+                pin,
+            );
             path(&dir, &shape)
         };
         let resident = at(WeightPin::Cached);
@@ -290,7 +301,11 @@ mod tests {
             captured: 500 << 20,
         };
         write(&resident, measured).expect("the record is written");
-        assert_eq!(read(&staged), None, "the staged load reads no resident record");
+        assert_eq!(
+            read(&staged),
+            None,
+            "the staged load reads no resident record"
+        );
         assert_eq!(read(&resident), Some(measured));
         let _ = std::fs::remove_dir_all(&dir);
     }

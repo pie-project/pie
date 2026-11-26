@@ -31,7 +31,10 @@ fn a_tier_read_lands_every_slot_whole() {
     let host_slots = (u64::from(facts.host_chunks) * facts.chunk_bytes / kv.slot_bytes) as u32;
     let mut counts = vec![1, 3, batch / 4 + 1, batch, batch + 2];
     counts.retain(|&n| 2 * n <= host_slots);
-    assert!(counts.len() >= 3, "the host tier holds {host_slots} kv slots");
+    assert!(
+        counts.len() >= 3,
+        "the host tier holds {host_slots} kv slots"
+    );
     let mut seed = 0usize;
     for n in counts {
         let on_device: Vec<u32> = (0..n).map(|_| refs.take(kv.id)).collect();
@@ -44,20 +47,27 @@ fn a_tier_read_lands_every_slot_whole() {
         engine::Tiers::write(&mut model.engine, &[(kv.id, there.clone())], &bytes)
             .expect("the host slots write");
         let copy = |model: &mut Model, src, dst, pairs: Vec<(u32, u32)>| {
-            engine::Tiers::copy(&mut model.engine, &SlotCopy {
+            engine::Tiers::copy(
+                &mut model.engine,
+                &SlotCopy {
                     shape: kv.id,
                     src,
                     dst,
                     slots: pairs,
                     runs: Vec::new(),
-                })
-                .expect("the slots move");
+                },
+            )
+            .expect("the slots move");
         };
         copy(
             &mut model,
             MemoryDomain::HostPinned,
             device,
-            there.iter().copied().zip(on_device.iter().copied()).collect(),
+            there
+                .iter()
+                .copied()
+                .zip(on_device.iter().copied())
+                .collect(),
         );
         // Read back in another order than written: the read keeps the
         // order it is asked in.
@@ -65,9 +75,12 @@ fn a_tier_read_lands_every_slot_whole() {
             .zip(back.iter().copied())
             .collect();
         copy(&mut model, device, MemoryDomain::HostPinned, pairs);
-        let got = engine::Tiers::read(&mut model.engine, &[(kv.id, back)])
-            .expect("the host slots read");
+        let got =
+            engine::Tiers::read(&mut model.engine, &[(kv.id, back)]).expect("the host slots read");
         let want: Vec<u8> = bytes.chunks(len).rev().flatten().copied().collect();
-        assert!(got == want, "{n} slots of {len} bytes came back whole and in order");
+        assert!(
+            got == want,
+            "{n} slots of {len} bytes came back whole and in order"
+        );
     }
 }

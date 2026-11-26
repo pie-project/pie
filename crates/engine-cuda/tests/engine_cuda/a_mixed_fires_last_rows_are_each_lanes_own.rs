@@ -70,7 +70,10 @@ fn shell(trace: poem::Trace, path: &Path, graphs: Graphs) -> Shell {
 
 fn worst(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 fn serve(graphs: Graphs) {
@@ -86,7 +89,9 @@ fn serve(graphs: Graphs) {
         .collect();
     let word = |rows: u32| trace.facts.word(&Request::new(rows, false));
     let prompt = |salt: u32| -> Vec<u32> {
-        (0..PROMPT).map(|t| (t * 7 + 11 + salt * 13) % VOCAB).collect()
+        (0..PROMPT)
+            .map(|t| (t * 7 + 11 + salt * 13) % VOCAB)
+            .collect()
     };
     // `(slot, tokens, held)` a lane.
     let fire = |shell: &mut Shell, lanes: &[(u32, &[u32], u32)]| -> Vec<Vec<f32>> {

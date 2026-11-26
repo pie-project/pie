@@ -9,8 +9,8 @@
 // sysctl and `disk`'s Windows free space, allowed there by name.
 #![deny(unsafe_code)]
 
-pub mod beam;
 pub mod adapter;
+pub mod beam;
 pub mod caps;
 pub mod channel;
 pub mod chunk;
@@ -57,23 +57,22 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket, KvDelta, Lane,
-    LaneReadout, LaneRecord, LaneReplay, ListKind, Mask, Masking, Readout, ReplayBound,
-    ReplayPast, ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, ScratchBytes, Serves, Step,
-    WindowFold,
+    LaneReadout, LaneRecord, LaneReplay, ListKind, Mask, Masking, Readout, ReplayBound, ReplayPast,
+    ReplayRows, RsReset, RsSnapshot, RsVerb, RungReplay, ScratchBytes, Serves, Step, WindowFold,
 };
 pub use load::{
-    Allowance, Budgets, Checkpoint, DeviceMemory, HostTier, LoadFacts, LoadRequest, Loaded,
-    Reload, Reloaded, Residency,
+    Allowance, Budgets, Checkpoint, DeviceMemory, HostTier, LoadFacts, LoadRequest, Loaded, Reload,
+    Reloaded, Residency,
 };
 pub use memory::SAFETY_FLOOR_BYTES;
-pub use shapes::{
-    Attachments, FireShape, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules, StepShape, StepShapes,
-    Treatment,
-};
 pub use program::{
     BindExtents, BoundInstance, FireFacts, FirePair, Footprint, GuestState, GuestTerm,
     InstanceBinding, InstanceId, LaidLanes, ProgramFacts, ProgramId, ProgramRegistration,
     ReadoutFacts, ReadoutLanding, Rebind, RingFacts, RingSlots, ScratchPlace,
+};
+pub use shapes::{
+    Attachments, FireShape, StatedSteps, StepComposition, StepFacts, StepGap, StepKind, StepRules,
+    StepShape, StepShapes, Treatment,
 };
 pub use transfer::{
     DeviceReach, KvCopy, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain,

@@ -214,7 +214,9 @@ pub fn bind_taken(
         pair_generation: taken.pair_generation(),
         ..binding.clone()
     };
-    match serve(engine, Engine::programs, "bind_instance").and_then(|programs| programs.bind(&binding)) {
+    match serve(engine, Engine::programs, "bind_instance")
+        .and_then(|programs| programs.bind(&binding))
+    {
         Ok(bound) => {
             roles.lock().unwrap().bound(bound.id, holder, taken);
             Ok(bound)

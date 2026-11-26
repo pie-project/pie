@@ -715,7 +715,10 @@ async fn run_turn(
 }
 
 async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
-    match gateway.push_tokens(worker_api::until_link_lost(), req_id, Tokens::Eos).await {
+    match gateway
+        .push_tokens(worker_api::until_link_lost(), req_id, Tokens::Eos)
+        .await
+    {
         Ok(_) => TurnEnd::Done,
         Err(e) => {
             tracing::warn!(%req_id, error = %e, "push Eos transport error");

@@ -346,7 +346,10 @@ pub enum Placement {
     /// pages, [`Dim::ContextPages`]) of `dtype`: no arena bytes. Each
     /// capturing lane's row lies in its reading program's guest region, a
     /// term of that program's members.
-    Capture { width: Dim, dtype: Dtype },
+    Capture {
+        width: Dim,
+        dtype: Dtype,
+    },
 }
 
 impl Placement {
@@ -681,7 +684,10 @@ fn rectangles(
                     Ty::Tensor { shape, dtype } if shape.first() == Some(&Dim::Capturing) => {
                         match shape[1..] {
                             [width @ (Dim::ContextTimes(_) | Dim::ContextPages)] => {
-                                Ok(Placement::Capture { width, dtype: *dtype })
+                                Ok(Placement::Capture {
+                                    width,
+                                    dtype: *dtype,
+                                })
                             }
                             _ => Err(Error::Unrectangled {
                                 value,
@@ -926,8 +932,16 @@ fn share(
     // same dtype. Any other write in place through a value outside the
     // arena is refused below.
     if kind == Share::InPlace
-        && let (Placement::Capture { width: aw, dtype: ad }, Placement::Capture { width: bw, dtype: bd }) =
-            (a, b)
+        && let (
+            Placement::Capture {
+                width: aw,
+                dtype: ad,
+            },
+            Placement::Capture {
+                width: bw,
+                dtype: bd,
+            },
+        ) = (a, b)
         && (aw, ad) == (bw, bd)
     {
         placements[s.0 as usize] = Placement::Alias(h);
@@ -1136,9 +1150,6 @@ fn widen(set: &mut ClassSet, by: &ClassSet) {
 }
 
 const BIND_ALIGN: u64 = 256;
-
-
-
 
 fn align(bytes: u64) -> u64 {
     bytes.div_ceil(BIND_ALIGN) * BIND_ALIGN

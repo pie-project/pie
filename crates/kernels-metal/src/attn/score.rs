@@ -228,7 +228,10 @@ pub fn pages(
         ));
     }
     ctx.fire(
-        Fire::at(FILE, PAGES).apply(Grid::of([page_count, requests, 1], [64.min(page_count), 1, 1])),
+        Fire::at(FILE, PAGES).apply(Grid::of(
+            [page_count, requests, 1],
+            [64.min(page_count), 1, 1],
+        )),
         &[
             keys.arg(),
             pages.arg(),

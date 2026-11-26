@@ -38,13 +38,19 @@ fn row(path: &str) -> Result<Vec<f32>, String> {
     }
     text.split(|c: char| c.is_whitespace() || c == ',')
         .filter(|word| !word.is_empty())
-        .map(|word| word.parse::<f32>().map_err(|why| format!("{path}: {word}: {why}")))
+        .map(|word| {
+            word.parse::<f32>()
+                .map_err(|why| format!("{path}: {word}: {why}"))
+        })
         .collect()
 }
 
 fn run(args: &[String]) -> Result<bool, String> {
     let value = |flag: &str| -> Option<&str> {
-        args.iter().position(|a| a == flag).and_then(|at| args.get(at + 1)).map(String::as_str)
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|at| args.get(at + 1))
+            .map(String::as_str)
     };
     let number = |flag: &str| -> Result<f32, String> {
         value(flag)
@@ -56,7 +62,11 @@ fn run(args: &[String]) -> Result<bool, String> {
     let contested: Vec<usize> = value("--contested")
         .ok_or("--contested is missing")?
         .split(',')
-        .map(|t| t.trim().parse::<usize>().map_err(|why| format!("--contested: {why}")))
+        .map(|t| {
+            t.trim()
+                .parse::<usize>()
+                .map_err(|why| format!("--contested: {why}"))
+        })
         .collect::<Result<_, _>>()?;
     let nucleus = match (value("--temperature"), value("--top-p")) {
         (None, None) => None,
@@ -87,9 +97,17 @@ fn run(args: &[String]) -> Result<bool, String> {
         ),
     };
     let ranks: Vec<String> = parting.ranks.iter().map(ToString::to_string).collect();
-    let diffuse = parting.diffuse.map_or("null".to_string(), |d| d.to_string());
-    let excl: Vec<String> = parting.excl.iter().map(|(a, b)| format!("[{a}, {b}]")).collect();
-    let clause = parting.clause.map_or("null".to_string(), |c| format!("\"{}\"", c.name()));
+    let diffuse = parting
+        .diffuse
+        .map_or("null".to_string(), |d| d.to_string());
+    let excl: Vec<String> = parting
+        .excl
+        .iter()
+        .map(|(a, b)| format!("[{a}, {b}]"))
+        .collect();
+    let clause = parting
+        .clause
+        .map_or("null".to_string(), |c| format!("\"{}\"", c.name()));
     println!(
         "{{\"gap\": {}, \"drift_max\": {}, \"drift_rms\": {}, \"ranks\": [{}], \"bound\": {}, \"diffuse\": {}, \"excl\": [{}], \"clause\": {}, \"tie\": {}}}",
         parting.gap,

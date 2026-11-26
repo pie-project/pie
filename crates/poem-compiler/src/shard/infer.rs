@@ -672,8 +672,8 @@ impl<'r, 't> Walk<'r, 't> {
             // Split by head as a head rule's query, each rank holding a term
             // of the row.
             Rule::Scores => {
-                let heads = rules::Heads::of(&["q"], &[rules::KV_HEADS])
-                    .cache(rules::Cache::SplitOrWhole);
+                let heads =
+                    rules::Heads::of(&["q"], &[rules::KV_HEADS]).cache(rules::Cache::SplitOrWhole);
                 let others = read(&["q", "into"]);
                 self.heads(op, &t, heads, &field, &others, &outs)
                     .into_iter()

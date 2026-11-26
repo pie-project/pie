@@ -29,7 +29,11 @@ impl Run<'_> {
 
     /// The committed scan's tables for the state `state`: its band's lane
     /// table of record piece ids.
-    pub(crate) fn rs_committed(&self, seat: &Seat, state: poem_ir::ValueId) -> crate::run::Ran<Committed> {
+    pub(crate) fn rs_committed(
+        &self,
+        seat: &Seat,
+        state: poem_ir::ValueId,
+    ) -> crate::run::Ran<Committed> {
         Ok(Committed {
             replay: seat.replay,
             commit: seat.commit,
@@ -189,7 +193,16 @@ impl Run<'_> {
                 continue;
             };
             if let Some(run) = &plan.scatter {
-                self.rs_move(op, &mut copies, seat, plane, run, own, indptr[r].max(0) as u32, true)?;
+                self.rs_move(
+                    op,
+                    &mut copies,
+                    seat,
+                    plane,
+                    run,
+                    own,
+                    indptr[r].max(0) as u32,
+                    true,
+                )?;
             }
         }
         self.rs_flush(&copies)
@@ -365,11 +378,9 @@ impl Run<'_> {
                 // The carried scan (a decode window over the corrected
                 // planes, through a page table) reads its own row alone.
                 paged.is_some()
-                    && seat
-                        .layout
-                        .in_of
-                        .get(&y.0)
-                        .is_some_and(|&plane| seat.layout.planes[plane].role == crate::rs::Role::Keys)
+                    && seat.layout.in_of.get(&y.0).is_some_and(|&plane| {
+                        seat.layout.planes[plane].role == crate::rs::Role::Keys
+                    })
                     && self.rs_snapshots(conv.state)?.is_none()
                     && self.carried_window(seat)?,
             )?;

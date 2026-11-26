@@ -754,8 +754,10 @@ pub fn copy_pages(
     }
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::runtime::channel::copy_pages"))
-            .apply(Launch::grid([run_count, max_planes, 1], [PAGES_BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, "::pie::runtime::channel::copy_pages")).apply(Launch::grid(
+            [run_count, max_planes, 1],
+            [PAGES_BLOCK, 1, 1],
+        )),
         &[
             ArgValue::Ptr(runs),
             ArgValue::Ptr(planes),
@@ -843,8 +845,10 @@ pub fn copy_rs_rows(
     }
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::runtime::channel::copy_rs_rows"))
-            .apply(Launch::grid([run_count, max_planes, 1], [PAGES_BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, "::pie::runtime::channel::copy_rs_rows")).apply(Launch::grid(
+            [run_count, max_planes, 1],
+            [PAGES_BLOCK, 1, 1],
+        )),
         &[
             ArgValue::Ptr(runs),
             ArgValue::Ptr(planes),
@@ -906,7 +910,8 @@ pub const BEAM_HEADER: u32 = 4;
 /// (`channel.cu`'s state layout).
 #[must_use]
 pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
-    BEAM_HEADER as u64 + 2 * lanes as u64 * cap as u64
+    BEAM_HEADER as u64
+        + 2 * lanes as u64 * cap as u64
         + cap as u64
         + frames as u64 * cap as u64
         + 3 * lanes as u64
@@ -960,7 +965,11 @@ pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32, width: u32) -> Resu
         Fire::at(kernel(FILE, "::pie::runtime::channel::beam_step")).apply(
             Launch::grid([run_count, 1, 1], [BEAM_BLOCK, 1, 1]).smem(beam_step_shared_bytes(width)),
         ),
-        &[ArgValue::Ptr(runs), ArgValue::U32(run_count), ArgValue::U32(width)],
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::U32(run_count),
+            ArgValue::U32(width),
+        ],
     )
 }
 
@@ -1007,10 +1016,14 @@ mod preloads {
     /// by the first serving fire that reaches it.
     #[test]
     fn every_fired_kernel_is_preloaded_or_walked() {
-        const WALKED: [&str; 5] =
-            ["mask_from_commit", "rs_scatter", "rs_ext_csr", "rs_ext_gather", "rs_ext_land"];
-        let held: Vec<&str> =
-            [&super::WAVE[..], &super::STAGING, &super::RING, &WALKED].concat();
+        const WALKED: [&str; 5] = [
+            "mask_from_commit",
+            "rs_scatter",
+            "rs_ext_csr",
+            "rs_ext_gather",
+            "rs_ext_land",
+        ];
+        let held: Vec<&str> = [&super::WAVE[..], &super::STAGING, &super::RING, &WALKED].concat();
         let mut fired: Vec<&str> = include_str!("channel.rs")
             .split("kernel(FILE, \"::pie::runtime::channel::")
             .skip(1)

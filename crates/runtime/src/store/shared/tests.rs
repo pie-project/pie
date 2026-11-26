@@ -976,7 +976,11 @@ async fn a_refused_evacuation_is_taken_back_whole_and_a_later_one_goes_through()
     grow.walk().await;
     {
         let engine = engine.lock().unwrap();
-        assert!(matches!(engine.calls[0], Call::Evacuate(_)), "{:?}", engine.calls);
+        assert!(
+            matches!(engine.calls[0], Call::Evacuate(_)),
+            "{:?}",
+            engine.calls
+        );
         assert_eq!(engine.calls[1..], [Call::Release(5)]);
         agree(&shared, &engine);
     }

@@ -84,17 +84,17 @@ mod collective;
 mod conv;
 #[path = "../../../engine-gpu/suite/elemwise/mod.rs"]
 mod elemwise;
+mod fills_verified;
 #[path = "../../../engine-gpu/suite/gather/mod.rs"]
 mod gather;
 #[path = "../../../engine-gpu/suite/gpu.rs"]
 mod gpu;
 #[path = "../../../engine-gpu/suite/linear/mod.rs"]
 mod linear;
-mod fills_verified;
-mod rates_bound;
-mod replay;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
+mod rates_bound;
+mod replay;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]
 mod runtime;
 #[path = "../../../engine-gpu/suite/sampling/mod.rs"]

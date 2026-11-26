@@ -90,9 +90,7 @@ impl ForwardHybrid for EncoderLayer {
                 } else {
                     RaggedMask::GroupBlockDiagonal
                 },
-                |table| {
-                    ops::attn::relative_bias(&table, MAX_LEN)
-                },
+                |table| ops::attn::relative_bias(&table, MAX_LEN),
             ),
         );
         let o = ops::gather::unpack_rows(&o, &perm);
@@ -103,18 +101,39 @@ impl ForwardHybrid for EncoderLayer {
 }
 
 pub fn trace() -> Trace {
-    trace_hybrid(NAME, &EncoderLayer { biased: true, stated: false }, Platform::Cuda)
+    trace_hybrid(
+        NAME,
+        &EncoderLayer {
+            biased: true,
+            stated: false,
+        },
+        Platform::Cuda,
+    )
 }
 
 /// The layer with no bias: its lanes may state group masks.
 pub fn unbiased_trace() -> Trace {
-    trace_hybrid(NAME, &EncoderLayer { biased: false, stated: true }, Platform::Cuda)
+    trace_hybrid(
+        NAME,
+        &EncoderLayer {
+            biased: false,
+            stated: true,
+        },
+        Platform::Cuda,
+    )
 }
 
 /// The layer with no bias whose attention states no lane's mask: a lane
 /// stating one is refused.
 pub fn unstated_trace() -> Trace {
-    trace_hybrid(NAME, &EncoderLayer { biased: false, stated: false }, Platform::Cuda)
+    trace_hybrid(
+        NAME,
+        &EncoderLayer {
+            biased: false,
+            stated: false,
+        },
+        Platform::Cuda,
+    )
 }
 
 pub fn to_bf16(x: f32) -> u16 {

@@ -291,7 +291,9 @@ impl Context {
             let device = MTLCreateSystemDefaultDevice()
                 .ok_or_else(|| "no Metal device to read the room of".to_string())?;
             let mine = device.currentAllocatedSize() as u64;
-            let all = super::iokit::gpu_system_allocated().unwrap_or(mine).max(mine);
+            let all = super::iokit::gpu_system_allocated()
+                .unwrap_or(mine)
+                .max(mine);
             let usable = derived_working_set(device.recommendedMaxWorkingSetSize(), mine);
             let held = all.saturating_add(crate::store::accounting::DRIVER_FLOOR);
             Ok(i64::try_from(usable).unwrap_or(i64::MAX) - i64::try_from(held).unwrap_or(i64::MAX))
@@ -353,12 +355,18 @@ impl Context {
                 4,
                 poem_ir::Dtype::U32,
             );
-            let sunk =
-                kernels_metal::Tensor::new(handles.bind(&sink, 0, 16).ok()?, 1, 4, poem_ir::Dtype::F32);
+            let sunk = kernels_metal::Tensor::new(
+                handles.bind(&sink, 0, 16).ok()?,
+                1,
+                4,
+                poem_ir::Dtype::F32,
+            );
             let frame = self.frame().ok()?;
             let encoder = crate::encode::Sink::new(self, &frame, &pipelines, &handles);
-            kernels_metal::runtime::resident::resident_groups(&encoder, counted, sunk, GROUPS, ITERS)
-                .ok()?;
+            kernels_metal::runtime::resident::resident_groups(
+                &encoder, counted, sunk, GROUPS, ITERS,
+            )
+            .ok()?;
             frame.commit().ok()?;
             let bytes = handles.read(counted.buf, 8).ok()?;
             Some(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
@@ -631,7 +639,12 @@ impl Frame {
         if !self.flush()? {
             return Ok((out, None));
         }
-        let buffer = self.flushed.borrow().last().cloned().expect("a flush keeps its buffer");
+        let buffer = self
+            .flushed
+            .borrow()
+            .last()
+            .cloned()
+            .expect("a flush keeps its buffer");
         buffer.waitUntilCompleted();
         Ok((out, Some(buffer.GPUEndTime() - buffer.GPUStartTime())))
     }
@@ -737,7 +750,8 @@ impl Frame {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn level(&self) {
         use objc2_metal::{MTLBarrierScope, MTLComputeCommandEncoder};
-        self.encoder().memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        self.encoder()
+            .memoryBarrierWithScope(MTLBarrierScope::Buffers);
     }
 
     /// Ends the pass here and opens the next once the GPU has done all the
@@ -1025,7 +1039,11 @@ impl Frame {
                             .or_else(|| buffer.error());
                         let refused = refused.map(|error| error.localizedDescription().to_string());
                         #[cfg(feature = "fault-injection")]
-                        let refused = if injected { Some(INJECTED.to_string()) } else { refused };
+                        let refused = if injected {
+                            Some(INJECTED.to_string())
+                        } else {
+                            refused
+                        };
                         on_done(refused);
                     },
                 );
@@ -1356,11 +1374,7 @@ pub fn host_resident(gpu: u64) -> u64 {
         // SAFETY: `info` is a `rusage_info_v2`, the struct the
         // RUSAGE_INFO_V2 flavor writes, owned here for the call.
         let rc = unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V2,
-                (&raw mut info).cast(),
-            )
+            libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, (&raw mut info).cast())
         };
         if rc == 0 {
             info.ri_phys_footprint.saturating_sub(gpu)

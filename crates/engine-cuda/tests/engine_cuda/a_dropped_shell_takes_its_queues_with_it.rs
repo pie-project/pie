@@ -66,7 +66,14 @@ fn load(trace: poem::Trace, path: &Path) -> Shell {
             pin: Some((Graphs::On, None)),
             ..engine_cuda::Knobs::default()
         },
-        ..crate::common::boot(trace, &contract, path, Budget::new(LANES, 64), 256, 2 * LANES + 1)
+        ..crate::common::boot(
+            trace,
+            &contract,
+            path,
+            Budget::new(LANES, 64),
+            256,
+            2 * LANES + 1,
+        )
     })
     .expect("the shell loads")
 }
@@ -117,7 +124,9 @@ fn a_dropped_shell_takes_its_queues_with_it() {
     };
     eprintln!("after the two-shell drop {first:?}, after one warm reload {warm:?}");
     at_least_listed("warm reload dropped", warm);
-    let area = kfd::save_areas(u32::MAX).expect("the rule's save areas read").area();
+    let area = kfd::save_areas(u32::MAX)
+        .expect("the rule's save areas read")
+        .area();
     if let (Some(warm_listed), Some(first_listed)) = (warm.0, first.0) {
         assert!(
             warm_listed <= first_listed + 1,

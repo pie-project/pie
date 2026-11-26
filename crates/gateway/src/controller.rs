@@ -95,8 +95,11 @@ impl GatewayControl for ControllerLink {
     }
 
     async fn heartbeat(&self, id: NodeId) -> Result<Ack> {
-        self.call("heartbeat", |c, ctx| async move { c.heartbeat(ctx, id).await })
-            .await
+        self.call(
+            "heartbeat",
+            |c, ctx| async move { c.heartbeat(ctx, id).await },
+        )
+        .await
     }
 
     async fn cluster_events(&self, gateway: GatewayId, events: Vec<ProcessEvent>) -> Result<()> {

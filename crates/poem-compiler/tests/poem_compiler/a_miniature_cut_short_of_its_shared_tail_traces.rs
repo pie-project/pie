@@ -8,8 +8,13 @@ use poem::Platform;
 
 #[test]
 fn a_miniature_cut_short_of_its_shared_tail_traces() {
-    for (name, layers) in [("gemma4-e4b-mini-l30-bf16-kv-bf16", 24), ("gemma4-e2b-bf16-kv-bf16", 6)] {
-        let mut cut = poem_compiler::catalog::deployment(name).expect("listed").clone();
+    for (name, layers) in [
+        ("gemma4-e4b-mini-l30-bf16-kv-bf16", 24),
+        ("gemma4-e2b-bf16-kv-bf16", 6),
+    ] {
+        let mut cut = poem_compiler::catalog::deployment(name)
+            .expect("listed")
+            .clone();
         cut.deploy.layers = Some(layers);
         for platform in [Platform::Metal, Platform::Xla] {
             cut.package

@@ -149,7 +149,10 @@ pub fn demand_of_lanes(
     let mut total = RsUnits::default();
     match plan {
         RsPlan::Groups(groups) => {
-            for group in groups.iter().filter(|group| lanes.contains(&group.lanes[0])) {
+            for group in groups
+                .iter()
+                .filter(|group| lanes.contains(&group.lanes[0]))
+            {
                 let ws = working_sets[group.lanes[0]];
                 let (write_state, fresh, _, writes, wwrites) = group.write(store, ws)?;
                 total = total.add(
@@ -502,28 +505,31 @@ pub fn prepare_many(
     for group in groups {
         let ws = working_sets[group.lanes[0]];
         let held = store.folded_slot(ws).map_err(|error| error.to_string())?;
-        let write = group
-            .write(store, ws)
-            .and_then(|(write_state, fresh, fold, writes, wwrites)| {
-                let mut write = store
-                    .prepare_group_split(
-                        ws,
-                        write_state,
-                        fresh,
-                        fold,
-                        writes,
-                        wwrites,
+        let write =
+            group
+                .write(store, ws)
+                .and_then(|(write_state, fresh, fold, writes, wwrites)| {
+                    let mut write = store
+                        .prepare_group_split(
+                            ws,
+                            write_state,
+                            fresh,
+                            fold,
+                            writes,
+                            wwrites,
+                            granted.as_deref_mut(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if let Err(error) = store.prepare_snapshots(
+                        &mut write,
+                        &group.snapshots,
                         granted.as_deref_mut(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if let Err(error) =
-                    store.prepare_snapshots(&mut write, &group.snapshots, granted.as_deref_mut())
-                {
-                    store.cancel_prepared(write);
-                    return Err(error.to_string());
-                }
-                Ok(write)
-            });
+                    ) {
+                        store.cancel_prepared(write);
+                        return Err(error.to_string());
+                    }
+                    Ok(write)
+                });
         let write = match write {
             Ok(write) => write,
             Err(error) => {
@@ -566,8 +572,11 @@ pub fn prepare_many(
             out.buffer_slot_ids.push(target.dst().0);
             if let crate::store::rs::write::RsBufferTarget::Cow { src, dst, .. } = *target {
                 if store.is_window_page(dst) && out.window_buffer_apart {
-                    out.wpage_copies
-                        .push((group.lanes[0], store.engine_id(src), store.engine_id(dst)));
+                    out.wpage_copies.push((
+                        group.lanes[0],
+                        store.engine_id(src),
+                        store.engine_id(dst),
+                    ));
                     continue;
                 }
                 out.page_copies.0.push(store.engine_id(src));
@@ -728,7 +737,8 @@ mod tests {
             lineage,
         };
         let mask = engine::Masking::Extent(engine::Mask::new(vec![0, 1, 3, 1], 5));
-        let beam = engine::fire::LaneReplay::of(&verb(engine::fire::Lineage::Admitted), Some(&mask), 38);
+        let beam =
+            engine::fire::LaneReplay::of(&verb(engine::fire::Lineage::Admitted), Some(&mask), 38);
         assert_eq!(
             beam,
             Some(engine::fire::LaneReplay {
@@ -760,7 +770,11 @@ mod tests {
         req.lanes[0].lane.kv.held = 4;
         req.lanes[1].lane.kv.held = 5;
         out.apply_to(&mut req);
-        assert!(req.lanes.iter().all(|lane| lane.replay_stated.is_some_and(|s| !s.one_run)));
+        assert!(
+            req.lanes
+                .iter()
+                .all(|lane| lane.replay_stated.is_some_and(|s| !s.one_run))
+        );
         settle(&mut store, out.txn);
     }
 
@@ -781,7 +795,15 @@ mod tests {
             },
         };
         let stated = |one_run| {
-            (0..10).map(move |_| (1, Some(engine::fire::LaneReplay { replayed: 37, one_run })))
+            (0..10).map(move |_| {
+                (
+                    1,
+                    Some(engine::fire::LaneReplay {
+                        replayed: 37,
+                        one_run,
+                    }),
+                )
+            })
         };
         let wide = engine::ReplayRows::of_lanes((0..10).map(|_| (1, 37)), false);
         // The runtime priced it compact, the engine lays it wide: a bug.
@@ -789,10 +811,16 @@ mod tests {
             .unwrap_err();
         assert!(why.contains("disagree"), "{why}");
         // Both wide: they agree (and both refuse it).
-        assert!(engine::fire::replay_agrees(stated(false), &rung, wide, false, true, true, false).is_ok());
+        assert!(
+            engine::fire::replay_agrees(stated(false), &rung, wide, false, true, true, false)
+                .is_ok()
+        );
         // The runtime wider than the engine: no bug.
         let narrow = engine::ReplayRows::of_lanes((0..10).map(|_| (1, 37)), true);
-        assert!(engine::fire::replay_agrees(stated(false), &rung, narrow, true, true, true, false).is_ok());
+        assert!(
+            engine::fire::replay_agrees(stated(false), &rung, narrow, true, true, true, false)
+                .is_ok()
+        );
     }
 
     #[test]

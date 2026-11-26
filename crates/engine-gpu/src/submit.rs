@@ -150,7 +150,9 @@ impl Admitted {
     #[must_use]
     pub fn ns(&self) -> f64 {
         match *self {
-            Admitted::Whole { ns } | Admitted::Layers { ns, .. } | Admitted::Refused { ns, .. } => ns,
+            Admitted::Whole { ns } | Admitted::Layers { ns, .. } | Admitted::Refused { ns, .. } => {
+                ns
+            }
         }
     }
 }
@@ -225,7 +227,10 @@ pub fn frame_submissions(
                 per_submission,
                 submissions,
                 ..
-            } => out.extend(std::iter::repeat_n((at, per_submission), submissions as usize)),
+            } => out.extend(std::iter::repeat_n(
+                (at, per_submission),
+                submissions as usize,
+            )),
             refused @ Admitted::Refused { .. } => return Err((at, refused)),
         }
     }
@@ -333,7 +338,14 @@ impl<B: Serve> Probe<B> {
         let out = lay(m, n, false)?;
         let pipelines = B::Pipelines::default();
         let probed = B::record_probe(device, &|frame| {
-            Self::encode(device, frame, &pipelines, &handles, (tactic, act, weight, out), 1)
+            Self::encode(
+                device,
+                frame,
+                &pipelines,
+                &handles,
+                (tactic, act, weight, out),
+                1,
+            )
         })?;
         let probe = Probe {
             handles,
@@ -370,11 +382,10 @@ impl<B: Serve> Probe<B> {
                 weight,
                 out,
                 kernels_slang::ssm::RowSpan::whole(act),
-            ).map_err(|e| {
-                Fault::Device {
-                    call: "submit bound: probe",
-                    why: e.to_string(),
-                }
+            )
+            .map_err(|e| Fault::Device {
+                call: "submit bound: probe",
+                why: e.to_string(),
             })?;
         }
         Ok(())
@@ -387,7 +398,14 @@ impl<B: Serve> Probe<B> {
         let started = std::time::Instant::now();
         let work = (self.tactic, self.act, self.weight, self.out);
         let span = B::replay_probe(device, &self.probed, &|frame| {
-            Self::encode(device, frame, &self.pipelines, &self.handles, work, self.slowed)
+            Self::encode(
+                device,
+                frame,
+                &self.pipelines,
+                &self.handles,
+                work,
+                self.slowed,
+            )
         })?;
         let host = started.elapsed().as_nanos() as f64;
         Ok(span.map_or(host, |ns| ns as f64).max(1.0))
@@ -496,8 +514,10 @@ const UNREAD: u64 = u64::MAX;
 impl DeviceTime {
     /// The fire took `ns` on the device.
     pub fn set(&self, ns: u64) {
-        self.0
-            .store(ns.clamp(1, UNREAD - 1), std::sync::atomic::Ordering::Release);
+        self.0.store(
+            ns.clamp(1, UNREAD - 1),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// The fire landed and its time was not read.
@@ -797,14 +817,15 @@ impl SubmitBound {
     /// The clock the GPU runs at now, where the platform states it.
     #[must_use]
     pub fn clock_now(&self) -> Option<u64> {
-        self.clock.as_ref().and_then(crate::clock::ClockRange::now_hz)
+        self.clock
+            .as_ref()
+            .and_then(crate::clock::ClockRange::now_hz)
     }
 
     /// Drops the measured fires that landed more than one bound before
     /// `now`.
     pub fn age(&mut self, now: std::time::Instant) {
-        if let Some(since) =
-            now.checked_sub(std::time::Duration::from_nanos(self.bound_ns as u64))
+        if let Some(since) = now.checked_sub(std::time::Duration::from_nanos(self.bound_ns as u64))
         {
             self.measured.since(since);
         }
@@ -1033,9 +1054,15 @@ fn uncuttable(lane: &engine::fire::Lane, facts: &poem_ir::Facts) -> Option<&'sta
             "its program places its rows",
         ),
         (
-            [Builtin::Masked, Builtin::Media, Builtin::Drafts, Builtin::Scores, Builtin::Encode]
-                .iter()
-                .any(|&b| facts.holds(lane.word, b)),
+            [
+                Builtin::Masked,
+                Builtin::Media,
+                Builtin::Drafts,
+                Builtin::Scores,
+                Builtin::Encode,
+            ]
+            .iter()
+            .any(|&b| facts.holds(lane.word, b)),
             "its class reads its whole rows (a mask, media, drafts, scores or an encoder)",
         ),
     ];
@@ -1064,7 +1091,11 @@ pub fn row_pieces(
 /// The rows of `step`'s widest lane: its one prompt lane's where it has one.
 #[must_use]
 pub fn prompt_rows(step: &engine::fire::Step) -> u32 {
-    step.lanes.iter().map(engine::fire::Lane::rows).max().unwrap_or(0)
+    step.lanes
+        .iter()
+        .map(engine::fire::Lane::rows)
+        .max()
+        .unwrap_or(0)
 }
 
 /// `step`'s one prompt lane's first `rows` rows split off: that lane alone
@@ -1183,7 +1214,11 @@ pub fn split_lane(
         {
             // Where the first piece leaves the record standing.
             let first = target.min(lane.kv.held + rows).max(stands);
-            let (from_row, to_row) = if from == 0 { (stands, first) } else { (first, target) };
+            let (from_row, to_row) = if from == 0 {
+                (stands, first)
+            } else {
+                (first, target)
+            };
             *folded = from_row;
             *fold = engine::fire::FoldLen::Host(to_row.saturating_sub(from_row));
         }
@@ -1316,10 +1351,16 @@ mod tests {
             ..bound(1.0)
         };
         let context = 4096;
-        assert!(matches!(b.admit(prompt(512, context)), Admitted::Refused { .. }));
+        assert!(matches!(
+            b.admit(prompt(512, context)),
+            Admitted::Refused { .. }
+        ));
         let rows = b.prefill_rows(context).expect("a narrower rung");
         assert!(rows < 512);
-        assert!(matches!(b.admit(prompt(rows, context)), Admitted::Whole { .. }));
+        assert!(matches!(
+            b.admit(prompt(rows, context)),
+            Admitted::Whole { .. }
+        ));
         // Within the bound at the widest rung: no preference.
         let roomy = SubmitBound {
             bound_ns: 100.0 * BOUND,
@@ -1333,7 +1374,10 @@ mod tests {
         let admitted = b.admit(step);
         assert!(matches!(admitted, Admitted::Refused { .. }));
         let why = b.refusal(step, &admitted);
-        assert!(why.contains("past the platform's stated bound of 2000 ms"), "{why}");
+        assert!(
+            why.contains("past the platform's stated bound of 2000 ms"),
+            "{why}"
+        );
         assert!(why.contains("is estimated at"), "{why}");
         assert_eq!(
             frame_submissions(&[shaped(&b, step)], b.layers, BOUND).map_err(|(at, _)| at),
@@ -1381,7 +1425,10 @@ mod tests {
         // 0.8215 of the bound at full clock, x8.125 at the floor: 6.7
         // bounds' worth, in 7 submissions of 4 layers.
         assert_eq!((submissions, layers_a_piece), (7, 4));
-        assert!(per_submission <= clocked.bound_ns, "{per_submission} past the bound");
+        assert!(
+            per_submission <= clocked.bound_ns,
+            "{per_submission} past the bound"
+        );
         let subs = frame_submissions(&[shaped(&clocked, step)], clocked.layers, clocked.bound_ns)
             .expect("every submission fits");
         assert!(subs.iter().all(|&(_, ns)| ns <= clocked.bound_ns));
@@ -1396,7 +1443,6 @@ mod tests {
         };
         assert!(matches!(clocked.admit(decode), Admitted::Whole { .. }));
     }
-
 
     /// A device slowing under load (a phone's GPU at its thermal cap):
     /// each fire's measured time over its estimate at a ratio of 1 rises
@@ -1426,12 +1472,24 @@ mod tests {
         let fire = 100.0 * MS;
         let mut read = Vec::new();
         for (at, ratio) in [1.5, 2.0, 2.1, 2.3, 2.6].into_iter().enumerate() {
-            b.landed(t0 + ms(at as u64 * 100), 256, fire, (fire * ratio) as u64, None);
+            b.landed(
+                t0 + ms(at as u64 * 100),
+                256,
+                fire,
+                (fire * ratio) as u64,
+                None,
+            );
             read.push((b.ratio_now(), b.admit(step).split()));
         }
         // Under the stored ratio: read at it, whole (2.1 is past it but
         // within the 5% to spare). Past it: read at the measured, split.
-        let want = [(worst, false), (worst, false), (2.1, false), (2.3, true), (2.6, true)];
+        let want = [
+            (worst, false),
+            (worst, false),
+            (2.1, false),
+            (2.3, true),
+            (2.6, true),
+        ];
         for ((got, split), (ratio, splits)) in read.iter().zip(want) {
             assert!((got - ratio).abs() < 1e-6 && *split == splits, "{read:?}");
         }
@@ -1443,7 +1501,10 @@ mod tests {
         assert!((b.ratio_now() - 2.6).abs() < 1e-6);
         let why = b.refusal(step, &b.admit(step));
         assert!(why.contains("at the ratio 2.600"), "{why}");
-        assert!(why.contains("worst ratio 2.600 measured over the 6 fires of every rung"), "{why}");
+        assert!(
+            why.contains("worst ratio 2.600 measured over the 6 fires of every rung"),
+            "{why}"
+        );
         // A bound past the slow fires: the stored ratio again.
         b.age(t0 + ms(501) + std::time::Duration::from_nanos(b.bound_ns as u64));
         assert!(b.measured.is_empty());

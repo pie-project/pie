@@ -175,8 +175,14 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
     shell
         .copy_slots(&SlotCopy {
             shape: ADAPTER,
-            src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
-            dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+            src: MemoryDomain::Device {
+                ordinal: 0,
+                reach: engine::DeviceReach::HostShared,
+            },
+            dst: MemoryDomain::Device {
+                ordinal: 0,
+                reach: engine::DeviceReach::HostShared,
+            },
             slots: refs.iter().copied().zip(moved.iter().copied()).collect(),
             runs: Vec::new(),
         })
@@ -184,8 +190,14 @@ fn an_adapter_in_slots_is_one_landing_through_the_table() {
     shell
         .copy_slots(&SlotCopy {
             shape: ADAPTER,
-            src: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
-            dst: MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared },
+            src: MemoryDomain::Device {
+                ordinal: 0,
+                reach: engine::DeviceReach::HostShared,
+            },
+            dst: MemoryDomain::Device {
+                ordinal: 0,
+                reach: engine::DeviceReach::HostShared,
+            },
             slots: refs.iter().map(|&r| (moved[0] + banks, r)).collect(),
             runs: Vec::new(),
         })

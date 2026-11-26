@@ -370,8 +370,7 @@ impl Windows {
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
                 && copyable(trace, region)
             {
-                let mut gathered =
-                    gather_of(&spans, indptr_host, copies.page_tables, copies.mask);
+                let mut gathered = gather_of(&spans, indptr_host, copies.page_tables, copies.mask);
                 gathered.spans[poem_ir::RowAxis::Patches] = patch;
                 gathered.spans[poem_ir::RowAxis::Voxels] = voxel;
                 seats(slots, &gathered)?;

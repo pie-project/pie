@@ -269,11 +269,21 @@ impl Rows {
         // kernels bound (the widest layer's), its pages composed each fire
         // over the ring, the buffer and the fire's own rows.
         if let Some(windowed) = recipe.windowed.as_ref()
-            && let Some(SlotLayout::List { tokens, bytes, rows, .. }) = windowed.buffer(recipe)
+            && let Some(SlotLayout::List {
+                tokens,
+                bytes,
+                rows,
+                ..
+            }) = windowed.buffer(recipe)
         {
             windows.push(WindowRows {
                 bytes: *bytes,
-                rows: windowed.layers.iter().map(|layer| layer.window).max().unwrap_or(0),
+                rows: windowed
+                    .layers
+                    .iter()
+                    .map(|layer| layer.window)
+                    .max()
+                    .unwrap_or(0),
                 tokens: *tokens,
             });
             window_runs.push(rows.as_slice());
@@ -1089,9 +1099,8 @@ impl Pools {
     ) -> Result<(Buffer, u64, Vec<(u64, u64, std::ptr::NonNull<u8>)>)> {
         let shape = *self.shape(id)?;
         let (chunk, index) = self.place(&shape, slot)?;
-        let global = u64::from(chunk) * self.layout.chunk_bytes
-            + u64::from(index) * shape.slot_bytes
-            + at;
+        let global =
+            u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes + at;
         self.pool.admit(chunk)?;
         let runs = self.pool.host_runs(global, bytes)?;
         let (view, offset) = self.pool.view_at(global);
@@ -1302,7 +1311,9 @@ impl Pools {
                 have: u64::from(per_seat),
             });
         }
-        (0..pages).map(|j| window.seat_ref(seat * per_seat + j)).collect()
+        (0..pages)
+            .map(|j| window.seat_ref(seat * per_seat + j))
+            .collect()
     }
 
     /// Where window table `k`'s slot ref `slot` lies, in bytes of the range.
@@ -1328,12 +1339,20 @@ impl Pools {
 
     /// Window table `k`'s slots a chunk.
     pub fn window_slots_a_chunk(&self, k: usize) -> Result<u32> {
-        Ok(self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.per_chunk.max(1))
+        Ok(self
+            .shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?
+            .per_chunk
+            .max(1))
     }
 
     /// Copies whole window slots of table `k`, `(from, to)` byte offsets, in
     /// `frame`: a boundary own-row page filled from its ring page.
-    pub fn copy_window_slots(&self, frame: &mut Frame, k: usize, copies: &[(u64, u64)]) -> Result<()> {
+    pub fn copy_window_slots(
+        &self,
+        frame: &mut Frame,
+        k: usize,
+        copies: &[(u64, u64)],
+    ) -> Result<()> {
         let bytes = self.shape(WINDOWS[k.min(MAX_WINDOWS - 1)])?.slot_bytes;
         for &(from, to) in copies {
             self.pool.copy(frame, from, to, bytes)?;
@@ -1387,8 +1406,12 @@ impl Pools {
             for &(keys, keys_cell, values, values_cell) in &runs {
                 let at = u64::from(first);
                 let len = u64::from(rows);
-                self.pool
-                    .copy(frame, from + keys + at * keys_cell, to + keys + at * keys_cell, len * keys_cell)?;
+                self.pool.copy(
+                    frame,
+                    from + keys + at * keys_cell,
+                    to + keys + at * keys_cell,
+                    len * keys_cell,
+                )?;
                 if values != keys {
                     self.pool.copy(
                         frame,
@@ -2162,7 +2185,9 @@ impl Pools {
     /// direct I/O boundary.
     #[must_use]
     pub fn disk_chunk_bytes(&self) -> u64 {
-        self.layout.chunk_bytes.next_multiple_of(engine::disk::ALIGN as u64)
+        self.layout
+            .chunk_bytes
+            .next_multiple_of(engine::disk::ALIGN as u64)
     }
 
     /// The disk tier's chunks.
@@ -2225,7 +2250,12 @@ impl Pools {
     /// as on the device. The disk chunks it holds.
     pub fn seat_disk(&mut self, dir: &std::path::Path, budget: u64) -> Result<u32> {
         let chunk = self.disk_chunk_bytes();
-        let widest = self.layout.shapes().map(|shape| shape.slot_bytes).max().unwrap_or(0);
+        let widest = self
+            .layout
+            .shapes()
+            .map(|shape| shape.slot_bytes)
+            .max()
+            .unwrap_or(0);
         if chunk > 0 && widest > 0 {
             self.disk = Spill::open(dir, "r0.state", chunk, super::cover_room(widest), budget)?;
         }
@@ -2769,7 +2799,9 @@ mod tables_run_tests {
                 "chunk {chunk}: {refused:?}"
             );
         }
-        let past = pools.kv_pages(&[3], None).expect("the first slot past the tables run");
+        let past = pools
+            .kv_pages(&[3], None)
+            .expect("the first slot past the tables run");
         assert_eq!(past.len(), 1);
     }
 }

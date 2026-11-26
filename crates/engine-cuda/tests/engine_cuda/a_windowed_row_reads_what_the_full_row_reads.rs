@@ -137,7 +137,10 @@ fn a_ring_fold_lands_after_every_read_of_its_fire() {
         let (want, _, _) = served(name, full_rows(&trace), &path, &prompt, 64);
         let (got, seen, sides) = served(name, trace, &path, &prompt, 64);
         eprintln!("{name}: {seen:?}, {sides} side stream(s)");
-        assert!(seen.direct > 0, "{name}: some fire writes its ring directly");
+        assert!(
+            seen.direct > 0,
+            "{name}: some fire writes its ring directly"
+        );
         assert!(seen.own > 0, "{name}: some fire takes own-row pages");
         assert!(
             seen.read_then_folded > 0,
@@ -146,7 +149,10 @@ fn a_ring_fold_lands_after_every_read_of_its_fire() {
         forked += sides;
         agree(&got, &want, name);
     }
-    assert!(forked > 0, "a load whose fires fork regions onto side streams");
+    assert!(
+        forked > 0,
+        "a load whose fires fork regions onto side streams"
+    );
 }
 
 /// `served`, its decodes reading a mask (every key but a stretch of the
@@ -169,7 +175,11 @@ fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec
     for chunk in prompt.chunks(CHUNK as usize) {
         let word = facts.word(&Request::new(chunk.len() as u32, false));
         let rows = shell
-            .fire(&[Lane { slot: 0, word, tokens: chunk }])
+            .fire(&[Lane {
+                slot: 0,
+                word,
+                tokens: chunk,
+            }])
             .expect("the fire runs");
         out.push(rows.into_iter().next().expect("one readout"));
     }
@@ -179,7 +189,14 @@ fn served_masked(trace: Trace, path: &Path, prompt: &[u32], decodes: u32) -> Vec
         let mask = Masking::Extent(Mask::new(vec![0, 8, 8, columns - 16], u64::from(columns)));
         let token = [(step * 7919) % 4096];
         let word = facts.word(&Request::new(1, false));
-        let seated = engine_cuda::serve::Seated::masked(Lane { slot: 0, word, tokens: &token }, &mask);
+        let seated = engine_cuda::serve::Seated::masked(
+            Lane {
+                slot: 0,
+                word,
+                tokens: &token,
+            },
+            &mask,
+        );
         let rows = shell
             .fire_rows(&[seated], &[Readout::Last])
             .expect("the masked fire runs");
@@ -228,7 +245,14 @@ fn decoded(
             pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        ..crate::common::boot(trace.clone(), &contract, path, Budget::new(1, CHUNK), 1024, 2)
+        ..crate::common::boot(
+            trace.clone(),
+            &contract,
+            path,
+            Budget::new(1, CHUNK),
+            1024,
+            2,
+        )
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
@@ -248,19 +272,37 @@ fn decoded(
             .expect("one readout")
     };
     for chunk in head.chunks(CHUNK as usize) {
-        fire(Seated::of(Lane { tokens: chunk, ..lane(chunk.len()) }));
+        fire(Seated::of(Lane {
+            tokens: chunk,
+            ..lane(chunk.len())
+        }));
     }
-    let snaps = [RsSnapshot { row: rows, slot: 1, pieces: Vec::new(), fixed: Vec::new() }];
-    let last = if from.is_some() { last } else { &last[..rows as usize] };
+    let snaps = [RsSnapshot {
+        row: rows,
+        slot: 1,
+        pieces: Vec::new(),
+        fixed: Vec::new(),
+    }];
+    let last = if from.is_some() {
+        last
+    } else {
+        &last[..rows as usize]
+    };
     fire(Seated {
         rs_snapshots: if from == Some(true) { &snaps } else { &[] },
-        ..Seated::of(Lane { tokens: last, ..lane(last.len()) })
+        ..Seated::of(Lane {
+            tokens: last,
+            ..lane(last.len())
+        })
     });
     let token = [77u32];
     let logits = fire(Seated {
         held: Some(head.len() as u32 + rows),
         rs_slot: from.map(|_| 1),
-        ..Seated::of(Lane { tokens: &token, ..lane(1) })
+        ..Seated::of(Lane {
+            tokens: &token,
+            ..lane(1)
+        })
     });
     drop(fire);
     (logits, shell.ring_seen())
@@ -286,10 +328,21 @@ fn a_ring_snapshot_holds_the_rows_before_it() {
         let (want, _) = decoded(&trace, &path, &prompt, rows, None);
         let (got, seen) = decoded(&trace, &path, &prompt, rows, Some(true));
         assert_eq!(seen.snapshots, 1, "row {rows}: the fire lands one");
-        agree(&[got], &[want.clone()], &format!("a snapshot at row {rows}"));
+        agree(
+            &[got],
+            &[want.clone()],
+            &format!("a snapshot at row {rows}"),
+        );
         let (bare, seen) = decoded(&trace, &path, &prompt, rows, Some(false));
         assert_eq!(seen.snapshots, 0);
-        let apart = bare.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        assert!(apart > 1e-3, "row {rows}: a record with no snapshot answers the same");
+        let apart = bare
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            apart > 1e-3,
+            "row {rows}: a record with no snapshot answers the same"
+        );
     }
 }

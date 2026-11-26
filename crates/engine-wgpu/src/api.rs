@@ -8,9 +8,9 @@ use engine::fire::{FireTicket, Step};
 use engine::transfer::{DeviceReach, MemoryDomain};
 use eta_ir::registry::PortMask;
 
-use engine_gpu::api::{Envelope, Host, PendingStep, program_attachments};
 #[cfg(feature = "wgpu")]
 use engine_gpu::api::refusal;
+use engine_gpu::api::{Envelope, Host, PendingStep, program_attachments};
 
 use crate::device::Api;
 
@@ -79,7 +79,6 @@ pub type Wgpu = engine_gpu::api::Gpu<Api>;
 
 impl Host for Api {
     const KIND: &'static str = "wgpu";
-
 
     type Programs = crate::program::Plane;
 

@@ -404,7 +404,11 @@ mod beside_tests {
         let p = macos_available_beside(29, 14 * gib, 32 * gib).expect("a reading");
         assert!((p - 0.2725).abs() < 1e-9, "{p}");
         assert_eq!(macos_available_beside(29, 0, 32 * gib), Some(0.71));
-        assert_eq!(macos_available_beside(90, 32 * gib, 32 * gib), Some(0.0), "capped at 100%");
+        assert_eq!(
+            macos_available_beside(90, 32 * gib, 32 * gib),
+            Some(0.0),
+            "capped at 100%"
+        );
         assert_eq!(macos_available_beside(101, 0, 32 * gib), None);
         assert_eq!(macos_available_beside(50, 0, 0), None);
     }
@@ -477,7 +481,10 @@ mod macos {
             libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, (&raw mut info).cast())
         };
         if status != 0 {
-            return Err(format!("proc_pid_rusage: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "proc_pid_rusage: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(info.ri_phys_footprint)
     }
@@ -512,5 +519,4 @@ mod tests {
         }
         assert!(Yield::new(0.0).is_ok() && Yield::new(1.0).is_ok());
     }
-
 }

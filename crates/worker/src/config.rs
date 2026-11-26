@@ -1193,7 +1193,11 @@ device = ["metal:0"]
         );
         let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"0B\"\n");
         let cfg = Config::parse(&zero).expect("0 is no disk tier, not refused");
-        assert_eq!(cfg.engine.memory.residency().disk_kv_budget, Some(0), "stated: none");
+        assert_eq!(
+            cfg.engine.memory.residency().disk_kv_budget,
+            Some(0),
+            "stated: none"
+        );
         let sized = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"2GiB\"\n");
         let cfg = Config::parse(&sized).unwrap();
         assert_eq!(cfg.engine.memory.residency().disk_kv_budget, Some(2 << 30));
@@ -1256,8 +1260,7 @@ device = ["metal:0"]
         );
         let err = Config::parse(&toml).unwrap_err().to_string();
         assert!(err.contains("the controller's to run"), "got: {err}");
-        let alone =
-            format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"my-policy\"]\n");
+        let alone = format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"my-policy\"]\n");
         Config::parse(&alone).expect("single-node runs them in its own controller");
     }
 

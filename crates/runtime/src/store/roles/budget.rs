@@ -63,7 +63,9 @@ impl Roles {
         let device = self.device.lock().unwrap();
         self.items
             .values()
-            .filter(|item| item.holder == Some(holder) && matches!(item.tier, Tier::Device | Tier::Moving))
+            .filter(|item| {
+                item.holder == Some(holder) && matches!(item.tier, Tier::Device | Tier::Moving)
+            })
             .flat_map(|item| &item.parts)
             .map(|part| self.part_bytes(&device, part))
             .sum::<u64>()

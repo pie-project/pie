@@ -539,5 +539,4 @@ impl Landings {
 }
 
 #[cfg(test)]
-mod digest_tests {
-}
+mod digest_tests {}

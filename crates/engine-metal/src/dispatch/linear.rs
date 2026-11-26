@@ -428,7 +428,10 @@ impl Run<'_> {
             } else {
                 self.register_counters(act, w, out.width).is_some()
             }) && out.rows == m
-                && self.ane().and_then(|ane| ane.plan_columns(w, m, self.dry())).is_none();
+                && self
+                    .ane()
+                    .and_then(|ane| ane.plan_columns(w, m, self.dry()))
+                    .is_none();
             let Some(bank) = self.banked(w)?.filter(|b| fits && b.ld % 256 == 0) else {
                 return Ok(false);
             };
@@ -562,7 +565,8 @@ impl Run<'_> {
             i32::try_from(counters).unwrap_or(0),
         );
         let rows = (17 * x.width + 4 * counters.unsigned_abs()).div_ceil(2 * x.width);
-        let Some((table, laid)) = self.register_table(act, rows, x.width, counters.unsigned_abs())?
+        let Some((table, laid)) =
+            self.register_table(act, rows, x.width, counters.unsigned_abs())?
         else {
             return Ok(false);
         };

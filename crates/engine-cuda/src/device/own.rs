@@ -149,8 +149,7 @@ fn held(device: i32) -> std::result::Result<u64, Unread> {
         (!library.is_null()).then(|| {
             move |name: &core::ffi::CStr| {
                 // SAFETY: a live module and a NUL-terminated name.
-                unsafe { GetProcAddress(library, name.as_ptr().cast()) }
-                    .map(|at| at as *mut c_void)
+                unsafe { GetProcAddress(library, name.as_ptr().cast()) }.map(|at| at as *mut c_void)
             }
         })
     }
@@ -194,7 +193,9 @@ fn held(device: i32) -> std::result::Result<u64, Unread> {
     unsafe {
         let asked = rt::cudaDeviceGetPCIBusId(bus.as_mut_ptr(), bus.len() as c_int, device);
         if asked != rt::cudaError::cudaSuccess {
-            return Err(Unread::Failed(format!("device {device}'s PCI bus id: {asked:?}")));
+            return Err(Unread::Failed(format!(
+                "device {device}'s PCI bus id: {asked:?}"
+            )));
         }
         let code = by_bus(bus.as_ptr(), &raw mut handle);
         if code != 0 {

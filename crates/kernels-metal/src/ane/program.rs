@@ -289,12 +289,19 @@ mod write_cached_tests {
                 let writers: Vec<_> = (0..4)
                     .map(|_| scope.spawn(|| write_cached(&directory, &name, &bytes)))
                     .collect();
-                writers.into_iter().map(|w| w.join().expect("the writer")).collect()
+                writers
+                    .into_iter()
+                    .map(|w| w.join().expect("the writer"))
+                    .collect()
             });
             for result in results {
                 result.expect("every writer lands");
             }
-            assert_eq!(std::fs::read(directory.join(&name)).expect("the file"), bytes, "whole bytes");
+            assert_eq!(
+                std::fs::read(directory.join(&name)).expect("the file"),
+                bytes,
+                "whole bytes"
+            );
         }
         let leftover = std::fs::read_dir(&directory)
             .expect("the directory")

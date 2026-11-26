@@ -34,7 +34,10 @@ pub struct Place<'a, B: Serve> {
 
 #[derive(Debug)]
 pub enum Refusal {
-    Closed { what: &'static str, id: u64 },
+    Closed {
+        what: &'static str,
+        id: u64,
+    },
 
     Program(String),
 
@@ -325,8 +328,14 @@ pub trait Programs<B: Serve>: Default {
         &self,
         instance: InstanceId,
         pools: &Pools<B>,
-    ) -> Result<Option<(u32, crate::guest::state::BeamLayout, crate::beam::Parents<B>)>, Refusal>
-    {
+    ) -> Result<
+        Option<(
+            u32,
+            crate::guest::state::BeamLayout,
+            crate::beam::Parents<B>,
+        )>,
+        Refusal,
+    > {
         let _ = (instance, pools);
         Ok(None)
     }
@@ -665,16 +674,13 @@ pub fn descriptor_ports(
                     ))
                 })?
         } else {
-            let ring = inst
-                .channels
-                .get(binding.channel as usize)
-                .ok_or_else(|| {
-                    Refusal::Program(format!(
-                        "instance {instance}: port `{port}` names channel {}, which the \
+            let ring = inst.channels.get(binding.channel as usize).ok_or_else(|| {
+                Refusal::Program(format!(
+                    "instance {instance}: port `{port}` names channel {}, which the \
                          instance does not carry",
-                        binding.channel
-                    ))
-                })?;
+                    binding.channel
+                ))
+            })?;
             if ring.is_empty() {
                 return Err(Refusal::Program(format!(
                     "instance {instance}: the `{port}` ring is empty at the fire; the port's \
@@ -745,9 +751,8 @@ pub fn device_lanes(
     first: usize,
     instance: InstanceId,
 ) -> Result<Vec<DeviceLane>, Refusal> {
-    let port = |error: engine::ports::PortError| {
-        Refusal::Program(format!("instance {instance}: {error}"))
-    };
+    let port =
+        |error: engine::ports::PortError| Refusal::Program(format!("instance {instance}: {error}"));
     envelope.host_rows = stated
         .iter()
         .map(|lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX))
@@ -921,20 +926,30 @@ mod tests {
         let why = device_lanes(&mut envelope, &[lane], 3, InstanceId(7))
             .expect_err("two lanes described over one owned")
             .to_string();
-        assert!(why.contains("describes 2") && why.contains("lane 3"), "{why}");
+        assert!(
+            why.contains("describes 2") && why.contains("lane 3"),
+            "{why}"
+        );
     }
 
     #[test]
     fn a_row_placed_past_what_the_lane_may_write_is_refused_by_name() {
-        let why = placed(40).expect_err("slot 40 is past write_end 32").to_string();
-        assert!(why.contains("kv slot 40") && why.contains("16..32"), "{why}");
+        let why = placed(40)
+            .expect_err("slot 40 is past write_end 32")
+            .to_string();
+        assert!(
+            why.contains("kv slot 40") && why.contains("16..32"),
+            "{why}"
+        );
     }
 
     #[test]
     fn a_row_placed_in_the_frozen_prefix_is_refused_by_name() {
         let refused = placed(3).expect_err("slot 3 is below the fold");
         let why = refused.to_string();
-        assert!(why.contains("kv slot 3") && why.contains("frozen prefix"), "{why}");
+        assert!(
+            why.contains("kv slot 3") && why.contains("frozen prefix"),
+            "{why}"
+        );
     }
-
 }

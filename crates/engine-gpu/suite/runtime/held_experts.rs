@@ -30,7 +30,11 @@ fn serve(shell: &mut Shell, trace: &poem_ir::Trace) -> Vec<Vec<f32>> {
         shell.open(slot).expect("the seat opens");
     }
     let prompts: Vec<Vec<u32>> = (0..2u32)
-        .map(|lane| (0..rows).map(|at| (at * 37 + lane * 11 + 5) % 2048).collect())
+        .map(|lane| {
+            (0..rows)
+                .map(|at| (at * 37 + lane * 11 + 5) % 2048)
+                .collect()
+        })
         .collect();
     let seated: Vec<Seated<'_>> = (0..2u32)
         .map(|lane| Seated {
@@ -78,9 +82,14 @@ fn a_held_load_whose_experts_overflow_its_pool_serves_what_the_runtime_places() 
         weights_held: true,
         ..engine::load::Residency::default()
     };
-    let Some(probe) =
-        load_capped_with(&fixture, PAGE, CONTEXT, u64::MAX, TARGET, residency(1 << 30))
-    else {
+    let Some(probe) = load_capped_with(
+        &fixture,
+        PAGE,
+        CONTEXT,
+        u64::MAX,
+        TARGET,
+        residency(1 << 30),
+    ) else {
         return;
     };
     let chunk = probe.pool_layout().chunk_bytes;
@@ -160,7 +169,10 @@ fn a_held_load_whose_experts_overflow_its_pool_serves_what_the_runtime_places() 
     let first = seats * layout.segment_chunks;
     let top = below_span.min(facts.segments.max * layout.segment_chunks) / layout.segment_chunks
         * layout.segment_chunks;
-    assert!(top > first, "a segment lies between the seats' and the span's");
+    assert!(
+        top > first,
+        "a segment lies between the seats' and the span's"
+    );
     shell
         .commit_segments(top / layout.segment_chunks)
         .expect("the runtime's segments commit");

@@ -96,13 +96,7 @@ fn a_step_module_writes_only_its_heap_and_its_status() {
 fn writes_only_its_heap_and_its_status(call: &str, source: &str) -> Result<(), String> {
     const READ_ONLY: [&str; 2] = ["tables", "pie_step"];
     const SET_AT_ENTRY: [&str; 7] = [
-        "b_status",
-        "b_descs",
-        "b_params",
-        "b_offs",
-        "b_heap",
-        "lim_heap",
-        "tmp_base",
+        "b_status", "b_descs", "b_params", "b_offs", "b_heap", "lim_heap", "tmp_base",
     ];
     let module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
     let named = |name: &str| {

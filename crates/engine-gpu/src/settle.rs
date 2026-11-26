@@ -158,7 +158,11 @@ pub struct Meet {
 
 #[derive(Default)]
 struct Met {
-    forward: Option<(engine::StepDone, engine::CompletionSink, engine::StepOutcome)>,
+    forward: Option<(
+        engine::StepDone,
+        engine::CompletionSink,
+        engine::StepOutcome,
+    )>,
     guests: Option<Vec<engine::LaneFault>>,
 }
 
@@ -440,7 +444,9 @@ impl FedCheck {
 
 impl std::fmt::Debug for FedCheck {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FedCheck").field("lanes", &self.inner.lanes).finish()
+        f.debug_struct("FedCheck")
+            .field("lanes", &self.inner.lanes)
+            .finish()
     }
 }
 

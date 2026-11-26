@@ -5,12 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{Fused, Operation, ParamSource, Trace};
-use crate::common::fnv;
 
 /// Rows whose routed MLPs the mega-MoE forms: GLM's bf16 banks under the
 /// weighted sum.

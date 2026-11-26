@@ -717,8 +717,13 @@ impl Shell {
                 // The guest state the device can hold live (the room a
                 // guest program binds within): evicted, it has a home.
                 let guest = self.chunk_facts()?.guest_room_bytes();
-                let need =
-                    engine::disk::derived_need(0, 0, pages.div_ceil(per_chunk) + state, chunk, guest);
+                let need = engine::disk::derived_need(
+                    0,
+                    0,
+                    pages.div_ceil(per_chunk) + state,
+                    chunk,
+                    guest,
+                );
                 let bytes = need.min(free / ranks);
                 // Its inputs, stated at load: what the field rules on.
                 tracing::info!(
@@ -882,7 +887,11 @@ impl Shell {
         } else {
             !self.windowed_layers().is_empty()
         };
-        if lands { crate::store::rs::SNAPSHOTS } else { 0 }
+        if lands {
+            crate::store::rs::SNAPSHOTS
+        } else {
+            0
+        }
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -1131,7 +1140,11 @@ impl Shell {
     /// ([`crate::program::Plane::pair_stale`]). For a test.
     #[doc(hidden)]
     #[must_use]
-    pub fn pair_stale(&self, program: engine::ProgramId, extents: eta_exec::Extents) -> Option<bool> {
+    pub fn pair_stale(
+        &self,
+        program: engine::ProgramId,
+        extents: eta_exec::Extents,
+    ) -> Option<bool> {
         self.programs.pair_stale(program, extents)
     }
 
@@ -1228,8 +1241,12 @@ impl Shell {
     ) -> Result<()> {
         let stream = self.device.stream();
         let pools = &self.pools;
-        self.programs
-            .rebind(id, slots, &|item, bytes| pools.guest_item(item, bytes), stream)
+        self.programs.rebind(
+            id,
+            slots,
+            &|item, bytes| pools.guest_item(item, bytes),
+            stream,
+        )
     }
 
     /// Settles the guest batches whose steps have landed: their channels'

@@ -103,7 +103,9 @@ impl ResidencyPlanner {
             %error,
             "planner: the tier below is full: the eviction is taken back"
         );
-        self.stats.eviction_tier_full.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .eviction_tier_full
+            .fetch_add(1, Ordering::Relaxed);
         // Blocked as room below short, which a stall with nothing in flight
         // lifts ([`Self::dump_stall`]).
         self.eviction_failed_inner(pid, true, false);
@@ -228,7 +230,12 @@ impl ResidencyPlanner {
         // With no bind pending, its unpark took what was held for it: the
         // rest goes back. A pending bind takes its runs from it, and its
         // take gives back the rest.
-        if self.with_inner(|inner| inner.procs.get(&pid).is_none_or(|proc| proc.bind_room.is_none())) {
+        if self.with_inner(|inner| {
+            inner
+                .procs
+                .get(&pid)
+                .is_none_or(|proc| proc.bind_room.is_none())
+        }) {
             self.port.release_restore(pid);
         }
         let signal = self.with_inner(|inner| {
@@ -351,7 +358,12 @@ impl ResidencyPlanner {
             inner
                 .procs
                 .get(&pid)
-                .map(|proc| proc.bind_room.into_iter().chain(proc.roles_short).collect::<Vec<_>>())
+                .map(|proc| {
+                    proc.bind_room
+                        .into_iter()
+                        .chain(proc.roles_short)
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default()
         });
         // Of what was recorded, only a need of the refusal's own length:
@@ -402,7 +414,11 @@ impl ResidencyPlanner {
         // serve opened first): grown on it, the need would grow a run a
         // refusal with nothing issued.
         let understated = refused_saw && stood < max_runs;
-        let pieces = if understated { pieces.max(stood.saturating_add(1)) } else { pieces };
+        let pieces = if understated {
+            pieces.max(stood.saturating_add(1))
+        } else {
+            pieces
+        };
         let updated = super::proc::PendingBind {
             singles: 0,
             run,
@@ -421,7 +437,10 @@ impl ResidencyPlanner {
         // the room moves, its need planned on chunks only moves empty.
         let room = ((run, pieces), free_chunks, refused_room);
         let repeat = self.with_inner(|inner| {
-            inner.procs.get_mut(&pid).is_some_and(|proc| proc.last_refusal.replace(room) == Some(room))
+            inner
+                .procs
+                .get_mut(&pid)
+                .is_some_and(|proc| proc.last_refusal.replace(room) == Some(room))
         });
         if repeat {
             self.stats.stuck_settles.fetch_add(1, Ordering::Relaxed);
@@ -477,8 +496,14 @@ impl ResidencyPlanner {
                 .map(|need| need.entries())
                 .unwrap_or_default();
             inner.queue.iter().find_map(|(key, waiter)| {
-                (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. }))
-                    .then(|| (*key, waiter.rs_need(), bind.clone(), inner.restore_kv_missing(*key)))
+                (waiter.pid == pid && matches!(waiter.kind, WaitKind::Restore { .. })).then(|| {
+                    (
+                        *key,
+                        waiter.rs_need(),
+                        bind.clone(),
+                        inner.restore_kv_missing(*key),
+                    )
+                })
             })
         });
         if let Some((key, state, bind, kv)) = queued {
@@ -494,7 +519,8 @@ impl ResidencyPlanner {
         // A need past the whole device pool: its gate is told, to refuse it
         // by name ([`Self::restore_never_fits`]) rather than wait.
         if self.restore_never_fits_now(pid)
-            && let Some(signal) = self.with_inner(|inner| inner.procs.get(&pid).map(|proc| proc.signal.clone()))
+            && let Some(signal) =
+                self.with_inner(|inner| inner.procs.get(&pid).map(|proc| proc.signal.clone()))
         {
             signal.notify_waiters();
         }

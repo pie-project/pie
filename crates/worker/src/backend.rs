@@ -8,7 +8,9 @@ use anyhow::Context;
 use anyhow::{Result, anyhow};
 
 #[cfg(feature = "engine-cuda")]
-use runtime::engine::backend::{DeviceBoot, Diagnostics, Knobs, QueueMasks, Transport, World, ordinal_of};
+use runtime::engine::backend::{
+    DeviceBoot, Diagnostics, Knobs, QueueMasks, Transport, World, ordinal_of,
+};
 
 use crate::backend::flavor::Flavor;
 use crate::config;
@@ -220,7 +222,6 @@ fn load_request(
         -1,
         frames_in_flight,
     )
-
 }
 
 #[allow(clippy::too_many_arguments)]

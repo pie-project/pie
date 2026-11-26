@@ -3,9 +3,9 @@ use std::sync::{Arc, Weak};
 
 use tokio::sync::Notify;
 
+use super::ProcessId;
 use super::departure::Departure;
 use super::grant::Demand;
-use super::ProcessId;
 use super::rank::Rank;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,7 +215,9 @@ impl Proc {
     pub(super) fn restore_need(&self) -> Option<(u32, u32)> {
         let need = self.roles_short.or(self.bind_room)?;
         let pieces = match self.roles_free_short {
-            Some((run, _)) if run == need.run => need.pieces.max(self.roles_free_short_at.saturating_add(1)),
+            Some((run, _)) if run == need.run => {
+                need.pieces.max(self.roles_free_short_at.saturating_add(1))
+            }
             _ => need.pieces,
         };
         Some((need.run, pieces))

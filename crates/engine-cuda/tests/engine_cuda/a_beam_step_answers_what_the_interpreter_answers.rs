@@ -92,8 +92,14 @@ fn fired_over(
             )
             .expect("the logits bind");
     }
-    let fired = plane.fire(&context, instance).map_err(|why| why.to_string())?;
-    assert!(matches!(fired, Fired::Committed), "{}: {fired:?}", case.name);
+    let fired = plane
+        .fire(&context, instance)
+        .map_err(|why| why.to_string())?;
+    assert!(
+        matches!(fired, Fired::Committed),
+        "{}: {fired:?}",
+        case.name
+    );
     let session = plane.instance_mut(instance).expect("the instance");
     Ok(case
         .readers
@@ -124,7 +130,10 @@ fn a_beam_step_answers_what_the_interpreter_answers() {
     // lanes 0 and 3 of an output read at lane 0 are no rows 0 and 1.
     let case = &beam_stage()[0];
     let mut seats = case.seats();
-    seats.push(Seat { lane: 3, ..seats[0] });
+    seats.push(Seat {
+        lane: 3,
+        ..seats[0]
+    });
     let refused = fired(case, &seats).expect_err("a seat past the rows is refused");
     assert!(refused.contains("bound at lane 3"), "{refused}");
 }
@@ -245,7 +254,11 @@ fn groups_splitting_in_one_wave_answer_as_each_alone() {
     // its own, as beams of distinct prompts and lengths are): eight groups,
     // which the wave fans over its side streams unless they meet.
     let cases: Vec<Case> = (0..4)
-        .flat_map(|_| beam_stage().into_iter().filter(|case| case.binding == Binding::OneLane))
+        .flat_map(|_| {
+            beam_stage()
+                .into_iter()
+                .filter(|case| case.binding == Binding::OneLane)
+        })
         .collect();
     assert!(cases.len() >= 8, "eight programs to group apart");
     let mut plane = crate::guest::alone_plane();
@@ -256,14 +269,20 @@ fn groups_splitting_in_one_wave_answer_as_each_alone() {
             .map(|(at, case)| bind_case(&mut plane, &context, case, 0xbe90_0000 + at as u64))
             .collect();
         for (instance, _) in &bound {
-            plane.stage(*instance, Stage::Epilogue).expect("the step stages");
+            plane
+                .stage(*instance, Stage::Epilogue)
+                .expect("the step stages");
         }
         plane.fly(&context).expect("the wave flies");
         plane.land(&context).expect("the wave lands");
         context.synchronize().expect("the wave settles");
         for (case, (instance, _)) in cases.iter().zip(&bound) {
             let fired = plane.settle_launched(*instance).expect("the step settles");
-            assert!(matches!(fired, Fired::Committed), "{}, wave {wave}: {fired:?}", case.name);
+            assert!(
+                matches!(fired, Fired::Committed),
+                "{}, wave {wave}: {fired:?}",
+                case.name
+            );
             let session = plane.instance_mut(*instance).expect("the instance");
             for (&channel, want) in case.readers.iter().zip(case.expected()) {
                 let got = session
@@ -295,18 +314,28 @@ fn sampler_step() -> eta_ir::container::TraceContainer {
         Op::Const(Literal::F32(0.8)),
         Op::Div(2, 3),
         Op::ReduceMax(4),
-        Op::Broadcast { value: 5, shape: row },
+        Op::Broadcast {
+            value: 5,
+            shape: row,
+        },
         Op::Sub(4, 6),
         Op::Exp(7),
         Op::ReduceSum(8),
-        Op::Broadcast { value: 9, shape: row },
+        Op::Broadcast {
+            value: 9,
+            shape: row,
+        },
         Op::Div(8, 10),
         Op::PivotThreshold {
             input: 11,
             predicate: Predicate::CummassLe(1),
         },
         Op::Const(Literal::F32(f32::NEG_INFINITY)),
-        Op::Select { cond: 12, a: 4, b: 13 },
+        Op::Select {
+            cond: 12,
+            a: 4,
+            b: 13,
+        },
         Op::RngKeyed {
             state: 0,
             shape: row,
@@ -440,17 +469,29 @@ fn a_split_select_beside_lane_samplers_answers_as_alone() {
             })
             .collect();
         for instance in decodes.iter().chain([&beam_instance]) {
-            plane.stage(*instance, Stage::Epilogue).expect("the step stages");
+            plane
+                .stage(*instance, Stage::Epilogue)
+                .expect("the step stages");
         }
         plane.fly(&context).expect("the wave flies");
         plane.land(&context).expect("the wave lands");
         context.synchronize().expect("the wave settles");
-        let fired = plane.settle_launched(beam_instance).expect("the beam settles");
+        let fired = plane
+            .settle_launched(beam_instance)
+            .expect("the beam settles");
         let session = plane.instance_mut(beam_instance).expect("the beam");
         let agrees = matches!(fired, Fired::Committed)
-            && beam.readers.iter().zip(beam.expected()).all(|(&channel, want)| {
-                session.take(channel).ok().flatten().is_some_and(|got| got == want)
-            });
+            && beam
+                .readers
+                .iter()
+                .zip(beam.expected())
+                .all(|(&channel, want)| {
+                    session
+                        .take(channel)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|got| got == want)
+                });
         beams_wrong += usize::from(!agrees);
         for instance in decodes {
             let fired = plane.settle_launched(instance).expect("the decode settles");
@@ -461,7 +502,8 @@ fn a_split_select_beside_lane_samplers_answers_as_alone() {
                 .ok()
                 .flatten()
                 .map(|cell| i32::from_le_bytes(cell[..4].try_into().unwrap()));
-            draws_wrong += usize::from(!matches!(fired, Fired::Committed) || token != Some(want_token));
+            draws_wrong +=
+                usize::from(!matches!(fired, Fired::Committed) || token != Some(want_token));
         }
     }
     assert_eq!(

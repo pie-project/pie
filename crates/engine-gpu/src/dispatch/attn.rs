@@ -264,10 +264,17 @@ impl<B: Backend> Run<'_, B> {
     ) -> Result<(kernels_slang::Tensor, kernels_slang::Tensor), kernels_slang::Error> {
         let missing = |what: &str| kernels_slang::Error::Backend {
             op,
-            detail: format!("a capturing fire with no {what}, which the load lays where its trace captures"),
+            detail: format!(
+                "a capturing fire with no {what}, which the load lays where its trace captures"
+            ),
         };
-        let table = self.bindings().capture.ok_or_else(|| missing("capture table"))?;
-        let stats = self.score_stats().ok_or_else(|| missing("normalisers' room"))?;
+        let table = self
+            .bindings()
+            .capture
+            .ok_or_else(|| missing("capture table"))?;
+        let stats = self
+            .score_stats()
+            .ok_or_else(|| missing("normalisers' room"))?;
         Ok((table, stats))
     }
 
@@ -640,7 +647,10 @@ impl<B: Backend> Run<'_, B> {
                         | poem_ir::RaggedMask::Stated,
                         None,
                     ) => None,
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, Some(_)) => {
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(_),
+                    ) => {
                         return Err(kernels_slang::Error::Backend {
                             op: "attn.ragged",
                             detail: "a lane states an attention mask over an attention its model \

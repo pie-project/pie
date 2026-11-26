@@ -25,7 +25,11 @@ fn a_settle_stale_by_code_alone_serves_its_picks_range_by_range() {
         return;
     };
     measure_behind(&mut first.engine);
-    let before = first.engine.loaded_mut().expect("loaded").dense_tactics_at(1)[0];
+    let before = first
+        .engine
+        .loaded_mut()
+        .expect("loaded")
+        .dense_tactics_at(1)[0];
     drop(first);
 
     // The one-row range given another vector kernel (one the load builds:
@@ -53,7 +57,10 @@ fn a_settle_stale_by_code_alone_serves_its_picks_range_by_range() {
         found.expect("the first boot stored a settle")
     };
     let text = std::fs::read_to_string(&path).expect("the profile reads");
-    let at = text.find("[[1, 1, ").expect("the settle decided the one-row range") + 1;
+    let at = text
+        .find("[[1, 1, ")
+        .expect("the settle decided the one-row range")
+        + 1;
     let end = at + text[at..].find(']').expect("a range closes") + 1;
     let row = backend::Shell::settled_row(1, 1, swapped);
     let text = format!(
@@ -63,7 +70,9 @@ fn a_settle_stale_by_code_alone_serves_its_picks_range_by_range() {
         &text[end..]
     );
     // `[method, of, code, [ranges...`: the code moved, the rest kept.
-    let head = text.find("dense_settled_keyed = [").expect("the settle's list");
+    let head = text
+        .find("dense_settled_keyed = [")
+        .expect("the settle's list");
     let entry = head + text[head..].find("\n  [").expect("an entry") + 4;
     let fields: Vec<&str> = text[entry..].splitn(4, ", ").collect();
     let code: u64 = fields[2].parse().expect("the code");

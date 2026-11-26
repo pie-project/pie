@@ -90,7 +90,11 @@ fn run(logits: &[f32]) -> Landed {
         assert_eq!((sm.dtype(), lsm.dtype()), (dtype::bf16, dtype::bf16));
         let s = reduce_sum(&x);
         let m = reduce_max(&x);
-        assert_eq!((s.dtype(), m.dtype()), (dtype::f32, dtype::f32), "a reduction is f32");
+        assert_eq!(
+            (s.dtype(), m.dtype()),
+            (dtype::f32, dtype::f32),
+            "a reduction is f32"
+        );
         let cs = cumsum(&x);
         assert_eq!(cs.dtype(), dtype::bf16, "a scan keeps bf16");
         let (vals, ids) = top_k(&x, TOP);
@@ -198,7 +202,12 @@ fn logits(n: usize, seed: u32) -> Vec<f32> {
 #[test]
 fn bf16_matches_an_f64_reference() {
     // An odd vocabulary: a value whose last word holds one element.
-    let rows = [logits(1001, 7), logits(64, 3), logits(5, 11), vec![1.0f32; 4096]];
+    let rows = [
+        logits(1001, 7),
+        logits(64, 3),
+        logits(5, 11),
+        vec![1.0f32; 4096],
+    ];
     for x in rows {
         let n = x.len();
         let got = run(&x);
@@ -210,14 +219,29 @@ fn bf16_matches_an_f64_reference() {
         );
         assert_eq!(got.wide, narrow, "the cast back is exact");
         let scaled: Vec<u16> = narrow.iter().map(|&a| bf16_bits(a * 0.5 + 1.0)).collect();
-        assert_eq!(got.scaled, scaled, "each op computes in f32, rounded once on store");
+        assert_eq!(
+            got.scaled, scaled,
+            "each op computes in f32, rounded once on store"
+        );
 
         // The f64 references.
-        let max = narrow.iter().copied().fold(f64::NEG_INFINITY, |m, a| m.max(a as f64));
+        let max = narrow
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, |m, a| m.max(a as f64));
         let sum: f64 = narrow.iter().map(|&a| a as f64).sum();
-        let lse = max + narrow.iter().map(|&a| (a as f64 - max).exp()).sum::<f64>().ln();
+        let lse = max
+            + narrow
+                .iter()
+                .map(|&a| (a as f64 - max).exp())
+                .sum::<f64>()
+                .ln();
         assert_eq!(got.max as f64, max);
-        assert!((got.sum as f64 - sum).abs() <= 1e-5 * sum.abs().max(1.0), "{} {sum}", got.sum);
+        assert!(
+            (got.sum as f64 - sum).abs() <= 1e-5 * sum.abs().max(1.0),
+            "{} {sum}",
+            got.sum
+        );
         let half_ulp = |r: f64| r.abs() * 2f64.powi(-8) + 1e-30;
         for i in 0..n {
             let p = (narrow[i] as f64 - lse).exp();
@@ -230,7 +254,10 @@ fn bf16_matches_an_f64_reference() {
             assert!((sm - p).abs() <= bound, "softmax[{i}] {sm} vs {p}");
             let lp = narrow[i] as f64 - lse;
             let lsm = bf16_to_f32(got.log_softmax[i]) as f64;
-            assert!((lsm - lp).abs() <= half_ulp(lp) + 1e-5, "log_softmax[{i}] {lsm} vs {lp}");
+            assert!(
+                (lsm - lp).abs() <= half_ulp(lp) + 1e-5,
+                "log_softmax[{i}] {lsm} vs {lp}"
+            );
         }
         let mut prefix = 0f64;
         for i in 0..n {
@@ -249,7 +276,11 @@ fn bf16_matches_an_f64_reference() {
             order[..want].iter().map(|&i| i as u32).collect::<Vec<_>>()[..]
         );
         for k in 0..want {
-            assert_eq!(got.top[k], bf16_bits(narrow[order[k]]), "a top-k value is exact");
+            assert_eq!(
+                got.top[k],
+                bf16_bits(narrow[order[k]]),
+                "a top-k value is exact"
+            );
         }
         assert_eq!(got.argmax as usize, order[0]);
     }

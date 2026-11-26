@@ -147,7 +147,9 @@ pub(crate) fn release_channel_state(gid: u64) -> bool {
 /// Releases this thread's channels of gid `first` on.
 pub(crate) fn release_channels_from(first: u64) {
     let released = CHANNELS_BY_GID.try_with(|map| {
-        map.try_borrow_mut().ok().map(|mut map| map.split_off(&first))
+        map.try_borrow_mut()
+            .ok()
+            .map(|mut map| map.split_off(&first))
     });
     drop(released);
 }

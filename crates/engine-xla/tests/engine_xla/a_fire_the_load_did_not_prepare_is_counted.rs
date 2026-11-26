@@ -39,7 +39,10 @@ fn a_fire_the_load_did_not_prepare_is_counted() {
     };
     two_rows(&mut model, &mut refs, 1);
     let first = live.tallied(Tally::Compiled);
-    assert!(first > 0, "a prompt reading two rows is off the ladder, and counted");
+    assert!(
+        first > 0,
+        "a prompt reading two rows is off the ladder, and counted"
+    );
     assert_eq!(
         live.tallied(Tally::BuiltInFire),
         first,

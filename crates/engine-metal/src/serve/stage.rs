@@ -16,7 +16,6 @@ pub(super) enum Form {
 }
 
 impl Shell {
-
     #[must_use]
     /// A windowed lane's window table for this fire (/// `store::windowed`): its ring's pages below the buffer's base, its
     /// window-buffer slots from it, and the fire's own rows past them: in
@@ -61,11 +60,21 @@ impl Shell {
                             })
                     })
                     .collect::<Result<_>>()?,
-                pieces.first().is_some_and(|&[_, cow]| self.ring_shared.contains(&cow)),
+                pieces
+                    .first()
+                    .is_some_and(|&[_, cow]| self.ring_shared.contains(&cow)),
             ),
             // A seat-addressed lane: its seat's ring, its own.
-            None if !seated.refs => (self.pools.window_seat_ring(k, seated.lane.slot, ring_rows / page)?, false),
-            None => return Err(refuse("a windowed lane states no ring pieces in its record".to_string())),
+            None if !seated.refs => (
+                self.pools
+                    .window_seat_ring(k, seated.lane.slot, ring_rows / page)?,
+                false,
+            ),
+            None => {
+                return Err(refuse(
+                    "a windowed lane states no ring pieces in its record".to_string(),
+                ));
+            }
         };
         let ring = self.pools.window_pages(k, &ring_refs)?;
         let ring_at: Vec<u64> = ring_refs
@@ -106,7 +115,9 @@ impl Shell {
                 }
                 let slot = self.own_arm * per_arm + self.own_used;
                 self.own_used += 1;
-                let (byte, id) = self.pools.window_slot_at(k, first + slot / per_chunk, slot % per_chunk)?;
+                let (byte, id) =
+                    self.pools
+                        .window_slot_at(k, first + slot / per_chunk, slot % per_chunk)?;
                 ids.push(id);
                 at.push(byte);
             }
@@ -122,11 +133,20 @@ impl Shell {
         };
         let pages = lane.pages(end)?;
         // The same lane over indices into `bytes`, for the fills and the fold.
-        let (r, b, o) = (ring_at.len() as u32, buffer_at.len() as u32, own_at.len() as u32);
+        let (r, b, o) = (
+            ring_at.len() as u32,
+            buffer_at.len() as u32,
+            own_at.len() as u32,
+        );
         let ring_ix: Vec<u32> = (0..r).collect();
         let buffer_ix: Vec<u32> = (r..r + b).collect();
         let own_ix: Vec<u32> = (r + b..r + b + o).collect();
-        let bytes: Vec<u64> = ring_at.iter().chain(&buffer_at).chain(&own_at).copied().collect();
+        let bytes: Vec<u64> = ring_at
+            .iter()
+            .chain(&buffer_at)
+            .chain(&own_at)
+            .copied()
+            .collect();
         let by_index = crate::store::windowed::WindowedLane {
             page,
             ring: &ring_ix,
@@ -189,7 +209,9 @@ impl Shell {
             let copies: Vec<(u64, u64, u32, u32)> = by_index
                 .fold_copies(seated.folded, seated.folded + advance)?
                 .into_iter()
-                .map(|(source, ring, first, rows)| (bytes[source as usize], bytes[ring as usize], first, rows))
+                .map(|(source, ring, first, rows)| {
+                    (bytes[source as usize], bytes[ring as usize], first, rows)
+                })
                 .collect();
             if !copies.is_empty() {
                 self.window_folds.push((k, copies));
@@ -197,7 +219,6 @@ impl Shell {
         }
         Ok(pages)
     }
-
 
     /// Where lane `lane`'s voxels of grid output `out` start: the plane's
     /// offset there, its width and dtype.
@@ -413,7 +434,9 @@ impl Shell {
                     // either way from this lane's own seat, never on lane
                     // 0's pitch into rows another request may hold.
                     if !self.outputs[out].classes.contains(row.class as usize)
-                        || !(reads.iter().any(|(name, lane)| *name == decl.name && *lane == k)
+                        || !(reads
+                            .iter()
+                            .any(|(name, lane)| *name == decl.name && *lane == k)
                             || self.programs.covers(attached.instance, &decl.name, k)?)
                     {
                         continue;
@@ -451,12 +474,26 @@ impl Shell {
                                         .map_or(0, |layout| capture_row_bytes(layout.keys, 0).0)
                             };
                             // Its own score row.
-                            (buffer, offset, decl.width, eta_ir::Dtype::F32, decl.width, 1)
+                            (
+                                buffer,
+                                offset,
+                                decl.width,
+                                eta_ir::Dtype::F32,
+                                decl.width,
+                                1,
+                            )
                         }
                         _ => {
                             let (offset, width, dtype, stride, held) =
                                 self.output_seat(prepared, out, at, fire_lane, &row_of)?;
-                            (self.arena.store().clone(), offset, width, dtype, stride, held)
+                            (
+                                self.arena.store().clone(),
+                                offset,
+                                width,
+                                dtype,
+                                stride,
+                                held,
+                            )
                         }
                     };
                     let name = self.outputs[out].decl.name.clone();
@@ -485,10 +522,7 @@ impl Shell {
             staged.push(attached.instance);
         }
         let mut refusal = None;
-        for (instance, launched) in
-            self.programs
-                .stage_batched(frame, &staged, prepared.arm)?
-        {
+        for (instance, launched) in self.programs.stage_batched(frame, &staged, prepared.arm)? {
             match launched {
                 crate::program::Launched::Airborne => owed.push(instance),
                 crate::program::Launched::Refused(fired) => {
@@ -540,7 +574,9 @@ impl Shell {
                     stride = u32::try_from(gap / element).unwrap_or(u32::MAX);
                 }
                 // Its layers, one plane after another.
-                let layers = u32::try_from(output.values.len()).unwrap_or(u32::MAX).max(1);
+                let layers = u32::try_from(output.values.len())
+                    .unwrap_or(u32::MAX)
+                    .max(1);
                 (at_row(fire_lane as u64), width, dtype, stride, layers)
             }
             poem_ir::InputAxis::Row => {
@@ -567,7 +603,11 @@ impl Shell {
     /// flight, its next pass staged in its other set of tables while that
     /// one runs; every other is held to none, its next fire staged only
     /// once its last landed. A close waits out every one (`ahead` false).
-    pub(super) fn fence_instances(&mut self, instances: &[engine::InstanceId], ahead: bool) -> Result<()> {
+    pub(super) fn fence_instances(
+        &mut self,
+        instances: &[engine::InstanceId],
+        ahead: bool,
+    ) -> Result<()> {
         if instances.is_empty() {
             return Ok(());
         }
@@ -613,7 +653,9 @@ impl Shell {
                 .iter()
                 .find(|flight| {
                     flight.attached.iter().any(|(held, _)| {
-                        carried.get(held).is_some_and(|&n| n > allowed(&self.programs, held))
+                        carried
+                            .get(held)
+                            .is_some_and(|&n| n > allowed(&self.programs, held))
                     })
                 })
                 .map(|flight| flight.seq);
@@ -639,7 +681,10 @@ impl Shell {
         if ids.is_empty() {
             return Ok(());
         }
-        for (instance, fired) in self.programs.fire_batched(&self.device, &ids, Stage::Prologue)? {
+        for (instance, fired) in self
+            .programs
+            .fire_batched(&self.device, &ids, Stage::Prologue)?
+        {
             match fired {
                 crate::Fired::Committed => {}
                 other => {
@@ -656,7 +701,11 @@ impl Shell {
         Ok(())
     }
 
-    pub(super) fn admit_attachments(&mut self, lanes: &[Seated<'_>], attachments: &[Attached]) -> Result<()> {
+    pub(super) fn admit_attachments(
+        &mut self,
+        lanes: &[Seated<'_>],
+        attachments: &[Attached],
+    ) -> Result<()> {
         if attachments.is_empty() {
             return Ok(());
         }
@@ -832,8 +881,7 @@ impl Shell {
         }
         self.window_fills.clear();
         self.window_folds.clear();
-        let window_tables: Vec<Vec<Vec<u32>>> =
-            vec![Vec::with_capacity(lanes.len()); window_lists];
+        let window_tables: Vec<Vec<Vec<u32>>> = vec![Vec::with_capacity(lanes.len()); window_lists];
         let tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         // Token rows copied from a cell on the device before the forward:
         // the row, and the cell's buffer and byte offset.
@@ -1040,7 +1088,8 @@ impl Shell {
         // runtime to commit ahead of it: the segments its seats and its
         // demand touch back now.
         if lanes.iter().all(|seated| !seated.refs) && !self.warming {
-            self.pools.commit_seats(demand.kv_pages, demand.state_slots)?;
+            self.pools
+                .commit_seats(demand.kv_pages, demand.state_slots)?;
         }
         // Every page and record piece the fire reads or writes is checked
         // backed, ref by ref: a page in an uncommitted chunk under the
@@ -1149,7 +1198,10 @@ impl Shell {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let staged = crate::beam::Staged {
-                indptr: geometries.iter().map(|geometry| geometry.indptr.as_slice()).collect(),
+                indptr: geometries
+                    .iter()
+                    .map(|geometry| geometry.indptr.as_slice())
+                    .collect(),
                 tables,
                 windowed: self
                     .pools
@@ -1209,7 +1261,8 @@ impl Shell {
         )?;
         let boundaries = windows.packed();
 
-        let staged = crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
+        let staged =
+            crate::mask::stage(&masks).map_err(|fault| fault.of_rows(composition.lanes()))?;
 
         let patch_rows = composition.patch_rows() as usize;
         let mut patch_payload: Vec<u8> = Vec::new();
@@ -1331,7 +1384,10 @@ impl Shell {
         if rs_active {
             let tokens = self.arena.current_tokens();
             let rung = self.rung_replay(tokens).ok_or_else(|| {
-                Fault::program("serve::rs", "an rs fire on a load that lays no rs layout".to_string())
+                Fault::program(
+                    "serve::rs",
+                    "an rs fire on a load that lays no rs layout".to_string(),
+                )
             })?;
             // The fire's compactness by the one function the runtime also
             // evaluates on this fire (`engine::fire::scratch_compact`: the
@@ -1356,12 +1412,18 @@ impl Shell {
                 );
             }
             let held = engine::ReplayRows::of_lanes(
-                rs_plans.iter().zip(&rs_own).map(|(plan, &own)| (own, plan.replay)),
+                rs_plans
+                    .iter()
+                    .zip(&rs_own)
+                    .map(|(plan, &own)| (own, plan.replay)),
                 fire_compact,
             );
             if engine::fire::replay_check_on() {
                 engine::fire::replay_agrees(
-                    lanes.iter().zip(&rs_own).map(|(seated, &own)| (own, seated.replay_stated)),
+                    lanes
+                        .iter()
+                        .zip(&rs_own)
+                        .map(|(seated, &own)| (own, seated.replay_stated)),
                     &rung,
                     held,
                     fire_compact,
@@ -1412,8 +1474,11 @@ impl Shell {
         // resolved over its list by the head step, and its rs copies over
         // every rs plane, through its set's rs entries.
         if !beam_records.groups.is_empty()
-            && let (Some(_), Some(buffers), Some(layout)) =
-                (rs_pages.as_ref(), self.rs_buffers.as_ref(), self.rs_layout.as_ref())
+            && let (Some(_), Some(buffers), Some(layout)) = (
+                rs_pages.as_ref(),
+                self.rs_buffers.as_ref(),
+                self.rs_layout.as_ref(),
+            )
         {
             let inputs = &self.inputs[self.arena.current()][arm];
             let addresses = inputs.beam_addresses().ok_or_else(|| {
@@ -2258,8 +2323,13 @@ impl Shell {
             frame.next_pass()?;
             {
                 let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
-                kernels_metal::runtime::beam::beam_step(&sink, beam.groups, beam.group_count, beam.widest)
-                    .map_err(crate::error::kernel)?;
+                kernels_metal::runtime::beam::beam_step(
+                    &sink,
+                    beam.groups,
+                    beam.group_count,
+                    beam.widest,
+                )
+                .map_err(crate::error::kernel)?;
             }
             #[cfg(target_vendor = "apple")]
             frame.next_pass()?;
@@ -2303,11 +2373,7 @@ impl Shell {
                         .map(crate::ane::Ane::handoff),
                 )
                 .dry(dry)
-                .flushing_after(if dry {
-                    0
-                } else {
-                    HEAD_LAUNCHES
-                });
+                .flushing_after(if dry { 0 } else { HEAD_LAUNCHES });
             let mut run = Run::new(
                 &sink,
                 &self.handles,
@@ -2453,7 +2519,10 @@ impl Shell {
                     let parents = cell.address_at(at).ok_or_else(|| {
                         Fault::program(
                             "serve::prepare",
-                            format!("instance {}'s parents cell has no address", attached.instance),
+                            format!(
+                                "instance {}'s parents cell has no address",
+                                attached.instance
+                            ),
                         )
                     })?;
                     if carried as u32 != layout.lanes {
@@ -2587,8 +2656,7 @@ impl Shell {
                     "serve::prepare",
                     format!(
                         "a media row names lane {} of the {} this fire has",
-                        shot.lane,
-                        lanes_len
+                        shot.lane, lanes_len
                     ),
                 ));
             }
@@ -2657,7 +2725,11 @@ impl Shell {
     }
 
     /// Each lane's clip record, checked against the load's voxel seat.
-    fn clip_rows<'c>(&self, clips: &'c [Clips<'c>], lanes_len: usize) -> Result<Vec<Option<&'c Clips<'c>>>> {
+    fn clip_rows<'c>(
+        &self,
+        clips: &'c [Clips<'c>],
+        lanes_len: usize,
+    ) -> Result<Vec<Option<&'c Clips<'c>>>> {
         let mut clips_of: Vec<Option<&'c Clips<'c>>> = vec![None; lanes_len];
         for tile in clips {
             if self.voxel_seat.is_none() {
@@ -2675,8 +2747,7 @@ impl Shell {
                     at: "serve::prepare",
                     why: format!(
                         "a clip submission names lane {} of the {} this fire has",
-                        tile.lane,
-                        lanes_len
+                        tile.lane, lanes_len
                     ),
                 });
             }
@@ -3107,7 +3178,7 @@ impl Shell {
             }
             verb => verb.clone(),
         };
-    let plan = engine::rs::LanePlan::of(
+        let plan = engine::rs::LanePlan::of(
             &rs,
             row.rows,
             first,
@@ -3116,9 +3187,9 @@ impl Shell {
         )
         .map_err(|error| Fault::program("serve::rs", format!("lane {source}: {error}")))?;
         rs_one_run.push(match &rs {
-            engine::fire::RsVerb::Buffer { folded, lineage, .. } => {
-                engine::fire::lane_one_run(masking, *folded, first, *lineage)
-            }
+            engine::fire::RsVerb::Buffer {
+                folded, lineage, ..
+            } => engine::fire::lane_one_run(masking, *folded, first, *lineage),
             _ => true,
         });
         // A beam group's lanes share their set's state: what its lanes
@@ -3126,9 +3197,8 @@ impl Shell {
         // rows, before any reads it (the group fold). Each lane then replays only
         // the rows past it, from its page table row started past them,
         // and folds none itself.
-        let beam_group = group_of[source].filter(|_| {
-            matches!(rs, engine::fire::RsVerb::Buffer { .. })
-        });
+        let beam_group =
+            group_of[source].filter(|_| matches!(rs, engine::fire::RsVerb::Buffer { .. }));
         let mut plan = plan;
         let (skip, beam_fold_to) = match (beam_group, &rs) {
             (Some(group), engine::fire::RsVerb::Buffer { folded, .. }) => {
@@ -3177,9 +3247,9 @@ impl Shell {
                 engine::fire::RsVerb::Buffer { folded, fold, .. } => {
                     let fold = match fold {
                         engine::fire::FoldLen::Host(n) => Some(*n),
-                        engine::fire::FoldLen::Device => ports
-                            .as_ref()
-                            .and_then(engine::ports::LanePorts::fold),
+                        engine::fire::FoldLen::Device => {
+                            ports.as_ref().and_then(engine::ports::LanePorts::fold)
+                        }
                     };
                     // A beam lane folds nothing itself: its group's fold
                     // is the runtime's, applied to the set (the group fold).
@@ -3339,8 +3409,7 @@ impl Shell {
                     Some((slots, offsets)) => {
                         for (&page, &off) in slots.iter().zip(offsets) {
                             let page = self.pools.kv_page(page)?;
-                            writes
-                                .push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
+                            writes.push(Some((narrow(u64::from(page)), narrow(u64::from(off)))));
                         }
                     }
                     None => writes.extend(std::iter::repeat_n(None, rows_here)),
@@ -3371,7 +3440,11 @@ impl Shell {
         if !seated.kv_less {
             let reach = have.saturating_add(row.rows);
             let set = (seated.set, seated.readable);
-            match ports.as_ref().map(|ports| ports.slots(rows_here)).transpose()? {
+            match ports
+                .as_ref()
+                .map(|ports| ports.slots(rows_here))
+                .transpose()?
+            {
                 Some(Some(slots)) => extents.lane(
                     &self.written,
                     source,

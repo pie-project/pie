@@ -19,8 +19,8 @@ impl Exports {
         context: u32,
         page_size: u32,
     ) -> Result<Exports> {
-        let outputs =
-            poem_exec::feeds::class_outputs(trace, compiled, context, page_size).map_err(Fault::Recipe)?;
+        let outputs = poem_exec::feeds::class_outputs(trace, compiled, context, page_size)
+            .map_err(Fault::Recipe)?;
         if outputs.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
@@ -92,7 +92,9 @@ fn applies_mask(attn: &poem_ir::Attn) -> bool {
 /// word stating none: an attention of theirs applies the fire's masks.
 #[must_use]
 pub(crate) fn mask_reading_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
-    classes_running(trace, compiled, |op| mask_reader(op).is_some_and(applies_mask))
+    classes_running(trace, compiled, |op| {
+        mask_reader(op).is_some_and(applies_mask)
+    })
 }
 
 /// The classes a lane may state a mask on: some attention of theirs applies
@@ -101,8 +103,9 @@ pub(crate) fn mask_reading_classes(trace: &Trace, compiled: &CompiledModel) -> p
 #[must_use]
 pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     let reading = mask_reading_classes(trace, compiled);
-    let passing =
-        classes_running(trace, compiled, |op| mask_reader(op).is_some_and(|attn| !applies_mask(attn)));
+    let passing = classes_running(trace, compiled, |op| {
+        mask_reader(op).is_some_and(|attn| !applies_mask(attn))
+    });
     poem_ir::ClassSet::of(reading.iter().filter(|&class| !passing.contains(class)))
 }
 

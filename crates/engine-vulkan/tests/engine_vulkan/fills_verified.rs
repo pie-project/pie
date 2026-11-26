@@ -26,7 +26,10 @@ fn every_laid_or_derived_fill_is_the_fires_own_walks() {
     let armed = shell.shelf.verified();
     eprintln!("the arm walk verified {armed:?}");
     assert!(armed.laid > 0, "the arm walk held no laid fill to a walk");
-    assert!(armed.derived > 0, "the arm walk held no derived fill to a walk");
+    assert!(
+        armed.derived > 0,
+        "the arm walk held no derived fill to a walk"
+    );
     shell.serving = true;
     serve(&mut shell, &fixture.trace);
     let served = shell.shelf.verified();
@@ -35,5 +38,8 @@ fn every_laid_or_derived_fill_is_the_fires_own_walks() {
         served.laid > armed.laid,
         "no unwalked length's laid fill was held to a walk"
     );
-    assert_eq!(served.mismatched, 0, "a laid or derived fill is not its walk's");
+    assert_eq!(
+        served.mismatched, 0,
+        "a laid or derived fill is not its walk's"
+    );
 }

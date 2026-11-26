@@ -86,7 +86,8 @@ pub fn pieces(
         // The lane's own record: each fixed shape's pieces it writes.
         let mut own = Vec::with_capacity(records.len());
         for &shape in records {
-            let Some((_, run_cow)) = lane.record.pieces().iter().find(|(id, _)| *id == shape) else {
+            let Some((_, run_cow)) = lane.record.pieces().iter().find(|(id, _)| *id == shape)
+            else {
                 return Err(refuse(
                     at,
                     &format!("names no record of fixed shape {shape}"),

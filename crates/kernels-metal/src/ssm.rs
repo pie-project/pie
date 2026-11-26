@@ -1231,7 +1231,10 @@ pub fn carried_pipelines() -> [Fire; 10] {
     [
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_short_bfloat16_s_8_v_4"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prep_bfloat16"),
-        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prepped_bfloat16_s_8_v_4"),
+        Fire::at(
+            GDN_SCAN_FILE,
+            "gated_delta_carried_prepped_bfloat16_s_8_v_4",
+        ),
         Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16"),
         Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16"),
         Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
@@ -1321,7 +1324,9 @@ fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::Arg
             paged.page_tokens.arg(),
             paged.page_bytes.arg(),
             paged.row_bytes.arg(),
-            i32::try_from(paged.page_ints.max(1)).unwrap_or(i32::MAX).arg(),
+            i32::try_from(paged.page_ints.max(1))
+                .unwrap_or(i32::MAX)
+                .arg(),
         ],
         None => [
             ctx.absent()?,
@@ -1492,8 +1497,15 @@ fn gated_delta_verify_at(
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
-    let [key_slab, key_row_bytes, u_slab, u_row_bytes, is_corrected, scalar_slab, scalar_row_bytes] =
-        corrected_args(ctx, corrected)?;
+    let [
+        key_slab,
+        key_row_bytes,
+        u_slab,
+        u_row_bytes,
+        is_corrected,
+        scalar_slab,
+        scalar_row_bytes,
+    ] = corrected_args(ctx, corrected)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
@@ -1575,7 +1587,9 @@ pub fn gated_delta_carried(
     if !gated_delta_verify_fits(k_dim, v_dim) {
         return Err(refuse(
             OP,
-            format!("the carried step reads {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"),
+            format!(
+                "the carried step reads {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"
+            ),
         ));
     }
     // A short carry (a decode at its run-ahead lag) runs 16 value rows a
@@ -1610,7 +1624,8 @@ pub fn gated_delta_carried(
         let holds = u64::from(k_heads) * u64::from(table.rows) * 4 >= record;
         // The prepared form where the profile's `kernel.gdn.carried` picks it
         // at these lanes ([`crate::tuning::GdnCarried`]).
-        if holds && tuning.gdn_carried(lanes, table.max_rep) == crate::tuning::GdnCarried::Prepared {
+        if holds && tuning.gdn_carried(lanes, table.max_rep) == crate::tuning::GdnCarried::Prepared
+        {
             let args = |table_arg| -> Result<Vec<_>, Error> {
                 Ok(vec![
                     qkv.arg(),
@@ -1651,8 +1666,11 @@ pub fn gated_delta_carried(
                 &args(table.table.arg_mut())?,
             )?;
             ctx.fire(
-                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prepped_bfloat16_s_8_v_4")
-                    .apply(gated_delta_verify_grid(sg, vrows, z)),
+                Fire::at(
+                    GDN_SCAN_FILE,
+                    "gated_delta_carried_prepped_bfloat16_s_8_v_4",
+                )
+                .apply(gated_delta_verify_grid(sg, vrows, z)),
                 &args(table.table.arg_mut())?,
             )?;
             return ctx.fire(
@@ -1733,8 +1751,7 @@ pub fn gated_delta_carried(
         )?;
     }
     ctx.fire(
-        Fire::at(GDN_SCAN_FILE, name)
-            .apply(gated_delta_verify_grid(groups, vrows, z)),
+        Fire::at(GDN_SCAN_FILE, name).apply(gated_delta_verify_grid(groups, vrows, z)),
         &[
             qkv.arg(),
             indptr.arg(),
@@ -1880,7 +1897,11 @@ pub fn causal_conv1d_group_fold(
     ctx.fire(
         Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16").apply(Grid::of(
             [channels / 4, 1, 1],
-            [(channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS), 1, 1],
+            [
+                (channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS),
+                1,
+                1,
+            ],
         )),
         &[
             folds.table.arg(),
@@ -1991,7 +2012,9 @@ pub fn causal_conv1d_verify(
                 paged.page_tokens.arg(),
                 paged.page_bytes.arg(),
                 paged.row_bytes.arg(),
-                i32::try_from(paged.page_ints.max(1)).unwrap_or(i32::MAX).arg(),
+                i32::try_from(paged.page_ints.max(1))
+                    .unwrap_or(i32::MAX)
+                    .arg(),
                 state.segments.arg(),
                 committed.ext_replay.arg(),
             ],
@@ -2006,7 +2029,11 @@ pub fn causal_conv1d_verify(
     let grid = if own_only && hist <= CONV_VERIFY_HIST / CONV_VERIFY_ROWS {
         Grid::of(
             [channels / 4, 1, lanes],
-            [(channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS), 1, 1],
+            [
+                (channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS),
+                1,
+                1,
+            ],
         )
     } else {
         Grid::of(

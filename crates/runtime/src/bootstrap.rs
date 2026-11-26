@@ -268,17 +268,18 @@ fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
         });
     let budget = budgets
         .iter()
-        .map(|budget| eta_ir::validate::Budget {
-            submit,
-            ..*budget
-        })
+        .map(|budget| eta_ir::validate::Budget { submit, ..*budget })
         .min_by_key(|budget| budget.room_bytes)
         .ok_or_else(|| anyhow::anyhow!("a model served by no engine has no guest budget"))?;
     if budget.room_bytes == 0 {
         anyhow::bail!(
             "an engine of this model states no state room past what it holds back \
              ({} state chunks of {} bytes, {} held back); no guest program could bind",
-            engines.iter().map(|e| e.chunks.state_chunks()).min().unwrap_or(0),
+            engines
+                .iter()
+                .map(|e| e.chunks.state_chunks())
+                .min()
+                .unwrap_or(0),
             engines.first().map_or(0, |e| e.chunks.chunk_bytes),
             engines.first().map_or(0, |e| e.chunks.held_bytes),
         );
@@ -311,7 +312,6 @@ fn frames_in_flight(engines: &[EngineConfig]) -> Result<u32> {
     }
     Ok(first)
 }
-
 
 /// A disk tier kept across runs: where its journal is, and whether the
 /// engine found its slot files as the last run left them.
@@ -649,11 +649,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // no guest code keeps the default, which builds nothing.
     // Registered as a request's are: a per-row channel declared at the rows
     // one fire binds, `model.max-pass-rows()` (the first engine's).
-    let rows = engine_configs
-        .first()
-        .map_or(u32::MAX, |engine| {
-            u32::try_from(engine.limits.max_forward_tokens).unwrap_or(u32::MAX)
-        });
+    let rows = engine_configs.first().map_or(u32::MAX, |engine| {
+        u32::try_from(engine.limits.max_forward_tokens).unwrap_or(u32::MAX)
+    });
     for (at, engine) in engine_configs.iter_mut().enumerate() {
         let backend =
             crate::engine::verbs::codegen_backend(&engine.engine_backend).map(str::to_owned);
@@ -661,11 +659,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         let Some(programs) = engine.engine_backend.programs() else {
             continue;
         };
-        programs
-            .prewarm(&registrations)
-            .map_err(|error| {
-                anyhow::anyhow!("engine {at}: the standard samplers' guest code: {error}")
-            })?;
+        programs.prewarm(&registrations).map_err(|error| {
+            anyhow::anyhow!("engine {at}: the standard samplers' guest code: {error}")
+        })?;
     }
 
     let scales: Vec<crate::policy::pressure::Scale> = engine_configs
@@ -1015,7 +1011,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     }
     let builtins = match builtins_ready.await {
         Ok(prepared) => prepared,
-        Err(_) => Err(anyhow::anyhow!("preparing the built-in programs ended unanswered")),
+        Err(_) => Err(anyhow::anyhow!(
+            "preparing the built-in programs ended unanswered"
+        )),
     };
     if let Err(error) = builtins {
         scheduler_shutdown.shutdown().await.ok();
@@ -1111,9 +1109,9 @@ async fn host_cover(
         crate::scheduler::configured_frame_size().max(1),
         crate::scheduler::configured_dispatch_depth(),
     );
-    let name = key
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    let name = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
     let path = cache.dir.join("cover").join(format!("{name:016x}.json"));
     let read = std::fs::read_to_string(&path)
         .ok()
@@ -1135,7 +1133,11 @@ async fn host_cover(
             return Ok((cover, false));
         }
     }
-    if let Some(held) = cache.committed.iter().find_map(|text| committed_cover(text, &key)) {
+    if let Some(held) = cache
+        .committed
+        .iter()
+        .find_map(|text| committed_cover(text, &key))
+    {
         tracing::info!(
             cover = held.cover,
             frame_us = held.frame_us,

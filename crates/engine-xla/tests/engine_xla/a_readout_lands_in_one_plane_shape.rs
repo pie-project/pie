@@ -28,7 +28,11 @@ fn outstanding(frames: u32) -> (usize, Option<usize>) {
         let facts = shell.trace().facts.clone();
         let tokens = vec![3u32 + k as u32; 4];
         let word = facts.word(&Request::new(4, false));
-        let mut s = Seated::of(Lane { slot: 0, word, tokens: &tokens });
+        let mut s = Seated::of(Lane {
+            slot: 0,
+            word,
+            tokens: &tokens,
+        });
         s.pages = &pages[..1];
         s.held = Some(0);
         shell.open(0).expect("opens");
@@ -54,7 +58,11 @@ fn two_frames_of_four_fires_outstanding_fit_two_frames_in_flight() {
     // refused at its sixth fire: the depth is what holds them.
     let (narrow, refused) = outstanding(1);
     crate::common_llm::set_knob("FRAMES", 1);
-    assert_eq!(refused, Some(narrow), "a ring {narrow} deep refuses fire {narrow}");
+    assert_eq!(
+        refused,
+        Some(narrow),
+        "a ring {narrow} deep refuses fire {narrow}"
+    );
     eprintln!(
         "two frames of four fires outstanding: held at depth {depth}, refused at depth {narrow}"
     );
@@ -81,7 +89,11 @@ fn a_fire_reading_out_past_the_store_is_refused() {
         let tokens = vec![3u32; count as usize];
         let rows: Vec<u32> = (0..count).collect();
         let word = facts.word(&Request::new(count, false));
-        let mut s = Seated::of(Lane { slot: 0, word, tokens: &tokens });
+        let mut s = Seated::of(Lane {
+            slot: 0,
+            word,
+            tokens: &tokens,
+        });
         s.pages = &pages[..(count as usize).div_ceil(16)];
         s.held = Some(0);
         s.readout = Some(&rows);
@@ -94,5 +106,8 @@ fn a_fire_reading_out_past_the_store_is_refused() {
         refused.to_string().contains("serve::readout_plane"),
         "refused by name: {refused}"
     );
-    eprintln!("a store of {store} rows reads out {store}; {} refused: {refused}", store + 1);
+    eprintln!(
+        "a store of {store} rows reads out {store}; {} refused: {refused}",
+        store + 1
+    );
 }

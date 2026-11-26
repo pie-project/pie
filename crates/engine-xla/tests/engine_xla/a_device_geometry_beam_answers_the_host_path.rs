@@ -10,8 +10,8 @@
 use crate::common_dit;
 
 use common_dit::{Rig, Weights, assert_close, attach, attach_over};
-use engine::{Channels, Engine, Programs};
 use engine::fire::{Lane, Readout};
+use engine::{Channels, Engine, Programs};
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
@@ -459,7 +459,9 @@ fn device_fed_tokens_reach_the_next_fire() {
         rig.channel_of(vec![1, VOCAB], EtaDtype::F32, HostRole::Reader),
     ];
     let first = 11u32;
-    let instance = engine::Programs::bind(&mut rig.engine, &engine::program::InstanceBinding {
+    let instance = engine::Programs::bind(
+        &mut rig.engine,
+        &engine::program::InstanceBinding {
             program,
             channels,
             seeds: vec![engine::channel::ChannelSeed {
@@ -481,9 +483,10 @@ fn device_fed_tokens_reach_the_next_fire() {
                 ..engine::program::BindExtents::default()
             },
             pair_generation: 0,
-        })
-        .expect("the instance binds")
-        .id;
+        },
+    )
+    .expect("the instance binds")
+    .id;
 
     let argmax = |row: &[f32]| -> u32 {
         (0..row.len())
@@ -494,7 +497,13 @@ fn device_fed_tokens_reach_the_next_fire() {
     let mut wants = Vec::new();
     for step in 0..2u32 {
         let want = rig.fire(
-            vec![host_lane(kv, 1, vec![host_token], vec![shared, host_own], PAGE + step)],
+            vec![host_lane(
+                kv,
+                1,
+                vec![host_token],
+                vec![shared, host_own],
+                PAGE + step,
+            )],
             Vec::new(),
             Vec::new(),
         );
@@ -509,7 +518,13 @@ fn device_fed_tokens_reach_the_next_fire() {
         let _ = rig
             .engine
             .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
-                lanes: vec![host_lane(kv, 3, vec![0], vec![shared, device_own], PAGE + step)],
+                lanes: vec![host_lane(
+                    kv,
+                    3,
+                    vec![0],
+                    vec![shared, device_own],
+                    PAGE + step,
+                )],
                 attachments: vec![attach(0, instance)],
                 media: Vec::new(),
                 voxels: Vec::new(),

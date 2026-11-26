@@ -394,7 +394,10 @@ impl LaunchPackage {
                 .channels
                 .iter()
                 .any(|channel| channel.dtype == ChanDType::Concrete(Dtype::Bf16))
-            || self.ports.iter().any(|port| port.const_dtype == Dtype::Bf16)
+            || self
+                .ports
+                .iter()
+                .any(|port| port.const_dtype == Dtype::Bf16)
     }
 
     /// The refusal of an engine with no `bf16` guest dtype: `Err` naming it

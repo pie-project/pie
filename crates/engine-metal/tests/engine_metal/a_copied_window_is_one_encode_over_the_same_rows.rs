@@ -222,11 +222,16 @@ fn the_gathered_window_names_the_rows_the_split_ran_over() {
 
     let mut expected: Vec<i32> = Vec::new();
     for run in 0..split.runs(at) {
-        let span = split.at(at, run).expect("the fire cut this region into this run").span;
+        let span = split
+            .at(at, run)
+            .expect("the fire cut this region into this run")
+            .span;
         expected.extend((span.row_offset..span.row_offset + span.rows).map(|row| row as i32));
     }
 
-    let window = copy.at(at, 0).expect("the fire cut this region into this run");
+    let window = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run");
     let gathered = window
         .gathered
         .as_ref()
@@ -255,7 +260,9 @@ fn the_boundaries_are_rebased_over_the_union_and_not_over_one_run() {
         .find(|&at| copy.runs(at) == 1 && split.runs(at) > 1)
         .expect("some region is copied");
 
-    let window = copy.at(at, 0).expect("the fire cut this region into this run");
+    let window = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run");
     assert_eq!(
         window.indptr_host.first().copied(),
         Some(0),
@@ -290,7 +297,12 @@ fn the_ambient_row_tables_are_permuted_and_not_sliced() {
     let lanes = compiled.classes.classes.len();
     let (positions, request_of_token) = ambient(lanes);
 
-    let gathered = copy.at(at, 0).expect("the fire cut this region into this run").gathered.as_ref().expect("a row map");
+    let gathered = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run")
+        .gathered
+        .as_ref()
+        .expect("a row map");
     let want_positions: Vec<i32> = gathered
         .rows_host
         .iter()
@@ -337,7 +349,9 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
     let lanes = compiled.classes.classes.len();
     let fire = geometry(lanes);
 
-    let window = copy.at(at, 0).expect("the fire cut this region into this run");
+    let window = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run");
     let gathered = window.gathered.as_ref().expect("a row map");
     assert_eq!(
         gathered.page_tables.len(),
@@ -419,7 +433,10 @@ fn a_window_reading_what_no_copy_carries_splits_however_the_switch_is_set() {
             "a region the copy path declined takes the split it always took"
         );
         assert!(
-            copy.at(at, 0).expect("the fire cut this region into this run").gathered.is_none(),
+            copy.at(at, 0)
+                .expect("the fire cut this region into this run")
+                .gathered
+                .is_none(),
             "and its window carries no row map, which is what `Serve::copies` \
              reads"
         );
@@ -440,7 +457,10 @@ fn only_a_withdrawn_mask_is_ever_in_pieces() {
                 "region {at} was seated and gathered anyway"
             );
             assert!(
-                copy.at(at, 0).expect("the fire cut this region into this run").gathered.is_none(),
+                copy.at(at, 0)
+                    .expect("the fire cut this region into this run")
+                    .gathered
+                    .is_none(),
                 "region {at} was seated and carries a row map"
             );
             continue;
@@ -490,7 +510,9 @@ fn the_packed_blob_and_the_bind_walk_it_in_one_order() {
     let mut seen: Vec<usize> = Vec::new();
     for at in 0..compiled.template().len() as u32 {
         for run in 0..copy.runs(at) {
-            let window = copy.at(at, run).expect("the fire cut this region into this run");
+            let window = copy
+                .at(at, run)
+                .expect("the fire cut this region into this run");
             let here = window.indptr_host.as_ptr() as usize;
             if seen.contains(&here) {
                 continue;

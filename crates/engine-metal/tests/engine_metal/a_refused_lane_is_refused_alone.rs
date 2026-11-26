@@ -212,21 +212,36 @@ fn a_refused_lane_is_refused_alone() {
     let mut ticket = engine
         .submit(&frame)
         .expect("a lane refused past the first step stops the frame there");
-    assert_eq!(ticket.steps.len(), 1, "the steps before the refusing one fired");
     assert_eq!(
-        ticket.refused.iter().map(|fault| fault.lane).collect::<Vec<_>>(),
+        ticket.steps.len(),
+        1,
+        "the steps before the refusing one fired"
+    );
+    assert_eq!(
+        ticket
+            .refused
+            .iter()
+            .map(|fault| fault.lane)
+            .collect::<Vec<_>>(),
         vec![1]
     );
     engine.settle_frame(&mut ticket).expect("the frame settles");
     assert_eq!(
-        ticket.steps[0].readouts.iter().map(|r| r.rows).collect::<Vec<_>>(),
+        ticket.steps[0]
+            .readouts
+            .iter()
+            .map(|r| r.rows)
+            .collect::<Vec<_>>(),
         vec![1, 1],
         "the step before the refusing one read out both its lanes"
     );
 
     // The plain lanes fire on, the refused one gone.
     let mut ticket = engine
-        .submit(&FrameSubmission::of(step_of(&trace, &[(5, false), (11, false)])))
+        .submit(&FrameSubmission::of(step_of(
+            &trace,
+            &[(5, false), (11, false)],
+        )))
         .expect("the rest fires again");
     engine.settle_frame(&mut ticket).expect("the frame settles");
     assert!(ticket.refused.is_empty());

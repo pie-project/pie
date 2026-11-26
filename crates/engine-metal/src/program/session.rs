@@ -176,7 +176,11 @@ impl Session {
         let mut widest = 0;
         for (index, plan) in compiled.plans.iter().enumerate() {
             if launches(compiled, index) {
-                widest = widest.max(Prepared::scratch_for(plan, &compiled.stages[index].regions, extents)?);
+                widest = widest.max(Prepared::scratch_for(
+                    plan,
+                    &compiled.stages[index].regions,
+                    extents,
+                )?);
             }
         }
         Ok(widest)
@@ -229,7 +233,8 @@ impl Session {
         device: eta_ir::registry::PortMask,
         device_positions: bool,
     ) {
-        let fires_alone = (0..compiled.stages.len()).any(|index| plan.runs_at(index, Stage::Prologue));
+        let fires_alone =
+            (0..compiled.stages.len()).any(|index| plan.runs_at(index, Stage::Prologue));
         let other_ports = plan.package.ports.iter().any(|binding| {
             !binding.is_const
                 && binding.port != eta_ir::registry::Port::EmbedTokens
@@ -248,12 +253,9 @@ impl Session {
     /// head its staging cursors name (the one [`Self::envelope`] reads),
     /// one u32 a lane. `None` where the port is not read from a channel.
     pub fn token_cell(&self, plan: &ExecPlan) -> Result<Option<(Buffer, u64)>> {
-        let Some(binding) = plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == eta_ir::registry::Port::EmbedTokens && !binding.is_const)
-        else {
+        let Some(binding) = plan.package.ports.iter().find(|binding| {
+            binding.port == eta_ir::registry::Port::EmbedTokens && !binding.is_const
+        }) else {
             return Ok(None);
         };
         let channel = binding.channel as usize;
@@ -299,9 +301,15 @@ impl Session {
     /// where its program states no parents.
     pub fn read_beam(&self, at: u64, into: &mut [u8]) -> Result<()> {
         let held = self.beam.as_ref().ok_or_else(|| {
-            Fault::program("program::session", "an instance holding no beam state read as one")
+            Fault::program(
+                "program::session",
+                "an instance holding no beam state read as one",
+            )
         })?;
-        if at.checked_add(into.len() as u64).is_none_or(|end| end > held.bytes()) {
+        if at
+            .checked_add(into.len() as u64)
+            .is_none_or(|end| end > held.bytes())
+        {
             return Err(Fault::program(
                 "program::session",
                 format!(
@@ -338,11 +346,10 @@ impl Session {
     /// forward (as [`Self::token_cell`]'s tokens are). `None` where the
     /// program states no positions channel.
     pub fn positions_cell(&self, plan: &ExecPlan) -> Result<Option<(Buffer, u64)>> {
-        let Some(binding) = plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == eta_ir::registry::Port::Positions && !binding.is_const)
+        let Some(binding) =
+            plan.package.ports.iter().find(|binding| {
+                binding.port == eta_ir::registry::Port::Positions && !binding.is_const
+            })
         else {
             return Ok(None);
         };
@@ -359,11 +366,10 @@ impl Session {
     /// beam step on the device and never on the host. `None` where the
     /// program binds no parents channel.
     pub fn parents_cell(&self, plan: &ExecPlan) -> Result<Option<(Buffer, u64)>> {
-        let Some(binding) = plan
-            .package
-            .ports
-            .iter()
-            .find(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const)
+        let Some(binding) =
+            plan.package.ports.iter().find(|binding| {
+                binding.port == eta_ir::registry::Port::Parents && !binding.is_const
+            })
         else {
             return Ok(None);
         };
@@ -702,14 +708,20 @@ impl Session {
     /// `lane` ([`super::launch::Prepared::covers`]).
     #[must_use]
     pub fn covers(&self, name: &str, lane: u32) -> bool {
-        self.sets[0].iter().flatten().any(|prepared| prepared.covers(name, lane))
+        self.sets[0]
+            .iter()
+            .flatten()
+            .any(|prepared| prepared.covers(name, lane))
     }
 
     /// Why a stage of this instance reads rows past what its lanes' seats
     /// hold, if one does ([`super::launch::Prepared::rows_unbounded`]).
     #[must_use]
     pub fn rows_unbounded(&self) -> Option<String> {
-        self.sets[0].iter().flatten().find_map(super::launch::Prepared::rows_unbounded)
+        self.sets[0]
+            .iter()
+            .flatten()
+            .find_map(super::launch::Prepared::rows_unbounded)
     }
 
     pub fn refuse_unread(&self) -> Result<()> {
@@ -754,13 +766,15 @@ impl Session {
                     read |= set == 0 && prepared.reads_output(name, lane);
                     continue;
                 }
-                let here = prepared.bind_output(name, lane, base, offset, dtype, width, stride, rows_held)?;
+                let here = prepared
+                    .bind_output(name, lane, base, offset, dtype, width, stride, rows_held)?;
                 if set == 0 {
                     read |= here;
                 }
             }
         }
-        self.unread.retain(|(named, at)| !(named == name && *at == lane));
+        self.unread
+            .retain(|(named, at)| !(named == name && *at == lane));
         if !read && lane > 0 {
             self.unread.push((name.to_string(), lane));
         }
@@ -828,14 +842,20 @@ impl Session {
             if !plan.runs_at(index, at) {
                 continue;
             }
-            let Some(prepared) = self.sets[self.staging].get_mut(index).and_then(Option::as_mut) else {
+            let Some(prepared) = self.sets[self.staging]
+                .get_mut(index)
+                .and_then(Option::as_mut)
+            else {
                 continue;
             };
             prepared.refresh(&self.rings, &cursors)?;
             // Its own scratch (its state's first frame in flight): a
             // standalone fire drains every frame before it.
             prepared.seat_scratch(scratch.clone().ok_or_else(|| {
-                Fault::program("program::session", "an instance fires a stage and holds no scratch")
+                Fault::program(
+                    "program::session",
+                    "an instance fires a stage and holds no scratch",
+                )
             })?)?;
             for (at, region) in stage.regions.iter().enumerate() {
                 prepared.encode_region(frame, region, at == 0)?;
@@ -878,7 +898,10 @@ impl Session {
         }
         // The set the pass in flight before it does not read (with none in
         // flight, the first).
-        self.staging = self.airborne.back().map_or(0, |pass| (pass.set + 1) % self.sets.len());
+        self.staging = self
+            .airborne
+            .back()
+            .map_or(0, |pass| (pass.set + 1) % self.sets.len());
         let _ = ahead;
         let cursors = self.staging_cursors(plan);
         let mut launched = Vec::with_capacity(compiled.stages.len());
@@ -886,7 +909,10 @@ impl Session {
             if !plan.runs_at(index, Stage::Epilogue) {
                 continue;
             }
-            let Some(prepared) = self.sets[self.staging].get_mut(index).and_then(Option::as_mut) else {
+            let Some(prepared) = self.sets[self.staging]
+                .get_mut(index)
+                .and_then(Option::as_mut)
+            else {
                 continue;
             };
             if stage.regions.is_empty() {
@@ -911,7 +937,9 @@ impl Session {
     }
 
     pub fn prepared_mut(&mut self, stage: usize) -> Option<&mut Prepared> {
-        self.sets[self.staging].get_mut(stage).and_then(Option::as_mut)
+        self.sets[self.staging]
+            .get_mut(stage)
+            .and_then(Option::as_mut)
     }
 
     /// What the completion handler of the frame carrying this instance's
@@ -961,7 +989,9 @@ impl Session {
         }
         Some(EpilogueCheck {
             statuses,
-            commit: self.commit_plan_from(&cursors, plan, Stage::Epilogue).map(|_| ()),
+            commit: self
+                .commit_plan_from(&cursors, plan, Stage::Epilogue)
+                .map(|_| ()),
             before,
             told: newest.told.clone(),
         })
@@ -1050,7 +1080,13 @@ impl Session {
         })
     }
 
-    fn verdict(&mut self, plan: &ExecPlan, launched: &[usize], set: usize, at: Stage) -> Result<Fired> {
+    fn verdict(
+        &mut self,
+        plan: &ExecPlan,
+        launched: &[usize],
+        set: usize,
+        at: Stage,
+    ) -> Result<Fired> {
         let max_channel = u32::try_from(self.shapes.len().saturating_sub(1)).unwrap_or(u32::MAX);
 
         let mut verdict = Verdict::Committed;
@@ -1353,7 +1389,12 @@ pub struct EpilogueCheck {
     /// harvest told it, else as its own check reads it (its set is not
     /// staged again before that harvest). If it does not commit, this one
     /// does not either.
-    before: Option<Box<(std::sync::Arc<std::sync::OnceLock<Option<String>>>, EpilogueCheck)>>,
+    before: Option<
+        Box<(
+            std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+            EpilogueCheck,
+        )>,
+    >,
     /// Where its own verdict is told for the pass staged after it.
     told: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
 }

@@ -15,7 +15,9 @@ mod common;
 
 use common::Gpu;
 use engine::beam::{self, Fire, State};
-use kernels_rocm::runtime::channel::{self, BeamListRun, RsRows, BeamStepRun, RsLane, RsPlane, RsTables};
+use kernels_rocm::runtime::channel::{
+    self, BeamListRun, BeamStepRun, RsLane, RsPlane, RsRows, RsTables,
+};
 
 const PAGE: u32 = 16;
 const FRAMES: u32 = 2;
@@ -198,7 +200,10 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
         let common = (folded + common_len).min(slot + 1);
         assert_eq!(held[3], common, "{at}: the common slot");
         let free = 4 + 2 * (lanes * cap) as usize;
-        let device_free: Vec<bool> = held[free..free + cap as usize].iter().map(|&w| w != 0).collect();
+        let device_free: Vec<bool> = held[free..free + cap as usize]
+            .iter()
+            .map(|&w| w != 0)
+            .collect();
         assert_eq!(device_free, replay.free, "{at}: free pages");
         let pending = free + cap as usize;
         let device_pending: Vec<bool> = held[pending..pending + (FRAMES * cap) as usize]
@@ -208,8 +213,16 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
         assert_eq!(device_pending, replay.pending, "{at}: pending pages");
         let copies = pending + (FRAMES * cap) as usize;
         for b in 0..lanes as usize {
-            let copy = [held[copies + 3 * b], held[copies + 3 * b + 1], held[copies + 3 * b + 2]];
-            let wanted = if want.copies[b][2] == 0 { [0, 0, 0] } else { want.copies[b] };
+            let copy = [
+                held[copies + 3 * b],
+                held[copies + 3 * b + 1],
+                held[copies + 3 * b + 2],
+            ];
+            let wanted = if want.copies[b][2] == 0 {
+                [0, 0, 0]
+            } else {
+                want.copies[b]
+            };
             assert_eq!(copy, wanted, "{at}: beam {b}'s copy");
         }
         let faults: Vec<u32> = gpu.down(faults_at, lanes as usize);
@@ -220,7 +233,11 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             let list: Vec<i32> = want.lists[b].iter().map(|&q| device_id(q)).collect();
             let entries = &resolved[b * cap as usize..b * cap as usize + c as usize + 1];
             assert_eq!(entries, &list[..], "{at}: beam {b}'s resolved entries");
-            assert_eq!(writes[b], device_id(want.lists[b][c as usize]), "{at}: beam {b}'s write page");
+            assert_eq!(
+                writes[b],
+                device_id(want.lists[b][c as usize]),
+                "{at}: beam {b}'s write page"
+            );
         }
         // A hybrid's rows: each beam lands its row at this fire's
         // slot through the list the step pointed it at, on the set's row of
@@ -242,7 +259,10 @@ fn search_rs(gpu: &Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_token
             replay_spans: 0,
             page_tokens: rs_tokens,
         };
-        let plane = RsPlane { off: 0, stride: u64::from(RS_ROW) };
+        let plane = RsPlane {
+            off: 0,
+            stride: u64::from(RS_ROW),
+        };
         channel::rs_scatter(&ctx, gpu.up(&rows), RS_ROW, indptr_at, lanes, tables, plane)
             .expect("rs_scatter launches");
         gpu.sync();
@@ -281,7 +301,13 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
     const T: u32 = 2;
     const BASE: u32 = 38;
     let f0 = BASE / PAGE;
-    let planes = [PagePlane { offset: 0, cell: 8 }, PagePlane { offset: 16, cell: 12 }];
+    let planes = [
+        PagePlane { offset: 0, cell: 8 },
+        PagePlane {
+            offset: 16,
+            cell: 12,
+        },
+    ];
     let entry_bytes = 16 + 2 * 12;
     let entries: u32 = 64;
     let pattern: Vec<u8> = (0..entries as usize * entry_bytes)
@@ -289,7 +315,9 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
         .collect();
     for (src, dst, tokens) in [(1u32, 3u32, 5u32), (0, 2, 9)] {
         let mem = gpu.up(&pattern);
-        let bases: Vec<u64> = (0..u64::from(entries)).map(|e| mem + e * entry_bytes as u64).collect();
+        let bases: Vec<u64> = (0..u64::from(entries))
+            .map(|e| mem + e * entry_bytes as u64)
+            .collect();
         let bases_at = gpu.up(&bases);
         let planes_at = gpu.up(&planes);
         let copy_at = gpu.up(&[src, dst, tokens]);
@@ -317,7 +345,8 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
         assert_eq!(fault, [0], "copy {src} -> {dst} x {tokens}: no fault");
         let row = |slot: u32, plane: &PagePlane| -> std::ops::Range<usize> {
             let (e, r) = ((slot - BASE) / T, (slot - BASE) % T);
-            let at = e as usize * entry_bytes + plane.offset as usize + r as usize * plane.cell as usize;
+            let at =
+                e as usize * entry_bytes + plane.offset as usize + r as usize * plane.cell as usize;
             at..at + plane.cell as usize
         };
         let mut want = pattern.clone();
@@ -331,11 +360,16 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
                 want[row(to, plane)].copy_from_slice(&bytes);
             }
         }
-        assert_eq!(after, want, "copy {src} -> {dst} x {tokens}: rows moved, nothing else");
+        assert_eq!(
+            after, want,
+            "copy {src} -> {dst} x {tokens}: rows moved, nothing else"
+        );
     }
     // A copy past the pool faults and moves nothing.
     let mem = gpu.up(&pattern);
-    let bases: Vec<u64> = (0..u64::from(entries)).map(|e| mem + e * entry_bytes as u64).collect();
+    let bases: Vec<u64> = (0..u64::from(entries))
+        .map(|e| mem + e * entry_bytes as u64)
+        .collect();
     let run = RsCopyRun {
         copy: gpu.up(&[1u32, 9, 4]),
         bases: gpu.up(&bases),
@@ -356,5 +390,9 @@ fn a_fork_copies_its_rs_rows_slot_by_slot() {
     channel::copy_rs_rows(&ctx, run_at, gpu.up(&planes), 1, 2).expect("copy_rs_rows launches");
     gpu.sync();
     assert_eq!(gpu.down::<u32>(fault_at, 1), [channel::PAGES_COPY_BOUNDS]);
-    assert_eq!(gpu.down::<u8>(mem, pattern.len()), pattern, "a refused copy moves nothing");
+    assert_eq!(
+        gpu.down::<u8>(mem, pattern.len()),
+        pattern,
+        "a refused copy moves nothing"
+    );
 }

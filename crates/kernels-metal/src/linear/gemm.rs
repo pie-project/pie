@@ -202,7 +202,10 @@ pub fn act_x_wt(
     } else if rows == 1 {
         (VECTOR_ENTRY, vector_grid(op, rows, columns)?)
     } else if few_rows(tuning, rows, columns, contraction) && columns <= KSPLIT_MAX_COLUMNS {
-        (KSPLIT_ROWS_ENTRY[unrolled(rows)], ksplit_grid(op, 1, columns)?)
+        (
+            KSPLIT_ROWS_ENTRY[unrolled(rows)],
+            ksplit_grid(op, 1, columns)?,
+        )
     } else if few_rows(tuning, rows, columns, contraction) {
         (ROWS_ENTRY[unrolled(rows)], vector_grid(op, 1, columns)?)
     } else if let Some((bm, bn)) = mpp_fit(tuning, rows, columns, contraction) {
@@ -220,7 +223,13 @@ pub fn act_x_wt(
     };
     debug_assert_eq!(
         entry,
-        route(tuning, rows, columns, contraction, y.dtype == dtype::Dtype::F32),
+        route(
+            tuning,
+            rows,
+            columns,
+            contraction,
+            y.dtype == dtype::Dtype::F32
+        ),
         "the dispatch and its route part"
     );
     ctx.fire(

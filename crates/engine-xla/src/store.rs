@@ -84,7 +84,6 @@ fn state_dtype(declared: Dtype) -> Dtype {
 const NULL_CHUNK: u32 = 0;
 const RESERVED_CHUNKS: u32 = 2;
 
-
 /// A plane's affine map: page or slot id `p` is the plane's block
 /// `p · stride + offset` of its view.
 pub type Map = kernels_xla::tensor::PageMap;
@@ -512,7 +511,6 @@ pub fn slab_bytes(
     Ok((u64::from(rows) * ROW_BYTES).div_ceil(chunk) * chunk)
 }
 
-
 /// The layout `trace` lays at `paging`, its chunk near `target` bytes.
 pub fn layout_of(
     trace: &Trace,
@@ -795,7 +793,10 @@ impl Pools {
     /// The miss copy of streamed bank `param`: its buffer.
     #[must_use]
     pub fn host_bank(&self, param: u32) -> Option<&Buffer> {
-        self.host_banks.iter().find(|b| b.0 == param).and_then(|b| b.3.as_ref())
+        self.host_banks
+            .iter()
+            .find(|b| b.0 == param)
+            .and_then(|b| b.3.as_ref())
     }
 
     /// The miss copy of streamed bank `param`: its root and the pool rows an
@@ -1523,7 +1524,11 @@ impl Pools {
         for &(root, dtype, rows, width) in rings {
             let mut slots = Vec::with_capacity(depth);
             for _ in 0..depth.max(1) {
-                slots.push(device.zeros_or_dry(dtype, rows, width)?.map(std::sync::Arc::new));
+                slots.push(
+                    device
+                        .zeros_or_dry(dtype, rows, width)?
+                        .map(std::sync::Arc::new),
+                );
             }
             self.readouts.push(ReadoutRing {
                 root,
@@ -1725,9 +1730,12 @@ impl Pools {
     /// The pool row slot `slot` of shape `id` starts at.
     fn slot_row(&self, id: ShapeId, slot: u32) -> Result<i64> {
         if id == layout::CHANNEL {
-            return self.channel_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
-                what: format!("Channel slot {slot}, which lies past the pool"),
-            });
+            return self
+                .channel_row(slot)
+                .map(i64::from)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("Channel slot {slot}, which lies past the pool"),
+                });
         }
         if id == layout::INSTANCE {
             return self
@@ -1738,9 +1746,12 @@ impl Pools {
                 });
         }
         if id == layout::ADAPTER {
-            return self.adapter_row(slot).map(i64::from).ok_or_else(|| Fault::Unbound {
-                what: format!("Adapter slot {slot}, which lies past the pool"),
-            });
+            return self
+                .adapter_row(slot)
+                .map(i64::from)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("Adapter slot {slot}, which lies past the pool"),
+                });
         }
         self.rows_at(id, self.grain(id, slot)?)
     }
@@ -1774,7 +1785,13 @@ impl Pools {
 
     /// Zeros blocks of `rows` pool rows from each of `all`, a chunk's worth
     /// a program run ([`Pools::units`]).
-    fn zero_rows(&mut self, device: &Device, handles: &Handles, rows: u64, all: &[i64]) -> Result<()> {
+    fn zero_rows(
+        &mut self,
+        device: &Device,
+        handles: &Handles,
+        rows: u64,
+        all: &[i64],
+    ) -> Result<()> {
         let cap = self.units(rows);
         for chunk in all.chunks(cap) {
             let (inputs, list, count) = listed(handles, chunk, cap);
@@ -1894,10 +1911,7 @@ impl Pools {
                 .unwrap_or(spans.len());
             let cap = self.units(rows);
             for chunk in spans[at..end].chunks(cap) {
-                let flat: Vec<i64> = chunk
-                    .iter()
-                    .flat_map(|&(_, from, to)| [from, to])
-                    .collect();
+                let flat: Vec<i64> = chunk.iter().flat_map(|&(_, from, to)| [from, to]).collect();
                 let (inputs, list, count) = listed(handles, &flat, 2 * cap);
                 let tracer = Tracer::new(handles).with_stage(self.stage_at(inputs.rows()));
                 let root = self.root;
@@ -2254,7 +2268,11 @@ fn read_batch(rows: u64) -> usize {
 /// the inputs of a maintenance program, so its text names how many entries
 /// it can hold and not how many it moves, nor which: one program a size
 /// serves every count.
-fn listed(handles: &Handles, values: &[i64], cap: usize) -> (crate::inputs::Inputs, Tensor, Tensor) {
+fn listed(
+    handles: &Handles,
+    values: &[i64],
+    cap: usize,
+) -> (crate::inputs::Inputs, Tensor, Tensor) {
     let mut inputs = crate::inputs::Inputs::new();
     let (list, count) = list_into(&mut inputs, handles, values, cap);
     (inputs, list, count)
@@ -2283,7 +2301,11 @@ fn each(
     cx: &mut crate::emit::Cx<'_>,
     whole: kernels_xla::hlo::Val,
     count: kernels_xla::hlo::Val,
-    body: impl FnOnce(&mut kernels_xla::hlo::Func, kernels_xla::hlo::Val, kernels_xla::hlo::Val) -> kernels_xla::hlo::Built<kernels_xla::hlo::Val>,
+    body: impl FnOnce(
+        &mut kernels_xla::hlo::Func,
+        kernels_xla::hlo::Val,
+        kernels_xla::hlo::Val,
+    ) -> kernels_xla::hlo::Built<kernels_xla::hlo::Val>,
 ) -> std::result::Result<kernels_xla::hlo::Val, kernels_xla::Error> {
     let zero = cx.const_i(Elem::I32, 0, &[]);
     let out = cx.while_loop(

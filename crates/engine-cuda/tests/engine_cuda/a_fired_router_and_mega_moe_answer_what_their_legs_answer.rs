@@ -25,12 +25,12 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Knobs, Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{Fused, Linear, Operation, ParamSource, Trace};
-use crate::common::fnv;
 
 const CEILING: u32 = 256;
 /// Routed rows of bf16 planes: Qwen3-MoE's softmax router, GLM-4.5-Air's

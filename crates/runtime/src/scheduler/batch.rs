@@ -140,7 +140,9 @@ pub(crate) fn pads_to(request: &PendingRequest, shapes: Option<&::engine::StepSh
 /// The set a step is checked against under the contract check: the load's
 /// stated one; in a test building its limits by hand, the one the runtime's
 /// rules form over those limits, every rung one fire wide, buffering.
-fn checked_shapes(limits: &SchedulerLimits) -> Option<std::borrow::Cow<'static, ::engine::StepShapes>> {
+fn checked_shapes(
+    limits: &SchedulerLimits,
+) -> Option<std::borrow::Cow<'static, ::engine::StepShapes>> {
     if let Some(shapes) = limits.shapes {
         return Some(std::borrow::Cow::Borrowed(shapes));
     }
@@ -208,7 +210,9 @@ pub(crate) fn restated_shape(
     lanes: &[::engine::Lane],
 ) -> Result<Option<::engine::FireShape>, ::engine::StepGap> {
     shapes.map_or(Ok(None), |shapes| {
-        shapes.fire_shape(&::engine::StepComposition::of(lanes)).map(Some)
+        shapes
+            .fire_shape(&::engine::StepComposition::of(lanes))
+            .map(Some)
     })
 }
 
@@ -473,24 +477,18 @@ pub(crate) fn build_batch_request(
             // Each lane moves into the step; its page ids stay with the
             // request, which a fire refused for placement goes again by
             // once its lanes come back from the step (`restore_lanes`).
-            lanes.extend(
-                req.request
-                    .lanes
-                    .iter_mut()
-                    .map(|fire_lane| {
-                        let mut lane = std::mem::take(&mut fire_lane.lane);
-                        lane.fires_after = fires_after;
-                        lane.group = lane.group.map(|id| {
-                            let local =
-                                own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
-                                    own.push(id);
-                                    own.len() - 1
-                                });
-                            groups + u32::try_from(local).unwrap_or(u32::MAX)
-                        });
-                        lane
-                    }),
-            );
+            lanes.extend(req.request.lanes.iter_mut().map(|fire_lane| {
+                let mut lane = std::mem::take(&mut fire_lane.lane);
+                lane.fires_after = fires_after;
+                lane.group = lane.group.map(|id| {
+                    let local = own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
+                        own.push(id);
+                        own.len() - 1
+                    });
+                    groups + u32::try_from(local).unwrap_or(u32::MAX)
+                });
+                lane
+            }));
             groups = groups.saturating_add(u32::try_from(own.len()).unwrap_or(u32::MAX));
             member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
             media.extend(
@@ -529,7 +527,10 @@ pub(crate) fn build_batch_request(
 /// media and voxels, found by its own completion. Says, per request,
 /// whether it came back: a fire a refused lane took out of the frame
 /// (failed alone) is in no step, and goes nowhere again.
-pub(crate) fn restore_lanes(requests: &mut [Box<PendingRequest>], steps: Vec<StepFire>) -> Vec<bool> {
+pub(crate) fn restore_lanes(
+    requests: &mut [Box<PendingRequest>],
+    steps: Vec<StepFire>,
+) -> Vec<bool> {
     let mut restored = vec![false; requests.len()];
     for step in steps {
         let ::engine::Step {
@@ -829,7 +830,11 @@ mod tests {
     #[test]
     fn a_step_takes_no_more_replay_than_its_rung_s_scratch_holds() {
         let rung = qwen3_5_rung_256();
-        assert_eq!(rung.scratch.bytes(6080, 160), 443_658_240, "Mac's 160-lane fire");
+        assert_eq!(
+            rung.scratch.bytes(6080, 160),
+            443_658_240,
+            "Mac's 160-lane fire"
+        );
         let fire = |instance: u64| {
             let mut request = FireRequest {
                 lanes: (0..10)
@@ -850,7 +855,10 @@ mod tests {
             ..limits()
         };
         let (frame, _) = build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
-        assert!(frame.steps.len() > 1, "one step would pass the rung's scratch");
+        assert!(
+            frame.steps.len() > 1,
+            "one step would pass the rung's scratch"
+        );
         for step in &frame.steps {
             let lanes = u32::try_from(step.submission.lanes.len()).unwrap();
             let rows = lanes + lanes * 37;
@@ -860,7 +868,11 @@ mod tests {
                 rung.scratch.bytes(rows, lanes)
             );
         }
-        let lanes: usize = frame.steps.iter().map(|step| step.submission.lanes.len()).sum();
+        let lanes: usize = frame
+            .steps
+            .iter()
+            .map(|step| step.submission.lanes.len())
+            .sum();
         assert_eq!(lanes, 160, "every lane served");
     }
 
@@ -1154,7 +1166,10 @@ mod tests {
     /// The set the runtime's rules form over `limits` at `rungs`, as a load
     /// states it.
     fn stated(limits: SchedulerLimits, rungs: &[u32], buffers: bool) -> ::engine::StepShapes {
-        ::engine::StepShapes::of(&::engine::StepRules::runtime(), &facts(limits, rungs, buffers))
+        ::engine::StepShapes::of(
+            &::engine::StepRules::runtime(),
+            &facts(limits, rungs, buffers),
+        )
     }
 
     /// The facts a load of `rungs` under `limits` states.
@@ -1259,14 +1274,24 @@ mod tests {
                     }
                     let (frame, flattened) =
                         build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
-                    assert_eq!(flattened.len(), frame.steps.iter().map(|s| s.fire_stamps.len()).sum::<usize>());
+                    assert_eq!(
+                        flattened.len(),
+                        frame
+                            .steps
+                            .iter()
+                            .map(|s| s.fire_stamps.len())
+                            .sum::<usize>()
+                    );
                     let served: usize = frame.steps.iter().map(|s| s.submission.lanes.len()).sum();
                     assert_eq!(served, lanes, "every lane is served");
                     for step in compositions(&frame) {
                         shapes.holds(&step).unwrap_or_else(|gap| panic!("{gap}"));
                     }
                     for step in &frame.steps {
-                        let shape = step.submission.shape.expect("a formed step carries its shape");
+                        let shape = step
+                            .submission
+                            .shape
+                            .expect("a formed step carries its shape");
                         shapes
                             .agrees(shape, &step.submission.lanes)
                             .unwrap_or_else(|why| panic!("{why}"));
@@ -1298,7 +1323,10 @@ mod tests {
         let base = limits();
         let limits = holding(base, stated(base, &[64], false));
         let admission = AdmissionLimits::new(limits, 16);
-        assert_eq!(admission.single_request_limit_error(&pending(decode(1, 1), InstanceId(1))), None);
+        assert_eq!(
+            admission.single_request_limit_error(&pending(decode(1, 1), InstanceId(1))),
+            None
+        );
         let refused = admission
             .single_request_limit_error(&buffered_decode(7))
             .expect("a buffered step the load never stated is refused");
@@ -1330,7 +1358,12 @@ mod tests {
             let limits = holding(base, shapes.clone());
             let admission = AdmissionLimits::new(limits, 16);
             let rows = 21_250u32;
-            let mut lane = crate::engine::fire::lane_of(0, (0..rows).map(|t| t + 100).collect(), 0, Vec::new());
+            let mut lane = crate::engine::fire::lane_of(
+                0,
+                (0..rows).map(|t| t + 100).collect(),
+                0,
+                Vec::new(),
+            );
             lane.pages = (0..rows.div_ceil(16)).collect();
             lane.readout = ::engine::Readout::Last;
             let mut full = FireRequest::one(lane);
@@ -1361,8 +1394,15 @@ mod tests {
                 assert_eq!(flattened.len(), 4, "no member is dropped");
                 for step in &frame.steps {
                     let composition = ::engine::StepComposition::of(&step.submission.lanes);
-                    shapes.holds(&composition).unwrap_or_else(|gap| panic!("piece {at}: {gap}"));
-                    for lane in step.submission.lanes.iter().filter(|lane| lane.tokens.len() > 1 || lane.tokens.first() != Some(&1)) {
+                    shapes
+                        .holds(&composition)
+                        .unwrap_or_else(|gap| panic!("piece {at}: {gap}"));
+                    for lane in step
+                        .submission
+                        .lanes
+                        .iter()
+                        .filter(|lane| lane.tokens.len() > 1 || lane.tokens.first() != Some(&1))
+                    {
                         served += lane.rows();
                         read += match &lane.readout {
                             ::engine::Readout::Last => 1,
@@ -1395,7 +1435,8 @@ mod tests {
             .single_request_limit_error(&pending(FireRequest::one(lane), InstanceId(9)))
             .expect("40 readout rows past 16 a fire");
         assert!(
-            refused.contains("instance 9") && refused.contains("readout rows 40 (the shape's 0-16)"),
+            refused.contains("instance 9")
+                && refused.contains("readout rows 40 (the shape's 0-16)"),
             "{refused}"
         );
     }

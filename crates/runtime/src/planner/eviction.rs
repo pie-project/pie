@@ -9,9 +9,9 @@ use super::error::StarveCause;
 use super::grant::AllocationGrant;
 use super::holdings::suspendable_rs_units;
 use super::plan::ServeOutcome;
+use super::pool::RunNeed;
 use super::proc::Residency;
 use super::rank::Rank;
-use super::pool::RunNeed;
 use super::reclaim::Reclaim;
 use super::victim::{Victim, VictimSet};
 use super::wait::{EntryKey, WaitKind};
@@ -323,7 +323,8 @@ impl ResidencyPlanner {
         }
         match moved {
             Ok(pages) => {
-                self.list_compaction_failed.store(u64::MAX, Ordering::Release);
+                self.list_compaction_failed
+                    .store(u64::MAX, Ordering::Release);
                 tracing::debug!(pages, "planner: a list compaction landed");
             }
             Err(why) => {
@@ -377,7 +378,12 @@ impl ResidencyPlanner {
             // a restore head with a plan (an eviction, or the compaction
             // after it) issuing nothing on a disk full of parked kv.
             if kv_own > 0 && (!self.port.suspend_capable() || swap_free == 0) {
-                self.plan_ended(victims.head, "no room below for the head's own kv", host_short, &[]);
+                self.plan_ended(
+                    victims.head,
+                    "no room below for the head's own kv",
+                    host_short,
+                    &[],
+                );
                 self.swap_bound.store(true, Ordering::Release);
                 self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
                 self.check_starvation(StarveCause::NoSwapRoom);
@@ -438,7 +444,9 @@ impl ResidencyPlanner {
         // progress, and the pass plans as any other.
         let forced = self.force_moves.swap(false, Ordering::AcqRel)
             && self.with_inner(|inner| inner.nothing_in_flight());
-        let mismatch = placement.as_ref().is_some_and(super::pool::RestorePlacement::stands)
+        let mismatch = placement
+            .as_ref()
+            .is_some_and(super::pool::RestorePlacement::stands)
             && self.no_more_room_than_refused(victims.head_pid);
         // Said only where the placement was read and stands: a refusal in
         // the same room read with no placement (a send held until more
@@ -495,9 +503,11 @@ impl ResidencyPlanner {
                  (a placement disagreement: its snapshot)"
             );
         }
-        if let (true, true, Some(head)) =
-            (forced || mismatch, victims.restore, self.head_room(victims.head))
-        {
+        if let (true, true, Some(head)) = (
+            forced || mismatch,
+            victims.restore,
+            self.head_room(victims.head),
+        ) {
             shape = Some(head);
         }
         // The whole chunks its placement lacks, read before a forced pass
@@ -575,7 +585,12 @@ impl ResidencyPlanner {
                     .saturating_sub(self.port.free_chunks())
             });
             if wanted > 0 && self.compact_lists(victims.head_pid, wanted) {
-                self.plan_ended(victims.head, "a list compaction frees whole chunks", host_short, &[]);
+                self.plan_ended(
+                    victims.head,
+                    "a list compaction frees whole chunks",
+                    host_short,
+                    &[],
+                );
                 self.note_short(victims.head, 0, 0);
                 return;
             }
@@ -589,9 +604,11 @@ impl ResidencyPlanner {
         // Only with nothing in flight: an eviction on its way (its victim
         // no candidate now, the map empty of it) forms the runs as it lands,
         // and a compaction asked meanwhile waited on what it would make.
-        if let (Some((run, pieces)), Some(need), Some(map)) =
-            (shape.as_ref().and_then(RunNeed::longest), shape.as_ref(), map.as_ref())
-            && map.cheapest_need(need).is_none()
+        if let (Some((run, pieces)), Some(need), Some(map)) = (
+            shape.as_ref().and_then(RunNeed::longest),
+            shape.as_ref(),
+            map.as_ref(),
+        ) && map.cheapest_need(need).is_none()
             && self.with_inner(|inner| inner.nothing_in_flight())
             && self.port.compaction_comes(
                 run,
@@ -691,7 +708,12 @@ impl ResidencyPlanner {
             self.record_host_swap_exhaustion();
         }
         if picks.is_empty() && parking_down {
-            self.plan_ended(victims.head, "parked state moves down", host_short, &unhostable);
+            self.plan_ended(
+                victims.head,
+                "parked state moves down",
+                host_short,
+                &unhostable,
+            );
             // The parked state's move funds it: nothing for the policy yet.
             self.note_short(victims.head, 0, 0);
             return;
@@ -705,7 +727,9 @@ impl ResidencyPlanner {
         // So too where the map stands the head with no move and its store
         // refuses it: the two disagree, nothing moves, the takes decide.
         let map_stands_store_refuses = victims.restore
-            && placement.as_ref().is_some_and(|placement| !placement.stands())
+            && placement
+                .as_ref()
+                .is_some_and(|placement| !placement.stands())
             && matches!(
                 (shape.as_ref(), map.as_ref()),
                 (Some(need), Some(map)) if map.cheapest_need(need).is_some_and(|moves| moves.is_empty())
@@ -902,7 +926,9 @@ impl ResidencyPlanner {
                         .held
                         .iter()
                         .filter(|held| held.by.iter().any(|(pid, _)| named.contains(pid)))
-                        .map(|held| format!("chunk {} used {} by {:?}", held.chunk, held.used, held.by))
+                        .map(|held| {
+                            format!("chunk {} used {} by {:?}", held.chunk, held.used, held.by)
+                        })
                         .collect();
                     tracing::warn!(
                         head = %victims.head_pid,
@@ -974,7 +1000,12 @@ impl ResidencyPlanner {
             // Every pick declined at its start: the head is short as with
             // none, and says so, rather than waiting on moves never begun.
             tracing::debug!(head = ?victims.head_pid, "planner: no pick could start its move");
-            self.plan_ended(victims.head, "no pick could start its move", host_short, &unhostable);
+            self.plan_ended(
+                victims.head,
+                "no pick could start its move",
+                host_short,
+                &unhostable,
+            );
             self.note_short(victims.head, deficit, if host_short { deficit } else { 0 });
         }
     }
@@ -1023,7 +1054,13 @@ impl ResidencyPlanner {
 
     /// Records where the eviction plan for `head` stopped, for the stall
     /// dump ([`super::victim::PlanEnd`]).
-    pub(super) fn plan_ended(&self, head: EntryKey, ended: &'static str, host_short: bool, unhostable: &[ProcessId]) {
+    pub(super) fn plan_ended(
+        &self,
+        head: EntryKey,
+        ended: &'static str,
+        host_short: bool,
+        unhostable: &[ProcessId],
+    ) {
         // A head waits for room only while something in flight or moving
         // gives room back (a fire, a copy, a restore landing): a wait so
         // chosen with nothing in flight is a planner bug, said as one.
@@ -1059,7 +1096,11 @@ impl ResidencyPlanner {
                 host_short,
                 unhostable: unhostable.to_vec(),
             };
-            if let Some(pid) = inner.queue.get(&inner.locate(head).unwrap_or(head)).map(|waiter| waiter.pid) {
+            if let Some(pid) = inner
+                .queue
+                .get(&inner.locate(head).unwrap_or(head))
+                .map(|waiter| waiter.pid)
+            {
                 // Only the queued keep an end: one gone leaves none behind.
                 let queued: std::collections::HashSet<ProcessId> =
                     inner.queue.values().map(|waiter| waiter.pid).collect();
@@ -1300,7 +1341,9 @@ impl ResidencyPlanner {
             let queued: HashSet<ProcessId> = inner
                 .queue
                 .values()
-                .filter(|waiter| waiter.is_unmet() && !matches!(waiter.kind, WaitKind::Restore { .. }))
+                .filter(|waiter| {
+                    waiter.is_unmet() && !matches!(waiter.kind, WaitKind::Restore { .. })
+                })
                 .map(|waiter| waiter.pid)
                 .collect();
             for (pid, expected) in picks {
@@ -1316,8 +1359,7 @@ impl ResidencyPlanner {
                 let waits = queued.contains(&pid);
                 // Not in a fire in flight, it runs nothing now: it yields as
                 // the victim set chose it (the one rule there).
-                let yields =
-                    proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
+                let yields = proc.idle || proc.held || proc.bind_waiting || quiet || !proc.firing();
                 if proc.state != Residency::Resident
                     || inner.bind_served(pid)
                     || inner.evicted_for_by(head_pid, pid)
@@ -1705,7 +1747,11 @@ mod chunk_picks_tests {
     #[test]
     fn a_bind_short_of_a_chunk_evicts_the_occupants_of_the_cheapest_emptiable_one() {
         let map = ChunkMap {
-            held: vec![held(1, 5, &[(1, 5)]), held(2, 4, &[(2, 2)]), held(3, 3, &[(3, 3)])],
+            held: vec![
+                held(1, 5, &[(1, 5)]),
+                held(2, 4, &[(2, 2)]),
+                held(3, 3, &[(3, 3)]),
+            ],
             free: vec![],
             headroom: None,
             segment_chunks: 0,
@@ -1737,9 +1783,16 @@ mod chunk_picks_tests {
             segment_chunks: 0,
         };
         assert_eq!(standing.cheapest_runs(4, 1), Some(vec![]), "a run stands");
-        let (kept, _, occupants) =
-            chunk_picks(candidates.clone(), deficit, Some(&RunNeed::one(4, 1)), Some(&standing));
-        assert!(kept.is_empty() && occupants.is_empty(), "a free run: no one moved");
+        let (kept, _, occupants) = chunk_picks(
+            candidates.clone(),
+            deficit,
+            Some(&RunNeed::one(4, 1)),
+            Some(&standing),
+        );
+        assert!(
+            kept.is_empty() && occupants.is_empty(),
+            "a free run: no one moved"
+        );
         // No candidate's chunk lies where a run could form: none moved.
         let scattered = ChunkMap {
             held: vec![held(1, 3, &[(1, 1)]), held(3, 3, &[(2, 1)])],
@@ -1747,12 +1800,24 @@ mod chunk_picks_tests {
             headroom: Some(64),
             segment_chunks: 0,
         };
-        assert_eq!(scattered.cheapest_runs(3, 1), None, "their chunks do not empty");
-        let (kept, _, _) = chunk_picks(candidates, deficit, Some(&RunNeed::one(3, 1)), Some(&scattered));
+        assert_eq!(
+            scattered.cheapest_runs(3, 1),
+            None,
+            "their chunks do not empty"
+        );
+        let (kept, _, _) = chunk_picks(
+            candidates,
+            deficit,
+            Some(&RunNeed::one(3, 1)),
+            Some(&scattered),
+        );
         assert!(kept.is_empty(), "evicting them makes no run: none moved");
-        assert!(scattered.explain(3).contains("stuck=2"), "{}", scattered.explain(3));
+        assert!(
+            scattered.explain(3).contains("stuck=2"),
+            "{}",
+            scattered.explain(3)
+        );
     }
-
 }
 
 #[cfg(test)]
@@ -1781,7 +1846,11 @@ mod order_tests {
             segment_chunks: 0,
         };
         let need = RunNeed::one(1, 1);
-        assert_eq!(map.cheapest_need(&need), Some(vec![pid(1)]), "no priorities: the cheapest");
+        assert_eq!(
+            map.cheapest_need(&need),
+            Some(vec![pid(1)]),
+            "no priorities: the cheapest"
+        );
         let priority = |p: ProcessId| if p == pid(1) { (5, 0) } else { (0, 0) };
         assert_eq!(
             map.cheapest_need_by(&need, &priority),
@@ -1789,7 +1858,9 @@ mod order_tests {
             "the low-priority occupant moves, though its chunk holds more"
         );
         // Both chunks wanted: whatever their priority, both move.
-        let mut both = map.cheapest_need_by(&RunNeed::one(1, 2), &priority).unwrap();
+        let mut both = map
+            .cheapest_need_by(&RunNeed::one(1, 2), &priority)
+            .unwrap();
         both.sort_unstable();
         assert_eq!(both, vec![pid(1), pid(2)]);
     }

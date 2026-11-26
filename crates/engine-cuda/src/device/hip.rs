@@ -712,7 +712,12 @@ pub mod dr {
         // the same arguments with the same contract, which the caller of this
         // fn upholds.
         CUresult::of(unsafe {
-            hip::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(blocks, function, block, shared_bytes)
+            hip::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                blocks,
+                function,
+                block,
+                shared_bytes,
+            )
         })
     }
     pub unsafe fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult {

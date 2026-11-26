@@ -76,15 +76,15 @@ use super::shared::programs::FireKey;
 use super::shared::{FixedShape, RoleShapes, Shared};
 use super::slots::SlotError;
 
-mod tiers;
-mod census;
-mod room;
 mod bind;
-mod park;
 mod budget;
-mod txn;
-mod rebind;
 mod calls;
+mod census;
+mod park;
+mod rebind;
+mod room;
+mod tiers;
+mod txn;
 pub use calls::*;
 
 /// Whose slots an item is: an instance's tables (and the rings it holds
@@ -112,7 +112,13 @@ impl Owner {
                 (
                     3,
                     u128::from(key.program.0),
-                    [at.row_count, at.token_count, at.sampled_rows, at.query_len, at.key_len],
+                    [
+                        at.row_count,
+                        at.token_count,
+                        at.sampled_rows,
+                        at.query_len,
+                        at.key_len,
+                    ],
                 )
             }
         }
@@ -255,9 +261,7 @@ pub enum RolesError {
 pub fn waits_for_room(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<RolesError>(),
-        Some(
-            RolesError::BindShort(_) | RolesError::GuestGrow { .. }
-        )
+        Some(RolesError::BindShort(_) | RolesError::GuestGrow { .. })
     )
 }
 
@@ -694,7 +698,11 @@ impl Item {
     /// teardown.
     fn takes_fresh(&self) -> bool {
         self.tier == Tier::Device
-            && (self.shed || self.parts.iter().any(|part| part.dead() && part.refs.is_empty()))
+            && (self.shed
+                || self
+                    .parts
+                    .iter()
+                    .any(|part| part.dead() && part.refs.is_empty()))
     }
 
     fn refs(&self) -> Vec<u32> {

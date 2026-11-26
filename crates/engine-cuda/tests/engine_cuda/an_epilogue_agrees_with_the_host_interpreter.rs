@@ -836,24 +836,51 @@ fn split_candidates(rows: u32, vocab: u32) -> TraceContainer {
             shape: row,
             dtype: Dtype::F32,
         },
-        Op::Reshape { value: 1, shape: Shape::vector(rows * vocab) },
-        Op::Reshape { value: 2, shape: row },
+        Op::Reshape {
+            value: 1,
+            shape: Shape::vector(rows * vocab),
+        },
+        Op::Reshape {
+            value: 2,
+            shape: row,
+        },
         Op::ReduceMax(0),
-        Op::Broadcast { value: 4, shape: Shape::vector(1) },
+        Op::Broadcast {
+            value: 4,
+            shape: Shape::vector(1),
+        },
         Op::Sub(0, 5),
-        Op::Broadcast { value: 6, shape: row },
+        Op::Broadcast {
+            value: 6,
+            shape: row,
+        },
         Op::ReduceMax(3),
-        Op::Reshape { value: 8, shape: column },
-        Op::Broadcast { value: 9, shape: row },
+        Op::Reshape {
+            value: 8,
+            shape: column,
+        },
+        Op::Broadcast {
+            value: 9,
+            shape: row,
+        },
         Op::Sub(3, 10),
         Op::Exp(11),
         Op::ReduceSum(12),
         Op::Log(13),
-        Op::Reshape { value: 14, shape: column },
-        Op::Broadcast { value: 15, shape: row },
+        Op::Reshape {
+            value: 14,
+            shape: column,
+        },
+        Op::Broadcast {
+            value: 15,
+            shape: row,
+        },
         Op::Sub(11, 16),
         Op::Add(7, 17),
-        Op::Reshape { value: 18, shape: Shape::vector(rows * vocab) },
+        Op::Reshape {
+            value: 18,
+            shape: Shape::vector(rows * vocab),
+        },
         Op::TopK { input: 19, k: 1 },
         Op::ChanPut { chan: 1, value: 20 },
         Op::ChanPut { chan: 2, value: 19 },
@@ -889,8 +916,8 @@ fn a_split_row_writes_every_cell_of_its_row() {
     }
     for (rows, vocab) in [(1, SPLIT_VOCAB), (2, 70_001), (4, 70_001), (16, 70_001)] {
         let what = format!("{rows} row(s) of {vocab}");
-        let bound =
-            crate::bound::logits(split_candidates(rows, vocab), vocab).expect("the candidates bind");
+        let bound = crate::bound::logits(split_candidates(rows, vocab), vocab)
+            .expect("the candidates bind");
         let stages = compile_bound(&bound);
         let package = eta_compiler::codegen::launch::build(&bound, &stages);
         let plan = package.plans.first().expect("one plan");
@@ -924,6 +951,11 @@ fn a_split_row_writes_every_cell_of_its_row() {
             unwritten.len(),
             unwritten.first()
         );
-        close(&got, &want, 1e-5, &format!("{what}: the split rows' candidates"));
+        close(
+            &got,
+            &want,
+            1e-5,
+            &format!("{what}: the split rows' candidates"),
+        );
     }
 }

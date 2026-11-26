@@ -120,7 +120,10 @@ fn near(got: &[f32], want: &[f32], tol: f32, what: &str) {
         .iter()
         .zip(want)
         .fold(0f32, |m, (g, w)| m.max((g - w).abs()));
-    assert!(off <= tol * scale.max(1e-6), "{what}: off by {off} of {scale}");
+    assert!(
+        off <= tol * scale.max(1e-6),
+        "{what}: off by {off} of {scale}"
+    );
 }
 
 /// KDA: twelve decodes of one lane, each carrying every row before it
@@ -148,7 +151,12 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
     let row = |base: u64, j: usize, width: usize, elem: usize| base + (j * width * elem) as u64;
     let dt_t = Tensor::new(dt_bias, 1, wide as u32, Dtype::F32);
     // Planes: forget, beta, keys, corrected values.
-    let planes = [wide as u64 * 2, u64::from(H) * 2, wide as u64 * 2, wide as u64 * 4];
+    let planes = [
+        wide as u64 * 2,
+        u64::from(H) * 2,
+        wide as u64 * 2,
+        wide as u64 * 4,
+    ];
     let a_t = Tensor::new(a_log, 1, H, Dtype::F32);
     for floor in [0.0f32, -5.0] {
         // The plain step, a row a fire, folding each.
@@ -206,10 +214,19 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 .expect("the carried KDA step fires");
                 gpu.sync();
                 if j + 1 < T {
-                    assert_eq!(gpu.down::<f32>(slab, stride), seed, "a decode committing nothing keeps the state");
+                    assert_eq!(
+                        gpu.down::<f32>(slab, stride),
+                        seed,
+                        "a decode committing nothing keeps the state"
+                    );
                 }
             }
-            near(&gpu.down::<f32>(y, T * wide), &want_y, 2e-3, "the carried decodes' rows");
+            near(
+                &gpu.down::<f32>(y, T * wide),
+                &want_y,
+                2e-3,
+                "the carried decodes' rows",
+            );
             near(
                 &gpu.down::<f32>(slab, stride),
                 &want_slabs[commit as usize - 1],
@@ -280,7 +297,11 @@ fn a_kda_decode_reads_its_buffered_rows_as_the_step_folds_them() {
                 let want: Vec<u16> = gpu.down(page.row(2, j as u32), wide);
                 assert_eq!(got, want, "row {j}'s keys");
             }
-            assert_eq!(gpu.down::<f32>(slab, stride), want_slabs[c - 1], "the tail keeps the state");
+            assert_eq!(
+                gpu.down::<f32>(slab, stride),
+                want_slabs[c - 1],
+                "the tail keeps the state"
+            );
         }
     }
 }
@@ -333,7 +354,16 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
         let mut out = Tensor::new(row(y, j, INNER), 1, INNER as u32, Dtype::Bf16);
         let pool = pool(slab, STRIDE, slots);
         match carry {
-            None => ssm::mamba2(&gpu.ctx(), args.0, args.1, args.2, m, &pool, N as u32, &mut out),
+            None => ssm::mamba2(
+                &gpu.ctx(),
+                args.0,
+                args.1,
+                args.2,
+                m,
+                &pool,
+                N as u32,
+                &mut out,
+            ),
             Some(carry) => ssm::mamba2_carried(
                 &gpu.ctx(),
                 args.0,
@@ -356,7 +386,11 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
         step(&mut gpu, slab, y, j, None);
         want_slabs.push(gpu.down::<f32>(slab, STRIDE));
     }
-    let want_y: Vec<f32> = gpu.down::<u16>(y, T * INNER).into_iter().map(from_bf16).collect();
+    let want_y: Vec<f32> = gpu
+        .down::<u16>(y, T * INNER)
+        .into_iter()
+        .map(from_bf16)
+        .collect();
     for commit in [T as i32 - 4, T as i32] {
         // Planes: step sizes, `x | B`.
         let page = Page::new(&mut gpu, &[HEADS as u64 * 2, XB as u64 * 2], None);
@@ -376,7 +410,11 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
         gpu.sync();
         for j in 0..T {
             let got: Vec<u16> = gpu.down(page.row(1, j as u32), XB);
-            assert_eq!(got, xbc_raw[j * WIDTH..j * WIDTH + XB].to_vec(), "row {j}'s `x | B`");
+            assert_eq!(
+                got,
+                xbc_raw[j * WIDTH..j * WIDTH + XB].to_vec(),
+                "row {j}'s `x | B`"
+            );
         }
         let slab = gpu.up(&seed);
         let y = gpu.zeros(T * INNER * 2);
@@ -385,10 +423,18 @@ fn a_mamba2_decode_reads_its_buffered_rows_as_the_step_folds_them() {
             let carry = page.carry(&mut gpu, j as u32, j as u32, c);
             step(&mut gpu, slab, y, j, Some(&carry));
             if j + 1 < T {
-                assert_eq!(gpu.down::<f32>(slab, STRIDE), seed, "a decode committing nothing keeps the state");
+                assert_eq!(
+                    gpu.down::<f32>(slab, STRIDE),
+                    seed,
+                    "a decode committing nothing keeps the state"
+                );
             }
         }
-        let got: Vec<f32> = gpu.down::<u16>(y, T * INNER).into_iter().map(from_bf16).collect();
+        let got: Vec<f32> = gpu
+            .down::<u16>(y, T * INNER)
+            .into_iter()
+            .map(from_bf16)
+            .collect();
         near(&got, &want_y, 2e-2, "the carried decodes' rows");
         near(
             &gpu.down::<f32>(slab, STRIDE),
@@ -494,7 +540,11 @@ fn a_gated_delta_group_fold_leaves_the_plain_decodes_state() {
     let keys: Vec<u16> = (0..T)
         .flat_map(|j| qkv_raw[j * conv_dim + width..j * conv_dim + 2 * width].to_vec())
         .collect();
-    let planes = [2 * u64::from(VH) * 2, width as u64 * 2, u64::from(VH * VD) * 4];
+    let planes = [
+        2 * u64::from(VH) * 2,
+        width as u64 * 2,
+        u64::from(VH * VD) * 4,
+    ];
     let page = Page::new(&mut gpu, &planes, Some((1, &keys)));
     let slab = gpu.up(&seed);
     let y = gpu.zeros(T * (VH * VD) as usize * 4);
@@ -520,7 +570,11 @@ fn a_gated_delta_group_fold_leaves_the_plain_decodes_state() {
         .expect("the carried gated-delta step fires");
         gpu.sync();
     }
-    assert_eq!(gpu.down::<u16>(slab, stride), seed, "decodes committing nothing keep the state");
+    assert_eq!(
+        gpu.down::<u16>(slab, stride),
+        seed,
+        "decodes committing nothing keep the state"
+    );
     for n in [5u32, T as u32] {
         let slab = gpu.up(&seed);
         let carry = page.carry(&mut gpu, 0, n, 0);
@@ -540,9 +594,22 @@ fn a_gated_delta_group_fold_leaves_the_plain_decodes_state() {
         )
         .expect("the gated-delta group fold fires");
         gpu.sync();
-        let got: Vec<f32> = gpu.down::<u16>(slab, stride).into_iter().map(from_bf16).collect();
-        let want: Vec<f32> = want_slabs[n as usize - 1].iter().copied().map(from_bf16).collect();
-        near(&got, &want, 2e-2, &format!("the state a group folds through {n} rows"));
+        let got: Vec<f32> = gpu
+            .down::<u16>(slab, stride)
+            .into_iter()
+            .map(from_bf16)
+            .collect();
+        let want: Vec<f32> = want_slabs[n as usize - 1]
+            .iter()
+            .copied()
+            .map(from_bf16)
+            .collect();
+        near(
+            &got,
+            &want,
+            2e-2,
+            &format!("the state a group folds through {n} rows"),
+        );
     }
     // An empty table folds nothing.
     let slab = gpu.up(&seed);
@@ -563,7 +630,11 @@ fn a_gated_delta_group_fold_leaves_the_plain_decodes_state() {
     )
     .expect("an empty fold fires");
     gpu.sync();
-    assert_eq!(gpu.down::<u16>(slab, stride), seed, "an empty table folds nothing");
+    assert_eq!(
+        gpu.down::<u16>(slab, stride),
+        seed,
+        "an empty table folds nothing"
+    );
 }
 
 /// A gated-delta decode carrying rows that span several chunks, on a grid
@@ -613,7 +684,11 @@ fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
     let keys: Vec<u16> = (0..T)
         .flat_map(|j| qkv_raw[j * conv_dim + width..j * conv_dim + 2 * width].to_vec())
         .collect();
-    let planes = [2 * u64::from(VH) * 2, width as u64 * 2, u64::from(VH * VD) * 4];
+    let planes = [
+        2 * u64::from(VH) * 2,
+        width as u64 * 2,
+        u64::from(VH * VD) * 4,
+    ];
     let sms = gpu.ctx().multiprocessors().unwrap_or(1);
     let room = gpu.zeros(ssm::carry_split_bytes(sms) as usize);
     let run = |gpu: &mut Gpu, split: u64, rows: bool| {
@@ -650,7 +725,11 @@ fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
         let us: Vec<f32> = (0..T as u32)
             .flat_map(|j| gpu.down::<f32>(page.row(2, j), (VH * VD) as usize))
             .collect();
-        (gpu.down::<f32>(y, T * (VH * VD) as usize), us, gpu.down::<u16>(slab, stride))
+        (
+            gpu.down::<f32>(y, T * (VH * VD) as usize),
+            us,
+            gpu.down::<u16>(slab, stride),
+        )
     };
     let (want_y, want_u, want_slab) = run(&mut gpu, 0, false);
     // Read through the lane's rows on the device, every byte as through its
@@ -665,5 +744,9 @@ fn a_gated_delta_decode_splitting_its_carried_rows_answers_the_whole_one() {
     let got: Vec<f32> = got_slab.into_iter().map(from_bf16).collect();
     let want: Vec<f32> = want_slab.into_iter().map(from_bf16).collect();
     near(&got, &want, 2e-2, "the state the split decode commits");
-    assert_eq!(gpu.down::<u32>(room, sms as usize), vec![0u32; sms as usize], "every unit's counter back at zero");
+    assert_eq!(
+        gpu.down::<u32>(room, sms as usize),
+        vec![0u32; sms as usize],
+        "every unit's counter back at zero"
+    );
 }

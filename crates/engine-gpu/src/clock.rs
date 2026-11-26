@@ -119,9 +119,10 @@ impl ClockRange {
                     cur,
                 });
             }
-            if let (Some(min), Some(max)) =
-                (read_hz(&dir.join("min_freq")), read_hz(&dir.join("max_freq")))
-                && max >= min
+            if let (Some(min), Some(max)) = (
+                read_hz(&dir.join("min_freq")),
+                read_hz(&dir.join("max_freq")),
+            ) && max >= min
             {
                 return Ok(ClockRange {
                     min_hz: min,
@@ -180,7 +181,9 @@ fn readable(nodes: &[(PathBuf, u64)]) -> Option<(PathBuf, u64)> {
 /// Whether a devfreq device's name says it is a GPU.
 fn names_a_gpu(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["gpu", "kgsl", "mali"].iter().any(|word| name.contains(word))
+    ["gpu", "kgsl", "mali"]
+        .iter()
+        .any(|word| name.contains(word))
 }
 
 /// The least and greatest of a list of clocks (whitespace-separated, any
@@ -219,10 +222,15 @@ mod tests {
     fn a_frequency_list_reads_its_least_and_greatest() {
         let levels = "1300000000 1200000000 1100000000 1050000000 1000000000 902000000 \
                       826000000 726000000 646000000 578000000 500000000 160000000\n";
-        assert_eq!(parse_frequencies(levels, 1), Some((160_000_000, 1_300_000_000)));
-        assert_eq!(parse_frequencies("1300 578 160", 1_000_000), Some((160_000_000, 1_300_000_000)));
+        assert_eq!(
+            parse_frequencies(levels, 1),
+            Some((160_000_000, 1_300_000_000))
+        );
+        assert_eq!(
+            parse_frequencies("1300 578 160", 1_000_000),
+            Some((160_000_000, 1_300_000_000))
+        );
         assert_eq!(parse_frequencies("", 1), None);
         assert_eq!(parse_frequencies("0 x", 1), None);
     }
-
 }

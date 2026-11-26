@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Lane, Seated, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
-use crate::common::fnv;
 
 const PAGE: u32 = 16;
 const CONTEXT: u32 = 256;
@@ -58,13 +58,13 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
 
 fn load(trace: &Trace, contract: &ModelContract, container: &Path) -> Shell {
     Shell::load(crate::common::boot(
-            trace.clone(),
-            contract,
-            container,
-            Budget::new(1, TOKENS),
-            CONTEXT,
-            1,
-        ))
+        trace.clone(),
+        contract,
+        container,
+        Budget::new(1, TOKENS),
+        CONTEXT,
+        1,
+    ))
     .expect("the micro trace loads")
 }
 

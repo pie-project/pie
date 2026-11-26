@@ -78,7 +78,10 @@ fn new_weights_drop_every_checkpoint() {
     for (key, owner) in [([6; 32], 6), ([7; 32], 7)] {
         let ws = s.create_working_set(geom());
         write_state(&mut s, ws);
-        assert!(s.checkpoint(ws, key, Some(ProcessId::from_u128(owner))).unwrap());
+        assert!(
+            s.checkpoint(ws, key, Some(ProcessId::from_u128(owner)))
+                .unwrap()
+        );
         s.release_working_set(ws);
     }
     assert!(s.cache_only() != RsUnits::default());
@@ -288,7 +291,11 @@ fn a_truncate_takes_back_the_buffer_past_its_cut() {
     let held = s.held([ws]);
     assert_eq!(s.buffer_size(ws), Ok(3));
     s.truncate(ws, 5).unwrap();
-    assert_eq!(s.buffer_size(ws), Ok(2), "slots 8..12 went, 4..8 holds row 4");
+    assert_eq!(
+        s.buffer_size(ws),
+        Ok(2),
+        "slots 8..12 went, 4..8 holds row 4"
+    );
     assert_eq!(s.held([ws]).pages + 1, held.pages, "and its page went back");
     assert_eq!(
         s.truncate(ws, 1),

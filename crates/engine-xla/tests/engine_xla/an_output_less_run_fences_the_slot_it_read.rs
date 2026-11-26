@@ -28,7 +28,9 @@ fn an_output_less_run_fences_the_slot_it_read() {
     let device = engine_xla::device::Device::open(None, 0).expect("the device opens");
     let rows = 8;
     let mut ring = Ring::lay(&device, 1, rows).expect("a staging ring lays");
-    let at = ring.write(&[7; ROW_WORDS]).expect("the slot takes a fire's inputs");
+    let at = ring
+        .write(&[7; ROW_WORDS])
+        .expect("the slot takes a fire's inputs");
     let program = device
         .program(
             &reads_and_returns_nothing(rows),
@@ -46,6 +48,10 @@ fn an_output_less_run_fences_the_slot_it_read() {
     ring.read_by(at, Some(Done::of(done)));
     assert!(ring.fenced(at), "the slot waits on the run that read it");
     // Writing the slot again waits for that run, then frees the fence.
-    ring.write(&[9; ROW_WORDS]).expect("the slot is written once the run has completed");
-    assert!(!ring.fenced(at), "a written slot waits on nothing until a run reads it");
+    ring.write(&[9; ROW_WORDS])
+        .expect("the slot is written once the run has completed");
+    assert!(
+        !ring.fenced(at),
+        "a written slot waits on nothing until a run reads it"
+    );
 }

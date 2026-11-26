@@ -79,15 +79,17 @@ pub(crate) fn sizing_take() -> crate::sizing::Footprint {
             sized
                 .asked
                 .into_iter()
-                .map(|((arena, name, region, scope), asked)| crate::sizing::Sized {
-                    key: SlabKey {
-                        arena,
-                        name,
-                        region,
-                        scope,
+                .map(
+                    |((arena, name, region, scope), asked)| crate::sizing::Sized {
+                        key: SlabKey {
+                            arena,
+                            name,
+                            region,
+                            scope,
+                        },
+                        asked,
                     },
-                    asked,
-                })
+                )
                 .collect(),
         )
     })
@@ -187,8 +189,9 @@ fn per_device(
 #[must_use]
 pub(crate) fn multiprocessors() -> Option<u32> {
     static COUNT: OnceLock<Mutex<HashMap<i32, Option<u32>>>> = OnceLock::new();
-    let units =
-        per_device(&COUNT, |o| attribute(sys::ATTR_MULTIPROCESSOR_COUNT, o).filter(|&n| n > 0))?;
+    let units = per_device(&COUNT, |o| {
+        attribute(sys::ATTR_MULTIPROCESSOR_COUNT, o).filter(|&n| n > 0)
+    })?;
     // The units this process's queues run on, where a CU mask was stated
     // (`hip::hold_queue_units`).
     Some(crate::hip::held_units(current()?.unsigned_abs(), units))

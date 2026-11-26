@@ -583,9 +583,8 @@ async fn tenants_never_share_pages_and_one_tenants_sets_do() {
     stores.kv.lock().set_keeps(true);
     let tokens: Vec<u32> = (0..65).map(|t| 2700 + t).collect();
     let of = |tenant: &str| keyed_pass_as(&stores, &tokens, Some(tenant_of(tenant)));
-    let looked = |ws, slots: &[_]| {
-        supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows
-    };
+    let looked =
+        |ws, slots: &[_]| supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows;
     let (a1, a1_slots) = of("a");
     let claims = crate::pipeline::coalesce::before_pass(&stores, a1, 0, &a1_slots, || {})
         .await
@@ -594,8 +593,7 @@ async fn tenants_never_share_pages_and_one_tenants_sets_do() {
     // second waits on its first.
     let (b1, b1_slots) = of("b");
     assert_ne!(a1_slots, b1_slots, "another tenant keys another chain");
-    let b_claims =
-        crate::pipeline::coalesce::before_pass(&stores, b1, 0, &b1_slots, || {}).await;
+    let b_claims = crate::pipeline::coalesce::before_pass(&stores, b1, 0, &b1_slots, || {}).await;
     assert!(b_claims.is_some(), "b claims its own pages");
     let (a2, a2_slots) = of("a");
     assert_eq!(a1_slots, a2_slots, "one tenant keys one chain");
@@ -619,7 +617,10 @@ async fn tenants_never_share_pages_and_one_tenants_sets_do() {
         failure: PipelineFailure::default(),
     }
     .landed(true);
-    assert!(a_waits.await.unwrap().is_none(), "sealed: nothing left to claim");
+    assert!(
+        a_waits.await.unwrap().is_none(),
+        "sealed: nothing left to claim"
+    );
     // Lookup, while a's first is live: a's second maps it in, b nothing.
     assert_eq!(looked(a2, &a2_slots), 64, "a maps a's four sealed pages");
     let (b2, b2_slots) = of("b");
@@ -682,9 +683,7 @@ async fn tenants_never_share_pages_and_one_tenants_sets_do() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_group_shares_across_tenants_only_while_granted() {
     use crate::policy::grants;
-    use crate::policy::share::{
-        Asker, SessionId, ShareAs, ShareScope, TenantId, scope_domain,
-    };
+    use crate::policy::share::{Asker, SessionId, ShareAs, ShareScope, TenantId, scope_domain};
     let _grants = grants::TEST_LOCK.lock();
     let grant = |version, tenants: &[&str]| {
         let tenants = tenants.iter().map(|t| t.to_string()).collect();
@@ -702,9 +701,8 @@ async fn a_group_shares_across_tenants_only_while_granted() {
     stores.kv.lock().set_keeps(true);
     let tokens: Vec<u32> = (0..65).map(|t| 3100 + t).collect();
     let of = |tenant: &str| keyed_pass_as(&stores, &tokens, Some(group(tenant)));
-    let looked = |ws, slots: &[_]| {
-        supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows
-    };
+    let looked =
+        |ws, slots: &[_]| supply(&stores, ws, &rows(0, &tokens), slots, Attach::Kv, 65, 16).rows;
     // a computes and seals the prompt under group(g).
     let (a1, a1_slots) = of("a");
     written(&stores, a1, &tokens);
@@ -731,7 +729,12 @@ async fn a_group_shares_across_tenants_only_while_granted() {
     // b's grant is revoked; a's row is reissued under a new id.
     grant(2, &["a"]);
     let mut kv = stores.kv.lock();
-    let local = scope_domain(&kv.domain(), &ShareScope::Group("g".into()), &asker("b"), None);
+    let local = scope_domain(
+        &kv.domain(),
+        &ShareScope::Group("g".into()),
+        &asker("b"),
+        None,
+    );
     assert_eq!(
         kv.pass_domain(fresh).unwrap(),
         (local, true),
@@ -739,7 +742,10 @@ async fn a_group_shares_across_tenants_only_while_granted() {
     );
     assert!(kv.shares(fresh));
     let (_, shared) = kv.pass_domain(a1).unwrap();
-    assert!(!shared, "a set with rows keyed under the old grant shares no more");
+    assert!(
+        !shared,
+        "a set with rows keyed under the old grant shares no more"
+    );
     assert!(!kv.shares(a1));
     let fresh_slots = kv.slot_hashes(fresh, 0, &tokens, 16).unwrap().unwrap();
     drop(kv);
@@ -1122,7 +1128,14 @@ async fn a_bind_about_to_wait_settles_its_fires_and_an_eviction_s_wait_for_their
     assert_eq!(kv.claim_pipeline_scope(&scope), Ok(()));
     // A fire of a pass whose geometry the device keeps, on its way.
     let (completion, tag) = submit(&kv, None, &cell, &fires, &failure, &geometry::Fold::Device);
-    assert!(!fires.lock().unwrap().front().unwrap().is_preemption_detachable());
+    assert!(
+        !fires
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .is_preemption_detachable()
+    );
 
     // The eviction: its sets fenced, then it waits for their leases.
     let handle = kv.suspend_handle();
@@ -1150,7 +1163,11 @@ async fn a_bind_about_to_wait_settles_its_fires_and_an_eviction_s_wait_for_their
         6,
         "its fold is placed as its own finalize places it"
     );
-    assert_eq!(*failure.lock().unwrap(), None, "a fire that ran fails nothing");
+    assert_eq!(
+        *failure.lock().unwrap(),
+        None,
+        "a fire that ran fails nothing"
+    );
     drop(residency);
     Ok(())
 }
@@ -1407,7 +1424,6 @@ async fn a_fire_that_ran_and_reported_no_fold_fails_its_set_by_name() -> Anyhow<
 // the scheduler dispatches none of them before the frame's last has
 // arrived. A fire behind one that folds by a count the device computes
 // is therefore staged before that count exists.
-
 
 /// A fire the engine took whose call then traps, here on a pass gone
 /// where each path advances its shadow, is never queued: nothing

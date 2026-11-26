@@ -632,30 +632,53 @@ mod tests {
             ValueType::matrix_of(2, 5, Dtype::F32),
         ];
         let ops = vec![
-            Op::ChanTake(0),                                  // 0 f32 [5]
-            Op::Cast { value: 0, dtype: Dtype::Bf16 },        // 1 bf16 [5]
-            Op::Const(Literal::F32(0.5)),                     // 2 f32 []
-            Op::Mul(1, 2),                                    // 3 bf16
-            Op::Add(2, 1),                                    // 4 bf16
-            Op::Exp(3),                                       // 5 bf16
-            Op::ReduceSum(1),                                 // 6 f32 []
-            Op::ReduceMax(1),                                 // 7 f32 []
-            Op::ReduceArgmax(1),                              // 8 i32 []
-            Op::CumSum(1),                                    // 9 bf16 [5]
-            Op::TopK { input: 1, k: 2 },                      // 10 bf16, 11 u32
-            Op::SortDesc(1),                                  // 12 bf16, 13 u32
-            Op::Gt(1, 0),                                     // 14 bool
-            Op::Select { cond: 14, a: 1, b: 0 },              // 15 bf16
-            Op::Cast { value: 1, dtype: Dtype::I32 },         // 16 i32
-            Op::Cast { value: 1, dtype: Dtype::F32 },         // 17 f32
-            Op::PivotThreshold { input: 1, predicate: Predicate::CummassLe(2) }, // 18 bool
-            Op::ChanTake(1),                                  // 19 f32 [2, 5]
-            Op::Cast { value: 19, dtype: Dtype::Bf16 },       // 20 bf16 [2, 5]
-            Op::Transpose(20),                                // 21 bf16 [5, 2]
-            Op::MatMul(20, 21),                               // 22 f32 [2, 2]
-            Op::Iota { len: 1 },                              // 23 u32 [1]
-            Op::Gather { src: 1, idx: 23 },                   // 24 bf16 [1]
-            Op::ScatterAdd { base: 1, idx: 23, vals: 2 },     // 25 bf16 [5]
+            Op::ChanTake(0), // 0 f32 [5]
+            Op::Cast {
+                value: 0,
+                dtype: Dtype::Bf16,
+            }, // 1 bf16 [5]
+            Op::Const(Literal::F32(0.5)), // 2 f32 []
+            Op::Mul(1, 2),   // 3 bf16
+            Op::Add(2, 1),   // 4 bf16
+            Op::Exp(3),      // 5 bf16
+            Op::ReduceSum(1), // 6 f32 []
+            Op::ReduceMax(1), // 7 f32 []
+            Op::ReduceArgmax(1), // 8 i32 []
+            Op::CumSum(1),   // 9 bf16 [5]
+            Op::TopK { input: 1, k: 2 }, // 10 bf16, 11 u32
+            Op::SortDesc(1), // 12 bf16, 13 u32
+            Op::Gt(1, 0),    // 14 bool
+            Op::Select {
+                cond: 14,
+                a: 1,
+                b: 0,
+            }, // 15 bf16
+            Op::Cast {
+                value: 1,
+                dtype: Dtype::I32,
+            }, // 16 i32
+            Op::Cast {
+                value: 1,
+                dtype: Dtype::F32,
+            }, // 17 f32
+            Op::PivotThreshold {
+                input: 1,
+                predicate: Predicate::CummassLe(2),
+            }, // 18 bool
+            Op::ChanTake(1), // 19 f32 [2, 5]
+            Op::Cast {
+                value: 19,
+                dtype: Dtype::Bf16,
+            }, // 20 bf16 [2, 5]
+            Op::Transpose(20), // 21 bf16 [5, 2]
+            Op::MatMul(20, 21), // 22 f32 [2, 2]
+            Op::Iota { len: 1 }, // 23 u32 [1]
+            Op::Gather { src: 1, idx: 23 }, // 24 bf16 [1]
+            Op::ScatterAdd {
+                base: 1,
+                idx: 23,
+                vals: 2,
+            }, // 25 bf16 [5]
         ];
         let types = body_types(&ops, &ctx_with(&chans)).expect("types");
         let dtypes: Vec<Dtype> = types.iter().map(|t| t.dtype).collect();
@@ -663,8 +686,8 @@ mod tests {
         assert_eq!(
             dtypes,
             [
-                F32, Bf16, F32, Bf16, Bf16, Bf16, F32, F32, I32, Bf16, Bf16, U32, Bf16, U32,
-                Bool, Bf16, I32, F32, Bool, F32, Bf16, Bf16, F32, U32, Bf16, Bf16
+                F32, Bf16, F32, Bf16, Bf16, Bf16, F32, F32, I32, Bf16, Bf16, U32, Bf16, U32, Bool,
+                Bf16, I32, F32, Bool, F32, Bf16, Bf16, F32, U32, Bf16, Bf16
             ]
         );
         assert_eq!(types[6].shape, Shape::SCALAR);
@@ -673,12 +696,19 @@ mod tests {
 
     #[test]
     fn bf16_is_refused_where_a_value_is_an_index_or_a_mask() {
-        let chans = [ValueType::vector(4, Dtype::Bf16), ValueType::vector(1, Dtype::U32)];
+        let chans = [
+            ValueType::vector(4, Dtype::Bf16),
+            ValueType::vector(1, Dtype::U32),
+        ];
         for op in [
             Op::Gather { src: 1, idx: 0 },
             Op::And(0, 0),
             Op::MaskApply { logits: 1, mask: 0 },
-            Op::RngKeyed { state: 0, shape: Shape::vector(2), kind: RngKind::Uniform },
+            Op::RngKeyed {
+                state: 0,
+                shape: Shape::vector(2),
+                kind: RngKind::Uniform,
+            },
         ] {
             let ops = vec![Op::ChanTake(0), Op::ChanTake(1), op];
             assert_eq!(
@@ -726,7 +756,10 @@ mod tests {
         for (keep, scale) in [(1, 1), (3, 3), (1, 0)] {
             let mut ops = base();
             ops.push(draw(keep, scale));
-            assert!(body_types(&ops, &ctx_with(&chans)).is_err(), "{keep} {scale}");
+            assert!(
+                body_types(&ops, &ctx_with(&chans)).is_err(),
+                "{keep} {scale}"
+            );
         }
     }
 

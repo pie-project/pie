@@ -923,7 +923,12 @@ impl Bodies {
     /// The compositions stated eager at arming, by name, in a stable order.
     #[must_use]
     pub fn stated_eager(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.recorder.stated.iter().map(ToString::to_string).collect();
+        let mut keys: Vec<String> = self
+            .recorder
+            .stated
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         keys.sort();
         keys
     }
@@ -1169,7 +1174,11 @@ impl Bodies {
         };
         let gate_cut = run
             .gates()
-            .then(|| script.iter().position(|cut| cut.island || !prepare_only(cut)))
+            .then(|| {
+                script
+                    .iter()
+                    .position(|cut| cut.island || !prepare_only(cut))
+            })
             .flatten();
         let mut gate_step: Option<usize> = None;
         for (index, cut) in script.into_iter().enumerate() {
@@ -1648,7 +1657,15 @@ mod tests {
             "and the bucket binds below the lane ceiling",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers(), None).to_string(),
+            BodyKey::of(
+                &table(&[(3, 3)]),
+                8,
+                &prefill_only(),
+                LANES,
+                &plain_tiers(),
+                None
+            )
+            .to_string(),
             "b8[c0:8]",
             "a class the decode arm does not name takes the bucket whole",
         );

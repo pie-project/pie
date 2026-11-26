@@ -3755,7 +3755,9 @@ mod tests {
         let fits = geometry(&mut f, indptr, indices, 16, (1 << 19) / 16);
         assert!(fits.is_ok(), "256 lanes of 512K keys fit: {fits:?}");
         let wide = geometry(&mut f, indptr, indices, 16, (8 << 20) / 16);
-        let why = wide.expect_err("256 lanes of 8M keys pass 2^31").to_string();
+        let why = wide
+            .expect_err("256 lanes of 8M keys pass 2^31")
+            .to_string();
         assert!(why.contains("2^31 key places"), "{why}");
     }
 }

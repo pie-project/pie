@@ -6,11 +6,15 @@ pub(super) type Anyhow<T> = anyhow::Result<T>;
 
 pub(super) struct PassLanes {
     pub(super) places: Vec<geometry::Place>,
-    pub(super) cursors: Vec<std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>>,
+    pub(super) cursors:
+        Vec<std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>>,
     pub(super) kv: Vec<KvWorkingSet>,
 }
 
-pub(super) fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<PassLanes> {
+pub(super) fn pass_lanes<C: FireContext>(
+    ctx: &mut C,
+    fwd: &Resource<ForwardPass>,
+) -> Anyhow<PassLanes> {
     use crate::inferlet::host::working_set::WorkingSet;
     let (lanes, kv_lanes) = {
         let pass = ctx.resources().get(fwd)?;
@@ -63,7 +67,8 @@ pub(super) fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass
     })
 }
 
-pub(super) type CursorCell = std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>;
+pub(super) type CursorCell =
+    std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>;
 
 /// The token a working set's lanes name it by to the engine
 /// ([`::engine::KvDelta::set`]): never 0, which names no set.
@@ -555,7 +560,10 @@ pub(super) fn scan_lane_media(
     Ok(matched)
 }
 
-pub(super) fn advance_shadow<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<()> {
+pub(super) fn advance_shadow<C: FireContext>(
+    ctx: &mut C,
+    fwd: &Resource<ForwardPass>,
+) -> Anyhow<()> {
     let pass = ctx
         .resources()
         .get_mut(fwd)?
@@ -665,7 +673,9 @@ fn reserve_beam_columns(
         let f0 = u64::from(folded) / page;
         let last = lanes
             .iter()
-            .map(|&lane| u64::from(landings[lane].start) + u64::from(landings[lane].rows.max(1)) - 1)
+            .map(|&lane| {
+                u64::from(landings[lane].start) + u64::from(landings[lane].rows.max(1)) - 1
+            })
             .max()
             .unwrap_or(u64::from(folded));
         let beams = lanes.len() as u64;
@@ -674,18 +684,15 @@ fn reserve_beam_columns(
         let named = beams * (column + 2) + beams * frames + 1;
         let end = f0 + named;
         let end_slot = u32::try_from(end * page).unwrap_or(u32::MAX);
-        let capacity = crate::store::registry::with_kv_lock(
-            &stores.kv,
-            "host-other",
-            |kv| kv.capacity_pages(),
-        );
+        let capacity = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
+            kv.capacity_pages()
+        });
         if let Err(refusal) = beam_pool_fits(lane, end, named, capacity) {
             return Ok(Err(refusal));
         }
-        if let Err(refusal) = crate::inferlet::host::working_set::grow_pages(
-            &pass_lanes.kv[lane],
-            end_slot,
-        ) {
+        if let Err(refusal) =
+            crate::inferlet::host::working_set::grow_pages(&pass_lanes.kv[lane], end_slot)
+        {
             return Ok(Err(format!(
                 "pipeline: lane {lane}'s beams' pool cannot grow to its column's {named} \
                  page(s): {refusal}"
@@ -1003,7 +1010,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // A pass that ends no page past its held rows, and starts inside
         // one, can map, claim or bring up nothing: no whole page of it is
         // keyed beyond what the set holds (a decode step mid-page).
-        let ends_no_page = super::promote::ends_no_page(u64::from(full.lanes[0].kv.held), u64::from(keyed), page_size);
+        let ends_no_page = super::promote::ends_no_page(
+            u64::from(full.lanes[0].kv.held),
+            u64::from(keyed),
+            page_size,
+        );
         let attach = if !shares || !cuttable || !keyable || !plain_rows(&full) || ends_no_page {
             Attach::No
         } else if rs_ws_ids.is_empty() {
@@ -1081,7 +1092,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // Mapping nothing and keeping no state, a pass needs none of its
             // keys: the walk over the set's pages under the kv lock is not
             // taken for it.
-            Some(_) if !super::promote::takes_supply(attach, state.is_some()) => Supplied::default(),
+            Some(_) if !super::promote::takes_supply(attach, state.is_some()) => {
+                Supplied::default()
+            }
             Some(slots) => {
                 let folds = fold.of(0).map_or(0, |count| {
                     u64::from(count).min(full.lanes[0].tokens.len() as u64)
@@ -1193,16 +1206,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // A fire asks for the recurrent rows it carries in unfolded too,
         // where they are more than its own: a rung's replay scratch holds
         // its tokens of them. The pass carries these into its first fire.
-        let frozen = match lanes_frozen(
-            &stores,
-            &rs_ws_ids,
-            &groups,
-            full.lanes.len(),
-            window_state,
-        ) {
-            Ok(frozen) => frozen,
-            Err(error) => return Ok(Err(error)),
-        };
+        let frozen =
+            match lanes_frozen(&stores, &rs_ws_ids, &groups, full.lanes.len(), window_state) {
+                Ok(frozen) => frozen,
+                Err(error) => return Ok(Err(error)),
+            };
         // A pass folding all it writes folds piece by piece, so only its
         // first piece carries rows in; one folding nothing carries its
         // earlier pieces' rows into each later one.
@@ -1585,7 +1593,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let set_lanes: Vec<Vec<usize>> = if rs_ws_ids.is_empty() {
                 Vec::new()
             } else {
-                present.iter().map(|&group| piece_groups[group].1.clone()).collect()
+                present
+                    .iter()
+                    .map(|&group| piece_groups[group].1.clone())
+                    .collect()
             };
             let rs_plan = || {
                 host_rs_plan(
@@ -1920,7 +1931,10 @@ pub(super) fn reframes(stamp: crate::scheduler::FrameStamp, ahead: u32, pieces: 
 
 /// Every lane of a pass rides its last fire, the one that runs the program:
 /// a pass whose last fire left a lane out would read it nowhere.
-pub(super) fn every_lane_in_last_piece(cuts: &[Vec<Option<(u32, u32)>>], lanes: usize) -> Result<(), String> {
+pub(super) fn every_lane_in_last_piece(
+    cuts: &[Vec<Option<(u32, u32)>>],
+    lanes: usize,
+) -> Result<(), String> {
     let held = cuts
         .last()
         .map_or(0, |piece| piece.iter().filter(|cut| cut.is_some()).count());

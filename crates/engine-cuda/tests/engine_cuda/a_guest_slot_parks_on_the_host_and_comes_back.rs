@@ -367,18 +367,30 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
         fresh: Vec::new(),
         seed: host.take_run(&shape),
         parked: host.take_run(&shape),
-        pattern: (0..bytes).map(|byte| (byte * 13 + 7) as u8 ^ (byte >> 9) as u8).collect(),
+        pattern: (0..bytes)
+            .map(|byte| (byte * 13 + 7) as u8 ^ (byte >> 9) as u8)
+            .collect(),
     };
     shell
         .write_tier_slots(&[(item.id, item.seed.clone())], &item.pattern)
         .expect("the host slots are written");
     shell
-        .copy_tier_slots(item.id, Tier::Host, Tier::Device, &pairs(&item.seed, &item.device))
+        .copy_tier_slots(
+            item.id,
+            Tier::Host,
+            Tier::Device,
+            &pairs(&item.seed, &item.device),
+        )
         .expect("the slots land on the device");
 
     for round in 0..8 {
         shell
-            .copy_tier_slots(item.id, Tier::Device, Tier::Host, &pairs(&item.device, &item.parked))
+            .copy_tier_slots(
+                item.id,
+                Tier::Device,
+                Tier::Host,
+                &pairs(&item.device, &item.parked),
+            )
             .expect("the slots park");
         let (told, landed) = std::sync::mpsc::channel();
         let telling = shell
@@ -409,7 +421,12 @@ fn a_park_is_told_landed_once_it_has_read_its_slots() {
         );
         // Back on the device for the next round's park.
         shell
-            .copy_tier_slots(item.id, Tier::Host, Tier::Device, &pairs(&item.seed, &item.device))
+            .copy_tier_slots(
+                item.id,
+                Tier::Host,
+                Tier::Device,
+                &pairs(&item.seed, &item.device),
+            )
             .expect("the slots land on the device");
     }
 }

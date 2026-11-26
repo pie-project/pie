@@ -219,7 +219,12 @@ pub(super) fn stamp_lane_reserve(
 /// earlier columns stay valid output (`BEAM-PAGE-LISTS.md` §3).
 pub(crate) const BEAM_POOL_OUTGROWN: &str = "outgrows the kv pool";
 
-pub(super) fn beam_pool_fits(lane: usize, end: u64, named: u64, capacity: u32) -> Result<(), String> {
+pub(super) fn beam_pool_fits(
+    lane: usize,
+    end: u64,
+    named: u64,
+    capacity: u32,
+) -> Result<(), String> {
     if end > u64::from(capacity) {
         return Err(format!(
             "pipeline: lane {lane}'s beams' pool {BEAM_POOL_OUTGROWN}: its next column needs \
@@ -232,7 +237,10 @@ pub(super) fn beam_pool_fits(lane: usize, end: u64, named: u64, capacity: u32) -
 
 /// Whether `fwd`'s program states each beam's parent (its lanes hold their
 /// own page lists of their set's reserve): decided when it registered.
-pub(super) fn binds_pages<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
+pub(super) fn binds_pages<C: FireContext>(
+    ctx: &mut C,
+    fwd: &Resource<ForwardPass>,
+) -> Anyhow<bool> {
     Ok(ctx.resources().get(fwd)?.instance.program.binds_pages)
 }
 

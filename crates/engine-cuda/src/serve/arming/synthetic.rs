@@ -26,7 +26,11 @@ impl Shell {
         self.live.clone()
     }
 
-    pub(super) fn synthetic_lanes_with(&self, lanes: &[LaneRows], media: &[LaneMedia]) -> Vec<Synthetic> {
+    pub(super) fn synthetic_lanes_with(
+        &self,
+        lanes: &[LaneRows],
+        media: &[LaneMedia],
+    ) -> Vec<Synthetic> {
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         // What the lanes name, inside the chunks the fit left the pool: a
         // stated kv budget may hold fewer records and pages than the
@@ -197,7 +201,13 @@ impl Shell {
         }
         let each = patches / clips;
         let boxes = (0..clips)
-            .map(|at| [(each + if at == 0 { patches % clips } else { 0 }) * pt, ph, pw])
+            .map(|at| {
+                [
+                    (each + if at == 0 { patches % clips } else { 0 }) * pt,
+                    ph,
+                    pw,
+                ]
+            })
             .collect();
         Some((boxes, patches * pt * ph * pw))
     }
@@ -221,11 +231,17 @@ impl Shell {
         })
     }
 
-    pub(super) fn representative(&self, class: usize, rows: u32, wants_media: bool) -> poem_ir::Request {
+    pub(super) fn representative(
+        &self,
+        class: usize,
+        rows: u32,
+        wants_media: bool,
+    ) -> poem_ir::Request {
         let landing = &self.landing[class];
         // A bare request first (no adapter, no score capture): a switched
         // class's lands beside its adapter and scoring twins.
-        let bare = |request: &&poem_ir::Request| !request.has_adapter() && !request.captures_scores();
+        let bare =
+            |request: &&poem_ir::Request| !request.has_adapter() && !request.captures_scores();
         landing
             .iter()
             .filter(bare)

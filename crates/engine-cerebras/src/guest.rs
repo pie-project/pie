@@ -99,9 +99,10 @@ impl Plane {
     /// why it is refused, by its hash.
     pub fn adopt(registration: &ProgramRegistration) -> Result<ExecPlan, Refusal> {
         let hash = registration.program_hash;
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone()).map_err(|error| {
-            Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}"))
-        })?;
+        let plan =
+            eta_exec::adopt_launch_package(registration.launch.clone()).map_err(|error| {
+                Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}"))
+            })?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
                 "program 0x{hash:016x} calls a semantic boundary this backend does not implement: {}",
@@ -125,7 +126,11 @@ impl Plane {
     /// Releases `id`, which no instance binds (`Programs::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
-        if self.instances.values().any(|instance| instance.program == id) {
+        if self
+            .instances
+            .values()
+            .any(|instance| instance.program == id)
+        {
             return Err(Refusal::Program(format!(
                 "program {id} still has an instance bound"
             )));

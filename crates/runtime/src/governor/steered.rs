@@ -154,7 +154,8 @@ impl PoolTarget for EnginePool {
     }
 
     fn mapped(&self) -> Mapped {
-        self.target().map_or_else(Mapped::default, PoolTarget::mapped)
+        self.target()
+            .map_or_else(Mapped::default, PoolTarget::mapped)
     }
 
     fn growth(&self) -> Growth {

@@ -28,7 +28,6 @@ pub const PROCESSES: &str = "/sys/class/kfd/kfd/proc";
 /// not state one (CLR's default).
 const HIP_HW_QUEUES: u32 = 4;
 
-
 /// The device memory the driver holds for this process's queues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveAreas {
@@ -189,7 +188,13 @@ pub unsafe fn warm_copies(
         // SAFETY: `scratch` holds `bytes` (the caller's contract) and `host`
         // was just allocated with them; the stream is the caller's, live.
         let code = unsafe {
-            super::rt::hipMemcpyAsync(scratch, host, bytes, super::sys::MEMCPY_HOST_TO_DEVICE, stream)
+            super::rt::hipMemcpyAsync(
+                scratch,
+                host,
+                bytes,
+                super::sys::MEMCPY_HOST_TO_DEVICE,
+                stream,
+            )
         };
         // SAFETY: as above.
         let synced = unsafe { super::rt::hipStreamSynchronize(stream) };
@@ -200,7 +205,9 @@ pub unsafe fn warm_copies(
         let mut warmed = warmed_streams();
         if !stream.is_null() && !warmed.live.contains(&stream.addr()) {
             warmed.live.push(stream.addr());
-            warmed.most = warmed.most.max(u32::try_from(warmed.live.len()).unwrap_or(u32::MAX));
+            warmed.most = warmed
+                .most
+                .max(u32::try_from(warmed.live.len()).unwrap_or(u32::MAX));
         }
     }
     // SAFETY: allocated above, freed once.
@@ -260,7 +267,12 @@ pub fn listed_queues() -> Option<u32> {
     let mut queues = 0u32;
     for entry in fs::read_dir(dir).ok()? {
         let queue = entry.ok()?.path();
-        if fs::read_to_string(queue.join("gpuid")).ok().as_deref().map(str::trim) == Some(gpu) {
+        if fs::read_to_string(queue.join("gpuid"))
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some(gpu)
+        {
             queues += 1;
         }
     }

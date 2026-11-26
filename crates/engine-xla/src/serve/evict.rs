@@ -169,9 +169,20 @@ mod tests {
     #[test]
     fn a_kv_landing_past_the_bound_drops_the_least_recently_fired_first() {
         // the loader's untaken program, then the one fired longest ago
-        let (dropped, fits) = choose(held(&[(1, 9, 3), (2, 0, 2), (3, 4, 3), (4, 7, 3)]), None, landing);
-        assert!(fits, "the landing finds room while droppable programs remain");
-        assert_eq!(dropped, vec![key(2), key(3)], "5 bytes freed, the two oldest");
+        let (dropped, fits) = choose(
+            held(&[(1, 9, 3), (2, 0, 2), (3, 4, 3), (4, 7, 3)]),
+            None,
+            landing,
+        );
+        assert!(
+            fits,
+            "the landing finds room while droppable programs remain"
+        );
+        assert_eq!(
+            dropped,
+            vec![key(2), key(3)],
+            "5 bytes freed, the two oldest"
+        );
         // room already: nothing dropped
         let (dropped, fits) = choose(held(&[(1, 9, 3)]), None, |_| true);
         assert!(fits && dropped.is_empty());

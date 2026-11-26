@@ -180,7 +180,9 @@ pub fn to_end_facts() -> (Option<u64>, bool) {
     let lanes = facts
         .iter()
         .map(|(lanes, _)| *lanes)
-        .try_fold(0u64, |sum, lanes| lanes.map(|lanes| sum.saturating_add(lanes)));
+        .try_fold(0u64, |sum, lanes| {
+            lanes.map(|lanes| sum.saturating_add(lanes))
+        });
     (lanes, facts.iter().all(|&(_, spread)| spread))
 }
 
@@ -213,9 +215,21 @@ mod tests {
     #[test]
     fn a_process_goes_to_the_first_engine_with_room() {
         assert_eq!(first_with_room(&[], |_| true), 0, "no engine: engine 0");
-        assert_eq!(first_with_room(&[0, 1, 2], |_| true), 0, "room everywhere: the first");
-        assert_eq!(first_with_room(&[0, 1, 2], |e| e != 0), 1, "the first with room");
+        assert_eq!(
+            first_with_room(&[0, 1, 2], |_| true),
+            0,
+            "room everywhere: the first"
+        );
+        assert_eq!(
+            first_with_room(&[0, 1, 2], |e| e != 0),
+            1,
+            "the first with room"
+        );
         assert_eq!(first_with_room(&[0, 1, 2], |e| e == 2), 2);
-        assert_eq!(first_with_room(&[0, 1, 2], |_| false), 0, "room nowhere: the first");
+        assert_eq!(
+            first_with_room(&[0, 1, 2], |_| false),
+            0,
+            "room nowhere: the first"
+        );
     }
 }

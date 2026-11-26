@@ -8,7 +8,8 @@
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, ArgValue, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, nonzero, refuse, stated,
+    Arg, ArgValue, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, nonzero, refuse,
+    stated,
 };
 use crate::error::Error;
 use crate::tensor::Tensor;
@@ -157,7 +158,10 @@ pub fn copy_runs(
     // load builds them all: a fire of another rung or lane count picks
     // another, after ready.
     if let Some(names) = ctx.naming() {
-        let widths: Vec<Fire> = COPY_RUNS.iter().map(|&(_, entry)| Fire::at(ROWS, entry)).collect();
+        let widths: Vec<Fire> = COPY_RUNS
+            .iter()
+            .map(|&(_, entry)| Fire::at(ROWS, entry))
+            .collect();
         for _ in 0..dispatches {
             names.either(&widths)?;
         }
@@ -173,9 +177,9 @@ pub fn copy_runs(
         ));
     }
     for at in 0..dispatches {
-        let chunk = runs.get(at * table..).map_or(&[][..], |rest| {
-            &rest[..rest.len().min(table)]
-        });
+        let chunk = runs
+            .get(at * table..)
+            .map_or(&[][..], |rest| &rest[..rest.len().min(table)]);
         let longest = chunk.iter().map(|run| run.words).max().unwrap_or(0).max(1);
         let count = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
         let mut args = vec![arena_a.arg_mut(), arena_b.arg_mut()];
@@ -195,8 +199,7 @@ pub fn copy_runs(
             args.push(ArgValue::Zeros(unused));
         }
         ctx.fire(
-            Fire::at(ROWS, entry)
-                .threads([longest, count.max(1), 1], [GROUP, 1, 1]),
+            Fire::at(ROWS, entry).threads([longest, count.max(1), 1], [GROUP, 1, 1]),
             &args,
         )
         .map_err(|why| match why {

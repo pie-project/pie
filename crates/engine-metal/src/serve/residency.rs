@@ -4,7 +4,6 @@
 use super::*;
 
 impl Shell {
-
     /// See `Engine::set_rung`: a raise backs the carve of `to` before any
     /// fire of it, refused as [`Fault::Refused`]; a lower gives back the
     /// carve above it. Either way, where the rung's staged regions move,
@@ -82,7 +81,14 @@ impl Shell {
     /// Hosts rung `slot`'s regions again after a move that failed; a failure
     /// here leaves the load unable to stage, and says so.
     pub(super) fn rehost(&mut self, slot: usize) {
-        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, slot, true, true) {
+        if let Err(fault) = host_rung(
+            &self.pools,
+            &mut self.inputs,
+            &mut self.readout,
+            slot,
+            true,
+            true,
+        ) {
             tracing::error!(%fault, "metal: a refused rung move could not host the rung it kept");
         }
     }
@@ -91,7 +97,14 @@ impl Shell {
     /// regions let go, the arena back on `from` and its regions (`left`)
     /// hosted again.
     pub(super) fn unswitch(&mut self, from: u32, index: usize, left: usize) {
-        if let Err(fault) = host_rung(&self.pools, &mut self.inputs, &mut self.readout, index, false, true) {
+        if let Err(fault) = host_rung(
+            &self.pools,
+            &mut self.inputs,
+            &mut self.readout,
+            index,
+            false,
+            true,
+        ) {
             tracing::error!(%fault, "metal: a refused rung move could not let go of the rung it tried");
         }
         self.arena.set_current(from);
@@ -254,10 +267,7 @@ impl Shell {
     /// `copy` drained behind every frame and encoded (a host copy to or
     /// from the slot files done here); the frame to
     /// commit, `None` for an empty copy.
-    pub(super) fn encode_copy(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-    ) -> Result<Option<Frame>> {
+    pub(super) fn encode_copy(&mut self, copy: &engine::chunk::SlotCopy) -> Result<Option<Frame>> {
         if copy.slots.is_empty() && copy.runs.is_empty() {
             return Ok(None);
         }
@@ -290,7 +300,10 @@ impl Shell {
         copy: &engine::chunk::SlotCopy,
         landed: Option<(engine::LandingSink, u64)>,
     ) -> Result<bool> {
-        let device = engine::MemoryDomain::Device { ordinal: 0, reach: engine::DeviceReach::HostShared };
+        let device = engine::MemoryDomain::Device {
+            ordinal: 0,
+            reach: engine::DeviceReach::HostShared,
+        };
         if copy.src != device || copy.dst != device {
             self.copy_slots(copy)?;
             return Ok(true);
@@ -308,7 +321,9 @@ impl Shell {
         // Told once the buffer retires, faulted or not: a faulted copy has
         // stopped reading its sources too, and its fault reaches the next
         // drain.
-        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| sink(token, engine::Landing::Landed))))?);
+        self.grafted = Some(frame.commit_async(Some(Box::new(move |_| {
+            sink(token, engine::Landing::Landed)
+        })))?);
         Ok(false)
     }
 
@@ -355,5 +370,4 @@ impl Shell {
         }
         Ok(())
     }
-
 }

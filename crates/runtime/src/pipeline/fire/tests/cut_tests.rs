@@ -152,12 +152,12 @@ fn every_lane_of_a_pass_rides_its_last_fire() {
     let pieces = pass_pieces(&req, true, true, 32, 16, &[], &[]);
     assert!(pieces.len() > 1);
     assert_eq!(every_lane_in_last_piece(&pieces, 2), Ok(()));
-    let short = vec![vec![Some((0, 50)), Some((0, 40))], vec![Some((50, 100)), None]];
+    let short = vec![
+        vec![Some((0, 50)), Some((0, 40))],
+        vec![Some((50, 100)), None],
+    ];
     let refusal = every_lane_in_last_piece(&short, 2).unwrap_err();
-    assert!(
-        refusal.contains("a pass of 2 lanes carries 1"),
-        "{refusal}"
-    );
+    assert!(refusal.contains("a pass of 2 lanes carries 1"), "{refusal}");
 }
 
 fn several_lanes_are_cut_and_end_together() {

@@ -73,7 +73,12 @@ struct MassForm {
 /// memory, and its keys a tile: the widest that fits the device and
 /// `heads` query heads over `kv_heads` of `head_dim`, every kv head's row of
 /// a tile's keys and every query head's row staged at once.
-fn mass_form(workgroup_bytes: u32, heads: u32, kv_heads: u32, head_dim: u32) -> Option<(MassForm, u32)> {
+fn mass_form(
+    workgroup_bytes: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+) -> Option<(MassForm, u32)> {
     let run = head_dim / 2 + 1;
     MASS.into_iter().find_map(|form| {
         let fits = workgroup_bytes >= form.bytes
@@ -182,7 +187,10 @@ pub fn capture(
             ),
         ));
     }
-    for (what, tensor) in [("the score rows", at.scores), ("the normalisers' scratch", at.stats)] {
+    for (what, tensor) in [
+        ("the score rows", at.scores),
+        ("the normalisers' scratch", at.stats),
+    ] {
         if tensor.dtype != Dtype::F32 {
             return Err(refuse(
                 OP,
@@ -190,11 +198,17 @@ pub fn capture(
             ));
         }
     }
-    for (what, tensor) in [("position table", at.positions), ("capture table", at.table)] {
+    for (what, tensor) in [
+        ("position table", at.positions),
+        ("capture table", at.table),
+    ] {
         if tensor.dtype != Dtype::I32 {
             return Err(refuse(
                 OP,
-                format!("the fire's {what} is {:?}, and this capture reads i32", tensor.dtype),
+                format!(
+                    "the fire's {what} is {:?}, and this capture reads i32",
+                    tensor.dtype
+                ),
             ));
         }
     }
@@ -279,7 +293,10 @@ pub fn capture(
     let tiles = context.div_ceil(tile);
     let launches = |what: &str, groups: u64| {
         u32::try_from(groups).map_err(|_| {
-            refuse(OP, format!("the {what} grid will not launch: {groups} workgroups"))
+            refuse(
+                OP,
+                format!("the {what} grid will not launch: {groups} workgroups"),
+            )
         })
     };
     let norm_x = launches("normaliser", u64::from(at.capturing) * u64::from(THREADS))?;
@@ -362,7 +379,10 @@ pub fn pages(
     if table.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
-            format!("the capture table is {:?}, and this sum reads i32", table.dtype),
+            format!(
+                "the capture table is {:?}, and this sum reads i32",
+                table.dtype
+            ),
         ));
     }
     nonzero(OP, "the capturing lanes this sum answers", capturing)?;
@@ -381,7 +401,10 @@ pub fn pages(
     if keys.rows < capturing {
         return Err(refuse(
             OP,
-            format!("the key rows hold {} lanes, and {capturing} capture", keys.rows),
+            format!(
+                "the key rows hold {} lanes, and {capturing} capture",
+                keys.rows
+            ),
         ));
     }
     let x = u32::try_from(u64::from(pages.width.div_ceil(THREADS)) * u64::from(THREADS))

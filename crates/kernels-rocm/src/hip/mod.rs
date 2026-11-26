@@ -53,7 +53,10 @@ pub fn open() -> Result<(), Error> {
     // release they are driven for is refused here, at the load.
     lt_grouped::library(dtype::Dtype::Bf16)
         .map(|_| ())
-        .map_err(|why| Error::Backend { op: OP, detail: why })
+        .map_err(|why| Error::Backend {
+            op: OP,
+            detail: why,
+        })
 }
 
 /// Makes each of `streams`' copy queue now ([`kfd::warm_copies`]): the

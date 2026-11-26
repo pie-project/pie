@@ -93,9 +93,9 @@ impl Site {
             Site::SinkNarrowerThanValue => Some("channel sink narrower than the value"),
             Site::MtpDraftsZeroRowWidth => Some("MtpDrafts with a zero row width"),
             Site::NoArmClaimedTheTag => Some("no arm claimed this op tag"),
-            Site::SelectRowsPastItsState => Some(
-                "a top-k / top-p select of more rows than its state holds (16 a select)",
-            ),
+            Site::SelectRowsPastItsState => {
+                Some("a top-k / top-p select of more rows than its state holds (16 a select)")
+            }
             Site::Unknown(_) => None,
         }
     }

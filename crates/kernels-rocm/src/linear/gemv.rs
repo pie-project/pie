@@ -66,7 +66,6 @@ pub(crate) fn gemv_bf16(
     )
 }
 
-
 /// The skinny kernel's wavefronts a block.
 const SKINNY_WAVES: u32 = 16;
 
@@ -158,7 +157,13 @@ pub(crate) fn skinny_norm_bf16(
 
 /// The skinny kernel's walk of a normed product, where it stages the rows
 /// and the fold pays ([`fold_pays`]); `None` where it does not.
-pub(crate) fn skinny_norm_plan(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -> Result<Option<SkinnyPlan>, Error> {
+pub(crate) fn skinny_norm_plan(
+    ctx: &Ctx,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+) -> Result<Option<SkinnyPlan>, Error> {
     if !super::skinny::fits(m, n, k) {
         return Ok(None);
     }
@@ -190,14 +195,36 @@ pub(crate) fn skinny_norm_plan(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -
 /// first block (priced at device memory's rate where the profile states no
 /// cached one), against the norm's own launch.
 #[allow(clippy::too_many_arguments)]
-fn fold_pays(ctx: &Ctx, kernel: &'static str, m: i32, n: i32, k: i32, gated: bool, grid: u32) -> bool {
+fn fold_pays(
+    ctx: &Ctx,
+    kernel: &'static str,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+    grid: u32,
+) -> bool {
     let t = ctx.tuning();
     let redundant = f64::from(grid) * f64::from(2 * m + 1) * f64::from(k) * 2.0;
-    let gbps = if t.cached_gbps > 0 { t.cached_gbps } else { t.hbm_gbps };
+    let gbps = if t.cached_gbps > 0 {
+        t.cached_gbps
+    } else {
+        t.hbm_gbps
+    };
     // GB/s is bytes a nanosecond.
-    let folds =
-        t.launch_ns > 0 && gbps > 0 && redundant / f64::from(gbps) < f64::from(t.launch_ns);
-    told_fold(kernel, m, n, k, gated, grid, redundant, t.launch_ns, gbps, folds);
+    let folds = t.launch_ns > 0 && gbps > 0 && redundant / f64::from(gbps) < f64::from(t.launch_ns);
+    told_fold(
+        kernel,
+        m,
+        n,
+        k,
+        gated,
+        grid,
+        redundant,
+        t.launch_ns,
+        gbps,
+        folds,
+    );
     folds
 }
 
@@ -238,10 +265,17 @@ fn told_fold(
     type Shape = (&'static str, i32, i32, i32, bool, u32);
     static TOLD: Mutex<Option<HashSet<Shape>>> = Mutex::new(None);
     let mut told = TOLD.lock().expect("told lock poisoned");
-    if told.get_or_insert_with(HashSet::new).insert((kernel, m, n, k, gated, grid)) {
+    if told
+        .get_or_insert_with(HashSet::new)
+        .insert((kernel, m, n, k, gated, grid))
+    {
         tracing::debug!(
             "the norm {} the {m}x{n}x{k} {kernel}{} product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
-            if folds { "folds into" } else { "stays apart from" },
+            if folds {
+                "folds into"
+            } else {
+                "stays apart from"
+            },
             if gated { " gated" } else { "" },
             bytes / 1e6
         );
@@ -696,7 +730,13 @@ pub(crate) fn skinnyt_norm(
 
 /// Whether the turned kernel stages a normed product's rows (they and their
 /// sums within its turn) and the fold pays ([`fold_pays`]).
-pub(crate) fn skinnyt_norm_covers(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool) -> Result<bool, Error> {
+pub(crate) fn skinnyt_norm_covers(
+    ctx: &Ctx,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+) -> Result<bool, Error> {
     if m <= 0 || n <= 0 || k <= 0 || k / 8 > NORM_ROW_PACKS {
         return Ok(false);
     }
@@ -710,8 +750,10 @@ pub(crate) fn skinnyt_norm_covers(ctx: &Ctx, m: i32, n: i32, k: i32, gated: bool
     };
     // The normed rows (each padded a 16-byte pack, spread over the LDS
     // banks) and their partial sums (four floats a row) in the turn.
-    Ok(m.unsigned_abs() * (k.unsigned_abs() * 2 + 32) <= ks * TURN_WAVE_LDS
-        && fold_pays(ctx, "turned", m, n, k, gated, grid))
+    Ok(
+        m.unsigned_abs() * (k.unsigned_abs() * 2 + 32) <= ks * TURN_WAVE_LDS
+            && fold_pays(ctx, "turned", m, n, k, gated, grid),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -788,8 +830,11 @@ pub fn cached_read_probe(
 ) -> Result<(), Error> {
     ctx.fire(
         "linear.cached_read_probe",
-        Fire::at(kernel("linear/gemv.hip", "::pie::linear::cached_read_probe"))
-            .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+        Fire::at(kernel(
+            "linear/gemv.hip",
+            "::pie::linear::cached_read_probe",
+        ))
+        .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(sets_base),
             ArgValue::I32(set_packs as i32),

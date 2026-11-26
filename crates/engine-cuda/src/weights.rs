@@ -644,7 +644,11 @@ impl Weights {
                             ring.rates.saturated >> 10,
                             ring.rates.latency * 1e6,
                             ring.rates.fill / 1e9,
-                            if known.is_some() { "from the device's profile" } else { "measured" },
+                            if known.is_some() {
+                                "from the device's profile"
+                            } else {
+                                "measured"
+                            },
                             opening.elapsed().as_millis(),
                         );
                         Some(ring)
@@ -695,7 +699,11 @@ impl Weights {
             );
             // What this machine's landing measured, where it measured it
             // (every rate stated, none from the profile).
-            let all = [reads.spawn_s, reads.thread_bytes_per_s, reads.whole_bytes_per_s];
+            let all = [
+                reads.spawn_s,
+                reads.thread_bytes_per_s,
+                reads.whole_bytes_per_s,
+            ];
             measured_landing = match (&sink.ring, known) {
                 (Some(ring), None) if all.iter().all(|v| *v > 0.0) => {
                     Some(profile::rates::Landing {

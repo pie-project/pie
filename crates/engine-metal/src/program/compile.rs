@@ -166,7 +166,9 @@ impl Module {
 
     /// Step `step`'s own pipeline, where it was built one.
     #[cfg(target_vendor = "apple")]
-    pub(crate) fn step_pipelines(&self) -> &[Retained<ProtocolObject<dyn MTLComputePipelineState>>] {
+    pub(crate) fn step_pipelines(
+        &self,
+    ) -> &[Retained<ProtocolObject<dyn MTLComputePipelineState>>] {
         &self.steps
     }
 
@@ -276,7 +278,9 @@ impl Threads {
     fn take(&self) -> bool {
         use std::sync::atomic::Ordering::AcqRel;
         self.spare
-            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| n.checked_sub(1))
+            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
+                n.checked_sub(1)
+            })
             .is_ok()
     }
 
@@ -299,7 +303,9 @@ impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
     fn work<'s>(&'s self, scope: &'s std::thread::Scope<'s, '_>) {
         loop {
             let at = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Some(slot) = self.slots.get(at) else { break };
+            let Some(slot) = self.slots.get(at) else {
+                break;
+            };
             if at + 1 < self.slots.len() && self.threads.take() {
                 scope.spawn(move || {
                     self.work(scope);
@@ -307,7 +313,9 @@ impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
                 });
             }
             let made = pooled(|| (self.make)(at));
-            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
         }
     }
 }
@@ -341,7 +349,10 @@ pub(crate) fn in_parallel<T: Send>(
     std::thread::scope(|scope| fan.work(scope));
     fan.slots
         .into_iter()
-        .filter_map(|slot| slot.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
+        .filter_map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
         .collect()
 }
 
@@ -563,13 +574,14 @@ impl Job {
             compile_nanos: 0,
         };
         let stages = (|| {
-            let index = Emitted::index(&self.kernels).map_err(|duplicate| Failure::Deterministic {
-                reason: format!(
-                    "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
+            let index =
+                Emitted::index(&self.kernels).map_err(|duplicate| Failure::Deterministic {
+                    reason: format!(
+                        "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
                      an engine cannot know which of the two the host meant",
-                    duplicate.kind as u32, duplicate.stage, duplicate.region
-                ),
-            })?;
+                        duplicate.kind as u32, duplicate.stage, duplicate.region
+                    ),
+                })?;
             let mut stages = Vec::with_capacity(self.slots.len());
             for (at, (held, ..)) in self.slots.iter().enumerate() {
                 if let Some(stage) = held {
@@ -803,7 +815,6 @@ impl Cache {
     pub fn forget(&mut self, program_hash: u64) {
         self.programs.remove(&program_hash);
     }
-
 }
 
 impl Builder<'_> {
@@ -825,9 +836,7 @@ impl Builder<'_> {
             {
                 continue;
             }
-            if let Some(region) =
-                self.streamed_region(stage_index, region_index, plan, index)?
-            {
+            if let Some(region) = self.streamed_region(stage_index, region_index, plan, index)? {
                 if region_trace() {
                     eprintln!(
                         "region: stage {stage_index} region {region_index} takes the Streamed \
@@ -1105,8 +1114,14 @@ impl Builder<'_> {
         {
             let began = std::time::Instant::now();
             let (module, built) = self.sharing.module(key, || {
-                Module::build(&self.device.device, &expanded, entry, steps, &self.sharing.threads)
-                    .map(Arc::new)
+                Module::build(
+                    &self.device.device,
+                    &expanded,
+                    entry,
+                    steps,
+                    &self.sharing.threads,
+                )
+                .map(Arc::new)
             });
             let module = module?;
             if built {
@@ -1151,9 +1166,7 @@ fn step_launches(published: StepNodes, region: &[u32]) -> StepNodes {
 mod tests {
     use super::*;
 
-    mod sampler_scratch {
-
-    }
+    mod sampler_scratch {}
 
     #[test]
     fn compile_every_case() {
@@ -1225,12 +1238,16 @@ mod parallel {
             let sharing = Sharing::over(threads);
             let asked = in_parallel(&sharing.threads, 8, |_| {
                 sharing.module(7, || {
-                    Err(Failure::Deterministic { reason: "`e`: refused".into() })
+                    Err(Failure::Deterministic {
+                        reason: "`e`: refused".into(),
+                    })
                 })
             });
             assert_eq!(asked.iter().filter(|(_, built)| *built).count(), 1);
             for (module, _) in asked {
-                let refused = Failure::Deterministic { reason: "`e`: refused".into() };
+                let refused = Failure::Deterministic {
+                    reason: "`e`: refused".into(),
+                };
                 assert_eq!(module.map(|_| ()), Err(refused));
             }
         }

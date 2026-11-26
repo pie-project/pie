@@ -58,8 +58,10 @@ impl Shell {
             );
             return Ok(());
         }
-        self.measured
-            .push(format!("product_ns ({} decode product times)", measured.len()));
+        self.measured.push(format!(
+            "product_ns ({} decode product times)",
+            measured.len()
+        ));
         let saved = crate::rates::save_product_times(
             profiles,
             self.device.name(),
@@ -105,7 +107,10 @@ impl Shell {
              {:.1} s ({}); {}",
             said.len(),
             started.elapsed().as_secs_f64(),
-            saved.map_or_else(|| "not saved: no profile directory".to_string(), |p| format!("saved to {p}")),
+            saved.map_or_else(
+                || "not saved: no profile directory".to_string(),
+                |p| format!("saved to {p}")
+            ),
             said.join("; "),
         );
         Ok(())

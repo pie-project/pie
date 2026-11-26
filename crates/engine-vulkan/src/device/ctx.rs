@@ -520,10 +520,11 @@ impl Core {
             _ => Err({
                 SPENT.store(true, Ordering::Release);
                 Fault::Ceiling {
-                what: "command buffers: the driver allocated a null one",
-                need: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0) + 1,
-                have: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0),
-            }}),
+                    what: "command buffers: the driver allocated a null one",
+                    need: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0) + 1,
+                    have: u64::try_from(LIVE_CMDS.load(Ordering::Relaxed)).unwrap_or(0),
+                }
+            }),
         }
     }
 }
@@ -729,7 +730,9 @@ impl Drop for Core {
             {
                 self.device.destroy_descriptor_pool(pool, None);
             }
-            for pool in std::mem::take(&mut self.shared.get_mut().expect("shared lock poisoned").pools) {
+            for pool in
+                std::mem::take(&mut self.shared.get_mut().expect("shared lock poisoned").pools)
+            {
                 self.device.destroy_descriptor_pool(pool, None);
             }
             // The instance is the process's (`shared_instance`).
@@ -1286,8 +1289,7 @@ impl Context {
         // storage buffers. A device without them lays its pool whole
         // (`Context::resizes_pool`); a test's boot takes that path on one
         // that has them (`DeviceBoot::whole_pool`).
-        let update_after_bind =
-            f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE;
+        let update_after_bind = f12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE;
         #[cfg(feature = "test-limits")]
         let update_after_bind = update_after_bind && !boot.whole_pool;
         if !enabled.shader_int16 || !enabled.storage_16bit {
@@ -1801,7 +1803,10 @@ impl Context {
         let kept: Vec<Arc<Inner>> = {
             let mut rebound = self.core.rebound.lock().expect("rebound lock poisoned");
             rebound.retain(|held| held.strong_count() > 0);
-            rebound.iter().filter_map(std::sync::Weak::upgrade).collect()
+            rebound
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect()
         };
         let range = u64::from(self.core.limits.max_storage_buffer_range);
         let mut infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
@@ -1917,7 +1922,10 @@ impl Context {
         self.arm_next.lock().expect("arm lock poisoned").take();
         self.room_next.lock().expect("room lock poisoned").take();
         self.fixed_next.lock().expect("fixed lock poisoned").take();
-        self.indirect_next.lock().expect("indirect lock poisoned").take();
+        self.indirect_next
+            .lock()
+            .expect("indirect lock poisoned")
+            .take();
         let inner = {
             let mut held = self.landed_frame.lock().expect("landed lock poisoned");
             match held.as_ref() {
@@ -2488,7 +2496,11 @@ impl Inner {
         }
         .map_err(|e| core.fault("vkGetQueryPoolResults", e))?;
         let bits = core.stamp_bits();
-        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         let ticks = ticks[1].wrapping_sub(ticks[0]) & mask;
         Ok(Some(
             (ticks as f64 * f64::from(core.limits.timestamp_period)) as u64,
@@ -2716,10 +2728,13 @@ impl Frame {
         align: u64,
         kept: usize,
     ) -> Result<(vk::Buffer, (usize, u64))> {
-        let (slab, chunk, at) = self
-            .block
-            .borrow_mut()
-            .lay(&self.inner.core, bytes, align, kept, !self.kept && !self.dry)?;
+        let (slab, chunk, at) = self.block.borrow_mut().lay(
+            &self.inner.core,
+            bytes,
+            align,
+            kept,
+            !self.kept && !self.dry,
+        )?;
         self.retain(&slab);
         Ok((slab.buffer, (chunk, at)))
     }
@@ -2758,7 +2773,10 @@ impl Frame {
         let head = core.alloc_cmd(self.inner.cmd_pool)?;
         match shared {
             Some(size) => {
-                arm.heads.lock().expect("heads lock poisoned").insert(size, head);
+                arm.heads
+                    .lock()
+                    .expect("heads lock poisoned")
+                    .insert(size, head);
             }
             None => self
                 .inner
@@ -2852,7 +2870,11 @@ impl Frame {
     /// A kept frame whose command names a pool segment directly (`what`)
     /// stands only while the segments do: no rebind writes a command.
     fn pin_copied(&self, buffers: &[vk::Buffer], what: &str) {
-        if self.kept && buffers.iter().any(|&buffer| self.segment_of(buffer).is_some()) {
+        if self.kept
+            && buffers
+                .iter()
+                .any(|&buffer| self.segment_of(buffer).is_some())
+        {
             self.pin(what.to_string());
         }
     }
@@ -2870,7 +2892,14 @@ impl Frame {
     /// Notes descriptor `binding` of `set`, a kept frame's, as binding pool
     /// segment `segment` at `offset` for `bytes` (`u64::MAX`: the buffer
     /// whole): a rebind writes it.
-    pub(crate) fn rebinds(&self, set: vk::DescriptorSet, binding: u32, segment: u32, offset: u64, bytes: u64) {
+    pub(crate) fn rebinds(
+        &self,
+        set: vk::DescriptorSet,
+        binding: u32,
+        segment: u32,
+        offset: u64,
+        bytes: u64,
+    ) {
         self.inner
             .rebinds
             .lock()
@@ -3337,7 +3366,11 @@ impl Frame {
         let pushed = vec![0u8; self.copier.push_bytes as usize];
         self.bake(&(
             "rows",
-            if room_src { u64::MAX } else { src.buffer.as_raw() },
+            if room_src {
+                u64::MAX
+            } else {
+                src.buffer.as_raw()
+            },
             dst.buffer.as_raw(),
             table_place,
             params_place,
@@ -3360,7 +3393,11 @@ impl Frame {
             use ash::vk::Handle;
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            let source = if room_src && self.copier.rooms & 1 != 0 { 0 } else { src.buffer.as_raw() };
+            let source = if room_src && self.copier.rooms & 1 != 0 {
+                0
+            } else {
+                src.buffer.as_raw()
+            };
             (
                 source,
                 src_range,
@@ -3411,9 +3448,19 @@ impl Frame {
             .fire_layout
             .expect("the copier reads its count from the fire block");
         let fire_set = if self.arms_block(params_buffer) {
-            self.fire_set(fire_layout, fire.binding, params_buffer, u64::from(fire.bytes))?
+            self.fire_set(
+                fire_layout,
+                fire.binding,
+                params_buffer,
+                u64::from(fire.bytes),
+            )?
         } else {
-            self.own_fire_set(fire_layout, fire.binding, params_buffer, u64::from(fire.bytes))?
+            self.own_fire_set(
+                fire_layout,
+                fire.binding,
+                params_buffer,
+                u64::from(fire.bytes),
+            )?
         };
         let fire_at = u32::try_from(params_place.1).map_err(|_| Fault::Ceiling {
             what: "the fire block's place of a copy's count, as a dynamic offset",
@@ -3587,10 +3634,16 @@ impl Frame {
         let head = self.staged_head()?;
         // SAFETY: as in `flush`: this frame's `cmd` is recording and only
         // `&self` records into it.
-        self.inner.end_cmd().map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        self.inner
+            .end_cmd()
+            .map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         // The segment's head runs before it, submitted with it.
         if let Some(head) = head {
-            self.inner.held.lock().expect("held lock poisoned").push(head);
+            self.inner
+                .held
+                .lock()
+                .expect("held lock poisoned")
+                .push(head);
         }
         self.inner
             .segments
@@ -3653,7 +3706,9 @@ impl Frame {
         // every method that ends it consumes the frame.
         let head = self.staged_head()?;
         // SAFETY: `cmd` is recording, so it may be ended.
-        self.inner.end_cmd().map_err(|e| core.fault("vkEndCommandBuffer", e))?;
+        self.inner
+            .end_cmd()
+            .map_err(|e| core.fault("vkEndCommandBuffer", e))?;
         {
             let bufs: Vec<vk::CommandBuffer> = head.into_iter().chain([cmd]).collect();
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
@@ -3728,10 +3783,15 @@ impl Frame {
         }
         self.open = false;
         if !self.inner.recording.load(Ordering::Acquire) {
-            return Err(self.inner.core.fault("vkEndCommandBuffer", vk::Result::ERROR_UNKNOWN));
+            return Err(self
+                .inner
+                .core
+                .fault("vkEndCommandBuffer", vk::Result::ERROR_UNKNOWN));
         }
         let core = &self.inner.core;
-        self.inner.end_cmd().map_err(|e| core.fault("vkEndCommandBuffer", e))
+        self.inner
+            .end_cmd()
+            .map_err(|e| core.fault("vkEndCommandBuffer", e))
     }
 
     fn submit(&mut self) -> Result<()> {
@@ -3749,8 +3809,11 @@ impl Frame {
             let submits = [vk::SubmitInfo::default().command_buffers(&bufs)];
             // SAFETY: `segment` was ended and never submitted; it has no
             // fence; the queue is held under its lock.
-            unsafe { core.device.queue_submit(*queue, &submits, vk::Fence::null()) }
-                .map_err(|e| core.fault("vkQueueSubmit", e))?;
+            unsafe {
+                core.device
+                    .queue_submit(*queue, &submits, vk::Fence::null())
+            }
+            .map_err(|e| core.fault("vkQueueSubmit", e))?;
             self.inner.segmented.store(true, Ordering::Release);
         }
         // SAFETY: `cmd` was just ended and never submitted, the fence is the
@@ -3829,7 +3892,12 @@ impl Frame {
             .expect("rebinds lock poisoned")
             .is_empty()
         {
-            let mut rebound = self.inner.core.rebound.lock().expect("rebound lock poisoned");
+            let mut rebound = self
+                .inner
+                .core
+                .rebound
+                .lock()
+                .expect("rebound lock poisoned");
             rebound.retain(|held| held.strong_count() > 0);
             rebound.push(Arc::downgrade(&self.inner));
         }
@@ -3940,11 +4008,16 @@ impl Kept {
         }
         // The kernels' room bindings take the fire's places in the room (a
         // copier's whole-buffer binding none: its regions are its table).
-        let views: Vec<usize> = (0..binds.len()).filter(|&at| binds[at].3 != u64::MAX).collect();
+        let views: Vec<usize> = (0..binds.len())
+            .filter(|&at| binds[at].3 != u64::MAX)
+            .collect();
         if views.len() != pasts.len() {
             return Ok(false);
         }
-        let moved = views.iter().zip(pasts).any(|(&at, &past)| binds[at].2 != past);
+        let moved = views
+            .iter()
+            .zip(pasts)
+            .any(|(&at, &past)| binds[at].2 != past);
         if now == *bound && !moved {
             return Ok(true);
         }
@@ -4006,7 +4079,11 @@ impl Kept {
     /// stands only while the segments do.
     #[must_use]
     pub fn pinned(&self) -> Option<String> {
-        self.inner.pinned.lock().expect("pinned lock poisoned").clone()
+        self.inner
+            .pinned
+            .lock()
+            .expect("pinned lock poisoned")
+            .clone()
     }
 
     /// What its commands carry, hashed ([`Frame::bake`]).
@@ -4043,7 +4120,11 @@ impl Kept {
     /// counts from the block.
     #[must_use]
     pub fn fixed(&self) -> bool {
-        !self.indirect_all && self.indirect.as_ref().is_none_or(|set| !set.iter().any(|&v| v))
+        !self.indirect_all
+            && self
+                .indirect
+                .as_ref()
+                .is_none_or(|set| !set.iter().any(|&v| v))
     }
 
     /// Whether dispatch `at` of its walk reads its group counts from the
@@ -4274,11 +4355,13 @@ impl Watch {
         if result.is_ok() {
             submission.inner.landed_pools();
         }
-        (self.on_done)(
-            result
-                .err()
-                .map(|e| submission.inner.core.fault("vkWaitForFences", e).to_string()),
-        );
+        (self.on_done)(result.err().map(|e| {
+            submission
+                .inner
+                .core
+                .fault("vkWaitForFences", e)
+                .to_string()
+        }));
         self.landing.land(result);
     }
 }
@@ -4326,7 +4409,10 @@ impl Pending {
     /// A pending submission; where `on_done` is given, the device's watcher
     /// thread blocks on the fence, runs it, then releases every
     /// [`Pending::wait`], so the fence has the one waiter.
-    fn watched(submission: Arc<Submission>, on_done: Option<engine_gpu::backend::OnDone>) -> Pending {
+    fn watched(
+        submission: Arc<Submission>,
+        on_done: Option<engine_gpu::backend::OnDone>,
+    ) -> Pending {
         let Some(on_done) = on_done else {
             return Pending {
                 submission,
@@ -4497,7 +4583,10 @@ mod tests {
         assert_eq!(integrated, engine::DeviceMemory::Hosts);
         assert_eq!(integrated.host_tier(None), Ok(engine::HostTier::Absent));
         let refused = integrated.host_tier(Some(1 << 30)).unwrap_err();
-        assert!(refused.contains("`[engine.memory] budget_host`"), "{refused}");
+        assert!(
+            refused.contains("`[engine.memory] budget_host`"),
+            "{refused}"
+        );
         assert_eq!(
             device_memory(vk::PhysicalDeviceType::VIRTUAL_GPU, true),
             engine::DeviceMemory::Hosts
@@ -4666,12 +4755,20 @@ mod tests {
         let frame = context.frame().unwrap();
         let (held, _) = frame.lay(&[1; 200], 4).unwrap();
         assert!(frame.arms_block(held));
-        assert_eq!(context.core.books.takes(), takes, "what fits reserves nothing");
+        assert_eq!(
+            context.core.books.takes(),
+            takes,
+            "what fits reserves nothing"
+        );
         for _ in 0..2 {
             let (past, _) = frame.lay(&[2; 200], 4).unwrap();
             assert!(!frame.arms_block(past));
         }
-        assert_eq!(context.core.books.takes(), takes + 1, "one chunk holds both");
+        assert_eq!(
+            context.core.books.takes(),
+            takes + 1,
+            "one chunk holds both"
+        );
         frame.commit().unwrap();
         context.arm_next(Some(arm));
         let kept = context.frame_kept().unwrap();
@@ -4715,4 +4812,3 @@ mod tests {
         eprintln!("caller woke {median:?} (median), {worst:?} (worst) after the watcher's landing");
     }
 }
-

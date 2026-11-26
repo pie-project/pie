@@ -76,7 +76,14 @@ fn shell(trace: poem::Trace, path: &Path, runahead: Runahead) -> Shell {
             ..engine_cuda::Knobs::default()
         },
         runahead,
-        ..crate::common::boot(trace, &contract, path, Budget::new(MAX_BEAMS, 64), 256, MAX_BEAMS)
+        ..crate::common::boot(
+            trace,
+            &contract,
+            path,
+            Budget::new(MAX_BEAMS, 64),
+            256,
+            MAX_BEAMS,
+        )
     })
     .expect("the shell loads");
     for slot in 0..MAX_BEAMS {
@@ -213,9 +220,8 @@ fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> eng
                 let numel = channel.shape.numel() as usize;
                 let cell = engine_cuda::program::launch::native_cell_bytes(dtype, numel) as u32;
                 let span = engine_cuda::program::Endpoint::cell_span(cell, channel.capacity);
-                let slots = guest.channel(
-                    &shell.guest_footprint(engine::chunk::SlotRole::Channel, span),
-                );
+                let slots =
+                    guest.channel(&shell.guest_footprint(engine::chunk::SlotRole::Channel, span));
                 let at = shell
                     .guest_span(engine::chunk::SlotRole::Channel, &slots, span)
                     .expect("the ring's slots");
@@ -475,7 +481,10 @@ fn a_decode_envelope_embeds_each_lanes_token_its_epilogue_has_yet_to_put() {
             engine_cuda::device::ctx::host_fn_on(
                 shell.stream(),
                 Box::new(move || {
-                    if gate.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                    if gate
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .is_err()
+                    {
                         told.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }),

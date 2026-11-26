@@ -605,7 +605,11 @@ impl crate::run::Run<'_> {
     /// in the seat's work area (the verify path's, unused by the carried
     /// scan): refused by name where the window's lanes carry more rows than
     /// it holds for each lane and key head.
-    pub(crate) fn dots_table(&self, seat: &crate::rs::Seat, k_heads: u32) -> Result<ssm::DotsTable, kernels_metal::Error> {
+    pub(crate) fn dots_table(
+        &self,
+        seat: &crate::rs::Seat,
+        k_heads: u32,
+    ) -> Result<ssm::DotsTable, kernels_metal::Error> {
         let lane0 = self.window()?.span.lane_offset as usize;
         let lanes = self.qo_indptr_host()?.len().saturating_sub(1);
         let max_rep = seat

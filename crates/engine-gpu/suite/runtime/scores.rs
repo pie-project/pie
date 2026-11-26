@@ -14,14 +14,14 @@
 //! seat, and the capturing lanes' pattern is part of the fire's slot table,
 //! so the recording a pattern keys binds its own rows.
 
-use engine_cpu::forward::{Output, Values};
 use engine_cpu::Forward;
+use engine_cpu::forward::{Output, Values};
 use poem::Request;
 use poem_ir::Trace;
 
 use crate::backend::{Lane, Seated, Shell};
-use engine_gpu::serve::DeviceCell;
 use crate::model_logits::{PAGE, fixture, load, load_lanes, seeded_bf16};
+use engine_gpu::serve::DeviceCell;
 
 const MODEL: &str = "qwen3-micro-text";
 const KEYS: &str = "attn.scores";
@@ -42,7 +42,9 @@ fn room(shell: &Shell) -> DeviceCell<crate::backend::Api> {
     let layout = pools.layout();
     let run = u32::try_from(bytes.div_ceil(layout.chunk_bytes)).expect("a run of chunks");
     let first = layout.total_chunks - pools.span_chunks() - run;
-    let (buffer, at) = pools.chunk_place(first).expect("the room's chunks are committed");
+    let (buffer, at) = pools
+        .chunk_place(first)
+        .expect("the room's chunks are committed");
     assert!(
         at / layout.chunk_bytes + u64::from(run) <= u64::from(layout.segment_chunks),
         "the room lies in one segment"
@@ -66,7 +68,12 @@ enum Reads {
 /// they read pages.
 fn lanes(pattern: &[Reads]) -> Vec<(Vec<u32>, bool, bool)> {
     let prompt = |n: u32, k: u32| (0..n).map(|at| (at * k + 3) % 256).collect::<Vec<_>>();
-    let prompts = [prompt(23, 37), prompt(45, 53), prompt(9, 29), prompt(20, 61)];
+    let prompts = [
+        prompt(23, 37),
+        prompt(45, 53),
+        prompt(9, 29),
+        prompt(20, 61),
+    ];
     pattern
         .iter()
         .zip(prompts)
@@ -236,7 +243,13 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
         }
         let tokens: Vec<Vec<u32>> = lanes
             .iter()
-            .map(|(prompt, ..)| if step == 0 { prompt.clone() } else { vec![DECODE[step - 1]] })
+            .map(|(prompt, ..)| {
+                if step == 0 {
+                    prompt.clone()
+                } else {
+                    vec![DECODE[step - 1]]
+                }
+            })
             .collect();
         let seated: Vec<Seated<'_>> = (0..n)
             .map(|lane| Seated {
@@ -273,10 +286,17 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
             };
             let [keys, page_rows] = &want[step];
             let got = of(KEYS).unwrap_or_else(|| panic!("lane {lane} reads its key row"));
-            assert_eq!(got.len(), context as usize, "a key row is the load's context");
+            assert_eq!(
+                got.len(),
+                context as usize,
+                "a key row is the load's context"
+            );
             let off = apart(&got, keys);
             eprintln!("context {context}, step {step}, lane {lane}: keys {off:.2e} apart");
-            assert!(off < 2e-2, "lane {lane}'s key row at step {step}: {off} apart");
+            assert!(
+                off < 2e-2,
+                "lane {lane}'s key row at step {step}: {off} apart"
+            );
             // Every layer adds a mass of one.
             let layers = trace
                 .nodes
@@ -297,7 +317,10 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
                 let got = of(PAGES).unwrap_or_else(|| panic!("lane {lane} reads its page row"));
                 assert_eq!(got.len(), context.div_ceil(PAGE) as usize);
                 let off = apart(&got, page_rows);
-                assert!(off < 2e-2, "lane {lane}'s page row at step {step}: {off} apart");
+                assert!(
+                    off < 2e-2,
+                    "lane {lane}'s page row at step {step}: {off} apart"
+                );
             } else {
                 assert!(of(PAGES).is_none(), "lane {lane} reads no pages");
             }
@@ -307,7 +330,11 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
         }
     }
     if moved.is_some() {
-        assert_eq!(shell.recorded_serving(), 0, "a fire after ready recorded a body");
+        assert_eq!(
+            shell.recorded_serving(),
+            0,
+            "a fire after ready recorded a body"
+        );
         if <crate::backend::Api as engine_gpu::serve::Serve>::RECORDS {
             assert_eq!(
                 shell.unkept_serving(),
@@ -330,7 +357,11 @@ fn served_with(context: u32, pattern: &[Reads], moved: Option<(usize, Moved)>) {
 #[test]
 fn a_capturing_fire_reads_its_room_where_it_moved() {
     use Reads::{Keys, Nothing, Pages};
-    served_with(256, &[Nothing, Pages, Nothing, Keys], Some((DECODE.len(), Moved::Down)));
+    served_with(
+        256,
+        &[Nothing, Pages, Nothing, Keys],
+        Some((DECODE.len(), Moved::Down)),
+    );
 }
 
 /// [`a_capturing_fire_reads_its_room_where_it_moved`], the room moved into
@@ -368,7 +399,10 @@ fn an_idle_capture_needs_no_chunk() {
     shell.filled_serving();
     shell.serving = true;
     let segment = shell.pools().layout().segment_chunks;
-    let facts = shell.chunk_facts().expect("the pool states its chunks").segments;
+    let facts = shell
+        .chunk_facts()
+        .expect("the pool states its chunks")
+        .segments;
     let committed = facts.committed;
     let mut held = 0u32;
     let mut fire = |shell: &mut Shell, tokens: &[u32]| {
@@ -393,7 +427,9 @@ fn an_idle_capture_needs_no_chunk() {
     let to = if fixed {
         (1 + shell.pool_layout().seat_chunks()).div_ceil(segment) * segment
     } else {
-        shell.commit_segments(committed + 1).expect("a segment commits");
+        shell
+            .commit_segments(committed + 1)
+            .expect("a segment commits");
         committed * segment
     };
     assert!(
@@ -406,7 +442,9 @@ fn an_idle_capture_needs_no_chunk() {
         })
         .expect("the chunk moves");
     if !fixed {
-        shell.release_segments(committed).expect("its segment goes back");
+        shell
+            .release_segments(committed)
+            .expect("its segment goes back");
     }
     fire(&mut shell, &[3]);
     if <crate::backend::Api as engine_gpu::serve::Serve>::RECORDS {
@@ -454,7 +492,10 @@ fn a_capturing_load_names_its_capture_kernels_at_the_baseline_tier() {
     };
     let named = shell.named();
     let unservable: Vec<_> = named.unservable.iter().map(|held| held.class).collect();
-    assert!(unservable.is_empty(), "classes held unservable: {unservable:?}");
+    assert!(
+        unservable.is_empty(),
+        "classes held unservable: {unservable:?}"
+    );
     for prefix in ["attn_score_norm_", "attn_score_mass_", "attn_score_pages"] {
         let kernel = named
             .kernels
@@ -492,7 +533,8 @@ fn the_arena_holds_no_score_row() {
             continue;
         }
         captures += 1;
-        let placed = &compiled.arena.placements[compiled.arena.root(poem_ir::ValueId(at as u32)).0 as usize];
+        let placed =
+            &compiled.arena.placements[compiled.arena.root(poem_ir::ValueId(at as u32)).0 as usize];
         assert!(
             matches!(placed, poem_compiler::Placement::Capture { .. }),
             "value {at} is a capturing lane's row, placed {placed:?}"
@@ -525,13 +567,16 @@ fn the_score_rows_are_the_oracles() {
     let room = room(&shell);
     let prompt: Vec<u32> = (0..6u32).map(|at| (11 + at * 37) % 256).collect();
     let budget = shell.budget();
-    let tokens = budget.max_tokens.checked_sub(prompt.len() as u32).unwrap_or_else(|| {
-        panic!(
-            "the load's fire top of {} tokens holds no {}-token prompt",
-            budget.max_tokens,
-            prompt.len()
-        )
-    });
+    let tokens = budget
+        .max_tokens
+        .checked_sub(prompt.len() as u32)
+        .unwrap_or_else(|| {
+            panic!(
+                "the load's fire top of {} tokens holds no {}-token prompt",
+                budget.max_tokens,
+                prompt.len()
+            )
+        });
     let lanes = budget.max_lanes.min(1 + tokens);
     assert!(
         lanes > 1,
@@ -548,7 +593,11 @@ fn the_score_rows_are_the_oracles() {
     let fire = |shell: &mut Shell, captures: bool| {
         let seated: Vec<Seated<'_>> = (0..lanes)
             .map(|slot| {
-                let tokens: &[u32] = if slot == 0 { &prompt } else { &one[slot as usize - 1] };
+                let tokens: &[u32] = if slot == 0 {
+                    &prompt
+                } else {
+                    &one[slot as usize - 1]
+                };
                 let capturing = captures && slot == 0;
                 Seated {
                     held: Some(0),
@@ -575,13 +624,22 @@ fn the_score_rows_are_the_oracles() {
     // One capturing lane among them lays one lane's rows.
     fire(&mut shell, true);
     let rows = shell.score_rows().expect("the rows read back");
-    assert_eq!(rows.len(), 1, "one capturing lane of {lanes} laid {} rows", rows.len());
+    assert_eq!(
+        rows.len(),
+        1,
+        "one capturing lane of {lanes} laid {} rows",
+        rows.len()
+    );
     let (source, keys, pages) = &rows[0];
     assert_eq!(*source, 0, "the row is the capturing lane's");
     assert_eq!(keys.len(), CONTEXT as usize, "a mass a key of the context");
     // The load's kv page, as its chunk recipe lays it.
     let page = shell.paging().page_size;
-    assert_eq!(pages.len(), CONTEXT.div_ceil(page) as usize, "a mass a page of it");
+    assert_eq!(
+        pages.len(),
+        CONTEXT.div_ceil(page) as usize,
+        "a mass a page of it"
+    );
 
     let mut oracle = Forward::new(trace.clone(), None, &seeded_bf16)
         .expect("the oracle loads")
@@ -601,7 +659,10 @@ fn the_score_rows_are_the_oracles() {
     let (want_keys, want_pages) = (floats(KEYS), floats(PAGES));
     let most = |got: &[f32], want: &[f32]| -> f32 {
         assert_eq!(got.len(), want.len());
-        got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f32::max)
+        got.iter()
+            .zip(want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0, f32::max)
     };
     let layers = trace
         .nodes
@@ -622,7 +683,16 @@ fn the_score_rows_are_the_oracles() {
     // bf16 activations against the oracle's: a few hundredths of one
     // layer's mass a key at most; a row of another head, layer or lane is
     // off by tenths.
-    assert!(keys_apart < 2e-2, "the key row is not the oracle's: {keys_apart} apart");
-    assert!(pages_apart < 4e-2, "the page row is not the oracle's: {pages_apart} apart");
-    assert!((mass - layers).abs() < 1e-3 * layers, "a row of mass {mass}, not {layers}");
+    assert!(
+        keys_apart < 2e-2,
+        "the key row is not the oracle's: {keys_apart} apart"
+    );
+    assert!(
+        pages_apart < 4e-2,
+        "the page row is not the oracle's: {pages_apart} apart"
+    );
+    assert!(
+        (mass - layers).abs() < 1e-3 * layers,
+        "a row of mass {mass}, not {layers}"
+    );
 }

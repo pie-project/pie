@@ -58,7 +58,10 @@ fn the_settle_submits_no_fire_past_the_bound() {
                 slots: 4,
                 ..Budgets::default()
             },
-            residency: Residency { device: crate::gpu::share(), ..Residency::default() },
+            residency: Residency {
+                device: crate::gpu::share(),
+                ..Residency::default()
+            },
             ordinal: 0,
             frames_in_flight: 1,
             steps: Default::default(),
@@ -68,20 +71,34 @@ fn the_settle_submits_no_fire_past_the_bound() {
     // Every estimate read at the ratio the rates step measured alone, as
     // the settle reads it once held (`Shell::hold_to`).
     shell.hold_to(f64::MAX);
-    let held = shell.submit_bound().expect("the bound the boot states").clone();
-    let step = |rows: u32| StepRows { rows, lanes: 1, keys: rows, prompt: rows > 1 };
+    let held = shell
+        .submit_bound()
+        .expect("the bound the boot states")
+        .clone();
+    let step = |rows: u32| StepRows {
+        rows,
+        lanes: 1,
+        keys: rows,
+        prompt: rows > 1,
+    };
     // Between a one-row step's estimate and the widest's: the decode
     // ranges' steps fit whole, the widest's does not.
     let at = |rows: u32| held.step_ns(step(rows)).0;
     let tight = (at(1) * at(TOKENS)).sqrt();
     shell.hold_to(tight);
-    shell.settle_dense().expect("the settle's picks resolve under the bound");
+    shell
+        .settle_dense()
+        .expect("the settle's picks resolve under the bound");
     let built = shell.compiled();
     while shell
         .measure_behind(&|| 0, &|| false, None)
         .expect("the settle runs behind serving under the bound")
     {}
-    assert_eq!(shell.compiled(), built, "a trial builds nothing: the load built what it weighs");
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "a trial builds nothing: the load built what it weighs"
+    );
     let settled = shell.settled().to_vec();
     assert!(!settled.is_empty(), "the settle walked no range");
     for range in &settled {

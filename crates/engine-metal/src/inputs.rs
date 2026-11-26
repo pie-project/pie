@@ -617,20 +617,45 @@ impl Inputs {
         fits("beam groups in one fire", records.groups.len(), b.lanes)?;
         fits("beam lanes in one fire", records.lanes as usize, b.lanes)?;
         fits("beam copies in one fire", records.copies.len(), b.lanes)?;
-        fits("beam list runs in one fire", records.lists.len(), b.lists_cap)?;
-        fits("kv planes a beam page copy spans", records.planes.len(), b.planes_cap)?;
-        fits("beam pool pages in one fire", records.trans.len(), b.pages_cap)?;
-        fits("beam pool pages copied in one fire", records.bases.len(), b.pages_cap)?;
+        fits(
+            "beam list runs in one fire",
+            records.lists.len(),
+            b.lists_cap,
+        )?;
+        fits(
+            "kv planes a beam page copy spans",
+            records.planes.len(),
+            b.planes_cap,
+        )?;
+        fits(
+            "beam pool pages in one fire",
+            records.trans.len(),
+            b.pages_cap,
+        )?;
+        fits(
+            "beam pool pages copied in one fire",
+            records.bases.len(),
+            b.pages_cap,
+        )?;
         fits("beam rs page tables in one fire", records.rs.len(), b.lanes)?;
-        fits("beam rs copies in one fire", records.rs_copies.len(), b.lanes)?;
-        fits("beam sets' rs entries in one fire", records.rs_bases.len(), b.rs_entries_cap)?;
+        fits(
+            "beam rs copies in one fire",
+            records.rs_copies.len(),
+            b.lanes,
+        )?;
+        fits(
+            "beam sets' rs entries in one fire",
+            records.rs_bases.len(),
+            b.rs_entries_cap,
+        )?;
         self.store.write(b.groups, &bytes(&records.groups))?;
         self.store.write(b.lists, &bytes(&records.lists))?;
         self.store.write(b.copies, &bytes(&records.copies))?;
         self.store.write(b.planes, &bytes(&records.planes))?;
         self.store.write(b.trans, &bytes(&records.trans))?;
         self.store.write(b.bases, &bytes(&records.bases))?;
-        self.store.write(b.faults, &vec![0u8; records.lanes as usize * 4])?;
+        self.store
+            .write(b.faults, &vec![0u8; records.lanes as usize * 4])?;
         self.store.write(b.rs_runs, &bytes(&records.rs))?;
         self.store.write(b.rs_bases, &bytes(&records.rs_bases))?;
         self.store.write(b.rs_copies, &bytes(&records.rs_copies))?;
@@ -638,18 +663,44 @@ impl Inputs {
         let bind = |offset: u64, count: usize, size: usize| -> Result<Tensor> {
             let len = (count.max(1) * size) as u64;
             let handle = handles.bind(view, self.store.at(offset), len)?;
-            Ok(Tensor::new(handle, count.max(1) as u32, size as u32, Dtype::U8))
+            Ok(Tensor::new(
+                handle,
+                count.max(1) as u32,
+                size as u32,
+                Dtype::U8,
+            ))
         };
         use kernels_metal::runtime::beam::{BeamStepRun, PageCopyRun, PagePlane, RsCopyRun};
         Ok(Some(BeamStaged {
-            groups: bind(b.groups, records.groups.len(), std::mem::size_of::<BeamStepRun>())?,
+            groups: bind(
+                b.groups,
+                records.groups.len(),
+                std::mem::size_of::<BeamStepRun>(),
+            )?,
             group_count: records.groups.len() as u32,
-            widest: records.groups.iter().map(|group| group.lanes).max().unwrap_or(1),
-            copies: bind(b.copies, records.copies.len(), std::mem::size_of::<PageCopyRun>())?,
-            planes: bind(b.planes, records.planes.len(), std::mem::size_of::<PagePlane>())?,
+            widest: records
+                .groups
+                .iter()
+                .map(|group| group.lanes)
+                .max()
+                .unwrap_or(1),
+            copies: bind(
+                b.copies,
+                records.copies.len(),
+                std::mem::size_of::<PageCopyRun>(),
+            )?,
+            planes: bind(
+                b.planes,
+                records.planes.len(),
+                std::mem::size_of::<PagePlane>(),
+            )?,
             copy_count: records.copies.len() as u32,
             plane_count: records.planes.len() as u32,
-            rs_copies: bind(b.rs_copies, records.rs_copies.len(), std::mem::size_of::<RsCopyRun>())?,
+            rs_copies: bind(
+                b.rs_copies,
+                records.rs_copies.len(),
+                std::mem::size_of::<RsCopyRun>(),
+            )?,
             rs_copy_count: records.rs_copies.len() as u32,
         }))
     }
@@ -671,7 +722,10 @@ impl Inputs {
                 have: u64::from(self.lanes.max(1)),
             });
         }
-        let at = [self.captures, self.captures + u64::from(self.lanes.max(1)) * 8];
+        let at = [
+            self.captures,
+            self.captures + u64::from(self.lanes.max(1)) * 8,
+        ];
         let words = |words: &[u64]| -> Vec<u8> {
             words.iter().flat_map(|word| word.to_le_bytes()).collect()
         };
@@ -690,11 +744,12 @@ impl Inputs {
     pub fn beam_fault_reader(&self, lanes: u32) -> Result<FaultReader> {
         let mut at = None;
         let len = u64::from(lanes) * 4;
-        self.store.walk(self.beam.faults, len, |address, done, take| {
-            if done == 0 && take == len {
-                at = Some(address.as_ptr() as usize);
-            }
-        })?;
+        self.store
+            .walk(self.beam.faults, len, |address, done, take| {
+                if done == 0 && take == len {
+                    at = Some(address.as_ptr() as usize);
+                }
+            })?;
         let at = at.ok_or(Fault::Ceiling {
             what: "one host run holding a fire's beam fault words",
             need: len,
@@ -1022,8 +1077,16 @@ impl Inputs {
         let width = self.bands.iter().sum::<u32>().max(1);
         let lanes = fire.slot_ids.len() as u32 / width;
         for (what, need, have) in [
-            ("token rows a fire stages in its rung's regions", rows, self.rows),
-            ("lanes a fire stages in its rung's regions", lanes, self.lanes),
+            (
+                "token rows a fire stages in its rung's regions",
+                rows,
+                self.rows,
+            ),
+            (
+                "lanes a fire stages in its rung's regions",
+                lanes,
+                self.lanes,
+            ),
         ] {
             if need > have {
                 return Err(Fault::Ceiling {
@@ -1096,7 +1159,9 @@ impl Inputs {
             (Some(replay), Some(commit)) => {
                 if replay.len() != lanes as usize
                     || commit.len() != lanes as usize
-                    || fire.rs_ext_replay.is_some_and(|ext| ext.len() != lanes as usize)
+                    || fire
+                        .rs_ext_replay
+                        .is_some_and(|ext| ext.len() != lanes as usize)
                 {
                     return Err(Fault::Ceiling {
                         what: "recurrent seat tables, one entry per lane",
@@ -1105,8 +1170,10 @@ impl Inputs {
                     });
                 }
                 self.store.write(self.rs_replay, bytes_of(replay))?;
-                self.store
-                    .write(self.rs_ext_replay, bytes_of(fire.rs_ext_replay.unwrap_or(replay)))?;
+                self.store.write(
+                    self.rs_ext_replay,
+                    bytes_of(fire.rs_ext_replay.unwrap_or(replay)),
+                )?;
                 self.store.write(self.rs_commit, bytes_of(commit))?;
                 true
             }
@@ -1169,7 +1236,8 @@ impl Inputs {
         }
         match fire.mask {
             None => {
-                self.store.zero_span(self.mask_enabled, u64::from(rows) * 4)?;
+                self.store
+                    .zero_span(self.mask_enabled, u64::from(rows) * 4)?;
             }
             Some(staged) => {
                 if staged.bytes.len() as u64 > self.mask_plane_bytes {
@@ -1180,7 +1248,8 @@ impl Inputs {
                     });
                 }
                 self.store.write(self.mask_planes, &staged.bytes)?;
-                self.store.write(self.mask_enabled, words_of(&staged.words))?;
+                self.store
+                    .write(self.mask_enabled, words_of(&staged.words))?;
             }
         }
 
@@ -1864,7 +1933,21 @@ mod rung_tests {
         };
         let paging = Paging::of(16, 64, 4, 1).expect("paging");
         let mut inputs = Inputs::reserve(
-            &device, &budget, paging, 1, 1, 0, None, None, false, &[], 0, &[1], 4, 0, 0,
+            &device,
+            &budget,
+            paging,
+            1,
+            1,
+            0,
+            None,
+            None,
+            false,
+            &[],
+            0,
+            &[1],
+            4,
+            0,
+            0,
         )
         .expect("a rung's regions");
         let wide = [0i32; 5];
@@ -1897,7 +1980,11 @@ mod rung_tests {
         assert!(
             matches!(
                 refused,
-                Some(Fault::Ceiling { what: "token rows a fire stages in its rung's regions", need: 5, have: 4 })
+                Some(Fault::Ceiling {
+                    what: "token rows a fire stages in its rung's regions",
+                    need: 5,
+                    have: 4
+                })
             ),
             "{refused:?}"
         );

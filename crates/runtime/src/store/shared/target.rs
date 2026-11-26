@@ -224,7 +224,8 @@ impl SharedGrow {
                 // brought down at once too: a bind waits on it. So is a
                 // rung past what the admitted work needs while a process's
                 // demand waits for room.
-                let forced = cap > pool.fit_cap() || pool.told_unfit() || (waits && past && !idle_gives);
+                let forced =
+                    cap > pool.fit_cap() || pool.told_unfit() || (waits && past && !idle_gives);
                 let waited = forced || !past || needed;
                 let step = self.rung_walk.lock().unwrap().step(
                     &pool,
@@ -296,7 +297,11 @@ impl SharedGrow {
                     // Runs in its way with no free run below: the segment
                     // walk, next, compacts below the raise's activation.
                     if self.shared.lock().unwrap().compaction_for_raise(goal) {
-                        tracing::debug!(engine = self.engine, goal, "a raise waits on a compaction below its activation");
+                        tracing::debug!(
+                            engine = self.engine,
+                            goal,
+                            "a raise waits on a compaction below its activation"
+                        );
                     }
                     self.fund_owed();
                     return;
@@ -418,7 +423,8 @@ impl SharedGrow {
                         super::rung_changed(self.engine);
                         // Taken back, the room it set aside is free again:
                         // the planner quotes its head now.
-                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine) {
+                        if let Some(planner) = crate::planner::planner_for(self.model, self.engine)
+                        {
                             planner.pages_freed();
                         }
                         return;
@@ -453,7 +459,12 @@ impl SharedGrow {
         let cap = pool.lifted(rung).min(pool.fit_cap());
         if cap > super::fire_cap(self.engine) {
             super::set_fire_cap(self.engine, cap);
-            tracing::debug!(engine = self.engine, cap, owed, "fires lifted to the frames held out");
+            tracing::debug!(
+                engine = self.engine,
+                cap,
+                owed,
+                "fires lifted to the frames held out"
+            );
         }
     }
 
@@ -817,10 +828,15 @@ impl SharedGrow {
             };
             let gives_back = matches!(op, PoolOp::ReleaseSegments(_) | PoolOp::ReleaseSpan(_));
             let moved = matches!(op, PoolOp::Evacuate(_)).then(|| {
-                if compacting.is_some() { "a compaction" } else { "a segment's evacuation" }
+                if compacting.is_some() {
+                    "a compaction"
+                } else {
+                    "a segment's evacuation"
+                }
             });
             let landed = {
-                let _awaits = super::walk_awaits(self.engine, format!("the reply to {}", op.name()));
+                let _awaits =
+                    super::walk_awaits(self.engine, format!("the reply to {}", op.name()));
                 (self.lane)(self.engine, op).await
             };
             match landed {
@@ -907,7 +923,10 @@ impl SharedGrow {
                 // handed out by now retire (the loop's next step reads
                 // that), and the run they clear is room given back.
                 let (current, _) = self.epochs();
-                self.shared.lock().unwrap().compaction_copied(planned, current);
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .compaction_copied(planned, current);
                 // Fires held for a refused chunk's move go again now.
                 crate::scheduler::nudge(self.engine);
             }
@@ -1016,7 +1035,10 @@ impl super::programs::Mover for WalkMover<'_> {
     }
 
     async fn set_rung(&self, from: u32, to: u32) -> Result<(), String> {
-        let _awaits = super::walk_awaits(self.0.engine, format!("the reply to set rung {from} -> {to}"));
+        let _awaits = super::walk_awaits(
+            self.0.engine,
+            format!("the reply to set rung {from} -> {to}"),
+        );
         (self.0.lane)(self.0.engine, PoolOp::Rung { from, to })
             .await
             .map_err(|error| format!("{error:#}"))
@@ -1113,7 +1135,11 @@ mod tests {
             let mut signals = Vec::new();
             let turn = steer.turn(grow, reader.read(), &mut |signal| signals.push(signal));
             let held = grow.held();
-            assert_eq!(turn.mapped.segments * segment, held, "the measure is held's");
+            assert_eq!(
+                turn.mapped.segments * segment,
+                held,
+                "the measure is held's"
+            );
             assert!(
                 turn.answer != Retarget::Reached || held <= turn.segments * segment,
                 "reached with {held} held over a target of {} segments",
@@ -1205,7 +1231,10 @@ mod tests {
                 super::super::owe_cut_rows(engine, 512, None);
                 grow.walk_rung().await;
                 let rung = shared.lock().unwrap().rung();
-                assert_eq!(rung, 512, "on_demand={on_demand} waits={waits}: raised to the owed");
+                assert_eq!(
+                    rung, 512,
+                    "on_demand={on_demand} waits={waits}: raised to the owed"
+                );
                 assert!(
                     super::super::fire_cap(engine) >= 512,
                     "on_demand={on_demand} waits={waits}: the cap rises with the raise, \
@@ -1213,7 +1242,10 @@ mod tests {
                     super::super::fire_cap(engine),
                     told.lock().unwrap()
                 );
-                assert!(super::super::engine_rows(engine) >= 512, "the engine holds it");
+                assert!(
+                    super::super::engine_rows(engine) >= 512,
+                    "the engine holds it"
+                );
                 super::super::owe_cut_rows(engine, 0, None);
             }
         }
@@ -1248,10 +1280,9 @@ mod tests {
                 super::super::owe_cut_rows(engine, 512, None);
                 // Drain the ask the hold itself made.
                 let _ = futures::FutureExt::now_or_never(super::super::walk_asked(engine));
-                let taken =
-                    super::super::programs::take_raise(&shared, |_| 512, &WalkMover(&grow))
-                        .await
-                        .expect("taken");
+                let taken = super::super::programs::take_raise(&shared, |_| 512, &WalkMover(&grow))
+                    .await
+                    .expect("taken");
                 assert!(taken.is_some(), "raised outside the walk");
                 assert_eq!(super::super::fire_cap(engine), 128, "no cap lifted by it");
                 assert!(
@@ -1344,7 +1375,10 @@ mod tests {
         let _ = grow.retarget(u64::from(high - 1));
         shared.lock().unwrap().block_commit(high - 1);
         grow.walk().await;
-        assert!(released.load(Ordering::Relaxed) > 0, "a segment was given back");
+        assert!(
+            released.load(Ordering::Relaxed) > 0,
+            "a segment was given back"
+        );
         assert_eq!(
             shared.lock().unwrap().commit_blocked(),
             None,

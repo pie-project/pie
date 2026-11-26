@@ -24,8 +24,8 @@ use engine::fire::{
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{InstanceBinding, InstanceId};
 use engine::{StepDone, StepOutcome};
-use engine_gpu::submit::{Admitted, StepRows};
 use engine_gpu::store::layout::{FIXED, LIST, RS};
+use engine_gpu::submit::{Admitted, StepRows};
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
@@ -65,12 +65,22 @@ fn fold_program() -> TraceContainer {
         names: Vec::new(),
         channels: vec![channel(Shape::vector(ROWS)), channel(Shape::vector(1))],
         ports: vec![
-            PortBinding { port: Port::EmbedTokens, source: PortSource::Channel(0) },
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            },
             PortBinding {
                 port: Port::EmbedIndptr,
-                source: PortSource::Const { dtype: EtaDtype::U32, shape: Shape::vector(2), data: indptr },
+                source: PortSource::Const {
+                    dtype: EtaDtype::U32,
+                    shape: Shape::vector(2),
+                    data: indptr,
+                },
             },
-            PortBinding { port: Port::Fold, source: PortSource::Channel(1) },
+            PortBinding {
+                port: Port::Fold,
+                source: PortSource::Channel(1),
+            },
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
@@ -91,7 +101,10 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
         .enumerate()
         .map(|(at, &width)| {
             let id = ChannelId((1 << 20) + at as u64);
-            slots.register(engine, channel(id, vec![width], EtaDtype::U32, HostRole::Writer, 2));
+            slots.register(
+                engine,
+                channel(id, vec![width], EtaDtype::U32, HostRole::Writer, 2),
+            );
             id
         })
         .collect();
@@ -112,7 +125,9 @@ fn bind_fold(engine: &mut backend::Engine, slots: &mut Slots) -> InstanceId {
         },
         &channels,
     );
-    engine::Programs::bind(engine, &binding).expect("the fold program binds an instance").id
+    engine::Programs::bind(engine, &binding)
+        .expect("the fold program binds an instance")
+        .id
 }
 
 /// Slot refs out of chunks of the test's own: a shape fills a chunk, then
@@ -126,7 +141,11 @@ struct Refs {
 
 impl Refs {
     fn take(&mut self, id: ShapeId) -> u32 {
-        let per = self.facts.shape(id).unwrap_or_else(|| panic!("{MODEL} lays out shape {id}")).slots_per_chunk;
+        let per = self
+            .facts
+            .shape(id)
+            .unwrap_or_else(|| panic!("{MODEL} lays out shape {id}"))
+            .slots_per_chunk;
         let at = match self.open.iter().position(|&(shape, ..)| shape == id) {
             Some(at) => at,
             None => {
@@ -145,7 +164,9 @@ impl Refs {
 }
 
 fn tokens(seed: u32) -> Vec<u32> {
-    (0..ROWS).map(|at| (seed * 29 + at * 37 + 11) % 256).collect()
+    (0..ROWS)
+        .map(|at| (seed * 29 + at * 37 + 11) % 256)
+        .collect()
 }
 
 /// One sequence: its kv pages, the rs-list slots its buffer holds from the
@@ -161,7 +182,9 @@ struct Set {
 impl Set {
     /// A set of its own slots for `rows` rows, nothing held.
     fn of(model: &mut Model, slot: u32, rows: u32) -> Set {
-        let kv = (0..rows.div_ceil(PAGE)).map(|_| model.refs.take(LIST)).collect();
+        let kv = (0..rows.div_ceil(PAGE))
+            .map(|_| model.refs.take(LIST))
+            .collect();
         let rs = (0..model.rs_pages).map(|_| model.refs.take(RS)).collect();
         let record = (0..model.pieces)
             .map(|_| {
@@ -169,7 +192,13 @@ impl Set {
                 [piece, piece]
             })
             .collect();
-        Set { slot, held: 0, kv, rs, record }
+        Set {
+            slot,
+            held: 0,
+            kv,
+            rs,
+            record,
+        }
     }
 
     /// A set whose prompt of `PROMPT` rows is folded: every set's the same,
@@ -189,7 +218,10 @@ impl Set {
         Lane {
             slot: self.slot,
             word: word(trace, tokens.len() as u32),
-            kv: KvDelta { held: self.held, ..KvDelta::default() },
+            kv: KvDelta {
+                held: self.held,
+                ..KvDelta::default()
+            },
             readout: Readout::Last,
             tables: vec![(LIST, self.kv[..upto.div_ceil(PAGE) as usize].to_vec())],
             record: engine::fire::LaneRecord::Pieces(vec![(FIXED, self.record.clone())]),
@@ -206,7 +238,13 @@ impl Set {
         let pages = self.rs.clone();
         let lineage = engine::fire::Lineage::Set;
         let lane = Lane {
-            rs: RsVerb::Buffer { pages, base: PROMPT, folded, fold, lineage },
+            rs: RsVerb::Buffer {
+                pages,
+                base: PROMPT,
+                folded,
+                fold,
+                lineage,
+            },
             reports,
             ..self.rows(trace, tokens(seed), RsReset::Held)
         };
@@ -234,11 +272,26 @@ struct Model {
 impl Model {
     fn submit(&mut self, lane: Lane, attach: Option<InstanceId>) -> FrameTicket {
         let attachments = attach
-            .map(|instance| Attachment { lane: 0, lanes: 1, instance, adapter_only: false, scratch: ::engine::ScratchPlace::None })
+            .map(|instance| Attachment {
+                lane: 0,
+                lanes: 1,
+                instance,
+                adapter_only: false,
+                scratch: ::engine::ScratchPlace::None,
+            })
             .into_iter()
             .collect();
-        let step = Step { lanes: vec![lane], attachments, media: Vec::new(), voxels: Vec::new(), shape: None };
-        let ticket = self.engine.submit(&FrameSubmission::of(step)).expect("the frame fires");
+        let step = Step {
+            lanes: vec![lane],
+            attachments,
+            media: Vec::new(),
+            voxels: Vec::new(),
+            shape: None,
+        };
+        let ticket = self
+            .engine
+            .submit(&FrameSubmission::of(step))
+            .expect("the frame fires");
         if !self.asynchronous {
             // What a frame settled inside `submit` tells, it has told by
             // now: nothing heard later counts.
@@ -250,7 +303,11 @@ impl Model {
     /// The frame's last-row logits, as bits.
     fn settled(&mut self, ticket: &mut FrameTicket) -> Vec<u32> {
         self.engine.settle_frame(ticket).expect("the frame settles");
-        ticket.steps[0].readouts[0].values.iter().map(|v| v.to_bits()).collect()
+        ticket.steps[0].readouts[0]
+            .values
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
     }
 
     /// Fires a host lane and settles it: it reports no fold.
@@ -258,7 +315,11 @@ impl Model {
         let mut ticket = self.submit(lane, None);
         let bits = self.settled(&mut ticket);
         let outcome = self.outcome(&ticket);
-        assert_eq!(outcome, self.asynchronous.then(StepOutcome::committed), "a host-folding fire reports no fold");
+        assert_eq!(
+            outcome,
+            self.asynchronous.then(StepOutcome::committed),
+            "a host-folding fire reports no fold"
+        );
         bits
     }
 
@@ -284,7 +345,8 @@ impl Model {
                 return None;
             }
             let heard = self.heard.recv_timeout(Duration::from_secs(60));
-            self.seen.push(heard.expect("the step's completion reaches the sink"));
+            self.seen
+                .push(heard.expect("the step's completion reaches the sink"));
         }
     }
 
@@ -311,7 +373,10 @@ impl Model {
     fn held(&mut self, bound: f64) -> engine_gpu::submit::SubmitBound {
         let shell = self.engine.loaded_mut().expect("loaded");
         shell.hold_to(bound);
-        shell.submit_bound().expect("the bound the boot states").clone()
+        shell
+            .submit_bound()
+            .expect("the bound the boot states")
+            .clone()
     }
 }
 
@@ -319,7 +384,10 @@ impl Model {
 /// `tokens` rows, on a device whose platform states `bound` on one GPU
 /// submission where given (the boot's, `test-limits`).
 fn load(frames: u8, bound: Option<Duration>, tokens: u32) -> Option<(Model, InstanceId)> {
-    let boot = crate::backend::DeviceBoot { submit_bound: bound, ..crate::gpu::device_boot() };
+    let boot = crate::backend::DeviceBoot {
+        submit_bound: bound,
+        ..crate::gpu::device_boot()
+    };
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return None;
@@ -339,7 +407,10 @@ fn load(frames: u8, bound: Option<Duration>, tokens: u32) -> Option<(Model, Inst
                 slots: SETS + 1,
                 ..Budgets::default()
             },
-            residency: Residency { device: crate::gpu::share(), ..Residency::default() },
+            residency: Residency {
+                device: crate::gpu::share(),
+                ..Residency::default()
+            },
             ordinal: 0,
             frames_in_flight: frames,
             steps: Default::default(),
@@ -348,15 +419,21 @@ fn load(frames: u8, bound: Option<Duration>, tokens: u32) -> Option<(Model, Inst
     let asynchronous = engine::Completion::asynchronous(&engine);
     let (tx, heard) = mpsc::channel();
     let tx = Mutex::new(tx);
-    engine::Completion::on_complete(&mut engine, Arc::new(move |at, outcome| {
-        let _ = tx.lock().expect("the sink's sender").send((at, outcome));
-    }));
+    engine::Completion::on_complete(
+        &mut engine,
+        Arc::new(move |at, outcome| {
+            let _ = tx.lock().expect("the sink's sender").send((at, outcome));
+        }),
+    );
 
     let facts = loaded.caps.chunks.clone();
     let Some(SlotKind::Fixed { pieces }) = facts.shape(FIXED).map(|shape| shape.kind) else {
         panic!("{MODEL}'s record shape is fixed");
     };
-    let Some(SlotKind::List { tokens: rs_tokens, .. }) = facts.shape(RS).map(|shape| shape.kind) else {
+    let Some(SlotKind::List {
+        tokens: rs_tokens, ..
+    }) = facts.shape(RS).map(|shape| shape.kind)
+    else {
         panic!("{MODEL}'s rs list is a list");
     };
     let rs_pages = (3 * ROWS).div_ceil(rs_tokens) + 1;
@@ -374,21 +451,41 @@ fn load(frames: u8, bound: Option<Duration>, tokens: u32) -> Option<(Model, Inst
     // it) has none past them: its chunks lie from the first segment past the
     // seats' runs, below the activation span's segment (the last).
     let (first, commit, most) = if facts.segments.growth == Growth::Fixed {
-        let seats = 1 + engine.loaded().expect("the shell stands").pool_layout().seat_chunks();
+        let seats = 1 + engine
+            .loaded()
+            .expect("the shell stands")
+            .pool_layout()
+            .seat_chunks();
         let first = seats.div_ceil(segment) * segment;
-        (first, (first + need).div_ceil(segment), facts.segments.max - 1)
+        (
+            first,
+            (first + need).div_ceil(segment),
+            facts.segments.max - 1,
+        )
     } else {
         let committed = facts.segments.committed;
-        (committed * segment, committed + need.div_ceil(segment), facts.segments.max)
+        (
+            committed * segment,
+            committed + need.div_ceil(segment),
+            facts.segments.max,
+        )
     };
-    assert!(most >= commit, "the test's chunks span {commit} segments, the pool has {most} for them");
+    assert!(
+        most >= commit,
+        "the test's chunks span {commit} segments, the pool has {most} for them"
+    );
     engine::Pool::commit(&mut engine, commit).expect("the segments commit");
     let mut slots = Slots::of(&facts, first, first + 1);
     let instance = bind_fold(&mut engine, &mut slots);
     let model = Model {
         engine,
         trace: fixture.trace,
-        refs: Refs { chunk: first + 2, end: commit * segment, facts, open: Vec::new() },
+        refs: Refs {
+            chunk: first + 2,
+            end: commit * segment,
+            facts,
+            open: Vec::new(),
+        },
         pieces,
         rs_pages,
         asynchronous,
@@ -433,9 +530,20 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
         // A step whose guest pass runs behind its forward hands the host
         // no rows.
         let got = model.settled(&mut second);
-        assert!(got.is_empty() || got == rows, "{frames}: the second fire replays from where the first left");
-        assert_eq!(model.reported(&first, 101), Some(N), "{frames}: the first fire's fold");
-        assert_eq!(model.reported(&second, 102), Some(N), "{frames}: the second fire's own fold");
+        assert!(
+            got.is_empty() || got == rows,
+            "{frames}: the second fire replays from where the first left"
+        );
+        assert_eq!(
+            model.reported(&first, 101),
+            Some(N),
+            "{frames}: the first fire's fold"
+        );
+        assert_eq!(
+            model.reported(&second, 102),
+            Some(N),
+            "{frames}: the second fire's own fold"
+        );
         assert!(
             model.probe(&mut device, PROMPT + 2 * N) == want,
             "{frames} frame(s) in flight: a pipelined device fold leaves what the host fold leaves"
@@ -454,25 +562,52 @@ fn a_device_fold_replays_what_a_host_fold_replays() {
 #[test]
 fn a_step_of_hybrid_prompts_past_the_bound_is_cut_and_serves_alike() {
     const EACH: u32 = 256;
-    let step = StepRows { rows: 2 * EACH, lanes: 2, keys: EACH, prompt: true };
+    let step = StepRows {
+        rows: 2 * EACH,
+        lanes: 2,
+        keys: EACH,
+        prompt: true,
+    };
     // Both prompts in one step held to `bound`, then a decode of both held
     // to a roomy one: each lane's logits of both, and the fires the
     // prompts' step took past its own.
     let serve = |model: &mut Model, bound: f64| -> (Vec<Vec<f32>>, u64) {
         let trace = model.trace.clone();
-        let mut sets: Vec<Set> = (0..SETS).map(|slot| Set::of(model, slot, EACH + 1)).collect();
+        let mut sets: Vec<Set> = (0..SETS)
+            .map(|slot| Set::of(model, slot, EACH + 1))
+            .collect();
         let mut fire = |lanes: Vec<Lane>, bound: f64| {
             model.held(bound);
-            let step = Step { lanes, attachments: Vec::new(), media: Vec::new(), voxels: Vec::new(), shape: None };
-            let mut ticket = model.engine.submit(&FrameSubmission::of(step)).expect("the step fires");
-            model.engine.settle_frame(&mut ticket).expect("the step settles");
+            let step = Step {
+                lanes,
+                attachments: Vec::new(),
+                media: Vec::new(),
+                voxels: Vec::new(),
+                shape: None,
+            };
+            let mut ticket = model
+                .engine
+                .submit(&FrameSubmission::of(step))
+                .expect("the step fires");
+            model
+                .engine
+                .settle_frame(&mut ticket)
+                .expect("the step settles");
             let step = &ticket.steps[0];
-            (step.id.0, step.readouts.iter().map(|r| r.values.clone()).collect::<Vec<_>>())
+            (
+                step.id.0,
+                step.readouts
+                    .iter()
+                    .map(|r| r.values.clone())
+                    .collect::<Vec<_>>(),
+            )
         };
         let prompts = sets
             .iter()
             .map(|set| {
-                let prompt = (0..EACH).map(|at| (at * (37 + 16 * set.slot) + 11) % 256).collect();
+                let prompt = (0..EACH)
+                    .map(|at| (at * (37 + 16 * set.slot) + 11) % 256)
+                    .collect();
                 set.rows(&trace, prompt, RsReset::Fresh)
             })
             .collect();
@@ -483,11 +618,19 @@ fn a_step_of_hybrid_prompts_past_the_bound_is_cut_and_serves_alike() {
             .zip(&logits)
             .map(|(set, row)| {
                 set.held = EACH;
-                set.rows(&trace, vec![crate::model_logits::argmax(row)], RsReset::Held)
+                set.rows(
+                    &trace,
+                    vec![crate::model_logits::argmax(row)],
+                    RsReset::Held,
+                )
             })
             .collect();
         let (after, decoded) = fire(decodes, 2e9);
-        assert_eq!(after, at + 1, "the decode is the fire after the prompts' last");
+        assert_eq!(
+            after,
+            at + 1,
+            "the decode is the fire after the prompts' last"
+        );
         logits.extend(decoded);
         (logits, at - 1)
     };
@@ -502,22 +645,47 @@ fn a_step_of_hybrid_prompts_past_the_bound_is_cut_and_serves_alike() {
     };
     let held = cut.held(2e9);
     let layer = |s: StepRows| held.step_ns(s).1;
-    let tight = (layer(StepRows { rows: 1, lanes: 1, ..step }) * layer(step)).sqrt();
+    let tight = (layer(StepRows {
+        rows: 1,
+        lanes: 1,
+        ..step
+    }) * layer(step))
+    .sqrt();
     let held = cut.held(tight);
-    assert!(matches!(held.admit(step), Admitted::Refused { .. }), "a layer of the step is past the bound");
+    assert!(
+        matches!(held.admit(step), Admitted::Refused { .. }),
+        "a layer of the step is past the bound"
+    );
     let (pieced, pieces) = serve(&mut cut, tight);
-    assert!(pieces >= 2, "each prompt lane cut off in a piece at least: {pieces}");
+    assert!(
+        pieces >= 2,
+        "each prompt lane cut off in a piece at least: {pieces}"
+    );
     let cosine = |a: &[f32], b: &[f32]| {
-        let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
         let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
         dot / (norm(a) * norm(b)).max(f64::MIN_POSITIVE)
     };
     for (at, (a, b)) in whole.iter().zip(&pieced).enumerate() {
-        let what = format!("lane {} {}", at % 2, if at < 2 { "prompt" } else { "decode" });
+        let what = format!(
+            "lane {} {}",
+            at % 2,
+            if at < 2 { "prompt" } else { "decode" }
+        );
         assert!(a.iter().chain(b).all(|v| v.is_finite()), "{what}: finite");
-        let (wa, wb) = (crate::model_logits::argmax(a), crate::model_logits::argmax(b));
+        let (wa, wb) = (
+            crate::model_logits::argmax(a),
+            crate::model_logits::argmax(b),
+        );
         assert_eq!(wa, wb, "{what}: the same argmax whole and in pieces");
         let cos = cosine(a, b);
-        assert!(cos > 0.999, "{what}: logits whole and in pieces at cosine {cos}");
+        assert!(
+            cos > 0.999,
+            "{what}: logits whole and in pieces at cosine {cos}"
+        );
     }
 }

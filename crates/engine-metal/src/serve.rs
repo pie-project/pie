@@ -235,7 +235,7 @@ impl<'a> Seated<'a> {
         const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
         Seated {
             replay_stated: None,
-                        lane,
+            lane,
             group: None,
             inputs: &[],
             pages: &[],
@@ -266,7 +266,7 @@ impl<'a> Seated<'a> {
     pub fn adapted(lane: Lane<'a>, id: u32) -> Seated<'a> {
         Seated {
             replay_stated: None,
-                        adapter: Some(id),
+            adapter: Some(id),
             ..Seated::of(lane)
         }
     }
@@ -659,25 +659,24 @@ impl Shell {
             None,
             boot.measure,
         )
-            .map_err(|why| Fault::Device {
-                call: "rates at load",
-                why,
-            })?;
+        .map_err(|why| Fault::Device {
+            call: "rates at load",
+            why,
+        })?;
         // The device measures `kernel.dense` here over the model's shapes,
         // once: kept under the profiles and read back by later loads of the
         // same shapes on the same kernels, over the profile's own ladder.
-        let chip =
-            crate::tune::dense::at_load(
-                &device,
-                chip,
-                boot.profiles.as_deref(),
-                boot.contract,
-                boot.measure,
-            )
-                .map_err(|why| Fault::Device {
-                    call: "kernel.dense at load",
-                    why,
-                })?;
+        let chip = crate::tune::dense::at_load(
+            &device,
+            chip,
+            boot.profiles.as_deref(),
+            boot.contract,
+            boot.measure,
+        )
+        .map_err(|why| Fault::Device {
+            call: "kernel.dense at load",
+            why,
+        })?;
         if chip
             .ladder::<kernels_metal::tuning::Qmm>()
             .values()
@@ -830,7 +829,10 @@ impl Classes {
             )
         });
         let wide = classes_running(trace, compiled, |op| {
-            matches!(op, Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. }))
+            matches!(
+                op,
+                Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
+            )
         });
         // Mask bits are staged per lane with causality baked in, unclipped
         // for a wide class: a causal masked prefill there would see future
@@ -869,10 +871,12 @@ fn classes_running(
 ) -> poem_ir::ClassSet {
     let mut classes = poem_ir::ClassSet::default();
     for region in compiled.template() {
-        let any = region
-            .nodes
-            .clone()
-            .any(|node| trace.nodes.get(node as usize).is_some_and(|node| runs(&node.op)));
+        let any = region.nodes.clone().any(|node| {
+            trace
+                .nodes
+                .get(node as usize)
+                .is_some_and(|node| runs(&node.op))
+        });
         if any {
             for class in region.mask.iter() {
                 classes.insert(class);
@@ -909,14 +913,7 @@ fn place_weights(
         &boot.trace,
         *chip.get::<crate::chip::WeightsLayout>(),
     )?;
-    let ane = crate::ane::load(
-        device,
-        &handles,
-        &boot.trace,
-        &weights,
-        chip,
-        ane_cache,
-    )
+    let ane = crate::ane::load(device, &handles, &boot.trace, &weights, chip, ane_cache)
         .unwrap_or_else(|why| {
             tracing::info!("the Neural Engine stays out of this load: {why}");
             None
@@ -924,11 +921,7 @@ fn place_weights(
     // The compiler's on-device Metal recipe is the one layout source: the
     // chunk, the list slot (its tokens are the kv page size), where
     // every fixed row's pieces lie in a record, and the weight slots.
-    let recipe = crate::chunks::recipe_near(
-        &boot.trace,
-        budgets,
-        boot.residency.chunk_bytes(),
-    )?;
+    let recipe = crate::chunks::recipe_near(&boot.trace, budgets, boot.residency.chunk_bytes())?;
     let weight_caches = if boot.residency.whole_weights() {
         Vec::new()
     } else {
@@ -1097,8 +1090,8 @@ impl PoolRoom<'_> {
         // chunks as it takes (fewer chunks map no more).
         let slack = crate::store::pool::mapped_bytes(chunk, total, per)
             .saturating_sub(chunk * u64::from(total));
-        total = total
-            .saturating_sub(u32::try_from(slack.div_ceil(chunk.max(1))).unwrap_or(u32::MAX));
+        total =
+            total.saturating_sub(u32::try_from(slack.div_ceil(chunk.max(1))).unwrap_or(u32::MAX));
         if total < least.saturating_add(span).saturating_add(tables_chunks) {
             return Err(Fault::Residency(format!(
                 "one working set takes {least} chunks of {chunk} bytes beside the \
@@ -1248,8 +1241,12 @@ impl PreparedLoad<'_> {
         // pages can never take it says so once, with the form that runs: a
         // silent fall-through had the M5's prompts read as tensor-op ones.
         if tuning.sdpa_mpp() {
-            let widths: std::collections::BTreeSet<u32> =
-                facts.rows.iter().flatten().map(|row| row.head_dim).collect();
+            let widths: std::collections::BTreeSet<u32> = facts
+                .rows
+                .iter()
+                .flatten()
+                .map(|row| row.head_dim)
+                .collect();
             for head_dim in widths {
                 let form = kernels_metal::attn::arbiter::prefill_form(
                     head_dim,
@@ -1430,7 +1427,8 @@ impl PreparedLoad<'_> {
         };
 
         let outputs =
-            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, page_size).map_err(Fault::Recipe)?;
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, page_size)
+                .map_err(Fault::Recipe)?;
         let grid_chains = outputs
             .iter()
             .map(|out| out.grid.and_then(&grid_chain))
@@ -1640,7 +1638,8 @@ impl PreparedLoad<'_> {
         // chunked to it; said by name.
         let unweighed = boot.measure == engine::rates::Measuring::Skip
             && !chip.rates().complete(&crate::rates::KEYS);
-        if let Some((counts, rungs, live, _)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled) {
+        if let Some((counts, rungs, live, _)) = weighed.as_ref().filter(|_| boot.top == Top::Ruled)
+        {
             let (live, rungs) = (*live, rungs.clone());
             let pick = if unweighed {
                 let lanes = budgets.tokens.max_lanes.max(1);
@@ -1793,11 +1792,12 @@ impl PreparedLoad<'_> {
         // from the load, or its first fires, cut to it, find the floor's
         // (the M1 stress: "this fire wants 2 token rows ... the load
         // reserved 1" at rung 2, until the first raise).
-        if let Some(boot) = act
-            .first()
-            .map(|&(_, floor)| floor)
-            .and_then(|floor| act.iter().filter(|&&(_, chunks)| chunks <= floor).map(|&(tokens, _)| tokens).max())
-        {
+        if let Some(boot) = act.first().map(|&(_, floor)| floor).and_then(|floor| {
+            act.iter()
+                .filter(|&&(_, chunks)| chunks <= floor)
+                .map(|&(tokens, _)| tokens)
+                .max()
+        }) {
             arena.set_current(boot);
         }
         if crate::diag::on().tier_trace {
@@ -1816,7 +1816,11 @@ impl PreparedLoad<'_> {
         // The rung the load starts at is backed from the load (the smallest
         // rung's chunks, which it shares), so a raise the system refuses
         // always has a rung in hand to cut back to.
-        pools.cover(arena.floor_reach().max(arena.rung_reach(arena.current_tokens())))?;
+        pools.cover(
+            arena
+                .floor_reach()
+                .max(arena.rung_reach(arena.current_tokens())),
+        )?;
         // Every rung's staged regions laid in the span; the floor's hosted,
         // where frames stage until the runtime raises.
         for (index, (inputs, readout)) in inputs.iter_mut().zip(&mut readout).enumerate() {
@@ -1826,10 +1830,20 @@ impl PreparedLoad<'_> {
                 readout.place(arena.store().clone(), readout_at);
             }
         }
-        host_rung(&pools, &mut inputs, &mut readout, arena.current(), true, true)?;
+        host_rung(
+            &pools,
+            &mut inputs,
+            &mut readout,
+            arena.current(),
+            true,
+            true,
+        )?;
         // The kernel scratch plane in the pool's buffer: the arena counts in
         // the span's view, and ends below a windowed load's own-row pages.
-        pools.zero_span(pools.span().0 + (arena.scratch_at() - span_at), scratch.bytes())?;
+        pools.zero_span(
+            pools.span().0 + (arena.scratch_at() - span_at),
+            scratch.bytes(),
+        )?;
         scratch.seat(arena.store().clone(), arena.scratch_at());
         pools.seat_weights(&device, &handles, weight_caches)?;
         weights.lay_banks(&handles, |bytes| pools.run_table(&device, bytes))?;
@@ -2283,8 +2297,8 @@ impl Shell {
             None => {
                 let state_bytes = self.pools.state_slot_bytes() + buffered;
                 let state_rows = if state_bytes > 0 { u64::from(seats) } else { 0 };
-                let pages =
-                    u64::from(seats) * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let pages = u64::from(seats)
+                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
                 let page_bytes = self.pools.page_bytes()?;
                 let room = engine::disk::room(dir);
                 // The guest state the device can hold live (the room a
@@ -2954,7 +2968,11 @@ fn beam_faulted(
         .filter(|(word, _)| *word != 0)
         .map(|(word, &(lane, instance))| {
             let at = u32::try_from(lane).unwrap_or(u32::MAX);
-            (at..at + 1, instance, engine::beam::fault_reason(word, lane, "engine-metal"))
+            (
+                at..at + 1,
+                instance,
+                engine::beam::fault_reason(word, lane, "engine-metal"),
+            )
         })
         .collect()
 }
@@ -3143,7 +3161,11 @@ impl engine::frame::Shell for Shell {
             let checks: Vec<(std::ops::Range<u32>, engine::InstanceId, Option<_>)> = attached
                 .iter()
                 .map(|(instance, lanes)| {
-                    (lanes.clone(), *instance, self.programs.epilogue_check(*instance))
+                    (
+                        lanes.clone(),
+                        *instance,
+                        self.programs.epilogue_check(*instance),
+                    )
                 })
                 .collect();
             (Some((tell, checks)), None, None, beam_check)

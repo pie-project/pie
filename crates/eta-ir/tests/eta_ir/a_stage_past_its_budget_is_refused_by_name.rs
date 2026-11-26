@@ -15,7 +15,10 @@ fn broadcast(shape: Shape) -> TraceContainer {
     TraceContainer {
         stages: vec![StageProgram {
             stage: Stage::Prologue,
-            ops: vec![Op::Const(Literal::F32(1.0)), Op::Broadcast { value: 0, shape }],
+            ops: vec![
+                Op::Const(Literal::F32(1.0)),
+                Op::Broadcast { value: 0, shape },
+            ],
         }],
         ..TraceContainer::default()
     }
@@ -27,10 +30,19 @@ fn a_stage_past_its_budget_is_refused_by_name() {
         room_bytes: 1 << 20,
         submit: None,
     };
-    let fits = bind_within(broadcast(Shape::vector(1024)), vec![], EngineCaps::default(), room)
-        .expect("a 4 KiB stage binds within a MiB");
+    let fits = bind_within(
+        broadcast(Shape::vector(1024)),
+        vec![],
+        EngineCaps::default(),
+        room,
+    )
+    .expect("a 4 KiB stage binds within a MiB");
     assert_eq!(footprints(&fits).unwrap()[0].bytes, 4 + 4 * 1024);
-    assert_eq!(fits.budget, Some(room), "the bind holds what it was held to");
+    assert_eq!(
+        fits.budget,
+        Some(room),
+        "the bind holds what it was held to"
+    );
 
     // A stage of 64 Gi floats: refused by name, with both numbers.
     let wide = Shape::matrix(1 << 16, 1 << 20);
@@ -50,13 +62,26 @@ fn a_stage_past_its_budget_is_refused_by_name() {
         room_bytes: 4 + 4 * 1024,
         submit: None,
     };
-    assert!(bind_within(broadcast(Shape::vector(1024)), vec![], EngineCaps::default(), exact).is_ok());
+    assert!(
+        bind_within(
+            broadcast(Shape::vector(1024)),
+            vec![],
+            EngineCaps::default(),
+            exact
+        )
+        .is_ok()
+    );
     let short = Budget {
         room_bytes: 3 + 4 * 1024,
         submit: None,
     };
     assert!(matches!(
-        bind_within(broadcast(Shape::vector(1024)), vec![], EngineCaps::default(), short),
+        bind_within(
+            broadcast(Shape::vector(1024)),
+            vec![],
+            EngineCaps::default(),
+            short
+        ),
         Err(ValidateError::StagePastRoom { .. })
     ));
 }
@@ -70,7 +95,10 @@ fn a_stage_past_a_u64_of_bytes_is_refused_by_name() {
         broadcast(past),
         vec![],
         EngineCaps::default(),
-        Budget { room_bytes: u64::MAX, submit: None },
+        Budget {
+            room_bytes: u64::MAX,
+            submit: None,
+        },
     )
     .unwrap_err();
     assert_eq!(

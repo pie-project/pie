@@ -988,7 +988,10 @@ fn split_rows(rows: u32) -> Suite {
             dtype::bf16,
         );
         greedy.put(reshape(cast(reduce_argmax(&logits), dtype::i32), [rows]));
-        scored.put(reshape(cast(reduce_argmax(log_softmax(&logits)), dtype::i32), [rows]));
+        scored.put(reshape(
+            cast(reduce_argmax(log_softmax(&logits)), dtype::i32),
+            [rows],
+        ));
     });
     for channel in [greedy, scored] {
         channel.note_host_take();
@@ -1034,7 +1037,13 @@ fn bf16_suites() -> Vec<Suite> {
     suites.push(standard("penalized min-p + top-p", &penalized));
     // Seventeen rows: more than a split row's launch splits
     // (`LANE_SAMPLER_BLOCKS`), each row on one block through every phase.
-    suites.extend([beam_bf16(1), beam_bf16(4), beam_bf16(17), split_rows(16), split_rows(17)]);
+    suites.extend([
+        beam_bf16(1),
+        beam_bf16(4),
+        beam_bf16(17),
+        split_rows(16),
+        split_rows(17),
+    ]);
     suites
 }
 

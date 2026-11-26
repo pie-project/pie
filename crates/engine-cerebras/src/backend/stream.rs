@@ -401,9 +401,10 @@ impl CerebrasEngine {
                         Value::I32(v) => v.into_iter().map(|x| x as f32).collect(),
                         Value::U32(v) => v.into_iter().map(|x| x as f32).collect(),
                         // bf16 widens exactly: its bits are an f32's high half
-                        Value::Bf16(v) => {
-                            v.into_iter().map(|x| f32::from_bits(u32::from(x) << 16)).collect()
-                        }
+                        Value::Bf16(v) => v
+                            .into_iter()
+                            .map(|x| f32::from_bits(u32::from(x) << 16))
+                            .collect(),
                         Value::Bool(_) => {
                             return Err(invalid(format!("input {}: a boolean cell", feed.id)));
                         }

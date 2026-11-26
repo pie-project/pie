@@ -46,7 +46,9 @@ fn a_load_walks_every_readout_tier_its_set_states() {
                     tokens: &tokens,
                 })
             }])
-            .unwrap_or_else(|why| panic!("a prompt of {rows} rows reading out each is served: {why}"));
+            .unwrap_or_else(|why| {
+                panic!("a prompt of {rows} rows reading out each is served: {why}")
+            });
         assert_eq!(
             shell.take_unbuilt_pipelines(),
             0,

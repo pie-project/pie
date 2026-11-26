@@ -1092,7 +1092,10 @@ mod tests {
         let (stated, walked) = (with(true), with(false));
         assert_eq!(stated.census(), walked.census());
         let apart = stated.apart(&walked).expect("the sets part");
-        assert!(apart.contains("snapshots: true") && apart.contains("snapshots: false"), "{apart}");
+        assert!(
+            apart.contains("snapshots: true") && apart.contains("snapshots: false"),
+            "{apart}"
+        );
         assert_eq!(stated.apart(&stated.clone()), None);
     }
 

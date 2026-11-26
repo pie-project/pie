@@ -215,7 +215,14 @@ mod tests {
             wide: false,
         }]);
         assert!(
-            matches!(refused, Err(Fault::Mask { stated: 3, extent: 4, .. })),
+            matches!(
+                refused,
+                Err(Fault::Mask {
+                    stated: 3,
+                    extent: 4,
+                    ..
+                })
+            ),
             "{refused:?}"
         );
     }

@@ -19,10 +19,12 @@ impl Run<'_> {
     /// The fire's capturing lanes' rows: a score op runs only in a fire one
     /// of whose lanes captures.
     fn capture_seat(&self) -> Result<crate::run::CaptureSeat, kernels_metal::Error> {
-        self.bindings().capture.ok_or_else(|| kernels_metal::Error::Backend {
-            op: "attn.score_capture",
-            detail: "this fire runs a score capture and none of its lanes captures".to_string(),
-        })
+        self.bindings()
+            .capture
+            .ok_or_else(|| kernels_metal::Error::Backend {
+                op: "attn.score_capture",
+                detail: "this fire runs a score capture and none of its lanes captures".to_string(),
+            })
     }
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
@@ -109,9 +111,7 @@ impl Run<'_> {
                     other => {
                         return Err(kernels_metal::Error::Backend {
                             op: "attn.plan_decode",
-                            detail: format!(
-                                "it defines a {other:?}, which is no decode plan kind"
-                            ),
+                            detail: format!("it defines a {other:?}, which is no decode plan kind"),
                         });
                     }
                 }

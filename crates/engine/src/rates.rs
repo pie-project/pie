@@ -1041,7 +1041,9 @@ pub fn keeping_stored(
     existing: Option<&str>,
 ) -> String {
     let Some(stored) = existing.and_then(|text| {
-        registry.parse(text, "the user's file", profile::Strict::User).ok()
+        registry
+            .parse(text, "the user's file", profile::Strict::User)
+            .ok()
     }) else {
         return file;
     };
@@ -1255,7 +1257,10 @@ pub fn resolve_at_load(
     max_submit: Option<std::time::Duration>,
     measuring: Measuring,
     stale_rates: StaleRates,
-    measure: impl FnOnce(Option<std::time::Duration>, &profile::rates::Rates) -> Result<Measured, String>,
+    measure: impl FnOnce(
+        Option<std::time::Duration>,
+        &profile::rates::Rates,
+    ) -> Result<Measured, String>,
 ) -> Result<profile::Profile, String> {
     // A checked-in file this device takes states a rate this pie does not
     // read: it was refused whole, and the load is refused by it.
@@ -1284,8 +1289,11 @@ pub fn resolve_at_load(
         .cloned()
         .filter(|_| stale_rates != StaleRates::Measured || measuring == Measuring::Skip)
         .unwrap_or_default();
-    let estimated: Vec<&'static str> =
-        lacked.iter().copied().filter(|key| stale.states(key)).collect();
+    let estimated: Vec<&'static str> = lacked
+        .iter()
+        .copied()
+        .filter(|key| stale.states(key))
+        .collect();
     let (chip, stated, lacked) = if estimated.is_empty() {
         (chip, stated, lacked)
     } else {
@@ -1329,7 +1337,9 @@ pub fn resolve_at_load(
             );
         }
         let mut tuned = chip.tuned().clone();
-        tuned.skipped.extend(lacked.iter().map(|key| (*key).to_string()));
+        tuned
+            .skipped
+            .extend(lacked.iter().map(|key| (*key).to_string()));
         return Ok(chip.with_tuned(tuned));
     }
     // The step lays its buffers before any of the load's: where the load's
@@ -1461,7 +1471,6 @@ fn civil(days: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400 + i64::from(m <= 2);
     (y, m, d)
 }
-
 
 /// A device's clock read off a reference kernel (a backend's own: engine-gpu's
 /// smallest shape on the matmul curve, CUDA's point's own body): the fastest
@@ -1935,5 +1944,4 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

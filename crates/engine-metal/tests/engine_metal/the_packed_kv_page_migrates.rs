@@ -14,6 +14,7 @@
 //!
 //! We run it at head_dim 256 AND 128 — the two blocks the packed codec ships.
 
+use crate::common::f32_to_bf16_bits;
 use engine::transfer::KvRun;
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -24,7 +25,6 @@ use engine_metal::store::{Pools, Rows, Seats, TableSeat};
 use kernels_metal::Tensor;
 use poem_compiler::chunk::{ChunkProfile, ChunkRecipe, RowId, SlotLayout, TokenRun};
 use poem_ir::{CacheRow, Dtype, Platform, Trace};
-use crate::common::{f32_to_bf16_bits};
 
 const HEADS: usize = 2; // kv_heads
 const PAGE_SIZE: u32 = 8;

@@ -269,8 +269,9 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 capacity: 2,
                 extern_name: Vec::new(),
                 slots: Vec::new(),
-            })
-            .expect("the channel registers");
+            },
+        )
+        .expect("the channel registers");
         let instance = guest
             .bind(
                 &mut engine,

@@ -204,7 +204,11 @@ impl HostOps {
             .ports
             .iter()
             .any(|binding| binding.port == eta_ir::registry::Port::Parents && !binding.is_const);
-        if beam { vec![HostOp::BeamList] } else { Vec::new() }
+        if beam {
+            vec![HostOp::BeamList]
+        } else {
+            Vec::new()
+        }
     }
 
     /// The first op of `needed` this does not serve.
@@ -345,7 +349,6 @@ mod mixed_lanes {
         assert!(laid.fits(&limits, 1, 2608 - 15 - 64, 1));
         assert!(!laid.fits(&limits, 1, 2608 - 15 - 64 + 1, 1));
     }
-
 }
 
 /// The frames in flight an engine states ([`Capabilities::frames_in_flight`])

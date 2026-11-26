@@ -68,8 +68,7 @@ fn fire(
         // The runtime states a kv-less lane so: a group mask is a kv-less
         // lane's.
         stated.kv_less = true;
-        stated.mask =
-            masked.then(|| Masking::Rows((0..n).map(|i| row_mask(at, i, n)).collect()));
+        stated.mask = masked.then(|| Masking::Rows((0..n).map(|i| row_mask(at, i, n)).collect()));
         lanes.push(stated);
         attachments.push(attach(at as u32, &handles));
     }

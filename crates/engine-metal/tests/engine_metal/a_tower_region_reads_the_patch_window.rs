@@ -171,7 +171,9 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
     let mut trunks = 0;
     let mut merge_saw_the_tower = false;
     for (at, region) in compiled.template().iter().enumerate() {
-        let window = windows.at(at as u32, 0).expect("the fire cut this region into this run");
+        let window = windows
+            .at(at as u32, 0)
+            .expect("the fire cut this region into this run");
         match axis_of(&compiled, at) {
             RowAxis::Patches => {
                 towers += 1;
@@ -257,8 +259,12 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
     let with = of(&mixed);
 
     for at in 0..compiled.template().len() {
-        let a = without.at(at as u32, 0).expect("the fire cut this region into this run");
-        let b = with.at(at as u32, 0).expect("the fire cut this region into this run");
+        let a = without
+            .at(at as u32, 0)
+            .expect("the fire cut this region into this run");
+        let b = with
+            .at(at as u32, 0)
+            .expect("the fire cut this region into this run");
         if axis_of(&compiled, at) == RowAxis::Tokens {
             assert_eq!(a.span, b.span, "region {at}'s token window moved");
             assert_eq!(a.indptr_host, b.indptr_host);

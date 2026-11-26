@@ -203,7 +203,10 @@ impl Knobs {
     /// Whether the routed banks stay dense on the device: no expert shape.
     #[must_use]
     pub fn dense_experts(&self) -> bool {
-        matches!(self.weight_pin(), WeightPin::Dense | WeightPin::DenseExperts)
+        matches!(
+            self.weight_pin(),
+            WeightPin::Dense | WeightPin::DenseExperts
+        )
     }
 }
 

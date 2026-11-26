@@ -72,15 +72,47 @@ impl Lay {
         let writes = take(lanes);
         let offsets = take(lanes);
         let common = take(1);
-        Lay { steps, lists, copies, planes, trans, parents, faults, tables, writes, offsets, common, words: at }
+        Lay {
+            steps,
+            lists,
+            copies,
+            planes,
+            trans,
+            parents,
+            faults,
+            tables,
+            writes,
+            offsets,
+            common,
+            words: at,
+        }
     }
 
     /// A step record: `state`'s group of `lanes` beams in a pool of `cap`
     /// pages, `backed` of them translated, at `slot`.
     #[allow(clippy::too_many_arguments)]
-    fn step(&self, state: u32, lanes: u32, cap: u32, reserve: u32, folded: u32, slot: u32, copies: u32, backed: u32) -> [u32; 20] {
-        let (p, t, l, f, c) = (self.parents, self.trans, self.lists, self.faults, self.common);
-        [state, p, t, l, f, lanes, cap, reserve, PAGE, folded, slot, copies, FRAMES, backed, 0, 0, c, 0, 0, 0]
+    fn step(
+        &self,
+        state: u32,
+        lanes: u32,
+        cap: u32,
+        reserve: u32,
+        folded: u32,
+        slot: u32,
+        copies: u32,
+        backed: u32,
+    ) -> [u32; 20] {
+        let (p, t, l, f, c) = (
+            self.parents,
+            self.trans,
+            self.lists,
+            self.faults,
+            self.common,
+        );
+        [
+            state, p, t, l, f, lanes, cap, reserve, PAGE, folded, slot, copies, FRAMES, backed, 0,
+            0, c, 0, 0, 0,
+        ]
     }
 }
 
@@ -147,12 +179,29 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
             store[(lay.writes + b) as usize] = 0xB000 + b;
             store[(lay.offsets + b) as usize] = slot % PAGE;
             let list = (lay.lists + b * kb::LIST_WORDS) as usize;
-            store[list..list + 8].copy_from_slice(&[table + f0, lay.writes + b, lay.offsets + b, b, entries - f0, 1, 0, 0]);
+            store[list..list + 8].copy_from_slice(&[
+                table + f0,
+                lay.writes + b,
+                lay.offsets + b,
+                b,
+                entries - f0,
+                1,
+                0,
+                0,
+            ]);
             let copy = (lay.copies + b * kb::COPY_WORDS) as usize;
             let copies = state + kb::copies_word(lanes, cap, FRAMES) as u32 + 3 * b;
             let planes = PLANES.len() as u32;
-            store[copy..copy + 8]
-                .copy_from_slice(&[copies, lay.trans, lay.faults + b, backed, PAGE, folded - f0 * PAGE, UNIT, planes]);
+            store[copy..copy + 8].copy_from_slice(&[
+                copies,
+                lay.trans,
+                lay.faults + b,
+                backed,
+                PAGE,
+                folded - f0 * PAGE,
+                UNIT,
+                planes,
+            ]);
             store[(lay.parents + b) as usize] = parents[b as usize];
         }
         for (k, plane) in PLANES.iter().enumerate() {
@@ -173,7 +222,16 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
             kb::copy_pages(c, records(lay.copies, lanes), PLANES.len() as u32, PAGE)
         });
 
-        let want = step(&mut host, &parents, Fire { page: PAGE, folded, reserve, slot });
+        let want = step(
+            &mut host,
+            &parents,
+            Fire {
+                page: PAGE,
+                folded,
+                reserve,
+                slot,
+            },
+        );
         // The pool pages: the replay's copies applied to the host's mirror.
         for &[src, dst, tokens] in &want.copies {
             if tokens == 0 || src == dst || want.faults.iter().any(|&f| f == fault::COPY_BOUNDS) {
@@ -190,7 +248,11 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
         let got_store = gpu.down_u32(store_h, lay.words as usize);
         let got_pool = gpu.down_u32(pool_h, pool.len());
         let what = format!("width {lanes}, folded {folded}, fire {t} (slot {slot}, column {c})");
-        assert_eq!(&got_pool[base as usize..], &pool[base as usize..], "{what}: the pool pages its copies moved");
+        assert_eq!(
+            &got_pool[base as usize..],
+            &pool[base as usize..],
+            "{what}: the pool pages its copies moved"
+        );
         let faults = &got_store[lay.faults as usize..(lay.faults + lanes) as usize];
         assert_eq!(faults, want.faults.as_slice(), "{what}: the faults");
         let s = state as usize;
@@ -206,16 +268,28 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
             let table = (lay.tables + b as u32 * columns) as usize;
             let resolved: Vec<u32> = want.lists[b].iter().map(|&q| id_of(q)).collect();
             let entries = &got_store[table + f0 as usize..table + entries as usize];
-            assert_eq!(entries, resolved.as_slice(), "{what}: beam {b}'s resolved entries");
+            assert_eq!(
+                entries,
+                resolved.as_slice(),
+                "{what}: beam {b}'s resolved entries"
+            );
             let write = got_store[lay.writes as usize + b];
-            assert_eq!(write, id_of(want.lists[b][c as usize]), "{what}: beam {b}'s write page");
+            assert_eq!(
+                write,
+                id_of(want.lists[b][c as usize]),
+                "{what}: beam {b}'s write page"
+            );
         }
         // §11.4: the common slot, the longest common prefix of the live
         // beams' histories (a token a fire unique to its beam), capped at
         // the slot past this fire's rows and never below the folded slot.
         histories = (0..lanes as usize)
             .map(|b| {
-                let mut kept = if t == 0 { Vec::new() } else { histories[parents[b] as usize].clone() };
+                let mut kept = if t == 0 {
+                    Vec::new()
+                } else {
+                    histories[parents[b] as usize].clone()
+                };
                 kept.push(t * 64 + b as u32);
                 kept
             })
@@ -223,23 +297,45 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
         let mut lcp = slot + 1 - folded;
         for i in 0..lanes as usize {
             for j in i + 1..lanes as usize {
-                let common = histories[i].iter().zip(&histories[j]).take_while(|(a, b)| a == b).count();
+                let common = histories[i]
+                    .iter()
+                    .zip(&histories[j])
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 lcp = lcp.min(common as u32);
             }
         }
         let common = (folded + lcp).min(slot + 1).max(folded);
-        assert_eq!(got_pool[s + 3], common, "{what}: the common slot in the header");
-        assert_eq!(got_store[lay.common as usize], common, "{what}: the common slot");
+        assert_eq!(
+            got_pool[s + 3],
+            common,
+            "{what}: the common slot in the header"
+        );
+        assert_eq!(
+            got_store[lay.common as usize], common,
+            "{what}: the common slot"
+        );
         let free_at = s + kb::HEADER as usize + 2 * (lanes * cap) as usize;
         let set = |from: usize, count: u32| -> Vec<bool> {
-            got_pool[from..from + count as usize].iter().map(|&w| w != 0).collect()
+            got_pool[from..from + count as usize]
+                .iter()
+                .map(|&w| w != 0)
+                .collect()
         };
         assert_eq!(set(free_at, cap), host.free, "{what}: the free pages");
-        assert_eq!(set(free_at + cap as usize, FRAMES * cap), host.pending, "{what}: the pending pages");
+        assert_eq!(
+            set(free_at + cap as usize, FRAMES * cap),
+            host.pending,
+            "{what}: the pending pages"
+        );
 
         // The next fire's parents: forks and retirements.
         parents = (0..lanes)
-            .map(|b| match rng.next() % 4 { 0 => 0, 1 => b, _ => rng.next() % lanes })
+            .map(|b| match rng.next() % 4 {
+                0 => 0,
+                1 => b,
+                _ => rng.next() % lanes,
+            })
             .collect();
     }
     eprintln!("width {lanes}, folded {folded}: {fires} fires equal the replay's");
@@ -253,7 +349,12 @@ fn a_beam_step_follows_the_spec() {
     };
     for lanes in [2u32, 4, 8] {
         for (at, folded) in [37u32, 48].into_iter().enumerate() {
-            run(&mut gpu, lanes, folded, 0x9E37 + u64::from(lanes) * 31 + at as u64);
+            run(
+                &mut gpu,
+                lanes,
+                folded,
+                0x9E37 + u64::from(lanes) * 31 + at as u64,
+            );
         }
     }
     // Groups wider than the old fixed 64 and than the step's workgroup (256
@@ -277,7 +378,9 @@ fn a_bad_step_faults_by_name() {
         return;
     };
     let (lanes, folded) = (4u32, 21u32);
-    let cap = BeamLayout::of(lanes, folded + 8, PAGE, FRAMES).expect("the layout").cap;
+    let cap = BeamLayout::of(lanes, folded + 8, PAGE, FRAMES)
+        .expect("the layout")
+        .cap;
     let state_words = kb::state_words(lanes, cap, FRAMES) as u32;
     let lay = Lay::of(lanes, cap, 4);
     let pool_words = state_words + (cap + 64) * UNIT;
@@ -295,7 +398,10 @@ fn a_bad_step_faults_by_name() {
             kb::step(c, records)
         });
         let got = gpu.down_u32(store_h, lay.words as usize);
-        (got[lay.faults as usize..(lay.faults + lanes) as usize].to_vec(), gpu.down_u32(pool_h, state_words as usize))
+        (
+            got[lay.faults as usize..(lay.faults + lanes) as usize].to_vec(),
+            gpu.down_u32(pool_h, state_words as usize),
+        )
     };
     // Each fire on the pool the last left: the state carries.
     let pool_h = gpu.up_u32(&vec![0u32; pool_words as usize]);
@@ -306,23 +412,50 @@ fn a_bad_step_faults_by_name() {
         let reserve = (lanes * (c + 2) + lanes * FRAMES + 1).min(cap);
         let backed = engine_gpu::beam::backed(lanes, slot, folded, PAGE, FRAMES, reserve);
         let mut store = vec![0u32; lay.words as usize];
-        store[..kb::STEP_WORDS as usize].copy_from_slice(&lay.step(0, lanes, cap, reserve, folded, slot, 0, backed));
+        store[..kb::STEP_WORDS as usize]
+            .copy_from_slice(&lay.step(0, lanes, cap, reserve, folded, slot, 0, backed));
         for q in 0..backed {
             store[(lay.trans + q) as usize] = 64 + q;
         }
         store[lay.parents as usize..(lay.parents + lanes) as usize].copy_from_slice(parents);
         let (faults, _) = fire(&mut gpu, pool_h, &store);
-        let want = step(&mut host, parents, Fire { page: PAGE, folded, reserve, slot });
+        let want = step(
+            &mut host,
+            parents,
+            Fire {
+                page: PAGE,
+                folded,
+                reserve,
+                slot,
+            },
+        );
         assert_eq!(faults, want.faults, "fire {t}'s faults");
         if t == 1 {
-            assert_eq!(faults, [0, fault::PARENT, 0, 0], "lane 1 alone faults PARENT");
+            assert_eq!(
+                faults,
+                [0, fault::PARENT, 0, 0],
+                "lane 1 alone faults PARENT"
+            );
         }
     }
     let mut store = vec![0u32; lay.words as usize];
     // A pool of more pages than the state's columns hold.
-    store[..kb::STEP_WORDS as usize].copy_from_slice(&lay.step(0, lanes, cap, cap + 1, folded, folded, 0, 0));
+    store[..kb::STEP_WORDS as usize].copy_from_slice(&lay.step(
+        0,
+        lanes,
+        cap,
+        cap + 1,
+        folded,
+        folded,
+        0,
+        0,
+    ));
     let fresh = gpu.up_u32(&vec![0u32; pool_words as usize]);
     let (faults, pool) = fire(&mut gpu, fresh, &store);
-    assert_eq!(faults, [kb::PAGES_TOO_WIDE; 4], "every lane faults the group's code");
+    assert_eq!(
+        faults,
+        [kb::PAGES_TOO_WIDE; 4],
+        "every lane faults the group's code"
+    );
     assert!(pool.iter().all(|&w| w == 0), "nothing was stepped");
 }

@@ -503,7 +503,6 @@ pub fn malloced_since() -> Option<u64> {
 #[cfg(feature = "rocm")]
 static MALLOC_MARK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-
 /// The marks the kept stores' fences hold of streams no live context owns:
 /// none, since a context's close lets go of every mark of its stream
 /// ([`retire_stream`]), and a take queries only live streams' events.
@@ -515,7 +514,13 @@ pub fn dead_marks() -> usize {
         .iter()
         .map(|entry| entry.stream)
         .collect();
-    let dead = |fence: &Fence| fence.0.iter().filter(|mark| !live.contains(&mark.stream)).count();
+    let dead = |fence: &Fence| {
+        fence
+            .0
+            .iter()
+            .filter(|mark| !live.contains(&mark.stream))
+            .count()
+    };
     pool::fences(&dead) + heap::fences(&dead)
 }
 

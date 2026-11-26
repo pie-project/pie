@@ -9,7 +9,7 @@
 
 use engine_metal::Shell;
 
-use super::a_scattered_pool_serves_the_same_logits::{Load, Fixture, fixture_of};
+use super::a_scattered_pool_serves_the_same_logits::{Fixture, Load, fixture_of};
 
 const LOADS: u32 = 200;
 

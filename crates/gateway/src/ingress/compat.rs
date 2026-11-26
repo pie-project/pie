@@ -264,17 +264,20 @@ const CODED: &[(&str, &str)] = &[
 
 /// A failure the runtime coded, with its code in the error body.
 fn coded(message: &str) -> Option<Response> {
-    CODED.iter().find(|(tag, _)| message.contains(tag)).map(|&(_, code)| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {
-                "message": message,
-                "type": "server_error",
-                "code": code,
-            }})),
-        )
-            .into_response()
-    })
+    CODED
+        .iter()
+        .find(|(tag, _)| message.contains(tag))
+        .map(|&(_, code)| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": code,
+                }})),
+            )
+                .into_response()
+        })
 }
 
 fn unix_now() -> u64 {
@@ -662,11 +665,7 @@ pub async fn models(State(state): State<GatewayState>, headers: HeaderMap) -> Re
         priority: Priority::Normal,
         resume: None,
     };
-    let (_handle, mut rx) = match state
-        .sessions
-        .create(identity(&headers), turn)
-        .await
-    {
+    let (_handle, mut rx) = match state.sessions.create(identity(&headers), turn).await {
         Ok(pair) => pair,
         Err(e) => return error_body(StatusCode::SERVICE_UNAVAILABLE, format!("admission: {e}")),
     };
@@ -715,7 +714,10 @@ mod tests {
                 "fire: acquire 9 pages: [admission_refused] refused at admission: the first ask of 9 kv pages fits nowhere",
                 "admission_refused",
             ),
-            ("acquire 1 pages: [tiers_full] every tier is full", "tiers_full"),
+            (
+                "acquire 1 pages: [tiers_full] every tier is full",
+                "tiers_full",
+            ),
             // As the runtime leads a wrapped failure: the code first, the
             // chain after it.
             (
@@ -729,7 +731,9 @@ mod tests {
         ] {
             let response = error_response(message);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["code"], code, "{body}");
         }
@@ -885,5 +889,4 @@ mod tests {
         state_prompt("/v1/chat/completions", &json!({"messages": []}), &mut props);
         assert!(props.is_empty());
     }
-
 }

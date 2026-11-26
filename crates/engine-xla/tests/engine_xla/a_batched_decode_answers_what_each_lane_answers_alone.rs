@@ -12,7 +12,10 @@ const LANES: u32 = 4;
 const STEPS: u32 = 4;
 /// The u4g64 deployments, cut to two layers: gpt-oss's head is 45 groups
 /// of a 201088 vocabulary (where the miscompile bit), qwen3's 64 groups.
-const DEPLOYMENTS: [&str; 2] = ["gptoss-20b-mini-u4g64-mxfp4-kv-bf16", "qwen3-8b-u4g64-kv-bf16"];
+const DEPLOYMENTS: [&str; 2] = [
+    "gptoss-20b-mini-u4g64-mxfp4-kv-bf16",
+    "qwen3-8b-u4g64-kv-bf16",
+];
 
 fn argmax(row: &[f32]) -> usize {
     row.iter()

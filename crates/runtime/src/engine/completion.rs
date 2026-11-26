@@ -143,7 +143,9 @@ fn classify_terminal_outcome(value: u32) -> TerminalOutcome {
 
 #[derive(Debug)]
 enum SubmissionCompletionMode {
-    Terminal { cell: OwnedTerminalCell },
+    Terminal {
+        cell: OwnedTerminalCell,
+    },
     /// Settled once published: a copy's landing, which has no outcome of
     /// its own to tell.
     Landed,
@@ -388,9 +390,7 @@ impl SubmissionCompletion {
                                     "engine callback published before terminal outcome settled"
                                 )))
                             })
-                        } else if let Some(why) =
-                            failed_landings().lock().unwrap().remove(&slot)
-                        {
+                        } else if let Some(why) = failed_landings().lock().unwrap().remove(&slot) {
                             Some(Err(anyhow::Error::new(CopyLandingFailed(why))))
                         } else {
                             Some(Ok(()))

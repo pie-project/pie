@@ -139,7 +139,10 @@ impl PlannerStats {
             self.map_pass_us.fetch_add(us, Relaxed);
         }
         let bucket = (u64::BITS - us.leading_zeros()) as usize;
-        if let Some(count) = self.plan_pass_buckets.get(bucket.min(self.plan_pass_buckets.len() - 1)) {
+        if let Some(count) = self
+            .plan_pass_buckets
+            .get(bucket.min(self.plan_pass_buckets.len() - 1))
+        {
             count.fetch_add(1, Relaxed);
         }
     }
@@ -150,7 +153,11 @@ impl PlannerStats {
     #[must_use]
     pub fn pass_census(&self) -> (u64, u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        let counts: Vec<u64> = self.plan_pass_buckets.iter().map(|c| c.load(Relaxed)).collect();
+        let counts: Vec<u64> = self
+            .plan_pass_buckets
+            .iter()
+            .map(|c| c.load(Relaxed))
+            .collect();
         let passes: u64 = counts.iter().sum();
         let total = self.plan_pass_us.load(Relaxed);
         let mean = total.checked_div(passes).unwrap_or(0);

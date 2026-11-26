@@ -18,7 +18,11 @@ fn a_buffer_asked_after_ready_is_refused_by_name() {
     let why = refused.to_string();
     assert!(why.contains("after the load was ready"), "{why}");
     assert!(why.contains(file!()), "the refusal names its caller: {why}");
-    assert_eq!(engine_cuda::device::free_bytes(), free, "the driver was asked");
+    assert_eq!(
+        engine_cuda::device::free_bytes(),
+        free,
+        "the driver was asked"
+    );
     alloc::loading_from_here();
     assert!(Buffer::zeroed(1 << 20).is_ok(), "a load lays its own");
 }

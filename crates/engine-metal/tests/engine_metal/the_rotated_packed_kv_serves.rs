@@ -387,7 +387,6 @@ fn the_rotated_packed_kv_serves() {
 }
 
 fn serve_case(head_dim: u32) {
-
     // ---- memory: straight from the allocation layer, needs no device --------
     // Any paging gives the same ratio (both dtypes scale by the same cell count);
     // we use the shell's paging so the byte figures are the ones it reserves.
@@ -466,7 +465,11 @@ fn serve_case(head_dim: u32) {
     // the 4-bit path's error at that step (a near-tie the quantization noise
     // tips); anywhere clearer, a flip is a wiring bug.
     for (step, (base, u4)) in baseline.iter().zip(&rot_u4).enumerate() {
-        let err = base.iter().zip(u4).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let err = base
+            .iter()
+            .zip(u4)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
         let gap = margin(base);
         if gap > 2.0 * err {
             assert_eq!(

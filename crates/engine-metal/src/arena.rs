@@ -176,7 +176,9 @@ impl Arena {
     /// holds of the rows a fire's lanes carry in.
     #[must_use]
     pub fn current_tokens(&self) -> u32 {
-        self.rungs.get(self.current).map_or(0, |(tokens, _)| *tokens)
+        self.rungs
+            .get(self.current)
+            .map_or(0, |(tokens, _)| *tokens)
     }
 
     /// The staged regions' bytes at rung `index`, every frame's.
@@ -280,7 +282,10 @@ impl Arena {
     /// regions and its carve.
     #[must_use]
     pub fn reach(&self, rows: FireRows) -> u64 {
-        self.beyond + self.scratch + self.over_carve(self.current) + room(self.carve_for(rows).bytes)
+        self.beyond
+            + self.scratch
+            + self.over_carve(self.current)
+            + room(self.carve_for(rows).bytes)
     }
 
     /// The bytes from the span's end a rung of `tokens` takes: the plane,
@@ -377,7 +382,11 @@ mod tests {
             live_in: Vec::new(),
             bytes,
         };
-        let rungs = vec![(256, map(1 << 20)), (512, map(3 << 20)), (1024, map(2 << 20))];
+        let rungs = vec![
+            (256, map(1 << 20)),
+            (512, map(3 << 20)),
+            (1024, map(2 << 20)),
+        ];
         let chunks = act_chunks(&rungs, 0, &[(0, 0); 3], &[0; 3], 1, 1 << 20);
         assert_eq!(
             chunks.iter().map(|&(t, _)| t).collect::<Vec<_>>(),

@@ -345,8 +345,12 @@ impl Bench {
         run(true)?;
         run(true)?;
         // `PIE_XLA_BENCH_TRACE=<dir>`: a device trace of the timed runs.
-        let trace = std::env::var_os("PIE_XLA_BENCH_TRACE")
-            .and_then(|d| Some((d, crate::pjrt::profiler::Profiler::start(client.api()).ok()?)));
+        let trace = std::env::var_os("PIE_XLA_BENCH_TRACE").and_then(|d| {
+            Some((
+                d,
+                crate::pjrt::profiler::Profiler::start(client.api()).ok()?,
+            ))
+        });
         let started = std::time::Instant::now();
         let mut last = None;
         for i in 0..iters {

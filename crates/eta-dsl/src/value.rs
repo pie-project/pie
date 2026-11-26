@@ -2,8 +2,8 @@ use alloc::vec::Vec;
 
 use eta_ir::container::const_elem_size;
 use eta_ir::expand;
-use eta_ir::op::Op;
 use eta_ir::infer::reduced_dtype;
+use eta_ir::op::Op;
 use eta_ir::types::{
     Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueType, float_result, is_float,
 };

@@ -118,4 +118,3 @@ impl BeamLane {
         self.word(u64::from(self.lanes) * u64::from(self.cap) + u64::from(self.beam))
     }
 }
-

@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::bf16_bits;
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 use poem_ir::InputAxis;
-use crate::common::bf16_bits;
 
 const C_IN: usize = 8;
 const C_MID: usize = 16;

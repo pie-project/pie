@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
+use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -33,7 +34,6 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
-use engine::Engine;
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -991,7 +991,10 @@ impl engine::Programs for Xla {
             _ => engine::program::Footprint::default(),
         };
         Ok(engine::program::ProgramFacts {
-            rings: self.programs.compiled_form(program).map_or_else(Vec::new, |c| c.rings()),
+            rings: self
+                .programs
+                .compiled_form(program)
+                .map_or_else(Vec::new, |c| c.rings()),
             adapter,
             ..Default::default()
         })
@@ -1030,7 +1033,10 @@ impl engine::Programs for Xla {
         extents: &engine::program::BindExtents,
     ) -> EngineResult<engine::program::FireFacts> {
         let _ = extents;
-        let load_temp = self.shell.as_ref().map_or(0, |shell| shell.device().load_temp());
+        let load_temp = self
+            .shell
+            .as_ref()
+            .map_or(0, |shell| shell.device().load_temp());
         Ok(self.programs.fire_facts(program, load_temp))
     }
 
@@ -1299,10 +1305,7 @@ impl engine::Channels for Xla {
         Ok(crate::program::Plane::ring_facts(registration))
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         self.programs
             .register_channel(registration)
             .map_err(refusal)
@@ -1312,22 +1315,13 @@ impl engine::Channels for Xla {
         self.programs.close_channel(id).map_err(refusal)
     }
 
-    fn publish(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.programs
             .publish(instance, channel, cell)
             .map_err(refusal)
     }
 
-    fn take(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.programs.take(instance, channel).map_err(refusal)
     }
 }
@@ -1372,10 +1366,7 @@ impl engine::WeightCache for Xla {
     /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
     /// from sc/tier-shared's contract) lands here; until that contract is
     /// merged only device-to-device copies are served.
-    fn set_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<u64> {
         // This engine holds back none of the chunks it states
         // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
         self.loaded_mut()?
@@ -1420,10 +1411,7 @@ impl engine::Tiers for Xla {
         Ok(())
     }
 
-    fn read(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
     }
 
@@ -1447,11 +1435,7 @@ impl engine::Tiers for Xla {
     /// into host memory before it writes anywhere, and a move within the
     /// device runs as a pool program, ordered ahead of every program (a
     /// fire, a bind's seeds, a channel's cells) enqueued after it.
-    fn copy_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        _token: u64,
-    ) -> EngineResult<bool> {
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, _token: u64) -> EngineResult<bool> {
         engine::Tiers::copy(self, copy)?;
         Ok(true)
     }
@@ -1476,7 +1460,10 @@ impl engine::Tiers for Xla {
         // by its tier too: each tier numbers its slot refs from 0, so a
         // host ref is not the device ref of the same number.
         for &(src, dst) in &copy.slots {
-            let (src, dst) = (tier_key(from, copy.shape, src), tier_key(to, copy.shape, dst));
+            let (src, dst) = (
+                tier_key(from, copy.shape, src),
+                tier_key(to, copy.shape, dst),
+            );
             match self.rs_ahead.get(&src).copied() {
                 Some(at) => self.rs_ahead.insert(dst, at),
                 None => self.rs_ahead.remove(&dst),
@@ -1605,7 +1592,10 @@ impl Xla {
             .shell
             .as_ref()
             .and_then(|shell| shell.pools().window_shape());
-        let kv_shape = self.shell.as_ref().and_then(|shell| shell.pools().kv_shape());
+        let kv_shape = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.pools().kv_shape());
         for attached in &submission.attachments {
             if self.programs.geometry_of(attached.instance) != Some(GeometryClass::DeviceGeometry) {
                 continue;
@@ -1792,7 +1782,13 @@ impl Xla {
             .filter(|attachment| {
                 !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
             })
-            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
+            .map(|attachment| {
+                (
+                    attachment.instance,
+                    attachment.lane,
+                    attachment.lanes.max(1),
+                )
+            })
             .collect();
         if prologues.is_empty() {
             return Ok(());
@@ -1998,7 +1994,10 @@ impl Xla {
         let device = self.device_lanes(submission)?;
         // A page holds what its last owner left until its set writes it: no
         // lane reads past what its set holds written (`engine::extent`).
-        let kv_shape = self.shell.as_ref().and_then(|shell| shell.pools().kv_shape());
+        let kv_shape = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.pools().kv_shape());
         let mut extents = engine::extent::FireExtents::default();
         for (at, lane) in submission.lanes.iter().enumerate() {
             if lane.kv_less {
@@ -2228,7 +2227,9 @@ impl Xla {
         for attachment in &submission.attachments {
             let at = attachment.lane as usize;
             match &mut verbs[at] {
-                engine::fire::RsVerb::Buffer { fold, .. } if *fold == engine::fire::FoldLen::Device => {
+                engine::fire::RsVerb::Buffer { fold, .. }
+                    if *fold == engine::fire::FoldLen::Device =>
+                {
                     if let Some(n) = self
                         .programs
                         .envelope_fold(attachment.instance)
@@ -2239,7 +2240,11 @@ impl Xla {
                     }
                 }
                 engine::fire::RsVerb::Buffer { .. } => {}
-                _ if submission.lanes.get(at).is_some_and(|lane| lane.reports != 0) => {
+                _ if submission
+                    .lanes
+                    .get(at)
+                    .is_some_and(|lane| lane.reports != 0) =>
+                {
                     kv_folds[at] = self
                         .programs
                         .envelope_fold(attachment.instance)
@@ -2492,7 +2497,11 @@ impl Xla {
                     for (b, &code) in words.iter().take(live as usize).enumerate() {
                         if code != 0 {
                             let lane = first + b as u32;
-                            hold.fault_lane(lane, instance, &engine::beam::fault_reason(code, lane as usize, "engine-xla"));
+                            hold.fault_lane(
+                                lane,
+                                instance,
+                                &engine::beam::fault_reason(code, lane as usize, "engine-xla"),
+                            );
                         }
                     }
                     // the group's common slot, after the lanes' faults (§11.3)
@@ -2507,7 +2516,13 @@ impl Xla {
             .attachments
             .iter()
             .filter(|attachment| !attachment.adapter_only)
-            .map(|attachment| (attachment.instance, attachment.lane, attachment.lanes.max(1)))
+            .map(|attachment| {
+                (
+                    attachment.instance,
+                    attachment.lane,
+                    attachment.lanes.max(1),
+                )
+            })
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {
@@ -2645,13 +2660,16 @@ fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) 
 /// shape's first piece, `[run, cow]` (a fork's `cow` differs); none where
 /// it holds no record.
 fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
-    let (id, &[run, cow]) =
-        lane.record.pieces().first().and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
+    let (id, &[run, cow]) = lane
+        .record
+        .pieces()
+        .first()
+        .and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
     Some((ref_key(id, run), ref_key(id, cow)))
 }
 
 /// Whether the lane holds kv pages: its kv list's table names any.
 fn holds_kv(lane: &engine::fire::Lane, kv: Option<engine::chunk::ShapeId>) -> bool {
-    kv.and_then(|id| table_of(lane, id)).is_some_and(|table| !table.is_empty())
+    kv.and_then(|id| table_of(lane, id))
+        .is_some_and(|table| !table.is_empty())
 }
-

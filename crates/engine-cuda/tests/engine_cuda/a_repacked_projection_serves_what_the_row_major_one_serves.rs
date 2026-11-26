@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use crate::common::bf16_bits;
 use checkpoint::contract::ModelContract;
 use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_ir::{TILED_BAND, TILED_STEP, Trace};
-use crate::common::bf16_bits;
 
 const VOCAB: u32 = 1000;
 
@@ -307,13 +307,13 @@ fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
     let contract = micro.load(&src);
     drop(src);
     let staged = engine_cuda::Shell::stage(crate::common::boot(
-            trace.clone(),
-            &contract,
-            &container,
-            poem_compiler::Budget::new(1, 256),
-            256,
-            1,
-        ))
+        trace.clone(),
+        &contract,
+        &container,
+        poem_compiler::Budget::new(1, 256),
+        256,
+        1,
+    ))
     .expect("the micro loads");
     let mut shell = staged.finish().expect("the micro arms");
     shell.open(0).unwrap();

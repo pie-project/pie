@@ -116,11 +116,18 @@ impl BeamLayout {
     /// frames in flight: each beam's pages to `end`, the pages a fire hands
     /// out, those pending over the frames and the prompt's own page
     /// (`BEAM-PAGE-LISTS.md` §3, §4). Refused by name with no depth.
-    pub fn of(lanes: u32, end: u32, page: u32, frames: u32) -> std::result::Result<BeamLayout, String> {
+    pub fn of(
+        lanes: u32,
+        end: u32,
+        page: u32,
+        frames: u32,
+    ) -> std::result::Result<BeamLayout, String> {
         if end <= 1 {
-            return Err("a beam group (parents) binds with no depth: its pass states the slot \
+            return Err(
+                "a beam group (parents) binds with no depth: its pass states the slot \
                         past the search's last row (state-geometry parents-end)"
-                .to_string());
+                    .to_string(),
+            );
         }
         kernels_slang::runtime::beam::admit_lanes(lanes).map_err(|why| why.to_string())?;
         let frames = frames.max(1);
@@ -129,7 +136,9 @@ impl BeamLayout {
             .checked_mul(pages)
             .and_then(|held| held.checked_add(lanes.checked_mul(frames + 1)?))
             .and_then(|held| held.checked_add(1))
-            .ok_or_else(|| format!("a beam group of {lanes} beams to slot {end} passes u32 pages"))?;
+            .ok_or_else(|| {
+                format!("a beam group of {lanes} beams to slot {end} passes u32 pages")
+            })?;
         Ok(BeamLayout {
             lanes,
             cap,
@@ -541,18 +550,33 @@ mod tests {
         let place = ScratchPlace::Run { first: 4, slots: 2 };
         let mut takings = Takings::default();
         assert!(takings.take(&place, 0), "the first bind clears");
-        assert!(!takings.take(&place, 0), "a sibling on the live taking does not");
-        assert!(takings.take(&place, 1), "another taking of the same refs clears");
+        assert!(
+            !takings.take(&place, 0),
+            "a sibling on the live taking does not"
+        );
+        assert!(
+            takings.take(&place, 1),
+            "another taking of the same refs clears"
+        );
         takings.give(&place, 0);
-        assert!(!takings.take(&place, 0), "one instance still holds taking 0");
+        assert!(
+            !takings.take(&place, 0),
+            "one instance still holds taking 0"
+        );
         takings.give(&place, 0);
         takings.give(&place, 0);
-        assert!(takings.take(&place, 0), "taken again once every holder let go");
+        assert!(
+            takings.take(&place, 0),
+            "taken again once every holder let go"
+        );
         assert_ne!(
             takings.group(&place, 0),
             takings.group(&place, 1),
             "each live taking is a group of its own"
         );
-        assert!(!takings.take(&ScratchPlace::None, 0), "no room, nothing to clear");
+        assert!(
+            !takings.take(&ScratchPlace::None, 0),
+            "no room, nothing to clear"
+        );
     }
 }

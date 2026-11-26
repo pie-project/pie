@@ -21,7 +21,7 @@ use engine_metal::{Lane, Shell};
 use poem::{Dtype, Platform};
 
 use super::a_scattered_pool_serves_the_same_logits::{
-    argmax, close, fixture_from, fixture_of, load_with, word, Fixture,
+    Fixture, argmax, close, fixture_from, fixture_of, load_with, word,
 };
 
 /// Rows a lane's fold trails its written end by (a run-ahead window less
@@ -33,7 +33,12 @@ fn a_lagged_window_fold_serves_the_folded_logits() {
     // One case at a time, its fixture built under the lock too: each takes
     // much of the device beside the host memory its checkpoint holds.
     let _heavy = crate::common::one_heavy_load();
-    lagged("gemma4-e4b-mini-l1", &fixture_of("gemma4-e4b-mini-l1", None), 1024, 40);
+    lagged(
+        "gemma4-e4b-mini-l1",
+        &fixture_of("gemma4-e4b-mini-l1", None),
+        1024,
+        40,
+    );
 }
 
 /// Windowed layers of 4-row buffer slots beside a kv list, past a 2048-row
@@ -58,7 +63,12 @@ fn a_lagged_window_fold_beside_a_compressed_kv_list_serves_the_folded_logits() {
     // One case at a time, its fixture built under the lock too: each takes
     // much of the device beside the host memory its checkpoint holds.
     let _heavy = crate::common::one_heavy_load();
-    lagged("dsv4-flash-mini", &fixture_of("dsv4-flash-mini", None), 1024, 700);
+    lagged(
+        "dsv4-flash-mini",
+        &fixture_of("dsv4-flash-mini", None),
+        1024,
+        700,
+    );
 }
 
 /// Two windows (a synthetic miniature, muse-glimmer-30b-mini-l8 with every
@@ -153,14 +163,19 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
     };
     let layout = shell.pool_layout();
     let facts = shell.pool_chunk_facts();
-    let window = layout.window(0).expect("a ring load's window buffer").clone();
+    let window = layout
+        .window(0)
+        .expect("a ring load's window buffer")
+        .clone();
     let page = window.tokens;
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk.max(1));
     let per_window = per(WINDOWS[0]);
     let ring_rows = window.rows.div_ceil(page) * page + page;
     let kv_page = shell.paging().page_size.max(1);
     let kv_pages = context.div_ceil(kv_page);
-    let list_chunks = facts.shape(LIST).map_or(0, |s| kv_pages.div_ceil(s.slots_per_chunk.max(1)));
+    let list_chunks = facts
+        .shape(LIST)
+        .map_or(0, |s| kv_pages.div_ceil(s.slots_per_chunk.max(1)));
     let pieces = layout.pieces;
     let lane_chunks = list_chunks + pieces + ring.pieces + 1;
     eprintln!(
@@ -176,7 +191,9 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
         .map(|lane| {
             let mut at = low + lane * lane_chunks;
             let list = facts.shape(LIST).map(|s| s.slots_per_chunk.max(1));
-            let pages = list.map_or_else(Vec::new, |per| (0..kv_pages).map(|p| at * per + p).collect());
+            let pages = list.map_or_else(Vec::new, |per| {
+                (0..kv_pages).map(|p| at * per + p).collect()
+            });
             at += list_chunks;
             let record = (0..pieces).map(|p| (at + p) * per(FIXED)).collect();
             at += pieces;
@@ -194,7 +211,10 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
 
     // Past the ring's wrap, within the load's context.
     let past = ring_rows + 2 * page;
-    let steps = past.saturating_sub(prompt).max(24).min(context - prompt - 1);
+    let steps = past
+        .saturating_sub(prompt)
+        .max(24)
+        .min(context - prompt - 1);
     // The prompt in pieces a fire takes, each lane folding every piece
     // (past `R - W + 1` rows a piece lands in own-row pages, not straight in
     // the ring); then the decodes, lane 1 trailing. Each lane fires alone: a
@@ -202,7 +222,11 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
     // two lanes of one fire need not agree to the bf16 unit.
     let piece = shell.budgets().tokens.max_tokens.max(1);
     let prompt_tokens: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
-    let mut pieces = prompt_tokens.chunks(piece as usize).map(<[u32]>::to_vec).collect::<Vec<_>>().into_iter();
+    let mut pieces = prompt_tokens
+        .chunks(piece as usize)
+        .map(<[u32]>::to_vec)
+        .collect::<Vec<_>>()
+        .into_iter();
     let mut fed: Vec<u32> = pieces.next().expect("a prompt");
     let mut have = 0u32;
     let mut folded = [0u32; 2];
@@ -214,7 +238,11 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
         let prefilling = end <= prompt;
         let advance = [
             end - folded[0],
-            if prefilling { end - folded[1] } else { end.saturating_sub(LAG).saturating_sub(folded[1]) },
+            if prefilling {
+                end - folded[1]
+            } else {
+                end.saturating_sub(LAG).saturating_sub(folded[1])
+            },
         ];
         let plan: Vec<(WindowFold, Vec<Vec<u32>>)> = (0..2)
             .map(|lane| {
@@ -223,7 +251,11 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
                 // before the fire; one carrying none, after it.
                 let carries = folded[lane] < have;
                 let base = if carries { folded[lane] } else { after } / page * page;
-                let buffer = if carries || after < end { lanes[lane].buffer(base, end, page) } else { Vec::new() };
+                let buffer = if carries || after < end {
+                    lanes[lane].buffer(base, end, page)
+                } else {
+                    Vec::new()
+                };
                 (
                     WindowFold {
                         base,
@@ -255,7 +287,9 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
         let got: Vec<Vec<f32>> = seated
             .iter()
             .map(|lane| {
-                let mut got = shell.fire_seated(std::slice::from_ref(lane)).expect("the fire lands");
+                let mut got = shell
+                    .fire_seated(std::slice::from_ref(lane))
+                    .expect("the fire lands");
                 got.remove(0)
             })
             .collect();
@@ -275,7 +309,10 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
         // Both lanes take lane 0's token: the same rows, step by step.
         fed = vec![argmax(&got[0])];
     }
-    assert!(folded[1] < have && folded[1] + LAG >= have, "{model}: lane 1 still trails");
+    assert!(
+        folded[1] < have && folded[1] + LAG >= have,
+        "{model}: lane 1 still trails"
+    );
     assert!(have > ring_rows, "{model}: past the ring's wrap");
     close(
         &format!("{model}: a lagged window fold against folding every fire"),

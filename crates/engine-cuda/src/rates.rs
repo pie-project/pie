@@ -780,7 +780,12 @@ mod on_device {
             kernels_cuda::linear::gemm::matmul(
                 ctx,
                 Tensor::new(self.act.ptr(), m, k, Dtype::Bf16),
-                Tensor::new(self.weights[w % self.weights.len()].ptr(), n, k, Dtype::Bf16),
+                Tensor::new(
+                    self.weights[w % self.weights.len()].ptr(),
+                    n,
+                    k,
+                    Dtype::Bf16,
+                ),
                 &mut Tensor::new(self.y.ptr(), m, n, Dtype::Bf16),
             )
         }
@@ -788,7 +793,8 @@ mod on_device {
         /// The ns of one rotation over every plane.
         fn rotation(&self, ctx: &Ctx, clock: &Clock) -> Result<f64, String> {
             clock.time(&mut || {
-                (0..self.weights.len()).try_for_each(|w| self.fire(ctx, w).map_err(say("the matmul")))
+                (0..self.weights.len())
+                    .try_for_each(|w| self.fire(ctx, w).map_err(say("the matmul")))
             })
         }
     }

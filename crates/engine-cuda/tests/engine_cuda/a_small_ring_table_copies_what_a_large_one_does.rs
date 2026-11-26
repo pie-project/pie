@@ -59,6 +59,10 @@ fn a_small_ring_table_copies_what_a_large_one_does() {
     assert!(small == large, "several launches land other bytes");
     for i in 0..RUNS {
         let to = ((i * 1237) % RUNS) * slot;
-        assert_eq!(small[to..to + run_bytes(i)], bytes[i * slot..i * slot + run_bytes(i)], "run {i}");
+        assert_eq!(
+            small[to..to + run_bytes(i)],
+            bytes[i * slot..i * slot + run_bytes(i)],
+            "run {i}"
+        );
     }
 }

@@ -873,7 +873,8 @@ impl Pool {
     /// wrong bytes.
     pub fn admit(&self, physical: u32) -> Result<()> {
         let have = self.committed_chunks();
-        let owned = physical < self.total_chunks && (physical < have || physical >= self.top_first());
+        let owned =
+            physical < self.total_chunks && (physical < have || physical >= self.top_first());
         if !owned || !self.mapped_under(physical) {
             return Err(Fault::Ceiling {
                 what: "committed chunks of the state pool",
@@ -1194,7 +1195,12 @@ impl Pool {
     /// `len` bytes from `offset` of the range zeroed on the device, in
     /// `frame`: in queue order behind every frame committed before it, so no
     /// frame in flight is waited on.
-    pub fn zero_in(&self, frame: &mut crate::device::ctx::Frame, offset: u64, len: u64) -> Result<()> {
+    pub fn zero_in(
+        &self,
+        frame: &mut crate::device::ctx::Frame,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
         self.walk(offset, len, |part, local, _, take| {
             frame.fill_zero(part.view.slab(), local, take)
         })
@@ -1232,14 +1238,16 @@ mod tests {
     fn a_state_chunk_inside_the_carve_is_refused_by_name() {
         let device = Context::bind().expect("a device");
         let mut pool = Pool::reserve(&device, CHUNK, 12, 4, 3, u64::MAX).expect("a pool");
-        pool.commit_span(1).expect("the span's segment, lent to state");
+        pool.commit_span(1)
+            .expect("the span's segment, lent to state");
         for chunk in 0..12 {
             pool.clear_of_carve(chunk, chunk).expect("no carve backed");
         }
         // A carve a byte past one chunk takes the top two.
         pool.cover(CHUNK + 1).expect("a carve");
         for chunk in 0..10 {
-            pool.clear_of_carve(chunk, chunk).expect("under the carve's bottom");
+            pool.clear_of_carve(chunk, chunk)
+                .expect("under the carve's bottom");
         }
         for chunk in [10, 11] {
             let refused = pool
@@ -1255,7 +1263,8 @@ mod tests {
         pool.clear_of_carve(11, 3).expect("placed under the carve");
         // SAFETY: nothing ran on this pool.
         unsafe { pool.narrow(1) }.expect("the rung lowers");
-        pool.clear_of_carve(10, 10).expect("the narrowed carve gave it back");
+        pool.clear_of_carve(10, 10)
+            .expect("the narrowed carve gave it back");
         assert!(pool.clear_of_carve(11, 11).is_err());
     }
 
@@ -1294,8 +1303,10 @@ mod tests {
         // SAFETY: nothing ran on this pool.
         unsafe { pool.narrow(small) }.expect("the rung lowers");
         assert!(pool.admit(6).is_err(), "the span's own chunks went back");
-        pool.admit(5).expect("chunk 5 is the bottom's, still backed");
-        pool.read(across, &mut seen).expect("the host copy reads it");
+        pool.admit(5)
+            .expect("chunk 5 is the bottom's, still backed");
+        pool.read(across, &mut seen)
+            .expect("the host copy reads it");
         assert_eq!(seen, [6u8; 64]);
         pool.read(past, &mut seen).expect("the host copy reads it");
         assert_eq!(seen, [8u8; 64]);
@@ -1337,5 +1348,4 @@ mod tests {
         pool.cover(span).expect("the whole span is a carve");
         assert_eq!(pool.covered(), span);
     }
-
 }

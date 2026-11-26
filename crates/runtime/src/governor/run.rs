@@ -10,7 +10,12 @@ use super::{Governor, Growth, Limits, Mapped, PoolTarget, Reader, Retarget, Sign
 /// ledger), every pool that can move is held within it.
 /// `source` is the pressure source the load's yield needs
 /// ([`super::source_for`]), read where the pool moves.
-pub fn start(pool: Shared<Steered>, yields: Yield, room: Option<PoolRoom>, source: Option<super::Source>) {
+pub fn start(
+    pool: Shared<Steered>,
+    yields: Yield,
+    room: Option<PoolRoom>,
+    source: Option<super::Source>,
+) {
     crate::rt::spawn(watch(pool, yields, room, source));
 }
 
@@ -622,9 +627,8 @@ fn said(
             // declared context, the reserved chunks, the activation span
             // and the held dense weights. A long max_context raises it,
             // and with it lowers how far yield can press.
-            let (parts, weights) = pool.with(|pool| {
-                (pool.inner().floor_parts(), pool.cache().pinned_bytes())
-            });
+            let (parts, weights) =
+                pool.with(|pool| (pool.inner().floor_parts(), pool.cache().pinned_bytes()));
             let mib = |bytes: Option<u64>| bytes.map_or(0, |bytes| bytes >> 20);
             tracing::info!(
                 engine,
@@ -848,7 +852,10 @@ mod tests {
         );
         assert_eq!(steer.under(), Some(true));
         pool.pinned = 0;
-        assert_eq!(turn(&mut steer, &mut pool, &mut reader), vec![Signal::Eased]);
+        assert_eq!(
+            turn(&mut steer, &mut pool, &mut reader),
+            vec![Signal::Eased]
+        );
         assert_eq!(pool.segments(), 100);
         // The app goes: the budget comes back.
         std::fs::write(&path, "0").unwrap();
@@ -880,7 +887,11 @@ mod tests {
             let moves = growth != Growth::Fixed;
             assert_eq!(steer.governor().yields().yields(), moves, "{engine}");
             let want = if moves { 100 } else { 1000 };
-            assert_eq!(pool.segments(), want, "{engine}: full yield at full pressure");
+            assert_eq!(
+                pool.segments(),
+                want,
+                "{engine}: full yield at full pressure"
+            );
         }
     }
 
@@ -923,8 +934,8 @@ mod tests {
     fn the_ceiling_follows_a_falling_and_recovering_room() {
         let host = Host::new(1200);
         let mut pool = Pool::on(&host, 1000, ELASTIC);
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         tick(&mut steer, &mut pool);
         assert_eq!(steer.ceiling(), Some(1000 * MIB));
         assert_eq!(pool.segments(), 1000);
@@ -951,8 +962,8 @@ mod tests {
     fn the_log_names_a_change_of_regime() {
         let host = Host::new(900);
         let mut pool = Pool::on(&host, 600, ELASTIC);
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         tick(&mut steer, &mut pool);
         assert_eq!(steer.regime(), Some(Regime::Room));
         // Another app takes 500 MiB: the ceiling falls under what is held.
@@ -970,8 +981,8 @@ mod tests {
         // More room than the pool may ever hold: its hard limit.
         let roomy = Host::new(5000);
         let mut big = Pool::on(&roomy, 600, ELASTIC);
-        let mut held = Steer::new(&big, half())
-            .with_room(&big, Some(PoolRoom::alone(roomy.reader())));
+        let mut held =
+            Steer::new(&big, half()).with_room(&big, Some(PoolRoom::alone(roomy.reader())));
         tick(&mut held, &mut big);
         assert_eq!(held.regime(), Some(Regime::AtLimit));
     }
@@ -980,8 +991,8 @@ mod tests {
     fn the_pool_reaching_and_leaving_its_hard_limit_is_an_edge_each() {
         let host = Host::new(2000);
         let mut pool = Pool::on(&host, 300, ELASTIC);
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         // The room lets it take its whole budget on its first tick, which
         // is named once.
         tick(&mut steer, &mut pool);
@@ -1034,9 +1045,8 @@ mod tests {
     fn pools_on_one_host_are_granted_its_room_once() {
         let (share, ha, hb, _free) = two_pools(1400, 500, 500);
         let (mut a, mut b) = (Pool::on(&ha, 500, ELASTIC), Pool::on(&hb, 500, ELASTIC));
-        let dedicated = |pool: &Pool| {
-            Steer::new(pool, Yield::NONE).with_room(pool, Some(share.pool()))
-        };
+        let dedicated =
+            |pool: &Pool| Steer::new(pool, Yield::NONE).with_room(pool, Some(share.pool()));
         let (mut sa, mut sb) = (dedicated(&a), dedicated(&b));
         tick(&mut sa, &mut a);
         tick(&mut sb, &mut b);
@@ -1091,8 +1101,8 @@ mod tests {
         let host = Host::new(1000);
         let mut pool = Pool::on(&host, 1000, ELASTIC);
         pool.pinned = 700;
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         tick(&mut steer, &mut pool);
         host.others.store(500, Ordering::Relaxed);
         let signals = tick(&mut steer, &mut pool);
@@ -1125,8 +1135,8 @@ mod tests {
         let host = Host::new(1000);
         let mut pool = Pool::on(&host, 1000, ELASTIC);
         pool.pinned = live;
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         assert!(tick(&mut steer, &mut pool).is_empty());
         assert_eq!(steer.ceiling(), Some(1000 * MIB));
 
@@ -1169,8 +1179,8 @@ mod tests {
     fn a_dedicated_pool_is_held_within_the_room_too() {
         let host = Host::new(1000);
         let mut pool = Pool::on(&host, 1000, ELASTIC);
-        let mut steer = Steer::new(&pool, Yield::NONE)
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let mut steer =
+            Steer::new(&pool, Yield::NONE).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         tick(&mut steer, &mut pool);
         assert_eq!(pool.segments(), 1000);
         host.others.store(300, Ordering::Relaxed);
@@ -1206,8 +1216,7 @@ mod tests {
                 reader()
             }
         });
-        let mut steer =
-            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(flaky)));
+        let mut steer = Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(flaky)));
         // Another app holds 300: the pool may hold 700, and grows into it.
         host.others.store(300, Ordering::Relaxed);
         for _ in 0..4 {
@@ -1237,8 +1246,8 @@ mod tests {
         let host = Host::new(1000);
         let mut pool = Pool::on(&host, 600, ELASTIC);
         let unreadable: ::engine::HostRoom = Arc::new(|| Err("no /proc/meminfo".to_string()));
-        let mut steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(unreadable)));
+        let mut steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(unreadable)));
         tick(&mut steer, &mut pool);
         assert_eq!(steer.ceiling(), Some(600 * MIB));
         assert_eq!(pool.segments(), 600);
@@ -1248,8 +1257,8 @@ mod tests {
     fn a_fixed_pool_takes_no_room_reader() {
         let host = Host::new(1000);
         let pool = Pool::on(&host, 1000, Growth::Fixed);
-        let steer = Steer::new(&pool, half())
-            .with_room(&pool, Some(PoolRoom::alone(host.reader())));
+        let steer =
+            Steer::new(&pool, half()).with_room(&pool, Some(PoolRoom::alone(host.reader())));
         assert!(!steer.has_room());
     }
 }

@@ -898,7 +898,10 @@ mod tests {
         };
         let rig = rig_on(table(0), &["default-cluster"], directory).await;
         let req = launch(1, serde_json::json!({}));
-        rig.router.admit(&req, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&req, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         when(&rig.router, || {
             rig.router.placement(&req).2 == [WorkerId(1)]
         })
@@ -919,7 +922,10 @@ mod tests {
         loaded.workers[1].coarse_load.kv_pressure_bucket = 10;
         let rig = rig_on(loaded, &["default-cluster"], DirectoryView::default()).await;
         let first = launch(1, serde_json::json!({}));
-        rig.router.admit(&first, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&first, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         assert_eq!(
             placed_on(&rig, &first),
             Some(vec![WorkerId(2), WorkerId(1)])
@@ -976,10 +982,7 @@ mod tests {
         // Worker 1 full: its sessions go to the other.
         let rig = pressed(255).await;
         for connection in 0..16 {
-            assert_eq!(
-                first(&rig, connection, connection, None).await,
-                WorkerId(2)
-            );
+            assert_eq!(first(&rig, connection, connection, None).await, WorkerId(2));
         }
     }
 
@@ -1034,7 +1037,11 @@ mod tests {
             let (router, routing, order) = (rig.router.clone(), rig.routing.clone(), order.clone());
             waits.push(tokio::spawn(async move {
                 router
-                    .admit(&launch(req, serde_json::json!({})), Facts::default(), &routing)
+                    .admit(
+                        &launch(req, serde_json::json!({})),
+                        Facts::default(),
+                        &routing,
+                    )
                     .await
                     .unwrap();
                 order.lock().unwrap().push(req);
@@ -1059,7 +1066,10 @@ mod tests {
     async fn a_reload_swaps_the_policies_and_withdraws_the_old_ones_rows() {
         let rig = rig(0).await;
         let placed = launch(1, serde_json::json!({"to": "1"}));
-        rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&placed, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         assert_eq!(placed_on(&rig, &placed), Some(vec![WorkerId(1)]));
         // An empty list holds a launch at the gateway.
         let held = launch(2, serde_json::json!({"to": ""}));
@@ -1085,7 +1095,10 @@ mod tests {
         for names in [["test-share", "test-route"], ["test-route", "test-share"]] {
             let rig = rig_of(0, &names).await;
             let placed = launch(1, serde_json::json!({"to": "1"}));
-            rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
+            rig.router
+                .admit(&placed, Facts::default(), &rig.routing)
+                .await
+                .unwrap();
             assert_eq!(placed_on(&rig, &placed), Some(vec![WorkerId(1)]));
             rig.host
                 .decisions(GatewayId(0))
@@ -1147,7 +1160,10 @@ mod tests {
         );
         // test-route still places.
         let placed = launch(1, serde_json::json!({"to": "1"}));
-        rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&placed, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         assert_eq!(placed_on(&rig, &placed), Some(vec![WorkerId(1)]));
     }
 
@@ -1162,8 +1178,14 @@ mod tests {
             let (router, routing, held) = (rig.router.clone(), rig.routing.clone(), held.clone());
             async move { router.admit(&held, Facts::default(), &routing).await }
         });
-        rig.router.admit(&listed, Facts::default(), &rig.routing).await.unwrap();
-        rig.router.admit(&free, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&listed, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
+        rig.router
+            .admit(&free, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         queued(&rig.router, &held).await;
         assert!(!waiting.is_finished(), "an empty list holds it");
         assert_eq!(placed_on(&rig, &held), Some(Vec::new()));
@@ -1182,13 +1204,20 @@ mod tests {
     async fn a_terminated_launch_is_refused_while_it_waits_and_cancelled_once_it_runs() {
         let mut rig = rig(0).await;
         let refused = launch(1, serde_json::json!({"refuse": "not today"}));
-        match rig.router.admit(&refused, Facts::default(), &rig.routing).await {
+        match rig
+            .router
+            .admit(&refused, Facts::default(), &rig.routing)
+            .await
+        {
             Err(AdmitReject::Refused(why)) => assert_eq!(why, "not today"),
             other => panic!("refused while it waits, got {other:?}"),
         }
 
         let stopped = launch(2, serde_json::json!({"stop": true}));
-        rig.router.admit(&stopped, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&stopped, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         rig.router.dispatched(&stopped, WorkerId(1));
         rig.router.started(&stopped);
         assert_eq!(rig.cancelled.recv().await, Some(ReqId(2)));
@@ -1205,7 +1234,10 @@ mod tests {
             "t/s".into(),
             serde_json::from_value(serde_json::json!({"to": "1,2"})).unwrap(),
         );
-        rig.router.admit(&placed, Facts::default(), &rig.routing).await.unwrap();
+        rig.router
+            .admit(&placed, Facts::default(), &rig.routing)
+            .await
+            .unwrap();
         until_placed(&rig, &placed, Some(vec![WorkerId(1), WorkerId(2)])).await;
         rig.router.dispatched(&placed, WorkerId(1));
 
@@ -1322,9 +1354,15 @@ mod tests {
             launch(1, serde_json::json!({"key": 1})),
             launch(2, serde_json::json!({})),
         );
-        router.admit(&live, Facts::default(), &routing).await.unwrap();
+        router
+            .admit(&live, Facts::default(), &routing)
+            .await
+            .unwrap();
         router.dispatched(&live, WorkerId(1));
-        router.admit(&gone, Facts::default(), &routing).await.unwrap();
+        router
+            .admit(&gone, Facts::default(), &routing)
+            .await
+            .unwrap();
         router.exited(&gone, Outcome::Completed);
         let changes: Props = serde_json::from_value(serde_json::json!({"eta": 9})).unwrap();
         router.session_props("t/s".into(), changes);

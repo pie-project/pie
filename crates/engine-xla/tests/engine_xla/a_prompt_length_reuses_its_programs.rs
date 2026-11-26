@@ -101,7 +101,10 @@ fn seated<'a>(
         tokens,
     });
     let pages = after.div_ceil(PAGE) as usize;
-    let table = lane.tables.first().map_or(&[][..], |(_, table)| table.as_slice());
+    let table = lane
+        .tables
+        .first()
+        .map_or(&[][..], |(_, table)| table.as_slice());
     seated.pages = &table[..pages.min(table.len())];
     seated.fixed = lane.record.pieces();
     seated
@@ -114,10 +117,14 @@ fn seated<'a>(
 fn a_masked_prompt_runs_the_ladders_programs() {
     use engine::fire::{FoldLen, Lineage, Mask, Masking, RsVerb};
     const HELD: u32 = 64;
-    const ROWS: [u32; 17] = [2, 3, 5, 7, 8, 14, 15, 16, 17, 29, 30, 31, 32, 63, 64, 100, 127];
+    const ROWS: [u32; 17] = [
+        2, 3, 5, 7, 8, 14, 15, 16, 17, 29, 30, 31, 32, 63, 64, 100, 127,
+    ];
     let rules = engine::StepRules::runtime();
     let mut shell = shell_of("qwen35-d0.8b-vision-mtp-bf16-kv-bf16", Some(&rules));
-    shell.warm_maintenance().expect("the maintenance programs lay");
+    shell
+        .warm_maintenance()
+        .expect("the maintenance programs lay");
     let stated = shell.stated_steps(&rules);
     let steps = stated.shapes.clone();
     shell.set_steps(stated.shapes);

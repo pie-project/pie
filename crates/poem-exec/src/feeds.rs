@@ -303,14 +303,15 @@ fn output_decl(
     let (first, dtype) = shape(values[0])?;
     // A row as wide as the load makes it: `runs` runs of its context, or
     // its context's pages; stated as the runs it is.
-    let context_runs = |value: ValueId| match trace.values.get(value.0 as usize).map(|decl| &decl.ty) {
-        Some(Ty::Tensor { shape, .. }) => match shape[..] {
-            [_, Dim::ContextTimes(runs)] => Some((runs, context)),
-            [_, Dim::ContextPages] => Some((1, context.div_ceil(page_size.max(1)))),
+    let context_runs =
+        |value: ValueId| match trace.values.get(value.0 as usize).map(|decl| &decl.ty) {
+            Some(Ty::Tensor { shape, .. }) => match shape[..] {
+                [_, Dim::ContextTimes(runs)] => Some((runs, context)),
+                [_, Dim::ContextPages] => Some((1, context.div_ceil(page_size.max(1)))),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    };
+        };
     let width_of = |value: ValueId| match context_runs(value) {
         Some((runs, run)) => Ok(u64::from(runs) * u64::from(run)),
         None => crate::store::kv::width_of(trace, value)
@@ -351,10 +352,15 @@ fn output_decl(
     // runs multiply to the width.
     let planes = match context_runs(values[0]) {
         Some((runs, run)) => vec![runs, run],
-        None => outputs.first().map(|output| output.planes.clone()).unwrap_or_default(),
+        None => outputs
+            .first()
+            .map(|output| output.planes.clone())
+            .unwrap_or_default(),
     };
     if context_runs(values[0]).is_none() && outputs.iter().any(|output| output.planes != planes) {
-        return Err(format!("output `{name}` is written at different planes by its layers"));
+        return Err(format!(
+            "output `{name}` is written at different planes by its layers"
+        ));
     }
     if !planes.is_empty() && planes.iter().map(|&p| u64::from(p)).product::<u64>() != width {
         return Err(format!(

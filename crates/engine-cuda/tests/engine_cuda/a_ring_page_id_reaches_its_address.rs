@@ -68,7 +68,10 @@ fn a_ring_page_id_reaches_its_address() {
     for (key, pages) in seated.into_iter().enumerate() {
         assert!(!pages.is_empty(), "a windowed load's record holds a ring");
         for (page, &(id, at)) in pages.iter().enumerate() {
-            assert!(reaches(id, at), "record {key}'s ring page {page}: id {id} at {at:#x}");
+            assert!(
+                reaches(id, at),
+                "record {key}'s ring page {page}: id {id} at {at:#x}"
+            );
         }
     }
     for page in 0..4 {

@@ -386,5 +386,4 @@ mod tests {
         drop(held);
         assert_eq!(waiter.join().unwrap().unwrap(), 0);
     }
-
 }

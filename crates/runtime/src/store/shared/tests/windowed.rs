@@ -199,10 +199,7 @@ fn a_beam_group_shares_one_folded_window() {
     let plan = one(vec![0, 1, 2], 17..20, GroupFold::Host(4));
     let out = prepare_many(&mut rs, &[ws; 3], &plan, None).unwrap();
     let lanes = lanes_of(&out, &shared, &[(17, 1), (18, 1), (19, 1)], 5);
-    let folds: Vec<FoldLen> = lanes
-        .iter()
-        .map(|lane| lane.window.unwrap().fold)
-        .collect();
+    let folds: Vec<FoldLen> = lanes.iter().map(|lane| lane.window.unwrap().fold).collect();
     assert_eq!(
         folds,
         vec![FoldLen::Host(4), FoldLen::Host(0), FoldLen::Host(0)],
@@ -247,7 +244,10 @@ fn a_fire_too_wide_for_the_free_buffer_slots_is_cut_not_refused() {
         snapshots: Vec::new(),
         beams: false,
     }]);
-    assert_eq!(demand(&rs, &[ws], &folds_all).map(|units| units.pages), Ok(0));
+    assert_eq!(
+        demand(&rs, &[ws], &folds_all).map(|units| units.pages),
+        Ok(0)
+    );
 
     // Left unfolded: the whole asks more than stands free, and is counted.
     let rows = (free + 8) * WB_TOKENS;
@@ -268,15 +268,24 @@ fn a_fire_too_wide_for_the_free_buffer_slots_is_cut_not_refused() {
         };
         let plan = one(vec![0], at..end, fold);
         let piece = demand(&rs, &[ws], &plan).unwrap();
-        assert!(piece.pages <= 16 / WB_TOKENS, "a piece asks its own rows' slots");
+        assert!(
+            piece.pages <= 16 / WB_TOKENS,
+            "a piece asks its own rows' slots"
+        );
         asked += piece.pages;
         let out = prepare_many(&mut rs, &[ws], &plan, None).unwrap();
         settle(&mut rs, out.txn);
         rs.retire_idle();
-        assert!(rs.held([ws]).pages <= 2 * 16 / WB_TOKENS, "two pieces' slots at most");
+        assert!(
+            rs.held([ws]).pages <= 2 * 16 / WB_TOKENS,
+            "two pieces' slots at most"
+        );
         at = end;
     }
-    assert_eq!(asked, whole.pages, "the pieces asked what the whole would, in turn");
+    assert_eq!(
+        asked, whole.pages,
+        "the pieces asked what the whole would, in turn"
+    );
     assert!(asked > free, "more than stood free at once");
 }
 
@@ -291,7 +300,9 @@ const HY_WB_TOKENS: u32 = 8;
 /// a slot) and the window buffer (8 rows a slot).
 fn hybrid_facts() -> ChunkFacts {
     let mut facts = facts();
-    facts.shapes.retain(|shape| shape.id == LIST || shape.id == CONV);
+    facts
+        .shapes
+        .retain(|shape| shape.id == LIST || shape.id == CONV);
     facts.shapes.insert(
         1,
         Facts {
@@ -360,7 +371,11 @@ fn a_hybrid_parks_both_buffers_and_its_whole_record() {
     settle(&mut rs, out.txn);
     let export = rs.export(ws).unwrap();
     assert_eq!(export.buffer.iter().flatten().count(), 2, "rs 4..8, 8..12");
-    assert_eq!(export.wbuffer.iter().flatten().count(), 2, "window 0..8, 8..16");
+    assert_eq!(
+        export.wbuffer.iter().flatten().count(),
+        2,
+        "window 0..8, 8..16"
+    );
     let sets = HashSet::from([ws]);
     let held = rs.suspendable(&sets);
     assert_eq!(
@@ -383,8 +398,12 @@ fn a_hybrid_parks_both_buffers_and_its_whole_record() {
         assert!(moved.contains(&shape), "{shape:?} in {moved:?}");
     }
     assert_eq!(rs.commit_suspend(txn), held);
-    let mut grant = rs.reserve(rs.swapped_units(&sets)).expect("room to come back");
-    let txn = rs.prepare_restore(&sets, &mut grant).expect("it comes back");
+    let mut grant = rs
+        .reserve(rs.swapped_units(&sets))
+        .expect("room to come back");
+    let txn = rs
+        .prepare_restore(&sets, &mut grant)
+        .expect("it comes back");
     rs.commit_restore(txn);
     assert_eq!(rs.suspendable(&sets), held, "on the device again");
 }
@@ -406,14 +425,21 @@ fn a_fold_s_freed_slots_stay_held_until_its_fire_settles() {
     settle(&mut rs, out.txn);
 
     // Frame N: A folds through 12, freeing the slots of rows 4..12.
-    let folding = prepare_many(&mut rs, &[a], &one(vec![0], 13..14, GroupFold::Host(6)), None)
-        .unwrap();
+    let folding = prepare_many(
+        &mut rs,
+        &[a],
+        &one(vec![0], 13..14, GroupFold::Host(6)),
+        None,
+    )
+    .unwrap();
     rs.retire_idle();
     let freed: HashSet<u32> = held[..2].iter().copied().collect();
     let free_before = rs.free().pages;
 
     // Frame N+1, staged while N runs: B takes every slot that stands free.
-    let grant = rs.reserve(RsUnits::of(0, free_before)).expect("what stands free");
+    let grant = rs
+        .reserve(RsUnits::of(0, free_before))
+        .expect("what stands free");
     let taken: HashSet<u32> = grant.pages.iter().map(|&id| rs.engine_id(id)).collect();
     assert!(
         taken.is_disjoint(&freed),
@@ -424,7 +450,10 @@ fn a_fold_s_freed_slots_stay_held_until_its_fire_settles() {
     let theirs: HashSet<u32> = table(&lanes_of(&out, &shared, &[(6, 4)], 6)[0])
         .into_iter()
         .collect();
-    assert!(theirs.is_disjoint(&freed), "B's rows land in slots of their own");
+    assert!(
+        theirs.is_disjoint(&freed),
+        "B's rows land in slots of their own"
+    );
 
     // Frame N lands: its freed slots come back.
     settle(&mut rs, folding.txn);

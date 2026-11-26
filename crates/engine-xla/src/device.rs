@@ -273,9 +273,11 @@ impl Device {
         })?;
         let client = self.client()?;
         let device = self.device()?;
-        let host = client.memory(device, "pinned_host")?.ok_or_else(|| Fault::Unbound {
-            what: "pinned host memory, which this device does not address".to_string(),
-        })?;
+        let host = client
+            .memory(device, "pinned_host")?
+            .ok_or_else(|| Fault::Unbound {
+                what: "pinned host memory, which this device does not address".to_string(),
+            })?;
         Ok(client.upload_to(device, Some(host), bytes, element_type(ty.elem), &ty.dims)?)
     }
 
@@ -953,7 +955,10 @@ impl Device {
 
     #[must_use]
     pub fn holds_key(&self, key: &[u8; 32]) -> bool {
-        self.cache.lock().expect("cache lock poisoned").contains_key(key)
+        self.cache
+            .lock()
+            .expect("cache lock poisoned")
+            .contains_key(key)
     }
 
     /// Takes `key`'s program out of the cache, the caller its last holder
@@ -1411,7 +1416,11 @@ impl HostRoom {
             // pass it on a program's estimate falling short
             let hold = (st.per_kib > 0).then(|| {
                 let own = st.per_kib.saturating_mul(len) / 1024;
-                if self.stated.is_some() { own.max(st.most) } else { own }
+                if self.stated.is_some() {
+                    own.max(st.most)
+                } else {
+                    own
+                }
             });
             let fits = match hold {
                 // unmeasured: alone, where there is room at all
@@ -1545,13 +1554,15 @@ impl CompileGate {
         loop {
             let fits = st.running == 0
                 || (st.running < 2 * st.ended
-                    && available_memory().is_none_or(|free| {
-                        free >= st.largest.saturating_mul(st.running + 1)
-                    }));
+                    && available_memory()
+                        .is_none_or(|free| free >= st.largest.saturating_mul(st.running + 1)));
             if fits {
                 break;
             }
-            st = self.ended.wait(st).expect("the compile gate's lock poisoned");
+            st = self
+                .ended
+                .wait(st)
+                .expect("the compile gate's lock poisoned");
         }
         st.running += 1;
         Gated {
@@ -1563,7 +1574,11 @@ impl CompileGate {
 
 impl Drop for Gated<'_> {
     fn drop(&mut self) {
-        let mut st = self.by.state.lock().expect("the compile gate's lock poisoned");
+        let mut st = self
+            .by
+            .state
+            .lock()
+            .expect("the compile gate's lock poisoned");
         let grew = resident_bytes().unwrap_or(0).saturating_sub(self.resident);
         st.largest = st.largest.max(grew / st.running.max(1));
         st.running -= 1;
@@ -1601,9 +1616,15 @@ impl Admission {
     /// Waits until a compile of `text` fits the room.
     pub(crate) fn admit(&self, text: &str) -> Admitted<'_> {
         let need = compile_need(text);
-        let mut busy = self.running.lock().expect("the compile admission lock poisoned");
+        let mut busy = self
+            .running
+            .lock()
+            .expect("the compile admission lock poisoned");
         while *busy > 0 && *busy + need > self.room {
-            busy = self.ended.wait(busy).expect("the compile admission lock poisoned");
+            busy = self
+                .ended
+                .wait(busy)
+                .expect("the compile admission lock poisoned");
         }
         *busy += need;
         Admitted { by: self, need }
@@ -1612,7 +1633,11 @@ impl Admission {
 
 impl Drop for Admitted<'_> {
     fn drop(&mut self) {
-        *self.by.running.lock().expect("the compile admission lock poisoned") -= self.need;
+        *self
+            .by
+            .running
+            .lock()
+            .expect("the compile admission lock poisoned") -= self.need;
         self.by.ended.notify_all();
     }
 }

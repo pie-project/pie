@@ -6,10 +6,10 @@ use tokio::sync::Notify;
 use super::grant::{AllocationGrant, Demand, DevicePageReservation, RsSlotReservation};
 use super::holdings::{swapped_page_count, swapped_rs_units};
 use super::inner::RestoreGate;
-use super::proc::{PendingBind, Residency};
 use super::pool::{IdleShort, RunNeed};
-use super::wait::{EntryKey, WaitKind, Waiter};
+use super::proc::{PendingBind, Residency};
 use super::residency_planner::IdleOutcome;
+use super::wait::{EntryKey, WaitKind, Waiter};
 use super::{ProcessId, ResidencyPlanner, exec};
 use crate::store::rs::RsUnits;
 
@@ -50,7 +50,10 @@ enum Step {
     /// runs of whole chunks.
     /// Room is made for it only where `fund` (the fleet stalled or
     /// waiting at binds); free runs of its need send it again either way.
-    EvictForRoles { need: (u32, u32), fund: bool },
+    EvictForRoles {
+        need: (u32, u32),
+        fund: bool,
+    },
     /// The head is a restore of a process a bind short of guest-state
     /// room suspended, its kv gathered: it waits for the room that bind
     /// asks as the bind would ([`Self::BindRoom`]).
@@ -87,8 +90,7 @@ enum Board {
 /// ([`super::residency_planner::ADMIT_SAYS_AFTER`]), the drain task looking
 /// with no plan pass: a stall that goes on is never silent, and no timer
 /// ends it.
-pub(super) const STALL_SAYS_AGAIN: std::time::Duration =
-    super::residency_planner::ADMIT_SAYS_AFTER;
+pub(super) const STALL_SAYS_AGAIN: std::time::Duration = super::residency_planner::ADMIT_SAYS_AFTER;
 
 /// A count of processes and the first few of them, for a log line.
 pub(super) fn some_pids<'a>(pids: impl ExactSizeIterator<Item = &'a ProcessId>) -> String {
@@ -124,7 +126,10 @@ impl ResidencyPlanner {
         // ended on reads what that pass read, and plans nothing new. A
         // stuck head is said once and costs no pass until an event.
         let generation = self.generation();
-        tracing::debug!("plan pass settled={}", *self.settled_at.lock() == Some(generation));
+        tracing::debug!(
+            "plan pass settled={}",
+            *self.settled_at.lock() == Some(generation)
+        );
         if *self.settled_at.lock() == Some(generation) {
             self.stats.skipped_wakes.fetch_add(1, Ordering::Relaxed);
             self.returns
@@ -410,7 +415,12 @@ impl ResidencyPlanner {
                 .and_then(|proc| proc.bind_room)
                 .map(|need| need.entries())
                 .unwrap_or_default();
-            Some((waiter.pid, waiter.rs_need(), bind, inner.restore_kv_missing(head)))
+            Some((
+                waiter.pid,
+                waiter.rs_need(),
+                bind,
+                inner.restore_kv_missing(head),
+            ))
         })?;
         Some(self.port.restore_placement(pid, need, state, kv, &bind))
     }
@@ -474,7 +484,11 @@ impl ResidencyPlanner {
             super::grant::WAKE_BEAT => "beat",
             _ => "call (an arrival, a release)",
         };
-        let now = (self.port.free_chunks(), self.port.device_stats().0, self.raw_swap_free());
+        let now = (
+            self.port.free_chunks(),
+            self.port.device_stats().0,
+            self.raw_swap_free(),
+        );
         for super::wait::LongWait {
             kind,
             lacked,
@@ -482,7 +496,13 @@ impl ResidencyPlanner {
             waited,
         } in waits
         {
-            let want = |n: u64| if n == u64::MAX { "-".to_owned() } else { n.to_string() };
+            let want = |n: u64| {
+                if n == u64::MAX {
+                    "-".to_owned()
+                } else {
+                    n.to_string()
+                }
+            };
             if let Some(count) = self.stats.long_waits.get(usize::from(cause)) {
                 count.fetch_add(1, Ordering::Relaxed);
             }
@@ -609,7 +629,9 @@ impl ResidencyPlanner {
             // Its kv pages still to gather: an allocation's need, and a
             // restore's beside its runs.
             let kv_missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-            let again = inner.stall_dumped.is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
+            let again = inner
+                .stall_dumped
+                .is_some_and(|(at, seen, _)| (at, seen) == (key, gives));
             inner.stall_dumped = Some((key, gives, crate::rt::Instant::now()));
             // Said once a stall episode (the head stuck, whatever room moves
             // meanwhile), and again only as a stall that goes on: said on
@@ -621,10 +643,33 @@ impl ResidencyPlanner {
                 inner.stall_said = Some((key, crate::rt::Instant::now()));
             }
             let (plan, blocked) = inner.plan_fields(key);
-            Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run, say))
+            Some((
+                key,
+                pid,
+                kind,
+                pids,
+                again,
+                refusal,
+                kv_missing,
+                plan,
+                blocked,
+                refused_run,
+                say,
+            ))
         });
-        let Some((key, pid, kind, pids, again, refusal, kv_missing, plan, blocked, refused_run, say)) =
-            stalled
+        let Some((
+            key,
+            pid,
+            kind,
+            pids,
+            again,
+            refusal,
+            kv_missing,
+            plan,
+            blocked,
+            refused_run,
+            say,
+        )) = stalled
         else {
             return;
         };
@@ -639,7 +684,10 @@ impl ResidencyPlanner {
         if self.with_inner(|inner| {
             inner.truly_wedged()
                 && (!inner.host_swap_blocked.is_empty()
-                    || inner.last_plan.as_ref().is_some_and(|end| end.host_short || !end.unhostable.is_empty()))
+                    || inner
+                        .last_plan
+                        .as_ref()
+                        .is_some_and(|end| end.host_short || !end.unhostable.is_empty()))
         }) && !self.waits_on_policy()
             && self.fail_tiers_full(None)
         {
@@ -652,12 +700,20 @@ impl ResidencyPlanner {
         // A head short of kv reads the map at runs of one chunk: what holds
         // the chunks it could take, parked state lying on the device among
         // it (a no-host pool's parked-in-place sets).
-        let run = need.as_ref().and_then(RunNeed::longest).map_or(1, |(run, _)| run);
+        let run = need
+            .as_ref()
+            .and_then(RunNeed::longest)
+            .map_or(1, |(run, _)| run);
         // The candidates the eviction pass reads (nothing is in flight
         // here: every member), so the dump's map is the plan's.
         let pids: Vec<ProcessId> = self
             .victim_set()
-            .map(|set| set.candidates(true).into_iter().map(|(pid, _)| pid).collect())
+            .map(|set| {
+                set.candidates(true)
+                    .into_iter()
+                    .map(|(pid, _)| pid)
+                    .collect()
+            })
             .unwrap_or(pids);
         let mut map = self.occupants(&pids);
         map.merge(self.parked_map(pid));
@@ -665,7 +721,9 @@ impl ResidencyPlanner {
         // map's own line reads one run of the longest length alone), a
         // restore's own takes placed first by the store's takes, as the
         // eviction plan reads it ([`Self::head_placement`]).
-        let placement = need.as_ref().and_then(|need| self.head_placement(key, need));
+        let placement = need
+            .as_ref()
+            .and_then(|need| self.head_placement(key, need));
         if let Some(placement) = &placement {
             placement.lay(&mut map);
         }
@@ -687,42 +745,42 @@ impl ResidencyPlanner {
         // its ask): unserved with nothing in flight, the planner found no
         // step for room that is there, which is its bug, never a wait.
         if say {
-        tracing::error!(
-            ?key,
-            %pid,
-            kind,
-            need = ?need,
-            short = ?short,
-            own_opened = ?placement.as_ref().map(|placement| placement.opened.len()),
-            bind_free_runs_after_own = ?placement.as_ref().and_then(|placement| placement.bind_free_runs),
-            kv_missing,
-            kv_chunks = kv_missing.div_ceil(self.port.chunks_as_pages(1).max(1)),
-            again,
-            refusal = %refusal.unwrap_or_default(),
-            map_room_at_refused_run = ?map_room,
-            ?need_moves,
-            %plan,
-            %blocked,
-            capped = %self.capped_line(),
-            passes = ?self.pass_census(),
-            skipped_wakes = self.stats.skipped_wakes.load(Ordering::Relaxed),
-            map_cache_hits = self.stats.map_cache_hits.load(Ordering::Relaxed),
-            swap = ?self.swap_stats(),
-            %held_by,
-            %store,
-            free_runs = ?need.as_ref().map(|need| {
-                need.entries()
-                    .iter()
-                    .map(|&(run, _)| (run, self.port.guest_free_runs(run)))
-                    .collect::<Vec<_>>()
-            }),
-            device = ?(free, total),
-            queue = %self.debug_queue(),
-            %map,
-            pool = %census,
-            "planner: the queue's head fits the pool alone and is unserved with nothing in \
-             flight (a planner bug: no step found)"
-        );
+            tracing::error!(
+                ?key,
+                %pid,
+                kind,
+                need = ?need,
+                short = ?short,
+                own_opened = ?placement.as_ref().map(|placement| placement.opened.len()),
+                bind_free_runs_after_own = ?placement.as_ref().and_then(|placement| placement.bind_free_runs),
+                kv_missing,
+                kv_chunks = kv_missing.div_ceil(self.port.chunks_as_pages(1).max(1)),
+                again,
+                refusal = %refusal.unwrap_or_default(),
+                map_room_at_refused_run = ?map_room,
+                ?need_moves,
+                %plan,
+                %blocked,
+                capped = %self.capped_line(),
+                passes = ?self.pass_census(),
+                skipped_wakes = self.stats.skipped_wakes.load(Ordering::Relaxed),
+                map_cache_hits = self.stats.map_cache_hits.load(Ordering::Relaxed),
+                swap = ?self.swap_stats(),
+                %held_by,
+                %store,
+                free_runs = ?need.as_ref().map(|need| {
+                    need.entries()
+                        .iter()
+                        .map(|&(run, _)| (run, self.port.guest_free_runs(run)))
+                        .collect::<Vec<_>>()
+                }),
+                device = ?(free, total),
+                queue = %self.debug_queue(),
+                %map,
+                pool = %census,
+                "planner: the queue's head fits the pool alone and is unserved with nothing in \
+                 flight (a planner bug: no step found)"
+            );
         }
         // A planner bug, never the head's: it waits on the next room, rung
         // or arrival event, never refused (only a need past the pool alone
@@ -755,7 +813,11 @@ impl ResidencyPlanner {
         // its room back, and read by the room's gives alone that would be a
         // new stall, forced again at once, a core burned. Room freed or a
         // fire landed forces it again.
-        let room = (key, self.port.free_chunks(), self.stats.fires_landed.load(Ordering::Acquire));
+        let room = (
+            key,
+            self.port.free_chunks(),
+            self.stats.fires_landed.load(Ordering::Acquire),
+        );
         let forced_here = self.with_inner(|inner| {
             let again = inner.stall_forced == Some(room);
             inner.stall_forced = Some(room);
@@ -1063,8 +1125,9 @@ impl ResidencyPlanner {
                         None => (run, pieces),
                         Some(rung) => match self
                             .with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid))
-                            .map_or(super::pool::RiseRoom::Fits, |pid| self.port.rise_room(pid, rung))
-                        {
+                            .map_or(super::pool::RiseRoom::Fits, |pid| {
+                                self.port.rise_room(pid, rung)
+                            }) {
                             super::pool::RiseRoom::Short { pieces } => {
                                 let pages = self.port.chunks_as_pages(pieces);
                                 self.with_inner(|inner| {
@@ -1099,9 +1162,10 @@ impl ResidencyPlanner {
                     if rise.is_none()
                         && self.port.guest_room_free(run, pieces)
                         && (singles == 0
-                            || self
-                                .port
-                                .guest_room_free(1, run.saturating_mul(pieces).saturating_add(singles)))
+                            || self.port.guest_room_free(
+                                1,
+                                run.saturating_mul(pieces).saturating_add(singles),
+                            ))
                     {
                         self.serve_bind_room(key);
                         continue;
@@ -1124,14 +1188,17 @@ impl ResidencyPlanner {
                     let short = IdleShort {
                         kv_pages: self.port.chunks_as_pages(run.saturating_mul(pieces)),
                         rs: true,
-                        chunks: self.chunks_short(run.saturating_mul(pieces).saturating_add(singles)),
+                        chunks: self
+                            .chunks_short(run.saturating_mul(pieces).saturating_add(singles)),
                     };
                     match self.reclaim_idle_once(short) {
                         IdleOutcome::Freed => {
                             continue;
                         }
                         IdleOutcome::Returning => {
-                            self.plan_stopped("bind room: reclaimed pages return as their fires retire");
+                            self.plan_stopped(
+                                "bind room: reclaimed pages return as their fires retire",
+                            );
                             return false;
                         }
                         IdleOutcome::Nothing if self.idle_out(key) => {
@@ -1179,7 +1246,9 @@ impl ResidencyPlanner {
                         let pid = inner.queue.get(&key).map(|waiter| waiter.pid);
                         (
                             pid,
-                            inner.bind_restoring.is_some_and(|restoring| Some(restoring) != pid)
+                            inner
+                                .bind_restoring
+                                .is_some_and(|restoring| Some(restoring) != pid)
                                 && !inner.bind_restoring_released(),
                         )
                     });
@@ -1217,19 +1286,26 @@ impl ResidencyPlanner {
                         continue;
                     }
                     if self.demote_idle_for(
-                        self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
+                        self.port
+                            .chunks_as_pages(need.run.saturating_mul(need.pieces)),
                         self.chunks_short(
-                            need.run.saturating_mul(need.pieces).saturating_add(need.singles),
+                            need.run
+                                .saturating_mul(need.pieces)
+                                .saturating_add(need.singles),
                         ),
                     ) {
                         self.plan_stopped("bind short of runs: idle cache moves down");
                         return false;
                     }
                     let short = IdleShort {
-                        kv_pages: self.port.chunks_as_pages(need.run.saturating_mul(need.pieces)),
+                        kv_pages: self
+                            .port
+                            .chunks_as_pages(need.run.saturating_mul(need.pieces)),
                         rs: true,
                         chunks: self.chunks_short(
-                            need.run.saturating_mul(need.pieces).saturating_add(need.singles),
+                            need.run
+                                .saturating_mul(need.pieces)
+                                .saturating_add(need.singles),
                         ),
                     };
                     match self.reclaim_idle_once(short) {
@@ -1266,7 +1342,9 @@ impl ResidencyPlanner {
                     // Funded once nothing in flight can free room
                     // ([`Inner::nothing_in_flight`]).
                     if !self.with_inner(|inner| inner.nothing_in_flight()) {
-                        self.plan_stopped("bind-suspended restore: something in flight, not funded");
+                        self.plan_stopped(
+                            "bind-suspended restore: something in flight, not funded",
+                        );
                         return false;
                     }
                     true
@@ -1346,7 +1424,9 @@ impl ResidencyPlanner {
                             self.head_placement(key, &room)
                                 .is_some_and(|placement| placement.stands())
                                 || self
-                                    .with_inner(|inner| inner.queue.get(&key).map(|waiter| waiter.pid))
+                                    .with_inner(|inner| {
+                                        inner.queue.get(&key).map(|waiter| waiter.pid)
+                                    })
                                     .is_some_and(|pid| self.take_send_regardless(pid))
                         })
                     {
@@ -1467,7 +1547,9 @@ impl ResidencyPlanner {
                             continue;
                         }
                         IdleOutcome::Returning => {
-                            self.plan_stopped("short of kv: reclaimed pages return as their fires retire");
+                            self.plan_stopped(
+                                "short of kv: reclaimed pages return as their fires retire",
+                            );
                             return false;
                         }
                         IdleOutcome::Nothing => {}
@@ -1531,7 +1613,9 @@ impl ResidencyPlanner {
                             continue;
                         }
                         IdleOutcome::Returning => {
-                            self.plan_stopped("short of state: reclaimed pages return as their fires retire");
+                            self.plan_stopped(
+                                "short of state: reclaimed pages return as their fires retire",
+                            );
                             return false;
                         }
                         IdleOutcome::Nothing => {}
@@ -1651,7 +1735,11 @@ impl ResidencyPlanner {
                             return Board::Replan;
                         }
                         // Suspended for a bind: the one restored at a time.
-                        if inner.procs.get(&pid).is_some_and(|proc| proc.bind_room.is_some()) {
+                        if inner
+                            .procs
+                            .get(&pid)
+                            .is_some_and(|proc| proc.bind_room.is_some())
+                        {
                             inner.bind_restoring = Some(pid);
                         }
                         let Some(proc) = inner.procs.get_mut(&pid) else {
@@ -1674,9 +1762,10 @@ impl ResidencyPlanner {
                         // once it fired, it would go round with a head no
                         // move forms runs for, restored past it and moved
                         // back.
-                        if let Some(head) = proc.evicted_for.filter(|head| {
-                            inner.passed.iter().any(|&(_, passed)| passed == *head)
-                        }) && !proc.restored_past.contains(&head)
+                        if let Some(head) = proc
+                            .evicted_for
+                            .filter(|head| inner.passed.iter().any(|&(_, passed)| passed == *head))
+                            && !proc.restored_past.contains(&head)
                         {
                             proc.restored_past.push(head);
                         }
@@ -1703,9 +1792,16 @@ impl ResidencyPlanner {
                             // meanwhile takes it (else its bind's chunk can
                             // be taken between its serve and its unpark).
                             let bind = self.with_inner(|inner| {
-                                inner.procs.get(&pid).and_then(|proc| proc.bind_room).map(|need| need.entries())
+                                inner
+                                    .procs
+                                    .get(&pid)
+                                    .and_then(|proc| proc.bind_room)
+                                    .map(|need| need.entries())
                             });
-                            let held = self.port.reserve_restore(pid, bind.as_deref().unwrap_or_default()) == Some(true);
+                            let held = self
+                                .port
+                                .reserve_restore(pid, bind.as_deref().unwrap_or_default())
+                                == Some(true);
                             // What held it for the head it was moved for, as
                             // that head stood when it went (the hold's terms,
                             // [`super::inner::Inner::unmet_head`]).

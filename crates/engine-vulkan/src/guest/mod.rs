@@ -98,8 +98,7 @@ pub fn lower(stage: usize, source: &str, layout: &[(u32, Slot)]) -> Result<Vec<u
         },
         ..naga::back::spv::Options::default()
     };
-    naga::back::spv::write_vec(&module, &info, &options, None)
-        .map_err(|e| refuse(e.to_string()))
+    naga::back::spv::write_vec(&module, &info, &options, None).map_err(|e| refuse(e.to_string()))
 }
 
 #[cfg(not(feature = "vulkan"))]

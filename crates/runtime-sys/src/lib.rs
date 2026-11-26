@@ -321,7 +321,8 @@ pub mod address {
             let mut counters: win::ProcessMemoryCountersEx = std::mem::zeroed();
             let size = std::mem::size_of::<win::ProcessMemoryCountersEx>() as u32;
             counters.cb = size;
-            if win::K32GetProcessMemoryInfo(win::GetCurrentProcess(), &raw mut counters, size) == 0 {
+            if win::K32GetProcessMemoryInfo(win::GetCurrentProcess(), &raw mut counters, size) == 0
+            {
                 return None;
             }
             Some((status.avail_page_file, counters.private_usage as u64))

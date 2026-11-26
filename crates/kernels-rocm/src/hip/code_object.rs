@@ -78,7 +78,9 @@ fn refuse(asked: &[(String, Ask)]) -> Result<(), String> {
 /// Each kernel of `image` and the late memory it asks for.
 fn asked(image: &[u8]) -> Result<Vec<(String, Ask)>, String> {
     if !elf64(image) {
-        return Err("the image is not an ELF code object, so what its kernels ask is not known".into());
+        return Err(
+            "the image is not an ELF code object, so what its kernels ask is not known".into(),
+        );
     }
     let mut asked = Vec::new();
     let mut described = false;
@@ -134,7 +136,12 @@ pub fn unbundle(image: &[u8], arch: &str) -> Result<Vec<u8>, String> {
     }
     let le = |bytes: &[u8], at: usize, n: usize| -> Option<u64> {
         let slice = bytes.get(at..at.checked_add(n)?)?;
-        Some(slice.iter().rev().fold(0, |acc, &b| acc << 8 | u64::from(b)))
+        Some(
+            slice
+                .iter()
+                .rev()
+                .fold(0, |acc, &b| acc << 8 | u64::from(b)),
+        )
     };
     let bundle = if image.starts_with(b"CCOB") {
         // The compressed bundle's header: version, method, then (from
@@ -144,7 +151,11 @@ pub fn unbundle(image: &[u8], arch: &str) -> Result<Vec<u8>, String> {
         let (header, size) = match version {
             2 => (24, le(image, 12, 4)),
             3 => (32, le(image, 16, 8)),
-            other => return Err(format!("a CCOB bundle of version {other}, which this reads not")),
+            other => {
+                return Err(format!(
+                    "a CCOB bundle of version {other}, which this reads not"
+                ));
+            }
         };
         let size = usize::try_from(size.ok_or("a CCOB header cut short")?)
             .map_err(|_| "a CCOB bundle past the address space")?;
@@ -154,10 +165,17 @@ pub fn unbundle(image: &[u8], arch: &str) -> Result<Vec<u8>, String> {
                 .map_err(|why| format!("a zlib CCOB bundle does not inflate: {why:?}"))?,
             1 => zstd::bulk::decompress(packed, size)
                 .map_err(|why| format!("a zstd CCOB bundle does not inflate: {why}"))?,
-            other => return Err(format!("a CCOB bundle compressed by method {other}, which this reads not")),
+            other => {
+                return Err(format!(
+                    "a CCOB bundle compressed by method {other}, which this reads not"
+                ));
+            }
         };
         if unpacked.len() != size {
-            return Err(format!("a CCOB bundle inflated to {} bytes, not the {size} it states", unpacked.len()));
+            return Err(format!(
+                "a CCOB bundle inflated to {} bytes, not the {size} it states",
+                unpacked.len()
+            ));
         }
         unpacked
     } else {
@@ -173,7 +191,8 @@ pub fn unbundle(image: &[u8], arch: &str) -> Result<Vec<u8>, String> {
     for _ in 0..entries {
         let offset = le(&bundle, at, 8).ok_or_else(cut)?;
         let size = le(&bundle, at + 8, 8).ok_or_else(cut)?;
-        let id_len = usize::try_from(le(&bundle, at + 16, 8).ok_or_else(cut)?).map_err(|_| cut())?;
+        let id_len =
+            usize::try_from(le(&bundle, at + 16, 8).ok_or_else(cut)?).map_err(|_| cut())?;
         let id = bundle.get(at + 24..at + 24 + id_len).ok_or_else(cut)?;
         at += 24 + id_len;
         // `hipv4-amdgcn-amd-amdhsa--gfx942[:features]`
@@ -182,14 +201,19 @@ pub fn unbundle(image: &[u8], arch: &str) -> Result<Vec<u8>, String> {
             .and_then(|id| id.rsplit_once("--"))
             .map(|(_, target)| target.split(':').next().unwrap_or_default());
         if target == Some(arch) {
-            let (offset, size) = (usize::try_from(offset).map_err(|_| cut())?, usize::try_from(size).map_err(|_| cut())?);
+            let (offset, size) = (
+                usize::try_from(offset).map_err(|_| cut())?,
+                usize::try_from(size).map_err(|_| cut())?,
+            );
             return bundle
                 .get(offset..offset.checked_add(size).ok_or_else(cut)?)
                 .map(<[u8]>::to_vec)
                 .ok_or_else(cut);
         }
     }
-    Err(format!("the offload bundle holds no code object for {arch}"))
+    Err(format!(
+        "the offload bundle holds no code object for {arch}"
+    ))
 }
 
 /// The descriptors of `image`'s AMDGPU metadata notes: an ELF64

@@ -156,7 +156,9 @@ impl RingRun {
             .ok_or_else(|| disagree(format!("lays {what} past the record's pieces")))?;
         let byte = self.run.offset + (first % per) * self.atom + from % self.atom;
         if byte % 4 != 0 {
-            return Err(disagree(format!("lays {what} at byte {byte}, inside a word")));
+            return Err(disagree(format!(
+                "lays {what} at byte {byte}, inside a word"
+            )));
         }
         Ok((piece, byte))
     }
@@ -902,7 +904,10 @@ impl<B: Backend> Pools<B> {
             .kv_runs()
             .into_iter()
             .map(|(offset, cell)| {
-                Ok([word(offset, "a kv plane's offset")?, word(cell, "a kv slot's cell")?])
+                Ok([
+                    word(offset, "a kv plane's offset")?,
+                    word(cell, "a kv slot's cell")?,
+                ])
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((word(unit, "a kv page id's unit")?, planes))
@@ -1194,9 +1199,7 @@ impl<B: Backend> Pools<B> {
         })?;
         if !at.is_multiple_of(unit) || !slot.is_multiple_of(unit) {
             return Err(Fault::Unbound {
-                what: format!(
-                    "fire slots at byte {at}, off the window buffer's {unit}-byte units"
-                ),
+                what: format!("fire slots at byte {at}, off the window buffer's {unit}-byte units"),
             });
         }
         (0..u64::from(count))
@@ -1344,15 +1347,9 @@ impl<B: Backend> Pools<B> {
     /// layers' rings.
     #[must_use]
     pub fn has_state(&self) -> bool {
-        self.rows.iter().any(|row| {
-            matches!(
-                row,
-                Row::State { .. } | Row::Kv {
-                    ring: Some(_),
-                    ..
-                }
-            )
-        })
+        self.rows
+            .iter()
+            .any(|row| matches!(row, Row::State { .. } | Row::Kv { ring: Some(_), .. }))
     }
 
     /// Whether the load holds recurrent state rows.
@@ -2092,7 +2089,14 @@ impl<B: Backend> Pools<B> {
         let chunk = self.disk_chunk_bytes();
         let widest = self.layout.shapes().map(|shape| shape.slot_bytes).max();
         if let (true, Some(widest)) = (chunk > 0, widest) {
-            self.disk = Spill::open(device, dir, "r0.state", chunk, cover_room(widest) as u64, budget)?;
+            self.disk = Spill::open(
+                device,
+                dir,
+                "r0.state",
+                chunk,
+                cover_room(widest) as u64,
+                budget,
+            )?;
         }
         Ok(self.disk_chunks())
     }
@@ -2199,7 +2203,11 @@ impl<B: Backend> Pools<B> {
     /// table as it stood ([`pool::Pool::evacuate`]): nothing is committed
     /// until the caller commits `frame`, and [`Pools::restore_table`] puts
     /// the old table back where it drops `frame` instead.
-    pub fn evacuate(&mut self, frame: &mut B::Frame, evacuation: &Evacuation) -> Result<ChunkTable> {
+    pub fn evacuate(
+        &mut self,
+        frame: &mut B::Frame,
+        evacuation: &Evacuation,
+    ) -> Result<ChunkTable> {
         self.pool.evacuate(frame, evacuation)
     }
 
@@ -2441,8 +2449,7 @@ impl<B: Backend> Spill<B> {
             if !to_disk {
                 for (&at, row) in places.iter().zip(staged.chunks_exact_mut(stride)) {
                     let (start, span, _) = cover(at, bytes);
-                    file.read_span(start, &mut row[..span])
-                        .map_err(slot_file)?;
+                    file.read_span(start, &mut row[..span]).map_err(slot_file)?;
                 }
                 stage.write(0, staged)?;
             }

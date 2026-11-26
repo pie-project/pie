@@ -81,7 +81,10 @@ impl Cache {
 }
 
 impl Heads {
-    pub(super) const fn of(follow: &'static [&'static str], scale: &'static [&'static str]) -> Heads {
+    pub(super) const fn of(
+        follow: &'static [&'static str],
+        scale: &'static [&'static str],
+    ) -> Heads {
         Heads {
             follow,
             scale,

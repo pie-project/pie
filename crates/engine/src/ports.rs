@@ -350,7 +350,9 @@ impl LanePorts<'_> {
 
 /// The rows `lanes` were placed, or `None` past a u32.
 fn rows_sum(lanes: &[u32]) -> Option<u32> {
-    lanes.iter().try_fold(0u32, |sum, &rows| sum.checked_add(rows))
+    lanes
+        .iter()
+        .try_fold(0u32, |sum, &rows| sum.checked_add(rows))
 }
 
 #[must_use]
@@ -368,10 +370,9 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
         // fire staged ahead or not.
         // So may each beam's parent, over which the engine keeps the beams'
         // own page lists (`new-memory/designs/BEAM-PAGE-LISTS.md`).
-        GeometryClass::DecodeEnvelope => matches!(
-            port,
-            Port::Positions | Port::AttnMask | Port::Parents
-        ),
+        GeometryClass::DecodeEnvelope => {
+            matches!(port, Port::Positions | Port::AttnMask | Port::Parents)
+        }
         GeometryClass::DeviceGeometry => matches!(port, Port::EmbedIndptr | Port::AttnMask),
         GeometryClass::Host => false,
     }

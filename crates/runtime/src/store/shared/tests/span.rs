@@ -265,11 +265,7 @@ fn can_grow_is_whether_the_walk_s_next_step_maps_a_segment() {
                         assert_eq!(can, grow.live_step_for_test().is_some(), "{case}");
                         assert_eq!(can, maps, "{case}: can_grow is the walk's own step");
                         if waiter.is_some() {
-                            assert_eq!(
-                                can,
-                                below && !blocked && (!prefix_whole || lent),
-                                "{case}"
-                            );
+                            assert_eq!(can, below && !blocked && (!prefix_whole || lent), "{case}");
                             assert_eq!(
                                 matches!(step, Some(SegmentMove::CommitSpan { .. })),
                                 below && prefix_whole && lent && !blocked,
@@ -400,14 +396,22 @@ fn a_refused_chunk_moves_down_and_its_fires_wait_for_the_copy() {
     while let Some(n) = pool.pool().span_to_commit() {
         pool.span_committed(n);
     }
-    let lent = pool.take_records(pool.records_available() as usize).unwrap();
+    let lent = pool
+        .take_records(pool.records_available() as usize)
+        .unwrap();
     let below: Vec<u32> = (0..u32::try_from(lent.len()).unwrap()).collect();
     pool.give_records(&below);
     pool.pool_mut().retire_through(u64::MAX);
     let physical = state_chunks(&pool, &lent);
     let logical: Vec<u32> = physical
         .iter()
-        .map(|&chunk| pool.pool().chunk_table().iter().position(|&p| p == chunk).unwrap() as u32)
+        .map(|&chunk| {
+            pool.pool()
+                .chunk_table()
+                .iter()
+                .position(|&p| p == chunk)
+                .unwrap() as u32
+        })
         .collect();
     pool.refuse_chunks(&logical);
     assert!(pool.refusals_pending(&logical), "waits for its move");
@@ -421,10 +425,20 @@ fn a_refused_chunk_moves_down_and_its_fires_wait_for_the_copy() {
         "down: {applied:?}"
     );
     let moved: Vec<u32> = applied.iter().map(|step| step.logical).collect();
-    let unmoved: Vec<u32> = logical.iter().copied().filter(|chunk| !moved.contains(chunk)).collect();
-    assert!(pool.refusals_pending(&moved), "until the engine took the copy");
+    let unmoved: Vec<u32> = logical
+        .iter()
+        .copied()
+        .filter(|chunk| !moved.contains(chunk))
+        .collect();
+    assert!(
+        pool.refusals_pending(&moved),
+        "until the engine took the copy"
+    );
     pool.compaction_copied(epoch, 2);
-    assert!(!pool.refusals_pending(&moved), "the copy taken: their fires go");
+    assert!(
+        !pool.refusals_pending(&moved),
+        "the copy taken: their fires go"
+    );
     assert_eq!(
         pool.refusals_pending(&unmoved),
         !unmoved.is_empty(),

@@ -244,7 +244,10 @@ impl Embedded {
 pub struct Loaded {
     #[cfg_attr(
         not(feature = "net"),
-        allow(dead_code, reason = "only the networked worker names its model to peers")
+        allow(
+            dead_code,
+            reason = "only the networked worker names its model to peers"
+        )
     )]
     pub(crate) model: String,
     /// The kv the engine exported, for peers to read in place.

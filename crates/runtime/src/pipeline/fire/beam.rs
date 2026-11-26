@@ -104,21 +104,22 @@ pub(crate) async fn relist_beam<C: FireContext>(
         leases.quiesce().await;
     }
     loop {
-        let needs = match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            kv.relist_beam_needs(ws, f0, order)
-        }) {
-            Ok(needs) => needs,
-            // Its pages went below with its process (evicted since its
-            // last fire): the finish waits for its restore, as a fire does,
-            // and goes then.
-            Err(crate::store::kv::KvStoreError::Table(
-                crate::store::kv::page_table::KvTableError::NonResident { .. },
-            )) => {
-                settle_and_wait_resident(ctx).await?;
-                continue;
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+        let needs =
+            match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                kv.relist_beam_needs(ws, f0, order)
+            }) {
+                Ok(needs) => needs,
+                // Its pages went below with its process (evicted since its
+                // last fire): the finish waits for its restore, as a fire does,
+                // and goes then.
+                Err(crate::store::kv::KvStoreError::Table(
+                    crate::store::kv::page_table::KvTableError::NonResident { .. },
+                )) => {
+                    settle_and_wait_resident(ctx).await?;
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
         let shared = match needs {
             crate::store::kv::RelistNeeds::MoveEnd(ended) => {
                 let notified = ended.notified();
@@ -141,13 +142,17 @@ pub(crate) async fn relist_beam<C: FireContext>(
                 rs: crate::store::rs::RsUnits::default(),
             };
             let pid = ctx.process_id();
-            let Some(mut granted) = acquire_grant(ctx, pid, demand, || Ok(vec![demand])).await? else {
+            let Some(mut granted) = acquire_grant(ctx, pid, demand, || Ok(vec![demand])).await?
+            else {
                 continue;
             };
             let pages: Vec<crate::store::kv::page_table::PhysicalKvPageId> =
                 granted.lend_kv().drain(..shared.len()).collect();
             grant = Some(granted);
-            let shape = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| kv.list_shape());
+            let shape =
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.list_shape()
+                });
             let copy = crate::scheduler::TierMove {
                 kind: crate::scheduler::TierKind::kv(shape),
                 tier: crate::scheduler::device_domain(engine),
@@ -164,7 +169,9 @@ pub(crate) async fn relist_beam<C: FireContext>(
                 crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
                     kv.release_device_reservation(pages);
                 });
-                return Err(format!("a beam's finish copying the chosen pages another reads: {error}"));
+                return Err(format!(
+                    "a beam's finish copying the chosen pages another reads: {error}"
+                ));
             }
             copies = shared.into_iter().zip(pages).collect::<Vec<_>>();
         }
@@ -180,18 +187,26 @@ pub(crate) async fn relist_beam<C: FireContext>(
                 crate::store::kv::page_table::KvTableError::NonResident { .. },
             )) => {
                 crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                    kv.release_device_reservation(
+                        copies.into_iter().map(|(_, copy)| copy).collect(),
+                    );
                 });
                 settle_and_wait_resident(ctx).await?;
             }
             // A move began while the copies ran: they go back, and the
             // finish waits for its end.
-            Ok(false) => crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-                kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
-            }),
+            Ok(false) => {
+                crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
+                    kv.release_device_reservation(
+                        copies.into_iter().map(|(_, copy)| copy).collect(),
+                    );
+                })
+            }
             Err(error) => {
                 crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-                    kv.release_device_reservation(copies.into_iter().map(|(_, copy)| copy).collect());
+                    kv.release_device_reservation(
+                        copies.into_iter().map(|(_, copy)| copy).collect(),
+                    );
                 });
                 return Err(error.to_string());
             }

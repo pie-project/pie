@@ -1109,14 +1109,25 @@ mod stepwise_tests {
             assert_eq!(temporary_bytes(tag, 151_936, 1), 151_936 * 16);
             assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 151_936 * 16);
         }
-        for tag in [tags::REDUCE_SUM, tags::REDUCE_MAX, tags::REDUCE_MIN, tags::REDUCE_ARGMAX] {
+        for tag in [
+            tags::REDUCE_SUM,
+            tags::REDUCE_MAX,
+            tags::REDUCE_MIN,
+            tags::REDUCE_ARGMAX,
+        ] {
             assert_eq!(temporary_bytes(tag, 151_936, 1), 4748 * 16);
             assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
             assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
         }
         // A draw's first level folds 8 lanes a job.
-        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1), 18_992 * 16);
-        assert_eq!(temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4), 4 * 18_992 * 16);
+        assert_eq!(
+            temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1),
+            18_992 * 16
+        );
+        assert_eq!(
+            temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4),
+            4 * 18_992 * 16
+        );
         assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
         assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
         assert!(selects(tags::PIVOT_THRESHOLD) && selects(tags::TOP_K));
@@ -1130,11 +1141,17 @@ mod stepwise_tests {
             "fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }",
             "fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }",
         ] {
-            assert!(RUNTIME.contains(cell), "the runtime no longer lays `{cell}`");
+            assert!(
+                RUNTIME.contains(cell),
+                "the runtime no longer lays `{cell}`"
+            );
         }
         let named = RUNTIME.matches("tmp_base +").count() + RUNTIME.matches("tmp_base -").count();
         assert_eq!(named, 7, "a temporary cell this statement has not read");
-        assert!(RUNTIME.contains(&alloc::format!("const SEL_WORDS : u32 = {}u;", super::SELECT_WORDS)));
+        assert!(RUNTIME.contains(&alloc::format!(
+            "const SEL_WORDS : u32 = {}u;",
+            super::SELECT_WORDS
+        )));
     }
 
     fn a_stepwise_entry_point_strides_by_the_whole_grid() {

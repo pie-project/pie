@@ -69,7 +69,6 @@ impl Operand {
     }
 }
 
-
 /// Where a rocBLAS call's workspace lies: given the bytes the call asks,
 /// the slab laid for it (`Ctx::blas_workspace`).
 pub type Workspace<'a> = dyn FnMut(usize) -> Result<u64, crate::Error> + 'a;
@@ -112,7 +111,9 @@ unsafe fn asks(
     const START: &str = "rocblas_start_device_memory_size_query";
     const STOP: &str = "rocblas_stop_device_memory_size_query";
     // SAFETY: the caller's handle contract.
-    answered(START, unsafe { (blas.rocblas_start_device_memory_size_query)(handle) })?;
+    answered(START, unsafe {
+        (blas.rocblas_start_device_memory_size_query)(handle)
+    })?;
     let status = run();
     let mut bytes = 0usize;
     // SAFETY: as above; `bytes` is a live local.

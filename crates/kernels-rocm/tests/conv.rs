@@ -516,8 +516,16 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
         slot_stride_elems: stride as i64,
         ..STATE
     };
-    cache_gather(&ctx, &pool(slab), clip_lanes, 0, g, frames as u32, &mut cache)
-        .expect("the gather fires");
+    cache_gather(
+        &ctx,
+        &pool(slab),
+        clip_lanes,
+        0,
+        g,
+        frames as u32,
+        &mut cache,
+    )
+    .expect("the gather fires");
     let mut want_cache = Vec::new();
     for (b, &slot) in boxes.iter().zip(&slots) {
         let n = frames * b.plane() * c;

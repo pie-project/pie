@@ -205,7 +205,10 @@ mod tests {
     #[test]
     fn a_mask_reads_its_columns_from_the_committed_boundary() {
         use engine::fire::{Mask, Masking};
-        let hide_first = Masking::Extent(Mask { runs: vec![1, 3], total: 4 });
+        let hide_first = Masking::Extent(Mask {
+            runs: vec![1, 3],
+            total: 4,
+        });
         let lane = LaneMask {
             mask: Some(&hide_first),
             have: 4,
@@ -216,10 +219,17 @@ mod tests {
         let staged = stage(&[lane], 256).unwrap().expect("a plane");
         let stride = staged.stride as usize;
         let row = |q: usize| &staged.bytes[q * stride..q * stride + 6];
-        assert_eq!(row(0), &[1, 1, 0, 1, 1, 0], "row 0: committed, buffer, itself");
+        assert_eq!(
+            row(0),
+            &[1, 1, 0, 1, 1, 0],
+            "row 0: committed, buffer, itself"
+        );
         assert_eq!(row(1), &[1, 1, 0, 1, 1, 1], "row 1: and row 0, itself");
         assert_eq!(staged.enabled, vec![1, 1]);
-        let short = Masking::Extent(Mask { runs: vec![0, 3], total: 3 });
+        let short = Masking::Extent(Mask {
+            runs: vec![0, 3],
+            total: 3,
+        });
         let refused = stage(
             &[LaneMask {
                 mask: Some(&short),

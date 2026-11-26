@@ -21,7 +21,11 @@ pub struct Refused {
 impl core::fmt::Display for Refused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.status == ABSENT {
-            write!(f, "`{}` has no hipBLASLt to call: the library did not load", self.call)
+            write!(
+                f,
+                "`{}` has no hipBLASLt to call: the library did not load",
+                self.call
+            )
         } else {
             write!(f, "`{}` answered {}", self.call, self.status)
         }

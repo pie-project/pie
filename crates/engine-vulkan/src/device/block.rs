@@ -77,7 +77,8 @@ impl Image {
         self.runs.shrink_to_fit();
         let mut hash = words_hash(&self.chunks) ^ words_hash(std::slice::from_ref(&self.bytes));
         for &(at, len) in &self.runs {
-            hash = (hash ^ (u64::from(at) << 32 | u64::from(len))).wrapping_mul(0x0000_0100_0000_01b3);
+            hash =
+                (hash ^ (u64::from(at) << 32 | u64::from(len))).wrapping_mul(0x0000_0100_0000_01b3);
         }
         self.hash = (hash ^ self.extent) | 1;
         self
@@ -105,7 +106,10 @@ impl Image {
     /// byte, joined to the run before where it ends at `at`.
     fn lay_sparse(&mut self, at: u64, bytes: &[u8]) {
         self.extent = self.extent.max(at + bytes.len() as u64);
-        let kept = bytes.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
+        let kept = bytes
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |last| last + 1);
         if kept == 0 {
             return;
         }
@@ -282,7 +286,9 @@ fn gaps(runs: &[(u32, u32)], extent: u64) -> Vec<(u64, u64)> {
 fn words_hash(chunks: &[Vec<u8>]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ chunks.len() as u64;
     let mut mix = |word: u64| {
-        hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+        hash = (hash ^ word)
+            .wrapping_mul(0x0000_0100_0000_01b3)
+            .rotate_left(23);
     };
     for chunk in chunks {
         mix(chunk.len() as u64);
@@ -297,7 +303,6 @@ fn words_hash(chunks: &[Vec<u8>]) -> u64 {
     // 0 is no hash at all ([`ArmBlock::stage`]).
     hash | 1
 }
-
 
 pub(crate) struct FireBlock {
     place: Place,
@@ -393,11 +398,7 @@ impl FireBlock {
                     self.image.chunks.push(Vec::new());
                 }
                 let chunk = chunks.last().expect("a chunk with room was just made");
-                let used = self
-                    .image
-                    .chunks
-                    .last_mut()
-                    .expect("a chunk has an image");
+                let used = self.image.chunks.last_mut().expect("a chunk has an image");
                 let at = (used.len() as u64).next_multiple_of(align);
                 used.resize(at as usize, 0);
                 used.extend_from_slice(bytes);
@@ -409,7 +410,8 @@ impl FireBlock {
 
     /// Whether `buffer` is the arm's block, which outlives the frame.
     pub(crate) fn is_arms(&self, buffer: ash::vk::Buffer) -> bool {
-        self.arm().is_some_and(|arm| arm.block.slab().buffer == buffer)
+        self.arm()
+            .is_some_and(|arm| arm.block.slab().buffer == buffer)
     }
 
     /// The image laid so far, taken from the block.
@@ -498,7 +500,10 @@ mod tests {
         assert_eq!(stale(&[(0, 4), (8, 4)], &[(0, 4), (8, 2)]), vec![(10, 12)]);
         assert_eq!(stale(&[(4, 4)], &[]), vec![(4, 8)]);
         assert_eq!(stale(&[(4, 4)], &[(0, 16)]), Vec::<(u64, u64)>::new());
-        assert_eq!(stale(&[(0, 16)], &[(2, 2), (6, 2)]), vec![(0, 2), (4, 6), (8, 16)]);
+        assert_eq!(
+            stale(&[(0, 16)], &[(2, 2), (6, 2)]),
+            vec![(0, 2), (4, 6), (8, 16)]
+        );
         assert_eq!(gaps(&[(2, 2), (8, 4)], 16), vec![(0, 2), (4, 8), (12, 16)]);
         assert_eq!(gaps(&[], 5), vec![(0, 5)]);
     }

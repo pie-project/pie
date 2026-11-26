@@ -90,7 +90,8 @@ pub(crate) fn notify_owner_unblocked(pid: ProcessId) {
 
 /// The owners told blocked, in order; for a test.
 #[cfg(test)]
-pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// `pid`'s guest waits on input from outside the runtime (a session
 /// receive, a timer, an HTTP response): no frame on any engine waits on its
@@ -156,7 +157,10 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     broadcast(|| SchedulerItem::ExecutionSlotConsumed(pid));
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "no policy runs in the browser"))]
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser")
+)]
 pub(crate) fn notify_schedule_changed() {
     broadcast(|| SchedulerItem::Nudge);
 }
@@ -411,12 +415,21 @@ pub(crate) enum HostKvOp {
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
     /// The bytes of host kv slots.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "the browser has no host or disk tier")
+    )]
     Read(Vec<u32>),
     /// The bytes of host tier slots, shape by shape (`Tiers::read`).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "the browser has no host or disk tier")
+    )]
     ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code, reason = "the browser has no host or disk tier"))]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "the browser has no host or disk tier")
+    )]
     WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
     /// The engine's tap groups (`Taps::groups`), as JSON.
     TapGroups,
@@ -486,7 +499,9 @@ impl std::future::Future for ReplyWait {
         match self.get_mut() {
             ReplyWait::Launch(reply) => std::pin::Pin::new(reply).poll(cx).map(|answer| {
                 LaneReply::Launch(answer.unwrap_or_else(|_| {
-                    Err("the engine lane dropped this launch unanswered".to_string().into())
+                    Err("the engine lane dropped this launch unanswered"
+                        .to_string()
+                        .into())
                 }))
             }),
             ReplyWait::Control { id, reply } => {

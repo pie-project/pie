@@ -103,7 +103,11 @@ pub fn guest_state(
 /// (where it holds one), then its scratch sets.
 #[must_use]
 pub fn with_resident(resident: u64, scratch_sets: &[u64]) -> Vec<u64> {
-    (resident > 0).then_some(resident).into_iter().chain(scratch_sets.iter().copied()).collect()
+    (resident > 0)
+        .then_some(resident)
+        .into_iter()
+        .chain(scratch_sets.iter().copied())
+        .collect()
 }
 
 /// Where each of `sets` lies in pieces of `pieces` bytes (the place the

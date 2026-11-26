@@ -367,10 +367,6 @@ fn statistics() -> (TraceContainer, Vec<u32>) {
     (p.container(), outs)
 }
 
-
-
-
-
 /// The compat sampler over one row: penalties over a carried histogram, a
 /// grammar mask (bools and packed words), temperature, top-k, top-p and a
 /// keyed Gumbel draw; plus the greedy token and the next histogram.
@@ -1002,7 +998,24 @@ fn corner_seeds() -> Vec<(u32, Value)> {
     ];
     // Division corners, beside the others: MIN / -1 wraps, x / 0 is 0,
     // MIN / MIN, -1 / MAX.
-    let b = vec![2, 2, -1, 0, 3, 3, 0, -2, 4, 1, 1, i32::MAX, i32::MIN, -5, -1, 15];
+    let b = vec![
+        2,
+        2,
+        -1,
+        0,
+        3,
+        3,
+        0,
+        -2,
+        4,
+        1,
+        1,
+        i32::MAX,
+        i32::MIN,
+        -5,
+        -1,
+        15,
+    ];
     let ua = vec![
         7,
         u32::MAX,
@@ -1022,7 +1035,24 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         15,
     ];
     // u32::MAX / 1, u32::MAX / u32::MAX.
-    let ub = vec![2, 2, 0, 0, 3, 7, 0xFFFF_FFF0, 2, 4, 1, 1, 1, u32::MAX, 5, 3, 15];
+    let ub = vec![
+        2,
+        2,
+        0,
+        0,
+        3,
+        7,
+        0xFFFF_FFF0,
+        2,
+        4,
+        1,
+        1,
+        1,
+        u32::MAX,
+        5,
+        3,
+        15,
+    ];
     vec![
         (0, Value::F32(x)),
         (1, Value::F32(y)),
@@ -1064,7 +1094,6 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     eprintln!("compiled {} stage program(s)", stages.len());
 }
 
-
 fn the_statistics_agree(device: &Device, stages: &mut Stages) {
     let (container, outs) = statistics();
     let plan = plan_of(container, VOCAB);
@@ -1101,17 +1130,6 @@ fn the_statistics_agree(device: &Device, stages: &mut Stages) {
     close(&got[4], &want[4], 1e-4, "softmax row mass");
     close(&got[5], &want[5], 1e-5, "probability at the argmax");
 }
-
-
-
-
-
-
-
-
-
-
-
 
 fn the_acceptance_rule_agrees(device: &Device, stages: &mut Stages) {
     let (container, outs) = acceptance();
@@ -1462,7 +1480,8 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
                 .iter()
                 .map(|&(c, w)| {
                     let first = at;
-                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2);
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32)
+                        .next_multiple_of(2);
                     (c, first)
                 })
                 .collect()
@@ -1541,6 +1560,3 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         }
     }
 }
-
-
-

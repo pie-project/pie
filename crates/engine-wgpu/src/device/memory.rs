@@ -363,7 +363,10 @@ mod tests {
         assert_eq!(unified, engine::DeviceMemory::Hosts);
         assert_eq!(unified.host_tier(None), Ok(engine::HostTier::Absent));
         let refused = unified.host_tier(Some(1 << 30)).unwrap_err();
-        assert!(refused.contains("`[engine.memory] budget_host`"), "{refused}");
+        assert!(
+            refused.contains("`[engine.memory] budget_host`"),
+            "{refused}"
+        );
         if !cfg!(target_os = "android") {
             let discrete = device_memory(DiscreteGpu, true);
             assert_eq!(discrete, engine::DeviceMemory::Own);

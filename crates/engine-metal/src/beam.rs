@@ -104,17 +104,16 @@ pub fn plan(
     let page = staged.page.max(1);
     records.planes.clone_from(&staged.planes);
     for group in groups {
-        let first = group.lanes.first().ok_or_else(|| {
-            Fault::program("beam", "a beam group of no lanes".to_string())
-        })?;
+        let first = group
+            .lanes
+            .first()
+            .ok_or_else(|| Fault::program("beam", "a beam group of no lanes".to_string()))?;
         if group.layout.lanes > staged.max_lanes {
             return Err(Fault::program(
                 "beam",
                 format!(
                     "instance {}'s beam group runs {} beams and the head step holds at most {}",
-                    group.instance,
-                    group.layout.lanes,
-                    staged.max_lanes
+                    group.instance, group.layout.lanes, staged.max_lanes
                 ),
             ));
         }
@@ -131,7 +130,11 @@ pub fn plan(
             ));
         }
         let slot = first.have;
-        if group.lanes.iter().any(|lane| lane.have != slot || lane.rows != 1) {
+        if group
+            .lanes
+            .iter()
+            .any(|lane| lane.have != slot || lane.rows != 1)
+        {
             return Err(Fault::program(
                 "beam",
                 format!(
@@ -156,7 +159,14 @@ pub fn plan(
                 ),
             ));
         }
-        let backed = backed(group.layout.lanes, slot, folded, page, group.layout.frames, reserve);
+        let backed = backed(
+            group.layout.lanes,
+            slot,
+            folded,
+            page,
+            group.layout.frames,
+            reserve,
+        );
         let (ids, bases) = pool(&whole[..backed as usize])?;
         let fault_at = faults.len() as u32;
         for lane in &group.lanes {
@@ -206,11 +216,8 @@ pub fn plan(
         });
         let bases_at = records.bases.len() as u32;
         records.bases.extend_from_slice(&bases);
-        let copies = kbeam::beam_copies_word(
-            group.layout.lanes,
-            group.layout.cap,
-            group.layout.frames,
-        );
+        let copies =
+            kbeam::beam_copies_word(group.layout.lanes, group.layout.cap, group.layout.frames);
         for beam in 0..group.layout.lanes {
             records.copies.push(PageCopyRun {
                 copy: group.state + (copies + 3 * u64::from(beam)) * 4,
@@ -262,9 +269,10 @@ pub fn plan_rs(
     records.planes.extend_from_slice(&rs.planes);
     let run_bytes = std::mem::size_of::<BeamRsRun>() as u64;
     for (group, step) in groups.iter().zip(records.groups.iter_mut()) {
-        let first = group.lanes.first().ok_or_else(|| {
-            Fault::program("beam", "a beam group of no lanes".to_string())
-        })?;
+        let first = group
+            .lanes
+            .first()
+            .ok_or_else(|| Fault::program("beam", "a beam group of no lanes".to_string()))?;
         let Some(Some((base, set))) = rs.sets.get(first.seat) else {
             continue;
         };
@@ -336,9 +344,8 @@ pub fn plan_rs(
                 plane_at,
                 planes: rs.planes.len() as u32,
                 bases_len,
-                page_bytes: u32::try_from(rs.page_bytes).map_err(|_| {
-                    Fault::program("beam", "an rs page past 4 GiB".to_string())
-                })?,
+                page_bytes: u32::try_from(rs.page_bytes)
+                    .map_err(|_| Fault::program("beam", "an rs page past 4 GiB".to_string()))?,
             });
         }
     }

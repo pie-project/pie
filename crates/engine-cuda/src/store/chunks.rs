@@ -954,11 +954,7 @@ impl Chunks {
     /// `stream`, then the table, so every fire enqueued after reads each
     /// chunk where it now lies. A copy that cannot be enqueued leaves the
     /// table as it was (what it wrote lies in free chunks).
-    pub fn evacuate(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        evacuated: Evacuated,
-    ) -> Result<()> {
+    pub fn evacuate(&mut self, stream: *mut core::ffi::c_void, evacuated: Evacuated) -> Result<()> {
         crate::device::copy_batch_d2d(stream, &evacuated.spans)?;
         self.table = evacuated.table;
         Ok(())

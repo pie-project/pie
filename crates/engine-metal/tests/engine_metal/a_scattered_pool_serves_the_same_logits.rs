@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use engine::chunk::{Evacuation, Growth};
-use engine_metal::serve::Seated;
 use engine::fire::{FoldLen, Lineage, WindowFold};
+use engine_metal::serve::Seated;
 use engine_metal::store::layout::{FIXED, LIST};
 use engine_metal::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
@@ -519,7 +519,8 @@ impl Placement {
     fn fold(&self, have: u32, rows: u32) -> Option<WindowFold> {
         match *self {
             Placement::Refs {
-                ring: Some((_, tokens)), ..
+                ring: Some((_, tokens)),
+                ..
             } => Some(WindowFold {
                 base: (have + rows) / tokens * tokens,
                 fold: FoldLen::Host(rows),
@@ -575,7 +576,9 @@ impl Placement {
     fn held(&self) -> u32 {
         match *self {
             Placement::Seats => 0,
-            Placement::Refs { pieces, ring, .. } => 3 + 2 * pieces + 2 * ring.map_or(0, |(ring, _)| ring),
+            Placement::Refs { pieces, ring, .. } => {
+                3 + 2 * pieces + 2 * ring.map_or(0, |(ring, _)| ring)
+            }
         }
     }
 }
@@ -732,7 +735,12 @@ fn check(model: &str, hybrid: bool) {
         eprintln!("skipping: no Metal device");
         return;
     }
-    check_near(model, hybrid, None, &Profiles::new(&format!("scattered-{model}")));
+    check_near(
+        model,
+        hybrid,
+        None,
+        &Profiles::new(&format!("scattered-{model}")),
+    );
 }
 
 /// [`check`] over a pool whose chunk aims near `chunk` bytes where stated:
@@ -771,9 +779,15 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
     let per_list = facts.shape(LIST).map(|s| s.slots_per_chunk);
     // A windowed model's rings: each lane's by slot ref too, so the
     // scattered serve moves every row the fire reads.
-    let ring = shell
-        .pool_ring()
-        .map(|ring| (ring.pieces, layout.window(0).expect("a ring load's window buffer").tokens));
+    let ring = shell.pool_ring().map(|ring| {
+        (
+            ring.pieces,
+            layout
+                .window(0)
+                .expect("a ring load's window buffer")
+                .tokens,
+        )
+    });
     let place = Placement::Refs {
         first: 0,
         per_list,
@@ -841,7 +855,14 @@ fn a_refused_evacuation_moves_nothing() {
         const STEPS: usize = 8;
         let profiles = Profiles::new(&format!("refused-evacuation-{model}"));
         let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
-        let seats = serve(&mut shell, &fixture.trace, &Placement::Seats, STEPS, usize::MAX, &mut |_| {});
+        let seats = serve(
+            &mut shell,
+            &fixture.trace,
+            &Placement::Seats,
+            STEPS,
+            usize::MAX,
+            &mut |_| {},
+        );
         drop(shell);
 
         let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
@@ -863,14 +884,28 @@ fn a_refused_evacuation_moves_nothing() {
         shell
             .commit_segments(kept + held.div_ceil(segment))
             .expect("the segments commit");
-        let scattered = serve(&mut shell, &fixture.trace, &place(first), STEPS, STEPS / 2, &mut |shell| {
-            let before = shell.chunk_table().clone();
-            let moves = (0..held).map(|at| (first + at, low + at)).collect();
-            engine_metal::serve::fail_next_repoint();
-            let refused = shell.evacuate(&Evacuation { moves });
-            assert!(refused.is_err(), "{model}: the injected refusal is answered");
-            assert_eq!(shell.chunk_table(), &before, "{model}: a refused evacuation moves nothing");
-        });
+        let scattered = serve(
+            &mut shell,
+            &fixture.trace,
+            &place(first),
+            STEPS,
+            STEPS / 2,
+            &mut |shell| {
+                let before = shell.chunk_table().clone();
+                let moves = (0..held).map(|at| (first + at, low + at)).collect();
+                engine_metal::serve::fail_next_repoint();
+                let refused = shell.evacuate(&Evacuation { moves });
+                assert!(
+                    refused.is_err(),
+                    "{model}: the injected refusal is answered"
+                );
+                assert_eq!(
+                    shell.chunk_table(),
+                    &before,
+                    "{model}: a refused evacuation moves nothing"
+                );
+            },
+        );
         close(
             &format!("{model}: decoding on past a refused evacuation, against the seats' runs"),
             &scattered,

@@ -145,7 +145,11 @@ fn a_sliding_row_holds_its_window_and_not_the_context() {
     };
     assert_eq!(held(34_816), GLOBAL * 34_816 + SLIDING * 16 * 65);
     assert_eq!(one(34_816) - held(34_816), SLIDING * 16 * 129);
-    assert_eq!(held(1024), one(1024), "a window that spans the context is no window");
+    assert_eq!(
+        held(1024),
+        one(1024),
+        "a window that spans the context is no window"
+    );
     assert_eq!(
         at(34_816).window_pages_at(8 * 2176),
         1 + 65 + 129 + 7 * 2176 / 2,

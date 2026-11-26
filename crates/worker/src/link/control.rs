@@ -73,8 +73,11 @@ impl ControlLink for ControllerLink {
     }
 
     async fn heartbeat(&self, id: NodeId) -> Result<Ack> {
-        self.call("heartbeat", |c, ctx| async move { c.heartbeat(ctx, id).await })
-            .await
+        self.call(
+            "heartbeat",
+            |c, ctx| async move { c.heartbeat(ctx, id).await },
+        )
+        .await
     }
 
     async fn report_worker(&self, id: WorkerId, status: WorkerStatus) -> Result<()> {
@@ -96,8 +99,10 @@ impl ControlLink for ControllerLink {
         asker: WorkerId,
         keys: Vec<[u8; 32]>,
     ) -> Result<Vec<(WorkerId, String, u32)>> {
-        self.call("locate", |c, ctx| async move { c.locate(ctx, asker, keys).await })
-            .await
+        self.call("locate", |c, ctx| async move {
+            c.locate(ctx, asker, keys).await
+        })
+        .await
     }
 
     async fn link(&self, worker: WorkerId) -> Result<Option<String>> {

@@ -308,5 +308,4 @@ mod tests {
         assert_eq!(frozen.held(&pieces), Some(2));
         assert_eq!(fold(1, 6, 1, frozen.held(&pieces)).plan.replay, 4);
     }
-
 }

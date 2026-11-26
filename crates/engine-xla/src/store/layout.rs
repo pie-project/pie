@@ -283,7 +283,13 @@ impl Layout {
                         .to_string(),
                 });
             }
-            let buffer = list(id(), Kind::Window { window }, page, &window_rows, rows.trace)?;
+            let buffer = list(
+                id(),
+                Kind::Window { window },
+                page,
+                &window_rows,
+                rows.trace,
+            )?;
             let ring = rows.rings.then(|| Shape {
                 id: id(),
                 kind: Kind::Ring {
@@ -488,7 +494,7 @@ impl Layout {
             .find(|s| matches!(s.kind, Kind::Ring { .. }))
     }
 
-        pub fn window(&self) -> Option<&Shape> {
+    pub fn window(&self) -> Option<&Shape> {
         self.shapes
             .iter()
             .find(|s| matches!(s.kind, Kind::Window { .. }))

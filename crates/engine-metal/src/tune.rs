@@ -1083,7 +1083,11 @@ pub fn run(
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
     ]);
     let file = assemble(&base, &name, &facts, &tuned, &provenance)?;
-    let file = engine::rates::keeping_stored(crate::chip::registry(), file, user_file(profiles, &name).as_deref());
+    let file = engine::rates::keeping_stored(
+        crate::chip::registry(),
+        file,
+        user_file(profiles, &name).as_deref(),
+    );
     Ok(Outcome {
         device: name,
         file,
@@ -1644,7 +1648,10 @@ mod tests {
         let takes = |said: &str| {
             let (chip, report) = crate::chip::resolve_keyed(DEVICE, &facts, Some(&home));
             assert!(
-                report.stored.iter().any(|line| line.starts_with("`launch_ns`: stored (user")),
+                report
+                    .stored
+                    .iter()
+                    .any(|line| line.starts_with("`launch_ns`: stored (user")),
                 "{said}: {:#?}",
                 report.stored
             );
@@ -1655,7 +1662,11 @@ mod tests {
 
         let tuned = "[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n";
         let file = assemble(&base, DEVICE, &facts, tuned, &[]).expect("the tuned file");
-        let file = engine::rates::keeping_stored(crate::chip::registry(), file, user_file(Some(&home), DEVICE).as_deref());
+        let file = engine::rates::keeping_stored(
+            crate::chip::registry(),
+            file,
+            user_file(Some(&home), DEVICE).as_deref(),
+        );
         std::fs::write(&path, file).unwrap();
         let chip = takes("a tune");
         assert_eq!(

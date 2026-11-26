@@ -65,8 +65,10 @@ impl Run<'_> {
             };
             // The mask bits are no rows: a copied window's lanes read them
             // in place, through their gathered offsets.
-            if matches!(decl.def, Def::Cache(_) | Def::Input(poem_ir::RuntimeInput::Mask))
-                || matches!(decl.ty, Ty::Struct(_))
+            if matches!(
+                decl.def,
+                Def::Cache(_) | Def::Input(poem_ir::RuntimeInput::Mask)
+            ) || matches!(decl.ty, Ty::Struct(_))
             {
                 return;
             }

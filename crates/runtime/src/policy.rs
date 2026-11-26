@@ -6,13 +6,16 @@
 //! reports here, and nothing listens.
 #![cfg_attr(
     target_arch = "wasm32",
-    allow(dead_code, reason = "no policy runs in the browser: its reports are formed and dropped")
+    allow(
+        dead_code,
+        reason = "no policy runs in the browser: its reports are formed and dropped"
+    )
 )]
 
+pub mod grants;
 pub mod pressure;
 pub mod retention;
 pub mod schedule;
-pub mod grants;
 pub mod share;
 
 #[cfg(not(target_arch = "wasm32"))]

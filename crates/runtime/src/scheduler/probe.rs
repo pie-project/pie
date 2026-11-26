@@ -156,13 +156,20 @@ impl HostSubmitProbes {
     pub(crate) fn reset(&self) {
         self.submits.store(0, std::sync::atomic::Ordering::Relaxed);
         self.total_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.drain_settled_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.geometry_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.kv_prepare_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.scheduler_submit_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.shadow_advance_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.validate_frame_us.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.validate_frame_calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.drain_settled_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.geometry_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.kv_prepare_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.scheduler_submit_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.shadow_advance_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.validate_frame_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.validate_frame_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

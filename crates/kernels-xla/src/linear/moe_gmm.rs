@@ -536,10 +536,10 @@ impl Gmm {
                             }
                             None => {
                                 let w = if self.pooled.is_some() {
-                    self.load_rows(b, held, 0, n)?
-                } else {
-                    b.vload_all(held)?
-                };
+                                    self.load_rows(b, held, 0, n)?
+                                } else {
+                                    b.vload_all(held)?
+                                };
                                 let w = b.convert_f(w, Elem::Bf16)?;
                                 let acc = b.splat_f(&[c * tm, n], Elem::F32, 0.0)?;
                                 let y = b.matmul(x, w, acc, orient == Orient::NMajor)?;
@@ -960,12 +960,14 @@ impl Gmm {
         for j in 0..self.k / 128 {
             let ji = b.index(j);
             let v = b.vload(held, &[ji, ri, zi], &[1, rows, 128])?;
-            parts.push(b.op(
-                "vector.shape_cast",
-                &[v],
-                "",
-                &[MTy::Vector(vec![rows, 128], Elem::Bf16)],
-            )[0]);
+            parts.push(
+                b.op(
+                    "vector.shape_cast",
+                    &[v],
+                    "",
+                    &[MTy::Vector(vec![rows, 128], Elem::Bf16)],
+                )[0],
+            );
         }
         if parts.len() == 1 {
             return Ok(parts[0]);
@@ -1059,10 +1061,7 @@ impl Gmm {
             ins: [Some(xs), Some(bank), bias].into_iter().flatten().collect(),
             outs: vec![out],
             vmem_limit: Some(limit as u64),
-            scratch: vec![
-                self.slots_ty(rb, cb, self.w),
-                MTy::Sem(vec![2]),
-            ],
+            scratch: vec![self.slots_ty(rb, cb, self.w), MTy::Sem(vec![2])],
         };
         kernel.build(|b, blk| {
             let (wbuf, sems) = (blk.scratch[0], blk.scratch[1]);

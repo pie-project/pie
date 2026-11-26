@@ -1,12 +1,12 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::attn::voxel;
 use kernels_metal::conv::{conv3d, group_norm, resample, rule};
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::Dtype;
-use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 
 type Case = (
     rule::GridRule,

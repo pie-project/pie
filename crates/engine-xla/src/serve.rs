@@ -10,8 +10,8 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
-pub(crate) mod ring;
 mod evict;
+pub(crate) mod ring;
 mod size;
 mod stream;
 mod warm;
@@ -884,9 +884,10 @@ impl Shell {
             u64::from(boot.context.div_ceil(boot.page_size.max(1))),
             boot.slots,
         )?;
-        let chunk_rows = crate::store::layout_of(&boot.trace, fit_paging, rs_layout.as_deref(), target)?
-            .chunk_bytes
-            / crate::store::layout::ROW_BYTES;
+        let chunk_rows =
+            crate::store::layout_of(&boot.trace, fit_paging, rs_layout.as_deref(), target)?
+                .chunk_bytes
+                / crate::store::layout::ROW_BYTES;
         let listed_rows = u32::try_from(
             (2 * chunk_rows + 1)
                 .div_ceil(crate::inputs::ROW_WORDS as u64)
@@ -916,11 +917,11 @@ impl Shell {
         // the top row rung's rows. Nothing is laid per fire.
         let readout_cap =
             poem_exec::fire::rung_of(&budgets.tokens.buckets, budgets.tokens.max_lanes);
-        let readout_exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
-            .map_err(|why| Fault::Unbound { what: why })?;
+        let readout_exports =
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
+                .map_err(|why| Fault::Unbound { what: why })?;
         let top_tokens = budgets.tokens.buckets.last().copied().unwrap_or(0);
-        let readout_specs =
-            fixed_readouts(&boot.trace, &readout_exports, readout_cap, top_tokens);
+        let readout_specs = fixed_readouts(&boot.trace, &readout_exports, readout_cap, top_tokens);
         // As many fires as can be outstanding: the frames in flight of at
         // most `STEPS_MAX` fires each, and the one being written
         // (`Runahead::staging_depth`, the staging ring's own count). A ring
@@ -928,8 +929,8 @@ impl Shell {
         // holds; the device orders a plane's reuse after its last reader by
         // the donation itself. (Four deep, a fire four back was still read
         // when two frames were in flight across a compile stall.)
-        let frames_in_flight = u8::try_from(boot.device.staging_slots.saturating_sub(1).max(1))
-            .unwrap_or(u8::MAX);
+        let frames_in_flight =
+            u8::try_from(boot.device.staging_slots.saturating_sub(1).max(1)).unwrap_or(u8::MAX);
         let readout_depth = engine::runahead::Runahead::of(frames_in_flight).staging_depth();
         let readout_bytes: u64 = readout_specs
             .iter()
@@ -1023,9 +1024,8 @@ impl Shell {
             };
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
-        let (fit, slots) =
-            engine::fit::pool_for(boot.kv_budget, boot.slots, seat, room, demand)
-                .map_err(|short| Fault::Residency(short.to_string()))?;
+        let (fit, slots) = engine::fit::pool_for(boot.kv_budget, boot.slots, seat, room, demand)
+            .map_err(|short| Fault::Residency(short.to_string()))?;
         if fit < least {
             return Err(Fault::Residency(format!(
                 "seats of {seat} page(s) (`seat_tokens`) leave the pool {fit} page(s), fewer \
@@ -1128,8 +1128,11 @@ impl Shell {
             })
             .collect();
         for spec in &readout_specs {
-            let names: Vec<&str> =
-                spec.exports.iter().map(|&e| readout_exports[e].decl.name.as_str()).collect();
+            let names: Vec<&str> = spec
+                .exports
+                .iter()
+                .map(|&e| readout_exports[e].decl.name.as_str())
+                .collect();
             tracing::info!(
                 outputs = ?names,
                 rows = spec.rows,
@@ -1168,8 +1171,9 @@ impl Shell {
             );
         }
 
-        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
-            .map_err(|why| Fault::Unbound { what: why })?;
+        let exports =
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
+                .map_err(|why| Fault::Unbound { what: why })?;
         let normal_exports = normal_exports(&boot.trace, &exports);
         tracing::info!(
             planes = ?(exports.iter().zip(&normal_exports))
@@ -1885,7 +1889,9 @@ impl Shell {
     ) -> Result<u32> {
         if slots.len() != planes.len() || slots.is_empty() {
             return Err(Fault::Adapter {
-                bank: planes.first().map_or_else(String::new, |(name, _)| name.clone()),
+                bank: planes
+                    .first()
+                    .map_or_else(String::new, |(name, _)| name.clone()),
                 why: format!(
                     "lands {} planes and the runtime took {} `Adapter` slots for it; the \
                      facts state one slot a plane",
@@ -1939,12 +1945,15 @@ impl Shell {
             let plane: u64 = p.shape.get(1..).unwrap_or(&[]).iter().product();
             let mut starts = Vec::with_capacity(k);
             for &id in adapters {
-                let slot = self.adapters.slot_of(id, &p.name).ok_or_else(|| Fault::Adapter {
-                    bank: p.name.clone(),
-                    why: format!(
-                        "a lane routes to adapter {id}, which landed no plane of this bank"
-                    ),
-                })?;
+                let slot = self
+                    .adapters
+                    .slot_of(id, &p.name)
+                    .ok_or_else(|| Fault::Adapter {
+                        bank: p.name.clone(),
+                        why: format!(
+                            "a lane routes to adapter {id}, which landed no plane of this bank"
+                        ),
+                    })?;
                 let row = self.pools.adapter_row(slot).ok_or_else(|| Fault::Unbound {
                     what: format!("Adapter slot {slot}, which lies past the pool"),
                 })?;
@@ -1974,7 +1983,10 @@ impl Shell {
     pub fn rebind_adapter(&mut self, id: u32, slots: &[u32]) -> Option<u32> {
         match self.adapters.slots(id) {
             Some(_) => self.adapters.rebind(id, slots),
-            None => slots.first().copied().filter(|&first| self.adapters.slots(first).is_some()),
+            None => slots
+                .first()
+                .copied()
+                .filter(|&first| self.adapters.slots(first).is_some()),
         }
     }
 
@@ -2031,7 +2043,9 @@ impl Shell {
 
     /// The host memory the held programs take, by the measured hold.
     fn programs_held(&self) -> u64 {
-        self.hold_per_kib.saturating_mul(self.device.held_text_bytes()) / 1024
+        self.hold_per_kib
+            .saturating_mul(self.device.held_text_bytes())
+            / 1024
     }
 
     fn load_parked(
@@ -2087,7 +2101,8 @@ impl Shell {
             && let (Some(before), Some(after)) = (resident, crate::device::resident_bytes())
             && kept.code.len() > 0
         {
-            self.hold_per_kib = after.saturating_sub(before).saturating_mul(1024) / kept.code.len() as u64;
+            self.hold_per_kib =
+                after.saturating_sub(before).saturating_mul(1024) / kept.code.len() as u64;
         }
         if self.device.code_on_disk(&kept.code) {
             self.evictable.insert(at, (kept, shape_key, self.fires));
@@ -2127,9 +2142,8 @@ impl Shell {
         };
         let fits = |shell: &Shell| fits_freed(shell, 0);
         let within = |shell: &Shell| {
-            crate::device::resident_bytes().is_none_or(|held| {
-                evict::within_bound(bound, held, shell.dropper.pending(), need)
-            })
+            crate::device::resident_bytes()
+                .is_none_or(|held| evict::within_bound(bound, held, shell.dropper.pending(), need))
         };
         // the droppable ones: a fired program by its last fire, one the
         // loader holds and no fire took before any (`evict::choose`)
@@ -2149,9 +2163,7 @@ impl Shell {
                     }),
             )
             .collect();
-        let (victims, _) = evict::choose(candidates, at, |freed| {
-            fits_freed(self, freed)
-        });
+        let (victims, _) = evict::choose(candidates, at, |freed| fits_freed(self, freed));
         let dropped = victims.len();
         for victim in victims {
             let mut held = Vec::new();
@@ -2188,7 +2200,9 @@ impl Shell {
         {
             return Err(Fault::Ceiling {
                 what: "bytes of the worker's resident memory under budget_host, every program but the one loading dropped",
-                need: crate::device::resident_bytes().unwrap_or(0).saturating_add(need),
+                need: crate::device::resident_bytes()
+                    .unwrap_or(0)
+                    .saturating_add(need),
                 have: bound,
             });
         }
@@ -2322,9 +2336,7 @@ impl Shell {
         let class = classes.class_of(seated.lane.word & classes.mask)?;
         let reads_input =
             (self.dit.feeds().inputs.iter()).any(|(_, readers)| readers.contains(class));
-        (!self.wide.contains(class)
-            && !self.corrected.contains(class)
-            && !reads_input)
+        (!self.wide.contains(class) && !self.corrected.contains(class) && !reads_input)
             .then_some(class)
     }
 
@@ -3252,7 +3264,8 @@ impl Shell {
         let mask_width = (paging.pages_per_slot.max(1) * paging.page_size.max(1))
             .max(256)
             .next_power_of_two();
-        let staged = crate::mask::stage(&masks, mask_width).map_err(|fault| fault.of_rows(composition.lanes()))?;
+        let staged = crate::mask::stage(&masks, mask_width)
+            .map_err(|fault| fault.of_rows(composition.lanes()))?;
         // The mask plane is one row of `stride` key bytes per token row (at
         // least one column), and the enable flags one byte per token row.
         // A mixed fire (prompt rows beside decodes) on a load whose classes
@@ -3314,7 +3327,8 @@ impl Shell {
         // rung and not by how many rows its lanes read (prompt logprobs, a
         // draft block): the rows past the count repeat the last, read by no
         // lane.
-        let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32);
+        let want =
+            poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32);
         if let Some(&last) = readout_rows.last() {
             readout_rows.resize((want as usize).max(readout_rows.len()), last);
         }
@@ -3782,7 +3796,9 @@ impl Shell {
         };
         // the fire's program is the most recently fired (`evict`)
         if found.is_some() {
-            let at = shape_key.and_then(|k| self.parked_shapes.get(&k).copied()).or(key);
+            let at = shape_key
+                .and_then(|k| self.parked_shapes.get(&k).copied())
+                .or(key);
             if let Some(entry) = at.and_then(|at| self.evictable.get_mut(&at)) {
                 entry.2 = self.fires;
             }
@@ -4121,9 +4137,13 @@ impl Shell {
             Vec::with_capacity(planes.len());
         for plane in &planes {
             let (ring, _) = plane.fixed;
-            buffers.push(self.pools.readout_current(ring).ok_or_else(|| Fault::Unbound {
-                what: format!("readout ring {ring}'s plane, which the fire did not write"),
-            })?);
+            buffers.push(
+                self.pools
+                    .readout_current(ring)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!("readout ring {ring}'s plane, which the fire did not write"),
+                    })?,
+            );
         }
         let host = if full_table.is_none() {
             host.into_iter()
@@ -4205,7 +4225,11 @@ impl Shell {
                 .collect::<Result<Vec<Tensor>>>()?;
             // The rows this fire writes: its readout rows, or every row of a
             // float output.
-            let rows = if out.decl.readout { readouts } else { handles[0].rows };
+            let rows = if out.decl.readout {
+                readouts
+            } else {
+                handles[0].rows
+            };
             let Some(ring) =
                 (self.readout_specs.iter()).position(|spec| spec.exports.contains(&export))
             else {
@@ -4366,15 +4390,18 @@ impl Shell {
         let count = u32::try_from(table.table.len()).unwrap_or(u32::MAX);
         let program = self.gather_program(shape.rows, shape.width, count)?;
         let bytes: Vec<u8> = table.table.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let ids = self
-            .device
-            .upload_flat(crate::pjrt::ElementType::S32, &bytes, i64::from(count))?;
+        let ids =
+            self.device
+                .upload_flat(crate::pjrt::ElementType::S32, &bytes, i64::from(count))?;
         let plane = outs.get(table.plane).ok_or_else(|| Fault::Unbound {
             what: "the readout plane, which the program did not return".to_string(),
         })?;
         let mut got = self.device.run(
             &program,
-            vec![crate::pjrt::Arg::Keep(plane.as_ref()), crate::pjrt::Arg::Keep(&ids)],
+            vec![
+                crate::pjrt::Arg::Keep(plane.as_ref()),
+                crate::pjrt::Arg::Keep(&ids),
+            ],
             false,
         )?;
         let buffer = got.pop().ok_or_else(|| Fault::Unbound {
@@ -4680,8 +4707,8 @@ impl Shell {
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(std::sync::Arc<crate::device::Program>, Vec<ValueId>)> {
         let (text, sig, probed) = self.trace_text(
-            slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage,
-            lands, pixels,
+            slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage, lands,
+            pixels,
         )?;
         let fire = || {
             let rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
@@ -4948,9 +4975,9 @@ impl Shell {
             for &value in &self.readout_entries {
                 let handle = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                     what: format!(
-                    "value {}, a readout entry, which the carve gave no rectangle",
-                    value.0
-                ),
+                        "value {}, a readout entry, which the carve gave no rectangle",
+                        value.0
+                    ),
                 })?;
                 extras.push(tracer.value(handle)?);
             }
@@ -5201,7 +5228,11 @@ fn fixed_readouts(
         values.push(export.values.clone());
         out.push(FixedReadout {
             exports: vec![at],
-            dtype: if decl.dtype == Dtype::I32 { Dtype::I32 } else { Dtype::F32 },
+            dtype: if decl.dtype == Dtype::I32 {
+                Dtype::I32
+            } else {
+                Dtype::F32
+            },
             cap,
             layers,
             rows: layers * cap,
@@ -5567,13 +5598,7 @@ impl Shell {
         h.update(env!("XLA_LOWERING_FINGERPRINT").as_bytes());
         h.update(format!("{:?}", self.trace).as_bytes());
         h.update(format!("{:?}", self.budgets).as_bytes());
-        h.update(
-            format!(
-                "{:?}|{:?}|{:?}",
-                self.tuning, self.pad, self.tpu
-            )
-            .as_bytes(),
-        );
+        h.update(format!("{:?}|{:?}|{:?}", self.tuning, self.pad, self.tpu).as_bytes());
         h.update(format!("{:?}", self.pools.layout()).as_bytes());
         h.update(format!("{:?}", self.streamed).as_bytes());
         // the staging's layout (its facts' times differ run to run)

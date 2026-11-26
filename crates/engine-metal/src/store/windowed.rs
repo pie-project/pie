@@ -65,7 +65,9 @@ impl WindowedLane<'_> {
     /// The ring's rows, `R`.
     #[must_use]
     pub fn ring_rows(&self) -> u32 {
-        u32::try_from(self.ring.len()).unwrap_or(u32::MAX).saturating_mul(self.page)
+        u32::try_from(self.ring.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(self.page)
     }
 
     /// The page logical page `n` reads.
@@ -81,7 +83,8 @@ impl WindowedLane<'_> {
         let base = u64::from(self.base);
         let held = base + self.buffer.len() as u64 * u64::from(page);
         if first >= base && first < held {
-            return Ok(self.buffer[usize::try_from((first - base) / u64::from(page)).unwrap_or(usize::MAX)]);
+            return Ok(self.buffer
+                [usize::try_from((first - base) / u64::from(page)).unwrap_or(usize::MAX)]);
         }
         if n >= self.own_page && ((n - self.own_page) as usize) < self.own.len() {
             return Ok(self.own[(n - self.own_page) as usize]);
@@ -176,11 +179,17 @@ mod tests {
 
     const P: u32 = 16;
 
-
     #[test]
     fn a_base_off_the_page_grid_is_refused() {
         let ring = [1u32, 2, 3];
-        let lane = WindowedLane { page: P, ring: &ring, base: 5, buffer: &[], own: &[], own_page: 0 };
+        let lane = WindowedLane {
+            page: P,
+            ring: &ring,
+            base: 5,
+            buffer: &[],
+            own: &[],
+            own_page: 0,
+        };
         assert!(lane.page_of(0).is_err());
     }
 }

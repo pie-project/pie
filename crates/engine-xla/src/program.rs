@@ -490,7 +490,9 @@ pub enum Tokens {
     /// a lane of it (its fed ring's slots), which the fire gathers. Row and
     /// lane apart, never one element index over the whole pool (an i32 of
     /// those reaches 8 GiB).
-    Device { at: Vec<(u32, u32)> },
+    Device {
+        at: Vec<(u32, u32)>,
+    },
 }
 
 impl Tokens {
@@ -677,7 +679,11 @@ impl Plane {
     /// Releases `id`, which no instance binds (`Engine::close_program`):
     /// its id answers nothing after.
     pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
-        if self.instances.values().any(|instance| instance.program == id) {
+        if self
+            .instances
+            .values()
+            .any(|instance| instance.program == id)
+        {
             return Err(Refusal::Program(format!(
                 "program {id} still has an instance bound"
             )));
@@ -918,8 +924,11 @@ impl Plane {
         pool: Option<&crate::pjrt::Buffer>,
     ) -> Result<(), Refusal> {
         self.flights.wait_all();
-        let registered: std::collections::HashSet<usize> =
-            self.channels.values().map(|r| Arc::as_ptr(r) as usize).collect();
+        let registered: std::collections::HashSet<usize> = self
+            .channels
+            .values()
+            .map(|r| Arc::as_ptr(r) as usize)
+            .collect();
         let Some(held) = self.instances.get_mut(&id) else {
             return Ok(());
         };
@@ -949,7 +958,7 @@ impl Plane {
         self.forms.get(program)
     }
 
-        pub fn register_channel(
+    pub fn register_channel(
         &mut self,
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel, Refusal> {
@@ -1051,8 +1060,12 @@ impl Plane {
             seeds.insert(seed.channel, value);
         }
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
-        let (cells, fed) =
-            self.rows_of(binding.program, &binding.channels, &binding.ring_slots, cell_row)?;
+        let (cells, fed) = self.rows_of(
+            binding.program,
+            &binding.channels,
+            &binding.ring_slots,
+            cell_row,
+        )?;
 
         self.next_instance += 1;
         let id = InstanceId(self.next_instance);
@@ -1177,7 +1190,9 @@ impl Plane {
             let at = u32::try_from(ring.head() % u64::from(capacity.max(1))).unwrap_or(0);
             let row = first + at * cell_rows;
             return Ok(Some(Tokens::Device {
-                at: span.map(|i| (row + i as u32 / 128, i as u32 % 128)).collect(),
+                at: span
+                    .map(|i| (row + i as u32 / 128, i as u32 % 128))
+                    .collect(),
             }));
         }
         self.settle_ring(ring);
@@ -1728,7 +1743,11 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0).collect()),
+        Dtype::Bool => Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
@@ -1971,11 +1990,15 @@ fn fed_of(
         .zip(firsts)
         .map(|(&(channel, w, capacity), (_, first))| {
             let slots = (u64::from(w) * 4).div_ceil(crate::guest::CHANNEL_SLOT);
-            (channel, first, capacity, u32::try_from(slots * 2).unwrap_or(u32::MAX))
+            (
+                channel,
+                first,
+                capacity,
+                u32::try_from(slots * 2).unwrap_or(u32::MAX),
+            )
         })
         .collect())
 }
-
 
 /// A program a registration prepared ([`Plane::prepare`]): what its
 /// compile, on any thread, compiles, and what [`Plane::finish`] holds.

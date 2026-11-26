@@ -287,9 +287,7 @@ impl Rooms {
                 }) => of(*q).map(|rect| (rect.width / (*head_dim).max(1), *observe)),
                 _ => None,
             })
-            .map(|(heads, observe)| {
-                kernels_slang::attn::score::stats_floats(1, heads, observe)
-            })
+            .map(|(heads, observe)| kernels_slang::attn::score::stats_floats(1, heads, observe))
             .max()
             .filter(|floats| *floats > 0)
             .map(|floats| {

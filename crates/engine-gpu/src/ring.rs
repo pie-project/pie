@@ -231,7 +231,11 @@ pub fn stage(lanes: &[Lane<'_>], tokens: u32, ring_rows: u32, windows: &[u32]) -
             lane.folded as i32,
             read_base as i32,
             lane.first as i32,
-            if lane.keeps { to as i32 } else { lane.folded as i32 },
+            if lane.keeps {
+                to as i32
+            } else {
+                lane.folded as i32
+            },
             shift as i32,
             run_at as i32,
         ]);

@@ -25,8 +25,8 @@ use eta_ir::op::Op;
 use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Port, PortMask, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 
-use engine::program::ProgramRegistration;
 use engine::frame::Shell as FrameShell;
+use engine::program::ProgramRegistration;
 use engine_metal::serve::{Attached, Seated, StepView};
 use engine_metal::{Done, Lane, Shell};
 
@@ -116,7 +116,9 @@ fn program(vocab: u32) -> ProgramRegistration {
 /// Binds the envelope as a decode envelope at `slot`'s places, `tok`
 /// seeded with [`FIRST_TOKEN`].
 fn bind_envelope(shell: &mut Shell, vocab: u32, slot: u32) -> engine::InstanceId {
-    let program = shell.register_program(&program(vocab)).expect("the program registers");
+    let program = shell
+        .register_program(&program(vocab))
+        .expect("the program registers");
     let facts = shell.program_facts(program).expect("the program's facts");
     let layout = shell.pool_layout();
     let instance = layout.instance.expect("an instance shape");
@@ -232,7 +234,10 @@ fn heard(rx: &mpsc::Receiver<Heard>, frame: u64) {
         .recv_timeout(Duration::from_secs(20))
         .unwrap_or_else(|_| panic!("step {frame} is told"));
     assert_eq!(at.frame, engine::FrameId(frame), "told in order");
-    assert!(outcome.faulted.is_empty(), "step {frame} commits: {outcome:?}");
+    assert!(
+        outcome.faulted.is_empty(),
+        "step {frame} commits: {outcome:?}"
+    );
 }
 
 /// The envelope's argmax cells, in order, after frames 1 (after the plain
@@ -261,7 +266,11 @@ fn argmaxes(fixture: &Fixture, airborne: bool) -> Vec<Vec<u8>> {
         numel: 1,
         dtype: eta_ir::Dtype::I32,
     };
-    let footprint = shell.ring_facts(shape).expect("a ring shape").footprint.slots;
+    let footprint = shell
+        .ring_facts(shape)
+        .expect("a ring shape")
+        .footprint
+        .slots;
     let layout = shell.pool_layout();
     let per_chunk = layout.channel.expect("a channel shape").per_chunk;
     let first = (layout.free_chunk() + 6) * per_chunk;
@@ -285,7 +294,11 @@ fn argmaxes(fixture: &Fixture, airborne: bool) -> Vec<Vec<u8>> {
     }
     submit(&mut shell, fixture, id, 2, false, &tx);
     if airborne {
-        assert_eq!(shell.airborne_steps(), 2, "frame 2 staged while frame 1 flies");
+        assert_eq!(
+            shell.airborne_steps(),
+            2,
+            "frame 2 staged while frame 1 flies"
+        );
         engine_metal::device::release_held_frame();
         heard(&rx, 1);
     }
@@ -302,8 +315,12 @@ fn argmaxes(fixture: &Fixture, airborne: bool) -> Vec<Vec<u8>> {
             .expect("each pass put its argmax");
         cells.push(cell);
     }
-    shell.close_program_instance(id).expect("the instance closes");
-    shell.close_program_instance(idle).expect("the idle instance closes");
+    shell
+        .close_program_instance(id)
+        .expect("the instance closes");
+    shell
+        .close_program_instance(idle)
+        .expect("the idle instance closes");
     cells
 }
 

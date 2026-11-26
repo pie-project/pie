@@ -1,9 +1,9 @@
 #![cfg(target_vendor = "apple")]
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
-use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
 #[test]
 fn mpp_attention_over_a_bf16_pool_matches_fp64() {
@@ -19,7 +19,9 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
     // model's chunk plan builds: the kernel reads a tile's two pages by their
     // own addresses, and the arbiter takes MPP at both sizes.
     for (d, m, qh, kh, requests, np, base, page) in [
-        (128usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize, 32usize),
+        (
+            128usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize, 32usize,
+        ),
         (256, 35, 6, 2, 3, 3, 65, 32),
         (256, 64, 8, 4, 2, 4, 65, 32),
         (256, 600, 2, 1, 3, 10, 65, 32),

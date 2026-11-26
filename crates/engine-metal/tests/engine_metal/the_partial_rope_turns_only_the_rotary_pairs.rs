@@ -9,12 +9,12 @@
 //! layers) pairs `(i, i + head_dim/2)` at `pos * theta^(-2i/head_dim)` for the
 //! first `rotary_dim/2` pairs instead, as HF's `proportional` rope type does.
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::rope;
 use poem_ir::Dtype;
-use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;

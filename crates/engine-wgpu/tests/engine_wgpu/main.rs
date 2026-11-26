@@ -74,9 +74,9 @@ macro_rules! spirv_only {
     };
 }
 
-mod built_at_load;
 #[path = "../../../engine-gpu/suite/attn/mod.rs"]
 mod attn;
+mod built_at_load;
 #[path = "../../../engine-gpu/suite/collective/mod.rs"]
 mod collective;
 #[path = "../../../engine-gpu/suite/conv/mod.rs"]

@@ -236,7 +236,11 @@ impl Pool {
             }
             // Room is not made from the pages this put keeps.
             while inner.bytes + bytes.len() > self.capacity {
-                let going = inner.order.values().find(|key| !sent.contains(*key)).copied();
+                let going = inner
+                    .order
+                    .values()
+                    .find(|key| !sent.contains(*key))
+                    .copied();
                 match going {
                     Some(going) => inner.remove(&going),
                     None => break,

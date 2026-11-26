@@ -240,11 +240,7 @@ pub fn classify_decode_envelope_why(
     if let Some(port) = taint.device_dependent_ports.iter().find(|port| {
         !matches!(
             port,
-            Port::EmbedTokens
-                | Port::Positions
-                | Port::Fold
-                | Port::AttnMask
-                | Port::Parents
+            Port::EmbedTokens | Port::Positions | Port::Fold | Port::AttnMask | Port::Parents
         )
     }) {
         return decline(format!("{port:?} is computed on the device"));

@@ -320,13 +320,10 @@ pub fn guest_budget(
                 "the device states a bound on one submission and its load measured no \
                  launch_ns to cost a guest stage against it",
             )?;
-            let gbps = cost
-                .elementwise_gbps
-                .filter(|gbps| *gbps > 0.0)
-                .ok_or(
-                    "the device states a bound on one submission and its load measured no \
+            let gbps = cost.elementwise_gbps.filter(|gbps| *gbps > 0.0).ok_or(
+                "the device states a bound on one submission and its load measured no \
                      elementwise_gbps to cost a guest stage against it",
-                )?;
+            )?;
             Some(eta_ir::validate::SubmitBound {
                 bound_ns,
                 launch_ns: launch_ns as f64,

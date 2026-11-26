@@ -179,9 +179,7 @@ impl RsGrant {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-            && self.pages.is_empty()
-            && self.wpages.is_empty()
+        self.slots.is_empty() && self.pages.is_empty() && self.wpages.is_empty()
     }
 }
 
@@ -483,13 +481,7 @@ impl RsStore {
             (Some(host), Some(list)) => ShapePool::shared_from(host, list, host_pages.ids_end()),
             _ => ShapePool::new(ShapeKind::List, 0, host_pages.ids_end(), 0),
         };
-        let mut store = Self::build(
-            slots,
-            pages,
-            host_slots,
-            host_pages,
-            records,
-        );
+        let mut store = Self::build(slots, pages, host_slots, host_pages, records);
         store.rs_tokens = rs_list.map(|list| list.tokens.max(1));
         store.window_buffer = shared.lock().unwrap().window_buffer().is_some();
         store.wpages = wpages;
@@ -531,9 +523,7 @@ impl RsStore {
         };
         let window = match (writes.clone(), fold) {
             (Some(writes), Some(fold))
-                if alone
-                    && table.iter().all(Option::is_none)
-                    && writes.start == entry.frozen =>
+                if alone && table.iter().all(Option::is_none) && writes.start == entry.frozen =>
             {
                 let start = writes.start.saturating_add(fold).min(writes.end);
                 (start < writes.end).then_some(start..writes.end)
@@ -571,7 +561,12 @@ impl RsStore {
     /// slot, or a page of a store of windowed layers alone.
     #[must_use]
     pub fn is_window_page(&self, id: RsSlotId) -> bool {
-        self.window_buffer && if self.hybrid() { self.is_wpage(id) } else { self.is_page(id) }
+        self.window_buffer
+            && if self.hybrid() {
+                self.is_wpage(id)
+            } else {
+                self.is_page(id)
+            }
     }
 
     /// The id of the hybrid's window-buffer slot the engine numbers `slot`.
@@ -642,18 +637,22 @@ impl RsStore {
     /// and each rs list slot in disk chunks of its own shape, as
     /// the engine lays them out (CONTRACT-BC 22). Without it an evicted
     /// process's state stayed on the device, its chunks held.
-    pub fn set_disk(&mut self, shared: &Shared, disk: std::sync::Arc<dyn crate::store::roles::DiskSlots>) {
+    pub fn set_disk(
+        &mut self,
+        shared: &Shared,
+        disk: std::sync::Arc<dyn crate::store::roles::DiskSlots>,
+    ) {
         if !self.is_shared() {
             return;
         }
         let (per_chunk, records, list, wshape) = {
             let pool = shared.lock().unwrap();
-            let wshape = pool
-                .rs_list()
-                .and(pool.window_buffer())
-                .map(|list| list.id);
-            let records: Vec<(::engine::chunk::ShapeId, u32)> =
-                pool.fixed().iter().map(|shape| (shape.id, shape.pieces)).collect();
+            let wshape = pool.rs_list().and(pool.window_buffer()).map(|list| list.id);
+            let records: Vec<(::engine::chunk::ShapeId, u32)> = pool
+                .fixed()
+                .iter()
+                .map(|shape| (shape.id, shape.pieces))
+                .collect();
             let list = pool.buffer_list().map(|list| list.id);
             let engines: Vec<::engine::chunk::ShapeId> = pool
                 .fixed()
@@ -711,10 +710,9 @@ impl RsStore {
         };
         let share = u64::from(free_chunks);
         let room = |shape: ::engine::chunk::ShapeId| -> u64 {
-            let open: u64 = disk
-                .chunks
-                .get(&shape)
-                .map_or(0, |chunks| chunks.values().map(|free| free.len() as u64).sum());
+            let open: u64 = disk.chunks.get(&shape).map_or(0, |chunks| {
+                chunks.values().map(|free| free.len() as u64).sum()
+            });
             open + share * u64::from(disk.per_chunk.get(&shape).copied().unwrap_or(0))
         };
         let clamp = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
@@ -781,14 +779,7 @@ impl RsStore {
                 disk.next - 1
             });
             let id = RsSlotId(DISK_ROWS + index);
-            disk.rows.insert(
-                id,
-                DiskRow {
-                    page,
-                    wpage,
-                    refs,
-                },
-            );
+            disk.rows.insert(id, DiskRow { page, wpage, refs });
             taken.push(id);
         }
         if failed {
@@ -846,7 +837,8 @@ impl RsStore {
     /// `RsUnits::default()` clears it.
     pub fn note_short_shared(&mut self, need: RsUnits) {
         self.slots.wait(u64::from(need.slots));
-        self.pages.wait(u64::from(need.pages.saturating_sub(need.wbuf)));
+        self.pages
+            .wait(u64::from(need.pages.saturating_sub(need.wbuf)));
         self.wpages.wait(u64::from(need.wbuf));
     }
 
@@ -1425,7 +1417,10 @@ impl RsStore {
     /// too ([`Self::begin_device_fold`]). None for a state that holds
     /// nothing yet; refused by name as [`Self::checkpoint`] is, a fire on
     /// its way aside.
-    pub fn checkpoint_ahead(&mut self, ws: RsWorkingSetId) -> Result<Option<RsWorkingSetId>, RsError> {
+    pub fn checkpoint_ahead(
+        &mut self,
+        ws: RsWorkingSetId,
+    ) -> Result<Option<RsWorkingSetId>, RsError> {
         let entry = self.entry(ws)?;
         if Self::empty(entry) {
             return Ok(None);
@@ -1897,12 +1892,7 @@ impl RsStore {
         let mut fresh_slots = slots.iter().copied();
         let mut fresh_ids = pages.iter().copied();
         let mut fresh_wids = wpages.iter().copied();
-        let allocated: Vec<RsSlotId> = slots
-            .iter()
-            .chain(&pages)
-            .chain(&wpages)
-            .copied()
-            .collect();
+        let allocated: Vec<RsSlotId> = slots.iter().chain(&pages).chain(&wpages).copied().collect();
 
         let state = if write_state {
             Some(match folded {
@@ -2280,7 +2270,10 @@ impl RsStore {
         let wbuf = self.wpages.available() as u32;
         RsUnits {
             wbuf,
-            ..RsUnits::of(self.slots.available() as u32, self.pages.available() as u32 + wbuf)
+            ..RsUnits::of(
+                self.slots.available() as u32,
+                self.pages.available() as u32 + wbuf,
+            )
         }
     }
 

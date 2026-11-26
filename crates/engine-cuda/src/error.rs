@@ -210,8 +210,7 @@ impl Fault {
     /// the step's lane that row is of.
     #[must_use]
     pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
-        if let Self::Mask { lane, .. }
-            | Self::MaskRows { lane, .. } = &mut self
+        if let Self::Mask { lane, .. } | Self::MaskRows { lane, .. } = &mut self
             && let Some(row) = rows.get(*lane as usize)
         {
             *lane = row.source;

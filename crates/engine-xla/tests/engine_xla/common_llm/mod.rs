@@ -627,8 +627,12 @@ impl Seq {
                 })
                 .expect("a kv list")
                 .id;
-            lane.tables
-                .push((kv, (0..need as u32).map(|p| self.slot * (context / PAGE) + p).collect()));
+            lane.tables.push((
+                kv,
+                (0..need as u32)
+                    .map(|p| self.slot * (context / PAGE) + p)
+                    .collect(),
+            ));
             return lane;
         }
         for list in refs.shapes(|s| {

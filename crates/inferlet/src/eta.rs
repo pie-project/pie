@@ -45,8 +45,8 @@ pub use working_set::*;
 
 pub mod shared_prelude {
     pub use super::{
-        Channel, Fold, Pipeline, ShareScope, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
-        frame_size, kv_page_size, readout_spans,
+        Channel, Fold, Pipeline, ShareScope, StateGeometry, TOKEN_PAD, WorkingSet,
+        channel_capacity, frame_size, kv_page_size, readout_spans,
     };
     pub use crate::{Context, Result, model};
     pub use eta_dsl::Stage;
@@ -112,5 +112,4 @@ mod tests {
         assert!(refused.starts_with("final rows: a beam"), "{refused}");
         assert!(refused.contains("ForwardPass::retractable"), "{refused}");
     }
-
 }

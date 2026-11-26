@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
+use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -15,7 +16,6 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
-use engine::Engine;
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -246,9 +246,7 @@ fn fault(fault: Fault) -> Error {
         Fault::Adapterless { .. }
         | Fault::AdapterWord { .. }
         | Fault::GeometryLanes { .. }
-        | Fault::OutputRows { .. } => {
-            Error::Invalid(fault.to_string())
-        }
+        | Fault::OutputRows { .. } => Error::Invalid(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,
@@ -546,7 +544,9 @@ impl Engine for Metal {
     }
 
     fn cover_fingerprint(&self) -> Option<String> {
-        self.shell.as_ref().map(crate::serve::Shell::cover_fingerprint)
+        self.shell
+            .as_ref()
+            .map(crate::serve::Shell::cover_fingerprint)
     }
 
     fn committed_covers(&self) -> &'static [&'static str] {
@@ -884,31 +884,46 @@ impl Engine for Metal {
         // A later boot of the same load (the same key) builds the keys an
         // earlier boot listed, from its binary archive, without walking; a
         // missing, stale or unreadable cache only costs the walk.
-        let cache = self.boot.profiles.as_ref().and_then(|profiles| profiles.parent()).map(|home| {
-            let key = shell.pipeline_cache_key(&caps.steps.shapes);
-            let name = key
-                .bytes()
-                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
-            let dir = home.join("cache").join("metal");
-            (key, dir.join(format!("{name:016x}.keys")), dir.join(format!("{name:016x}.metalarchive")))
-        });
+        let cache = self
+            .boot
+            .profiles
+            .as_ref()
+            .and_then(|profiles| profiles.parent())
+            .map(|home| {
+                let key = shell.pipeline_cache_key(&caps.steps.shapes);
+                let name = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                });
+                let dir = home.join("cache").join("metal");
+                (
+                    key,
+                    dir.join(format!("{name:016x}.keys")),
+                    dir.join(format!("{name:016x}.metalarchive")),
+                )
+            });
         #[cfg(target_vendor = "apple")]
         if let Some((_, _, archive)) = cache.as_ref() {
             shell.use_pipeline_archive(archive);
         }
-        let listed = cache.as_ref().and_then(|(key, keys, _)| read_pipeline_keys(keys, key));
+        let listed = cache
+            .as_ref()
+            .and_then(|(key, keys, _)| read_pipeline_keys(keys, key));
         let built = listed.and_then(|keys| {
             shell
                 .build_pipelines(&keys)
                 .inspect_err(|error| {
-                    tracing::warn!("metal: a listed pipeline did not build, so the load walks: {error}");
+                    tracing::warn!(
+                        "metal: a listed pipeline did not build, so the load walks: {error}"
+                    );
                 })
                 .ok()
         });
         let (fires, built) = match built {
             Some(built) => (0, built),
             None => {
-                let walked = shell.warm_pipelines_over(&caps.steps.shapes).map_err(fault)?;
+                let walked = shell
+                    .warm_pipelines_over(&caps.steps.shapes)
+                    .map_err(fault)?;
                 if let Some((key, keys, _archive)) = cache.as_ref() {
                     write_pipeline_keys(keys, key, &shell.pipeline_keys());
                     #[cfg(target_vendor = "apple")]
@@ -1350,10 +1365,7 @@ impl engine::Channels for Metal {
         Ok(self.loaded()?.ring_facts(channel_shape(registration)))
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         if registration.host_role != eta_ir::container::HostRole::None {
             return Err(Error::unsupported(self.kind(), "register_channel"));
         }
@@ -1382,11 +1394,7 @@ impl engine::Channels for Metal {
             .map_err(fault)
     }
 
-    fn take(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.loaded_mut()?
             .program_instance_taking(instance, channel)
             .map_err(fault)?
@@ -1435,10 +1443,7 @@ impl engine::Pool for Metal {
 }
 
 impl engine::WeightCache for Metal {
-    fn set_residency(
-        &mut self,
-        residency: &engine::chunk::WeightResidency,
-    ) -> EngineResult<u64> {
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<u64> {
         // This engine holds back none of the chunks it states
         // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
         self.loaded_mut()?
@@ -1479,11 +1484,7 @@ impl engine::Tiers for Metal {
     /// reading its sources when the call returns: told landed from that
     /// buffer's completion. A move to or from the slot
     /// files is a host copy done inside the call: its sources are read.
-    fn copy_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
         let landed = self.landed.clone();
         self.loaded_mut()?
             .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
@@ -1498,10 +1499,7 @@ impl engine::Tiers for Metal {
         self.loaded_mut()?.copy_slots(copy).map_err(fault)
     }
 
-    fn read(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         let _ = slots;
         Err(no_host_slots())
     }
@@ -1923,7 +1921,10 @@ fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyTex
         let _ = std::fs::create_dir_all(dir);
     }
     let partial = path.with_extension(format!("keys.{}", std::process::id()));
-    if std::fs::write(&partial, text).and_then(|()| std::fs::rename(&partial, path)).is_err() {
+    if std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, path))
+        .is_err()
+    {
         let _ = std::fs::remove_file(&partial);
     }
 }
@@ -1956,7 +1957,10 @@ fn drop_older_pipelines(keep: &std::path::Path, key: &str) {
         }
     }
     if dropped > 0 {
-        tracing::info!(dropped, "metal: this model's older pipeline lists and archives are removed");
+        tracing::info!(
+            dropped,
+            "metal: this model's older pipeline lists and archives are removed"
+        );
     }
 }
 
@@ -1990,7 +1994,13 @@ mod pipeline_cache {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
             left,
-            ["new.keys", "new.metalarchive", "note.keys", "other.keys", "other.metalarchive"]
+            [
+                "new.keys",
+                "new.metalarchive",
+                "note.keys",
+                "other.keys",
+                "other.metalarchive"
+            ]
         );
     }
 }
@@ -2021,7 +2031,10 @@ mod told {
             let served = crate::top::bounded(&baked, top);
             let mut told = asked.clone();
             told_within(&mut told, &served);
-            assert_eq!(told.max_tokens, top, "the told widest fire is the ruled top rung");
+            assert_eq!(
+                told.max_tokens, top,
+                "the told widest fire is the ruled top rung"
+            );
             assert_eq!(told.max_lanes, top.min(asked.max_lanes));
             assert_eq!(told.buckets, served.buckets);
             assert!(told.buckets.iter().all(|&rows| rows <= top));
@@ -2067,7 +2080,10 @@ mod no_host_tier_tests {
     fn a_host_budget_on_metal_is_refused_by_name() {
         let refused = super::no_host_tier(Some(8 << 30)).expect_err("refused");
         let text = refused.to_string();
-        assert!(text.contains("budget_host") && text.contains("the device's memory is the host's"), "{text}");
+        assert!(
+            text.contains("budget_host") && text.contains("the device's memory is the host's"),
+            "{text}"
+        );
         assert!(super::no_host_tier(None).is_ok());
         assert!(super::no_host_tier(Some(0)).is_ok());
     }
@@ -2092,7 +2108,13 @@ mod placement {
             panic!("a placement refusal: {refused:?}");
         };
         assert_eq!(chunks, &vec![2057]);
-        assert!(reason.contains("activation span's backed carve"), "{reason}");
-        assert!(refused.to_string().starts_with("impossible submission: "), "{refused}");
+        assert!(
+            reason.contains("activation span's backed carve"),
+            "{reason}"
+        );
+        assert!(
+            refused.to_string().starts_with("impossible submission: "),
+            "{refused}"
+        );
     }
 }

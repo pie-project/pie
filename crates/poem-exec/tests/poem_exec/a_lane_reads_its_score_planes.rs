@@ -10,10 +10,14 @@ fn a_lane_reads_its_score_planes() {
     let row = poem_compiler::catalog::deployment("qwen3-0.6b-bf16-kv-bf16")
         .expect("the catalog lists Qwen3-0.6B");
     let trace = row.trace(Platform::Metal);
-    let compiled = compile_axes(&trace, &Budgets::of(Budget::new(4, 256)), &DeviceProfile::default())
-        .expect("the axes compile");
-    let outputs = poem_exec::feeds::class_outputs(&trace, &compiled, 2048, 16)
-        .expect("the outputs declare");
+    let compiled = compile_axes(
+        &trace,
+        &Budgets::of(Budget::new(4, 256)),
+        &DeviceProfile::default(),
+    )
+    .expect("the axes compile");
+    let outputs =
+        poem_exec::feeds::class_outputs(&trace, &compiled, 2048, 16).expect("the outputs declare");
     let decl = |name: &str| {
         outputs
             .iter()
@@ -23,7 +27,15 @@ fn a_lane_reads_its_score_planes() {
             .clone()
     };
     let keys = decl("attn.scores");
-    assert_eq!((keys.planes.clone(), keys.width, keys.layers), (vec![1, 2048], 2048, 0), "{keys:?}");
+    assert_eq!(
+        (keys.planes.clone(), keys.width, keys.layers),
+        (vec![1, 2048], 2048, 0),
+        "{keys:?}"
+    );
     let pages = decl("attn.scores.pages");
-    assert_eq!((pages.planes.clone(), pages.width, pages.layers), (vec![1, 128], 128, 0), "{pages:?}");
+    assert_eq!(
+        (pages.planes.clone(), pages.width, pages.layers),
+        (vec![1, 128], 128, 0),
+        "{pages:?}"
+    );
 }

@@ -33,8 +33,7 @@ pub fn trace(name: &str, platform: Platform) -> Result<Trace> {
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub fn need(name: &str, context: u32) -> Result<(engine_metal::store::accounting::Need, u64)> {
     let trace = trace(name, Platform::Metal)?;
-    let device =
-        engine_metal::Context::bind().map_err(|why| anyhow!("this Mac's GPU: {why}"))?;
+    let device = engine_metal::Context::bind().map_err(|why| anyhow!("this Mac's GPU: {why}"))?;
     let caches = device
         .hold_resident(std::iter::empty(), true)
         .map_err(|why| anyhow!("this Mac's GPU: {why}"))?;

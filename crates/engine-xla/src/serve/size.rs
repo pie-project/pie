@@ -53,7 +53,12 @@ impl Shell {
         // Only words a compiled class runs.
         words.retain(|&(word, ..)| classes.class_of(word & classes.mask).is_some());
         let buckets = self.budgets.tokens.buckets.clone();
-        let lanes_cap = self.budgets.tokens.max_lanes.min(self.held.len() as u32).max(1);
+        let lanes_cap = self
+            .budgets
+            .tokens
+            .max_lanes
+            .min(self.held.len() as u32)
+            .max(1);
         let page = self.paging().page_size.max(1);
         let pages = self.paging().pages_per_slot.max(1);
         let context = pages * page;

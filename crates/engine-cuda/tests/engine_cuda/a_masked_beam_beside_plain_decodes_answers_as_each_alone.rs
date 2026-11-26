@@ -72,7 +72,14 @@ fn shell(trace: poem::Trace, path: &Path, graphs: Graphs, lanes: u32) -> Shell {
             pin: Some((graphs, None)),
             ..engine_cuda::Knobs::default()
         },
-        ..crate::common::boot(trace, &contract, path, Budget::new(lanes, 64), 256, 2 * lanes + 1)
+        ..crate::common::boot(
+            trace,
+            &contract,
+            path,
+            Budget::new(lanes, 64),
+            256,
+            2 * lanes + 1,
+        )
     })
     .expect("the shell loads");
     shell
@@ -88,10 +95,7 @@ fn argmax(row: &[f32]) -> usize {
 /// The beam's mask over `columns` keys: every key but a stretch of its
 /// prompt (`8..16`), so a lane reading no mask answers otherwise.
 fn beam_mask(columns: u32) -> Masking {
-    Masking::Extent(Mask::new(
-        vec![0, 8, 8, columns - 16],
-        u64::from(columns),
-    ))
+    Masking::Extent(Mask::new(vec![0, 8, 8, columns - 16], u64::from(columns)))
 }
 
 /// Each lane's slot pair: batched in slot `l`, alone in slot `LANES + l`.
@@ -152,14 +156,7 @@ fn serve(graphs: Graphs) {
         let mask = beam_mask(held + 1);
         let next: Vec<[u32; 1]> = (0..LANES as usize).map(|l| [last[l][0]]).collect();
         let rows: Vec<Row<'_>> = (0..LANES)
-            .map(|l| {
-                (
-                    l,
-                    &next[l as usize][..],
-                    held,
-                    (l == beam).then_some(&mask),
-                )
-            })
+            .map(|l| (l, &next[l as usize][..], held, (l == beam).then_some(&mask)))
             .collect();
         let batched = fire(&mut shell, &rows);
         if matches!(graphs, Graphs::On) {
@@ -283,19 +280,39 @@ fn maskless_through_masked_arms(lanes: u32) {
             let seated = [Seated {
                 pages: &pages,
                 held: Some(held),
-                ..Seated::of(Lane { slot: 0, word: word(tokens.len() as u32), tokens: &tokens })
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: word(tokens.len() as u32),
+                    tokens: &tokens,
+                })
             }];
-            out.push(shell.fire_rows(&seated, &[Readout::Last]).expect("fires").swap_remove(0));
+            out.push(
+                shell
+                    .fire_rows(&seated, &[Readout::Last])
+                    .expect("fires")
+                    .swap_remove(0),
+            );
             held += tokens.len() as u32;
         }
         out
     };
     let (masked, plain) = (serve(true), serve(false));
     for (step, (a, b)) in masked.iter().zip(&plain).enumerate() {
-        let worst = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        let span = b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
+        let worst = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        let span =
+            b.iter().copied().fold(f32::MIN, f32::max) - b.iter().copied().fold(f32::MAX, f32::min);
         eprintln!("step {step}: worst {worst} of a span {span}");
-        assert!(a.iter().all(|x| x.is_finite()), "step {step}: the masked arms answer a non-finite logit");
-        assert!(worst <= span * 1e-2, "step {step}: the masked arms answer otherwise ({worst})");
+        assert!(
+            a.iter().all(|x| x.is_finite()),
+            "step {step}: the masked arms answer a non-finite logit"
+        );
+        assert!(
+            worst <= span * 1e-2,
+            "step {step}: the masked arms answer otherwise ({worst})"
+        );
     }
 }

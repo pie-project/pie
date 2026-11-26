@@ -264,7 +264,11 @@ pub fn plan(
             ));
         }
         let slot = first.have;
-        if group.lanes.iter().any(|lane| lane.have != slot || lane.rows != 1) {
+        if group
+            .lanes
+            .iter()
+            .any(|lane| lane.have != slot || lane.rows != 1)
+        {
             return Err(Fault::program(
                 "serve::pages",
                 format!(
@@ -279,7 +283,14 @@ pub fn plan(
         let f0 = folded / page;
         let whole = table_pages.get(f0 as usize..).unwrap_or(&[]);
         let reserve = whole.len() as u32;
-        let backed = backed(group.layout.lanes, slot, folded, page, group.layout.frames, reserve);
+        let backed = backed(
+            group.layout.lanes,
+            slot,
+            folded,
+            page,
+            group.layout.frames,
+            reserve,
+        );
         let pool = &whole[..backed as usize];
         if reserve > group.layout.cap {
             return Err(Fault::program(
@@ -444,8 +455,9 @@ fn rs_lists(
         work.rs.push(RsRowsPlan {
             entry: group.rows_at + beam as u32,
             list: group.state
-                + u64::from(kernels_cuda::runtime::channel::BEAM_HEADER + beam as u32 * group.layout.cap)
-                    * 4,
+                + u64::from(
+                    kernels_cuda::runtime::channel::BEAM_HEADER + beam as u32 * group.layout.cap,
+                ) * 4,
             cap: group.layout.cap,
             f0,
             page,

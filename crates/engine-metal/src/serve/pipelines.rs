@@ -5,7 +5,6 @@ use super::stage::Form;
 use super::*;
 
 impl Shell {
-
     /// What the runtime's host cover depends on here
     /// (`engine::Engine::cover_fingerprint`): the device and its OS release
     /// (`crate::stored::measured_on`, the part a committed cover is filed
@@ -16,7 +15,9 @@ impl Shell {
     #[must_use]
     pub fn cover_fingerprint(&self) -> String {
         let fnv = |bytes: &[u8]| {
-            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            })
         };
         let kernels = kernels_metal::sources::SOURCES.iter().fold(
             0xcbf2_9ce4_8422_2325u64,
@@ -74,7 +75,9 @@ impl Shell {
     #[must_use]
     pub fn pipeline_cache_key(&self, steps: &engine::StepShapes) -> String {
         let fnv = |bytes: &[u8]| {
-            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            })
         };
         #[cfg(target_vendor = "apple")]
         let os = objc2_foundation::NSProcessInfo::processInfo()
@@ -95,7 +98,12 @@ impl Shell {
             .unwrap_or_default();
         let trace = fnv(format!("{:?}", self.trace).as_bytes());
         let paging = self.paging();
-        let weights: Vec<_> = self.weights.lines().into_iter().map(|(owner, _)| owner).collect();
+        let weights: Vec<_> = self
+            .weights
+            .lines()
+            .into_iter()
+            .map(|(owner, _)| owner)
+            .collect();
         let shape = format!(
             "{:?}|{:?}|{}:{}:{}|{steps:?}|{}|{:016x}|{weights:?}|ane {} nan {}",
             self.arena.rung_tokens(),
@@ -128,7 +136,10 @@ impl Shell {
 
     /// Builds `keys` (a list an earlier boot of the same load wrote): the
     /// pipelines, before ready, without walking. Returns how many it built.
-    pub fn build_pipelines(&self, keys: &[(String, String, String, Option<[u64; 2]>)]) -> Result<u64> {
+    pub fn build_pipelines(
+        &self,
+        keys: &[(String, String, String, Option<[u64; 2]>)],
+    ) -> Result<u64> {
         let before = self.pipelines.compiled();
         for (file, entry, stamp, strides) in keys {
             let leak = |text: &str| -> &'static str { Box::leak(text.to_owned().into_boxed_str()) };
@@ -272,7 +283,10 @@ impl Shell {
         let windows: Vec<Vec<u32>> = layout
             .window_lists()
             .map(|window| {
-                vec![window.slots.per_chunk * past_tables; context.div_ceil(window.tokens.max(1)) as usize]
+                vec![
+                    window.slots.per_chunk * past_tables;
+                    context.div_ceil(window.tokens.max(1)) as usize
+                ]
             })
             .collect();
         let verbs: Vec<(engine::fire::RsVerb, u32)> = if self.serves_rs_verbs() {
@@ -380,7 +394,12 @@ impl Shell {
             fires.extend(
                 inside(shape.rows, &[2, 4, 8])
                     .into_iter()
-                    .chain(tails.iter().copied().filter(|&rows| rows >= shape.rows.lo && rows <= shape.rows.hi))
+                    .chain(
+                        tails
+                            .iter()
+                            .copied()
+                            .filter(|&rows| rows >= shape.rows.lo && rows <= shape.rows.hi),
+                    )
                     .filter(|&rows| rows > 1)
                     .map(|rows| (rows, 1)),
             );
@@ -394,7 +413,10 @@ impl Shell {
             for (rows, reads) in fires {
                 let rows = rows.min(top);
                 let reads = reads.min(rows);
-                for &form in forms.iter().filter(|(_, scores)| !scores || octaves.contains(&rung)) {
+                for &form in forms
+                    .iter()
+                    .filter(|(_, scores)| !scores || octaves.contains(&rung))
+                {
                     for verb in verbs_of(shape.treatment) {
                         let key = (rung, rows, reads, form, verb);
                         if fired.insert(key) {

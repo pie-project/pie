@@ -993,7 +993,9 @@ impl KvPageTable {
     /// The owners of the live working sets.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn working_set_owners(&self) -> impl Iterator<Item = ProcessId> + '_ {
-        self.working_sets.iter().filter_map(|(_, entry)| entry.owner)
+        self.working_sets
+            .iter()
+            .filter_map(|(_, entry)| entry.owner)
     }
 
     pub fn page_hash_at(
@@ -1817,7 +1819,9 @@ impl KvPageTable {
                         None => {
                             let mut locations = Vec::new();
                             if self
-                                .visit_working_set_locations(ws, |location| locations.push(location))
+                                .visit_working_set_locations(ws, |location| {
+                                    locations.push(location)
+                                })
                                 .is_err()
                             {
                                 // A set the table no longer knows: as a
@@ -1833,7 +1837,9 @@ impl KvPageTable {
                             || pinned.contains(&location)
                             || readers.get(&location).is_some_and(|by| match by {
                                 Readers::One(reader) => !sets.contains(reader),
-                                Readers::Many(list) => list.iter().any(|reader| !sets.contains(reader)),
+                                Readers::Many(list) => {
+                                    list.iter().any(|reader| !sets.contains(reader))
+                                }
                             })
                         {
                             continue;
@@ -2388,7 +2394,11 @@ impl KvPageTable {
     #[allow(clippy::type_complexity)]
     pub fn device_pages_by_reader(
         &self,
-    ) -> Vec<(TriePageLocation, PhysicalKvPageId, Option<Vec<(WorkingSetId, bool)>>)> {
+    ) -> Vec<(
+        TriePageLocation,
+        PhysicalKvPageId,
+        Option<Vec<(WorkingSetId, bool)>>,
+    )> {
         let mut readers: FxHashMap<TriePageLocation, Option<Vec<(WorkingSetId, bool)>>> =
             FxHashMap::default();
         for (ws, entry) in self.working_sets.iter() {
@@ -2490,7 +2500,12 @@ impl KvPageTable {
     pub fn every_resident_table(&self) -> Vec<(WorkingSetId, Vec<u32>)> {
         self.working_sets
             .iter()
-            .filter_map(|(ws, _)| Some((ws, self.flatten(ws).ok()?.iter().map(|page| page.0).collect())))
+            .filter_map(|(ws, _)| {
+                Some((
+                    ws,
+                    self.flatten(ws).ok()?.iter().map(|page| page.0).collect(),
+                ))
+            })
             .collect()
     }
 

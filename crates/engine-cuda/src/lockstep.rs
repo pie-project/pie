@@ -23,7 +23,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::api::{ContractFor, Cuda, DeviceBoot, PendingStep};
-use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers};
 use engine::adapter::AdapterRegistration;
 use engine::caps::DeviceFacts;
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -33,6 +32,7 @@ use engine::load::{LoadRequest, Loaded};
 use engine::placement::Limits;
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle};
+use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers};
 
 /// What a rank brings to a step: its frame and the token bucket it asks.
 pub struct Arrival<F> {
@@ -919,10 +919,7 @@ impl Channels for Rank {
         }
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> EngineResult<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         self.with(|cuda| Channels::open(&mut *cuda, registration))
     }
 
@@ -930,20 +927,11 @@ impl Channels for Rank {
         self.with(|cuda| Channels::close(&mut *cuda, id))
     }
 
-    fn publish(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-        cell: &[u8],
-    ) -> EngineResult<bool> {
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
         self.with(|cuda| cuda.publish(instance, channel, cell))
     }
 
-    fn take(
-        &mut self,
-        instance: InstanceId,
-        channel: u32,
-    ) -> EngineResult<Option<Vec<u8>>> {
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
         self.with(|cuda| cuda.take(instance, channel))
     }
 }
@@ -985,11 +973,7 @@ impl Tiers for Rank {
         self.with(|cuda| cuda.settle())
     }
 
-    fn copy_landing(
-        &mut self,
-        copy: &engine::chunk::SlotCopy,
-        token: u64,
-    ) -> EngineResult<bool> {
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
         self.with(|cuda| cuda.copy_landing(copy, token))
     }
 
@@ -999,10 +983,7 @@ impl Tiers for Rank {
         }
     }
 
-    fn read(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-    ) -> EngineResult<Vec<u8>> {
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
         self.with(|cuda| Tiers::read(&mut *cuda, slots))
     }
 
@@ -1017,17 +998,11 @@ impl Tiers for Rank {
 
 impl Peers for Rank {
     fn export(&self) -> Option<KvHandle> {
-        self.group.ranks[self.rank]
-            .try_lock()
-            .ok()?
-            .export()
+        self.group.ranks[self.rank].try_lock().ok()?.export()
     }
 
     fn layout(&self) -> Option<state::PageLayout> {
-        self.group.ranks[self.rank]
-            .try_lock()
-            .ok()?
-            .layout()
+        self.group.ranks[self.rank].try_lock().ok()?.layout()
     }
 
     fn read(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
@@ -1050,7 +1025,6 @@ impl Taps for Rank {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -1,12 +1,12 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::ssm::dyn_conv;
 use kernels_metal::tensor::RaggedTensor;
 use poem_ir::Dtype;
-use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 
 const CHANNELS: u32 = 96;
 const GROUP: u32 = 16;

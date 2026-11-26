@@ -131,7 +131,10 @@ fn a_pool_view_reads_the_packed_rows_order() {
             let Some(got) = read(&packed, width, how) else {
                 return;
             };
-            assert_eq!(got, want, "{how:?} at {width}: packed bytes read their values");
+            assert_eq!(
+                got, want,
+                "{how:?} at {width}: packed bytes read their values"
+            );
             let permuted = read(&linear, width, how).expect("ran above");
             assert_ne!(
                 permuted, want,

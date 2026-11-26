@@ -724,7 +724,16 @@ impl Run<'_> {
                 into,
                 scores,
                 ..
-            } => self.capture(q, cache, head_dim as usize, q_heads, sm_scale, observe, into, scores),
+            } => self.capture(
+                q,
+                cache,
+                head_dim as usize,
+                q_heads,
+                sm_scale,
+                observe,
+                into,
+                scores,
+            ),
             Attn::ScorePages { keys, pages } => self.score_pages(keys, pages),
             Attn::Prefill { mask: Some(_), .. } => {
                 Err("a custom mask, which this forward does not read".into())

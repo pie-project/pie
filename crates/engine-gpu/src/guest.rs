@@ -596,7 +596,10 @@ mod tests {
             b.outputs(logits(vocab));
             let rows = beams as usize;
             b.bind_port(Port::EmbedTokens, leak(Channel::from(vec![42i32; rows])));
-            b.bind_port(Port::EmbedIndptr, leak(Channel::from((0u32..=beams).collect::<Vec<u32>>())));
+            b.bind_port(
+                Port::EmbedIndptr,
+                leak(Channel::from((0u32..=beams).collect::<Vec<u32>>())),
+            );
             b.bind_port(Port::Fold, leak(Channel::from([u32::MAX])));
             b.stage(Stage::Epilogue, move || {
                 let logits = cast(
@@ -606,8 +609,8 @@ mod tests {
                 let scores = carried.take();
                 let best = reduce_max(&scores);
                 let relative = cast(&scores - &best, dtype::bf16);
-                let cand = broadcast(reshape(relative, [beams, 1]), [beams, vocab])
-                    + log_softmax(&logits);
+                let cand =
+                    broadcast(reshape(relative, [beams, 1]), [beams, vocab]) + log_softmax(&logits);
                 let (s, i) = top_k(reshape(cand, [beams * vocab]), beams);
                 carried.put(cast(&s, dtype::f32) + &best);
                 out.put(cast(&i % vocab, dtype::i32));
@@ -662,7 +665,11 @@ mod tests {
             .into_iter()
             .map(|(name, traced)| (name, traced, Extents::default()))
             .collect();
-        programs.push(("beam prefill", shipped::beam_prefill(vocab, 4), Extents::default()));
+        programs.push((
+            "beam prefill",
+            shipped::beam_prefill(vocab, 4),
+            Extents::default(),
+        ));
         programs.push(("beam-4 decode", shipped::beam_decode(vocab, 4), four));
         for (name, traced, extents) in &programs {
             let package = shipped::package(traced, vocab);
@@ -676,25 +683,32 @@ mod tests {
                 let at = tables.offsets[value];
                 (at, at + tables.descriptors[value].device_bytes())
             };
-            let overlap = |a: eta_exec::Lifetime, b: eta_exec::Lifetime| {
-                a.last >= b.def && b.last >= a.def
-            };
+            let overlap =
+                |a: eta_exec::Lifetime, b: eta_exec::Lifetime| a.last >= b.def && b.last >= a.def;
             let aliases = eta_compiler::codegen::wgsl_analysis::analyze_stage(plan).aliases;
             for &(result, source) in &aliases {
                 let (result, source) = (result as usize, source as usize);
-                assert!(lifetimes[result].dead, "{name}: alias {result} takes no bytes");
+                assert!(
+                    lifetimes[result].dead,
+                    "{name}: alias {result} takes no bytes"
+                );
                 assert_eq!(tables.offsets[result], tables.offsets[source], "{name}");
                 assert!(
                     lifetimes[source].last >= lifetimes[result].last,
                     "{name}: value {source} dies before its alias {result} is read"
                 );
             }
-            let live: Vec<usize> = (0..lifetimes.len()).filter(|&v| !lifetimes[v].dead).collect();
+            let live: Vec<usize> = (0..lifetimes.len())
+                .filter(|&v| !lifetimes[v].dead)
+                .collect();
             for (at, &a) in live.iter().enumerate() {
                 for &b in &live[at + 1..] {
                     let ((sa, ea), (sb, eb)) = (span(a), span(b));
                     if overlap(lifetimes[a], lifetimes[b]) {
-                        assert!(ea <= sb || eb <= sa, "{name}: values {a} and {b} alive together");
+                        assert!(
+                            ea <= sb || eb <= sa,
+                            "{name}: values {a} and {b} alive together"
+                        );
                     }
                 }
             }
@@ -706,10 +720,15 @@ mod tests {
                 for &value in &live {
                     let (start, end) = span(value);
                     if overlap(lifetimes[value], area.life) {
-                        assert!(end <= low || high <= start, "{name}: value {value} in area {at}");
+                        assert!(
+                            end <= low || high <= start,
+                            "{name}: value {value} in area {at}"
+                        );
                     }
                 }
-                for (other, (them, &their)) in areas.iter().zip(&laid.areas).enumerate().skip(at + 1) {
+                for (other, (them, &their)) in
+                    areas.iter().zip(&laid.areas).enumerate().skip(at + 1)
+                {
                     if overlap(area.life, them.life) {
                         assert!(
                             high <= their - them.reserve || their + them.bytes <= low,

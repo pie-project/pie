@@ -212,7 +212,13 @@ impl Record for BeamListRun {
 
 impl Record for BeamStepRun {
     fn put(&self, out: &mut Vec<u8>) {
-        for v in [self.state, self.parents, self.trans, self.lists, self.faults] {
+        for v in [
+            self.state,
+            self.parents,
+            self.trans,
+            self.lists,
+            self.faults,
+        ] {
             put64(out, v);
         }
         for v in [
@@ -237,7 +243,14 @@ impl Record for BeamRsRun {
     fn put(&self, out: &mut Vec<u8>) {
         put64(out, self.pages);
         put64(out, self.bases);
-        for v in [self.lane, self.first, self.entries, self.base, self.tokens, self.bases_len] {
+        for v in [
+            self.lane,
+            self.first,
+            self.entries,
+            self.base,
+            self.tokens,
+            self.bases_len,
+        ] {
             put32(out, v);
         }
     }
@@ -270,7 +283,14 @@ impl Record for PageCopyRun {
         for v in [self.copy, self.base, self.fault] {
             put64(out, v);
         }
-        for v in [self.reserve, self.page, self.floor_rel, self.plane_at, self.planes, self.pad] {
+        for v in [
+            self.reserve,
+            self.page,
+            self.floor_rel,
+            self.plane_at,
+            self.planes,
+            self.pad,
+        ] {
             put32(out, v);
         }
     }
@@ -332,7 +352,10 @@ pub fn beam_step(ctx: &Ctx<'_>, runs: Tensor, run_count: u32, widest: u32) -> Re
     let tg_words = u32::try_from(bytes / 4).unwrap_or(u32::MAX);
     ctx.fire(
         Fire::at(FILE, "beam_step")
-            .apply(Grid::of([STEP_THREADS * run_count, 1, 1], [STEP_THREADS, 1, 1]))
+            .apply(Grid::of(
+                [STEP_THREADS * run_count, 1, 1],
+                [STEP_THREADS, 1, 1],
+            ))
             .threadgroup_bytes(u32::try_from(bytes).unwrap_or(u32::MAX)),
         &[runs.arg(), run_count.arg(), tg_words.arg()],
     )

@@ -409,7 +409,8 @@ impl Job {
                     ),
                     Err(why) => tracing::warn!(
                         "ane: the Neural Engine {} -> {} program did not compile ({why}); the load is refused",
-                        shape.k, shape.n
+                        shape.k,
+                        shape.n
                     ),
                 }
                 let _ = slot.set(result);
@@ -512,9 +513,10 @@ pub fn load(
             site.shape.clone(),
         ));
     }
-    let cache = kernels_metal::ane::cache_directory(
-        &cache.map_or_else(|| std::env::temp_dir().join("pie-cache"), std::path::Path::to_path_buf),
-    );
+    let cache = kernels_metal::ane::cache_directory(&cache.map_or_else(
+        || std::env::temp_dir().join("pie-cache"),
+        std::path::Path::to_path_buf,
+    ));
     std::thread::Builder::new()
         .name("pie-ane-compile".into())
         .spawn(move || {

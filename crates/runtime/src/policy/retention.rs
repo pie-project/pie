@@ -64,8 +64,16 @@ impl Table {
         tiers: HashMap<ProcessId, Vec<(Option<u64>, u8)>>,
         default: Option<u8>,
     ) -> Self {
-        self.off_device = tiers.values().flatten().filter(|(_, row)| row & DEVICE == 0).count();
-        self.below_device = tiers.values().flatten().filter(|(_, row)| row & BELOW != 0).count();
+        self.off_device = tiers
+            .values()
+            .flatten()
+            .filter(|(_, row)| row & DEVICE == 0)
+            .count();
+        self.below_device = tiers
+            .values()
+            .flatten()
+            .filter(|(_, row)| row & BELOW != 0)
+            .count();
         self.tiers = tiers;
         self.tiers_default = default;
         self
@@ -74,15 +82,26 @@ impl Table {
     /// The owners named after `revision`, where all of them are still held.
     fn changed_since(&self, revision: u64) -> Option<Vec<ProcessId>> {
         let after = self.changes.partition_point(|&(at, _)| at <= revision);
-        (after > 0).then(|| self.changes.range(after..).map(|&(_, owner)| owner).collect())
+        (after > 0).then(|| {
+            self.changes
+                .range(after..)
+                .map(|&(_, owner)| owner)
+                .collect()
+        })
     }
 
     /// Install `revision` named `owners`; all of them, where a default moved.
-    fn note_changes(&mut self, revision: u64, owners: &std::collections::HashSet<ProcessId>, all: bool) {
+    fn note_changes(
+        &mut self,
+        revision: u64,
+        owners: &std::collections::HashSet<ProcessId>,
+        all: bool,
+    ) {
         if all {
             self.changes.clear();
         }
-        self.changes.extend(owners.iter().map(|&owner| (revision, owner)));
+        self.changes
+            .extend(owners.iter().map(|&owner| (revision, owner)));
         let most = self.steps.len() + self.tiers.len() + owners.len();
         while self.changes.len() > most {
             self.changes.pop_front();
@@ -476,11 +495,15 @@ mod tests {
         let _lock = crate::policy::schedule::TEST_LOCK.blocking_write();
         let (named, unnamed) = (ProcessId::from_u128(0xd1), ProcessId::from_u128(0xd2));
         install(None);
-        assert_eq!(Installed.tiers_at(Some(unnamed), 0), ALL_TIERS, "no policy: every tier");
-        install(Some(
-            Table::new(HashMap::new(), None)
-                .with_tiers(HashMap::from([(named, vec![(None, ALL_TIERS)])]), Some(DEVICE)),
-        ));
+        assert_eq!(
+            Installed.tiers_at(Some(unnamed), 0),
+            ALL_TIERS,
+            "no policy: every tier"
+        );
+        install(Some(Table::new(HashMap::new(), None).with_tiers(
+            HashMap::from([(named, vec![(None, ALL_TIERS)])]),
+            Some(DEVICE),
+        )));
         assert_eq!(Installed.tiers_at(Some(unnamed), 0), DEVICE);
         assert_eq!(Installed.tiers_at(None, 0), DEVICE);
         assert_eq!(Installed.tiers_at(Some(named), 0), ALL_TIERS, "its row");
@@ -493,7 +516,11 @@ mod tests {
         let (a, b) = (ProcessId::from_u128(0xa1), ProcessId::from_u128(0xb1));
         install(None);
         apply(Change {
-            keys: vec![((a, None), Some(5)), ((a, Some(10)), Some(9)), ((b, None), Some(-3))],
+            keys: vec![
+                ((a, None), Some(5)),
+                ((a, Some(10)), Some(9)),
+                ((b, None), Some(-3)),
+            ],
             tiers: vec![((b, None), Some(HOST))],
             ..Change::default()
         });
@@ -501,7 +528,11 @@ mod tests {
         assert_eq!(Installed.key_at(Some(a), 10), 5);
         assert_eq!(Installed.key_at(Some(b), 0), -3);
         assert_eq!(Installed.tiers_at(Some(b), 0), HOST);
-        assert_eq!(Installed.tiers_at(Some(a), 0), own_tiers(), "no row: the column's own");
+        assert_eq!(
+            Installed.tiers_at(Some(a), 0),
+            own_tiers(),
+            "no row: the column's own"
+        );
         apply(Change {
             keys: vec![((a, Some(10)), None)],
             key_default: Some(Some(2)),
@@ -509,7 +540,11 @@ mod tests {
             ..Change::default()
         });
         assert_eq!(Installed.key_at(Some(a), 3), 5, "the head row deleted");
-        assert_eq!(Installed.key_at(Some(ProcessId::from_u128(0xc1)), 0), 2, "the default");
+        assert_eq!(
+            Installed.key_at(Some(ProcessId::from_u128(0xc1)), 0),
+            2,
+            "the default"
+        );
         assert_eq!(Installed.tiers_at(Some(b), 0), 0, "nowhere: dropped");
         assert_eq!(Installed.steps(a), Vec::<u64>::new());
         // A lease withdrawal is every row deleted and both defaults reset.

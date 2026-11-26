@@ -62,7 +62,9 @@ fn words(values: &[u32]) -> Vec<u8> {
 
 fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
     let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
-    engine::Programs::bind(&mut rig.engine, &InstanceBinding {
+    engine::Programs::bind(
+        &mut rig.engine,
+        &InstanceBinding {
             program,
             channels: vec![COUNTER, out],
             seeds: if seeded {
@@ -84,9 +86,10 @@ fn bind(rig: &mut Rig, program: ProgramId, seeded: bool) -> InstanceId {
             scratch: engine::ScratchPlace::None,
             pair: engine::ScratchPlace::None,
             pair_generation: 0,
-        })
-        .expect("an instance bound to the registered counter binds")
-        .id
+        },
+    )
+    .expect("an instance bound to the registered counter binds")
+    .id
 }
 
 /// One pass of `instance` on a lane of one token: the count it put.
@@ -214,7 +217,9 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
     let bound = |rig: &mut Rig, seeded: bool| -> InstanceId {
         let input = rig.channel_of(vec![2], Dtype::U32, HostRole::Writer);
         let out = rig.channel_of(vec![2], Dtype::U32, HostRole::Reader);
-        engine::Programs::bind(&mut rig.engine, &InstanceBinding {
+        engine::Programs::bind(
+            &mut rig.engine,
+            &InstanceBinding {
                 program,
                 channels: vec![input, out],
                 seeds: if seeded {
@@ -234,17 +239,21 @@ fn a_guest_fault_fails_its_own_lanes_alone() {
                 scratch: engine::ScratchPlace::None,
                 pair: engine::ScratchPlace::None,
                 pair_generation: 0,
-            })
-            .expect("the instance binds")
-            .id
+            },
+        )
+        .expect("the instance binds")
+        .id
     };
     let fed = bound(&mut rig, true);
     let starved = bound(&mut rig, false);
     let outcomes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let heard = std::sync::Arc::clone(&outcomes);
-    engine::Completion::on_complete(&mut rig.engine, std::sync::Arc::new(move |_, outcome| {
-        heard.lock().expect("outcomes lock").push(outcome);
-    }));
+    engine::Completion::on_complete(
+        &mut rig.engine,
+        std::sync::Arc::new(move |_, outcome| {
+            heard.lock().expect("outcomes lock").push(outcome);
+        }),
+    );
     rig.fire(
         vec![
             host_lane(kv, 1, vec![3], vec![page_a], 0),

@@ -140,7 +140,9 @@ fn a_guest_over_two_lanes_reads_each_lanes_own_row() {
     let mut shell = load_with(&fixture, CONTEXT);
     let mut vocab = 0;
     for slot in 0..3u32 {
-        let prompt: Vec<u32> = (0..PROMPT).map(|t| (t * 7 + 11 + slot * 29) % 256).collect();
+        let prompt: Vec<u32> = (0..PROMPT)
+            .map(|t| (t * 7 + 11 + slot * 29) % 256)
+            .collect();
         shell.open(slot).expect("the slot opens");
         let logits = shell
             .fire_seated(&[Seated {
@@ -205,5 +207,7 @@ fn a_guest_over_two_lanes_reads_each_lanes_own_row() {
         want[..2],
         "each of the guest's lanes reads its own row (the host's argmaxes {want:?})"
     );
-    shell.close_program_instance(id).expect("the instance closes");
+    shell
+        .close_program_instance(id)
+        .expect("the instance closes");
 }

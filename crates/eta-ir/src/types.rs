@@ -177,9 +177,16 @@ mod dtype_tests {
         assert_eq!(bf16_bits(f32::from_bits(0x3F80_8001)), 0x3F81);
         assert_eq!(bf16_bits(f32::INFINITY), 0x7F80);
         assert_eq!(bf16_bits(f32::NEG_INFINITY), 0xFF80);
-        assert_eq!(bf16_bits(f32::MAX), 0x7F80, "past the largest bf16 rounds to inf");
+        assert_eq!(
+            bf16_bits(f32::MAX),
+            0x7F80,
+            "past the largest bf16 rounds to inf"
+        );
         assert!(bf16_to_f32(bf16_bits(f32::NAN)).is_nan());
-        assert!(bf16_to_f32(bf16_bits(f32::from_bits(0x7F80_0001))).is_nan(), "a low NaN stays NaN");
+        assert!(
+            bf16_to_f32(bf16_bits(f32::from_bits(0x7F80_0001))).is_nan(),
+            "a low NaN stays NaN"
+        );
         assert_eq!(bf16_bits(-0.0), 0x8000);
         for bits in [0u16, 0x3F80, 0xC2F7, 0x0001, 0x8001, 0x7F7F] {
             assert_eq!(bf16_bits(bf16_to_f32(bits)), bits, "{bits:#06x} is exact");

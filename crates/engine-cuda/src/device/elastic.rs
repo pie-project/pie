@@ -583,7 +583,11 @@ impl Arena {
                     "the flat range of {} bytes was sized to what the card had free less what \
                      the driver holds beside it ({}), and the device refused it: {why}",
                     self.virtual_bytes,
-                    if pool.beside.said.is_empty() { "nothing" } else { &pool.beside.said },
+                    if pool.beside.said.is_empty() {
+                        "nothing"
+                    } else {
+                        &pool.beside.said
+                    },
                 ))
             })?;
             self.base = base as u64;
@@ -1125,7 +1129,8 @@ impl Range {
     /// they lie this way: its first segments at its base, its last ones
     /// under what lies above them.
     pub fn part(&mut self, from: u64, by: u64) -> Result<()> {
-        if !from.is_multiple_of(self.segment_bytes) || u64::from(self.committed) * self.segment_bytes > from
+        if !from.is_multiple_of(self.segment_bytes)
+            || u64::from(self.committed) * self.segment_bytes > from
         {
             return Err(Fault::program(
                 "device::elastic",

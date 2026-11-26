@@ -107,12 +107,7 @@ impl<B: Backend> Run<'_, B> {
             } => {
                 let ([x, y], window) = self.windowed([*x, *y]);
                 kernels_slang::elemwise::norm::rmsnorm_no_scale(
-                    self.ctx,
-                    x,
-                    *head_dim,
-                    *eps,
-                    y,
-                    window,
+                    self.ctx, x, *head_dim, *eps, y, window,
                 )
             }
 
@@ -168,13 +163,7 @@ impl<B: Backend> Run<'_, B> {
                 bias: None,
             } => {
                 let ([x, y], window) = self.windowed([*x, *y]);
-                kernels_slang::elemwise::norm::layernorm_no_scale(
-                    self.ctx,
-                    x,
-                    *eps,
-                    y,
-                    window,
-                )
+                kernels_slang::elemwise::norm::layernorm_no_scale(self.ctx, x, *eps, y, window)
             }
             Elemwise::Modulate {
                 x,

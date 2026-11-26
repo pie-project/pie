@@ -235,7 +235,15 @@ pub(super) async fn fire_device_geometry<C: FireContext>(
         groups.iter().map(|(_, lanes)| lanes.clone()).collect()
     };
     let rs_plan = || {
-        device_rs_plan(&stores, &rs_ws_ids, &groups, &pass_lanes, &split, &fold, states_parents)
+        device_rs_plan(
+            &stores,
+            &rs_ws_ids,
+            &groups,
+            &pass_lanes,
+            &split,
+            &fold,
+            states_parents,
+        )
     };
     let reserved = reserve(
         ctx,

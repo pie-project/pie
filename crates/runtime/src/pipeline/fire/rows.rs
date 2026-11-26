@@ -307,7 +307,10 @@ impl PassScratch<'_> {
         let snapshots = match kept.as_slice() {
             [(start, end)] => {
                 self.snapshots > 0
-                    && self.checkpoints.iter().any(|&row| *start < row && row < *end)
+                    && self
+                        .checkpoints
+                        .iter()
+                        .any(|&row| *start < row && row < *end)
             }
             _ => false,
         };
@@ -353,13 +356,21 @@ pub(super) fn piece_replayed(
             let (from, _) = (*cut)?;
             let start = rows.kv.held.saturating_add(from);
             let frozen = frozen.get(lane).copied().flatten()?;
-            Some(if folded_behind { 0 } else { start.saturating_sub(frozen) })
+            Some(if folded_behind {
+                0
+            } else {
+                start.saturating_sub(frozen)
+            })
         })
         .fold(0u32, u32::saturating_add)
 }
 
-
-pub(super) fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: u32) -> rs::GroupFold {
+pub(super) fn group_fold(
+    fold: &geometry::Fold,
+    first: usize,
+    frozen: u32,
+    end: u32,
+) -> rs::GroupFold {
     match fold.of(first) {
         None => rs::GroupFold::Device,
         Some(count) => match count.min(end.saturating_sub(frozen)) {
@@ -370,7 +381,10 @@ pub(super) fn group_fold(fold: &geometry::Fold, first: usize, frozen: u32, end: 
 }
 
 /// Whether the pass's program adapts the KV it writes beyond its tokens.
-pub(super) fn lora_program_of<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<bool> {
+pub(super) fn lora_program_of<C: FireContext>(
+    ctx: &mut C,
+    fwd: &Resource<ForwardPass>,
+) -> Anyhow<bool> {
     let p = ctx.resources().get(fwd)?;
     Ok(container_has_lora_sink(&p.instance.program.bound.container))
 }

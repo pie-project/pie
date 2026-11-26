@@ -155,9 +155,10 @@ impl TraceContainer {
             PortSource::Const { .. } => true,
             PortSource::Channel(channel) => {
                 !put(channel)
-                    && self.channels.get(channel as usize).is_some_and(|decl| {
-                        decl.seeded || decl.host_role == HostRole::Writer
-                    })
+                    && self
+                        .channels
+                        .get(channel as usize)
+                        .is_some_and(|decl| decl.seeded || decl.host_role == HostRole::Writer)
             }
         });
         if !host_fed {
@@ -167,13 +168,19 @@ impl TraceContainer {
             if let PortSource::Channel(channel) = binding.source
                 && let Some(flag) = rows.get_mut(channel as usize)
             {
-                *flag = matches!(binding.port, Port::EmbedTokens | Port::Positions | Port::Slots);
+                *flag = matches!(
+                    binding.port,
+                    Port::EmbedTokens | Port::Positions | Port::Slots
+                );
             }
         }
         // A channel another port also binds is that port's too: unflagged.
         for binding in &self.ports {
             if let PortSource::Channel(channel) = binding.source
-                && !matches!(binding.port, Port::EmbedTokens | Port::Positions | Port::Slots)
+                && !matches!(
+                    binding.port,
+                    Port::EmbedTokens | Port::Positions | Port::Slots
+                )
                 && let Some(flag) = rows.get_mut(channel as usize)
             {
                 *flag = false;

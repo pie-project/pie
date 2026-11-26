@@ -59,8 +59,8 @@ pub(crate) fn recognize_library_dataflows(
             Some(Dimension::Static(width)) if *width >= LANE_CUT_WIDTH
         );
         // A bf16 row's cut reads it as f32 (`eta_ir::types`), as an f32 row's.
-        let float = input_type.dtype == Dtype::F32
-            || (forms.bf16_cut && input_type.dtype == Dtype::Bf16);
+        let float =
+            input_type.dtype == Dtype::F32 || (forms.bf16_cut && input_type.dtype == Dtype::Bf16);
         if !float || !wide || !(1..=2).contains(&input_type.rank()) {
             continue;
         }

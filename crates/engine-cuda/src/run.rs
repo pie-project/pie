@@ -1389,8 +1389,8 @@ impl<'c> Run<'c> {
     /// fire, whose `[b | a]` its recurrence lands.
     pub(crate) fn rs_step_gates(&self, gates: ValueId) -> bool {
         self.rs
-                .as_ref()
-                .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
+            .as_ref()
+            .is_some_and(|seat| seat.buffers.planes().step_gates(gates).is_some())
     }
 
     /// Value `id`'s buffered plane.
@@ -1479,7 +1479,11 @@ impl<'c> Run<'c> {
             commit_len: pool.commit_len.ptr,
             page_tokens: tables.page_tokens.max(1),
             #[cfg(not(feature = "rocm"))]
-            split: if seat.splits { seat.buffers.split_room() } else { 0 },
+            split: if seat.splits {
+                seat.buffers.split_room()
+            } else {
+                0
+            },
             ..kernels_cuda::ssm::Carry::NONE
         };
         for (at, &plane) in planes.iter().enumerate() {

@@ -4,12 +4,12 @@
 //! lands what it lands over the `[gate | up]` rows of the same values, bit
 //! for bit, an unclamped one clamped at the largest finite f32.
 
+use crate::common::bf16_bytes;
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::linear::mlp;
 use poem_ir::Dtype;
-use crate::common::{bf16_bytes};
 
 fn unit(at: u64) -> f32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;

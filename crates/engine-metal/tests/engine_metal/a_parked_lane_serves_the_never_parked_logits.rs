@@ -87,7 +87,13 @@ fn park(
         .expect("the slots park");
     let fresh: Vec<u32> = slots
         .iter()
-        .map(|&slot| if slot == 0 { 0 } else { device.take(shape, per) })
+        .map(|&slot| {
+            if slot == 0 {
+                0
+            } else {
+                device.take(shape, per)
+            }
+        })
         .collect();
     shell
         .copy_slots(&SlotCopy {
@@ -170,7 +176,9 @@ fn serve(fixture: &Fixture, offload: Offload) -> (Vec<Vec<f32>>, Vec<Kind>) {
     let own = |device: &mut Refs| -> (Vec<u32>, Vec<u32>) {
         (
             fixed.map_or_else(Vec::new, |per| {
-                (0..layout.pieces).map(|_| device.take(FIXED, per)).collect()
+                (0..layout.pieces)
+                    .map(|_| device.take(FIXED, per))
+                    .collect()
             }),
             (0..ring_pieces).map(|_| device.take(RING, 1)).collect(),
         )
@@ -184,7 +192,9 @@ fn serve(fixture: &Fixture, offload: Offload) -> (Vec<Vec<f32>>, Vec<Kind>) {
     if matches!(offload, Offload::Wrong(Kind::Record | Kind::Ring)) {
         let tokens: Vec<u32> = (0..40u32).map(|at| (at * 11 + 3) % 256).collect();
         let pages: Vec<u32> = list.map_or_else(Vec::new, |per| {
-            (0..40u32.div_ceil(page)).map(|_| device.take(LIST, per)).collect()
+            (0..40u32.div_ceil(page))
+                .map(|_| device.take(LIST, per))
+                .collect()
         });
         let rings = cow(&other_ring);
         let seated = Seated {
@@ -218,7 +228,11 @@ fn serve(fixture: &Fixture, offload: Offload) -> (Vec<Vec<f32>>, Vec<Kind>) {
                 pages.push(device.take(LIST, per));
             }
         }
-        let after = if step == 0 { end } else { end.saturating_sub(LAG).max(folded) };
+        let after = if step == 0 {
+            end
+        } else {
+            end.saturating_sub(LAG).max(folded)
+        };
         let rings = cow(&ring);
         let mut tables = Vec::new();
         let mut window = None;
@@ -227,7 +241,11 @@ fn serve(fixture: &Fixture, offload: Offload) -> (Vec<Vec<f32>>, Vec<Kind>) {
             buffer.retain(|&at, _| at >= plan.base / page);
             let table: Vec<u32> = if folded < held || after < end {
                 (plan.base / page..end.div_ceil(page))
-                    .map(|at| *buffer.entry(at).or_insert_with(|| device.take(WINDOWS[0], per)))
+                    .map(|at| {
+                        *buffer
+                            .entry(at)
+                            .or_insert_with(|| device.take(WINDOWS[0], per))
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -261,26 +279,58 @@ fn serve(fixture: &Fixture, offload: Offload) -> (Vec<Vec<f32>>, Vec<Kind>) {
         kinds.clear();
         if let Some(per) = list {
             let crossed = wrong(Kind::List);
-            pages = park(&mut shell, &mut device, &mut disk, LIST, per, &pages, crossed);
+            pages = park(
+                &mut shell,
+                &mut device,
+                &mut disk,
+                LIST,
+                per,
+                &pages,
+                crossed,
+            );
             kinds.push(Kind::List);
         }
         if let Some((_, per)) = buffered {
             let slots: Vec<u32> = buffer.values().copied().collect();
-            assert!(step != PARKS[1] || slots.len() > 1, "the buffer holds pages to cross");
+            assert!(
+                step != PARKS[1] || slots.len() > 1,
+                "the buffer holds pages to cross"
+            );
             let crossed = wrong(Kind::Window);
-            let fresh = park(&mut shell, &mut device, &mut disk, WINDOWS[0], per, &slots, crossed);
+            let fresh = park(
+                &mut shell,
+                &mut device,
+                &mut disk,
+                WINDOWS[0],
+                per,
+                &slots,
+                crossed,
+            );
             for (slot, at) in buffer.values_mut().zip(fresh) {
                 *slot = at;
             }
-            let from = if wrong(Kind::Ring) { &other_ring } else { &ring };
+            let from = if wrong(Kind::Ring) {
+                &other_ring
+            } else {
+                &ring
+            };
             ring = park(&mut shell, &mut device, &mut disk, RING, 1, from, false);
             kinds.extend([Kind::Window, Kind::Ring]);
         }
         if let Some(per) = fixed {
-            let from = if wrong(Kind::Record) { &other_record } else { &record };
+            let from = if wrong(Kind::Record) {
+                &other_record
+            } else {
+                &record
+            };
             record = park(&mut shell, &mut device, &mut disk, FIXED, per, from, false);
             // A record with no recurrent state holds nothing a fire reads.
-            if fixture.trace.caches.iter().any(|row| matches!(row, poem_ir::CacheRow::State { .. })) {
+            if fixture
+                .trace
+                .caches
+                .iter()
+                .any(|row| matches!(row, poem_ir::CacheRow::State { .. }))
+            {
                 kinds.push(Kind::Record);
             }
         }
@@ -297,7 +347,10 @@ fn check(model: &str) -> Vec<Kind> {
     eprintln!("{model}: parked = kept over {} rows", kept.len());
     for kind in &kinds {
         let (wrong, _) = serve(&fixture, Offload::Wrong(*kind));
-        assert_ne!(wrong, kept, "{model}: {kind:?} slots brought back wrong move the logits");
+        assert_ne!(
+            wrong, kept,
+            "{model}: {kind:?} slots brought back wrong move the logits"
+        );
     }
     eprintln!("{model}: each of {kinds:?} brought back wrong moves the logits");
     kinds
@@ -332,10 +385,15 @@ fn a_ref_lane_stating_no_ring_is_refused() {
     let mut shell = load_with(&fixture, CONTEXT);
     assert!(shell.pool_ring().is_some(), "a windowed load lays rings");
     let layout = shell.pool_layout();
-    let per = shell.pool_chunk_facts().shape(FIXED).map(|s| s.slots_per_chunk.max(1));
+    let per = shell
+        .pool_chunk_facts()
+        .shape(FIXED)
+        .map(|s| s.slots_per_chunk.max(1));
     let low = layout.free_chunk();
     let record: Vec<u32> = per.map_or_else(Vec::new, |per| {
-        (0..layout.pieces).map(|piece| (low + piece) * per).collect()
+        (0..layout.pieces)
+            .map(|piece| (low + piece) * per)
+            .collect()
     });
     let segment = shell.pool_chunk_facts().segment_chunks;
     shell
@@ -354,7 +412,10 @@ fn a_ref_lane_stating_no_ring_is_refused() {
         }])
         .expect_err("no page it would read is its own")
         .to_string();
-    assert!(why.contains("states no ring pieces and no window fold"), "{why}");
+    assert!(
+        why.contains("states no ring pieces and no window fold"),
+        "{why}"
+    );
     shell
         .warm_pipelines()
         .expect("the pipeline walk, whose fires are dropped, states neither");

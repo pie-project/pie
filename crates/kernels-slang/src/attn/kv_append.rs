@@ -125,7 +125,16 @@ pub fn kv_append(
     write_offset: Tensor,
     rows: Rows,
 ) -> Result<(), Error> {
-    append(ctx, "attn.kv_append", k, v, pool, write_page, write_offset, rows)
+    append(
+        ctx,
+        "attn.kv_append",
+        k,
+        v,
+        pool,
+        write_page,
+        write_offset,
+        rows,
+    )
 }
 
 /// One plane written as both the key and the value.

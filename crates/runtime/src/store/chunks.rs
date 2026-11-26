@@ -73,10 +73,18 @@ impl<I: PoolId> ShapePool<I> {
         match &self.slots {
             Backing::Own(pool) => pool.set_room_signal(signal, tier, Some(0)),
             Backing::Shape(shared, shape) => {
-                shared.lock().unwrap().pool().set_room_signal(signal, tier, Some(*shape));
+                shared
+                    .lock()
+                    .unwrap()
+                    .pool()
+                    .set_room_signal(signal, tier, Some(*shape));
             }
             Backing::Records(shared) => {
-                shared.lock().unwrap().pool().set_room_signal(signal, tier, None);
+                shared
+                    .lock()
+                    .unwrap()
+                    .pool()
+                    .set_room_signal(signal, tier, None);
             }
         }
     }
@@ -215,7 +223,10 @@ impl<I: PoolId> ShapePool<I> {
         outside: &std::collections::BTreeSet<u32>,
     ) -> Option<Vec<I>> {
         let (shared, shape) = self.shared_shape()?;
-        let refs = shared.lock().unwrap().take_refs_outside(shape, n as u64, outside)?;
+        let refs = shared
+            .lock()
+            .unwrap()
+            .take_refs_outside(shape, n as u64, outside)?;
         Some(
             refs.into_iter()
                 .map(|r| I::from_index(self.base + r))
@@ -938,5 +949,4 @@ mod seats_tests {
             "{message}"
         );
     }
-
 }

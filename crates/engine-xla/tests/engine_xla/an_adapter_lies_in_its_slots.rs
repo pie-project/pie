@@ -72,11 +72,14 @@ fn register(model: &mut Model, layers: u32, rank: u32, hidden: u32) -> ProgramId
     .expect("the program binds");
     let stages = eta_compiler::plan::compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
-    engine::Programs::register(&mut model.engine, &ProgramRegistration {
+    engine::Programs::register(
+        &mut model.engine,
+        &ProgramRegistration {
             launch,
             ..Default::default()
-        })
-        .expect("the lora program registers")
+        },
+    )
+    .expect("the lora program registers")
 }
 
 /// F32 values of a small spread, a seed apart: one plane's wire.
@@ -135,7 +138,9 @@ impl Rig {
             .map(|shape| {
                 let id = ChannelId(u64::from(self.next_channel));
                 self.next_channel += 1;
-                engine::Channels::open(&mut self.model.engine, &ChannelRegistration {
+                engine::Channels::open(
+                    &mut self.model.engine,
+                    &ChannelRegistration {
                         id,
                         shape,
                         dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -145,20 +150,24 @@ impl Rig {
                         capacity: 1,
                         extern_name: Vec::new(),
                         slots: Vec::new(),
-                    })
-                    .expect("the channel registers");
+                    },
+                )
+                .expect("the channel registers");
                 id
             })
             .collect();
-        engine::Programs::bind(&mut self.model.engine, &InstanceBinding {
+        engine::Programs::bind(
+            &mut self.model.engine,
+            &InstanceBinding {
                 program: self.program,
                 channels,
                 seeds,
                 adapter_slots: slots.to_vec(),
                 ..Default::default()
-            })
-            .expect("the adapter-carrying instance binds")
-            .id
+            },
+        )
+        .expect("the adapter-carrying instance binds")
+        .id
     }
 
     fn slots(&mut self) -> Vec<u32> {
@@ -229,8 +238,8 @@ fn an_adapter_lies_in_its_slots() {
     let (rank, hidden) = (lora_a[0].rows as u32, lora_a[0].cols as u32);
     assert!(layers > 0, "the model text corrects through LoRA banks");
     let program = register(&mut model, layers, rank, hidden);
-    let facts = engine::Programs::facts(&model.engine, program)
-        .expect("the program states its facts");
+    let facts =
+        engine::Programs::facts(&model.engine, program).expect("the program states its facts");
     assert_eq!(
         facts.adapter.slots,
         2 * layers,
@@ -298,7 +307,9 @@ fn an_adapter_lies_in_its_slots() {
     );
     let device = rig.model.loaded.caps.device.domain;
     let host: Vec<u32> = (0..want.len() as u32).collect();
-    engine::Tiers::copy(&mut rig.model.engine, &SlotCopy {
+    engine::Tiers::copy(
+        &mut rig.model.engine,
+        &SlotCopy {
             shape: ADAPTER,
             src: device,
             dst: MemoryDomain::HostPinned,
@@ -308,8 +319,9 @@ fn an_adapter_lies_in_its_slots() {
                 .zip(host.iter().copied())
                 .collect(),
             runs: Vec::new(),
-        })
-        .expect("the slots park");
+        },
+    )
+    .expect("the slots park");
     let back = engine::Tiers::read(&mut rig.model.engine, &[(ADAPTER, host)])
         .expect("the host slots read");
     let slot = back.len() / want.len();

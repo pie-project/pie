@@ -22,8 +22,13 @@ fn load(fixture: &Fixture, home: &Path) -> Shell {
     let mut knobs = knobs();
     knobs.profiles = Some(home.join("profiles"));
     knobs.chip = None;
-    load_under(fixture, &home.join("cache"), knobs, engine::Allowance::WHOLE)
-        .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
+    load_under(
+        fixture,
+        &home.join("cache"),
+        knobs,
+        engine::Allowance::WHOLE,
+    )
+    .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
 }
 
 /// The user's profile under `dir`: the one file the loads stored there.
@@ -49,7 +54,10 @@ fn two_models_exported_boot_a_clean_home_measuring_nothing() {
         return;
     }
     let home = |what: &str| {
-        std::env::temp_dir().join(format!("pie-cuda-measured-none-{what}-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "pie-cuda-measured-none-{what}-{}",
+            std::process::id()
+        ))
     };
     let (measured, clean) = (home("measured"), home("clean"));
     let _ = std::fs::remove_dir_all(&measured);
@@ -70,10 +78,17 @@ fn two_models_exported_boot_a_clean_home_measuring_nothing() {
     let profiles = measured.join("profiles");
     let stored = stored_file(&profiles);
     let text = std::fs::read_to_string(&stored).expect("the stored profile reads");
-    let (exported, report) =
-        profile::export_reporting(engine_cuda::chip::registry(), "the device", &text, "user.toml")
-            .expect("the home exports");
-    assert!(report.iter().all(|line| !line.starts_with("WARN")), "{report:?}");
+    let (exported, report) = profile::export_reporting(
+        engine_cuda::chip::registry(),
+        "the device",
+        &text,
+        "user.toml",
+    )
+    .expect("the home exports");
+    assert!(
+        report.iter().all(|line| !line.starts_with("WARN")),
+        "{report:?}"
+    );
     let into = clean
         .join("profiles")
         .join(stored.strip_prefix(&profiles).expect("under the home"));
@@ -84,7 +99,11 @@ fn two_models_exported_boot_a_clean_home_measuring_nothing() {
     assert_eq!(bodies.len(), models.len(), "a record a model: {bodies:?}");
     for fixture in &models {
         let timed = load(fixture, &clean).measured_at_load().to_vec();
-        assert!(timed.is_empty(), "{}'s load from the export measured {timed:?}", fixture.model);
+        assert!(
+            timed.is_empty(),
+            "{}'s load from the export measured {timed:?}",
+            fixture.model
+        );
     }
     let _ = std::fs::remove_dir_all(&measured);
     let _ = std::fs::remove_dir_all(&clean);

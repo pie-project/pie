@@ -118,8 +118,10 @@ pub fn probe() -> Option<(String, Facts)> {
 #[must_use]
 pub fn now_at(index: u32) -> Option<Box<dyn profile::rates::Now>> {
     measured_on_at(index).map(|on| {
-        Box::new(engine_gpu::stored::Keys::new(on, kernels_slang::Target::Wgsl))
-            as Box<dyn profile::rates::Now>
+        Box::new(engine_gpu::stored::Keys::new(
+            on,
+            kernels_slang::Target::Wgsl,
+        )) as Box<dyn profile::rates::Now>
     })
 }
 

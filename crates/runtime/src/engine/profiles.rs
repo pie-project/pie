@@ -424,7 +424,12 @@ pub fn covers_over(cache: &Path, on: &str, committed: &[&str]) -> Option<String>
             .and_then(serde_json::Value::as_str)
             .is_some_and(|key| key.split('|').any(|part| part == on))
     };
-    let key_of = |v: &serde_json::Value| v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_owned();
+    let key_of = |v: &serde_json::Value| {
+        v.get("key")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
     let mut held: Vec<serde_json::Value> = std::fs::read_dir(cache.join("cover"))
         .into_iter()
         .flatten()
@@ -453,7 +458,9 @@ pub fn covers_over(cache: &Path, on: &str, committed: &[&str]) -> Option<String>
         return None;
     }
     held.sort_by_key(key_of);
-    serde_json::to_string_pretty(&held).ok().map(|text| text + "\n")
+    serde_json::to_string_pretty(&held)
+        .ok()
+        .map(|text| text + "\n")
 }
 
 /// What the home holds of `backend`'s device `index`: its stored
@@ -574,8 +581,13 @@ fn held(
         Some(Ok(file)) => file.tuned.rates.measured_on.clone(),
         _ => None,
     };
-    let committed_rates = committed
-        .map(|text| registry.parse(text, &profile::measured_name(&device), profile::Strict::Measured));
+    let committed_rates = committed.map(|text| {
+        registry.parse(
+            text,
+            &profile::measured_name(&device),
+            profile::Strict::Measured,
+        )
+    });
     let mut report = Vec::new();
     // The home's measured entries over what of the committed profile still
     // holds for this build, each said: a re-export never shrinks it.
@@ -595,13 +607,18 @@ fn held(
             // Not one entry of it reads (each list entry is read alone, so
             // this is the file as a whole): none carried, said by name.
             Some(Err(why)) => {
-                report.push(format!("dropped: the committed profile does not read ({why})"));
+                report.push(format!(
+                    "dropped: the committed profile does not read ({why})"
+                ));
                 None
             }
             None => None,
         };
         if mine == profile::rates::Rates::default() && theirs.is_none() {
-            return Err(user.clone().err().unwrap_or_else(|| format!("{origin}: stores nothing")));
+            return Err(user
+                .clone()
+                .err()
+                .unwrap_or_else(|| format!("{origin}: stores nothing")));
         }
         let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
         report.extend(lines);
@@ -685,7 +702,11 @@ fn device_on(backend: &Backend, index: u32, device: &str) -> Option<String> {
 /// memory measurement) that this build made, from `cache_dir` into `out`'s
 /// `bodies/`, beside its committed measured profile: the names written.
 /// Another engine keeps none.
-pub fn export_bodies(backend: &Backend, cache_dir: &Path, out: &Path) -> Result<Vec<String>, String> {
+pub fn export_bodies(
+    backend: &Backend,
+    cache_dir: &Path,
+    out: &Path,
+) -> Result<Vec<String>, String> {
     match backend.name {
         #[cfg(feature = "engine-cuda")]
         "cuda" => engine_cuda::serve::export_bodies(cache_dir, out)
@@ -792,10 +813,7 @@ pub fn backends() -> Vec<Backend> {
 }
 
 #[cfg(test)]
-mod cover_tests {
-    
-
-}
+mod cover_tests {}
 
 #[cfg(test)]
 mod committed_tests {
@@ -824,5 +842,4 @@ mod committed_tests {
             }
         }
     }
-
 }

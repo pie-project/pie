@@ -12,9 +12,16 @@ use poem::{Attn, Dim, Operation, Platform, Ty};
 const ROWS: [&str; 2] = ["qwen3-0.6b-bf16-kv-bf16", "qwen35-d0.8b-bf16-kv-bf16"];
 
 fn shape_of(trace: &poem::Trace, name: &str) -> Vec<Dim> {
-    let outputs: Vec<_> = trace.outputs.iter().filter(|output| output.name == name).collect();
+    let outputs: Vec<_> = trace
+        .outputs
+        .iter()
+        .filter(|output| output.name == name)
+        .collect();
     assert_eq!(outputs.len(), 1, "one `{name}` output, not one a layer");
-    assert_eq!(outputs[0].layer, None, "`{name}` is read out once, after the layers");
+    assert_eq!(
+        outputs[0].layer, None,
+        "`{name}` is read out once, after the layers"
+    );
     match &trace.values[outputs[0].value.0 as usize].ty {
         Ty::Tensor { shape, .. } => shape.clone(),
         other => panic!("`{name}` is {other:?}"),
@@ -47,7 +54,10 @@ fn a_score_output_states_its_heads_and_keys() {
             })
             .collect();
         assert!(!captures.is_empty(), "{name} captures no scores");
-        assert_eq!(captures[0].0, None, "{name}: the first layer's capture zeroes the row");
+        assert_eq!(
+            captures[0].0, None,
+            "{name}: the first layer's capture zeroes the row"
+        );
         for pair in captures.windows(2) {
             assert_eq!(
                 pair[1].0,

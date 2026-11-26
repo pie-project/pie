@@ -271,7 +271,10 @@ mod tests {
             _frame: &::engine::FrameSubmission,
         ) -> ::engine::Result<::engine::FrameTicket> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "submit"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "submit",
+            ))
         }
 
         fn settle_frame(&mut self, _ticket: &mut ::engine::FrameTicket) -> ::engine::Result<()> {
@@ -301,7 +304,10 @@ mod tests {
             _registration: &::engine::program::ProgramRegistration,
         ) -> ::engine::Result<::engine::ProgramCompile> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "prepare_program"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "prepare_program",
+            ))
         }
 
         fn finish(
@@ -309,11 +315,17 @@ mod tests {
             _prepared: ::engine::Prepared,
         ) -> ::engine::Result<::engine::ProgramId> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "finish_program"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "finish_program",
+            ))
         }
 
         fn close_program(&mut self, _program: ::engine::ProgramId) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "close_program"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "close_program",
+            ))
         }
 
         fn bind(
@@ -321,37 +333,67 @@ mod tests {
             _binding: &::engine::program::InstanceBinding,
         ) -> ::engine::Result<::engine::program::BoundInstance> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "bind_instance"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "bind_instance",
+            ))
         }
 
-        fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_program"))
+        fn register(
+            &mut self,
+            _registration: &::engine::ProgramRegistration,
+        ) -> ::engine::Result<::engine::ProgramId> {
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "register_program",
+            ))
         }
 
         fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "close_instance"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "close_instance",
+            ))
         }
 
-        fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "register_adapter"))
+        fn adapter(
+            &mut self,
+            _registration: &::engine::adapter::AdapterRegistration,
+        ) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "register_adapter",
+            ))
         }
     }
 
     impl ::engine::Pool for NoBeamList {
         fn chunk_table(&self) -> ::engine::Result<::engine::chunk::ChunkTable> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "chunk_table"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "chunk_table",
+            ))
         }
 
         fn commit(&mut self, _segments: u32) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "commit_segments"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "commit_segments",
+            ))
         }
 
         fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "release_segments"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "release_segments",
+            ))
         }
 
         fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "evacuate"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "evacuate",
+            ))
         }
     }
 
@@ -369,22 +411,40 @@ mod tests {
         }
 
         fn copy(&mut self, _copy: &::engine::chunk::SlotCopy) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_slots"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "copy_slots",
+            ))
         }
 
-        fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "read_tier_slots"))
+        fn read(
+            &mut self,
+            _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        ) -> ::engine::Result<Vec<u8>> {
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "read_tier_slots",
+            ))
         }
 
-        fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "write_tier_slots"))
+        fn write(
+            &mut self,
+            _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+            _bytes: &[u8],
+        ) -> ::engine::Result<()> {
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "write_tier_slots",
+            ))
         }
 
         fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
-            Err(::engine::Error::unsupported(::engine::Engine::kind(self), "copy_kv"))
+            Err(::engine::Error::unsupported(
+                ::engine::Engine::kind(self),
+                "copy_kv",
+            ))
         }
     }
-
 
     fn spec(host_ops: ::engine::HostOps) -> EngineSpec {
         EngineSpec {
@@ -453,9 +513,16 @@ mod tests {
         .map(|_| ())
         .expect_err("a beam group binds on no engine without `beam_list`");
         let why = format!("{refused:#}");
-        assert!(why.contains("no-beam-list engine"), "names the engine: {why}");
+        assert!(
+            why.contains("no-beam-list engine"),
+            "names the engine: {why}"
+        );
         assert!(why.contains("`beam_list`"), "names the op: {why}");
-        assert_eq!(calls.load(Ordering::Relaxed), 0, "the engine was asked for nothing");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "the engine was asked for nothing"
+        );
 
         let plain = ::engine::ProgramRegistration::default();
         crate::engine::backend::refuse_unserved_host_ops(engine, &plain.launch)

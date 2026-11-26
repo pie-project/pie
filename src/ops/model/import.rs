@@ -2343,7 +2343,11 @@ mod tests {
             ("metal", Platform::Metal),
         ] {
             let doc = format!("[engine]\ntype = \"{kind}\"\ndevice = [\"{kind}:0\"]\n");
-            assert_eq!(configured_platform(Some(&doc)).unwrap(), Some(want), "{kind}");
+            assert_eq!(
+                configured_platform(Some(&doc)).unwrap(),
+                Some(want),
+                "{kind}"
+            );
         }
         assert_eq!(configured_platform(None).unwrap(), None);
         assert_eq!(

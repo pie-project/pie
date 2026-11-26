@@ -204,7 +204,10 @@ pub fn traces(
             all.push((format!("{name} (prompt)"), prefill));
             all.push((format!("{name} (decode)"), decode));
         }
-        all.push(("the built-in `prefill`".to_owned(), builtin_prefill(vocab, page_size, outputs)?));
+        all.push((
+            "the built-in `prefill`".to_owned(),
+            builtin_prefill(vocab, page_size, outputs)?,
+        ));
         Ok(all)
     })
 }
@@ -338,11 +341,18 @@ mod tests {
         for prompt in [1, 37, 300, 1500] {
             let request = Request { prompt, ..PREWARM };
             let [asked, _] = passes(VOCAB, 16, &outputs(), 8, shape, &request).expect("traces");
-            assert_eq!(hash(&asked), hash(&prewarmed[0].1), "a {prompt}-token prompt");
+            assert_eq!(
+                hash(&asked),
+                hash(&prewarmed[0].1),
+                "a {prompt}-token prompt"
+            );
         }
         let builtin = &prewarmed.last().expect("the built-in `prefill`").1;
         assert_eq!(hash(builtin), hash(builtin));
-        assert_eq!(registry.counts().0, 2, "one program each: the prompt pass and `prefill`");
+        assert_eq!(
+            registry.counts().0,
+            2,
+            "one program each: the prompt pass and `prefill`"
+        );
     }
-
 }

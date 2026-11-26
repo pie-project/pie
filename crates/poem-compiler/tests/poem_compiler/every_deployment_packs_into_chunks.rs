@@ -573,7 +573,11 @@ fn qwen35_vision_mtp_lays_its_rs_rows_in_an_rs_list_layer_major() {
             assert!(state.ends_with("gdn.delta_state"), "{state}");
             let scalars = chunk.rs_corrected && chunk.rs_scalars;
             let corrected = if chunk.rs_corrected { 2 } else { 0 };
-            assert_eq!(rs.planes.len(), 2 + corrected + usize::from(scalars), "{preset}");
+            assert_eq!(
+                rs.planes.len(),
+                2 + corrected + usize::from(scalars),
+                "{preset}"
+            );
             if scalars {
                 assert_eq!(rs.planes[4].bytes % 8, 0, "two f32 a value head");
             }

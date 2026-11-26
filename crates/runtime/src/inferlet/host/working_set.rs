@@ -510,14 +510,20 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
                 asker.clone(),
             ),
             Some(crate::inferlet::process::Keying::OnBehalf(domain)) => ShareAs::OnBehalf(*domain),
-            None => return Ok(Err("share: this process has no authenticated tenant".to_string())),
+            None => {
+                return Ok(Err(
+                    "share: this process has no authenticated tenant".to_string()
+                ));
+            }
         };
         let kv_rep = self.ctx().table.get(&this)?.kv;
         let kv = kv_of(self, kv_rep)?;
         let stores = store_registry::get(kv.model, kv.engine);
-        Ok(store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
-            s.share(kv.id, ask)
-        }))
+        Ok(store_registry::with_kv_lock(
+            &stores.kv,
+            "host-working-set",
+            |s| s.share(kv.id, ask),
+        ))
     }
 
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {

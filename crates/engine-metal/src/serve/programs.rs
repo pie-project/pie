@@ -4,7 +4,6 @@
 use super::*;
 
 impl Shell {
-
     pub fn register_program(
         &mut self,
         registration: &engine::program::ProgramRegistration,

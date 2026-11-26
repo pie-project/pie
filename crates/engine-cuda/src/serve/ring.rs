@@ -207,8 +207,12 @@ pub fn compose(
         let stop = ((n + 1) * page).min(held);
         if n >= base_page {
             let slot = lane.buffer[(n - base_page) as usize];
-            out.refills
-                .push((slot.1, lane.ring[(n % ring_pages) as usize].1, row % page, stop - row));
+            out.refills.push((
+                slot.1,
+                lane.ring[(n % ring_pages) as usize].1,
+                row % page,
+                stop - row,
+            ));
         }
         row = stop;
     }
@@ -250,10 +254,16 @@ pub fn compose(
         let stop = ((n + 1) * page).min(to);
         if let Source::At(at) = sources[n as usize] {
             let ring = lane.ring[(n % ring_pages) as usize];
-            if out.table.iter().take(base_page as usize).any(|&id| id == ring.0) {
+            if out
+                .table
+                .iter()
+                .take(base_page as usize)
+                .any(|&id| id == ring.0)
+            {
                 out.read_then_folded += 1;
             }
-            out.folds.push((ring.1, Source::At(at), row % page, stop - row));
+            out.folds
+                .push((ring.1, Source::At(at), row % page, stop - row));
         }
         row = stop;
     }
@@ -283,13 +293,15 @@ impl Work {
         for &(dst, from, first, rows) in &composed.refills {
             for &(offset, row_bytes) in planes {
                 let at = offset + u64::from(first) * row_bytes;
-                self.refills.push((dst + at, from + at, u64::from(rows) * row_bytes));
+                self.refills
+                    .push((dst + at, from + at, u64::from(rows) * row_bytes));
             }
         }
         for &(dst, from, first, rows) in &composed.snaps {
             for &(offset, row_bytes) in planes {
                 let at = offset + u64::from(first) * row_bytes;
-                self.snaps.push((dst + at, from + at, u64::from(rows) * row_bytes));
+                self.snaps
+                    .push((dst + at, from + at, u64::from(rows) * row_bytes));
             }
         }
         for &(ring, source, first, rows) in &composed.folds {
@@ -331,11 +343,15 @@ mod tests {
     use super::*;
 
     fn ring_at(pages: u32, at: u64) -> Vec<(i32, u64)> {
-        (0..pages).map(|p| (900 + p as i32, at + u64::from(p))).collect()
+        (0..pages)
+            .map(|p| (900 + p as i32, at + u64::from(p)))
+            .collect()
     }
 
     fn ring(pages: u32) -> Vec<(i32, u64)> {
-        (0..pages).map(|p| (100 + p as i32, 1000 + u64::from(p))).collect()
+        (0..pages)
+            .map(|p| (100 + p as i32, 1000 + u64::from(p)))
+            .collect()
     }
 
     #[test]

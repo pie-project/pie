@@ -330,7 +330,8 @@ impl AddressSpace {
             Some(maps) if cost.instance_maps > 0 => by_bytes.min(maps / cost.instance_maps),
             _ => by_bytes,
         };
-        self.fits_commit(cost).map_or(by_maps, |commit| by_maps.min(commit))
+        self.fits_commit(cost)
+            .map_or(by_maps, |commit| by_maps.min(commit))
     }
 
     /// The most instances the commit left holds, where the pool commits.
@@ -373,12 +374,18 @@ pub(crate) fn size_pool(
     let fits = space.fits(cost);
     match configured {
         Some(n) if u64::from(n) <= fits => Ok(n),
-        Some(n) if space.fits_commit(cost).is_some_and(|commit| u64::from(n) > commit) => bail!(
-            "[sandbox] max_instances = {n} commits {} of tables as the pool is laid; this process \
+        Some(n)
+            if space
+                .fits_commit(cost)
+                .is_some_and(|commit| u64::from(n) > commit) =>
+        {
+            bail!(
+                "[sandbox] max_instances = {n} commits {} of tables as the pool is laid; this process \
              has {} (it holds {fits} instances)",
-            show(u64::from(n).saturating_mul(cost.instance_commit)),
-            space.commit_shown(),
-        ),
+                show(u64::from(n).saturating_mul(cost.instance_commit)),
+                space.commit_shown(),
+            )
+        }
         Some(n) => {
             let needs = cost.bytes(u64::from(n));
             if needs > space.pool_bytes() {
@@ -789,7 +796,10 @@ mod tests {
             "{error}"
         );
         // Where it commits nothing, no commit bounds it.
-        let roomy = AddressSpace { commit: None, ..short };
+        let roomy = AddressSpace {
+            commit: None,
+            ..short
+        };
         assert_eq!(roomy.fits(&cost), short.fits(&cost));
         assert!(short.fits(&cost) > 100);
 

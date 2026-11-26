@@ -263,7 +263,10 @@ pub fn step(state: &mut State, parents: &[u32], at: Fire) -> Step {
         if tokens == 0 || src == dst {
             continue;
         }
-        if src >= q_n || dst >= q_n || tokens > s || u64::from(f0 + dst) * u64::from(s) < u64::from(at.folded)
+        if src >= q_n
+            || dst >= q_n
+            || tokens > s
+            || u64::from(f0 + dst) * u64::from(s) < u64::from(at.folded)
         {
             raise(&mut faults, b, fault::COPY_BOUNDS);
         }
@@ -285,7 +288,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) as u32
         }
     }
@@ -326,10 +332,16 @@ mod tests {
             let c = ((folded + t) / page - f0) as usize;
             for (b, list) in step.lists.iter().enumerate() {
                 for &q in list {
-                    assert!(!state.free[q as usize], "fire {t}: beam {b} names free page {q}");
+                    assert!(
+                        !state.free[q as usize],
+                        "fire {t}: beam {b} names free page {q}"
+                    );
                 }
                 for (e, other) in step.lists.iter().enumerate().take(b) {
-                    assert_ne!(list[c], other[c], "fire {t}: beams {e} and {b} write one page");
+                    assert_ne!(
+                        list[c], other[c],
+                        "fire {t}: beams {e} and {b} write one page"
+                    );
                 }
             }
         }

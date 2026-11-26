@@ -94,8 +94,12 @@ pub fn full(
     // and a decode's few rows spread their heads as before.
     let heads = num_q_heads + num_kv_heads;
     let per_block = if pairs > 0 {
-        let groups = (2 * ctx.multiprocessors(OP)?).div_ceil(q.rows.max(1)).max(1);
-        heads.div_ceil(groups).clamp(heads_per_block(half).min(heads), heads)
+        let groups = (2 * ctx.multiprocessors(OP)?)
+            .div_ceil(q.rows.max(1))
+            .max(1);
+        heads
+            .div_ceil(groups)
+            .clamp(heads_per_block(half).min(heads), heads)
     } else {
         heads_per_block(half)
     };

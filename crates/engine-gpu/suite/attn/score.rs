@@ -34,11 +34,36 @@ struct LaneAt {
 }
 
 const LANES: [LaneAt; 5] = [
-    LaneAt { rows: 2, held: 3, captures: false, pages: false },
-    LaneAt { rows: 6, held: 0, captures: true, pages: true },
-    LaneAt { rows: 1, held: 9, captures: true, pages: false },
-    LaneAt { rows: 1, held: 2, captures: false, pages: false },
-    LaneAt { rows: 3, held: 0, captures: true, pages: true },
+    LaneAt {
+        rows: 2,
+        held: 3,
+        captures: false,
+        pages: false,
+    },
+    LaneAt {
+        rows: 6,
+        held: 0,
+        captures: true,
+        pages: true,
+    },
+    LaneAt {
+        rows: 1,
+        held: 9,
+        captures: true,
+        pages: false,
+    },
+    LaneAt {
+        rows: 1,
+        held: 2,
+        captures: false,
+        pages: false,
+    },
+    LaneAt {
+        rows: 3,
+        held: 0,
+        captures: true,
+        pages: true,
+    },
 ];
 
 struct Fixture {
@@ -71,7 +96,9 @@ fn fixture(context: usize) -> Fixture {
     let pool_pages = *page_indptr.last().unwrap() as usize;
     // Pages out of order: a stride prime to the pool's pages.
     let step = (3..).find(|s| pool_pages % s != 0).unwrap();
-    let page_indices = (0..pool_pages).map(|i| ((i * step + 1) % pool_pages) as u32).collect();
+    let page_indices = (0..pool_pages)
+        .map(|i| ((i * step + 1) % pool_pages) as u32)
+        .collect();
     let rows = *qo.last().unwrap() as usize;
     let slots = pool_pages * PAGE;
     let widen = |v: Vec<f32>| -> Vec<f64> {
@@ -162,7 +189,13 @@ fn table(f: &Fixture, context: usize) -> Vec<i32> {
             } else {
                 -1
             };
-            [lane as i32, f.qo[lane], f.qo[lane + 1], (row * context) as i32, page]
+            [
+                lane as i32,
+                f.qo[lane],
+                f.qo[lane + 1],
+                (row * context) as i32,
+                page,
+            ]
         })
         .collect()
 }
@@ -178,15 +211,17 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
     let slots = f.pool_pages * PAGE;
     let row = KV_HEADS * HEAD_DIM;
     let t = |b: u32, r: usize, w: usize, d: Dtype| Tensor::new(b, r as u32, w as u32, d);
-    let up_bf16 = |gpu: &mut Gpu, v: &[f64]| {
-        gpu.up(&v.iter().map(|x| *x as f32).collect::<Vec<_>>()).0
-    };
+    let up_bf16 =
+        |gpu: &mut Gpu, v: &[f64]| gpu.up(&v.iter().map(|x| *x as f32).collect::<Vec<_>>()).0;
     let pi = gpu.up_u32(&f.page_indices);
     let pp = gpu.up_u32(&f.page_indptr);
     let pos = gpu.up_i32(&f.positions);
     let capture_table = table(&f, context);
     let capturing = (capture_table.len() / TABLE_INTS as usize) as u32;
-    let page_rows = capture_table.chunks(TABLE_INTS as usize).filter(|e| e[4] >= 0).count();
+    let page_rows = capture_table
+        .chunks(TABLE_INTS as usize)
+        .filter(|e| e[4] >= 0)
+        .count();
     let tb = gpu.up_i32(&capture_table);
     let pools: Vec<KvPool> = (0..2)
         .map(|layer| {
@@ -249,12 +284,20 @@ fn case(gpu: &mut Gpu, context: usize, observe: usize, q_heads: usize, workgroup
         agrees(&got[c * context..][..context], keys)
             .unwrap_or_else(|why| panic!("{what}: capturing lane {c}'s key row: {why}"));
         // Each layer's mass is the lane's share of the model's heads.
-        let mass: f64 = got[c * context..][..context].iter().map(|v| f64::from(*v)).sum();
+        let mass: f64 = got[c * context..][..context]
+            .iter()
+            .map(|v| f64::from(*v))
+            .sum();
         let share = 2.0 * Q_HEADS as f64 / q_heads as f64;
-        assert!((mass - share).abs() < 1e-4, "{what}: lane {c} holds {mass}, not {share}");
+        assert!(
+            (mass - share).abs() < 1e-4,
+            "{what}: lane {c} holds {mass}, not {share}"
+        );
     }
     assert!(
-        got[capturing as usize * context..].iter().all(|&v| v == 7.0),
+        got[capturing as usize * context..]
+            .iter()
+            .all(|&v| v == 7.0),
         "{what}: the row past the capturing lanes is no capture's"
     );
 

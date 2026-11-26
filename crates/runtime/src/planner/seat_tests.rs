@@ -223,5 +223,8 @@ async fn a_pool_with_no_tier_below_the_device_serves() {
         .now_or_never()
         .expect("pages stand free")
         .expect("served");
-    assert!(matches!(acquired, super::Acquired::Granted(_)), "granted on the device alone");
+    assert!(
+        matches!(acquired, super::Acquired::Granted(_)),
+        "granted on the device alone"
+    );
 }

@@ -173,5 +173,4 @@ mod tests {
             .expect("the default settings validate");
         assert_eq!(config.runtime.frame_size, u32::from(Runahead::STEPS_MAX));
     }
-
 }

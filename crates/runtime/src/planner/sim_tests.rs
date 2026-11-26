@@ -219,7 +219,10 @@ impl PoolShape {
     /// for a process: none states its own).
     fn most_pages(&self) -> u32 {
         let largest_run = self.programs.iter().map(|p| p.run * 2).max().unwrap_or(0);
-        (self.state_chunks() * 3 / 5).saturating_sub(largest_run).max(2) * PAGES_PER_CHUNK
+        (self.state_chunks() * 3 / 5)
+            .saturating_sub(largest_run)
+            .max(2)
+            * PAGES_PER_CHUNK
     }
 
     /// State chunks: the total less the reserved chunk and the activation.
@@ -502,7 +505,12 @@ impl Bytes {
             slots: copy
                 .slots
                 .iter()
-                .map(|&(from, to)| (self.key(src, copy.shape.0, from), self.key(dst, copy.shape.0, to)))
+                .map(|&(from, to)| {
+                    (
+                        self.key(src, copy.shape.0, from),
+                        self.key(dst, copy.shape.0, to),
+                    )
+                })
                 .collect(),
         }
     }
@@ -539,7 +547,6 @@ impl Bytes {
             _ => TIER_DEVICE,
         }
     }
-
 }
 
 /// The engine's own view of its state pool, as the pool ops it applied
@@ -591,7 +598,8 @@ impl EngineView {
         held.iter()
             .filter_map(|&(logical, physical)| {
                 let engine = self.table.physical(logical);
-                (engine != Some(physical) || !self.admits(physical)).then_some((logical, physical, engine))
+                (engine != Some(physical) || !self.admits(physical))
+                    .then_some((logical, physical, engine))
             })
             .collect()
     }
@@ -616,10 +624,17 @@ impl EngineView {
 
 /// The first slot a holder outside the pool names that the pool does not
 /// count held, said with its holder.
-fn stray_holders(ctx: &Ctx, shared: &Arc<Mutex<crate::store::shared::SharedPool>>) -> Option<String> {
+fn stray_holders(
+    ctx: &Ctx,
+    shared: &Arc<Mutex<crate::store::shared::SharedPool>>,
+) -> Option<String> {
     let mut named: Vec<(String, crate::store::slots::Slot)> = Vec::new();
     with_kv_lock(&ctx.stores.kv, "sim-holders", |kv| {
-        named.extend(kv.device_page_slots().into_iter().map(|slot| ("a kv page".to_string(), slot)));
+        named.extend(
+            kv.device_page_slots()
+                .into_iter()
+                .map(|slot| ("a kv page".to_string(), slot)),
+        );
     });
     if let Some(roles) = &ctx.stores.roles {
         named.extend(roles.lock().unwrap().device_slots_named());
@@ -640,7 +655,10 @@ fn stray_holders(ctx: &Ctx, shared: &Arc<Mutex<crate::store::shared::SharedPool>
                 continue;
             };
             for &slot in &places.instance {
-                named.push((format!("instance {id}'s tables"), shared.slot(instance, slot)));
+                named.push((
+                    format!("instance {id}'s tables"),
+                    shared.slot(instance, slot),
+                ));
             }
             for ring in &places.rings {
                 for &slot in &ring.slots {
@@ -649,7 +667,10 @@ fn stray_holders(ctx: &Ctx, shared: &Arc<Mutex<crate::store::shared::SharedPool>
             }
             if parked.is_none() {
                 for slot in place_slots(&places.scratch, &bytes) {
-                    named.push((format!("instance {id}'s scratch"), shared.slot(instance, slot)));
+                    named.push((
+                        format!("instance {id}'s scratch"),
+                        shared.slot(instance, slot),
+                    ));
                 }
                 for slot in place_slots(&places.pair, &bytes) {
                     named.push((
@@ -799,12 +820,11 @@ impl SimEngine {
             .instance
             .iter()
             .map(|&slot| slot_run(bytes, INSTANCE, slot))
-            .chain(
-                places
-                    .rings
+            .chain(places.rings.iter().flat_map(|ring| {
+                ring.slots
                     .iter()
-                    .flat_map(|ring| ring.slots.iter().map(|&slot| slot_run(bytes, CHANNEL, slot))),
-            )
+                    .map(|&slot| slot_run(bytes, CHANNEL, slot))
+            }))
             .collect();
         if scratch {
             runs.extend(
@@ -898,7 +918,8 @@ impl SimEngine {
         );
         drop(bytes);
         if let Err(overlap) = self.claims.claim_all(&moved) {
-            self.refusals.push(format!("a compaction's rebase: {overlap}"));
+            self.refusals
+                .push(format!("a compaction's rebase: {overlap}"));
         }
     }
 
@@ -933,9 +954,7 @@ impl ::engine::Engine for SimEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -983,10 +1002,7 @@ impl ::engine::Programs for SimEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -1110,16 +1126,28 @@ impl ::engine::Programs for SimEngine {
         Ok(())
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
     fn close(&mut self, _id: ::engine::InstanceId) -> ::engine::Result<u64> {
         Err(::engine::Error::unsupported(self.kind(), "close_instance"))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -1133,7 +1161,10 @@ impl ::engine::Pool for SimEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -1159,19 +1190,28 @@ impl ::engine::Tiers for SimEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 const PART_TABLE: u8 = 0;
 const PART_RING: u8 = 1;
@@ -1348,7 +1388,13 @@ impl Workload {
         // Filed with no fire to come after it, then asked for: again and
         // again, until the tiers below hold as much cache as they take.
         let cached = script.clone();
-        let mut after = workload.scripts.iter().map(|script| script.at).max().unwrap_or(0) + 300;
+        let mut after = workload
+            .scripts
+            .iter()
+            .map(|script| script.at)
+            .max()
+            .unwrap_or(0)
+            + 300;
         let below = workload.pool.host_chunks + workload.pool.disk_chunks;
         for _ in 0..below.div_ceil(2).min(24) {
             let mut asker = cached.clone();
@@ -1501,9 +1547,7 @@ impl Workload {
             }
         }
         let mut ring_rng = Rng(seed ^ 0x2196_57a9);
-        let ring = ring_rng
-            .chance(1, 3)
-            .then(|| ring_rng.range(1, 3) as usize);
+        let ring = ring_rng.chance(1, 3).then(|| ring_rng.range(1, 3) as usize);
         let mut fail_rng = Rng(seed ^ 0xfa11_ed00);
         let landing_fails = fail_rng
             .chance(1, 4)
@@ -1918,7 +1962,10 @@ impl Progress {
         for pid in std::mem::take(&mut ctx.log.lock().unwrap().requests) {
             self.owed.retain(|&(_, head)| head != pid);
         }
-        for (pid, evicted) in ctx.planner.with_inner(|inner| std::mem::take(&mut inner.moves)) {
+        for (pid, evicted) in ctx
+            .planner
+            .with_inner(|inner| std::mem::take(&mut inner.moves))
+        {
             if evicted.is_some() {
                 *ctx.log.lock().unwrap().evicted_of.entry(pid).or_default() += 1;
             }
@@ -1954,7 +2001,13 @@ impl Ctx {
                 .filter(|(moved, evicted)| *moved == pid && evicted.is_some())
                 .count()
         });
-        self.log.lock().unwrap().evicted_of.get(&pid).copied().unwrap_or(0)
+        self.log
+            .lock()
+            .unwrap()
+            .evicted_of
+            .get(&pid)
+            .copied()
+            .unwrap_or(0)
             + u32::try_from(logged).unwrap_or(u32::MAX)
     }
 
@@ -2216,7 +2269,10 @@ async fn fire(
                             chunk.copy_from_slice(&rng.next().to_le_bytes());
                         }
                         if ctx.idle_cache {
-                            ctx.sealed.lock().unwrap().insert(hash, pattern(5, set.tag, index));
+                            ctx.sealed
+                                .lock()
+                                .unwrap()
+                                .insert(hash, pattern(5, set.tag, index));
                         }
                         crate::store::kv::write::PageCommit {
                             token_hashes: Vec::new(),
@@ -2359,9 +2415,7 @@ async fn bind(ctx: &Ctx, pid: ProcessId, program: u32) -> Result<InstanceId, Str
             }
         },
         || Some(roles.lock().unwrap().room_watch()),
-        |run, pieces, singles| {
-            roles.lock().unwrap().room_free(run, pieces, singles)
-        },
+        |run, pieces, singles| roles.lock().unwrap().room_free(run, pieces, singles),
         |run, pieces, singles| {
             let holds = roles.lock().unwrap().holds_guest_state(pid);
             async move {
@@ -2439,7 +2493,14 @@ fn take_bind_error(
 ) -> String {
     let mut engine = engine.lock().unwrap();
     let free_chunks = roles.lock().unwrap().free_runs(1);
-    match crate::store::roles::take_bind(Some(roles), &mut *engine, binding, |_| false, Some(pid), |_| true) {
+    match crate::store::roles::take_bind(
+        Some(roles),
+        &mut *engine,
+        binding,
+        |_| false,
+        Some(pid),
+        |_| true,
+    ) {
         Ok(taken) => {
             if let Some(taken) = taken {
                 roles.lock().unwrap().untake(taken);
@@ -2521,7 +2582,9 @@ async fn import(ctx: &Ctx, pid: ProcessId, pages: u32) -> Result<(), String> {
         *next += 1;
         *next
     };
-    let rows: Vec<u32> = (0..pages * 16).map(|row| row ^ (first as u32) << 16).collect();
+    let rows: Vec<u32> = (0..pages * 16)
+        .map(|row| row ^ (first as u32) << 16)
+        .collect();
     let tokens: Vec<Vec<Option<Hash256>>> = chain_slots(&[7; 32], None, 0, &rows)
         .chunks(16)
         .map(|page| page.iter().map(|hash| Some(*hash)).collect())
@@ -2529,7 +2592,10 @@ async fn import(ctx: &Ctx, pid: ProcessId, pages: u32) -> Result<(), String> {
     let keys: Vec<Hash256> = tokens.iter().map(|page| page_hash(page)).collect();
     for (index, (key, page)) in keys.iter().zip(&local).enumerate() {
         let value = pattern(5, first, index as u64);
-        ctx.bytes.lock().unwrap().write(TIER_DEVICE, LIST, page.0, value);
+        ctx.bytes
+            .lock()
+            .unwrap()
+            .write(TIER_DEVICE, LIST, page.0, value);
         ctx.sealed.lock().unwrap().insert(*key, value);
     }
     let backings = local.into_iter().map(KvPageBacking::Resident).collect();
@@ -2582,7 +2648,9 @@ fn read_pinned(ctx: &Ctx, pinned: &Pinned) -> Result<(), String> {
     for &(page, want) in &pinned.pages {
         let got = bytes.read(TIER_DEVICE, LIST, page);
         if got != Some(want) {
-            return Err(format!("a pinned cached page at device page {page}: {got:?}"));
+            return Err(format!(
+                "a pinned cached page at device page {page}: {got:?}"
+            ));
         }
     }
     Ok(())
@@ -2591,8 +2659,9 @@ fn read_pinned(ctx: &Ctx, pinned: &Pinned) -> Result<(), String> {
 /// Ends the readers whose step has come (`every`: all of them).
 fn unpin(ctx: &Ctx, step: u64, every: bool) {
     let mut pinned = ctx.pinned.lock().unwrap();
-    let (ended, stay): (Vec<_>, Vec<_>) =
-        pinned.drain(..).partition(|pinned| every || pinned.until <= step);
+    let (ended, stay): (Vec<_>, Vec<_>) = pinned
+        .drain(..)
+        .partition(|pinned| every || pinned.until <= step);
     *pinned = stay;
     drop(pinned);
     for ended in ended {
@@ -2600,7 +2669,9 @@ fn unpin(ctx: &Ctx, step: u64, every: bool) {
             let nobody = ProcessId::from_u128(0);
             ctx.log.lock().unwrap().corrupt.push((nobody, what));
         }
-        with_kv_lock(&ctx.stores.kv, "sim-unpin", |kv| kv.release_reader(ended.pin));
+        with_kv_lock(&ctx.stores.kv, "sim-unpin", |kv| {
+            kv.release_reader(ended.pin)
+        });
         ctx.act();
     }
 }
@@ -2917,7 +2988,10 @@ async fn quiesce(
             let delay = u32::from(late > 0 && ctx.rng.lock().unwrap().chance(1, late));
             // Encoded now: its places resolved through the chunk table as
             // it stands at submit.
-            let resolved = copy.slots.as_ref().map(|slots| ctx.bytes.lock().unwrap().resolve(slots));
+            let resolved = copy
+                .slots
+                .as_ref()
+                .map(|slots| ctx.bytes.lock().unwrap().resolve(slots));
             pending.push((step + 1 + delay, copy, resolved));
         }
         let now = signature(pending.len());
@@ -3019,14 +3093,22 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         .into_iter()
         .next()
     {
-        return Err(fail("quiet", format!("a wait chosen with nothing in flight: {ended}")));
+        return Err(fail(
+            "quiet",
+            format!("a wait chosen with nothing in flight: {ended}"),
+        ));
     }
     // A failed process departs within a step: a failure no wait of its own
     // reads leaves its kill in flight for good and the fleet quiet (the
     // Metal mix's seed 42), failed loudly here instead.
     {
         let failed: Vec<ProcessId> = ctx.planner.with_inner(|inner| {
-            inner.failed.keys().copied().filter(|pid| inner.procs.contains_key(pid)).collect()
+            inner
+                .failed
+                .keys()
+                .copied()
+                .filter(|pid| inner.procs.contains_key(pid))
+                .collect()
         });
         let mut log = ctx.log.lock().unwrap();
         log.failed_at.retain(|pid, _| failed.contains(pid));
@@ -3071,7 +3153,13 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
         }
         // No ref two items hold, none an item holds that the pool counts
         // free (one slot handed to a restore's rebind and a fresh bind).
-        if let Some(line) = roles.lock().unwrap().audit_device_slots().into_iter().next() {
+        if let Some(line) = roles
+            .lock()
+            .unwrap()
+            .audit_device_slots()
+            .into_iter()
+            .next()
+        {
             return Err(fail("double", line));
         }
     }
@@ -3103,7 +3191,11 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
     let queue = planner.debug_queue();
     let ended = planner.with_inner(|inner| {
         inner.unmet_head().map(|(key, _)| {
-            format!("{} in_flight={}", inner.plan_fields(key).0, !inner.nothing_in_flight())
+            format!(
+                "{} in_flight={}",
+                inner.plan_fields(key).0,
+                !inner.nothing_in_flight()
+            )
         })
     });
     // Beside a reader a stuck head waits for its end, but not at a rung that
@@ -3118,7 +3210,10 @@ fn check(ctx: &Ctx, step: u32) -> Result<Vec<Failure>, Failure> {
             (shared.rung(), shared.rungs().first().copied().unwrap_or(0))
         };
         if rung > lowest {
-            return Err(fail("rung", format!("a head is stuck at rung {rung}: {}", planner.debug_queue())));
+            return Err(fail(
+                "rung",
+                format!("a head is stuck at rung {rung}: {}", planner.debug_queue()),
+            ));
         }
     }
     super::plan::PROGRESS_STRICT.with(|strict| strict.set(true));
@@ -3227,7 +3322,9 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         let pool = &workload.pool;
         let segments = pool.segments();
         let mut refuse_rng = Rng(workload.seed ^ 0x2ef0_5ed0);
-        let refuse_span = refuse_rng.chance(1, 2).then(|| u64::from(refuse_rng.range(2, 6)));
+        let refuse_span = refuse_rng
+            .chance(1, 2)
+            .then(|| u64::from(refuse_rng.range(2, 6)));
         Arc::new(Mutex::new(EngineView {
             total: pool.total,
             segment: pool.segment,
@@ -3244,8 +3341,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     crate::store::shared::owe_cut_rows(0, 0, None);
     crate::store::shared::set_fire_cap_for_test(0, u32::MAX);
     crate::store::shared::grant_rung(0, u32::MAX);
-    let planner_cell: Arc<std::sync::OnceLock<std::sync::Weak<ResidencyPlanner>>> =
-        Arc::default();
+    let planner_cell: Arc<std::sync::OnceLock<std::sync::Weak<ResidencyPlanner>>> = Arc::default();
     let mut grow = workload.pool.governed.then(|| {
         let shared = stores.shared.clone().expect("a shared pool");
         let (lane_bytes, lane_engine, total) =
@@ -3363,7 +3459,9 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         rng: Mutex::new(Rng(workload.seed ^ 0x5eed)),
         walks: grow.is_some(),
         engine_view,
-        seats: workload.default_policy.then(|| Mutex::new(SeatHolds::default())),
+        seats: workload
+            .default_policy
+            .then(|| Mutex::new(SeatHolds::default())),
         idle_cache: workload.idle_cache,
         sealed: Mutex::default(),
         pinned: Mutex::default(),
@@ -3377,7 +3475,11 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     let mut idle_rng = Rng(workload.seed ^ 0xde_307e);
     let mut pid_rng = Rng(workload.seed.wrapping_mul(31).wrapping_add(7));
     let mut fires_before = 0u64;
-    let mut rung = ctx.stores.shared.as_ref().map_or(0, |shared| shared.lock().unwrap().rung());
+    let mut rung = ctx
+        .stores
+        .shared
+        .as_ref()
+        .map_or(0, |shared| shared.lock().unwrap().rung());
     let scripts: Vec<(usize, &Script)> = workload
         .scripts
         .iter()
@@ -3403,10 +3505,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
     // its moves. A heavy mix on a small device (the field's) runs nearly
     // one process at a time, and its last process ends that late without
     // anyone starving.
-    let work: u32 = scripts
-        .iter()
-        .map(|(_, script)| 1 + script.decode)
-        .sum();
+    let work: u32 = scripts.iter().map(|(_, script)| 1 + script.decode).sum();
     let bound = last_arrival + 600 + work;
     let mut progress = Progress::default();
     let mut step = 0u32;
@@ -3594,7 +3693,13 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
         coverage.bind_waits = log.bind_waits;
         coverage.bind_suspends = log.bind_suspends;
         coverage.raises_owed = log.raises_owed;
-        eprintln!("SIM outcome: finished {} refused_at_admission_retried {} failed_wedged {} other_failures {}", log.finished, log.retries, log.wedged, log.refusals.len());
+        eprintln!(
+            "SIM outcome: finished {} refused_at_admission_retried {} failed_wedged {} other_failures {}",
+            log.finished,
+            log.retries,
+            log.wedged,
+            log.refusals.len()
+        );
         coverage.rung_raises = lane_ops[0].load(Ordering::Relaxed);
         coverage.rung_lowers = lane_ops[2].load(Ordering::Relaxed);
         coverage.evacuations = lane_ops[1].load(Ordering::Relaxed);
@@ -3627,9 +3732,7 @@ async fn drive(workload: &Workload, keep: Option<&[usize]>) -> (Vec<Failure>, Co
                 kind: "thrash".to_string(),
                 line: format!(
                     "{first}; {} such, {} evictions for {} finished",
-                    progress.again,
-                    coverage.evictions,
-                    log.finished
+                    progress.again, coverage.evictions, log.finished
                 ),
             });
         }
@@ -3684,7 +3787,10 @@ fn the_simulated_fleet_settles_every_step_on_its_seeds() {
         failures.extend(found.into_iter().map(|failure| (seed, failure)));
     }
     assert!(failures.is_empty(), "failures: {failures:?}\n{coverage:?}");
-    assert!(coverage.evictions > 0 && coverage.restores > 0, "{coverage:?}");
+    assert!(
+        coverage.evictions > 0 && coverage.restores > 0,
+        "{coverage:?}"
+    );
 }
 
 /// The same with idle cache beside the fleet: no waiter is left to cache a
@@ -3902,26 +4008,43 @@ fn raise_script(at: u32, prompt: u32, decode: u32, raise: Option<u32>, bound: bo
 fn a_raise_past_the_pool_beside_its_own_kv_is_refused_by_name() {
     // 11 chunks of prompt and 60 pages: 15 chunks of kv, the reserved
     // chunk and the rung's 5, 21 of 18.
-    let (failures, coverage) = run(&raise_beside_own_workload(vec![raise_script(0, 10, 70, Some(68), false)]), None);
+    let (failures, coverage) = run(
+        &raise_beside_own_workload(vec![raise_script(0, 10, 70, Some(68), false)]),
+        None,
+    );
     for failure in &failures {
-        eprintln!("SIM raise past step {}: [{}] {}", failure.step, failure.kind, failure.line);
+        eprintln!(
+            "SIM raise past step {}: [{}] {}",
+            failure.step, failure.kind, failure.line
+        );
     }
     eprintln!("SIM raise past: {coverage:?}");
     assert!(coverage.raises_owed > 0, "the raise was owed: {coverage:?}");
     assert!(
-        failures.iter().all(|failure| failure.kind == "refused" && failure.line.contains("rung")),
+        failures
+            .iter()
+            .all(|failure| failure.kind == "refused" && failure.line.contains("rung")),
         "only its refusal, by name: {failures:?}"
     );
-    assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
+    assert!(
+        failures.iter().any(|failure| failure.kind == "refused"),
+        "refused"
+    );
     // Beside another whose kv has the rung lowered and which then ends: 8
     // chunks of kv beside the rung's 5 and the reserved chunk, 14 of 18.
     // It fits alone: it waits, and is served.
     let (failures, coverage) = run(
-        &raise_beside_own_workload(vec![raise_script(0, 6, 30, Some(28), false), raise_script(0, 7, 8, None, true)]),
+        &raise_beside_own_workload(vec![
+            raise_script(0, 6, 30, Some(28), false),
+            raise_script(0, 7, 8, None, true),
+        ]),
         None,
     );
     for failure in &failures {
-        eprintln!("SIM raise fits step {}: [{}] {}", failure.step, failure.kind, failure.line);
+        eprintln!(
+            "SIM raise fits step {}: [{}] {}",
+            failure.step, failure.kind, failure.line
+        );
     }
     eprintln!("SIM raise fits: {coverage:?}");
     assert!(failures.is_empty(), "fits alone: served, {failures:?}");
@@ -3938,13 +4061,21 @@ fn a_raise_past_the_pool_beside_its_own_kv_is_refused_by_name() {
 fn a_run_no_arrangement_opens_is_refused_by_name() {
     let (failures, _) = run(&run_need_workload(0, 18, 6, 7, false), None);
     for failure in &failures {
-        eprintln!("SIM run past a segment step {}: [{}] {}", failure.step, failure.kind, failure.line);
+        eprintln!(
+            "SIM run past a segment step {}: [{}] {}",
+            failure.step, failure.kind, failure.line
+        );
     }
     assert!(
-        failures.iter().all(|failure| failure.kind == "refused" && failure.line.contains("never")),
+        failures
+            .iter()
+            .all(|failure| failure.kind == "refused" && failure.line.contains("never")),
         "only its refusal, by name: {failures:?}"
     );
-    assert!(failures.iter().any(|failure| failure.kind == "refused"), "refused");
+    assert!(
+        failures.iter().any(|failure| failure.kind == "refused"),
+        "refused"
+    );
 }
 
 /// A pool with no tier below the device, few segments mapped and the
@@ -3990,13 +4121,23 @@ async fn a_first_ask_takes_room_the_walk_can_open() {
         })
     };
     let refused = ask(open + 1).await.unwrap();
-    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+    assert!(matches!(
+        refused,
+        Err(PlannerError::AdmissionRefused { .. })
+    ));
 
     let _ = grow.retarget(6);
     let more = port.commit_room();
-    assert_eq!(more, 3 * shape.segment * PAGES_PER_CHUNK, "three segments of chunks");
+    assert_eq!(
+        more,
+        3 * shape.segment * PAGES_PER_CHUNK,
+        "three segments of chunks"
+    );
     let refused = ask(open + more + 1).await.unwrap();
-    assert!(matches!(refused, Err(PlannerError::AdmissionRefused { .. })));
+    assert!(matches!(
+        refused,
+        Err(PlannerError::AdmissionRefused { .. })
+    ));
     let served = ask(open + more);
     for _ in 0..100 {
         crate::rt::yield_now().await;

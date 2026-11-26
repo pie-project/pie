@@ -575,7 +575,13 @@ fn share_slots(members: &[(String, u64, Option<(usize, usize)>)]) -> (Vec<usize>
             }
         };
     }
-    (slot_of, slots.into_iter().map(|(_, row_bytes, _)| row_bytes).collect())
+    (
+        slot_of,
+        slots
+            .into_iter()
+            .map(|(_, row_bytes, _)| row_bytes)
+            .collect(),
+    )
 }
 
 #[derive(Debug)]
@@ -682,7 +688,9 @@ pub fn page_ints(context: u32, page_tokens: u32) -> u32 {
     if page_tokens == 0 {
         return 0;
     }
-    1 + (page_tokens - 1).saturating_add(context).div_ceil(page_tokens)
+    1 + (page_tokens - 1)
+        .saturating_add(context)
+        .div_ceil(page_tokens)
 }
 
 /// The page table of `lanes`, one `ints` row a lane ([`page_ints`]); `None`

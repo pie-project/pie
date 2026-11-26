@@ -50,11 +50,7 @@ fn prefill_float_bytes(
                 "the prefill workspace grant: the graph form of {rows} rows over {lanes} \
                  lanes ({} query heads over {} kv heads, {} wide, window {:?}, pages of \
                  {page_size}, {} SMs) refused: {refused}",
-                facts.q_heads,
-                facts.kv_heads,
-                facts.head_dim,
-                facts.window,
-                device.num_sm,
+                facts.q_heads, facts.kv_heads, facts.head_dim, facts.window, device.num_sm,
             ),
         })?;
         most = most.max(asked);
@@ -449,7 +445,10 @@ impl Free {
         self.bits.fetch_or(1u64 << at, Ordering::Release);
         // Under the lock, so a claim between its failed take and its wait
         // does not miss this.
-        let _held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _held = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.given.notify_all();
     }
 
@@ -460,7 +459,10 @@ impl Free {
     /// itself, and the claim is refused by name at once: the claimant is
     /// running deeper than the `depth` it was laid for.
     pub fn claim(self: &Arc<Self>, what: &'static str) -> Result<SlotGuard> {
-        let mut held = self.lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if let Some(at) = self.take() {
                 return Ok(SlotGuard {
@@ -613,10 +615,7 @@ fn inject_tokens(
     let words = injects
         .iter()
         .all(|inject| inject.bytes % 4 == 0 && inject.dst_off % 4 == 0);
-    if injects.len() < GATHERED_INJECTS
-        || !words
-        || crate::device::alloc::is_capturing(stream)
-    {
+    if injects.len() < GATHERED_INJECTS || !words || crate::device::alloc::is_capturing(stream) {
         for inject in injects {
             crate::device::copy_d2d(stream, tokens + inject.dst_off, inject.src, inject.bytes)?;
         }
@@ -735,16 +734,37 @@ fn stage_pages(
         }
         Ok(())
     };
-    fits("beam pool pages in one fire", work.trans.len(), at.trans_cap)?;
-    fits("pool and rs pages one fire's lanes name", work.bases.len(), at.bases_cap)?;
-    fits("kv planes a page copy spans", work.planes.len(), at.planes_cap)?;
+    fits(
+        "beam pool pages in one fire",
+        work.trans.len(),
+        at.trans_cap,
+    )?;
+    fits(
+        "pool and rs pages one fire's lanes name",
+        work.bases.len(),
+        at.bases_cap,
+    )?;
+    fits(
+        "kv planes a page copy spans",
+        work.planes.len(),
+        at.planes_cap,
+    )?;
     fits("beam list runs in one fire", work.lists.len(), at.lists_cap)?;
     fits("beam groups in one fire", work.groups.len(), at.groups_cap)?;
     fits("beam copies in one fire", work.copies.len(), at.copies_cap)?;
     fits("beam lanes in one fire", work.faults.len(), at.faults_cap)?;
-    let beam_rows = work.rs.iter().map(|plan| plan.entry as usize + 1).max().unwrap_or(0);
+    let beam_rows = work
+        .rs
+        .iter()
+        .map(|plan| plan.entry as usize + 1)
+        .max()
+        .unwrap_or(0);
     fits("lanes whose rs rows one fire lays", beam_rows, at.rs_cap)?;
-    fits("beam rs copies in one fire", work.rs_copies.len(), at.rs_cap)?;
+    fits(
+        "beam rs copies in one fire",
+        work.rs_copies.len(),
+        at.rs_cap,
+    )?;
     let base = store.ptr();
     let faults = at.faults + u64::from(slot) * at.faults_cap * 4;
     let bytes_of = |ptr: *const u8, len: usize| -> &[u8] {
@@ -774,7 +794,10 @@ fn stage_pages(
         let table = tables.get(list.table as usize).ok_or_else(|| {
             crate::error::Fault::program(
                 "inputs::commit",
-                format!("a beam list names page table {} the fire stages none of", list.table),
+                format!(
+                    "a beam list names page table {} the fire stages none of",
+                    list.table
+                ),
             )
         })?;
         lists.push(BeamListRun {
@@ -787,7 +810,10 @@ fn stage_pages(
             _pad: 0,
         });
     }
-    let lists_at = put(bytes_of(lists.as_ptr().cast(), lists.len() * size_of::<BeamListRun>()));
+    let lists_at = put(bytes_of(
+        lists.as_ptr().cast(),
+        lists.len() * size_of::<BeamListRun>(),
+    ));
     // The lanes' rs rows, at their fixed place (a recorded body reads them
     // there): where the carried kernels resolve each lane's rows, a beam's
     // through its group's list, which the step points it at.
@@ -835,12 +861,15 @@ fn stage_pages(
             list_count: group.list_count,
             frames: group.frames,
             backed: group.backed,
-            rows: group
-                .rows_at
-                .map_or(0, |at_row| base + at.rs + u64::from(at_row) * size_of::<RsRows>() as u64),
+            rows: group.rows_at.map_or(0, |at_row| {
+                base + at.rs + u64::from(at_row) * size_of::<RsRows>() as u64
+            }),
         })
         .collect();
-    let groups_at = put(bytes_of(groups.as_ptr().cast(), groups.len() * size_of::<BeamStepRun>()));
+    let groups_at = put(bytes_of(
+        groups.as_ptr().cast(),
+        groups.len() * size_of::<BeamStepRun>(),
+    ));
     let copies: Vec<PageCopyRun> = work
         .copies
         .iter()
@@ -856,7 +885,10 @@ fn stage_pages(
             _pad: 0,
         })
         .collect();
-    let copies_at = put(bytes_of(copies.as_ptr().cast(), copies.len() * size_of::<PageCopyRun>()));
+    let copies_at = put(bytes_of(
+        copies.as_ptr().cast(),
+        copies.len() * size_of::<PageCopyRun>(),
+    ));
     // A hybrid's beams' rs copies: row by row of each rs plane.
     let rs_copies: Vec<RsCopyRun> = work
         .rs_copies
@@ -877,8 +909,15 @@ fn stage_pages(
             _pad: 0,
         })
         .collect();
-    let rs_copies_at = put(bytes_of(rs_copies.as_ptr().cast(), rs_copies.len() * size_of::<RsCopyRun>()));
-    fits("bytes of a fire's beam tables", image.len(), at.end - at.trans)?;
+    let rs_copies_at = put(bytes_of(
+        rs_copies.as_ptr().cast(),
+        rs_copies.len() * size_of::<RsCopyRun>(),
+    ));
+    fits(
+        "bytes of a fire's beam tables",
+        image.len(),
+        at.end - at.trans,
+    )?;
     store.stage(stream, at.trans, &image)?;
     // The fire's lanes' fault words, zero before its kernels write them.
     crate::device::zero_span_on(stream, base + faults, work.faults.len() * 4)?;
@@ -889,14 +928,22 @@ fn stage_pages(
         copies_at,
         planes,
         copies.len() as u32,
-        work.copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
+        work.copies
+            .iter()
+            .map(|copy| copy.planes)
+            .max()
+            .unwrap_or(0),
     )?;
     kernels_cuda::runtime::channel::copy_rs_rows(
         device.ctx(),
         rs_copies_at,
         planes,
         rs_copies.len() as u32,
-        work.rs_copies.iter().map(|copy| copy.planes).max().unwrap_or(0),
+        work.rs_copies
+            .iter()
+            .map(|copy| copy.planes)
+            .max()
+            .unwrap_or(0),
     )?;
     // Fault words only a beam group's step writes.
     Ok((!work.groups.is_empty()).then_some(base + faults))
@@ -1039,8 +1086,16 @@ impl Inputs {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(crate::window::lane_capacity(budget.max_lanes));
         let pages = lanes * u64::from(paging.pages_per_slot);
-        let window_slots =
-            crate::window::Slots::new(classes, lanes, runs, gathered, rows, page_tables, pages, masked);
+        let window_slots = crate::window::Slots::new(
+            classes,
+            lanes,
+            runs,
+            gathered,
+            rows,
+            page_tables,
+            pages,
+            masked,
+        );
         let window_ints = window_slots.words();
 
         let mut at = 0u64;
@@ -1648,7 +1703,10 @@ impl Inputs {
                     });
                 }
                 let mut folds = tables.folds.to_vec();
-                folds.resize(at.folds_cap as usize, kernels_cuda::ssm::GroupFold::default());
+                folds.resize(
+                    at.folds_cap as usize,
+                    kernels_cuda::ssm::GroupFold::default(),
+                );
                 // SAFETY: `GroupFold` is plain `repr(C)` data, read as its bytes.
                 let raw = unsafe {
                     core::slice::from_raw_parts(
@@ -2336,7 +2394,10 @@ mod claim_tests {
         let refused = free
             .claim("staging slots (the caller runs deeper than its frames in flight)")
             .expect_err("a third slot of two, none landing");
-        assert!(began.elapsed() < Duration::from_millis(100), "refused at once");
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "refused at once"
+        );
         assert!(refused.to_string().contains("staging slots"), "{refused}");
         drop(held);
     }

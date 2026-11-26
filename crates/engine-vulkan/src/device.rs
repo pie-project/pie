@@ -14,7 +14,9 @@ pub use alloc::{Buffer, FileWriter, Memory};
 #[cfg(feature = "vulkan")]
 pub use block::{ArmBlock, Image};
 #[cfg(feature = "vulkan")]
-pub use ctx::{Context, Enabled, Frame, Kept, Pending, Stamps, held_counts, present, reservations, take_spent};
+pub use ctx::{
+    Context, Enabled, Frame, Kept, Pending, Stamps, held_counts, present, reservations, take_spent,
+};
 #[cfg(feature = "vulkan")]
 pub use pipelines::{Pipeline, Pipelines};
 
@@ -23,9 +25,7 @@ mod stub;
 
 #[cfg(not(feature = "vulkan"))]
 pub mod ctx {
-    pub use super::stub::{
-        Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations,
-    };
+    pub use super::stub::{Context, Enabled, Frame, Kept, Pending, Stamps, present, reservations};
 }
 #[cfg(not(feature = "vulkan"))]
 pub mod alloc {

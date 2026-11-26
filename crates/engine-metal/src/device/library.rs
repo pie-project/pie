@@ -126,10 +126,18 @@ impl Pipelines {
         let open = |url: Option<&objc2_foundation::NSURL>| {
             let descriptor = MTLBinaryArchiveDescriptor::new();
             descriptor.setUrl(url);
-            device.newBinaryArchiveWithDescriptor_error(&descriptor).ok()
+            device
+                .newBinaryArchiveWithDescriptor_error(&descriptor)
+                .ok()
         };
-        let url = objc2_foundation::NSURL::fileURLWithPath(&super::ctx::nsstring(&path.to_string_lossy()));
-        let archive = if path.exists() { open(Some(&url)).or_else(|| open(None)) } else { open(None) };
+        let url = objc2_foundation::NSURL::fileURLWithPath(&super::ctx::nsstring(
+            &path.to_string_lossy(),
+        ));
+        let archive = if path.exists() {
+            open(Some(&url)).or_else(|| open(None))
+        } else {
+            open(None)
+        };
         *self.archive.borrow_mut() = archive;
     }
 
@@ -137,8 +145,12 @@ impl Pipelines {
     /// compile.
     #[cfg(target_vendor = "apple")]
     pub fn save_archive(&self, path: &std::path::Path) -> bool {
-        let Some(archive) = self.archive.borrow().clone() else { return false };
-        let url = objc2_foundation::NSURL::fileURLWithPath(&super::ctx::nsstring(&path.to_string_lossy()));
+        let Some(archive) = self.archive.borrow().clone() else {
+            return false;
+        };
+        let url = objc2_foundation::NSURL::fileURLWithPath(&super::ctx::nsstring(
+            &path.to_string_lossy(),
+        ));
         archive.serializeToURL_error(&url).is_ok()
     }
 
@@ -251,7 +263,8 @@ impl Pipelines {
         descriptor.setComputeFunction(Some(&function));
         let archive = self.archive.borrow().clone();
         if let Some(archive) = archive.as_ref() {
-            descriptor.setBinaryArchives(Some(&objc2_foundation::NSArray::from_slice(&[&**archive])));
+            descriptor
+                .setBinaryArchives(Some(&objc2_foundation::NSArray::from_slice(&[&**archive])));
         }
         descriptor.setSupportIndirectCommandBuffers(true);
         descriptor.setLabel(Some(&super::ctx::nsstring(fire.entrypoint)));

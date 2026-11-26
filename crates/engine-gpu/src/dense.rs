@@ -206,7 +206,14 @@ impl Dense {
     pub fn canonical(&self) -> String {
         let rows = |by: &[(u32, Tactic)]| {
             by.iter()
-                .map(|&(r, t)| format!("{r}:{}.{}.{}", t.vector, u8::from(t.wide), tier_code(t.tier)))
+                .map(|&(r, t)| {
+                    format!(
+                        "{r}:{}.{}.{}",
+                        t.vector,
+                        u8::from(t.wide),
+                        tier_code(t.tier)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",")
         };
@@ -241,7 +248,11 @@ pub fn settle_of(planes: &[(u32, u32, u32, f64)], lanes: u32, top: u32, target: 
         Target::Wgsl => "wgsl",
     };
     profile::rates::fingerprint(
-        format!("planes {}|lanes {lanes}|top {top}|{target}", planes.join(" ")).as_bytes(),
+        format!(
+            "planes {}|lanes {lanes}|top {top}|{target}",
+            planes.join(" ")
+        )
+        .as_bytes(),
     )
 }
 
@@ -252,7 +263,9 @@ pub fn settle_of(planes: &[(u32, u32, u32, f64)], lanes: u32, top: u32, target: 
 /// change of either settles the model again.
 #[must_use]
 pub fn settle_code(kernels: u32, dense: &Dense) -> u32 {
-    profile::rates::fingerprint(format!("kernels {kernels:#010x}|picks {}", dense.canonical()).as_bytes())
+    profile::rates::fingerprint(
+        format!("kernels {kernels:#010x}|picks {}", dense.canonical()).as_bytes(),
+    )
 }
 
 /// Which of a settle's candidates' timings (`samples`, each candidate's
@@ -522,7 +535,9 @@ pub fn choose(
     full: Option<u32>,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
     let launch_ns = Constants::of(rates)?.launch_ns;
-    weigh(target, rungs, &tiled, rates, launch_ns, planes, records, full)
+    weigh(
+        target, rungs, &tiled, rates, launch_ns, planes, records, full,
+    )
 }
 
 /// [`choose`] where no roofline is stated, under a load that skips
@@ -541,7 +556,9 @@ pub fn choose_unrated(
     full: Option<u32>,
 ) -> Result<(Dense, Vec<Weighed>), &'static str> {
     let launch_ns = rates.launch_ns.map_or(0.0, |ns| ns as f64);
-    weigh(target, rungs, &tiled, rates, launch_ns, planes, records, full)
+    weigh(
+        target, rungs, &tiled, rates, launch_ns, planes, records, full,
+    )
 }
 
 /// [`choose`] at `launch_ns` a plane.
@@ -889,7 +906,12 @@ pub struct Shaped {
 impl Shaped {
     /// `tactic`'s work at `rows` over `planes` on `target`.
     #[must_use]
-    pub fn of(target: Target, tactic: Tactic, planes: &[(u32, u32, u32, f64)], rows: u32) -> Shaped {
+    pub fn of(
+        target: Target,
+        tactic: Tactic,
+        planes: &[(u32, u32, u32, f64)],
+        rows: u32,
+    ) -> Shaped {
         let mut work = Shaped {
             bytes: 0.0,
             flops: 0.0,
@@ -900,7 +922,8 @@ impl Shaped {
             let tile = kernel.row_tile().max(1);
             let computed = rows.max(1).div_ceil(tile) * tile;
             work.bytes += f64::from(count) * f64::from(reads) * bytes;
-            work.flops += f64::from(count) * 2.0 * f64::from(computed) * f64::from(n) * f64::from(k);
+            work.flops +=
+                f64::from(count) * 2.0 * f64::from(computed) * f64::from(n) * f64::from(k);
         }
         work
     }
@@ -1044,7 +1067,11 @@ pub fn by_shape(
                                  padded rows, which the device's bandwidth and flops weigh, and \
                                  no layer states them: {})",
                                 name(&path),
-                                among.iter().map(|&t| said(t)).collect::<Vec<_>>().join("; ")
+                                among
+                                    .iter()
+                                    .map(|&t| said(t))
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
                             ),
                         )
                     }
@@ -1201,8 +1228,10 @@ mod tests {
             wide: false,
         };
         let pick = |rungs: &[u32], one, wide| {
-            let by: Vec<(u32, Tactic)> =
-                rungs.iter().map(|&r| (r, of(if r == 1 { one } else { wide }))).collect();
+            let by: Vec<(u32, Tactic)> = rungs
+                .iter()
+                .map(|&r| (r, of(if r == 1 { one } else { wide })))
+                .collect();
             Dense {
                 by_rows: by.clone(),
                 planes: vec![((1024, 2048), by)],
@@ -1211,7 +1240,11 @@ mod tests {
         };
         let at_128 = pick(&[1, 8, 128], 1, 8);
         assert_eq!(pick(&[1, 8, 128, 256], 1, 8), at_128, "another rung");
-        assert_eq!(pick(&[1, 8, 128], 1, 4), at_128, "another kernel at wide rows");
+        assert_eq!(
+            pick(&[1, 8, 128], 1, 4),
+            at_128,
+            "another kernel at wide rows"
+        );
         assert_ne!(pick(&[1, 8, 128], 4, 8), at_128, "another one-row kernel");
     }
 
@@ -1298,7 +1331,6 @@ mod tests {
         .unwrap();
         assert_eq!(dense.at(1, 4096, 4096).vector, 0);
     }
-
 
     /// A curve stopped short of a rung's rows (the phone's head, its vector
     /// curve beaten at 512 rows) keeps weighing its plane: no candidate's

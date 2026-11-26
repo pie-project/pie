@@ -25,7 +25,9 @@ impl Kernel {
     /// The kernel coded `code`, where it is one of this backend's.
     #[must_use]
     pub fn of(code: u32) -> Option<Kernel> {
-        [Kernel::Skinny, Kernel::Turned].into_iter().find(|k| *k as u32 == code)
+        [Kernel::Skinny, Kernel::Turned]
+            .into_iter()
+            .find(|k| *k as u32 == code)
     }
 }
 

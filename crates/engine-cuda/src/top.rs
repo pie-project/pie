@@ -196,7 +196,9 @@ pub fn row_tile(chip: &profile::Profile) -> engine::roofline::RowTile {
 pub fn shape(
     chip: &profile::Profile,
 ) -> Result<
-    impl Fn(engine::roofline::Constants) -> std::result::Result<engine::roofline::Constants, &'static str>
+    impl Fn(
+        engine::roofline::Constants,
+    ) -> std::result::Result<engine::roofline::Constants, &'static str>
     + use<>,
 > {
     let tile = row_tile(chip);
@@ -225,8 +227,7 @@ pub fn shape(
         }
         #[cfg(feature = "rocm")]
         {
-            Ok(constants
-                .with_gemm_waves(std::sync::Arc::new(kernels_cuda::linear::gemm::waves)))
+            Ok(constants.with_gemm_waves(std::sync::Arc::new(kernels_cuda::linear::gemm::waves)))
         }
         #[cfg(not(feature = "device"))]
         {

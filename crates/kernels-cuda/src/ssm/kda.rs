@@ -419,11 +419,17 @@ pub fn kda_tail(
         OP,
         Fire::at(kernel(
             KDA,
-            &format!("::pie::ssm::kda_tail_corrected<::pie::bf16, {}>", head_dim / WARP),
+            &format!(
+                "::pie::ssm::kda_tail_corrected<::pie::bf16, {}>",
+                head_dim / WARP
+            ),
         ))
         .apply(
-            Launch::grid([lanes, heads, head_dim.div_ceil(BLOCK_ROWS)], [STEP_BLOCK, 1, 1])
-                .smem(kda_shmem(head_dim)),
+            Launch::grid(
+                [lanes, heads, head_dim.div_ceil(BLOCK_ROWS)],
+                [STEP_BLOCK, 1, 1],
+            )
+            .smem(kda_shmem(head_dim)),
         ),
         &[
             mixed.arg(),
@@ -577,8 +583,7 @@ pub fn kda_fold(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
     ctx.fire(
         OP,
-        Fire::at(fold_kernel(head_dim))
-        .apply(Launch::grid(
+        Fire::at(fold_kernel(head_dim)).apply(Launch::grid(
             [heads, 1, head_dim.div_ceil(BLOCK_ROWS)],
             [BLOCK, 1, 1],
         )),

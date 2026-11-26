@@ -137,7 +137,10 @@ fn page_bytes() -> usize {
 fn page_bytes() -> usize {
     // SAFETY: a query of a constant of the system.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(page).ok().filter(|&page| page > 0).unwrap_or(4096)
+    usize::try_from(page)
+        .ok()
+        .filter(|&page| page > 0)
+        .unwrap_or(4096)
 }
 
 /// Rounds a size is timed in: its rate is the fastest of them.
@@ -217,9 +220,9 @@ fn measure(stream: *mut c_void, largest: usize) -> Result<Rates> {
         }
         break;
     }
-    let (saturated, copy) = curve
-        .iter()
-        .fold((page, 0.0), |best, &(bytes, rate, _)| if rate > best.1 { (bytes, rate) } else { best });
+    let (saturated, copy) = curve.iter().fold((page, 0.0), |best, &(bytes, rate, _)| {
+        if rate > best.1 { (bytes, rate) } else { best }
+    });
     Ok(Rates {
         latency,
         copy,

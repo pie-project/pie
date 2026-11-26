@@ -118,10 +118,13 @@ fn served(
     if held == Held::Whole {
         // The host copy is gone: a residency that moves an atom is refused.
         let moved = residency(&facts.weights, Held::Moved);
-        let refused = engine::WeightCache::set_residency(&mut model.engine, &WeightResidency {
-            held: true,
-            ..moved
-        });
+        let refused = engine::WeightCache::set_residency(
+            &mut model.engine,
+            &WeightResidency {
+                held: true,
+                ..moved
+            },
+        );
         assert!(
             refused.is_err(),
             "{name}: a held set keeps no host copy to move an atom with"
@@ -201,4 +204,3 @@ fn a_streamed_row_table_answers_the_base_build_whatever_lies_resident() {
 fn streamed_experts_answer_the_base_build_whatever_lies_resident() {
     every_residency("qwen3-30b-a3b-mini", 256, None, WeightKind::Expert);
 }
-

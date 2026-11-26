@@ -109,7 +109,9 @@ impl ResidencyPlanner {
     /// alone, however short the pool is now.
     pub fn past_device(&self, alone: Demand) -> Option<PlannerError> {
         let total = self.device_pages_most();
-        let need = alone.kv_pages.saturating_add(self.port.rs_as_pages(alone.rs));
+        let need = alone
+            .kv_pages
+            .saturating_add(self.port.rs_as_pages(alone.rs));
         (need > total).then_some(PlannerError::PastDevice {
             need,
             total,
@@ -134,12 +136,17 @@ impl ResidencyPlanner {
         // whoever still runs, and its client retries. Admitted processes
         // wait and move instead (contention: suspend, or fail by name
         // only with every tier full).
-        let newcomer = self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| !proc.seated));
+        let newcomer =
+            self.with_inner(|inner| inner.procs.get(&pid).is_some_and(|proc| !proc.seated));
         // A need past the device alone is no admission's: it is refused
         // as never fitting ([`PlannerError::Impossible`],
         // [`PlannerError::PastPool`]) by the ask itself.
         if newcomer && demand.kv_pages > 0 && demand.kv_pages <= self.device_pages_most() {
-            let (device, host, disk) = (self.port.device_stats(), self.port.host_stats(), self.port.disk_stats());
+            let (device, host, disk) = (
+                self.port.device_stats(),
+                self.port.host_stats(),
+                self.port.disk_stats(),
+            );
             let room = u64::from(device.0) + u64::from(self.swap_stats().0);
             // Free room read first: counting the rest walks the cache.
             let need = u64::from(demand.kv_pages);
@@ -739,7 +746,12 @@ impl ResidencyPlanner {
     {
         let pieces = match self.port.rise_room(pid, rung) {
             super::pool::RiseRoom::Past { need, own, total } => {
-                return Err(PlannerError::PastRung { rung, need, own, total });
+                return Err(PlannerError::PastRung {
+                    rung,
+                    need,
+                    own,
+                    total,
+                });
             }
             super::pool::RiseRoom::Fits => return Ok(Some(take().await)),
             super::pool::RiseRoom::Short { pieces } => pieces,
@@ -753,7 +765,12 @@ impl ResidencyPlanner {
         }
         // Served: it fits, or (the pool shrank under it) never will.
         if let super::pool::RiseRoom::Past { need, own, total } = self.port.rise_room(pid, rung) {
-            return Err(PlannerError::PastRung { rung, need, own, total });
+            return Err(PlannerError::PastRung {
+                rung,
+                need,
+                own,
+                total,
+            });
         }
         let taken = take().await;
         // Off the queue: the heads behind it are planned again.

@@ -137,8 +137,12 @@ pub fn full(
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
     let span = head_dim / 2;
-    rotate(ctx, OP, q, positions, window, pos0, base, head_dim, head_dim, span)?;
-    rotate(ctx, OP, k, positions, window, pos0, base, head_dim, head_dim, span)
+    rotate(
+        ctx, OP, q, positions, window, pos0, base, head_dim, head_dim, span,
+    )?;
+    rotate(
+        ctx, OP, k, positions, window, pos0, base, head_dim, head_dim, span,
+    )
 }
 
 pub fn partial(
@@ -156,8 +160,12 @@ pub fn partial(
     const OP: &str = "elemwise.rope";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
-    rotate(ctx, OP, q, positions, window, pos0, base, head_dim, rotary_dim, span)?;
-    rotate(ctx, OP, k, positions, window, pos0, base, head_dim, rotary_dim, span)
+    rotate(
+        ctx, OP, q, positions, window, pos0, base, head_dim, rotary_dim, span,
+    )?;
+    rotate(
+        ctx, OP, k, positions, window, pos0, base, head_dim, rotary_dim, span,
+    )
 }
 
 pub fn partial_q(

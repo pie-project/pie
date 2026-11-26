@@ -295,7 +295,11 @@ impl<'a> Streams<'a> {
                 let view = self.bases[reader];
                 if self.ops[reader].tag == tags::RESHAPE
                     && self.output_source(view).is_some()
-                    && crate::codegen::alias::covers(&self.stage.normalized.value_types, value, view)
+                    && crate::codegen::alias::covers(
+                        &self.stage.normalized.value_types,
+                        value,
+                        view,
+                    )
                 {
                     pending.push(view);
                 } else {
@@ -1633,7 +1637,10 @@ pub(super) fn emit_stream(
                         post,
                         "      const float total = ptir_canonical_reduce_met({tag}u, stream_work + {slot}u, {chunks}u, stream_fold{node}, stream_fold{node} + {upper}u);"
                     );
-                    let _ = writeln!(post, "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);");
+                    let _ = writeln!(
+                        post,
+                        "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);"
+                    );
                     let _ = writeln!(post, "    }}");
                     let _ = writeln!(post, "    __syncthreads();");
                 } else {

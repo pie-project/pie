@@ -4,7 +4,6 @@
 use super::*;
 
 impl Shell {
-
     /// Lets step `landed`'s rows go, landed or not: a frame no one will ask
     /// the rows of.
     pub fn forget(&mut self, landed: &Landed) {
@@ -48,13 +47,13 @@ impl Shell {
         let mut faulted = Vec::new();
         if waited.is_ok() {
             for (instance, lanes) in &flight.attached {
-                let outcome = self
-                    .programs
-                    .settle_launched(*instance)
-                    .and_then(|fired| match fired {
-                        crate::Fired::Committed => Ok(()),
-                        other => Err(refused(&other, *instance)),
-                    });
+                let outcome =
+                    self.programs
+                        .settle_launched(*instance)
+                        .and_then(|fired| match fired {
+                            crate::Fired::Committed => Ok(()),
+                            other => Err(refused(&other, *instance)),
+                        });
                 if let Err(fault) = outcome {
                     if flight.told.is_none() {
                         // The handler told this step from the epilogue's

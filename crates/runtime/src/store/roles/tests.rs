@@ -196,9 +196,7 @@ impl ::engine::Engine for FakeEngine {
     }
 
     fn measured_at_load(&self) -> Vec<String> {
-
         Vec::new()
-
     }
 
     fn skips_measuring(&self) -> bool {
@@ -254,10 +252,7 @@ impl ::engine::Programs for FakeEngine {
         Err(::engine::Error::unsupported(self.kind(), "prepare_program"))
     }
 
-    fn finish(
-        &mut self,
-        _prepared: ::engine::Prepared,
-    ) -> ::engine::Result<::engine::ProgramId> {
+    fn finish(&mut self, _prepared: ::engine::Prepared) -> ::engine::Result<::engine::ProgramId> {
         Err(::engine::Error::unsupported(self.kind(), "finish_program"))
     }
 
@@ -346,12 +341,24 @@ impl ::engine::Programs for FakeEngine {
         Ok(0)
     }
 
-    fn register(&mut self, _registration: &::engine::ProgramRegistration) -> ::engine::Result<::engine::ProgramId> {
-        Err(::engine::Error::unsupported(self.kind(), "register_program"))
+    fn register(
+        &mut self,
+        _registration: &::engine::ProgramRegistration,
+    ) -> ::engine::Result<::engine::ProgramId> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_program",
+        ))
     }
 
-    fn adapter(&mut self, _registration: &::engine::adapter::AdapterRegistration) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "register_adapter"))
+    fn adapter(
+        &mut self,
+        _registration: &::engine::adapter::AdapterRegistration,
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "register_adapter",
+        ))
     }
 }
 
@@ -382,10 +389,7 @@ impl ::engine::Channels for FakeEngine {
         !self.no_channels
     }
 
-    fn open(
-        &mut self,
-        registration: &ChannelRegistration,
-    ) -> ::engine::Result<RegisteredChannel> {
+    fn open(&mut self, registration: &ChannelRegistration) -> ::engine::Result<RegisteredChannel> {
         if self.no_channels {
             return Err(::engine::Error::unsupported(
                 self.kind(),
@@ -410,11 +414,20 @@ impl ::engine::Channels for FakeEngine {
         Ok(())
     }
 
-    fn publish(&mut self, _instance: ::engine::InstanceId, _channel: u32, _cell: &[u8]) -> ::engine::Result<bool> {
+    fn publish(
+        &mut self,
+        _instance: ::engine::InstanceId,
+        _channel: u32,
+        _cell: &[u8],
+    ) -> ::engine::Result<bool> {
         Err(::engine::Error::unsupported(self.kind(), "publish_channel"))
     }
 
-    fn take(&mut self, _instance: ::engine::InstanceId, _channel: u32) -> ::engine::Result<Option<Vec<u8>>> {
+    fn take(
+        &mut self,
+        _instance: ::engine::InstanceId,
+        _channel: u32,
+    ) -> ::engine::Result<Option<Vec<u8>>> {
         Err(::engine::Error::unsupported(self.kind(), "take_channel"))
     }
 }
@@ -429,7 +442,10 @@ impl ::engine::Pool for FakeEngine {
     }
 
     fn release(&mut self, _segments: u32) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "release_segments"))
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "release_segments",
+        ))
     }
 
     fn evacuate(&mut self, _evacuation: &::engine::chunk::Evacuation) -> ::engine::Result<()> {
@@ -458,19 +474,28 @@ impl ::engine::Tiers for FakeEngine {
         Err(::engine::Error::unsupported(self.kind(), "copy_slots"))
     }
 
-    fn read(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)]) -> ::engine::Result<Vec<u8>> {
+    fn read(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+    ) -> ::engine::Result<Vec<u8>> {
         Err(::engine::Error::unsupported(self.kind(), "read_tier_slots"))
     }
 
-    fn write(&mut self, _slots: &[(::engine::chunk::ShapeId, Vec<u32>)], _bytes: &[u8]) -> ::engine::Result<()> {
-        Err(::engine::Error::unsupported(self.kind(), "write_tier_slots"))
+    fn write(
+        &mut self,
+        _slots: &[(::engine::chunk::ShapeId, Vec<u32>)],
+        _bytes: &[u8],
+    ) -> ::engine::Result<()> {
+        Err(::engine::Error::unsupported(
+            self.kind(),
+            "write_tier_slots",
+        ))
     }
 
     fn copy_kv(&mut self, _copy: &::engine::KvCopy) -> ::engine::Result<()> {
         Err(::engine::Error::unsupported(self.kind(), "copy_kv"))
     }
 }
-
 
 pub(crate) fn holder(n: u128) -> super::Holder {
     uuid::Uuid::from_u128(n)
@@ -492,7 +517,16 @@ pub(crate) fn registered(
         engine,
         &plan,
         Some(holder(by)),
-        |engine, plan| Ok(crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?.open(plan)?),
+        |engine, plan| {
+            Ok(
+                crate::engine::verbs::serve(
+                    engine,
+                    ::engine::Engine::channels,
+                    "register_channel",
+                )?
+                .open(plan)?,
+            )
+        },
     )
     .unwrap();
     plan.id
@@ -670,7 +704,10 @@ fn a_cell_past_a_chunk_is_refused_by_name() {
         ..ChannelRegistration::default()
     };
     let error = register_channel(Some(&roles), &mut engine, &plan, None, |engine, plan| {
-        Ok(crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?.open(plan)?)
+        Ok(
+            crate::engine::verbs::serve(engine, ::engine::Engine::channels, "register_channel")?
+                .open(plan)?,
+        )
     })
     .unwrap_err();
     assert_eq!(

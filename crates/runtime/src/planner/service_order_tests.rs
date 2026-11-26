@@ -76,11 +76,7 @@ fn a_restore_short_of_room_for_its_roles_waits_then_evicts_once_stalled() {
         (2, Residency::Resident, true),
     ]);
     park_restore(&mut inner, pids[0], 4);
-    assert_eq!(
-        inner.restore_gate(pids[0]),
-        RestoreGate::Serve,
-        "control"
-    );
+    assert_eq!(inner.restore_gate(pids[0]), RestoreGate::Serve, "control");
     inner.procs.get_mut(&pids[0]).unwrap().roles_short = Some(super::proc::PendingBind {
         singles: 0,
         run: 3,

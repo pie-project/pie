@@ -1216,7 +1216,11 @@ impl Plane {
                 .session
                 .kept_cell(binding.channel)
         {
-            return Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Cell(cell))));
+            return Ok(Some((
+                state,
+                beam.layout(),
+                engine_gpu::beam::Parents::Cell(cell),
+            )));
         }
         #[cfg(feature = "wgpu")]
         if ring.is_empty() {
@@ -1231,7 +1235,11 @@ impl Plane {
             &seat.landing,
             &seat.poisoned,
         )?;
-        Ok(Some((state, beam.layout(), engine_gpu::beam::Parents::Host(parents))))
+        Ok(Some((
+            state,
+            beam.layout(),
+            engine_gpu::beam::Parents::Host(parents),
+        )))
     }
 
     #[cfg(feature = "wgpu")]
@@ -1407,8 +1415,8 @@ impl Plane {
                 }
             }
             let inputs = PassInputs::none();
-            let mut runner =
-                crate::guest::run::OnDevice::new(device, session, &widen, seats).deferred(
+            let mut runner = crate::guest::run::OnDevice::new(device, session, &widen, seats)
+                .deferred(
                     frame,
                     engine_gpu::program::read_at_fire(seat.geometry, seat.device),
                 );
@@ -1541,7 +1549,10 @@ impl Plane {
     /// ([`engine_gpu::program::Programs::resolve_rebind`]): each resolved
     /// against `pools`' moved table, then every moved run claimed as one.
     /// Refused with nothing changed.
-    pub fn resolve_rebind(&mut self, pools: &Pools<crate::device::Api>) -> Result<Rebound, Refusal> {
+    pub fn resolve_rebind(
+        &mut self,
+        pools: &Pools<crate::device::Api>,
+    ) -> Result<Rebound, Refusal> {
         #[cfg(feature = "wgpu")]
         {
             let mut sessions = Vec::with_capacity(self.instances.len());
@@ -1588,7 +1599,11 @@ impl Plane {
             if let Some(library) = &self.library {
                 library.claim_moved(&moved).map_err(Refusal::fault)?;
             }
-            Ok(Rebound { sessions, cells, beams })
+            Ok(Rebound {
+                sessions,
+                cells,
+                beams,
+            })
         }
         #[cfg(not(feature = "wgpu"))]
         {

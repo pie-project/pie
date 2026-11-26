@@ -52,7 +52,11 @@ fn every_attention_reads_its_plan_at_one_reading_minimax() {
         let width = width_of(&trace, read.q).expect("a query is a rectangle");
         let reading = (read.head_dim, kv_heads, width, read.window);
         let known = plans.entry(read.plan).or_insert(reading);
-        assert_eq!(*known, reading, "plan value {} is read at one reading", read.plan.0);
+        assert_eq!(
+            *known, reading,
+            "plan value {} is read at one reading",
+            read.plan.0
+        );
     }
     assert!(!plans.is_empty(), "MiniMax M3 attends its kv rows");
 }

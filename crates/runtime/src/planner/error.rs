@@ -218,10 +218,7 @@ impl std::fmt::Display for PlannerError {
                  for less"
             ),
             PlannerError::PastDevice { need, total, runs } => {
-                write!(
-                    f,
-                    "device memory can never hold this need: {need} pages"
-                )?;
+                write!(f, "device memory can never hold this need: {need} pages")?;
                 if let Some((run, pieces)) = runs {
                     write!(f, " (its kv, and {pieces} runs of {run} adjacent chunks)")?;
                 }
@@ -250,7 +247,12 @@ impl std::fmt::Display for PlannerError {
                  policy's order, fails so the others proceed",
                 device.0, device.1, host.0, host.1, disk.0, disk.1
             ),
-            PlannerError::AdmissionRefused { need, device, host, disk } => write!(
+            PlannerError::AdmissionRefused {
+                need,
+                device,
+                host,
+                disk,
+            } => write!(
                 f,
                 "[admission_refused] refused at admission: the first ask of {need} kv pages fits nowhere \
                  (device {} of {} pages free, host {} of {}, disk {} of {}): the device \

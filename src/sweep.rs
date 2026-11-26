@@ -32,11 +32,7 @@ impl Knobs {
 
 impl std::fmt::Display for Knobs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "k={} dispatch={}",
-            self.frame_size, self.dispatch_depth
-        )
+        write!(f, "k={} dispatch={}", self.frame_size, self.dispatch_depth)
     }
 }
 

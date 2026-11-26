@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::bf16_bits;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
 use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
 use poem_ir::GluAct;
 use poem_ir::{Fused, Operation, Trace};
-use crate::common::bf16_bits;
 
 const VOCAB: u32 = 1000;
 // The packed gate-up plane decodes to 16 MiB of bf16 and the down plane to

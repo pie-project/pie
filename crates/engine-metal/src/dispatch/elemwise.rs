@@ -650,7 +650,10 @@ impl Run<'_> {
                 proj,
                 y,
             } => {
-                let planes = blocks.iter().map(|b| self.tensor(*b)).collect::<crate::run::Ran<Vec<Tensor>>>()?;
+                let planes = blocks
+                    .iter()
+                    .map(|b| self.tensor(*b))
+                    .collect::<crate::run::Ran<Vec<Tensor>>>()?;
                 let Some(first) = planes.first().copied() else {
                     return Err(kernels_metal::Error::Backend {
                         op: "elemwise.res_blend",
@@ -932,18 +935,23 @@ impl Run<'_> {
                         table,
                         counters,
                     ),
-                    None => {
-                        elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate)?, self.tensor(*x)?)
-                    }
+                    None => elemwise::gate::sigmoid_mul(
+                        self.ctx(),
+                        self.tensor(*gate)?,
+                        self.tensor(*x)?,
+                    ),
                 }
             }
 
             Elemwise::HcExpand { x, streams, y } => {
                 elemwise::hc::expand(self.ctx(), self.tensor(*x)?, *streams, self.tensor(*y)?)
             }
-            Elemwise::HcRmsnormF32 { streams, eps, y } => {
-                elemwise::hc::rmsnorm_f32(self.ctx(), self.tensor(*streams)?, *eps, self.tensor(*y)?)
-            }
+            Elemwise::HcRmsnormF32 { streams, eps, y } => elemwise::hc::rmsnorm_f32(
+                self.ctx(),
+                self.tensor(*streams)?,
+                *eps,
+                self.tensor(*y)?,
+            ),
             Elemwise::HcProject {
                 normed,
                 weight,

@@ -130,15 +130,19 @@ pub fn page_ceiling(trace: &Trace, page_size: u32, context: u32, bytes: u64) -> 
 /// modules took theirs): the activations and a second sequence have the
 /// other half. The most a declared context is served at: the fit shortens it
 /// to what it seats (`Pools::declare_context`). Never under one page.
-pub fn declared_context_within(trace: &Trace, page_size: u32, declared: u32, live: u64) -> Result<u32> {
+pub fn declared_context_within(
+    trace: &Trace,
+    page_size: u32,
+    declared: u32,
+    live: u64,
+) -> Result<u32> {
     let page_size = page_size.max(1);
     let window = window_of(trace)?;
     // A sequence as it is held between fires: a windowed row its window
     // alone; a fire's rows past it are the activations' half, weighed per
     // rung once the rung is ruled (`window_fire_bytes`).
     let one = |pages: u32| -> Result<u64> {
-        let paging =
-            Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
+        let paging = Paging::of(page_size, pages.saturating_mul(page_size), 1, 1)?.held(window);
         one_slot_bytes(trace, paging)
     };
     let room = live / 2;
@@ -761,7 +765,13 @@ impl Pools {
         // card's refusal by name, not a residency fault: the load asked the
         // model's context, and the card holds no sequence of it.
         let declared = self.declared;
-        let short = |why: String| if declared { Fault::Card(why) } else { Fault::Residency(why) };
+        let short = |why: String| {
+            if declared {
+                Fault::Card(why)
+            } else {
+                Fault::Residency(why)
+            }
+        };
         let WorkingSet {
             least,
             need,

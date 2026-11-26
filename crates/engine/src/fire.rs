@@ -965,10 +965,9 @@ impl ScratchBytes {
         let up = |bytes: u64| bytes.max(4).div_ceil(pad).saturating_mul(pad);
         let rows = u64::from(rows.max(1));
         let lanes = u64::from(lanes.max(1));
-        let slots = self
-            .slot_bytes
-            .iter()
-            .fold(0u64, |sum, &slot| sum.saturating_add(up(rows.saturating_mul(slot))));
+        let slots = self.slot_bytes.iter().fold(0u64, |sum, &slot| {
+            sum.saturating_add(up(rows.saturating_mul(slot)))
+        });
         slots
             .saturating_add(up(lanes.saturating_mul(self.lane_bytes)))
             .max(pad)
@@ -1000,19 +999,19 @@ impl ReplayRows {
     /// decode lane's included), its rs scratch `compact` or not (the fire's,
     /// [`scratch_compact`]).
     #[must_use]
-    pub fn of_lanes(lanes: impl IntoIterator<Item = (u32, u32)> + Clone, compact: bool) -> ReplayRows {
+    pub fn of_lanes(
+        lanes: impl IntoIterator<Item = (u32, u32)> + Clone,
+        compact: bool,
+    ) -> ReplayRows {
         let own = lanes
             .clone()
             .into_iter()
             .fold(0u32, |sum, (own, _)| sum.saturating_add(own));
         ReplayRows {
             own,
-            carried: lanes
-                .clone()
-                .into_iter()
-                .fold(0u32, |sum, (own, carried)| {
-                    sum.saturating_add(lane_carried(own, carried))
-                }),
+            carried: lanes.clone().into_iter().fold(0u32, |sum, (own, carried)| {
+                sum.saturating_add(lane_carried(own, carried))
+            }),
             scratch: rs_scratch_rows(own, lanes.clone(), compact),
             lanes: u32::try_from(lanes.into_iter().count()).unwrap_or(u32::MAX),
         }
@@ -1039,7 +1038,11 @@ impl ReplayRows {
 /// ([`scratch_compact`]) only those a rung counts ([`lane_carried`]: a
 /// decode lane's none), else every one, a decode lane's included.
 #[must_use]
-pub fn rs_scratch_rows(own: u32, lanes: impl IntoIterator<Item = (u32, u32)>, compact: bool) -> u32 {
+pub fn rs_scratch_rows(
+    own: u32,
+    lanes: impl IntoIterator<Item = (u32, u32)>,
+    compact: bool,
+) -> u32 {
     lanes.into_iter().fold(own, |sum, (lane_own, carried)| {
         sum.saturating_add(if compact {
             lane_carried(lane_own, carried)
@@ -1075,7 +1078,11 @@ impl std::fmt::Display for ReplayPast {
                 "bytes of rs scratch (its own rows and its lanes' carried rows, over its lanes)"
             }
         };
-        write!(f, "{} {what}, past the {} the rung's replay scratch holds", self.rows, self.max)
+        write!(
+            f,
+            "{} {what}, past the {} the rung's replay scratch holds",
+            self.rows, self.max
+        )
     }
 }
 
@@ -1244,7 +1251,6 @@ pub fn scratch_compact(
 ) -> bool {
     layout_compact && (!per_fire || (every_lane_one_run && !any_lane_snapshots))
 }
-
 
 /// The carried rows a lane of `own` rows counts toward a rung's
 /// `carried_max` ([`RungReplay`]): a

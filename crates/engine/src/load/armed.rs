@@ -121,5 +121,4 @@ mod tests {
         );
         assert_eq!(scored_classes(&landing), ClassSet::of([1usize]));
     }
-
 }

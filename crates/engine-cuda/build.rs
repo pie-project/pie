@@ -59,7 +59,8 @@ fn item_end(src: &[u8], mut at: usize) -> usize {
                 if src.get(k) == Some(&b'"') {
                     k += 1;
                     'raw: while k < src.len() {
-                        if src[k] == b'"' && (0..hashes).all(|h| src.get(k + 1 + h) == Some(&b'#')) {
+                        if src[k] == b'"' && (0..hashes).all(|h| src.get(k + 1 + h) == Some(&b'#'))
+                        {
                             k += 1 + hashes;
                             break 'raw;
                         }
@@ -83,7 +84,10 @@ fn item_end(src: &[u8], mut at: usize) -> usize {
             b'\'' => {
                 // A char literal ('x', '\n', '\u{..}'), not a lifetime.
                 let close = if src.get(at + 1) == Some(&b'\\') {
-                    src[at + 2..].iter().position(|&b| b == b'\'').map(|p| at + 2 + p)
+                    src[at + 2..]
+                        .iter()
+                        .position(|&b| b == b'\'')
+                        .map(|p| at + 2 + p)
                 } else if src.get(at + 2) == Some(&b'\'') {
                     Some(at + 2)
                 } else {
@@ -157,11 +161,13 @@ fn strip_tests(src: &str) -> String {
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"));
-    let kernels = manifest.join("..").join(if std::env::var_os("CARGO_FEATURE_ROCM").is_some() {
-        "kernels-rocm"
-    } else {
-        "kernels-cuda"
-    });
+    let kernels = manifest
+        .join("..")
+        .join(if std::env::var_os("CARGO_FEATURE_ROCM").is_some() {
+            "kernels-rocm"
+        } else {
+            "kernels-cuda"
+        });
     let roots = [
         manifest.join("src"),
         kernels.join("src"),
@@ -234,9 +240,14 @@ fn main() {
         })
         .unwrap_or_default();
     records.sort();
-    let mut table = String::from("/// The committed bodies records, by key.\npub(crate) const COMMITTED: &[(&str, &str)] = &[\n");
+    let mut table = String::from(
+        "/// The committed bodies records, by key.\npub(crate) const COMMITTED: &[(&str, &str)] = &[\n",
+    );
     for (name, path) in &records {
-        table.push_str(&format!("    ({name:?}, include_str!({:?})),\n", path.display().to_string()));
+        table.push_str(&format!(
+            "    ({name:?}, include_str!({:?})),\n",
+            path.display().to_string()
+        ));
     }
     table.push_str("];\n");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets it"));

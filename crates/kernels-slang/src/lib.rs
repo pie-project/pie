@@ -20,9 +20,7 @@ pub mod sources;
 pub mod ssm;
 pub mod tensor;
 
-pub use encode::{
-    ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Naming, Target, Tier,
-};
+pub use encode::{ABSENT, Arg, ArgValue, Ctx, Encode, Fire, Geometry, Grid, Naming, Target, Tier};
 pub use error::Error;
 pub use sources::{CENSUS, SPIRV, WGSL, key, spirv, wgsl};
 pub use tensor::{Bank, Comm, KvPool, RaggedTensor, Ring, SEGMENTS, Segments, Tensor, words_of};

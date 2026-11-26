@@ -94,7 +94,12 @@ pub fn scope_domain(
         (ShareScope::Tenant, _) => vec![b"scope:tenant", tenant],
         (ShareScope::Group(group), Some(grant)) => {
             grant_bytes = grant.0.to_le_bytes();
-            vec![b"scope:group-granted", b"group", group.as_bytes(), &grant_bytes]
+            vec![
+                b"scope:group-granted",
+                b"group",
+                group.as_bytes(),
+                &grant_bytes,
+            ]
         }
         (ShareScope::Group(group), None) => {
             vec![b"scope:group-local", tenant, b"group", group.as_bytes()]
@@ -169,7 +174,8 @@ mod tests {
     fn every_scope_and_part_moves_the_domain() {
         let model = [7; 32];
         let a = asker("a", "s");
-        let d = |scope: &ShareScope, asker: &Asker, grant| scope_domain(&model, scope, asker, grant);
+        let d =
+            |scope: &ShareScope, asker: &Asker, grant| scope_domain(&model, scope, asker, grant);
         let group = ShareScope::Group("g".into());
         let all = [
             d(&ShareScope::Tenant, &a, None),

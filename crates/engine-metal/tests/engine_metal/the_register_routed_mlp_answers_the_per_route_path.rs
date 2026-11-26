@@ -6,12 +6,12 @@
 //! where it rides along, the tiles' combine against the fold's gated add of
 //! the shared expert, and both against f64.
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::linear::{mlp, moe, qmm};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
-use crate::common::{bf16, noise};
 
 const EXPERTS: u32 = 24;
 const TOP_K: u32 = 8;

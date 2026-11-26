@@ -436,7 +436,8 @@ pub struct Tuning {
 }
 
 /// `kernel.dense`'s picks a tuning has read, by `(rows, n, k)`.
-type DensePicks = std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(u32, u32, u32), Dense>>>;
+type DensePicks =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(u32, u32, u32), Dense>>>;
 
 impl Tuning {
     /// `wide_range`: the model's activations leave the fp16 range (diffusion

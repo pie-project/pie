@@ -409,7 +409,11 @@ fn scans_agree(kernel: &str) {
 
     let floor = 1e-5f64;
     for (name, old_slot, new_slot) in [
-        ("committed", SLOT_DIRECT_COMMITTED, SLOT_DISPATCHED_COMMITTED),
+        (
+            "committed",
+            SLOT_DIRECT_COMMITTED,
+            SLOT_DISPATCHED_COMMITTED,
+        ),
         ("step", SLOT_DIRECT_STEPS, SLOT_DISPATCHED_STEPS),
     ] {
         let (bank_rms, _) = compare(&bank(old_slot), &bank(new_slot));
