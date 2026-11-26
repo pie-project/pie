@@ -9,7 +9,7 @@
 use crate::common::attn_ref::{col, pool, ten};
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::{Bf16, I32, I64, U8, U32};
-use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
+use kernels_cuda::attn::plan::{self, Device, Live, Shape, Workspace};
 use kernels_cuda::attn;
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
@@ -111,7 +111,6 @@ fn fire(heads: [usize; 3], reqs: &[(usize, usize, usize)], plane: Plane) -> Vec<
     };
     let ctx = gpu.ctx().with_tuning(Tuning::DEFAULT);
     let device = Device::probe(&ctx).expect("the device answers");
-    let toggles = Toggles::of(Tuning::DEFAULT);
     let ([qh, kvh, d], page_size) = ([qh, kvh, d].map(|x| x as u32), PAGE as u32);
     #[rustfmt::skip]
     let shape = Shape { num_requests: n as u32, lane_offset: 0, num_q_heads: qh, num_kv_heads: kvh, head_dim: d, page_size, hnd_layout: false };
@@ -141,7 +140,6 @@ fn fire(heads: [usize; 3], reqs: &[(usize, usize, usize)], plane: Plane) -> Vec<
         false,
         Some(mask_ip),
         &device,
-        toggles,
         ws,
     )
     .expect("the prefill plans");

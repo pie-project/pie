@@ -1000,7 +1000,6 @@ mod on_device {
             false,
             None,
             &device.device(),
-            device.toggles(),
             workspace,
         )
         .map_err(say("the attention's plan"))?;

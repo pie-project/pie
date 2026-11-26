@@ -438,7 +438,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                     boot.page_size,
                     &facts,
                     &device.device(),
-                    device.toggles(),
                     &crate::exports::schedule_streams(&boot.trace, &compiled),
                 )
                 .map_err(|e| e.to_string())?,
@@ -1319,7 +1318,6 @@ impl Shell {
             poem_exec::fire::max_runs(&compiled),
             poem_exec::fire::fragmentable(&compiled),
             device.device(),
-            device.toggles(),
             boot.runahead,
             patch_seat,
             mrope_seat,

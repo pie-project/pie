@@ -201,7 +201,7 @@ fn check_live(
         } else {
             let (q, k, l) = (&qo, &kv_indptr, &kv_len);
             let p = plan::plan_prefill(
-                q, k, l, total, shape, live, window, true, graph, None, &device, toggles, ws,
+                q, k, l, total, shape, live, window, true, graph, None, &device, ws,
             );
             let plan = p.expect("the prefill plans");
             plan.stage(&ctx).expect("the plan uploads");

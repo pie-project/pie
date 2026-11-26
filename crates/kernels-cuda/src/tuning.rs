@@ -679,12 +679,6 @@ pub struct QmmSplitThinMax(pub u32);
 #[decision(id = "kernel.qmm.split_wide_max", constant(set(8, 16, 32)), default = 16, tune = search)]
 pub struct QmmSplitWideMax(pub u32);
 
-/// Prefill attention CTAs per SM: the grid a split prefill fills, and the
-/// floor a recorded prefill pads its tiles to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
-pub struct PrefillCtasPerSm(pub u32);
-
 /// The cuBLASLt workspace, in MiB: more unlocks split-K and stream-K
 /// algorithms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -938,7 +932,6 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitWarpsPerSm>()
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
-        .add::<PrefillCtasPerSm>()
         .add::<GemmWorkspaceMb>()
         .add::<GemmHeuristics>()
         .add::<GemmSkinnyRows>()
@@ -1244,7 +1237,6 @@ tuning! {
     qmm_split_warps_per_sm: u32 = 58, get QmmSplitWarpsPerSm;
     qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
     qmm_split_wide_max: u32 = 16, get QmmSplitWideMax;
-    prefill_ctas_per_sm: u32 = 2, get PrefillCtasPerSm;
     gemm_workspace_mb: u32 = 8, get GemmWorkspaceMb;
     gemm_heuristics: u32 = 8, get GemmHeuristics;
     gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;

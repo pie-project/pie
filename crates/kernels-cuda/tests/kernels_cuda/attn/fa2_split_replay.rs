@@ -10,7 +10,7 @@ use crate::common::host::upload_to;
 use crate::common::{Gpu, Lcg, captured, forget, replay};
 use dtype::Dtype::{Bf16, I32, I64, U8};
 use kernels_cuda::attn;
-use kernels_cuda::attn::plan::{self, Device, Live, PrefillPlan, Shape, Toggles, Workspace};
+use kernels_cuda::attn::plan::{self, Device, Live, PrefillPlan, Shape, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
 
@@ -83,7 +83,6 @@ fn plan_of(
         graph,
         Some(mask_indptr),
         device,
-        Toggles::of(Tuning::DEFAULT),
         ws,
     )
     .unwrap_or_else(|e| panic!("{fire:?} plans (graph {graph}): {e}"))

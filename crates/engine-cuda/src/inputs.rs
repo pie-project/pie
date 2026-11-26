@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 use kernels_cuda::Tensor;
-use kernels_cuda::attn::plan::{Device, Toggles, Workspace, prefill_graph_float_bytes};
+use kernels_cuda::attn::plan::{Device, Workspace, prefill_graph_float_bytes};
 use poem_compiler::Budget;
 use poem_ir::{Dtype, StructKind};
 
@@ -20,17 +20,13 @@ const GRANT_FLOAT_BYTES: u64 = 64 << 20;
 /// over `shapes`, each a body's (rows, lanes) carve: each shape's ask is
 /// the plan's own layout of it ([`prefill_graph_float_bytes`]). The ask is
 /// no function of one corner: the CTA tile narrows as the lanes thin each
-/// lane's rows, and a split shows only below half the grid in tiles, so the
-/// widest rung over the most lanes can ask less than a middle rung over
-/// fewer (on an L40S a 512-row rung of Qwen3-0.6B splits over 256 lanes on
-/// 128-row tiles, 132 MiB of partials, half that over 128 lanes, and over
-/// 512 lanes its 16-row tiles run unsplit and ask nothing).
+/// lane's rows, and the partials are the most work items the carve's grid
+/// lets a replay split into, so a middle rung can ask more than the widest.
 fn prefill_float_bytes(
     facts: &SpaceFacts,
     page_size: u32,
     shapes: impl Iterator<Item = (u32, u32)>,
     device: &Device,
-    toggles: Toggles,
 ) -> Result<u64> {
     let mut most = 0usize;
     for (rows, lanes) in shapes {
@@ -43,7 +39,6 @@ fn prefill_float_bytes(
             page_size,
             facts.window,
             device,
-            toggles,
         )
         .map_err(|refused| crate::error::Fault::Unbound {
             what: format!(
@@ -100,7 +95,6 @@ fn plan_floats(
     page_size: u32,
     facts: &Facts,
     device: &Device,
-    toggles: Toggles,
 ) -> Result<Vec<Option<u64>>> {
     let lanes = fire_lanes.max(1);
     let buckets: Vec<u32> = if budget.buckets.is_empty() {
@@ -122,7 +116,6 @@ fn plan_floats(
                 page_size,
                 (1..=lanes).map(|lanes| (lanes, lanes)),
                 device,
-                toggles,
             )?
         } else {
             prefill_float_bytes(
@@ -132,7 +125,6 @@ fn plan_floats(
                     .iter()
                     .flat_map(|&rows| (1..=lanes).map(move |lanes| (rows, lanes))),
                 device,
-                toggles,
             )?
         };
         swept.push(((reading, rows_a_lane), bytes));
@@ -167,10 +159,9 @@ pub fn attention_workspace_bytes(
     page_size: u32,
     facts: &Facts,
     device: &Device,
-    toggles: Toggles,
     schedule_streams: &[Option<u32>],
 ) -> Result<u64> {
-    let floats_of = plan_floats(budget, fire_lanes, page_size, facts, device, toggles)?;
+    let floats_of = plan_floats(budget, fire_lanes, page_size, facts, device)?;
     let mut per_stream: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let mut own = 0u64;
     for (plan, floats) in floats_of.iter().enumerate() {
@@ -1022,7 +1013,6 @@ impl Inputs {
         runs: u32,
         gathered: usize,
         device: Device,
-        toggles: Toggles,
         runahead: engine::runahead::Runahead,
         patch: Option<PatchSeat>,
         mrope: bool,
@@ -1218,7 +1208,6 @@ impl Inputs {
             paging.page_size,
             facts,
             &device,
-            toggles,
         )?;
         let mut per_stream: std::collections::BTreeMap<u32, u64> =
             std::collections::BTreeMap::new();

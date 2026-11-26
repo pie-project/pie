@@ -272,7 +272,6 @@ pub(super) fn refit(
                 boot.page_size,
                 &facts,
                 &device.device(),
-                device.toggles(),
                 &schedule_streams(&boot.trace, &compiled),
             )?)
             .saturating_add(tiles)

@@ -7,7 +7,6 @@ device = "NVIDIA H100 PCIe"
 [kernel]
 gemm.heuristics = 4  # 1.7% faster end to end
 gemm.workspace_mb = 64  # 1.4% faster end to end
-sdpa.prefill.ctas_per_sm = 3  # 1.2% faster end to end
 # as on the H100 SXM: DSA index scores on tensor cores, the radix top-k, FP8 dense shadows
 sdpa.index_mma = true
 sdpa.index_radix = true
@@ -63,7 +62,6 @@ measured = [
   "kernel.sdpa.decode.grouped_prefill_window",
   "kernel.sdpa.fa2_live",
   "kernel.sdpa.merge_warp",
-  "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.prefill.wide_sliding",
   "engine.copies",
   "engine.host_planes",

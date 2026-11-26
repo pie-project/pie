@@ -152,7 +152,6 @@ fn both(
                     false,
                     masked,
                     &device,
-                    toggles,
                     ws,
                 )
                 .expect("the prefill plans");

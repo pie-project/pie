@@ -190,7 +190,6 @@ impl Run<'_> {
                                 fire.capture,
                                 spans,
                                 &fire.device,
-                                fire.toggles,
                                 seat.workspace,
                             )?;
                             built.mask_origin = self.mask_origin();

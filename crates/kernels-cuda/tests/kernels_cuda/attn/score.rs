@@ -10,7 +10,7 @@ use crate::common::attn_ref::{col, pool, ten};
 use crate::common::spread::agrees;
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::{Bf16, I32};
-use kernels_cuda::attn::plan::{self, Device, Live, Shape, Toggles, Workspace};
+use kernels_cuda::attn::plan::{self, Device, Live, Shape, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 
 const PAGE: usize = 16;
@@ -121,7 +121,6 @@ fn a_score_capture_lands_each_lanes_mass_at_its_row() {
         false,
         None,
         &device,
-        Toggles::default(),
         ws,
     )
     .expect("the prefill plans");

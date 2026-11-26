@@ -18,13 +18,10 @@ pub struct Request<'a> {
     pub page_size: u32,
     pub enable_cuda_graph: bool,
     pub window_left: Option<u32>,
-    /// The blocks a multiprocessor holds of an eager plan's launch (the
-    /// profile's `kernel.sdpa.prefill.ctas_per_sm`).
-    pub ctas_per_sm: u32,
-    /// The blocks a multiprocessor holds of the kernel a captured plan's
-    /// launch runs, at `(head_dim, cta_tile_q)`, as the device states them
-    /// (`fa2::prefill_blocks_per_sm`); `None` where it states none, and
-    /// the captured plan then holds `ctas_per_sm`.
+    /// The blocks a multiprocessor holds of the prefill kernel at
+    /// `(head_dim, cta_tile_q)`, as the device states them
+    /// (`fa2::prefill_blocks_per_sm`); `None` where no kernel exists at
+    /// that tile, which the launch then refuses.
     pub blocks_per_sm: fn(u32, u32, &Device) -> Option<u32>,
 }
 
@@ -176,10 +173,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let kv_pages = spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let group = u64::from(req.num_qo_heads / req.num_kv_heads);
 
-    let max_grid_size = u64::from(req.ctas_per_sm.max(1)) * u64::from(device.num_sm);
-    let max_batch_size_if_split =
-        u32::try_from(max_grid_size / u64::from(req.num_kv_heads)).unwrap_or(u32::MAX);
-
     let packed_qo_lens: Vec<u64> = qo_lens.iter().map(|&q| u64::from(q) * group).collect();
     let min_kv_chunk_size = u64::from((128 / req.page_size).max(1));
 
@@ -194,6 +187,14 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
             .sum();
         (tile, tiles)
     };
+    // The blocks the device holds at once of the kernel this plan launches.
+    let concurrent = u64::from(
+        (req.blocks_per_sm)(req.head_dim, cta_tile_q, device)
+            .unwrap_or(1)
+            .max(1),
+    ) * u64::from(device.num_sm.max(1));
+    let max_batch_size_if_split =
+        u32::try_from(concurrent / u64::from(req.num_kv_heads)).unwrap_or(u32::MAX);
 
     let effective_kv_lens: Vec<u64> = kv_pages
         .iter()
@@ -216,10 +217,6 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     // fire's own data, restaged as the plan's tables are; a fire of one
     // chunk lands its rows whole.
     let graph_capacity = req.enable_cuda_graph.then(|| {
-        let per_sm = (req.blocks_per_sm)(req.head_dim, cta_tile_q, device)
-            .unwrap_or(req.ctas_per_sm)
-            .max(1);
-        let concurrent = u64::from(per_sm) * u64::from(device.num_sm.max(1));
         let heads = u64::from(req.num_kv_heads.max(1));
         let grid = total_num_tiles_q.max(concurrent.div_ceil(heads));
         (concurrent, grid, split_capacity(grid, heads, concurrent))
@@ -585,7 +582,6 @@ mod tests {
                         page_size: 16,
                         enable_cuda_graph: graph,
                         window_left: None,
-                        ctas_per_sm: 2,
                         blocks_per_sm: |_, _, _| Some(2),
                     };
                     let sched = schedule("test", &req, &Device::L40S).unwrap();

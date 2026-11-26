@@ -70,7 +70,6 @@ measured = [
   "kernel.sdpa.pool_mma",
   "kernel.sdpa.index_mma",
   "kernel.sdpa.index_radix",
-  "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
   "engine.prefill_lattice_steps",

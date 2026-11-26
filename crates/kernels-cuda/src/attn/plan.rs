@@ -254,8 +254,6 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    pub prefill_ctas_per_sm: u32,
-
     pub decode_gqa: crate::attn::decode_gqa::Gate,
 }
 
@@ -263,7 +261,6 @@ impl Toggles {
     #[must_use]
     pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
     }
@@ -416,7 +413,6 @@ pub fn plan_prefill(
     enable_cuda_graph: bool,
     mask_indptr: Option<Tensor>,
     device: &Device,
-    toggles: Toggles,
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
     const OP: &str = "attn.plan_prefill";
@@ -438,7 +434,6 @@ pub fn plan_prefill(
         page_size: shape.page_size,
         enable_cuda_graph,
         window_left: window.map(|w| w - 1),
-        ctas_per_sm: toggles.prefill_ctas_per_sm,
         blocks_per_sm: crate::attn::fa2::prefill_blocks_per_sm,
     };
 
@@ -491,7 +486,6 @@ pub fn prefill_graph_float_bytes(
     page_size: u32,
     window: Option<u32>,
     device: &Device,
-    toggles: Toggles,
 ) -> Result<usize, Error> {
     const OP: &str = "attn.plan_prefill";
     window_left(OP, window)?;
@@ -516,7 +510,6 @@ pub fn prefill_graph_float_bytes(
         page_size: page_size.max(1),
         enable_cuda_graph: true,
         window_left: window.map(|w| w - 1),
-        ctas_per_sm: toggles.prefill_ctas_per_sm,
         blocks_per_sm: crate::attn::fa2::prefill_blocks_per_sm,
     };
     Ok(prefill::plan(OP, &req, device, usize::MAX, usize::MAX)?.float_bytes)
