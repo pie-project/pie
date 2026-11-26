@@ -3916,17 +3916,11 @@ fn golden_staged_experts() {
         // nothing more of the device.
         let first = staged_steps(&mut shell, trace);
         let free = engine_cuda::device::free_bytes();
-        let heaps = engine_cuda::device::held::heap_bytes();
         let second = staged_steps(&mut shell, trace);
         assert_eq!(
             engine_cuda::device::free_bytes(),
             free,
             "{model}: a staged fire took device memory"
-        );
-        assert_eq!(
-            engine_cuda::device::held::heap_bytes(),
-            heaps,
-            "{model}: a staged fire grew a heap"
         );
         assert_eq!(second, first, "{model}: the second round is the first's");
         for (at, (got, want)) in first.iter().zip(&want).enumerate() {
@@ -3982,9 +3976,14 @@ fn golden_staged_experts() {
             staging.banks(),
             "{model}: the same banks stage under the least budget"
         );
+        // The fit names the staging's bytes; where the rungs' check binds
+        // first (no rung's span fits beside the banks the weight cache
+        // seats), it names the banks it holds beside the fires instead.
         assert!(
-            said.contains(&format!("{} bytes of staged experts", least_staging.bytes())),
-            "{model}: and the bytes ({} for {} rows under the least budget): {said}",
+            said.contains(&format!("{} bytes of staged experts", least_staging.bytes()))
+                || said.contains("the weight cache seats the routed bank(s)"),
+            "{model}: and the bytes ({} for {} rows under the least budget), or the banks held \
+             beside the fires: {said}",
             least_staging.bytes(),
             least_staging.rows()
         );

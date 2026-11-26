@@ -145,6 +145,12 @@ pub(super) fn room_line(
 /// working set is sized into them. A deployment whose banks exceed the room
 /// streams them, and its fires are sized in the room as it is.
 pub(super) fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
+    Ok(room - beside(boot, room)?.0)
+}
+
+/// What [`held_beside`] holds out of `room`, and the banks it names, as a
+/// refusal of the room left says them: nothing where the banks exceed it.
+pub(super) fn beside(boot: &Boot<'_>, room: u64) -> Result<(u64, String)> {
     let bytes = crate::weights::laid_bytes(&boot.trace)?;
     let cached: u64 = boot
         .residency
@@ -152,7 +158,25 @@ pub(super) fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
         .iter()
         .map(|&param| bytes[param].next_multiple_of(crate::weights::ALIGN))
         .sum();
-    Ok(if cached < room { room - cached } else { room })
+    if cached >= room || cached == 0 {
+        return Ok((0, String::new()));
+    }
+    let names: Vec<String> = boot
+        .residency
+        .cached_experts()
+        .iter()
+        .filter_map(|&param| boot.trace.params.get(param))
+        .map(|param| format!("`{}`", param.name))
+        .collect();
+    Ok((
+        cached,
+        format!(
+            "; the weight cache seats the routed bank(s) {} ({} MiB) beside the fires, out of \
+             that room",
+            names.join(", "),
+            cached >> 20
+        ),
+    ))
 }
 
 /// The token and lane budgets fitted to what the card has with the weights
@@ -425,35 +449,24 @@ pub(super) fn ledger(shell: &Shell, device_total: u64, free_before: u64) -> engi
             ),
         );
     }
-    ledger.enter(Class::Fire, "inputs", held.inputs);
-    ledger.enter(Class::Fire, "readout rows", held.readout);
-    ledger.enter(Class::Fire, "staged experts", held.experts);
-    // The heaps' chunks are this process's whatever load made them, and a
-    // load carves its own cells from them (the readout rows among them),
-    // so they are entered whole, less the cells entered by their owners,
-    // and the device held before the load is entered without them.
-    let heaps = crate::device::held::heap_bytes() as u64;
-    let heaps_before = heaps.saturating_sub(crate::device::held::heap_bytes_since() as u64);
-    ledger.enter(
-        Class::Outside,
-        "heap chunks",
-        heaps.saturating_sub(if shell.readout_rows.carved() {
-            held.readout
-        } else {
-            0
-        }),
-    );
-    ledger.enter(
-        Class::Outside,
-        "idle shelf",
-        crate::device::held::kept_bytes() as u64,
-    );
+    // Each run staged in the activation's span past the workspaces, under
+    // its own name: what a flat range's span spare leaves out is entered.
+    let [inputs, readouts, voxels, predicates, experts, arenas, scores, rings] =
+        shell.staged_runs();
+    for (name, bytes) in [
+        ("inputs", inputs),
+        ("readout rows", readouts),
+        ("voxels", voxels),
+        ("predicates", predicates),
+        ("staged experts", experts),
+        ("lane arenas", arenas),
+        ("capture table", scores),
+        ("ring runs", rings),
+    ] {
+        ledger.enter(Class::Fire, name, bytes);
+    }
     ledger.enter(Class::Outside, "graph bodies", held.bodies);
-    ledger.enter(
-        Class::Outside,
-        "before the load",
-        held.before.saturating_sub(heaps_before),
-    );
+    ledger.enter(Class::Outside, "before the load", held.before);
     // Where the allocator's own takes are known, the driver's and its
     // libraries' (streams' queues, code objects) are measured as what the
     // device holds past them, the bodies apart; the audit then states only

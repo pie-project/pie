@@ -340,7 +340,9 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // weight tier to come, and the driver's floor.
     let room_line = room_line(boot.allowance, ceiling, total - free, weight_tier, after_weights);
     tracing::info!("{room_line}");
-    let after_weights = held_beside(boot, after_weights)?;
+    let (banks, banks_said) = room::beside(boot, after_weights)?;
+    let after_weights = after_weights - banks;
+    let room_line = format!("{room_line}{banks_said}");
     // A declared context is the model's, not the operator's: it is served at
     // the longest one sequence of which takes half the room this line leaves
     // (this process's context and modules already out of it), and the fit
@@ -771,6 +773,8 @@ impl Shell {
             crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
         crate::device::held::heap_mark();
+        // A load lays its own buffers, whatever this thread served before.
+        crate::device::alloc::loading_from_here();
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.
