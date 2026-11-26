@@ -369,6 +369,17 @@ fn rates_metal(
     engine_metal::tune::rates(Some(req.profiles), say)
 }
 
+/// `pie tune metal --fire-terms`: each model's fire terms timed on
+/// Metal's own fires of it.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn fire_terms_metal(
+    req: &TuneRequest<'_>,
+    models: &[(std::path::PathBuf, String)],
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    engine_metal::tune::terms::measure(Some(req.profiles), models, say)
+}
+
 /// `pie tune metal --check-estimate`: Metal's loads of a model for the
 /// check of the estimate.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -840,6 +851,9 @@ pub fn backends() -> Vec<Backend> {
         bench: Some(bench_metal),
         #[cfg(not(target_vendor = "apple"))]
         bench: None,
+        #[cfg(target_vendor = "apple")]
+        fire_terms: Some(fire_terms_metal),
+        #[cfg(not(target_vendor = "apple"))]
         fire_terms: None,
     });
     out
