@@ -210,6 +210,14 @@ impl Shell {
         )
     }
 
+    /// Whether the load settled the driver's count of this worker
+    /// ([`Self::settle_outside`]), so that [`Self::held_and_outside`] states
+    /// it rather than the ledger's outside entries.
+    #[must_use]
+    pub fn outside_settled(&self) -> bool {
+        self.outside.is_some()
+    }
+
     /// Settles what this worker holds of the device beyond the ledger's
     /// own entries, before the load's last fit: once arming has fired
     /// every composition, each step kind (a decode step, then a prompt) is
