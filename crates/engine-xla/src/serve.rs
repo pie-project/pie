@@ -11,6 +11,7 @@
 //! only the sink page and the sink slot.
 
 pub(crate) mod ring;
+mod evict;
 mod size;
 mod stream;
 mod warm;
@@ -273,6 +274,7 @@ fn no_disk() -> Fault {
 /// A fire the warm ladder traced and has not compiled yet.
 /// A warm program the load compiled and parked in the disk cache (the host
 /// held no more in memory): what the first fire of its shape loads it from.
+#[derive(Clone)]
 pub(crate) struct Parked {
     code: crate::device::Code,
     sig: crate::trace::Signature,
@@ -311,7 +313,7 @@ pub(crate) struct LoadWidth {
 #[derive(Default)]
 pub(crate) struct Behind {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<u64>>,
     begun: bool,
 }
 
@@ -455,6 +457,16 @@ pub struct Shell {
     /// one (`engine::Residency::host_programs`); `None` the host's free.
     host_programs: Option<u64>,
     parked_shapes: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    /// Programs a fire loaded from the disk cache (`load_parked`): what each
+    /// parks again as, its shape key, and when a fire last took it, in fires
+    /// (`evict`).
+    evictable: std::collections::HashMap<[u8; 32], (Parked, Option<[u8; 32]>, u64)>,
+    /// Fires so far, the clock `evictable` is read by.
+    fires: u64,
+    /// The host memory a held program takes a KiB of its text, as the
+    /// loader behind serving measured one alone (0: none measured).
+    hold_per_kib: u64,
+    dropper: evict::Dropper,
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
@@ -1336,6 +1348,10 @@ impl Shell {
             parked: std::collections::HashMap::new(),
             host_programs: None,
             parked_shapes: std::collections::HashMap::new(),
+            evictable: std::collections::HashMap::new(),
+            fires: 0,
+            hold_per_kib: 0,
+            dropper: evict::Dropper::default(),
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
             laddered: false,
@@ -1965,6 +1981,9 @@ impl Shell {
         let Some(parked) = self.parked.remove(&at) else {
             return Ok(None);
         };
+        self.make_host_room(&parked, at);
+        let kept = parked.clone();
+        let resident = crate::device::resident_bytes();
         let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
             // Not loading from the disk cache though its file stood as it
             // was kept at the ladder (corrupt within its length): nothing is
@@ -1993,7 +2012,71 @@ impl Shell {
         };
         self.probed.insert(at, parked.probed);
         self.traced.insert(at, std::sync::Arc::clone(&program));
+        // unmeasured by the loader: this load's own growth
+        if self.hold_per_kib == 0
+            && let (Some(before), Some(after)) = (resident, crate::device::resident_bytes())
+            && kept.code.len() > 0
+        {
+            self.hold_per_kib = after.saturating_sub(before).saturating_mul(1024) / kept.code.len() as u64;
+        }
+        if self.device.code_on_disk(&kept.code) {
+            self.evictable.insert(at, (kept, shape_key, self.fires));
+        }
         Ok(Some(program))
+    }
+
+    /// The host memory `parked`'s program would hold, by the loader's
+    /// measured hold a KiB of text (0 where none was measured).
+    fn hold_of(&self, parked: &Parked) -> u64 {
+        self.hold_per_kib.saturating_mul(parked.code.len() as u64) / 1024
+    }
+
+    /// Parks again, least recently fired first, the programs a fire loaded
+    /// while the host's free memory does not hold `parked`'s beside what the
+    /// guest stages' compiles take (`evict`); waits on the drops it needs.
+    /// With none left to drop, the load goes ahead.
+    fn make_host_room(&mut self, parked: &Parked, at: [u8; 32]) {
+        let need = self.hold_of(parked);
+        let fits = |dropper: &evict::Dropper| {
+            crate::device::available_memory().is_none_or(|free| {
+                free.saturating_add(dropper.pending())
+                    >= need.saturating_add(crate::guest::run::guest_reserve())
+            })
+        };
+        let mut dropped = 0u32;
+        while !fits(&self.dropper) {
+            let victim = (self.evictable.iter())
+                .filter(|(key, _)| **key != at)
+                .min_by_key(|(key, (_, _, used))| (*used, **key))
+                .map(|(key, _)| *key);
+            let Some(victim) = victim else {
+                break;
+            };
+            let Some((again, shape, _)) = self.evictable.remove(&victim) else {
+                break;
+            };
+            let mut held = Vec::new();
+            held.extend(self.traced.remove(&victim));
+            if let Some(shape) = shape {
+                held.extend(self.shaped.remove(&shape));
+            }
+            held.extend(self.device.take_key(&again.code.hash()));
+            let bytes = self.hold_of(&again);
+            self.parked.insert(victim, again);
+            self.dropper.drop_later(held, bytes);
+            dropped += 1;
+        }
+        // the room the drops under way free, before the load takes it
+        while !fits(&self.dropper) && self.dropper.pending() > 0 {
+            self.dropper.wait();
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                need,
+                "xla programs parked again for a fire's load: the host's memory held no more"
+            );
+        }
     }
 
     pub fn fire_full(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
@@ -3567,6 +3650,7 @@ impl Shell {
             )
             .as_bytes()
         });
+        self.fires += 1;
         let hit = shape_key
             .and_then(|k| self.shaped.get(&k))
             .map(std::sync::Arc::clone)
@@ -3580,6 +3664,13 @@ impl Shell {
                 self.traced.get(&k).map(std::sync::Arc::clone)
             }
         };
+        // the fire's program is the most recently fired (`evict`)
+        if found.is_some() {
+            let at = shape_key.and_then(|k| self.parked_shapes.get(&k).copied()).or(key);
+            if let Some(entry) = at.and_then(|at| self.evictable.get_mut(&at)) {
+                entry.2 = self.fires;
+            }
+        }
         // a miss, which every path below that reads it is, keyed it
         let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
         if found.is_none() && self.deferred.is_some() {

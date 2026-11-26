@@ -901,6 +901,7 @@ impl Shell {
                     hold_per_kib = room.per_kib(),
                     "xla parked programs loaded before ready; {left} programs left parked, each loads on its first fire"
                 );
+                room.per_kib()
             });
         match spawned {
             Ok(handle) => self.behind.handle = Some(handle),
@@ -951,8 +952,10 @@ impl Shell {
             self.behind.begun = true;
             self.load_behind();
         }
-        if let Some(handle) = self.behind.handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.behind.handle.take()
+            && let Ok(per_kib) = handle.join()
+        {
+            self.hold_per_kib = per_kib;
         }
     }
 
@@ -1089,6 +1092,22 @@ impl Shell {
         // (`guest::run::guest_reserve`) and loads nothing beside one
         // measuring its need.
         let parked = parked.load(SeqCst);
+        // With no disk cache a program the host does not hold has nowhere to
+        // be loaded again from: its first fire would build it after ready.
+        // Refused by name instead (v6e Qwen3.5's 747 programs hold ~255 GiB
+        // of host memory; its host's cgroup caps 150).
+        if parked > 0 && !parks {
+            return Err(crate::error::Fault::Program {
+                at: "serve::warm",
+                why: format!(
+                    "{parked} of the warm ladder's {} programs do not fit the host's memory \
+                     beside those held ({} GiB) and this load keeps no program cache on disk \
+                     to load them again from: a fire of one would build it after ready",
+                    texts.len(),
+                    host_room.held() >> 30
+                ),
+            });
+        }
         if parked > 0 {
             tracing::warn!(
                 parked,

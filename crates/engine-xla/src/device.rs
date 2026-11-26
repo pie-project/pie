@@ -944,6 +944,12 @@ impl Device {
 
     /// [`Device::forget`] by the cache key of a program's text (the blake3
     /// of it): a stage the guest stage cache evicted.
+    /// Takes `key`'s program out of the cache, the caller its last holder
+    /// where nothing else holds it.
+    pub fn take_key(&self, key: &[u8; 32]) -> Option<Arc<Program>> {
+        self.cache.lock().expect("cache lock poisoned").remove(key)
+    }
+
     pub fn forget_key(&self, key: &[u8; 32]) {
         self.cache.lock().expect("cache lock poisoned").remove(key);
     }
