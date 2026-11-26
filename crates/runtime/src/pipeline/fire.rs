@@ -200,10 +200,7 @@ fn settled_off_lane(settle: impl FnOnce() + Send + 'static) {
                 .expect("the settle thread starts");
             std::sync::Mutex::new(tx)
         });
-    let on_lane = std::thread::current()
-        .name()
-        .is_some_and(|name| name.starts_with("pie-engine-"));
-    if !on_lane {
+    if !crate::scheduler::lane::on_engine_lane() {
         return settle();
     }
     if let Err(std::sync::mpsc::SendError(settle)) = SETTLER.lock().unwrap().send(Box::new(settle)) {

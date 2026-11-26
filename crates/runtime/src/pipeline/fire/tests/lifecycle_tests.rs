@@ -613,8 +613,8 @@ fn a_settle_asked_on_an_engine_lane_runs_off_it_in_order() {
     let lane = {
         let ran = Arc::clone(&ran);
         std::thread::Builder::new()
-            .name("pie-engine-77".to_string())
             .spawn(move || {
+                crate::scheduler::lane::mark_engine_lane();
                 for at in 0..8 {
                     super::settled_off_lane(note(at, &ran));
                 }

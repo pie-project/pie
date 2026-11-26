@@ -941,6 +941,22 @@ static BEHIND_SAID_EARLY: std::sync::atomic::AtomicBool =
 
 /// Every lane's control queue, to turn it once the runtime is ready
 /// ([`open_behind`]).
+std::thread_local! {
+    /// Set on an engine lane's own thread as it starts.
+    static ENGINE_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread an engine lane ([`on_engine_lane`]).
+pub(crate) fn mark_engine_lane() {
+    ENGINE_LANE.with(|lane| lane.set(true));
+}
+
+/// Whether this thread is an engine lane: what runs here holds up the
+/// engine's next launch.
+pub(crate) fn on_engine_lane() -> bool {
+    ENGINE_LANE.with(std::cell::Cell::get)
+}
+
 static LANES: std::sync::Mutex<Vec<crate::rt::channel::Sender<LaneRequest>>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -1059,6 +1075,7 @@ impl Lane {
         let thread = crate::rt::thread::Builder::new()
             .name(format!("pie-engine-{engine_idx}"))
             .spawn(move || {
+                mark_engine_lane();
                 Self::run(
                     engine_idx,
                     engine,
