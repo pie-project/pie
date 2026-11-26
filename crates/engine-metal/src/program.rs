@@ -925,7 +925,9 @@ impl Plane {
         let mut bytes = vec![0u8; cap as usize * 4];
         state.read(row, &mut bytes)?;
         Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .collect())
     }
@@ -2408,6 +2410,16 @@ fn rings_disjoint(rings: &[Vec<usize>]) -> bool {
     })
 }
 
+/// How the pool places a guest's state ([`guest::Room`]).
+fn room_of(pools: &Pools) -> Result<guest::Room> {
+    let (slot_bytes, chunk_slots) = pools.instance_slots()?;
+    Ok(guest::Room {
+        slot_bytes,
+        chunk_slots,
+        chunk_bytes: pools.chunk_bytes(),
+    })
+}
+
 #[cfg(test)]
 mod rings_tests {
     #[test]
@@ -2422,14 +2434,4 @@ mod rings_tests {
             "two members share ring 2"
         );
     }
-}
-
-/// How the pool places a guest's state ([`guest::Room`]).
-fn room_of(pools: &Pools) -> Result<guest::Room> {
-    let (slot_bytes, chunk_slots) = pools.instance_slots()?;
-    Ok(guest::Room {
-        slot_bytes,
-        chunk_slots,
-        chunk_bytes: pools.chunk_bytes(),
-    })
 }

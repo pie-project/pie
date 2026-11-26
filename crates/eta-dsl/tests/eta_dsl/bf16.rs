@@ -105,7 +105,7 @@ fn run(logits: &[f32]) -> Landed {
             broadcast(reshape(&m, []), [2]),
         );
         let t = reduce_argmax(&x);
-        tok.put(&reshape(&t, [1]));
+        tok.put(reshape(&t, [1]));
         positions.put(Tensor::constant([0u32]));
         narrow.put(&x);
         scaled.put(&y);
@@ -115,8 +115,8 @@ fn run(logits: &[f32]) -> Landed {
         top_c.put(&vals);
         top_ids.put(&ids);
         sums.put(&both);
-        wide.put(&cast(&x, dtype::f32));
-        argmax.put(&reshape(&t, [1]));
+        wide.put(cast(&x, dtype::f32));
+        argmax.put(reshape(&t, [1]));
     });
     for reader in readers {
         reader.note_host_take();

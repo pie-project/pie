@@ -1047,7 +1047,7 @@ mod tests {
                 .iter()
                 .map(|(name, json)| (name.to_string(), json.to_string()))
                 .collect(),
-            prompt: prompt.map(client_api::props::prompt_blocks).map(Into::into),
+            prompt: prompt.map(client_api::props::prompt_blocks),
             connection: None,
             tied: None,
         }

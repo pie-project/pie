@@ -191,7 +191,7 @@ fn lay(g: &Geometry, lanes: &[Lane], seed: u64) -> Laid {
 
 /// Row `p` of lane `l`'s mask column `c` (key `folded + c`).
 fn admits(l: usize, p: usize, c: usize) -> bool {
-    (c * 5 + l * 3 + p) % 4 != 0
+    !(c * 5 + l * 3 + p).is_multiple_of(4)
 }
 
 /// The keys row `p` of `lane` reads: its window, and past its folded index

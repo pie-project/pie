@@ -923,7 +923,7 @@ fn panels(plane: &[u8], rows: usize, width: usize, out: &mut [u8]) {
 /// views), word `l` holding elements `l` (low half) and `l + 128`.
 fn packed_rows(bytes: &mut [u8]) {
     let mut row = [0u8; 512];
-    for chunk in bytes.chunks_exact_mut(512) {
+    for chunk in bytes.as_chunks_mut::<512>().0 {
         row.copy_from_slice(chunk);
         for l in 0..128 {
             chunk[4 * l..4 * l + 2].copy_from_slice(&row[2 * l..2 * l + 2]);

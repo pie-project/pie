@@ -1078,7 +1078,9 @@ impl Shell {
         let mut bytes = vec![0u8; cap as usize * 4];
         crate::device::copy_d2h(at + row, &mut bytes)?;
         Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect())
     }

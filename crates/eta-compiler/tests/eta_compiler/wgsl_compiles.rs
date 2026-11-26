@@ -413,9 +413,7 @@ fn ends_without_a_return(source: &str) -> Vec<String> {
         if returns {
             let body = after[open + 1..close].trim_end();
             let last = body.strip_suffix(';').map(|inner| {
-                let start = inner
-                    .rfind(|c| matches!(c, ';' | '{' | '}'))
-                    .map_or(0, |at| at + 1);
+                let start = inner.rfind([';', '{', '}']).map_or(0, |at| at + 1);
                 inner[start..].trim()
             });
             if !last.is_some_and(|statement| statement.starts_with("return")) {

@@ -711,7 +711,7 @@ fn bf16_battery(rows: u32) -> Suite {
         top_out.put(reshape(&top, [rows * 5]));
         top_ids_out.put(reshape(&ids, [rows * 5]));
         let stats =
-            [reduce_sum(&x), reduce_max(&x), reduce_sum(&exp(&x))].map(|s| reshape(s, [rows, 1]));
+            [reduce_sum(&x), reduce_max(&x), reduce_sum(exp(&x))].map(|s| reshape(s, [rows, 1]));
         let k = broadcast(reshape(iota(3), [1, 3]), [rows, 3]);
         let pick = |i: u32| broadcast(&stats[i as usize], [rows, 3]);
         stats_out.put(reshape(

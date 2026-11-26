@@ -1702,7 +1702,7 @@ mod abandon_tests {
         super::super::global::init_planner(model, 0, planner);
         let roles = crate::store::registry::get(model, 0).roles.expect("roles");
         let mut engine = FakeEngine::default();
-        learn_program(&roles, &mut engine, PROGRAM).unwrap();
+        learn_program(&roles, &engine, PROGRAM).unwrap();
         let mut ids = Vec::new();
         for by in [1, 2] {
             let binding = ::engine::InstanceBinding {

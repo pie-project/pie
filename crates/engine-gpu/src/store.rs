@@ -155,7 +155,7 @@ impl RingRun {
             .get(usize::try_from(first / per).unwrap_or(usize::MAX))
             .ok_or_else(|| disagree(format!("lays {what} past the record's pieces")))?;
         let byte = self.run.offset + (first % per) * self.atom + from % self.atom;
-        if byte % 4 != 0 {
+        if !byte.is_multiple_of(4) {
             return Err(disagree(format!(
                 "lays {what} at byte {byte}, inside a word"
             )));
@@ -885,7 +885,7 @@ impl<B: Backend> Pools<B> {
     pub fn kv_planes(&self) -> Result<(u32, Vec<[u32; 2]>)> {
         let unit = self.unit(LIST)?;
         let word = |bytes: u64, what: &'static str| {
-            if bytes % 4 != 0 {
+            if !bytes.is_multiple_of(4) {
                 return Err(Fault::Program {
                     at: "store::kv_planes",
                     why: format!(

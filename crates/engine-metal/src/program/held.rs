@@ -323,7 +323,7 @@ impl Held {
     #[must_use]
     pub fn host_word(&self, at: u64) -> Option<HostWord> {
         let end = at.checked_add(4)?;
-        if end > self.bytes || at % 4 != 0 {
+        if end > self.bytes || !at.is_multiple_of(4) {
             return None;
         }
         let runs = self.runs();

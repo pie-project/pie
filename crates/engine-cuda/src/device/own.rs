@@ -132,7 +132,7 @@ fn held(device: i32) -> std::result::Result<u64, Unread> {
         // SAFETY: the name is NUL-terminated; the library stays loaded for
         // the process's life.
         let library = unsafe { libc::dlopen(c"libnvidia-ml.so.1".as_ptr(), libc::RTLD_NOW) };
-        (!library.is_null()).then(|| {
+        (!library.is_null()).then_some({
             move |name: &core::ffi::CStr| {
                 // SAFETY: a live handle and a NUL-terminated name.
                 let at = unsafe { libc::dlsym(library, name.as_ptr()) };

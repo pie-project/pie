@@ -629,7 +629,7 @@ fn bind_through(
     engine: &mut SetEngine,
     program: ProgramId,
 ) -> Result<InstanceId, String> {
-    let total = <SetEngine as ::engine::Programs>::standing_after(&engine, &binding(program))
+    let total = <SetEngine as ::engine::Programs>::standing_after(engine, &binding(program))
         .map_err(|error| error.to_string())?;
     let added = shared.lock().unwrap().standing_added(total);
     let open = ProgramOpen::new(shared, key(program), added)?;
@@ -681,8 +681,7 @@ async fn a_bind_s_standing_bytes_are_backed_before_its_bind_and_a_total_past_the
     // 63 chunks more: the smallest rung's one and the 65 standing are past
     // the 63 the device has.
     let why = bind_through(&shared, &mut engine, ProgramId(9))
-        .err()
-        .expect("a total past the span is refused");
+        .expect_err("a total past the span is refused");
     assert!(why.contains("standing guest bytes"), "{why}");
     assert_eq!(engine.binds, 1, "the engine's bind was not entered");
     let pool = shared.lock().unwrap();

@@ -3594,7 +3594,7 @@ fn launch_gap<B: Serve>(
     let wide_y = rig.zeros(LAUNCH * n, LAUNCH, Dtype::Bf16)?;
     let next = std::cell::Cell::new(0u32);
     let chained = |sink: &kernels_slang::Ctx<'_>| {
-        let (from, into) = if next.get() % 2 == 0 {
+        let (from, into) = if next.get().is_multiple_of(2) {
             (act, y)
         } else {
             (y, act)

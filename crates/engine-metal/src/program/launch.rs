@@ -1594,7 +1594,8 @@ impl Prepared {
         match self.reads.get(slot).copied().flatten() {
             Some(_) => true,
             None => {
-                matches!(self.reads.get(named).copied().flatten(), Some(_) if lane > 0 && lane < self.read_rows[named])
+                self.reads.get(named).copied().flatten().is_some()
+                    && (lane > 0 && lane < self.read_rows[named])
             }
         }
     }

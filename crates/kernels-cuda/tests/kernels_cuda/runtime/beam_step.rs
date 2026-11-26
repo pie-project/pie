@@ -32,7 +32,7 @@ impl Lcg {
     /// Each beam's parent: none moved, or sorted draws (forks where one
     /// repeats, retirements where one is skipped).
     fn parents(&mut self, lanes: u32) -> Vec<u32> {
-        if self.next() % 4 == 0 {
+        if self.next().is_multiple_of(4) {
             return (0..lanes).collect();
         }
         let mut parents: Vec<u32> = (0..lanes).map(|_| self.next() % lanes).collect();
@@ -63,7 +63,8 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
     let ctx = gpu.ctx();
     let f0 = folded / PAGE;
     let columns = (folded + steps - 1) / PAGE - f0 + 1;
-    let reserve = lanes * columns + lanes + lanes * FRAMES + u32::from(folded % PAGE > 0);
+    let reserve =
+        lanes * columns + lanes + lanes * FRAMES + u32::from(!folded.is_multiple_of(PAGE));
     let cap = reserve + 8;
     let words = channel::beam_state_words(lanes, cap, FRAMES) as usize;
     let mut state_at = gpu.up(&vec![0u32; words]);
@@ -94,7 +95,8 @@ fn search_rs(gpu: &mut Gpu, lanes: u32, folded: u32, steps: u32, seed: u64, rs_t
         let c = slot / PAGE - f0;
         let o = slot % PAGE;
         // The pool grows a column at a time: what this fire's column needs.
-        let pool = (lanes * (c + 2) + lanes * FRAMES + u32::from(folded % PAGE > 0)).min(reserve);
+        let pool = (lanes * (c + 2) + lanes * FRAMES + u32::from(!folded.is_multiple_of(PAGE)))
+            .min(reserve);
         let parents = rng.parents(lanes);
         let parents_at = gpu.up(&parents);
         let offset_at = gpu.up(&vec![o as i32; lanes as usize]);

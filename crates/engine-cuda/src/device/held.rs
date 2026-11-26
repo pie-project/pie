@@ -906,7 +906,8 @@ pub(crate) mod heap {
 
         #[test]
         fn a_size_is_carved_in_the_least_power_of_two_that_holds_it() {
-            for kind in [Kind::Pinned] {
+            {
+                let kind = Kind::Pinned;
                 assert_eq!(class_of(kind, 1), Some(0));
                 assert_eq!(class_of(kind, kind.smallest()), Some(0));
                 assert_eq!(class_of(kind, kind.smallest() + 1), Some(1));

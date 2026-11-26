@@ -2706,11 +2706,11 @@ async fn owe_raise(ctx: &Ctx, pid: ProcessId) -> Result<(), String> {
                 return Ok(());
             }
         }
-        if let Some((by, why)) = crate::store::shared::take_refused_owed(0) {
-            if by == pid {
-                crate::store::shared::owe_cut_rows(0, 0, None);
-                return Err(format!("raise: {why}"));
-            }
+        if let Some((by, why)) = crate::store::shared::take_refused_owed(0)
+            && by == pid
+        {
+            crate::store::shared::owe_cut_rows(0, 0, None);
+            return Err(format!("raise: {why}"));
         }
         ctx.next_step().await;
     }

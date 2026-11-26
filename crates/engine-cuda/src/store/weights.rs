@@ -38,9 +38,9 @@ impl Pools {
                 let first = planes.len();
                 // A companion plane is read through its bank's table alone.
                 let companion = |param: u32| {
-                    groups.iter().any(|(codes, members)| {
-                        *codes != param && members.iter().any(|member| *member == Some(param))
-                    })
+                    groups
+                        .iter()
+                        .any(|(codes, members)| *codes != param && members.contains(&Some(param)))
                 };
                 let mut counted = false;
                 for plane in bank {

@@ -234,7 +234,7 @@ fn run(gpu: &mut Gpu, lanes: u32, folded: u32, seed: u64) {
         );
         // The pool pages: the replay's copies applied to the host's mirror.
         for &[src, dst, tokens] in &want.copies {
-            if tokens == 0 || src == dst || want.faults.iter().any(|&f| f == fault::COPY_BOUNDS) {
+            if tokens == 0 || src == dst || want.faults.contains(&fault::COPY_BOUNDS) {
                 continue;
             }
             for plane in PLANES {

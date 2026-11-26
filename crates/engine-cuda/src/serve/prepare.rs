@@ -1912,8 +1912,8 @@ impl Shell {
         if let Err(past) = engine::fire::rung_holds(&holds, count) {
             return Err(Fault::Ceiling {
                 what: "buffered recurrent rows a fire replays ahead of its own",
-                need: u64::from(past.rows),
-                have: u64::from(past.max),
+                need: past.rows,
+                have: past.max,
             });
         }
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;

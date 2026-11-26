@@ -176,7 +176,6 @@ impl Arena {
         self.committed
     }
 
-    #[must_use]
     pub fn slots(
         &self,
         pools: &Pools,

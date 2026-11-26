@@ -579,7 +579,7 @@ mod tests {
                 let class = if next(5) == 0 {
                     0
                 } else {
-                    (1u64 << 40) | u64::from(width) * 4
+                    (1u64 << 40) | (u64::from(width) * 4)
                 };
                 lifetimes.push(Lifetime {
                     dead: false,

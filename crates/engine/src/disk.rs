@@ -91,8 +91,8 @@ impl SlotFile {
     fn span(&self, at: u64, stage: &[u8]) -> io::Result<u64> {
         let len = u64::from(self.slots) * self.stride as u64;
         let align = ALIGN as u64;
-        if at % align != 0
-            || stage.len() % ALIGN != 0
+        if !at.is_multiple_of(align)
+            || !stage.len().is_multiple_of(ALIGN)
             || stage.as_ptr().align_offset(ALIGN) != 0
             || at
                 .checked_add(stage.len() as u64)

@@ -1854,12 +1854,12 @@ mod tests {
         device.core.device.destroy();
         // The lost callback runs as the device is polled.
         let _ = device.core.device.poll(wgpu::PollType::wait_indefinitely());
-        lost_by_name(before.commit().err().expect("refused"));
-        lost_by_name(Buffer::zeroed(&device, 64, owner).err().expect("refused"));
+        lost_by_name(before.commit().expect_err("refused"));
+        lost_by_name(Buffer::zeroed(&device, 64, owner).expect_err("refused"));
         lost_by_name(device.frame().err().expect("refused"));
-        lost_by_name(buffer.write(0, &[1, 2, 3, 4]).err().expect("refused"));
+        lost_by_name(buffer.write(0, &[1, 2, 3, 4]).expect_err("refused"));
         let mut got = [0u8; 4];
-        lost_by_name(buffer.read(0, &mut got).err().expect("refused"));
+        lost_by_name(buffer.read(0, &mut got).expect_err("refused"));
     }
 
     #[test]
@@ -1963,9 +1963,7 @@ mod tests {
         let owner = engine_gpu::books::owners::TEST;
         let before = device.core.books.device();
         past(
-            Buffer::zeroed(&device, bound + 4, owner)
-                .err()
-                .expect("refused"),
+            Buffer::zeroed(&device, bound + 4, owner).expect_err("refused"),
             "bytes of one device reservation",
             bound,
         );
@@ -1978,7 +1976,7 @@ mod tests {
         let held = device.core.books.device();
         let frame = device.frame().unwrap();
         past(
-            frame.scratch_slot(pooled + 256).err().expect("refused"),
+            frame.scratch_slot(pooled + 256).expect_err("refused"),
             "bytes of one scratch reservation",
             pooled,
         );

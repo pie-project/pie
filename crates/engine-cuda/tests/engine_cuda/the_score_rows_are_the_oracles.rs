@@ -54,7 +54,7 @@ impl ForwardHybrid for Micro {
         let mut spec = StateRows::new();
         let plane = u64::from(KV_HEADS) * u64::from(HEAD_DIM);
         for layer in 0..LAYERS {
-            spec.kv(&kv(layer), Dtype::Bf16, [plane, plane], HEAD_DIM);
+            spec.kv(kv(layer), Dtype::Bf16, [plane, plane], HEAD_DIM);
         }
         spec
     }
@@ -256,7 +256,9 @@ fn floats(at: u64, count: u32) -> Vec<f32> {
         .read(0, &mut bytes)
         .expect("the rows read back");
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect()
 }

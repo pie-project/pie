@@ -825,7 +825,9 @@ mod tests {
         let rows = w2.expected();
         let words = |bytes: &[u8]| -> Vec<u32> {
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         };

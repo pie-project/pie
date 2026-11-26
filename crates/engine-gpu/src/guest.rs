@@ -302,19 +302,11 @@ pub fn step_module(call: usize) -> Option<String> {
         .map(|text| wgsl::step_module(ENTRY, text))
 }
 
+#[derive(Default)]
 pub struct Forms {
     compiled: HashMap<ProgramId, Arc<Compiled>>,
 
     refused: HashMap<ProgramId, Refused>,
-}
-
-impl Default for Forms {
-    fn default() -> Forms {
-        Forms {
-            compiled: HashMap::new(),
-            refused: HashMap::new(),
-        }
-    }
 }
 
 impl Forms {

@@ -296,6 +296,21 @@ impl Capabilities {
     }
 }
 
+/// The frames in flight an engine states ([`Capabilities::frames_in_flight`])
+/// from the depth it runs: refused by name at load where none or more than
+/// a `u32` holds, never clamped.
+pub fn stated_frames(depth: usize) -> Result<u32, crate::error::Error> {
+    match u32::try_from(depth) {
+        Ok(0) => Err(crate::error::Error::Program(
+            "this load keeps no frame in flight; a fire needs one".to_string(),
+        )),
+        Ok(frames) => Ok(frames),
+        Err(_) => Err(crate::error::Error::Program(format!(
+            "this load keeps {depth} frames in flight, past what a u32 states"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod mixed_lanes {
     use super::*;
@@ -348,20 +363,5 @@ mod mixed_lanes {
         // the padded rows: prompts, their pad lanes, the decode lanes, the rest lane
         assert!(laid.fits(&limits, 1, 2608 - 15 - 64, 1));
         assert!(!laid.fits(&limits, 1, 2608 - 15 - 64 + 1, 1));
-    }
-}
-
-/// The frames in flight an engine states ([`Capabilities::frames_in_flight`])
-/// from the depth it runs: refused by name at load where none or more than
-/// a `u32` holds, never clamped.
-pub fn stated_frames(depth: usize) -> Result<u32, crate::error::Error> {
-    match u32::try_from(depth) {
-        Ok(0) => Err(crate::error::Error::Program(
-            "this load keeps no frame in flight; a fire needs one".to_string(),
-        )),
-        Ok(frames) => Ok(frames),
-        Err(_) => Err(crate::error::Error::Program(format!(
-            "this load keeps {depth} frames in flight, past what a u32 states"
-        ))),
     }
 }

@@ -67,7 +67,8 @@ impl ForwardHybrid for Micro {
 /// slot more.
 fn shell(trace: poem::Trace, path: &Path, graphs: Graphs, lanes: u32) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
-    let shell = Shell::load(Boot {
+
+    Shell::load(Boot {
         knobs: engine_cuda::Knobs {
             pin: Some((graphs, None)),
             ..engine_cuda::Knobs::default()
@@ -81,8 +82,7 @@ fn shell(trace: poem::Trace, path: &Path, graphs: Graphs, lanes: u32) -> Shell {
             2 * lanes + 1,
         )
     })
-    .expect("the shell loads");
-    shell
+    .expect("the shell loads")
 }
 
 fn argmax(row: &[f32]) -> usize {

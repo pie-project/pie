@@ -127,7 +127,8 @@ fn a_ring_fold_lands_after_every_read_of_its_fire() {
         return;
     }
     let mut forked = 0usize;
-    for name in [DEPLOYMENT] {
+    {
+        let name = DEPLOYMENT;
         let trace = poem_compiler::catalog::deployment(name)
             .expect("the mini")
             .trace(Platform::Cuda);
@@ -330,7 +331,7 @@ fn a_ring_snapshot_holds_the_rows_before_it() {
         assert_eq!(seen.snapshots, 1, "row {rows}: the fire lands one");
         agree(
             &[got],
-            &[want.clone()],
+            std::slice::from_ref(&want),
             &format!("a snapshot at row {rows}"),
         );
         let (bare, seen) = decoded(&trace, &path, &prompt, rows, Some(false));

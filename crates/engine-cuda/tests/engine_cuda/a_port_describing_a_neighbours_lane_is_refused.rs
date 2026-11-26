@@ -104,7 +104,7 @@ fn a_port_describing_a_neighbours_lane_is_refused() {
     let rows = beside(&mut shell, word, own_lane, &table, &reader)
         .expect("ports describing the attachment's own lane");
     assert!(
-        rows.iter().any(|row| *row == want),
+        rows.contains(&want),
         "the neighbour answers as it did alone"
     );
     assert_eq!(

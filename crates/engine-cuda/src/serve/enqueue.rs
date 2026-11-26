@@ -146,10 +146,10 @@ impl Shell {
     ) -> Result<(u32, Option<Readback>)> {
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
-        if p.rs.rows_ext > 0 {
-            if let Some(buffers) = self.buffers.as_mut() {
-                buffers.ensure_scratch(&mut self.pools, p.rs.rows_ext)?;
-            }
+        if p.rs.rows_ext > 0
+            && let Some(buffers) = self.buffers.as_mut()
+        {
+            buffers.ensure_scratch(&mut self.pools, p.rs.rows_ext)?;
         }
         let rs_scratch = self
             .buffers

@@ -605,6 +605,18 @@ pub fn kernel(error: kernels_slang::Error) -> KernelError {
     }
 }
 
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,17 +679,5 @@ mod tests {
              its own and 4 pool segments) and this adapter binds a stage 10 \
              (`maxStorageBuffersPerShaderStage`)"
         );
-    }
-}
-
-impl From<engine::guest_claims::Overlap> for Fault {
-    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
-        Fault::Claimed(overlap.into())
-    }
-}
-
-impl From<engine::guest_claims::Refusal> for Fault {
-    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
-        Fault::Claimed(refusal)
     }
 }

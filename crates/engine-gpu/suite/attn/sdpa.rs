@@ -61,7 +61,7 @@ fn keeps(b: &Batch, r: usize, kp: usize, window: Option<usize>) -> bool {
 /// bound hides.
 fn sparse(origin: usize, pos: usize, row: usize) -> Vec<u8> {
     (0..MASK_STRIDE)
-        .map(|c| u8::from(origin + c >= pos || (c * 7 + row * 3) % 5 != 0))
+        .map(|c| u8::from(origin + c >= pos || !(c * 7 + row * 3).is_multiple_of(5)))
         .collect()
 }
 

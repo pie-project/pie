@@ -73,7 +73,7 @@ impl WindowedLane<'_> {
     /// The page logical page `n` reads.
     pub fn page_of(&self, n: u32) -> Result<u32> {
         let page = self.page.max(1);
-        if self.base % page != 0 {
+        if !self.base.is_multiple_of(page) {
             return Err(refused(format!(
                 "a window buffer based at row {} of {page}-row pages",
                 self.base

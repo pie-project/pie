@@ -753,7 +753,7 @@ fn no_slot_is_handed_out_past_what_the_engine_binds() {
         for &r in &refs {
             let chunk = chunk_of(&pool, r);
             assert!(
-                chunk >= 1 && chunk < 2 * SEGMENT,
+                (1..2 * SEGMENT).contains(&chunk),
                 "ref {r} in chunk {chunk}"
             );
         }
@@ -853,7 +853,7 @@ fn every_lane_of_a_state_holding_load_states_its_record() {
         state_size: 1024,
         buffer_page_tokens: 16,
     };
-    let bound = rs.create_working_set(geometry.clone());
+    let bound = rs.create_working_set(geometry);
     let unbound = rs.create_working_set(geometry);
     // Lane 0's working set writes its state; lane 1's is in no group.
     let plan = RsPlan::Groups(vec![GroupPlan {

@@ -610,7 +610,8 @@ fn curve_id(d: Dense) -> (u32, u32) {
 /// 64-wide column and contraction steps): a shape it cannot run needs no
 /// curve of it.
 fn runs_shape(d: Dense, n: u32, k: u32) -> bool {
-    !matches!(d, Dense::Mpp) || (n % Dense::MPP_STEP == 0 && k % Dense::MPP_STEP == 0)
+    !matches!(d, Dense::Mpp)
+        || (n.is_multiple_of(Dense::MPP_STEP) && k.is_multiple_of(Dense::MPP_STEP))
 }
 
 /// The source file `d`'s kernels are built from: its curve's key.

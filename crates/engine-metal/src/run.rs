@@ -1317,10 +1317,11 @@ impl<'c> Run<'c> {
                     .address(handle.buf)
                     .and_then(|key| self.copy.tight(key))
                     .ok_or_else(|| {
-                        run_fault(format!(
+                        run_fault(
                             "a copied window reads the fire's masks and its copy carries none; \
                              `dispatch::copy` gathers them wherever the fire stages any"
-                        ))
+                                .to_string(),
+                        )
                     })?;
                 return Ok(Tensor::new(
                     tight.buf,
@@ -1331,7 +1332,7 @@ impl<'c> Run<'c> {
             }
         }
         let span = self.window()?.span;
-        Ok(self.slice(handle, span.row_offset, span.rows)?)
+        self.slice(handle, span.row_offset, span.rows)
     }
 
     pub(crate) fn at_region(&self) -> u32 {
@@ -1351,16 +1352,15 @@ impl<'c> Run<'c> {
     }
 
     fn voxel_seat(&self, at: usize) -> Ran<crate::inputs::VoxelHandles> {
-        Ok(self.fire.voxels.ok_or_else(|| {
+        self.fire.voxels.ok_or_else(|| {
             run_fault(format!(
                 "value {at} reads the voxel axis, and no lane of this fire submitted a clip"
             ))
-        })?)
+        })
     }
 
     fn guest(&self, at: usize, id: u32) -> Ran<Tensor> {
-        Ok(self
-            .fire
+        self.fire
             .inputs
             .iter()
             .find(|(have, _)| *have == id)
@@ -1369,12 +1369,11 @@ impl<'c> Run<'c> {
                 run_fault(format!(
                     "value {at} reads guest input {id}, which this load carved no rectangle for"
                 ))
-            })?)
+            })
     }
 
     fn packing(&self, at: usize, select: poem_ir::Selection) -> Ran<crate::inputs::PackingHandles> {
-        Ok(self
-            .fire
+        self.fire
             .packings
             .iter()
             .find(|(have, _)| *have == select)
@@ -1385,11 +1384,11 @@ impl<'c> Run<'c> {
                      carved {} selection(s)",
                     self.fire.packings.len()
                 ))
-            })?)
+            })
     }
 
     pub(crate) fn uncut(&self, id: ValueId) -> Ran<Tensor> {
-        Ok(self.whole(id)?)
+        self.whole(id)
     }
 
     pub(crate) fn group_mask(
@@ -1511,7 +1510,7 @@ impl<'c> Run<'c> {
     fn cut(&self, id: ValueId, handle: Tensor) -> Ran<Tensor> {
         let at = id.0 as usize;
         if self.window()?.gathered.is_some() {
-            return Ok(self.compacted(id, handle)?);
+            return self.compacted(id, handle);
         }
         if matches!(
             self.values[at].def,
@@ -1550,7 +1549,7 @@ impl<'c> Run<'c> {
             Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
             Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
         };
-        Ok(self.slice(handle, skip, keep)?)
+        self.slice(handle, skip, keep)
     }
 
     fn compacted(&self, id: ValueId, handle: Tensor) -> Ran<Tensor> {
@@ -1644,7 +1643,7 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn tensor(&self, id: ValueId) -> Ran<Tensor> {
-        Ok(self.cut(id, self.whole(id)?)?)
+        self.cut(id, self.whole(id)?)
     }
 
     /// The row `grid` addresses `rows`' row 0 at: the fire's grids hold fire-wide rows, so the
@@ -1811,13 +1810,13 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn planes(&self, id: ValueId) -> Ran<Bank> {
-        Ok(self.banked(id)?.ok_or_else(|| {
+        self.banked(id)?.ok_or_else(|| {
             run_fault(format!(
                 "value {} is bound as one dense handle, and this op reads a split-plane \
                  bank",
                 id.0
             ))
-        })?)
+        })
     }
 
     /// The address table weight `id` is read through, where the weight
@@ -1890,11 +1889,9 @@ impl<'c> Run<'c> {
         match self.weights.0.get(row).copied().flatten() {
             Some(WeightRow::Planes(bank)) => Ok(Some(bank)),
             Some(WeightRow::Dense(_)) => Ok(None),
-            None => {
-                return Err(run_fault(format!(
-                    "value {at} is weight {row}, which the shell has not bound"
-                )));
-            }
+            None => Err(run_fault(format!(
+                "value {at} is weight {row}, which the shell has not bound"
+            ))),
         }
     }
 
@@ -1976,12 +1973,12 @@ impl<'c> Run<'c> {
             | GeomKind::GroupIndptr { .. }
             | GeomKind::LaneIndptr { .. } => None,
         };
-        Ok(bound.ok_or_else(|| {
+        bound.ok_or_else(|| {
             run_fault(format!(
                 "value {at} reads {kind:?} of page table {table}, which this \
                  fire left unbound"
             ))
-        })?)
+        })
     }
 
     /// Prefill plan `plan` as cache row `cache` reads it: its last-page

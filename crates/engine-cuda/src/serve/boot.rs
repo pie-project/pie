@@ -40,18 +40,13 @@ impl Graphs {
 /// How captured fires are kept. Serving keeps recorded bodies; a walked
 /// load keeps none (`Off`); the shaped mode exists only in a test build
 /// (feature `test-pins`), as [`Graphs`]' does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Recording {
     Off,
     #[cfg(feature = "test-pins")]
     Shaped,
+    #[default]
     Bodies,
-}
-
-impl Default for Recording {
-    fn default() -> Recording {
-        Recording::Bodies
-    }
 }
 
 impl Recording {

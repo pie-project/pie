@@ -1690,6 +1690,16 @@ fn init_tracing(
     Ok(())
 }
 
+/// The tiers below the device suspended kv goes to, as a load stated them.
+fn below_device(host: bool, disk: bool) -> &'static str {
+    match (host, disk) {
+        (true, true) => "the host, then the disk",
+        (true, false) => "the host (no disk tier)",
+        (false, true) => "the disk (no host tier)",
+        (false, false) => "nowhere: no tier below the device",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::quieted;
@@ -1762,15 +1772,5 @@ mod tests {
         let (hybrid, caps) = read(&facts);
         assert!(hybrid && caps.has_state());
         assert_eq!(caps.state_size, 3000, "a record's bytes, not the slot's");
-    }
-}
-
-/// The tiers below the device suspended kv goes to, as a load stated them.
-fn below_device(host: bool, disk: bool) -> &'static str {
-    match (host, disk) {
-        (true, true) => "the host, then the disk",
-        (true, false) => "the host (no disk tier)",
-        (false, true) => "the disk (no host tier)",
-        (false, false) => "nowhere: no tier below the device",
     }
 }

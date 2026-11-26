@@ -1238,7 +1238,8 @@ mod tests {
         owns: |owner| CACHED.lock().unwrap().iter().any(|(o, _)| *o == owner),
         list: || {
             let now = crate::rt::Instant::now();
-            let sets = CACHED
+
+            CACHED
                 .lock()
                 .unwrap()
                 .iter()
@@ -1248,8 +1249,7 @@ mod tests {
                     pages,
                     last_use: now,
                 })
-                .collect();
-            sets
+                .collect()
         },
         page: || 16,
         rooms: || [(100, 40), (400, 300), (0, 0)],

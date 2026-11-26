@@ -1674,7 +1674,7 @@ impl PreparedLoad<'_> {
                     boot.context,
                     &chip.tuned().rates,
                     device.name(),
-                    &counts,
+                    counts,
                 )?
             };
             let asked = budgets.tokens.max_tokens;

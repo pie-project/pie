@@ -1254,7 +1254,7 @@ impl ResidencyPlanner {
                         // flight it runs nothing, a victim like any other.
                         && !(proc.unfired
                             && !proc.bind_waiting
-                            && (!queued(*pid) || !quiet()))
+                            && (!queued(pid) || !quiet()))
                         // Restored past this head while it stood passed
                         // over: it fires before this head moves it again.
                         && !proc.restored_past.contains(&waiter.pid)

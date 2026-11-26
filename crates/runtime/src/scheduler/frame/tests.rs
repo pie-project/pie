@@ -71,11 +71,11 @@ fn processes_over_the_execution_permits_joining_together_all_finish() {
         policy.preload_free_slots(PERMITS);
         let owners: Vec<ProcessId> = (0..PROCESSES).map(|_| pid()).collect();
         let lanes: Vec<ProcessId> = (0..PROCESSES).map(|_| pid()).collect();
-        let mut admitted = vec![false; PROCESSES];
-        let mut opened = vec![false; PROCESSES];
-        let mut done = vec![false; PROCESSES];
-        let mut submitted = vec![0u64; PROCESSES];
-        let mut retired = vec![0u64; PROCESSES];
+        let mut admitted = [false; PROCESSES];
+        let mut opened = [false; PROCESSES];
+        let mut done = [false; PROCESSES];
+        let mut submitted = [0u64; PROCESSES];
+        let mut retired = [0u64; PROCESSES];
         let mut fire_of: HashMap<u64, usize> = HashMap::new();
         let mut queued: Vec<u64> = Vec::new();
         let mut next_id = 1u64;

@@ -1026,7 +1026,7 @@ impl Session {
         };
         let why = "the pass staged before it did not land".to_string();
         let _ = pass.told.set(Some(why.clone()));
-        self.stale = (!self.airborne.is_empty()).then(|| Fired::Faulted(why));
+        self.stale = (!self.airborne.is_empty()).then_some(Fired::Faulted(why));
     }
 
     fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan, at: Stage) -> Result<Option<Fired>> {
@@ -1308,6 +1308,72 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
     Ok(())
 }
 
+/// An airborne pass's verdict as [`Session::verdict`] will reach it at the
+/// harvest, readable from any thread once its frame's buffer completed
+/// ([`Session::epilogue_check`]).
+pub struct EpilogueCheck {
+    statuses: Vec<(usize, held::Held)>,
+    commit: std::result::Result<(), String>,
+    /// The pass in flight before it, where one is: its verdict as its
+    /// harvest told it, else as its own check reads it (its set is not
+    /// staged again before that harvest). If it does not commit, this one
+    /// does not either.
+    before: Option<
+        Box<(
+            std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+            EpilogueCheck,
+        )>,
+    >,
+    /// Where its own verdict is told for the pass staged after it.
+    told: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+}
+
+impl EpilogueCheck {
+    /// `None` where the pass commits; why it doesn't otherwise. Its
+    /// status words are read here, so only once the buffer completed.
+    /// Tells its verdict where the pass staged after it reads it: from the
+    /// completion handler, which Metal calls in the order a queue's buffers
+    /// complete, so before that pass's handler. Its harvest tells the same.
+    pub fn tell(&self, fault: Option<String>) {
+        let _ = self.told.set(fault);
+    }
+
+    #[must_use]
+    pub fn fault(&self) -> Option<String> {
+        if let Some(before) = &self.before {
+            let (told, check) = &**before;
+            let earlier = match told.get() {
+                Some(told) => told.clone(),
+                None => check.fault(),
+            };
+            if let Some(why) = earlier {
+                return Some(format!("the pass staged before it did not commit: {why}"));
+            }
+        }
+        let mut verdict = Verdict::Committed;
+        for (stage, status) in &self.statuses {
+            let mut bytes = [0u8; eta_exec::STATUS_BYTES];
+            let read = status
+                .read(0, &mut bytes)
+                .ok()
+                .and_then(|()| eta_exec::Status::read(&bytes));
+            let here = match read.and_then(|status| status.state()) {
+                Some(eta_exec::State::Running | eta_exec::State::Committed) => Verdict::Committed,
+                Some(eta_exec::State::Retry) => Verdict::Declined,
+                other => Verdict::Faulted(format!(
+                    "stage {stage}: its status word reads {other:?} (the harvest logs its report)"
+                )),
+            };
+            verdict = verdict.worse(here);
+        }
+        match verdict {
+            Verdict::Faulted(why) => Some(why),
+            Verdict::Declined => Some("the program declined the pass".to_string()),
+            Verdict::Committed => self.commit.as_ref().err().cloned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use eta_compiler::codegen::launch::LaunchPackage;
@@ -1376,71 +1442,5 @@ mod tests {
             Verdict::Committed.worse(Verdict::Committed),
             Verdict::Committed
         ));
-    }
-}
-
-/// An airborne pass's verdict as [`Session::verdict`] will reach it at the
-/// harvest, readable from any thread once its frame's buffer completed
-/// ([`Session::epilogue_check`]).
-pub struct EpilogueCheck {
-    statuses: Vec<(usize, held::Held)>,
-    commit: std::result::Result<(), String>,
-    /// The pass in flight before it, where one is: its verdict as its
-    /// harvest told it, else as its own check reads it (its set is not
-    /// staged again before that harvest). If it does not commit, this one
-    /// does not either.
-    before: Option<
-        Box<(
-            std::sync::Arc<std::sync::OnceLock<Option<String>>>,
-            EpilogueCheck,
-        )>,
-    >,
-    /// Where its own verdict is told for the pass staged after it.
-    told: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
-}
-
-impl EpilogueCheck {
-    /// `None` where the pass commits; why it doesn't otherwise. Its
-    /// status words are read here, so only once the buffer completed.
-    /// Tells its verdict where the pass staged after it reads it: from the
-    /// completion handler, which Metal calls in the order a queue's buffers
-    /// complete, so before that pass's handler. Its harvest tells the same.
-    pub fn tell(&self, fault: Option<String>) {
-        let _ = self.told.set(fault);
-    }
-
-    #[must_use]
-    pub fn fault(&self) -> Option<String> {
-        if let Some(before) = &self.before {
-            let (told, check) = &**before;
-            let earlier = match told.get() {
-                Some(told) => told.clone(),
-                None => check.fault(),
-            };
-            if let Some(why) = earlier {
-                return Some(format!("the pass staged before it did not commit: {why}"));
-            }
-        }
-        let mut verdict = Verdict::Committed;
-        for (stage, status) in &self.statuses {
-            let mut bytes = [0u8; eta_exec::STATUS_BYTES];
-            let read = status
-                .read(0, &mut bytes)
-                .ok()
-                .and_then(|()| eta_exec::Status::read(&bytes));
-            let here = match read.and_then(|status| status.state()) {
-                Some(eta_exec::State::Running | eta_exec::State::Committed) => Verdict::Committed,
-                Some(eta_exec::State::Retry) => Verdict::Declined,
-                other => Verdict::Faulted(format!(
-                    "stage {stage}: its status word reads {other:?} (the harvest logs its report)"
-                )),
-            };
-            verdict = verdict.worse(here);
-        }
-        match verdict {
-            Verdict::Faulted(why) => Some(why),
-            Verdict::Declined => Some("the program declined the pass".to_string()),
-            Verdict::Committed => self.commit.as_ref().err().cloned(),
-        }
     }
 }

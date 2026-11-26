@@ -1375,7 +1375,7 @@ impl Shell {
         programs.set_beam_bounds(
             boot.page_size,
             u32::from(boot.runahead.frames_in_flight),
-            kernels_cuda::runtime::channel::beam_max_lanes(&device.ctx()),
+            kernels_cuda::runtime::channel::beam_max_lanes(device.ctx()),
         );
 
         let airborne = crate::settle::Airborne::new();

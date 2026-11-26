@@ -77,7 +77,7 @@ pub fn compose(
     }
     let page = page.max(1);
     let end = lane.have + lane.rows;
-    if lane.base % page != 0 || lane.base > (lane.folded + lane.fold).max(lane.folded) {
+    if !lane.base.is_multiple_of(page) || lane.base > (lane.folded + lane.fold).max(lane.folded) {
         return Err(refuse(format!(
             "a window buffer from row {} under a fold of [{}, {}) on pages of {page}",
             lane.base,

@@ -581,7 +581,7 @@ fn a_pair_run_is_never_another_program_s_while_a_member_may_still_fire() {
     // Another program binds: none of its room is the resident pair's.
     let mut other = GuestEngine::new(2 * CHUNK, PAIR);
     other.next = 100;
-    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    learn_program(&roles, &other, ProgramId(8)).unwrap();
     bind_instance(
         Some(&roles),
         &mut other,
@@ -808,7 +808,7 @@ async fn a_bind_past_the_room_waits_for_room_given_back() {
     // Twenty chunks of state: no budget of this pool holds it.
     let mut huge = GuestEngine::new(20 * CHUNK, 0);
     huge.next = 200;
-    learn_program(&roles, &mut huge, ProgramId(9)).unwrap();
+    learn_program(&roles, &huge, ProgramId(9)).unwrap();
     let refused = bind_instance(
         Some(&roles),
         &mut huge,
@@ -1037,7 +1037,7 @@ fn waiting_bind<'a>(
     super::bind_when_resident(
         holder(by),
         move || std::future::ready(bind_as(roles, &mut engine.borrow_mut(), program, by)),
-        || std::future::pending::<Result<(), String>>(),
+        std::future::pending::<Result<(), String>>,
         move |prefix, run| super::grow_for_guest(device, engine_id, prefix, run),
         move || Some(roles.lock().unwrap().room_watch()),
         move |run, pieces, singles| roles.lock().unwrap().room_free(run, pieces, singles),
@@ -2520,7 +2520,7 @@ async fn a_bind_whose_commit_will_not_come_waits_in_the_planner_and_binds() {
             let (roles, engine) = (roles.clone(), long_engine.clone());
             move || std::future::ready(bind_as(&roles, &mut engine.borrow_mut(), long, 1))
         },
-        || std::future::pending::<Result<(), String>>(),
+        std::future::pending::<Result<(), String>>,
         {
             // The walk has no segment left for it: the target came down.
             let grow = grow.clone();
@@ -2811,7 +2811,7 @@ fn a_served_restore_s_reserved_chunks_are_its_own_until_it_binds() {
     // Another holder binds meanwhile: none of the held chunks are its.
     let mut other = GuestEngine::new(2 * CHUNK, 0);
     other.next = 100;
-    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    learn_program(&roles, &other, ProgramId(8)).unwrap();
     bind_instance(
         Some(&roles),
         &mut other,
@@ -2909,7 +2909,7 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
     bind(&roles, &mut engine, 1).unwrap();
     let pair_at = engine.bindings[0].pair.clone();
-    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    learn_program(&roles, &engine, PROGRAM).unwrap();
     let binding = InstanceBinding {
         program: PROGRAM,
         ..InstanceBinding::default()
@@ -2929,7 +2929,7 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
     // Another program binds meanwhile: none of its room is the pair's.
     let mut other = GuestEngine::new(2 * CHUNK, PAIR);
     other.next = 100;
-    learn_program(&roles, &mut other, ProgramId(8)).unwrap();
+    learn_program(&roles, &other, ProgramId(8)).unwrap();
     bind_instance(
         Some(&roles),
         &mut other,
@@ -2969,7 +2969,7 @@ fn a_pair_a_bind_has_taken_stays_while_its_last_member_parks() {
 fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
     let Pools { device, roles } = pools(64);
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
-    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    learn_program(&roles, &engine, PROGRAM).unwrap();
     let before = held(&device);
     let binding = InstanceBinding {
         program: PROGRAM,
@@ -3004,7 +3004,7 @@ fn a_bind_of_a_process_not_resident_waits_for_its_restore() {
 fn a_bind_on_its_way_holds_its_process_s_park_until_it_lands() {
     let Pools { device, roles } = pools(64);
     let mut engine = GuestEngine::new(2 * CHUNK, PAIR);
-    learn_program(&roles, &mut engine, PROGRAM).unwrap();
+    learn_program(&roles, &engine, PROGRAM).unwrap();
     let binding = InstanceBinding {
         program: PROGRAM,
         ..InstanceBinding::default()

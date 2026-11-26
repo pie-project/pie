@@ -141,7 +141,9 @@ impl<B: Backend> Resident<B> {
             let mut bytes = vec![0u8; words * 4];
             buffer.read(offset, &mut bytes)?;
             Ok(bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect())
         };
@@ -498,7 +500,7 @@ pub fn plan<'a, B: Backend>(
                 ))
             })?;
             let tokens = rs.tokens.max(1);
-            if page % tokens != 0 || base % tokens != 0 {
+            if !page.is_multiple_of(tokens) || base % tokens != 0 {
                 return Err(refused(format!(
                     "instance {}'s beams buffer recurrent rows {tokens} a page from slot {base}, \
                      and their page lists page kv slots {page} a page: a hybrid's beams need \

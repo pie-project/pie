@@ -424,7 +424,7 @@ fn rs_lists(
         return Ok(None);
     };
     let tokens = rs.page_tokens.max(1);
-    if page % tokens != 0 || base % tokens != 0 {
+    if !page.is_multiple_of(tokens) || base % tokens != 0 {
         return Err(Fault::program(
             "serve::pages",
             format!(

@@ -872,10 +872,10 @@ impl Shell {
         {
             let mut seen = std::collections::HashSet::new();
             for seated in lanes {
-                if let Some(&[_, cow]) = seated.ring.and_then(|pieces| pieces.first()) {
-                    if !seen.insert(cow) {
-                        self.ring_shared.insert(cow);
-                    }
+                if let Some(&[_, cow]) = seated.ring.and_then(|pieces| pieces.first())
+                    && !seen.insert(cow)
+                {
+                    self.ring_shared.insert(cow);
                 }
             }
         }
@@ -2087,7 +2087,9 @@ impl Shell {
             let mut out = vec![0u8; floats as usize * 4];
             self.programs.read_capture(instance, at, &mut out)?;
             Ok(out
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         };

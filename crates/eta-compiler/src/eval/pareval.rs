@@ -622,7 +622,7 @@ mod tests {
         };
         let bound = bind(c, vec![vec![]], EngineCaps::default()).unwrap();
         // Channel 2's cell is known; channel 0's is not.
-        let known = Value::F32(alloc::vec![1.0, 1.00390625, 3.0, -0.5]);
+        let known = Value::F32(alloc::vec![1.0, 1.003_906_3, 3.0, -0.5]);
         let fold = fold_stage(&bound, Stage::Prologue, &mut |chan| {
             (chan == 2).then(|| known.clone())
         })

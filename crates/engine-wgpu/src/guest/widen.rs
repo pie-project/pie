@@ -391,7 +391,9 @@ mod tests {
         dst.read(0, &mut got).unwrap();
         let f = |at: usize, n: usize| -> Vec<f32> {
             got[at..at + 4 * n]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect()
         };

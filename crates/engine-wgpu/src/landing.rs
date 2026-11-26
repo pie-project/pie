@@ -69,7 +69,9 @@ fn read_seat(
                 let from = usize::try_from(tail.at).unwrap_or(usize::MAX);
                 raw.get(from..from + tail.words as usize * 4)
                     .unwrap_or(&[])
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                     .collect()
             });

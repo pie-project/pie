@@ -978,11 +978,10 @@ impl ResidencyPlanner {
             && host_free == 0
             && disk_free > 0
             && !self.spill_failed.load(Ordering::Acquire)
+            && let Some(txn) = self.port.prepare_spill(wanted.max(1) as usize)
         {
-            if let Some(txn) = self.port.prepare_spill(wanted.max(1) as usize) {
-                exec::spawn_spill(self.clone(), txn, Self::spill_done);
-                return true;
-            }
+            exec::spawn_spill(self.clone(), txn, Self::spill_done);
+            return true;
         }
         // Short of free slots below, the store makes the room from idle cache
         // the host holds keyed below what moves down (each tier holds the

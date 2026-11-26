@@ -62,7 +62,7 @@ pub fn row_seats<'a, B: Backend>(
         return Ok(vec![(seat, values)]);
     }
     let row = seat.width.max(1);
-    if values % row != 0 {
+    if !values.is_multiple_of(row) {
         return Err(Fault::Program {
             at: "guest::run",
             why: format!(

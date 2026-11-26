@@ -183,7 +183,6 @@ pub struct HostSubmitStats {
     pub validate_frame_calls: u64,
 }
 
-
 pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateStats {
     let mut total_batches = 0u64;
     let mut total_tokens = 0u64;

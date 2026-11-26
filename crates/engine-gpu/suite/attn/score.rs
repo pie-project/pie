@@ -95,7 +95,7 @@ fn fixture(context: usize) -> Fixture {
     }
     let pool_pages = *page_indptr.last().unwrap() as usize;
     // Pages out of order: a stride prime to the pool's pages.
-    let step = (3..).find(|s| pool_pages % s != 0).unwrap();
+    let step = (3..).find(|s| !pool_pages.is_multiple_of(*s)).unwrap();
     let page_indices = (0..pool_pages)
         .map(|i| ((i * step + 1) % pool_pages) as u32)
         .collect();

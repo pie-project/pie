@@ -899,11 +899,10 @@ impl Pools {
     /// of its own, [`Pools::delta_table`].)
     #[must_use]
     pub fn map_bytes(state_rows: usize, parts: usize) -> u64 {
-        let maps = match state_rows {
+        match state_rows {
             0 => 0,
             rows => crate::arena::room(rows as u64 * super::state_map_bytes(parts)),
-        };
-        maps
+        }
     }
 
     /// `bytes` of the tables run (`Reserved::Tables`), zeroed and written

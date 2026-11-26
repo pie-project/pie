@@ -467,7 +467,7 @@ fn answers_the_host_path(frames: u8) {
                 ChannelRegistration {
                     id,
                     shape: decl.shape.dims()[..decl.shape.rank()].to_vec(),
-                    dtype: decl.dtype.clone(),
+                    dtype: decl.dtype,
                     host_role: decl.host_role,
                     seeded: decl.seeded,
                     extern_dir: None,

@@ -1066,7 +1066,7 @@ impl Walk<'_, '_> {
             return Err(invalid("resolved owned buffer is missing"));
         };
         let published = match bytes.get(offset..offset + len) {
-            Some(slice) => self.sink.publish(name, slice).map_err(Error::from),
+            Some(slice) => self.sink.publish(name, slice),
             None => Err(invalid("owned buffer range is out of bounds")),
         };
         self.buffers.insert(root, BufferLoc::Owned(bytes));

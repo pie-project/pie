@@ -323,12 +323,12 @@ impl Registry {
     /// shares one entry; a new one takes its room as `tenant`'s
     /// ([`Registry::make_room`]).
     fn insert(&mut self, entry: Arc<RegisteredProgram>, tenant: Tenant) -> Arc<RegisteredProgram> {
-        if let Some(raced) = self.inner.get(&entry.hash) {
-            if raced.bytes == entry.bytes {
-                let raced = raced.clone();
-                self.found += 1;
-                return raced;
-            }
+        if let Some(raced) = self.inner.get(&entry.hash)
+            && raced.bytes == entry.bytes
+        {
+            let raced = raced.clone();
+            self.found += 1;
+            return raced;
         }
         self.make_room(tenant);
         self.registered += 1;

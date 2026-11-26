@@ -766,7 +766,9 @@ impl Inputs {
         let mut raw = vec![0u8; lanes as usize * 4];
         self.store.read(self.beam.faults, &mut raw)?;
         Ok(raw
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     }
@@ -1204,7 +1206,7 @@ impl Inputs {
             }
             self.store.write(self.rs_pages, bytes_of(pages))?;
         }
-        if fire.rs_folds.len() > lanes as usize * 2 || fire.rs_folds.len() % 2 != 0 {
+        if fire.rs_folds.len() > lanes as usize * 2 || !fire.rs_folds.len().is_multiple_of(2) {
             return Err(Fault::Ceiling {
                 what: "beam group folds, a pair a group and at most a group a lane",
                 need: fire.rs_folds.len() as u64,

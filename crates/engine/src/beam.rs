@@ -301,11 +301,12 @@ mod tests {
         let frames = 2;
         let f0 = folded / page;
         let columns = (folded + steps - 1) / page - f0 + 1;
-        let reserve = lanes * columns + lanes + lanes * frames + u32::from(folded % page > 0);
+        let reserve =
+            lanes * columns + lanes + lanes * frames + u32::from(!folded.is_multiple_of(page));
         let mut state = State::new(lanes, reserve + 8, frames);
         let mut rng = Lcg(seed);
         for t in 0..steps {
-            let parents: Vec<u32> = if rng.next() % 3 == 0 {
+            let parents: Vec<u32> = if rng.next().is_multiple_of(3) {
                 (0..lanes).collect()
             } else {
                 let mut p: Vec<u32> = (0..lanes).map(|_| rng.next() % lanes).collect();

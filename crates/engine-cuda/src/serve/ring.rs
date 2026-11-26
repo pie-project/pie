@@ -100,7 +100,7 @@ pub fn compose(
     }
     // The buffer starts at or below the fold the fire leaves: past the rows
     // a fire folds itself where it buffers none earlier.
-    if lane.base % page != 0 || lane.base > lane.folded + lane.fold {
+    if !lane.base.is_multiple_of(page) || lane.base > lane.folded + lane.fold {
         return Err(Fault::program(
             "serve::ring",
             format!(

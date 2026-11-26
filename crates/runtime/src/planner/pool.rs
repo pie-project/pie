@@ -346,7 +346,7 @@ impl ChunkMap {
                         .copied()
                         .filter(|(pid, _)| wanted.contains(pid))
                         .collect();
-                    (!by.is_empty()).then(|| ChunkHeld {
+                    (!by.is_empty()).then_some(ChunkHeld {
                         chunk: chunk.chunk,
                         used: chunk.used,
                         by,

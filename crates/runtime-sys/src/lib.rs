@@ -111,7 +111,7 @@ pub mod address {
         {
             return None;
         }
-        Some(limit.rlim_cur as u64)
+        Some(limit.rlim_cur)
     }
 
     /// The host's page size; Windows pages are 4 KiB on every architecture

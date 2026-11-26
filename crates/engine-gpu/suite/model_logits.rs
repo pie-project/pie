@@ -2267,7 +2267,7 @@ fn a_stated_position_rotates_and_bounds_no_key() {
     same(
         "positions stated as the slots",
         &[slots],
-        &[unstated.clone()],
+        std::slice::from_ref(&unstated),
     );
     assert!(
         apart(&one, &unstated) > 1e-3,

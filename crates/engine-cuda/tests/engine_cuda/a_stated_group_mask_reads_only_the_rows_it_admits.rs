@@ -20,7 +20,7 @@ const ROWS: [usize; 3] = [5, 13, 29];
 /// Row `i` of lane `at` attends key row `j`: itself always, else a pattern
 /// that differs lane by lane, so a lane reading another's bits shows.
 fn admits(at: usize, i: usize, j: usize) -> bool {
-    i == j || (i * 7 + j * 3 + at) % 4 != 0
+    i == j || !(i * 7 + j * 3 + at).is_multiple_of(4)
 }
 
 /// Row `i`'s mask over the lane's `rows` key rows, as runs: hidden,

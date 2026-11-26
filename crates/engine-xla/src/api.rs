@@ -1278,7 +1278,9 @@ impl engine::Programs for Xla {
         }
         let from = ((2 + i64::from(beam) * cap) * 4) as usize;
         Ok(state[from..from + cap as usize * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .collect())
     }
@@ -2491,7 +2493,9 @@ impl Xla {
             std::thread::spawn(move || {
                 let outcome = words.download().map_err(|e| e.to_string()).map(|bytes| {
                     let words: Vec<u32> = bytes
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                         .collect();
                     for (b, &code) in words.iter().take(live as usize).enumerate() {

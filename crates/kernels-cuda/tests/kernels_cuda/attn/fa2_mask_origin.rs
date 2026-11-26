@@ -30,7 +30,7 @@ enum Plane {
 /// The buffer bit of row `q`, column `c` past the boundary: a pattern that
 /// hides some keys of every row and keeps its own.
 fn kept(q: usize, c: usize, buffer: usize) -> bool {
-    c == buffer + q || (c * 7 + q * 3) % 5 != 0
+    c == buffer + q || !(c * 7 + q * 3).is_multiple_of(5)
 }
 
 /// The masked prefill over `[q heads, kv heads, head dim]` and requests of

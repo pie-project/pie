@@ -51,7 +51,7 @@ fn search(lanes: u32, rung: u32, folded: u32, steps: u32, seed: u64) -> Option<(
     let mut hist: Vec<Vec<u64>> = vec![Vec::new(); rung as usize];
     let mut commons: Vec<u32> = Vec::new();
     for t in 0..steps {
-        let mut parents: Vec<u32> = if rng.next() % 3 == 0 {
+        let mut parents: Vec<u32> = if rng.next().is_multiple_of(3) {
             (0..lanes).collect()
         } else {
             let mut p: Vec<u32> = (0..lanes).map(|_| rng.next() % lanes).collect();
