@@ -1301,6 +1301,9 @@ where
                 mib(held),
                 held / chunk,
             );
+            if let Some(unseen) = crate::backend::Context::outside_unseen(shell.device()) {
+                tracing::info!(engine = B::KIND, "outside: {unseen}");
+            }
         }
         // What the load itself walked is the load's: serving counts from here.
         shell.recorded_serving();

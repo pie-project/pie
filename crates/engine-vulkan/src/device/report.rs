@@ -41,6 +41,19 @@ pub(crate) unsafe extern "system" fn reported(
     }
 }
 
+/// The bytes the driver holds live in every heap for this process: where
+/// the device's heaps are all the host's memory (a phone's protected and
+/// lazily-allocated heaps beside its device-local one), each counts.
+#[must_use]
+pub fn live_bytes_all() -> u64 {
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .flatten()
+        .map(|(_, (bytes, _))| *bytes)
+        .sum()
+}
+
 /// The bytes the driver holds live in `heap` for this process, every
 /// object it reported made there and not yet freed.
 #[must_use]

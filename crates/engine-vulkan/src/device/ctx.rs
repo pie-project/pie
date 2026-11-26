@@ -299,6 +299,11 @@ impl Core {
         let reserved = engine_gpu::books::process_reserved();
         match self.budget() {
             Some((_, usage)) => usage.saturating_sub(reserved),
+            // On a device whose heaps are all the host's, every heap the
+            // driver allocates in is this process's memory.
+            None if self.features.memory_report && self.whose_memory.unified() => {
+                super::report::live_bytes_all().saturating_sub(reserved)
+            }
             None if self.features.memory_report => {
                 super::report::live_bytes(self.heap).saturating_sub(reserved)
             }
@@ -1581,6 +1586,18 @@ impl Context {
     #[must_use]
     pub fn measures_outside(&self) -> bool {
         self.core.features.memory_budget || self.core.features.memory_report
+    }
+
+    /// What of the driver's share the memory report does not see: the
+    /// buffers the process's other graphics APIs make (EGL surfaces,
+    /// gralloc), which no Vulkan reading counts. `None` under a memory
+    /// budget, whose usage is the heap's whole.
+    #[must_use]
+    pub fn outside_unseen(&self) -> Option<&'static str> {
+        (!self.core.features.memory_budget && self.core.features.memory_report).then_some(
+            "buffers the process's other graphics APIs make (EGL surfaces, gralloc) lie \
+             outside every Vulkan count, and this reading does not see them",
+        )
     }
 
     /// Where the device shares the host's memory (a ceiling was read at

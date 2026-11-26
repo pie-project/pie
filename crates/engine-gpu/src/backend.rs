@@ -160,6 +160,12 @@ pub trait Context<B: Backend> {
         false
     }
 
+    /// What of the driver's share no reading of this device's sees, said in
+    /// the load's line: `None` where its reading covers the process.
+    fn outside_unseen(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The reader of what the host can still give this process, where the
     /// device shares the host's memory and no budget of the device's says
     /// what it has ([`engine::Engine::host_room`]). `None`, the default:
