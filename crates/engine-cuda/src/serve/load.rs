@@ -532,7 +532,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                     let arch = crate::chip::family_of(&on).unwrap_or("").to_string();
                     let found = crate::chip::fallback(
                         &on,
-                        crate::device::spec::stated(boot.ordinal, &arch),
+                        crate::device::spec::stated(boot.ordinal, device.name(), &arch),
                     );
                     let weigh = |rates: profile::rates::Rates| {
                         #[cfg_attr(not(feature = "device"), allow(unused_mut))]

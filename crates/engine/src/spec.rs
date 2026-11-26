@@ -5,7 +5,12 @@
 //!
 //! Memory bandwidth is the driver's stated peak memory clock times its
 //! stated bus width, twice a clock (as CUDA's `deviceQuery` sample computes
-//! it). Compute is the driver's stated multiprocessor (CU) count times its
+//! it), only on an architecture where that is checked against a datasheet
+//! ([`Bandwidth::Driver`], the check cited); elsewhere (the HBM parts whose
+//! stated bus figures are not the memory's: an MI300X states 1300 MHz over
+//! 2048 bits, 665.6 GB/s by the formula, of its 5.3 TB/s) the datasheet's
+//! figure, a part at a time by the device's name ([`Bandwidth::Parts`]).
+//! Compute is the driver's stated multiprocessor (CU) count times its
 //! stated peak clock times the architecture's published dense operations a
 //! clock a multiprocessor ([`ARCHS`], one row an architecture, each citing
 //! its source). No row holds a tuned figure: each is the vendor's, divided
@@ -33,6 +38,31 @@ pub struct Arch {
     /// Where the figures come from, and the shipped part they are divided
     /// back from.
     pub source: &'static str,
+    /// Where the memory bandwidth comes from on this architecture.
+    pub bandwidth: Bandwidth,
+}
+
+/// Where an architecture's memory bandwidth comes from: the driver's stated
+/// memory clock x bus width x 2, only where that has been checked against a
+/// datasheet on a part of the architecture (and the check is cited); else
+/// the datasheet's own figure, a part at a time, matched by the device name
+/// the driver states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Bandwidth {
+    /// The driver's formula, and the check that verifies it.
+    Driver { verified: &'static str },
+    /// Each part's datasheet bandwidth: a part with none listed states no
+    /// bandwidth.
+    Parts(&'static [Part]),
+}
+
+/// One part's datasheet memory bandwidth.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Part {
+    /// A piece of the device name the driver states (`"MI300X"`).
+    pub name: &'static str,
+    pub gbps: f64,
+    pub source: &'static str,
 }
 
 /// One row an architecture. Each figure is a shipped part's published dense
@@ -49,6 +79,9 @@ pub const ARCHS: &[Arch] = &[
         fp8: None,
         fp32: 128.0,
         source: "NVIDIA A100 Tensor Core GPU Architecture whitepaper (A100 SXM4)",
+        bandwidth: Bandwidth::Driver {
+            verified: "A100 SXM4 40GB: deviceQuery states a 1215 MHz memory clock over 5120 bits, x 2 = 1555 GB/s, the A100 datasheet's 1555 GB/s",
+        },
     },
     // NVIDIA Ampere GA102 GPU Architecture whitepaper:
     // RTX A6000, 84 SMs at 1800 MHz, 154.8 TFLOPS dense FP16 / BF16 tensor
@@ -61,6 +94,9 @@ pub const ARCHS: &[Arch] = &[
         fp8: None,
         fp32: 256.0,
         source: "NVIDIA Ampere GA102 GPU Architecture whitepaper (RTX A6000)",
+        bandwidth: Bandwidth::Driver {
+            verified: "RTX A6000: deviceQuery states 8001 MHz over 384 bits, x 2 = 768 GB/s, the RTX A6000 datasheet's 768 GB/s",
+        },
     },
     // NVIDIA Ada GPU Architecture whitepaper / L40S
     // datasheet: L40S, 142 SMs at 2520 MHz, 362 TFLOPS dense FP16 / BF16
@@ -72,6 +108,9 @@ pub const ARCHS: &[Arch] = &[
         fp8: Some(2048.0),
         fp32: 256.0,
         source: "NVIDIA Ada GPU Architecture whitepaper; L40S datasheet",
+        bandwidth: Bandwidth::Driver {
+            verified: "L40S: deviceQuery states 9001 MHz over 384 bits, x 2 = 864 GB/s, the L40S datasheet's 864 GB/s",
+        },
     },
     // NVIDIA H100 Tensor Core GPU Architecture whitepaper: H100
     // SXM5, 132 SMs at 1830 MHz, 989 TFLOPS dense BF16 / FP16 tensor, 1979
@@ -83,6 +122,9 @@ pub const ARCHS: &[Arch] = &[
         fp8: Some(8192.0),
         fp32: 256.0,
         source: "NVIDIA H100 Tensor Core GPU Architecture whitepaper (H100 SXM5)",
+        bandwidth: Bandwidth::Driver {
+            verified: "H100 SXM5: deviceQuery states 2619 MHz over 5120 bits, x 2 = 3352 GB/s, the H100 datasheet's 3.35 TB/s",
+        },
     },
     // NVIDIA Blackwell Architecture Technical Brief / DGX B200 datasheet:
     // B200, 148 SMs at 1965 MHz, 2.25 PFLOPS dense BF16 / FP16 tensor, 4.5
@@ -94,6 +136,11 @@ pub const ARCHS: &[Arch] = &[
         fp8: Some(16384.0),
         fp32: 256.0,
         source: "NVIDIA Blackwell Architecture Technical Brief (B200)",
+        bandwidth: Bandwidth::Parts(&[Part {
+            name: "B200",
+            gbps: 8000.0,
+            source: "NVIDIA DGX B200 datasheet: 8 TB/s HBM3e a GPU",
+        }]),
     },
     // NVIDIA RTX Blackwell GPU Architecture whitepaper: RTX PRO
     // 6000 Blackwell, 188 SMs at 2617 MHz, 503.8 TFLOPS dense FP16 / BF16
@@ -106,6 +153,9 @@ pub const ARCHS: &[Arch] = &[
         fp8: Some(2048.0),
         fp32: 256.0,
         source: "NVIDIA RTX Blackwell GPU Architecture whitepaper (RTX PRO 6000)",
+        bandwidth: Bandwidth::Driver {
+            verified: "RTX PRO 4500 Blackwell (on this project's box): the driver states 14001 MHz over 256 bits, x 2 = 896 GB/s, the RTX PRO 4500 Blackwell datasheet's 896 GB/s",
+        },
     },
     // AMD CDNA 2 Architecture whitepaper / MI250X datasheet: MI250X, 220 CUs
     // at 1700 MHz, 383 TFLOPS dense BF16 / FP16 matrix, 47.9 TFLOPS FP32
@@ -117,6 +167,23 @@ pub const ARCHS: &[Arch] = &[
         fp8: None,
         fp32: 128.0,
         source: "AMD CDNA 2 Architecture whitepaper; Instinct MI250X datasheet",
+        bandwidth: Bandwidth::Parts(&[
+            Part {
+                name: "MI250X",
+                gbps: 1638.4,
+                source: "AMD Instinct MI250X datasheet: 3.2768 TB/s over its two GCDs, each a device",
+            },
+            Part {
+                name: "MI250",
+                gbps: 1638.4,
+                source: "AMD Instinct MI250 datasheet: 3.2768 TB/s over its two GCDs, each a device",
+            },
+            Part {
+                name: "MI210",
+                gbps: 1638.4,
+                source: "AMD Instinct MI210 datasheet: 1.6384 TB/s",
+            },
+        ]),
     },
     // AMD CDNA 3 Architecture whitepaper: MI300X, 304 CUs at 2100
     // MHz, 1307.4 TFLOPS dense BF16 / FP16 matrix, 2614.9 TFLOPS dense FP8,
@@ -128,6 +195,23 @@ pub const ARCHS: &[Arch] = &[
         fp8: Some(4096.0),
         fp32: 256.0,
         source: "AMD CDNA 3 Architecture whitepaper (Instinct MI300X)",
+        bandwidth: Bandwidth::Parts(&[
+            Part {
+                name: "MI300X",
+                gbps: 5300.0,
+                source: "AMD Instinct MI300X datasheet: 5.3 TB/s (8 HBM3 stacks); HIP states 1300 MHz over 2048 bits, which x 2 is 665.6 GB/s",
+            },
+            Part {
+                name: "MI300A",
+                gbps: 5300.0,
+                source: "AMD Instinct MI300A datasheet: 5.3 TB/s",
+            },
+            Part {
+                name: "MI325X",
+                gbps: 6000.0,
+                source: "AMD Instinct MI325X datasheet: 6 TB/s (HBM3E)",
+            },
+        ]),
     },
     // AMD CDNA 4 Architecture whitepaper: MI355X, 256 CUs at 2400 MHz, 2.5
     // PFLOPS dense BF16 / FP16 matrix, 5.0 PFLOPS dense FP8, 157.3 TFLOPS
@@ -139,12 +223,26 @@ pub const ARCHS: &[Arch] = &[
         fp8: Some(8192.0),
         fp32: 256.0,
         source: "AMD CDNA 4 Architecture whitepaper (Instinct MI355X)",
+        bandwidth: Bandwidth::Parts(&[
+            Part {
+                name: "MI355X",
+                gbps: 8000.0,
+                source: "AMD Instinct MI355X datasheet: 8 TB/s (HBM3E)",
+            },
+            Part {
+                name: "MI350X",
+                gbps: 8000.0,
+                source: "AMD Instinct MI350X datasheet: 8 TB/s (HBM3E)",
+            },
+        ]),
     },
 ];
 
 /// What a device's driver states of itself, as the spec rates read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stated {
+    /// The device's name, as the driver states it.
+    pub device: String,
     /// The architecture's token (`sm_89`, `gfx942`).
     pub arch: String,
     /// Multiprocessors (CUs).
@@ -179,16 +277,46 @@ pub fn rates(stated: &Stated) -> Result<(profile::rates::Rates, String), String>
             stated.units, stated.clock_khz
         ));
     }
-    if stated.memory_clock_khz == 0 || stated.bus_bits == 0 {
-        return Err(format!(
-            "the driver stated a {} kHz memory clock over a {}-bit bus",
-            stated.memory_clock_khz, stated.bus_bits
-        ));
-    }
+    let (gbps, bandwidth) = match row.bandwidth {
+        Bandwidth::Driver { verified } => {
+            if stated.memory_clock_khz == 0 || stated.bus_bits == 0 {
+                return Err(format!(
+                    "the driver stated a {} kHz memory clock over a {}-bit bus",
+                    stated.memory_clock_khz, stated.bus_bits
+                ));
+            }
+            let gbps = 2.0 * f64::from(stated.memory_clock_khz) * 1e3 * f64::from(stated.bus_bits)
+                / 8.0
+                / 1e9;
+            (
+                gbps,
+                format!(
+                    "a {}-bit bus at {:.0} MHz, twice a clock = {gbps:.0} GB/s (the driver's \
+                     figures, verified on {verified})",
+                    stated.bus_bits,
+                    f64::from(stated.memory_clock_khz) / 1e3
+                ),
+            )
+        }
+        Bandwidth::Parts(parts) => {
+            let part = parts
+                .iter()
+                .find(|part| stated.device.contains(part.name))
+                .ok_or_else(|| {
+                    format!(
+                        "`{}`'s bus figures are not the datasheet's on {}, and no part of the \
+                         table's matches the device's name",
+                        stated.device, stated.arch
+                    )
+                })?;
+            (
+                part.gbps,
+                format!("{:.0} GB/s, the datasheet's ({})", part.gbps, part.source),
+            )
+        }
+    };
     let clock = f64::from(stated.clock_khz) * 1e3;
     let tflops = f64::from(stated.units) * clock * row.bf16 / 1e12;
-    let gbps =
-        2.0 * f64::from(stated.memory_clock_khz) * 1e3 * f64::from(stated.bus_bits) / 8.0 / 1e9;
     let flat = |t: f64| vec![(256, t), (8192, t)];
     let rates = profile::rates::Rates {
         gemm_tflops_by_rows: Some(vec![(1024, flat(tflops)), (4096, flat(tflops))]),
@@ -200,13 +328,11 @@ pub fn rates(stated: &Stated) -> Result<(profile::rates::Rates, String), String>
     };
     let line = format!(
         "computed from spec: {} {} at {:.0} MHz x {} bf16 dense ops a clock = {tflops:.1} \
-         TFLOP/s; a {}-bit bus at {:.0} MHz, twice a clock = {gbps:.0} GB/s ({})",
+         TFLOP/s ({}); {bandwidth}",
         stated.units,
         stated.arch,
         clock / 1e6,
         row.bf16,
-        stated.bus_bits,
-        f64::from(stated.memory_clock_khz) / 1e3,
         row.source
     );
     Ok((rates, line))
@@ -228,6 +354,17 @@ mod tests {
                 row.name
             );
             assert!(row.fp8.is_none_or(|fp8| fp8 >= row.bf16), "{}", row.name);
+            match row.bandwidth {
+                Bandwidth::Driver { verified } => assert!(!verified.is_empty(), "{}", row.name),
+                Bandwidth::Parts(parts) => assert!(
+                    !parts.is_empty()
+                        && parts
+                            .iter()
+                            .all(|p| !p.name.is_empty() && p.gbps > 0.0 && !p.source.is_empty()),
+                    "{}",
+                    row.name
+                ),
+            }
             assert!(
                 ARCHS[..at].iter().all(|other| other.name != row.name),
                 "{} twice",
@@ -242,6 +379,7 @@ mod tests {
     #[test]
     fn a_device_with_only_driver_stated_values_gets_spec_rates_named() {
         let stated = Stated {
+            device: "NVIDIA L40S".into(),
             arch: "sm_89".into(),
             units: 142,
             clock_khz: 2_520_000,
@@ -272,5 +410,29 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// An MI300X stating what HIP states (1300 MHz over 2048 bits, 665.6
+    /// GB/s by the driver's formula) gets its datasheet's 5.3 TB/s, named;
+    /// a gfx942 part the table does not list gets no bandwidth, said why.
+    #[test]
+    fn an_mi300x_gets_its_datasheet_bandwidth_not_its_bus_figures() {
+        let stated = Stated {
+            device: "AMD Instinct MI300X VF".into(),
+            arch: "gfx942".into(),
+            units: 304,
+            clock_khz: 2_100_000,
+            memory_clock_khz: 1_300_000,
+            bus_bits: 2048,
+        };
+        let (spec, line) = rates(&stated).expect("the MI300X is listed");
+        assert_eq!(spec.hbm_gbps, Some(5300.0), "{line}");
+        assert!(line.contains("the datasheet's"), "{line}");
+        let other = Stated {
+            device: "AMD Instinct MI3XX".into(),
+            ..stated
+        };
+        let why = rates(&other).expect_err("no part matches");
+        assert!(why.contains("no part of the table's matches"), "{why}");
     }
 }

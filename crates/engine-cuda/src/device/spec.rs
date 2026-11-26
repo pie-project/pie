@@ -6,7 +6,7 @@
 /// stored key names (`sm_120`, `gfx942`).
 #[cfg(feature = "cuda")]
 #[allow(unsafe_code)]
-pub fn stated(ordinal: i32, arch: &str) -> Result<engine::spec::Stated, String> {
+pub fn stated(ordinal: i32, device: &str, arch: &str) -> Result<engine::spec::Stated, String> {
     use crate::device::rt;
     let attribute = |which: rt::cudaDeviceAttr, name: &str| -> Result<u32, String> {
         let mut value = 0i32;
@@ -20,6 +20,7 @@ pub fn stated(ordinal: i32, arch: &str) -> Result<engine::spec::Stated, String> 
         u32::try_from(value).map_err(|_| format!("{name} is {value}"))
     };
     Ok(engine::spec::Stated {
+        device: device.to_string(),
         arch: arch.to_string(),
         units: attribute(
             rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount,
@@ -45,7 +46,7 @@ pub fn stated(ordinal: i32, arch: &str) -> Result<engine::spec::Stated, String> 
 /// `MultiprocessorCount`).
 #[cfg(feature = "rocm")]
 #[allow(unsafe_code)]
-pub fn stated(ordinal: i32, arch: &str) -> Result<engine::spec::Stated, String> {
+pub fn stated(ordinal: i32, device: &str, arch: &str) -> Result<engine::spec::Stated, String> {
     use core::ffi::c_int;
     const CLOCK_RATE: c_int = 5;
     const MEMORY_BUS_WIDTH: c_int = 59;
@@ -62,6 +63,7 @@ pub fn stated(ordinal: i32, arch: &str) -> Result<engine::spec::Stated, String> 
         u32::try_from(value).map_err(|_| format!("{name} is {value}"))
     };
     Ok(engine::spec::Stated {
+        device: device.to_string(),
         arch: arch.to_string(),
         units: attribute(MULTIPROCESSOR_COUNT, "MultiprocessorCount")?,
         clock_khz: attribute(CLOCK_RATE, "ClockRate")?,
@@ -72,7 +74,7 @@ pub fn stated(ordinal: i32, arch: &str) -> Result<engine::spec::Stated, String> 
 
 /// A runtimeless build reads no device.
 #[cfg(not(feature = "device"))]
-pub fn stated(_ordinal: i32, _arch: &str) -> Result<engine::spec::Stated, String> {
+pub fn stated(_ordinal: i32, _device: &str, _arch: &str) -> Result<engine::spec::Stated, String> {
     Err("a runtimeless build reads no device".to_string())
 }
 
@@ -82,7 +84,8 @@ mod tests {
     #[test]
     #[ignore = "reads the bound device"]
     fn the_bound_device_states_its_spec() {
-        let stated = super::stated(0, "sm_120").expect("the driver states");
+        let stated =
+            super::stated(0, "NVIDIA RTX PRO 4500 Blackwell", "sm_120").expect("the driver states");
         eprintln!(
             "{stated:?}: {:?}",
             engine::spec::rates(&stated).map(|(_, line)| line)

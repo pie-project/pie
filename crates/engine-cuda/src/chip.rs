@@ -443,6 +443,7 @@ mod tests {
     #[test]
     fn the_fallback_takes_the_family_then_the_spec_then_none() {
         let stated = |arch: &str| engine::spec::Stated {
+            device: "NVIDIA RTX PRO 4500 Blackwell".to_string(),
             arch: arch.to_string(),
             units: 82,
             clock_khz: 3_090_000,
