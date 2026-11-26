@@ -7,7 +7,7 @@ use toml::Spanned;
 use toml::de::DeValue;
 
 use super::{Curve, Landing, ProductTime, WidthCurves, by_toml};
-use crate::curves::{DenseSettled, KernelCurve};
+use crate::curves::{DenseSettled, FireTerm, KernelCurve};
 use crate::registry::{Walk, found, int};
 
 /// A `[rates]` value: how it is written under its key, how it is read (a
@@ -289,6 +289,40 @@ impl Form for Vec<KernelCurve> {
 
     fn over(self, below: Self) -> Self {
         joined(self, below, KernelCurve::id)
+    }
+}
+
+/// The fire's terms, one entry per kind and shape: a layer's entries join
+/// the one below, a shape's own replacing it.
+impl Form for Vec<FireTerm> {
+    fn write(&self, key: &str, out: &mut String) {
+        let rows: Vec<String> = self
+            .iter()
+            .map(|t| {
+                let shape: Vec<String> = t.shape.iter().map(u32::to_string).collect();
+                let points: Vec<String> = t
+                    .curve
+                    .iter()
+                    .map(|(x, ns)| format!("[{x}, {ns:?}]"))
+                    .collect();
+                format!(
+                    "  [{}, [{}], {}, [{}]],\n",
+                    t.kind,
+                    shape.join(", "),
+                    by_toml(&t.by),
+                    points.join(", ")
+                )
+            })
+            .collect();
+        let _ = writeln!(out, "{key} = [\n{}]", rows.concat());
+    }
+
+    fn read(walk: &mut Walk<'_>, _key: &str, v: &Spanned<DeValue<'_>>) -> Option<Self> {
+        walk.fire_terms(v)
+    }
+
+    fn over(self, below: Self) -> Self {
+        joined(self, below, FireTerm::id)
     }
 }
 

@@ -849,6 +849,7 @@ pub fn measure_keys(
         attn_tflops_by_rows_keys: None,
         product_ns: None,
         kernel_curves: None,
+        fire_terms: None,
         dense_settled: Vec::new(),
         measured_on: Some(crate::stored::measured_on(device.name())),
         measured_by: Some(

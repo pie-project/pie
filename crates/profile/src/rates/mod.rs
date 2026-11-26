@@ -54,7 +54,7 @@ use std::fmt::Write as _;
 use toml::Spanned;
 use toml::de::DeValue;
 
-use crate::curves::{DenseSettled, KernelCurve};
+use crate::curves::{DenseSettled, FireTerm, KernelCurve};
 use crate::registry::Walk;
 use form::Slot;
 
@@ -168,6 +168,13 @@ pub struct Rates {
     /// Measured; not one of [`KEYS`] (a load measures it once its model's
     /// shapes are known).
     pub kernel_curves: Option<Vec<KernelCurve>>,
+    /// The terms of a fire's time as `pie tune` measured them, each at the
+    /// shape serving launches it at ([`FireTerm`], [`FIRE_TERMS`]): what the
+    /// estimate reads a fire's attention, matmuls, routed experts, per-row
+    /// pass and own fixed cost off, keyed entry by entry by what measured
+    /// it. Entries accumulate tune to tune, a shape's own replacing it.
+    /// Measured at `pie tune`, never at a load; not one of [`KEYS`].
+    pub fire_terms: Option<Vec<FireTerm>>,
     /// The dense kernels each load's settle took in context over the
     /// curves' picks ([`DENSE_SETTLED`]), one entry per key (a model's
     /// planes, curves and rungs: [`DenseSettled::of`]), many a device: what
@@ -239,6 +246,11 @@ pub const KEYS: [&str; 9] = [
 /// (`Rates::kernel_curves`), each curve keyed by what measured it
 /// ([`KernelCurve::by`]).
 pub const KERNEL_CURVES: &str = "kernel_curves";
+
+/// The `[rates]` key of [`Rates::fire_terms`]: a list of `[kind, [shape],
+/// method, [[kernel, code], ...], [[rows, ns], ...]]`, one per kind and
+/// shape.
+pub const FIRE_TERMS: &str = "fire_terms";
 
 /// The `[rates]` key of [`Rates::dense_settled`]: a list of `[method, of,
 /// code, [[bottom, top, replaced, vector, wide, tier], ...], [[n, k], ...]]`,
@@ -478,6 +490,7 @@ rate_keys! {
     landing: LANDING,
     attn_tflops_by_rows_keys: ATTN_BY_ROWS_KEYS,
     kernel_curves: KERNEL_CURVES,
+    fire_terms: FIRE_TERMS,
     dense_settled: DENSE_SETTLED,
 }
 
@@ -493,6 +506,9 @@ impl Rates {
         }
         if let Some(curves) = &mut self.kernel_curves {
             curves.sort_by_key(KernelCurve::id);
+        }
+        if let Some(terms) = &mut self.fire_terms {
+            terms.sort_by_key(FireTerm::id);
         }
         if let Some(product) = &mut self.product_ns {
             product.sort_by_key(ProductTime::key);
@@ -654,6 +670,7 @@ mod tests {
                 ("hbm_gbps", 1),
                 ("gemm_tflops_by_rows", 1),
                 (KERNEL_CURVES, 1),
+                (FIRE_TERMS, 1),
                 (DENSE_SETTLED, 1),
             ],
             code: vec![("tiled", 11), ("coopmat", 22), ("gemv", 33)],
@@ -687,6 +704,26 @@ mod tests {
             hbm_gbps: Some(700.0),
             gemm_tflops_by_rows: Some(vec![(1024, vec![(256, 20.0)])]),
             kernel_curves: Some(vec![curve(32, "tiled"), curve(64, "coopmat")]),
+            fire_terms: Some(vec![
+                FireTerm {
+                    kind: FireTerm::ATTENTION,
+                    shape: vec![16, 8, 128, 0, 0, 64, 16384],
+                    curve: vec![(2048, 1_951_376.0), (4096, 3_376_128.0)],
+                    by: by(&["tiled"], now),
+                },
+                FireTerm {
+                    kind: FireTerm::GEMM,
+                    shape: vec![6144, 4096, 1],
+                    curve: vec![(256, 131_752.0), (4096, 1_347_296.0)],
+                    by: by(&["coopmat"], now),
+                },
+                FireTerm {
+                    kind: FireTerm::FIRE_FIXED,
+                    shape: vec![],
+                    curve: vec![(1, 530_000.0)],
+                    by: by(&["gemv"], now),
+                },
+            ]),
             dense_settled: vec![DenseSettled {
                 method: 1,
                 of: 5,
@@ -761,6 +798,26 @@ mod tests {
         let curves = rates.kernel_curves.clone().unwrap();
         assert_eq!(curves.len(), 1);
         assert_eq!(curves[0].key, 32, "the tiled curve stands");
+        let terms = rates.fire_terms.clone().unwrap();
+        assert_eq!(
+            terms.iter().map(|t| t.kind).collect::<Vec<_>>(),
+            [FireTerm::ATTENTION, FireTerm::FIRE_FIXED],
+            "the gemm term it fired goes, the others stand"
+        );
+        assert_eq!(
+            rates
+                .stale
+                .as_ref()
+                .and_then(|s| s.fire_terms.clone())
+                .map(|t| t[0].kind),
+            Some(FireTerm::GEMM),
+            "kept as an estimate"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.contains("fire term gemm [6144, 4096, 1]: not taken")),
+            "{said:#?}"
+        );
         assert_eq!(
             rates.dense_settled, before.dense_settled,
             "the settle checks its own"
@@ -823,5 +880,24 @@ mod tests {
             );
         }
         assert!(registry.parse(text, "c.toml", Strict::CheckedIn).is_err());
+    }
+
+    /// A fire term of a kind this pie does not read, or whose shape lacks a
+    /// field, is skipped alone, by name, to be measured again at `pie
+    /// tune`; the list's others are read.
+    #[test]
+    fn a_fire_term_in_another_form_is_skipped_alone() {
+        let text = "api = 1\n[rates]\nfire_terms = [\n  [1, [16, 8, 128, 0, 0, 64, 4096], 1, [[\"tiled\", 11]], [[2048, 431856.0]]],\n  [9, [1], 1, [], [[1, 2.0]]],\n  [2, [6144, 4096], 1, [], [[256, 1.0]]],\n]\n";
+        let registry = crate::Registry::new("test", &[], &[]);
+        let read = registry.parse(text, "user", Strict::User).unwrap();
+        let terms = read.tuned.rates.fire_terms.clone().unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].shape, [16, 8, 128, 0, 0, 64, 4096]);
+        assert_eq!(read.skipped_rates.len(), 2, "{:?}", read.skipped_rates);
+        assert!(
+            read.skipped_rates
+                .iter()
+                .all(|s| s.starts_with("fire_terms["))
+        );
     }
 }

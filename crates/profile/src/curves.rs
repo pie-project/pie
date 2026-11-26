@@ -26,6 +26,67 @@ pub struct DenseSettled {
     pub planes: Vec<(u32, u32)>,
 }
 
+/// One term of a fire's time, measured at `pie tune` as serving launches it
+/// ([`Rates::fire_terms`]): its kind, the shape it was timed at, its time a
+/// launch in nanoseconds by rows (ascending), and what measured it. What the
+/// estimate reads a fire's terms off in place of its roofline's, an
+/// unprofiled shape falling back to the roofline, named.
+///
+/// The kinds and their shapes:
+/// - [`FireTerm::ATTENTION`]: `[q_heads, kv_heads, head_dim, window (0:
+///   none), sinks (0 or 1), lanes (the capture's carve), keys]`, the rows a
+///   rung's prefill attends at `keys` keys, launched through serving's
+///   masked prefill and padded to the carve's lanes;
+/// - [`FireTerm::GEMM`]: `[n, k, dtype]`, a dense plane's matmul;
+/// - [`FireTerm::EXPERTS`]: `[experts, top_k, n, k, dtype]`, one routed
+///   select (gate/up or down) with its routing, sort and combine;
+/// - [`FireTerm::ROW_OPS`]: `[hidden, inter]`, a layer's per-row pass (norm,
+///   rope, residual, gated activation, kv write);
+/// - [`FireTerm::FIRE_FIXED`]: `[]`, a fire's own cost past its kernels
+///   (host preparation, replay, sync), by rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FireTerm {
+    pub kind: u32,
+    pub shape: Vec<u32>,
+    pub curve: Vec<(u32, f64)>,
+    pub by: MeasuredBy,
+}
+
+impl FireTerm {
+    pub const ATTENTION: u32 = 1;
+    pub const GEMM: u32 = 2;
+    pub const EXPERTS: u32 = 3;
+    pub const ROW_OPS: u32 = 4;
+    pub const FIRE_FIXED: u32 = 5;
+
+    /// The fields a kind's shape holds, the kind named; none for a kind
+    /// this pie does not read.
+    #[must_use]
+    pub fn shape_of(kind: u32) -> Option<(&'static str, usize)> {
+        Some(match kind {
+            Self::ATTENTION => ("attention", 7),
+            Self::GEMM => ("gemm", 3),
+            Self::EXPERTS => ("experts", 5),
+            Self::ROW_OPS => ("row ops", 2),
+            Self::FIRE_FIXED => ("fire fixed", 0),
+            _ => return None,
+        })
+    }
+
+    /// What one entry is joined, sorted and replaced by: its kind and shape.
+    #[must_use]
+    pub fn id(&self) -> (u32, Vec<u32>) {
+        (self.kind, self.shape.clone())
+    }
+
+    #[must_use]
+    pub fn name(&self) -> String {
+        let kind = Self::shape_of(self.kind).map_or("?", |(name, _)| name);
+        let shape: Vec<String> = self.shape.iter().map(u32::to_string).collect();
+        format!("{kind} [{}]", shape.join(", "))
+    }
+}
+
 /// One dense kernel's measured curve at one shape
 /// ([`Rates::kernel_curves`]): the kernel (`kind`
 /// [`KernelCurve::VECTOR`], `key` the rows a workgroup carries, or
