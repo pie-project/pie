@@ -704,19 +704,22 @@ impl Rank {
 }
 
 impl Engine for Rank {
-    /// A lockstep rank keys no host cover, and `measure = false` is refused for one by name (worker config).
+    /// A lockstep rank keys no host cover; it measures nothing at boot, so the runtime takes the
+    /// cover's estimate ([`Engine::skips_measuring`]).
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
 
-    /// Not tracked for a lockstep rank: its ranks measure at every boot (`measure =
-    /// false` is refused for one), said so by name.
+    /// Not tracked for a lockstep rank: a serving load measures nothing (`pie tune` does), but
+    /// its ranks' records are not gathered here, said so by name.
     fn measured_at_load(&self) -> Vec<String> {
         vec!["cuda (a lockstep rank): what it measured is not tracked".to_string()]
     }
 
+    /// A serving load never measures at boot: what a profile lacks is the
+    /// fallback, named.
     fn skips_measuring(&self) -> bool {
-        false
+        true
     }
 
     fn kind(&self) -> &'static str {

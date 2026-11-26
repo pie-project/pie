@@ -139,15 +139,13 @@ fn cuda_budgets(max_context: Option<u32>, declared: Option<u32>) -> engine::Budg
 }
 
 #[cfg(feature = "engine-cuda")]
-fn device_boot(
-    opts: &CudaEngineOptions,
-    home: &Path,
-    cache_dir: &Path,
-    measure: bool,
-) -> Result<DeviceBoot> {
+fn device_boot(opts: &CudaEngineOptions, home: &Path, cache_dir: &Path) -> Result<DeviceBoot> {
     let mut knobs = Knobs {
         profiles: Some(home.join("profiles")),
-        measuring: engine::rates::Measuring::of(measure),
+        // A serving load never measures: a rate, curve or product time its
+        // profile lacks is served by the engine's fallback, named in the
+        // load line; `pie tune` measures them.
+        measuring: engine::rates::Measuring::Skip,
         ..Knobs::default()
     };
     if let Some(words) = opts.diagnostics.as_deref() {
@@ -344,7 +342,7 @@ pub(crate) fn create_engine_backend_group(
         let EngineOptions::Cuda(opts) = rank_options else {
             return Err(anyhow!("cuda group creation requires cuda rank options"));
         };
-        let boot = device_boot(opts, home, cache_dir, true)?;
+        let boot = device_boot(opts, home, cache_dir)?;
         if opts.verbose {
             dump_device_boot(home, &boot, group_id, Some(rank));
         }
@@ -410,7 +408,7 @@ pub(crate) fn create_engine_lockstep(
                 "an expert-parallel group requires cuda rank options"
             ));
         };
-        let boot = device_boot(opts, home, cache_dir, true)?;
+        let boot = device_boot(opts, home, cache_dir)?;
         if opts.verbose {
             dump_device_boot(home, &boot, rank, Some(rank));
         }
@@ -488,7 +486,9 @@ pub(crate) fn create_engine_backend(
     opened: Option<runtime::engine::EngineBox>,
 ) -> Result<GroupEngine> {
     let cache_dir = &crate::disk::engine_cache_dir(home);
-    let _ = (group_id, &opened);
+    // `measure` reaches the engines that still measure at load; a cuda one
+    // never does.
+    let _ = (group_id, &opened, measure);
     validate_snapshot_dir(snapshot_dir)?;
 
     let (mut backend, budgets, platform): (
@@ -507,7 +507,7 @@ pub(crate) fn create_engine_backend(
         _ => unreachable!("`EngineOptions` has no variants in this build"),
         #[cfg(feature = "engine-cuda")]
         EngineOptions::Cuda(opts) => {
-            let boot = device_boot(opts, home, cache_dir, measure)?;
+            let boot = device_boot(opts, home, cache_dir)?;
             if opts.verbose {
                 dump_device_boot(home, &boot, group_id, None);
             }
@@ -733,6 +733,21 @@ mod tests {
         the_pool_budget_seats_by_state_slots_not_pages();
         an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else();
         an_engine_without_a_disk_tier_is_handed_no_default_dir();
+        #[cfg(feature = "engine-cuda")]
+        a_cuda_serving_load_measures_nothing();
+    }
+
+    /// A cuda serving load (CUDA or ROCm, one device or a group's rank)
+    /// never measures: its knobs state [`engine::rates::Measuring::Skip`],
+    /// so a rate, curve or product time its profile lacks is served by the
+    /// fallback, named in the load line (`engine::rates::resolve_at_load`,
+    /// `Shell::routes_measured`); `pie tune` measures them.
+    #[cfg(feature = "engine-cuda")]
+    fn a_cuda_serving_load_measures_nothing() {
+        let home = std::env::temp_dir().join(format!("pie-no-boot-rates-{}", std::process::id()));
+        let boot = device_boot(&CudaEngineOptions::default(), &home, &home.join("cache"))
+            .expect("the boot is laid");
+        assert_eq!(boot.knobs.measuring, engine::rates::Measuring::Skip);
     }
 
     fn an_engine_without_a_disk_tier_is_handed_no_default_dir() {

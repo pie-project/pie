@@ -516,18 +516,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             top
         } else {
             match choice {
-                // A load that skips measuring (`[engine] measure = false`) on a
-                // card whose layers state no rate this model is weighed by: its
-                // fire top is the narrowest rung a decode fire takes, a prompt
-                // chunked to it; said by name.
+                // A load that measures nothing (every serving load; `pie tune`
+                // measures) on a card whose layers state no rate this model is
+                // weighed by: its fire top is the narrowest rung a decode fire
+                // takes, a prompt chunked to it; said by name.
                 Err(engine::load::Refused::NoRates { key, .. })
                     if boot.knobs.measuring == engine::rates::Measuring::Skip =>
                 {
                     let rung = crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
                     tracing::info!(
-                        "skipped: the roofline `[rates] {key}` (`[engine] measure = false`, no layer \
-                         states it): the fire top is {rung}, the narrowest rung a decode fire of \
-                         {fire_lanes} lanes takes, a prompt chunked to it"
+                        "fallback: the roofline `[rates] {key}` (no layer states it; a load \
+                         measures nothing, `pie tune` does): the fire top is {rung}, the narrowest \
+                         rung a decode fire of {fire_lanes} lanes takes, a prompt chunked to it"
                     );
                     weighed = None;
                     rung

@@ -34,13 +34,13 @@ impl Shell {
             );
             return Ok(());
         }
-        // Under `[engine] measure = false` nothing is timed: each shape no
+        // A serving load times nothing (`pie tune` does): each shape no
         // layer states keeps its stated kernel, by name, and none is saved.
         if self.routes_measuring == engine::rates::Measuring::Skip {
             tracing::info!(
-                "rates: skipped: `[rates] product_ns` for {} decode product \
-                 shape(s): nothing timed (`[engine] measure = false`); each keeps its stated \
-                 kernel",
+                "rates: fallback: `[rates] product_ns` for {} decode product \
+                 shape(s): nothing timed at load (`pie tune` measures it); each keeps its \
+                 stated kernel",
                 wanted.len()
             );
             return Ok(());

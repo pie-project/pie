@@ -1301,7 +1301,7 @@ pub fn resolve_at_load(
                         " (this engine does not time it behind serving here: the next export \
                          round refreshes it)"
                     }
-                    (Measuring::Skip, _) => " (`[engine] measure = false`: not timed again)",
+                    (Measuring::Skip, _) => " (not timed at load: `pie tune` times it)",
                 }
             );
         }
@@ -1323,9 +1323,9 @@ pub fn resolve_at_load(
     if measuring == Measuring::Skip {
         for key in &lacked {
             tracing::info!(
-                "rates: skipped: `[rates] {key}`: nothing timed (`[engine] measure = false`) and no \
-                 layer states it under a matching key; served by the estimate, which names what \
-                 it takes in its place"
+                "rates: fallback: `[rates] {key}`: nothing timed at load (`pie tune` measures \
+                 it) and no layer states it under a matching key; served by the estimate, which \
+                 names what it takes in its place"
             );
         }
         let mut tuned = chip.tuned().clone();

@@ -375,19 +375,22 @@ impl Drop for Group {
 }
 
 impl Engine for Group {
-    /// A group keys no host cover, and `measure = false` is refused for one by name (worker config).
+    /// A group keys no host cover; it measures nothing at boot, so the runtime takes the
+    /// cover's estimate ([`Engine::skips_measuring`]).
     fn committed_covers(&self) -> &'static [&'static str] {
         &[]
     }
 
-    /// Not tracked for a tensor-parallel group: its ranks measure at every boot (`measure =
-    /// false` is refused for one), said so by name.
+    /// Not tracked for a tensor-parallel group: a serving load measures nothing (`pie tune` does), but
+    /// its ranks' records are not gathered here, said so by name.
     fn measured_at_load(&self) -> Vec<String> {
         vec!["cuda (a tensor-parallel group): what it measured is not tracked".to_string()]
     }
 
+    /// A serving load never measures at boot: what a profile lacks is the
+    /// fallback, named.
     fn skips_measuring(&self) -> bool {
-        false
+        true
     }
 
     fn kind(&self) -> &'static str {

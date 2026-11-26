@@ -832,9 +832,11 @@ pub struct EngineConfig {
     /// curve at the model's planes, the dense settle), and keeps them for
     /// the next boot. `false` times nothing: each is served by the engine's
     /// estimate, named in the load log, and nothing is stored (`pie serve
-    /// --no-measure`). Vulkan, wgpu, and a one-device cuda engine (CUDA or
-    /// ROCm); xla, whose load times nothing on the device, states it to the
-    /// runtime, which estimates the host cover rather than timing it.
+    /// --no-measure`). Vulkan and wgpu; xla, whose load times nothing on
+    /// the device, states it to the runtime, which estimates the host cover
+    /// rather than timing it. A cuda engine (CUDA or ROCm) never measures at
+    /// load, whatever this says: what its profile lacks is served by the
+    /// fallback, named, and `pie tune` measures it.
     #[serde(default = "default_measure")]
     pub measure: bool,
     /// `[engine.memory]`: the optional caps for sharing a machine.
@@ -1036,16 +1038,11 @@ impl EngineConfig {
                     self.kind,
                     EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal | EngineKind::Xla
                 )
-                || (self.kind == EngineKind::Cuda && self.device.len() == 1),
+                || self.kind == EngineKind::Cuda,
             "engine.measure = false skips the measurements a load takes on the vulkan, wgpu, \
-             metal and xla engines and a one-device cuda engine; the {} engine{} still measures outside \
-             that path, so omit the key",
+             metal and xla engines (a cuda load never measures); the {} engine still measures \
+             outside that path, so omit the key",
             self.kind.as_str(),
-            if self.kind == EngineKind::Cuda {
-                " across devices"
-            } else {
-                ""
-            }
         );
         ensure!(
             self.memory.kv_device_tokens.is_none() || self.kind == EngineKind::Cuda,
@@ -1169,7 +1166,7 @@ device = ["metal:0"]
         a_distributed_worker_states_no_cluster_policies();
         the_policies_default_to_the_built_in_defaults();
         the_diag_flag_states_the_engines_diagnostics_key();
-        measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
+        measuring_is_skipped_on_every_engine_that_skips();
         an_engine_s_own_key_is_written_beside_the_common_ones();
         parses_minimal_metal_config();
         every_engine_kind_round_trips_through_its_config_string();
@@ -1315,7 +1312,7 @@ device = ["metal:0"]
         );
     }
 
-    fn measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere() {
+    fn measuring_is_skipped_on_every_engine_that_skips() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.skip_measuring().expect("metal skips");
         assert!(!cfg.engine.measure);
@@ -1324,7 +1321,7 @@ device = ["metal:0"]
             .replace("[\"metal:0\"]", "[\"cuda:0\", \"cuda:1\"]");
         let mut cfg: Config = toml::from_str(&group).unwrap();
         cfg.skip_measuring()
-            .expect_err("a cuda group measures outside the skip path");
+            .expect("a cuda group never measures at load, so it skips too");
     }
 
     fn an_engine_s_own_key_is_written_beside_the_common_ones() {
