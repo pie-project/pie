@@ -1021,7 +1021,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let inputs: Input = a.next()?;
-            let kv: StateName = a.next()?;
+            let kv: String = a.next()?;
             let q_heads: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -1031,9 +1031,55 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.capture_scores", || {
                     ops::attn::capture_scores(
-                        &q, &inputs, &kv.0, q_heads, kv_heads, head_dim, sm_scale, observe,
+                        &q, &inputs, &kv, q_heads, kv_heads, head_dim, sm_scale, observe,
                     )
                 })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "score_capture",
+        params: &[
+            "q", "inputs", "kv", "q_heads", "kv_heads", "head_dim", "sm_scale", "observe", "into",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let inputs: Input = a.next()?;
+            let kv: StateName = a.next()?;
+            let q_heads: u32 = a.next()?;
+            let kv_heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            let observe: u32 = a.next()?;
+            let into: Option<Value> = a.next()?;
+            result(
+                heap,
+                dsl("attn.score_capture", || {
+                    ops::attn::score_capture(
+                        &q,
+                        &inputs,
+                        &kv.0,
+                        q_heads,
+                        kv_heads,
+                        head_dim,
+                        sm_scale,
+                        observe,
+                        into.as_ref(),
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "score_pages",
+        params: &["keys"],
+        call: |a, heap| {
+            let keys: Value = a.next()?;
+            result(
+                heap,
+                dsl("attn.score_pages", || ops::attn::score_pages(&keys))?,
             )
         },
     },
