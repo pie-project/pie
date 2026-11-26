@@ -32,16 +32,10 @@ echo "== inferlets (wasm32-wasip3)"
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
 
-# The device budget, derived: the model's bytes (its artifact for this
-# engine), what the load's rates step lays to measure the roofline rates no
-# profile states for llvmpipe (`engine::rates::step_bytes()`, 1792 MiB: the
-# refusal reads "measuring them needs 1792 MiB of device memory where the
-# load's budget leaves ..."), and the floor kept under every device's
-# capacity (`engine::memory::SAFETY_FLOOR_BYTES`, 64 MiB).
-model_bytes=$(find "$PIE_HOME/artifacts" -name "*.$engine.zt" -printf '%s\n' | head -1)
-[ -n "$model_bytes" ] || { echo "no $engine artifact under $PIE_HOME/artifacts"; exit 1; }
-budget_device=$(( model_bytes + (1792 << 20) + (64 << 20) ))
-echo "budget_device = $budget_device bytes: model $model_bytes + rates step $((1792 << 20)) + floor $((64 << 20))"
+# llvmpipe is too slow to time the roofline rates on (a measuring boot ran
+# past seven minutes and its fences timed out): the load measures nothing
+# (`[engine] measure = false`, each rate served by the estimate, named in the
+# log), so the budget holds only the model and its pools, as main's did.
 
 case "$engine" in
   wgpu)   engine_toml=$'type = "wgpu"\nbackends = "vulkan"\ndevice = ["wgpu:0"]' ;;
@@ -56,8 +50,9 @@ name = "default"
 source = "snapshot"
 [engine]
 $engine_toml
+measure = false
 [engine.memory]
-budget_device = "${budget_device}B"
+budget_device = "1GiB"
 [sandbox]
 allow_fs = false
 allow_network = true
