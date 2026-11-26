@@ -80,7 +80,7 @@ pub const ARCHS: &[Arch] = &[
         fp32: 128.0,
         source: "NVIDIA A100 Tensor Core GPU Architecture whitepaper (A100 SXM4)",
         bandwidth: Bandwidth::Driver {
-            verified: "A100 SXM4 40GB: deviceQuery states a 1215 MHz memory clock over 5120 bits, x 2 = 1555 GB/s, the A100 datasheet's 1555 GB/s",
+            verified: "A100 SXM4 40GB, recalled (not read on our cards): deviceQuery as published states a 1215 MHz memory clock over 5120 bits, x 2 = 1555 GB/s, the A100 datasheet's 1555 GB/s",
         },
     },
     // NVIDIA Ampere GA102 GPU Architecture whitepaper:
@@ -95,7 +95,7 @@ pub const ARCHS: &[Arch] = &[
         fp32: 256.0,
         source: "NVIDIA Ampere GA102 GPU Architecture whitepaper (RTX A6000)",
         bandwidth: Bandwidth::Driver {
-            verified: "RTX A6000: deviceQuery states 8001 MHz over 384 bits, x 2 = 768 GB/s, the RTX A6000 datasheet's 768 GB/s",
+            verified: "RTX A6000, recalled (not read on our cards): deviceQuery as published states 8001 MHz over 384 bits, x 2 = 768 GB/s, the RTX A6000 datasheet's 768 GB/s",
         },
     },
     // NVIDIA Ada GPU Architecture whitepaper / L40S
@@ -109,7 +109,7 @@ pub const ARCHS: &[Arch] = &[
         fp32: 256.0,
         source: "NVIDIA Ada GPU Architecture whitepaper; L40S datasheet",
         bandwidth: Bandwidth::Driver {
-            verified: "L40S: deviceQuery states 9001 MHz over 384 bits, x 2 = 864 GB/s, the L40S datasheet's 864 GB/s",
+            verified: "L40S, read on our card: cudaDevAttrMemoryClockRate 9001000 kHz over a 384-bit bus, x 2 = 864.1 GB/s, the L40S datasheet's 864 GB/s",
         },
     },
     // NVIDIA H100 Tensor Core GPU Architecture whitepaper: H100
@@ -123,7 +123,7 @@ pub const ARCHS: &[Arch] = &[
         fp32: 256.0,
         source: "NVIDIA H100 Tensor Core GPU Architecture whitepaper (H100 SXM5)",
         bandwidth: Bandwidth::Driver {
-            verified: "H100 SXM5: deviceQuery states 2619 MHz over 5120 bits, x 2 = 3352 GB/s, the H100 datasheet's 3.35 TB/s",
+            verified: "H100 PCIe, read on our cards (driver 595.112.07): cudaDevAttrMemoryClockRate 1593000 kHz (nvidia-smi's clocks.max.memory) over a 5120-bit bus, x 2 = 2039 GB/s, the H100 PCIe datasheet's 2.0 TB/s: the rule holds on this HBM part",
         },
     },
     // NVIDIA Blackwell Architecture Technical Brief / DGX B200 datasheet:
