@@ -43,7 +43,19 @@ pub struct DenseSettled {
 /// - [`FireTerm::ROW_OPS`]: `[hidden, inter]`, a layer's per-row pass (norm,
 ///   rope, residual, gated activation, kv write);
 /// - [`FireTerm::FIRE_FIXED`]: `[]`, a fire's own cost past its kernels
-///   (host preparation, replay, sync), by rows.
+///   (host preparation, replay, sync), by rows: the rung's body fired end
+///   to end less the same body's device time;
+/// - [`FireTerm::SCAN`]: `[k_heads, v_heads, k_dim, v_dim, conv_width]`, one
+///   gated-delta layer's recurrent part (its conv, chunked scan, gates and
+///   norm together; its projections are [`FireTerm::GEMM`] terms).
+///
+/// Every kind's `rows` are the rungs the engine arms (the estimate
+/// interpolates between them in log rows). An attention entry is one key
+/// count (its shape's last field); a rung's attention at other keys is read
+/// linearly between the entries at the same heads and lanes. `lanes` is the
+/// carve the engine's captured plan pads the rung to. A term is one layer's
+/// (or one plane's); the estimate multiplies by the layers that hold it.
+/// `dtype` codes: [`FireTerm::BF16`] and on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FireTerm {
     pub kind: u32,
@@ -58,6 +70,17 @@ impl FireTerm {
     pub const EXPERTS: u32 = 3;
     pub const ROW_OPS: u32 = 4;
     pub const FIRE_FIXED: u32 = 5;
+    pub const SCAN: u32 = 6;
+
+    /// A plane's stored dtype, as a gemm or experts shape states it.
+    pub const BF16: u32 = 1;
+    pub const FP16: u32 = 2;
+    pub const FP8_E4M3: u32 = 3;
+    pub const MXFP4: u32 = 4;
+    pub const NVFP4: u32 = 5;
+    /// Affine 4-bit codes in groups (`u4g64`).
+    pub const INT4_AFFINE: u32 = 6;
+    pub const FP32: u32 = 7;
 
     /// The fields a kind's shape holds, the kind named; none for a kind
     /// this pie does not read.
@@ -69,6 +92,7 @@ impl FireTerm {
             Self::EXPERTS => ("experts", 5),
             Self::ROW_OPS => ("row ops", 2),
             Self::FIRE_FIXED => ("fire fixed", 0),
+            Self::SCAN => ("scan", 5),
             _ => return None,
         })
     }
