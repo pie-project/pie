@@ -1,0 +1,192 @@
+# device,NVIDIA L40S,profile,user profile <home>/profiles/cuda/user/nvidia-l40s.toml,home,<path>
+kind,model,op,rows,n_or_keys,k_or_window,ns
+attn,qwen3-8b,full,256,4096,0,99256
+# plan,qwen3-8b,256,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,512,4096,0,174744
+# plan,qwen3-8b,512,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,1024,4096,0,311184
+# plan,qwen3-8b,1024,4096,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,2048,4096,0,567016
+# plan,qwen3-8b,2048,4096,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,4096,4096,0,731496
+# plan,qwen3-8b,4096,4096,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,256,16384,0,334680
+# plan,qwen3-8b,256,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,512,16384,0,640864
+# plan,qwen3-8b,512,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,1024,16384,0,1287184
+# plan,qwen3-8b,1024,16384,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,2048,16384,0,2494600
+# plan,qwen3-8b,2048,16384,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,4096,16384,0,4572576
+# plan,qwen3-8b,4096,16384,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,8192,16384,0,7720472
+# plan,qwen3-8b,8192,16384,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,16384,16384,0,10366664
+# plan,qwen3-8b,16384,16384,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,256,32768,0,681400
+# plan,qwen3-8b,256,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,512,32768,0,1356032
+# plan,qwen3-8b,512,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,1024,32768,0,2637904
+# plan,qwen3-8b,1024,32768,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,2048,32768,0,5069472
+# plan,qwen3-8b,2048,32768,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,4096,32768,0,9692248
+# plan,qwen3-8b,4096,32768,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,8192,32768,0,18420015
+# plan,qwen3-8b,8192,32768,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-8b,full,16384,32768,0,31355480
+# plan,qwen3-8b,16384,32768,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,256,4096,0,64936
+# plan,qwen3-0.6b,256,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,512,4096,0,104744
+# plan,qwen3-0.6b,512,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,1024,4096,0,177312
+# plan,qwen3-0.6b,1024,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,2048,4096,0,303760
+# plan,qwen3-0.6b,2048,4096,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,4096,4096,0,441512
+# plan,qwen3-0.6b,4096,4096,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,256,16384,0,183072
+# plan,qwen3-0.6b,256,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,512,16384,0,335776
+# plan,qwen3-0.6b,512,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,1024,16384,0,663368
+# plan,qwen3-0.6b,1024,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,2048,16384,0,1290424
+# plan,qwen3-0.6b,2048,16384,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,4096,16384,0,2424400
+# plan,qwen3-0.6b,4096,16384,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,8192,16384,0,4008800
+# plan,qwen3-0.6b,8192,16384,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,16384,16384,0,5394672
+# plan,qwen3-0.6b,16384,16384,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,256,32768,0,359856
+# plan,qwen3-0.6b,256,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,512,32768,0,662232
+# plan,qwen3-0.6b,512,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,1024,32768,0,1333048
+# plan,qwen3-0.6b,1024,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,2048,32768,0,2609600
+# plan,qwen3-0.6b,2048,32768,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,4096,32768,0,5017120
+# plan,qwen3-0.6b,4096,32768,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,8192,32768,0,9129120
+# plan,qwen3-0.6b,8192,32768,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-0.6b,full,16384,32768,0,15675384
+# plan,qwen3-0.6b,16384,32768,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,256,4096,0,105480
+# plan,gpt-oss-20b,256,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,512,4096,0,181032
+# plan,gpt-oss-20b,512,4096,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,1024,4096,0,336280
+# plan,gpt-oss-20b,1024,4096,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,2048,4096,0,562520
+# plan,gpt-oss-20b,2048,4096,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,4096,4096,0,761432
+# plan,gpt-oss-20b,4096,4096,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,256,16384,0,355040
+# plan,gpt-oss-20b,256,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,512,16384,0,726928
+# plan,gpt-oss-20b,512,16384,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,1024,16384,0,1437624
+# plan,gpt-oss-20b,1024,16384,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,2048,16384,0,2693288
+# plan,gpt-oss-20b,2048,16384,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,4096,16384,0,4929720
+# plan,gpt-oss-20b,4096,16384,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,8192,16384,0,8800928
+# plan,gpt-oss-20b,8192,16384,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,16384,16384,0,11507288
+# plan,gpt-oss-20b,16384,16384,split_kv false padded_grid 1024 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,256,32768,0,692632
+# plan,gpt-oss-20b,256,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,512,32768,0,1459728
+# plan,gpt-oss-20b,512,32768,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,1024,32768,0,2838256
+# plan,gpt-oss-20b,1024,32768,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,2048,32768,0,5527200
+# plan,gpt-oss-20b,2048,32768,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,4096,32768,0,11076832
+# plan,gpt-oss-20b,4096,32768,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,8192,32768,0,19583632
+# plan,gpt-oss-20b,8192,32768,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,full,16384,32768,0,33972713
+# plan,gpt-oss-20b,16384,32768,split_kv false padded_grid 1024 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,256,4096,128,31544
+# plan,gpt-oss-20b,256,4096,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,512,4096,128,33664
+# plan,gpt-oss-20b,512,4096,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,1024,4096,128,62032
+# plan,gpt-oss-20b,1024,4096,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,2048,4096,128,89416
+# plan,gpt-oss-20b,2048,4096,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,4096,4096,128,153896
+# plan,gpt-oss-20b,4096,4096,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,256,16384,128,23224
+# plan,gpt-oss-20b,256,16384,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,512,16384,128,27800
+# plan,gpt-oss-20b,512,16384,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,1024,16384,128,52232
+# plan,gpt-oss-20b,1024,16384,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,2048,16384,128,88376
+# plan,gpt-oss-20b,2048,16384,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,4096,16384,128,156512
+# plan,gpt-oss-20b,4096,16384,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,8192,16384,128,301760
+# plan,gpt-oss-20b,8192,16384,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,16384,16384,128,572304
+# plan,gpt-oss-20b,16384,16384,split_kv false padded_grid 1024 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,256,32768,128,23464
+# plan,gpt-oss-20b,256,32768,split_kv true padded_grid 35 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,512,32768,128,22084
+# plan,gpt-oss-20b,512,32768,split_kv false padded_grid 32 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,1024,32768,128,52144
+# plan,gpt-oss-20b,1024,32768,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,2048,32768,128,87788
+# plan,gpt-oss-20b,2048,32768,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,4096,32768,128,156960
+# plan,gpt-oss-20b,4096,32768,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,8192,32768,128,302352
+# plan,gpt-oss-20b,8192,32768,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,gpt-oss-20b,window,16384,32768,128,577456
+# plan,gpt-oss-20b,16384,32768,split_kv false padded_grid 1024 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,256,4096,0,97560
+# plan,qwen3-30b-a3b,256,4096,split_kv true padded_grid 71 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,512,4096,0,176616
+# plan,qwen3-30b-a3b,512,4096,split_kv true padded_grid 71 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,1024,4096,0,319768
+# plan,qwen3-30b-a3b,1024,4096,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,2048,4096,0,566424
+# plan,qwen3-30b-a3b,2048,4096,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,4096,4096,0,753320
+# plan,qwen3-30b-a3b,4096,4096,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,256,16384,0,324360
+# plan,qwen3-30b-a3b,256,16384,split_kv true padded_grid 71 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,512,16384,0,640440
+# plan,qwen3-30b-a3b,512,16384,split_kv true padded_grid 71 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,1024,16384,0,1313152
+# plan,qwen3-30b-a3b,1024,16384,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,2048,16384,0,2490464
+# plan,qwen3-30b-a3b,2048,16384,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,4096,16384,0,4621640
+# plan,qwen3-30b-a3b,4096,16384,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,8192,16384,0,7939328
+# plan,qwen3-30b-a3b,8192,16384,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,16384,16384,0,10825672
+# plan,qwen3-30b-a3b,16384,16384,split_kv false padded_grid 1024 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,256,32768,0,674128
+# plan,qwen3-30b-a3b,256,32768,split_kv true padded_grid 71 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,512,32768,0,1334352
+# plan,qwen3-30b-a3b,512,32768,split_kv true padded_grid 71 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,1024,32768,0,2631688
+# plan,qwen3-30b-a3b,1024,32768,split_kv false padded_grid 64 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,2048,32768,0,5169632
+# plan,qwen3-30b-a3b,2048,32768,split_kv false padded_grid 128 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,4096,32768,0,10152128
+# plan,qwen3-30b-a3b,4096,32768,split_kv false padded_grid 256 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,8192,32768,0,18237583
+# plan,qwen3-30b-a3b,8192,32768,split_kv false padded_grid 512 cta_tile_q 128 ctas_per_sm 2
+attn,qwen3-30b-a3b,full,16384,32768,0,31678944
+# plan,qwen3-30b-a3b,16384,32768,split_kv false padded_grid 1024 cta_tile_q 128 ctas_per_sm 2
