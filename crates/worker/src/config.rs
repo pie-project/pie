@@ -905,12 +905,19 @@ pub struct MemoryConfig {
     /// states unified memory (Metal, phones, DGX Spark: the pool and the
     /// host share one RAM) and `0` on separate device memory.
     ///
-    /// Idle cache is not timed out by the runtime: it stays until a demand
-    /// needs its room, and then goes in retention-priority, then
-    /// least-recently-used, order, down a tier where its `retention/tiers`
-    /// row lets it sit (under `noop`, every tier), else dropped (what an
-    /// exited process left, under `default`). How long it is kept past
-    /// that is the policy's to state.
+    /// What a lower target gives back is the pool's free segments, and
+    /// segments whose chunks move into the room left in the rest. Short of
+    /// that room, the weight cache is shed, then idle cache goes, in
+    /// retention-priority, then least-recently-used, order: down a tier
+    /// only where a `retention/tiers` row or the policy's tiers default
+    /// names one, else dropped (idle cache no row keys, all of it under
+    /// `noop`, and what an exited process left under `default`). The
+    /// activation rung comes down last. Live, suspended and resting
+    /// state is never given up for it: what they hold stays held.
+    ///
+    /// Idle cache is not timed out by the runtime: it stays until a demand,
+    /// or a lower target, needs its room. How long it is kept past that is
+    /// the policy's to state.
     #[serde(rename = "yield")]
     pub yield_share: Option<f64>,
 }
