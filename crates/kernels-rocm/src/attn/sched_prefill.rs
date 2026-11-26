@@ -339,6 +339,7 @@ fn layout(
     info.kv_chunk_size_ptr_offset = Some(ints.alloc(4, 1, "batch_prefill_kv_chunk_size_ptr")?);
     if req.enable_cuda_graph {
         info.total_num_rows_offset = Some(ints.alloc(4, 16, "batch_prefill_total_num_rows")?);
+        info.block_live_offset = Some(ints.alloc(4, 16, "batch_prefill_block_live")?);
     }
 
     let mut floats = AlignedAllocator::new(op, float_space);
@@ -362,8 +363,8 @@ fn layout(
             "batch_prefill_merge_indptr",
         )?);
     }
-    // A captured grid is padded past the work: its extra blocks read the
-    // mask and leave.
+    // A captured grid is padded past the work: its extra blocks leave on the
+    // live count (`block_live_offset`) or the mask.
     if sched.split_kv || req.enable_cuda_graph {
         info.block_valid_mask_offset =
             Some(ints.alloc(padded, 16, "batch_prefill_block_valid_mask")?);
@@ -419,6 +420,11 @@ fn stage(
             at(info.total_num_rows_offset),
             req.qo_indptr[req.live.requests as usize],
             "batch_prefill_total_num_rows",
+        )?;
+        staging.put_i32(
+            at(info.block_live_offset),
+            narrow(op, "batch_prefill_block_live", i64::from(sched.new_batch_size))?,
+            "batch_prefill_block_live",
         )?;
     }
     if sched.split_kv {

@@ -29,6 +29,10 @@ struct Paged {
     const i32* kv_tile_indices;
     const i32* kv_chunk_size;
     const u8* block_valid;
+    // A captured grid's live work items (staged each fire), null for every
+    // block of the grid: the blocks past them exit, and the live ones take
+    // the unpadded grid's order (`prefill_item`).
+    const i32* block_live;
     void* o;
     float* lse;
     i32 num_qo_heads;
@@ -609,13 +613,23 @@ constexpr int prefill_bc() {
 // at once are neighbouring query tiles of one head and find that head's keys
 // and values in its L2; causal items walk each head from its last (the
 // longest) down.
-__device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head) {
-    const int total = gridDim.x * gridDim.y, b = blockIdx.x + gridDim.x * blockIdx.y;
+__device__ __forceinline__ void prefill_item(const Paged& p, bool causal, int& bx, int& kv_head) {
+    // A captured grid is padded past its live items. Spread over the padded
+    // width, the swizzle below would give half the chiplets only empty
+    // blocks; over the live width the live blocks are the grid's first and
+    // run in the unpadded order, and the rest leave (bx −1).
+    const int live = p.block_live != nullptr ? min(*p.block_live, static_cast<int>(gridDim.x)) : gridDim.x;
+    const int total = live * gridDim.y, b = blockIdx.x + gridDim.x * blockIdx.y;
+    if (b >= total) {
+        bx = -1;
+        kv_head = 0;
+        return;
+    }
     const int xcd = b % 8, q = total / 8, rem = total % 8;
     const int at = xcd * q + min(xcd, rem) + b / 8;
-    kv_head = at / gridDim.x;
-    bx = at % gridDim.x;
-    if (causal) bx = gridDim.x - 1 - bx;
+    kv_head = at / live;
+    bx = at % live;
+    if (causal) bx = live - 1 - bx;
 }
 
 // The masked form's two segments, a request each (`kernels_cuda`'s custom
@@ -644,8 +658,8 @@ __device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const Pr
     __shared__ alignas(16) bf16 vt[D][VPAD];
 
     int bx, kv_head;
-    prefill_item(CAUSAL, bx, kv_head);
-    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
+    prefill_item(p, CAUSAL, bx, kv_head);
+    if (bx < 0 || (p.block_valid != nullptr && p.block_valid[bx] == 0)) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
     const int qo_tile = p.qo_tile_indices[bx];
@@ -915,8 +929,8 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     // Causal tiles grow with their position: the last of a request walks the
     // most keys, so the grid starts there and the short ones fill the tail.
     int bx, kv_head;
-    prefill_item(CAUSAL, bx, kv_head);
-    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
+    prefill_item(p, CAUSAL, bx, kv_head);
+    if (bx < 0 || (p.block_valid != nullptr && p.block_valid[bx] == 0)) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
     const int qo_tile = p.qo_tile_indices[bx];
@@ -1144,8 +1158,8 @@ __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, con
 // bind reads as masked (origin 0, wide), as the masked body reads it.
 __device__ __forceinline__ bool prefill_reads_no_bit(const Paged& p, const PrefillMask& mask) {
     int bx, kv_head;
-    prefill_item(true, bx, kv_head);
-    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return false;
+    prefill_item(p, true, bx, kv_head);
+    if (bx < 0 || (p.block_valid != nullptr && p.block_valid[bx] == 0)) return false;
     const int req = p.request_indices[bx];
     const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
     return (word >> 31) == 0 && static_cast<int>(word & 0x7fffffffu) >= kv_length(p, req);
