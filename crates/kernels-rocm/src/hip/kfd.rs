@@ -289,6 +289,14 @@ fn node_of_current_device() -> Result<PathBuf, String> {
 /// The current device's PCI domain and KFD location id (bus << 8 | device
 /// << 3 | function).
 fn pci_location() -> Result<(u64, u64), String> {
+    let id = pci_bus_id()?;
+    parse_bus_id(&id)
+        .ok_or_else(|| format!("HIP's PCI bus id `{id}` is not domain:bus:device.function"))
+}
+
+/// The current device's PCI bus id as HIP states it
+/// (`domain:bus:device.function`).
+pub fn pci_bus_id() -> Result<String, String> {
     let mut device = 0;
     // SAFETY: writes one int.
     unsafe { super::rt::hipGetDevice(&raw mut device) };
@@ -301,11 +309,9 @@ fn pci_location() -> Result<(u64, u64), String> {
         return Err(format!("hipDeviceGetPCIBusId answered {code}"));
     }
     // SAFETY: HIP wrote a NUL-terminated string into `bus`.
-    let id = unsafe { core::ffi::CStr::from_ptr(bus.as_ptr()) }
+    Ok(unsafe { core::ffi::CStr::from_ptr(bus.as_ptr()) }
         .to_string_lossy()
-        .into_owned();
-    parse_bus_id(&id)
-        .ok_or_else(|| format!("HIP's PCI bus id `{id}` is not domain:bus:device.function"))
+        .into_owned())
 }
 
 fn parse_bus_id(id: &str) -> Option<(u64, u64)> {

@@ -518,28 +518,19 @@ fn pairings<'a>(
 }
 
 /// How a load knows the link its weights cross: the profile's stated
-/// landing, the fallback's (a serving load, which times nothing), or
-/// measured as the ring opens (`pie tune`'s loads).
+/// landing; the host link's stated ceiling alone (a serving load, which
+/// times nothing, whose profile states no landing): its copy latency, fill
+/// rate and saturating copy unknown, so the ring's rule sizes a slot at
+/// its bound, the largest tensor; no stated figure at all, each tensor
+/// copied as it lands; or measured as the ring opens (`pie tune`'s loads).
 #[derive(Clone, Copy, Debug)]
 pub enum Landed {
     Stated(profile::rates::Landing),
-    Fallback,
+    /// The host link's stated copy ceiling, bytes a second.
+    Link(f64),
+    Unstated,
     Measured,
 }
-
-/// The link a load assumes where its profile states no `[rates] landing`
-/// and it times nothing: a PCIe-class copy and fill, its read rates unknown
-/// (0), so the checkpoint walk splits its reads as it learns them, as with
-/// no rates at all.
-pub const LANDING_FALLBACK: profile::rates::Landing = profile::rates::Landing {
-    copy_latency_ns: 10_000.0,
-    copy_gbps: 25.0,
-    copy_full_bytes: 4_194_304.0,
-    fill_gbps: 10.0,
-    read_spawn_ns: 0.0,
-    read_thread_gbps: 0.0,
-    read_whole_gbps: 0.0,
-};
 
 impl Weights {
     #[allow(clippy::too_many_arguments)]
@@ -556,8 +547,7 @@ impl Weights {
     ) -> Result<Weights> {
         let known = match landed {
             Landed::Stated(stated) => Some(stated),
-            Landed::Fallback => Some(LANDING_FALLBACK),
-            Landed::Measured => None,
+            Landed::Link(_) | Landed::Unstated | Landed::Measured => None,
         };
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -652,17 +642,38 @@ impl Weights {
                 .max()
                 .unwrap_or(0);
             let opening = std::time::Instant::now();
-            let ring = match largest {
-                0 => None,
-                _ => match crate::landing_ring::Ring::open(
-                    largest,
-                    known.map(|known| crate::landing_ring::Rates {
-                        latency: known.copy_latency_ns / 1e9,
-                        copy: known.copy_gbps * 1e9,
-                        saturated: known.copy_full_bytes as usize,
-                        fill: known.fill_gbps * 1e9,
-                    }),
-                ) {
+            let rates = match landed {
+                Landed::Stated(known) => Some(crate::landing_ring::Rates {
+                    latency: known.copy_latency_ns / 1e9,
+                    copy: known.copy_gbps * 1e9,
+                    saturated: known.copy_full_bytes as usize,
+                    fill: known.fill_gbps * 1e9,
+                }),
+                // The link states its ceiling and nothing else: no latency to
+                // cover (0) and no fill to overlap (the copy's own), so the
+                // rule sizes a slot at its bound, the largest tensor.
+                Landed::Link(copy) => Some(crate::landing_ring::Rates {
+                    latency: 0.0,
+                    copy,
+                    saturated: largest,
+                    fill: copy,
+                }),
+                Landed::Unstated | Landed::Measured => None,
+            };
+            let ring = match (largest, landed) {
+                (0, _) | (_, Landed::Unstated) => None,
+                _ => match crate::landing_ring::Ring::open(largest, rates) {
+                    Ok(ring) if matches!(landed, Landed::Link(_)) => {
+                        tracing::info!(
+                            "the weights cross by a pinned ring of 2 x {} KiB, the largest \
+                             tensor: the host link states a {:.1} GB/s ceiling, and its copy \
+                             latency, fill rate and saturating copy are unknown ({} ms)",
+                            ring.slot_bytes() >> 10,
+                            ring.rates.copy / 1e9,
+                            opening.elapsed().as_millis(),
+                        );
+                        Some(ring)
+                    }
                     Ok(ring) => {
                         tracing::info!(
                             "the weights cross by a pinned ring of 2 x {} KiB: the \
@@ -673,11 +684,7 @@ impl Weights {
                             ring.rates.saturated >> 10,
                             ring.rates.latency * 1e6,
                             ring.rates.fill / 1e9,
-                            match landed {
-                                Landed::Stated(_) => "from the device's profile",
-                                Landed::Fallback => "the fallback's",
-                                Landed::Measured => "measured",
-                            },
+                            if known.is_some() { "from the device's profile" } else { "measured" },
                             opening.elapsed().as_millis(),
                         );
                         Some(ring)

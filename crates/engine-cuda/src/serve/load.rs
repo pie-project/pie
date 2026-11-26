@@ -869,16 +869,27 @@ impl Shell {
                 // the profile states nothing of crosses at the fallback's
                 // figures, named.
                 None if boot.knobs.measuring == engine::rates::Measuring::Skip => {
-                    tracing::info!(
-                        "rates: fallback: `[rates] landing`: nothing timed at load (`pie tune` \
-                         measures it); the weights' pinned ring is sized by the fallback link \
-                         ({:.0} GB/s past {:.0} us, {} KiB copies, a {:.0} GB/s fill)",
-                        crate::weights::LANDING_FALLBACK.copy_gbps,
-                        crate::weights::LANDING_FALLBACK.copy_latency_ns / 1e3,
-                        crate::weights::LANDING_FALLBACK.copy_full_bytes as u64 >> 10,
-                        crate::weights::LANDING_FALLBACK.fill_gbps,
-                    );
-                    crate::weights::Landed::Fallback
+                    match crate::device::link::stated(boot.ordinal) {
+                        Ok(link) => {
+                            tracing::info!(
+                                "rates: fallback: `[rates] landing`: nothing timed at load \
+                                 (`pie tune` measures it); the host link states {} lanes at \
+                                 {} GT/s, a {:.1} GB/s ceiling",
+                                link.width,
+                                link.gts,
+                                link.copy_ceiling() / 1e9,
+                            );
+                            crate::weights::Landed::Link(link.copy_ceiling())
+                        }
+                        Err(why) => {
+                            tracing::info!(
+                                "rates: fallback: `[rates] landing`: nothing timed at load \
+                                 (`pie tune` measures it), and the host link states nothing \
+                                 ({why}): each tensor is copied as it lands"
+                            );
+                            crate::weights::Landed::Unstated
+                        }
+                    }
                 }
                 None => crate::weights::Landed::Measured,
             },
