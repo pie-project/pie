@@ -1203,8 +1203,8 @@ __global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const
 // ----------------------------------------------------------------- merge --
 
 // Folds partials: row `pos`'s parts are rows indptr[pos]..indptr[pos+1] of
-// `parts` (f32, [part][heads][D]) with log2-domain lse `part_lse`. One block
-// of four wavefronts per (row, head): the wavefronts split the parts, each
+// `parts` (f32, [part][heads][D]) with log2-domain lse `part_lse`. Blocks of
+// four wavefronts stride the (row, head) pairs: the wavefronts split the parts, each
 // lane owning D/64 columns, and fold through LDS. The window, when staged,
 // caps the rows and offsets them.
 template <int D>
@@ -1217,11 +1217,13 @@ __global__ __launch_bounds__(256) void merge_partials(const float* __restrict__ 
     constexpr int WAVES = 4, C = (D + kWave - 1) / kWave;
     __shared__ float red[WAVES];
     __shared__ float acc_s[WAVES][D];
-    const int pos = blockIdx.x / heads;
-    const int head = blockIdx.x % heads;
     const int staged = rows_ptr != nullptr ? static_cast<int>(*rows_ptr) : max_rows;
     const int rows = win != nullptr ? min(staged, static_cast<int>(win[0])) : staged;
-    if (pos >= rows) return;
+    // A grid of the device's blocks strides the (row, head) pairs: a launch
+    // with nothing to fold leaves in one wave of them, not one a pair.
+    for (long long item = blockIdx.x; item < static_cast<long long>(rows) * heads; item += gridDim.x) {
+    const int pos = static_cast<int>(item / heads);
+    const int head = static_cast<int>(item % heads);
     const long long out_row = (win != nullptr ? static_cast<long long>(win[1]) : 0) + pos;
     const int first = indptr[pos], last = indptr[pos + 1];
     const int wave = threadIdx.x / kWave, l = lane();
@@ -1266,6 +1268,7 @@ __global__ __launch_bounds__(256) void merge_partials(const float* __restrict__ 
         o[(out_row * heads + head) * D + j] = from_f32<bf16>(sum > 0.f ? total / sum : 0.f);
     }
     if (threadIdx.x == 0 && lse != nullptr) lse[out_row * heads + head] = sum > 0.f ? big + log2f(sum) : neg_inf();
+    }
 }
 
 }  // namespace pie::attn

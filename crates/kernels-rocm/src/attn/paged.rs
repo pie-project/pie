@@ -69,29 +69,36 @@ const _: () = assert!(core::mem::size_of::<Args>() == 216);
 /// once a width and device. The split prefill's schedule fills the device
 /// by it (`sched_prefill::split_chunks`).
 pub fn prefill_resident_blocks(op: &'static str, head_dim: u32) -> Result<u32, Error> {
+    let name = if matches!(head_dim, 128 | 256) {
+        format!("::pie::attn::paged_prefill<{head_dim}, false, true, false>")
+    } else {
+        format!("::pie::attn::paged_prefill_wide<{head_dim}, false, true, false>")
+    };
+    resident_blocks(op, &name, 512)
+}
+
+/// The blocks of `threads` threads of `name` (in this file) one compute unit
+/// of the current device holds at once, read once a kernel and device.
+fn resident_blocks(op: &'static str, name: &str, threads: u32) -> Result<u32, Error> {
     #[cfg(feature = "rocm")]
     {
         use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock};
-        static SEEN: OnceLock<Mutex<HashMap<(i32, u32), u32>>> = OnceLock::new();
+        static SEEN: OnceLock<Mutex<HashMap<(i32, String), u32>>> = OnceLock::new();
         let device = crate::jit::device::current()
             .ok_or_else(|| refuse(op, "HIP would not name the current device"))?;
         let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(&blocks) = seen.lock().expect("the occupancy table").get(&(device, head_dim)) {
+        let key = (device, name.to_string());
+        if let Some(&blocks) = seen.lock().expect("the occupancy table").get(&key) {
             return Ok(blocks);
         }
-        let name = if matches!(head_dim, 128 | 256) {
-            format!("::pie::attn::paged_prefill<{head_dim}, false, true, false>")
-        } else {
-            format!("::pie::attn::paged_prefill_wide<{head_dim}, false, true, false>")
-        };
-        let blocks = kernel(FILE, &name).resident_blocks(512, 0)?;
-        seen.lock().expect("the occupancy table").insert((device, head_dim), blocks);
+        let blocks = kernel(FILE, name).resident_blocks(threads, 0)?;
+        seen.lock().expect("the occupancy table").insert(key, blocks);
         Ok(blocks)
     }
     #[cfg(not(feature = "rocm"))]
     {
-        let _ = head_dim;
+        let _ = (name, threads);
         Err(refuse(op, "no HIP device to seat the prefill on"))
     }
 }
@@ -640,16 +647,23 @@ fn merge(ctx: &Ctx, op: &'static str, parts: &Partials) -> Result<(), Error> {
     if parts.parts == 0 || parts.part_lse == 0 || parts.indptr == 0 {
         return Err(refuse(op, "the split plan staged no partials to fold"));
     }
-    let blocks = parts.max_rows.saturating_mul(parts.heads);
-    if blocks == 0 {
+    let pairs = parts.max_rows.saturating_mul(parts.heads);
+    if pairs == 0 {
         return Ok(());
     }
+    // As many blocks as the device holds at once (or pairs, if fewer): they
+    // stride the (row, head) pairs, so a fold a replay leaves (`skip`) costs
+    // one wave of blocks, not one a pair.
+    let name = format!("::pie::attn::merge_partials<{}>", parts.head_dim);
+    #[cfg(feature = "rocm")]
+    let units = crate::jit::device::multiprocessors()
+        .ok_or_else(|| refuse(op, "HIP would not count the compute units"))?;
+    #[cfg(not(feature = "rocm"))]
+    let units: u32 = 1;
+    let blocks = pairs.min(units.saturating_mul(resident_blocks(op, &name, 256)?));
     ctx.fire(
         op,
-        Fire::at(kernel(
-            FILE,
-            &format!("::pie::attn::merge_partials<{}>", parts.head_dim),
-        ))
+        Fire::at(kernel(FILE, &name))
         .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(parts.parts),
