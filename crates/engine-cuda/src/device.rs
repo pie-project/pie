@@ -55,6 +55,7 @@ pub mod held {
 #[cfg(feature = "rocm")]
 pub mod hip;
 pub mod link;
+pub mod spec;
 pub mod own;
 
 /// The runtime, driver, NCCL and cuBLAS bindings the engine calls: CUDA's,

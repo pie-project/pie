@@ -36,6 +36,7 @@ pub mod roofline;
 pub mod rs;
 pub mod runahead;
 pub mod shapes;
+pub mod spec;
 pub mod transfer;
 
 pub use adapter::{AdapterPlane, AdapterRegistration};

@@ -529,8 +529,28 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 {
                     use profile::rates::Now as _;
                     let on = keys.on();
-                    let family = crate::chip::family_rates(&on).and_then(|(from, theirs)| {
-                        let rates = chip.rates().over(theirs);
+                    let arch = crate::chip::family_of(&on).unwrap_or("").to_string();
+                    let found = crate::chip::fallback(
+                        &on,
+                        crate::device::spec::stated(boot.ordinal, &arch),
+                    );
+                    let weigh = |rates: profile::rates::Rates| {
+                        #[cfg_attr(not(feature = "device"), allow(unused_mut))]
+                        let mut rates = chip.rates().over(rates);
+                        // The few-rows kernel's residency, as the driver's
+                        // occupancy states it, where nothing measured it.
+                        #[cfg(feature = "device")]
+                        if rates.workgroups_per_core.is_none() {
+                            rates.workgroups_per_core =
+                                kernels_cuda::linear::gemm::few_rows_resident_blocks(
+                                    device.ctx(),
+                                    16,
+                                    4096,
+                                    4096,
+                                )
+                                .ok()
+                                .map(f64::from);
+                        }
                         crate::top::choose(
                             &rungs,
                             after_weights,
@@ -541,15 +561,33 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                             &counts,
                         )
                         .ok()
-                        .map(|(top, estimate)| (from, top, estimate))
-                    });
+                    };
+                    let (family, why) = match found {
+                        crate::chip::Fallback::Family(from, theirs) => {
+                            let from = format!(
+                                "the rates `{from}`'s committed profile states, its family's"
+                            );
+                            let why = format!("{from} do not weigh this model");
+                            (weigh(theirs).map(|(t, e)| (from, t, e)), why)
+                        }
+                        crate::chip::Fallback::Spec(line, theirs) => {
+                            let why = format!(
+                                "the rates {line} do not weigh this model: it needs a rate a spec \
+                                 does not state"
+                            );
+                            (
+                                weigh(theirs).map(|(t, e)| (format!("the rates {line}"), t, e)),
+                                why,
+                            )
+                        }
+                        crate::chip::Fallback::None(why) => (None, why),
+                    };
                     match family {
                         Some((from, top, estimate)) => {
                             tracing::info!(
                                 "fallback: the roofline `[rates] {key}` (this device's profile \
                                  states none; a load measures nothing, `pie tune` does): the fire \
-                                 top is weighed by the estimate over the rates `{from}`'s \
-                                 committed profile states, its family's: {}",
+                                 top is weighed by the estimate over {from}: {}",
                                 engine::load::line_of(
                                     &top,
                                     top.tokens,
@@ -570,12 +608,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                             let rung =
                                 crate::top::narrowest(&rungs, fire_lanes).map_err(refused)?;
                             tracing::info!(
-                                "fallback: the roofline `[rates] {key}` (no layer states it, and no \
-                                 committed profile of a device of this one's family `{}` does; a \
-                                 load measures nothing, `pie tune` does): with no rate to weigh a \
-                                 rung by, the fire top is {rung}, the narrowest rung a decode fire \
-                                 of {fire_lanes} lanes takes, a prompt chunked to it",
-                                crate::chip::family_of(&on).unwrap_or("none stated")
+                                "fallback: the roofline `[rates] {key}` (no layer states it; a \
+                                 load measures nothing, `pie tune` does; {why}): with no rate to \
+                                 weigh a rung by, the fire top is {rung}, the narrowest rung a \
+                                 decode fire of {fire_lanes} lanes takes, a prompt chunked to it"
                             );
                             weighed = None;
                             rung

@@ -174,6 +174,39 @@ pub fn family_rates(on: &str) -> Option<(String, profile::rates::Rates)> {
         .next()
 }
 
+/// Where a load whose own profile states none of the estimate's rates takes
+/// them from, first that serves: its family's committed profile
+/// ([`family_rates`]), then its driver's stated figures through the spec
+/// table (`engine::spec`); only where neither serves, none, and why.
+#[derive(Debug, Clone)]
+pub enum Fallback {
+    /// The device a committed profile of this one's family names, and its
+    /// rates.
+    Family(String, profile::rates::Rates),
+    /// The rates its driver's figures give, and the line naming them
+    /// ("computed from spec ...").
+    Spec(String, profile::rates::Rates),
+    /// Why neither serves.
+    None(String),
+}
+
+/// [`Fallback`] for the device `on` names, `spec` what its driver states (or
+/// why it states nothing), in that order.
+#[must_use]
+pub fn fallback(on: &str, spec: Result<engine::spec::Stated, String>) -> Fallback {
+    if let Some((from, rates)) = family_rates(on) {
+        return Fallback::Family(from, rates);
+    }
+    let family = family_of(on).unwrap_or("none stated");
+    match spec.and_then(|stated| engine::spec::rates(&stated)) {
+        Ok((rates, line)) => Fallback::Spec(line, rates),
+        Err(why) => Fallback::None(format!(
+            "no committed profile of a device of this one's family `{family}` states a rate, and \
+             the spec gives none: {why}"
+        )),
+    }
+}
+
 #[must_use]
 pub fn registry() -> &'static Registry {
     &REGISTRY
@@ -403,6 +436,54 @@ mod tests {
     #[test]
     fn the_registry_holds_together() {
         assert_eq!(registry().check(), Vec::<String>::new());
+    }
+
+    /// The fallback's order: a family's committed rates before the spec's,
+    /// the spec's before none, each said.
+    #[test]
+    fn the_fallback_takes_the_family_then_the_spec_then_none() {
+        let stated = |arch: &str| engine::spec::Stated {
+            arch: arch.to_string(),
+            units: 82,
+            clock_khz: 3_090_000,
+            memory_clock_khz: 14_001_000,
+            bus_bits: 256,
+        };
+        let on = "NVIDIA RTX PRO 4500 Blackwell sm_120 cuda driver 13020";
+        match fallback(on, Ok(stated("sm_120"))) {
+            // A committed sm_120 profile stating rates would be taken first.
+            Fallback::Family(..) => {}
+            Fallback::Spec(line, rates) => {
+                assert!(line.starts_with("computed from spec"), "{line}");
+                assert!(rates.hbm_gbps.is_some_and(|g| (g - 896.0).abs() < 1.0));
+            }
+            Fallback::None(why) => panic!("the spec serves: {why}"),
+        }
+        assert!(matches!(
+            fallback("A Device sm_1 driver 1", Ok(stated("sm_1"))),
+            Fallback::None(why) if why.contains("no row in the spec table")
+        ));
+        assert!(matches!(
+            fallback("A Device sm_1 driver 1", Err("no driver".to_string())),
+            Fallback::None(why) if why.contains("no driver")
+        ));
+        let measured = SEEDED.iter().find_map(|(name, text)| {
+            let rates = registry()
+                .parse(text, name, profile::Strict::Measured)
+                .ok()?
+                .tuned
+                .rates;
+            (rates.missing(&profile::rates::KEYS).len() < profile::rates::KEYS.len())
+                .then_some(rates.measured_on?)
+        });
+        if let Some(theirs) = measured {
+            let family = family_of(&theirs).expect("a family");
+            let sibling = format!("Another Device {family} driver 1");
+            assert!(
+                matches!(fallback(&sibling, Ok(stated(family))), Fallback::Family(from, _) if from == theirs),
+                "the family before the spec"
+            );
+        }
     }
 
     /// A device whose own profile states no rate is weighed by a committed
