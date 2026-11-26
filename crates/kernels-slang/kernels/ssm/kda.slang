@@ -289,8 +289,14 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     }
 #else
-    // A padding row holds no record (its slot -1): it folds nothing.
-    if (pie_state_none(r)) {
+    // A padding row holds no record (its slot -1): it folds nothing. Read
+    // uniformly: `token` holds barriers, which WGSL lets follow only
+    // workgroup-uniform control flow.
+    if (tid == 0u) {
+        kda_keep = pie_state_none(r) ? 1 : 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (workgroupUniformLoad(kda_keep) != 0) {
         return;
     }
     token(tid, r, h, pie_state_atom(r, h, cells));
