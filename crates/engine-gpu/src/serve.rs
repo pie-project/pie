@@ -3135,17 +3135,30 @@ impl<B: Serve> Shell<B> {
                 .device()
                 .saturating_sub(first.reserved);
             let driver = device.outside().saturating_sub(first.outside);
+            let weights = device.books().ledger().bytes(engine::memory::Class::Model);
+            // The room the first weighing left, less what was reserved past
+            // the weights it estimated and what the driver took since: the
+            // rest is what the ledger keeps (each class in whole chunks, the
+            // capacity it settled to).
+            let kept = first
+                .room
+                .saturating_add(first.weights)
+                .saturating_sub(reserved)
+                .saturating_sub(driver)
+                .saturating_sub(left);
             tracing::info!(
                 "the pool's room: {} MiB, against the {} MiB the rungs were weighed by: since, the \
-                 load reserved {} MiB ({} MiB of it the weights, estimated at {} MiB then) and the \
-                 driver came to hold {} MiB more (pipelines, the shelf's buffers); the ledger \
-                 holds every class in whole chunks of {} MiB",
+                 load reserved {} MiB ({} MiB of it the weights, estimated at {} MiB then), the \
+                 driver came to hold {} MiB more (pipelines, the shelf's buffers), and the ledger \
+                 keeps {} MiB (every class in whole chunks of {} MiB, under the capacity it \
+                 settled to)",
                 mib(left),
                 mib(first.room),
                 mib(reserved),
-                mib(device.books().ledger().bytes(engine::memory::Class::Model)),
+                mib(weights),
                 mib(first.weights),
                 mib(driver),
+                mib(kept),
                 mib(chunk),
             );
         }
