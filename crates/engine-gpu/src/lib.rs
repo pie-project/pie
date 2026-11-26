@@ -29,6 +29,7 @@ pub mod probe;
 pub mod program;
 pub mod rates;
 pub mod ring;
+pub mod region;
 pub mod rs;
 pub mod run;
 pub mod scratch;

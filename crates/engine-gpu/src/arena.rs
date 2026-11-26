@@ -51,6 +51,9 @@ pub struct Rung {
     fire_slots: u32,
     /// The carve and the rooms.
     bytes: u64,
+    /// The span's regions above every carve ([`Span::with_regions`]): a
+    /// rung's footprint holds them, its carve lies below them.
+    regions: u64,
 }
 
 /// The score rows of a load whose trace captures (`Dim::Capturing`): a
@@ -178,6 +181,7 @@ impl Rung {
             fire_at: bytes,
             fire_slots: 0,
             bytes,
+            regions: 0,
         })
     }
 
@@ -197,10 +201,11 @@ impl Rung {
         self.bytes = (at + u64::from(slots) * slot_bytes + unit).next_multiple_of(ALIGN);
     }
 
-    /// The carve and the rooms, aligned.
+    /// The rung's footprint: its carve and rooms, aligned, and the span's
+    /// regions above them.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.bytes
+        self.bytes + self.regions
     }
 
     /// Whether a fire of `rows` carrying `carried` recurrent rows ahead of
@@ -231,6 +236,9 @@ pub struct Span<B: Backend> {
     /// segment is the span a fire's carve may take, and the pool states it
     /// so (`ChunkFacts::act_span_chunks`).
     place: Option<(B::Buffer, u64)>,
+    /// The fire-class reservations laid at the span's top, above every
+    /// carve, each its owner's and aligned bytes ([`Span::with_regions`]).
+    regions: Vec<(crate::books::Owner, u64)>,
 }
 
 impl<B: Backend> Span<B> {
@@ -265,6 +273,7 @@ impl<B: Backend> Span<B> {
             routers,
             capture,
             place: None,
+            regions: Vec::new(),
         })
     }
 
@@ -295,7 +304,7 @@ impl<B: Backend> Span<B> {
             .iter()
             .map(|rung| {
                 let chunks =
-                    u32::try_from(rung.bytes.div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX);
+                    u32::try_from(rung.bytes().div_ceil(chunk_bytes.max(1))).unwrap_or(u32::MAX);
                 most = most.max(chunks);
                 (rung.tokens, most)
             })
@@ -361,7 +370,7 @@ impl<B: Backend> Span<B> {
                 let room = room(self.rungs[at].tokens);
                 (at..self.rungs.len())
                     .rev()
-                    .find(|&wide| self.rungs[wide].bytes <= room)
+                    .find(|&wide| self.rungs[wide].bytes() <= room)
                     .unwrap_or(at)
             })
             .collect();
@@ -371,7 +380,7 @@ impl<B: Backend> Span<B> {
     /// end less its bytes.
     pub fn base(&self, rung: usize) -> Result<u64> {
         let (_, end) = self.placed()?;
-        Ok(end - self.rungs[rung].bytes)
+        Ok(end - self.rungs[rung].bytes())
     }
 
     /// Room in every rung for its fires' own windowed rows
@@ -380,6 +389,51 @@ impl<B: Backend> Span<B> {
         for rung in &mut self.rungs {
             rung.with_fire_slots(tokens_a_slot, lanes, slot_bytes, unit);
         }
+    }
+
+    /// Lays `regions` (each an owner's reservation of so many bytes) at
+    /// the span's top, above every rung's carve: each rung's footprint
+    /// grows by their bytes, each aligned, so the pool's span holds them
+    /// at every rung and no rung lends them to state. After every other
+    /// part of the rungs is laid ([`Span::with_fire_slots`]), before the
+    /// pool sizes the span.
+    pub fn with_regions(&mut self, regions: &[(crate::books::Owner, u64)]) {
+        self.regions = regions
+            .iter()
+            .map(|&(owner, bytes)| (owner, bytes.max(1).next_multiple_of(ALIGN)))
+            .collect();
+        let bytes: u64 = self.regions.iter().map(|&(_, bytes)| bytes).sum();
+        for rung in &mut self.rungs {
+            rung.regions = bytes;
+        }
+    }
+
+    /// The bytes the span's regions take at its top.
+    #[must_use]
+    pub fn region_bytes(&self) -> u64 {
+        self.regions.iter().map(|&(_, bytes)| bytes).sum()
+    }
+
+    /// Each region's owner and aligned bytes, in the order laid.
+    #[must_use]
+    pub fn region_owners(&self) -> &[(crate::books::Owner, u64)] {
+        &self.regions
+    }
+
+    /// The regions as laid in the placed span, in the order stated
+    /// ([`Span::with_regions`]): the first right above the carves, the last
+    /// at the span's end.
+    pub fn regions(&self) -> Result<Vec<crate::region::Region<B>>> {
+        let (buffer, end) = self.placed()?;
+        let mut at = end - self.region_bytes();
+        self.regions
+            .iter()
+            .map(|&(owner, bytes)| {
+                let region = crate::region::Region::new(buffer.clone(), at, bytes, owner);
+                at += bytes;
+                region
+            })
+            .collect()
     }
 
     /// Each rung's tokens and the bytes its fire slots take in its carve
@@ -422,7 +476,7 @@ impl<B: Backend> Span<B> {
     ) -> Result<SlotTable> {
         let (buffer, end) = self.placed()?;
         let at = &self.rungs[rung];
-        let base = end - at.bytes;
+        let base = end - at.bytes();
         let captured = match self.capture {
             Some(capture) if scored.rows() > 0 => {
                 let (pages_at, region) = capture.region(scored.rows(), scored.page_rows());

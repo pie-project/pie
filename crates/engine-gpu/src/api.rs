@@ -1279,6 +1279,7 @@ where
                 "ledger: {}",
                 books.ledger()
             );
+            tracing::info!(engine = B::KIND, "fire beside the pool: {}", books.fire_line());
         }
         // What the load itself walked is the load's: serving counts from here.
         shell.recorded_serving();

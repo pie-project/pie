@@ -370,7 +370,7 @@ impl Core {
         let buffer = self.held(
             &wgpu::BufferDescriptor {
                 label: Some("pie uniforms"),
-                size: UNIFORM_CHUNK * frames,
+                size: Core::uniform_bytes(),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             },
@@ -383,6 +383,12 @@ impl Core {
             );
             self.return_uniforms((0..frames).map(|at| at * UNIFORM_CHUNK).collect());
         }
+    }
+
+    /// The bytes of the uniform buffer ([`Core::stock_uniforms`]): a region
+    /// for each frame in flight any load takes and the one beside them.
+    pub(crate) fn uniform_bytes() -> u64 {
+        UNIFORM_CHUNK * (u64::from(engine::runahead::Runahead::MAX_FRAMES) + 1)
     }
 
     /// Stocks a scratch chunk for each of `frames` frames in flight, at load:

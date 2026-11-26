@@ -321,6 +321,24 @@ impl Serve for Api {
         pipelines.bound()
     }
 
+    /// The uniform buffer frames write their dispatches' scalars to, bound
+    /// as a uniform beside every dispatch's writable storage, so a buffer
+    /// of its own, booked under the span.
+    fn booked(
+        _device: &Context,
+        _pipelines: &Pipelines,
+        _arms: usize,
+        _fires: engine_gpu::serve::FireBound,
+    ) -> Vec<(engine_gpu::Owner, u64)> {
+        #[cfg(feature = "wgpu")]
+        return vec![(
+            engine_gpu::books::owners::UNIFORMS,
+            crate::device::ctx::Core::uniform_bytes(),
+        )];
+        #[cfg(not(feature = "wgpu"))]
+        Vec::new()
+    }
+
     fn shelf(
         device: &Context,
         pipelines: &Pipelines,

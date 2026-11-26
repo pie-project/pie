@@ -472,6 +472,22 @@ impl Serve for Api {
         probed.replay_spanned()
     }
 
+    /// Each arm's fire block, its device part: read as uniforms and as
+    /// indirect arguments, so a buffer of its own (the span's segment is
+    /// made for neither), booked under the span. Its staging twin is
+    /// host-visible memory.
+    fn booked(
+        device: &Context,
+        pipelines: &Pipelines,
+        arms: usize,
+        fires: engine_gpu::serve::FireBound,
+    ) -> Vec<(engine_gpu::Owner, u64)> {
+        vec![(
+            engine_gpu::books::owners::UNIFORMS,
+            arms as u64 * block_bytes(device, pipelines, fires),
+        )]
+    }
+
     fn shelf(
         device: &Context,
         pipelines: &Pipelines,
@@ -480,30 +496,7 @@ impl Serve for Api {
         fires: engine_gpu::serve::FireBound,
         guest: engine_gpu::serve::GuestRoom,
     ) -> Result<Shelf> {
-        // An arm's fire block holds what its widest fire lays: each dispatch's
-        // group counts and its scalars at the uniform alignment, each with
-        // its alignment's slack, and the readout copier's region tables.
-        let (uniform, storage) = device.fire_alignments();
-        // A dispatch's scalars at the uniform alignment; the few kernels whose
-        // scalars are a table of runs (a recurrent copy's, read from the block
-        // alone) at their own size, a run of them each fire's recurrent layers
-        // take.
-        let most = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
-        let scalars = most.min(512);
-        // The recurrent copies' run tables, each its own place in the block
-        // at the uniform alignment, as many as the widest fire lays
-        // (`engine_gpu::rs::run_tables`, the bound a fire's seat copies by).
-        let tables = fires.run_tables * (fires.run_table_bytes.next_multiple_of(uniform) + uniform);
-        let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
-        // A recording moves every readout copy with the copier (its table,
-        // count and group counts laid in the block, each at its alignment):
-        // one copier's slack beside each plane's rows.
-        let copier = 16 + uniform + storage + 64;
-        // Twice the naming walk's widest fire: a fire that buffers its rows
-        // copies them a lane at a time, past what the naming walk counted.
-        let bytes = 2 * u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
-            + fires.readout_rows * 16
-            + tables;
+        let bytes = block_bytes(device, pipelines, fires);
         let arms = (0..readout.len())
             .map(|_| crate::device::ArmBlock::new(device, bytes))
             .collect::<Result<Vec<_>>>()?;
@@ -1230,6 +1223,38 @@ impl Serve for Api {
         Ok(())
     }
 }
+/// The bytes an arm's fire block takes for fires of at most `fires` asks.
+fn block_bytes(
+    device: &Context,
+    pipelines: &Pipelines,
+    fires: engine_gpu::serve::FireBound,
+) -> u64 {
+    // An arm's fire block holds what its widest fire lays: each dispatch's
+    // group counts and its scalars at the uniform alignment, each with
+    // its alignment's slack, and the readout copier's region tables.
+    let (uniform, storage) = device.fire_alignments();
+    // A dispatch's scalars at the uniform alignment; the few kernels whose
+    // scalars are a table of runs (a recurrent copy's, read from the block
+    // alone) at their own size, a run of them each fire's recurrent layers
+    // take.
+    let most = u64::from(pipelines.most_scalars().max(device.copier_scalars()));
+    let scalars = most.min(512);
+    // The recurrent copies' run tables, each its own place in the block
+    // at the uniform alignment, as many as the widest fire lays
+    // (`engine_gpu::rs::run_tables`, the bound a fire's seat copies by).
+    let tables = fires.run_tables * (fires.run_table_bytes.next_multiple_of(uniform) + uniform);
+    let per_dispatch = 16 + scalars.next_multiple_of(uniform) + uniform + storage;
+    // A recording moves every readout copy with the copier (its table,
+    // count and group counts laid in the block, each at its alignment):
+    // one copier's slack beside each plane's rows.
+    let copier = 16 + uniform + storage + 64;
+    // Twice the naming walk's widest fire: a fire that buffers its rows
+    // copies them a lane at a time, past what the naming walk counted.
+    2 * u64::from(fires.dispatches.max(1)) * (per_dispatch + copier)
+        + fires.readout_rows * 16
+        + tables
+}
+
 
 /// A family's key: what its walk's commands carry, hashed
 /// ([`crate::device::Frame::bake`]), on its arm; where an expert stage cut

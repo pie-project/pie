@@ -81,6 +81,13 @@ pub mod owners {
     pub const GUEST: Owner = Owner::fire("guest");
     pub const COLLECTIVE: Owner = Owner::fire("collective");
     pub const TUNING: Owner = Owner::fire("tuning");
+
+    /// The fire-class owners named outside the span on a device with memory
+    /// of its own (ONE-POOL step 2): host-visible memory (inputs, snapshot
+    /// table, staging), query memory (timestamps), and the rigs the load
+    /// times before any pool exists (tuning). A kernel test's operands
+    /// stand outside any load.
+    pub const EXCEPTIONS: [Owner; 6] = [INPUTS, SNAPSHOTS, STAGING, TIMESTAMPS, TUNING, TEST];
 }
 
 /// The device bytes every device's books in this process hold: a driver
@@ -112,6 +119,14 @@ pub struct Books {
     /// Whether these bytes are the process's: a device's are, and a naming
     /// load's ([`Books::apart`]) reserve nothing.
     process: bool,
+    /// The fire-class reservations held beside the span and booked under
+    /// it (ONE-POOL step 2 (B)), each its owner's and the bytes it holds at
+    /// most: the pool is sized without them, whether or not they are made
+    /// yet ([`Books::unheld_booked`]).
+    booked: Mutex<Vec<(Owner, u64)>>,
+    /// The owners whose reservations are regions of the span
+    /// ([`Books::region`]).
+    regions: Mutex<Vec<Owner>>,
 }
 
 impl Default for Books {
@@ -130,6 +145,8 @@ impl Books {
             host: AtomicU64::new(0),
             takes: AtomicU64::new(0),
             process: true,
+            booked: Mutex::new(Vec::new()),
+            regions: Mutex::new(Vec::new()),
         }
     }
 
@@ -209,6 +226,110 @@ impl Books {
             let there = ledger.of(to.class, to.name);
             ledger.enter(to.class, to.name, there.saturating_add(moved));
         });
+    }
+
+    /// `owner` holds at most `bytes` beside the span, booked under it: the
+    /// pool is sized without them. A booking stated again replaces the one
+    /// before.
+    pub fn book(&self, owner: Owner, bytes: u64) {
+        let mut booked = self.booked.lock().expect("booked lock poisoned");
+        booked.retain(|&(held, _)| held != owner);
+        booked.push((owner, bytes));
+    }
+
+    /// The bytes booked beside the span that their owners do not hold yet:
+    /// what a pool sized now leaves out of the room the device has left.
+    #[must_use]
+    pub fn unheld_booked(&self) -> u64 {
+        let booked = self.booked.lock().expect("booked lock poisoned").clone();
+        self.unheld(&booked)
+    }
+
+    /// The bytes of `booked` (owners and the bytes each holds at most) that
+    /// their owners do not hold yet.
+    #[must_use]
+    pub fn unheld(&self, booked: &[(Owner, u64)]) -> u64 {
+        self.with(|ledger| {
+            booked
+                .iter()
+                .map(|&(owner, bytes)| bytes.saturating_sub(ledger.of(owner.class, owner.name)))
+                .sum()
+        })
+    }
+
+    /// `bytes` of the activation span are `owner`'s region of it: entered
+    /// under `owner`, out of the span's.
+    pub fn region(&self, owner: Owner, bytes: u64) {
+        self.relabel(owners::SPAN, owner, bytes);
+        let mut regions = self.regions.lock().expect("regions lock poisoned");
+        if !regions.contains(&owner) {
+            regions.push(owner);
+        }
+    }
+
+    /// The fire class as the pool holds it, in MiB: what lies in the span
+    /// (its carve and each region), what is booked beside it (held, and
+    /// booked at most), the exceptions named outside it, and any fire
+    /// entry none of those names (`unbooked`), which step 2 leaves none of.
+    #[must_use]
+    pub fn fire_line(&self) -> String {
+        let booked = self.booked.lock().expect("booked lock poisoned").clone();
+        let regions = self.regions.lock().expect("regions lock poisoned").clone();
+        let mib = |bytes: u64| format!("{:.1}", bytes as f64 / f64::from(1u32 << 20));
+        let ledger = self.ledger();
+        let fire: Vec<(&'static str, u64)> = ledger
+            .entries()
+            .filter(|&(class, _, _)| class == Class::Fire)
+            .map(|(_, name, bytes)| (name, bytes))
+            .collect();
+        let named = |owner: &Owner| owner.class == Class::Fire;
+        let list = |picked: &[(&'static str, u64)]| -> String {
+            let total: u64 = picked.iter().map(|&(_, bytes)| bytes).sum();
+            let each: Vec<String> = picked
+                .iter()
+                .map(|&(name, bytes)| format!("{name} {}", mib(bytes)))
+                .collect();
+            format!("{} MiB ({})", mib(total), each.join(", "))
+        };
+        let of = |name: &str| fire.iter().find(|&&(n, _)| n == name).map_or(0, |&(_, b)| b);
+        let span: Vec<(&'static str, u64)> = std::iter::once(owners::SPAN)
+            .chain(regions.iter().copied().filter(named))
+            .map(|owner| (owner.name, of(owner.name)))
+            .collect();
+        let beside: Vec<String> = booked
+            .iter()
+            .filter(|(owner, _)| named(owner))
+            .map(|&(owner, bytes)| {
+                format!("{} {} of {}", owner.name, mib(of(owner.name)), mib(bytes))
+            })
+            .collect();
+        let excepted: Vec<(&'static str, u64)> = fire
+            .iter()
+            .copied()
+            .filter(|&(name, _)| owners::EXCEPTIONS.iter().any(|owner| owner.name == name))
+            .collect();
+        let unbooked: Vec<(&'static str, u64)> = fire
+            .iter()
+            .copied()
+            .filter(|&(name, _)| {
+                name != owners::SPAN.name
+                    && !regions.iter().any(|owner| owner.name == name)
+                    && !booked.iter().any(|(owner, _)| owner.name == name)
+                    && !owners::EXCEPTIONS.iter().any(|owner| owner.name == name)
+            })
+            .collect();
+        format!(
+            "in the span {}; booked beside it {} MiB ({}); exceptions {}; unbooked {}",
+            list(&span),
+            mib(booked
+                .iter()
+                .filter(|(owner, _)| named(owner))
+                .map(|(owner, _)| of(owner.name))
+                .sum()),
+            beside.join(", "),
+            list(&excepted),
+            list(&unbooked)
+        )
     }
 
     /// What the driver holds for this process beside every reservation,

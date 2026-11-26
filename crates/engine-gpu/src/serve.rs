@@ -354,6 +354,20 @@ pub trait Serve: Backend {
     /// ([`engine::live::Tally::BoundInFire`]). 0 where it keeps none.
     fn bound(pipelines: &Self::Pipelines) -> u64;
 
+    /// The fire-class reservations the backend holds beside the span for
+    /// `arms` arms of fires of at most `fires` asks, booked under the span
+    /// (ONE-POOL step 2 (B)): each owner's bytes at most, which the pool is
+    /// sized without, made or not. None, the default.
+    fn booked(
+        device: &Self::Context,
+        pipelines: &Self::Pipelines,
+        arms: usize,
+        fires: FireBound,
+    ) -> Vec<(crate::books::Owner, u64)> {
+        let _ = (device, pipelines, arms, fires);
+        Vec::new()
+    }
+
     /// The backend's state of a fresh load over its `readout` seats, with
     /// whatever device memory it keeps for every fire, at most `fires`
     /// asks, and its guest plane takes (`guest`), made before the pool is
@@ -2339,6 +2353,25 @@ impl<B: Serve> Shell<B> {
             // one working set at the context lie in that room's pool, cut
             // into segments with the span whole in the last
             // (`store::pool::infeasible`).
+            // What the backend books beside the span for fires cut to a
+            // rung (ONE-POOL step 2 (B)) and does not hold yet comes out of
+            // that room too.
+            let readout_planes: u64 = readouts
+                .iter()
+                .map(|plane| plane.values.len() as u64)
+                .sum();
+            let booked_beside = |tokens: u32| {
+                let fires = fire_bound(
+                    rs_layout.as_deref(),
+                    tokens,
+                    budgets.tokens.max_lanes,
+                    asks.dispatches + readouts.len() as u32,
+                    readout_planes,
+                );
+                device
+                    .books()
+                    .unheld(&B::booked(&device, &pipelines, arms as usize, fires))
+            };
             let rooms: Vec<crate::store::pool::Rung> = span
                 .act_chunks(chunk)
                 .into_iter()
@@ -2349,7 +2382,9 @@ impl<B: Serve> Shell<B> {
                     crate::store::pool::Rung {
                         tokens,
                         act,
-                        left: pool_left.saturating_sub(arms_bytes),
+                        left: pool_left
+                            .saturating_sub(arms_bytes)
+                            .saturating_sub(booked_beside(tokens)),
                         widest,
                     }
                 })
@@ -3056,23 +3091,21 @@ impl<B: Serve> Shell<B> {
         let expert_caches =
             crate::store::experts::ExpertCaches::new(&device, expert_shapes, chunk)?;
         let weights_stream = weights.streams() || weights.gathered().is_some();
-        let (run_tables, run_table_bytes) = rs_layout.as_deref().map_or((0, 0), |layout| {
-            crate::rs::run_tables(
-                layout.in_of.len() + layout.out_of.len(),
-                span.rungs().last().map_or(1, |rung| rung.tokens),
-                boot.budget.max_lanes,
-            )
-        });
-        let fires = FireBound {
-            run_tables,
-            run_table_bytes,
-            dispatches: asks.dispatches + readouts.len() as u32,
-            readout_rows: span.rungs().last().map_or(0, |rung| u64::from(rung.tokens))
-                * readouts
-                    .iter()
-                    .map(|plane| plane.values.len() as u64)
-                    .sum::<u64>(),
-        };
+        let fires = fire_bound(
+            rs_layout.as_deref(),
+            span.rungs().last().map_or(1, |rung| rung.tokens),
+            boot.budget.max_lanes,
+            asks.dispatches + readouts.len() as u32,
+            readouts
+                .iter()
+                .map(|plane| plane.values.len() as u64)
+                .sum::<u64>(),
+        );
+        // What the backend holds beside the span is booked under it before
+        // it is made: the pool is sized without it (ONE-POOL step 2 (B)).
+        for (owner, bytes) in B::booked(&device, &pipelines, arms, fires) {
+            device.books().book(owner, bytes);
+        }
         let shelf = B::shelf(
             &device,
             &pipelines,
@@ -3103,7 +3136,10 @@ impl<B: Serve> Shell<B> {
         // whole chunks, so what is left is what it leaves: a pool of the
         // bytes the device leaves would hold up to a chunk a class past what
         // the device has.
-        let left = device.left().min(device.books().ledger().room());
+        let left = device
+            .left()
+            .min(device.books().ledger().room())
+            .saturating_sub(device.books().unheld_booked());
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -3205,6 +3241,11 @@ impl<B: Serve> Shell<B> {
                     what: "the pool's last segment, which its first commit backs".to_string(),
                 })?;
             span.place(buffer.clone(), end)?;
+        }
+        // Each region laid at the span's top is its owner's in the books,
+        // out of the span's (ONE-POOL step 2 (A)).
+        for region in span.regions()? {
+            device.books().region(region.owner(), region.bytes());
         }
         let rs_buffers =
             rs_at.map(|at| crate::rs::Buffers::in_pool(at.plane_at, at.tokens, pools.rs_stride()));
@@ -9312,6 +9353,27 @@ fn readout_table<B: Serve>(
         }
     }
     Ok((table, layout))
+}
+
+/// The most a fire of `tokens` tokens and `lanes` lanes asks: `dispatches`
+/// of them, `tokens` rows of each of `planes` readout planes, and the run
+/// tables its recurrent copies lay ([`crate::rs::run_tables`]).
+fn fire_bound(
+    rs: Option<&crate::rs::Layout>,
+    tokens: u32,
+    lanes: u32,
+    dispatches: u32,
+    planes: u64,
+) -> FireBound {
+    let (run_tables, run_table_bytes) = rs.map_or((0, 0), |layout| {
+        crate::rs::run_tables(layout.in_of.len() + layout.out_of.len(), tokens, lanes)
+    });
+    FireBound {
+        run_tables,
+        run_table_bytes,
+        dispatches,
+        readout_rows: u64::from(tokens) * planes,
+    }
 }
 
 /// The bytes an arm's readout seat takes for a fire of `budget`: the host's
