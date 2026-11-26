@@ -464,6 +464,7 @@ mod tests {
                 None,
                 None,
                 Some(bag),
+                None,
             );
             for _ in 0..8 {
                 tokio::task::yield_now().await;
