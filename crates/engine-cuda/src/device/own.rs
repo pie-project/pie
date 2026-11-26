@@ -39,18 +39,6 @@ pub fn before_loads(latch: bool) -> Result<Option<u64>> {
     Ok(Some(bytes))
 }
 
-/// What this process holds of the device its thread is bound to now, as the
-/// driver counts it ([`held`]): its context, its driver's queues and module
-/// images, every allocation; why not, where the driver does not say.
-pub fn used_now() -> std::result::Result<u64, Unread> {
-    held(bound().map_err(|_| Unread::Unbound)?)
-}
-
-/// What this process holds of `device`, as the driver counts it ([`held`]).
-pub fn held_of(device: i32) -> std::result::Result<u64, Unread> {
-    held(device)
-}
-
 /// The reader that says what this process holds of a device: the
 /// management library on CUDA, the kernel driver's process list on ROCm.
 pub const READER: &str = if cfg!(feature = "rocm") {
@@ -76,8 +64,6 @@ pub enum Unread {
     NotAvailable,
     /// The reader was asked and failed.
     Failed(String),
-    /// No device is bound to this thread.
-    Unbound,
     /// This build has no reader.
     NoReader,
 }
@@ -97,7 +83,6 @@ impl std::fmt::Display for Unread {
                  as under WDDM)"
             ),
             Unread::Failed(why) => write!(f, "{READER} was asked and failed: {why}"),
-            Unread::Unbound => write!(f, "no device is bound to this thread"),
             Unread::NoReader => write!(f, "this build reads no driver's process usage"),
         }
     }

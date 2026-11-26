@@ -395,13 +395,6 @@ impl Pools {
             .saturating_sub(self.committed_bytes())
     }
 
-    /// The load settled what this worker holds of the device at `used`
-    /// bytes: the pool holds what lies beside its committed pages from here
-    /// on ([`crate::device::elastic::PhysicalPool::settle_outside`]).
-    pub fn settle_outside(&mut self, used: u64) -> u64 {
-        self.pool.settle_outside(used)
-    }
-
     pub fn spare_bytes(&self) -> Result<u64> {
         self.pool.spare_bytes(self.segment_reserve())
     }

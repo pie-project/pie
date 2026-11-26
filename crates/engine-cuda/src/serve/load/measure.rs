@@ -190,113 +190,12 @@ impl Shell {
     /// what the fit holds back of the chunks it stated, and what the driver
     /// holds outside the engine's span, as the ledger enters it (read by
     /// the policy, taken out of no range).
-    /// The second is the settled figure where the load settled one
-    /// ([`Self::settle_outside`]): what the driver counts this worker
-    /// holding past the ledger's own entries; else the ledger's own
-    /// outside entries.
     #[must_use]
     pub fn held_and_outside(&self) -> (u64, u64) {
         (
             self.pools.kept_back_bytes(),
-            self.outside.map_or_else(
-                || self.ledger().bytes(engine::memory::Class::Outside),
-                |(outside, ledgered)| outside.beyond(ledgered),
-            ),
+            self.ledger().bytes(engine::memory::Class::Outside),
         )
-    }
-
-    /// Settles what this worker holds of the device beyond the ledger's
-    /// own entries, before the load's last fit: once arming has fired
-    /// every composition, each step kind (a decode step, then a prompt) is
-    /// fired once more on a fresh slot, the driver's count of this worker
-    /// read before and after each ([`crate::device::own::used_now`]). Two
-    /// readings a fire apart within one of the device's allocation units
-    /// settle it; else the largest stands, said so
-    /// ([`engine::memory::Outside::settle`]). The pool holds what of it lies
-    /// beside its committed pages from here on (the larger of it and its
-    /// reading at sizing), and the last fit sizes the pool by that and the
-    /// pool's own count under the budget: the driver is not asked again.
-    /// Where the driver does not say, before the fires or between them, or
-    /// the load seats no slot to fire on, it is said by name and nothing is
-    /// settled: the reading at sizing stands.
-    pub(in super::super) fn settle_outside(&mut self) -> Result<()> {
-        use engine::memory::Class;
-        let first = match crate::device::own::used_now() {
-            Ok(bytes) => bytes,
-            Err(why) => {
-                tracing::info!(
-                    "outside: unmeasured: {why}; budget_device bounds the card's free figure \
-                     and the reading at sizing, if any"
-                );
-                return Ok(());
-            }
-        };
-        if self.held.is_empty() || self.pools.by_refs() {
-            tracing::info!("outside: unmeasured: this load seats no slot of its own to fire on");
-            return Ok(());
-        }
-        let token = |i: u32| 100 + (i * 7919) % 5000;
-        let prompt: Vec<u32> = (0..32).map(token).collect();
-        let decode = [token(1)];
-        let mut readings = vec![first];
-        for tokens in [&decode[..], &prompt[..]] {
-            self.open(0)?;
-            let word = self
-                .trace()
-                .facts
-                .word(&poem::Request::new(tokens.len() as u32, false));
-            self.fire(&[crate::Lane {
-                slot: 0,
-                word,
-                tokens,
-            }])?;
-            self.device.synchronize()?;
-            match crate::device::own::used_now() {
-                Ok(bytes) => readings.push(bytes),
-                Err(why) => {
-                    self.open(0)?;
-                    tracing::info!(
-                        "outside: unsettled: the reading after fire {} failed: {why}; nothing is \
-                         settled, the reading at sizing stands (readings so far {:?} MiB)",
-                        readings.len(),
-                        readings.iter().map(|&b| b >> 20).collect::<Vec<_>>(),
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        self.open(0)?;
-        let unit = self.pools.map_unit_bytes().max(1);
-        let Some(outside) = engine::memory::Outside::settle(&readings, unit) else {
-            return Ok(());
-        };
-        let held = self.pools.settle_outside(outside.used);
-        let ledger = self.ledger();
-        let ledgered = [Class::Model, Class::State, Class::Fire]
-            .iter()
-            .map(|class| ledger.bytes(*class))
-            .sum::<u64>();
-        let mib = |bytes: u64| bytes >> 20;
-        tracing::info!(
-            "outside: {} MiB this worker holds of the device past the ledger's own {} MiB, \
-             {} over {} fires (each step kind once more after arming; readings {:?} MiB, a \
-             unit {} MiB); {} MiB of it beside the pool's committed pages, held from here on{}",
-            mib(outside.beyond(ledgered)),
-            mib(ledgered),
-            if outside.settled { "settled" } else { "unsettled, the largest reading taken" },
-            outside.fires,
-            readings.iter().map(|&b| mib(b)).collect::<Vec<_>>(),
-            mib(unit),
-            mib(held),
-            crate::device::card::budget().map_or_else(String::new, |budget| format!(
-                "; the pool is sized under budget_device {} MiB less all this worker holds \
-                 and the {} MiB floor",
-                mib(budget),
-                mib(engine::SAFETY_FLOOR_BYTES)
-            )),
-        );
-        self.outside = Some((outside, ledgered));
-        Ok(())
     }
 
     /// Settles the fit of a load that armed at its starting weight
@@ -317,13 +216,8 @@ impl Shell {
         // A pool stated as the chunks it backs has nothing held back to
         // lift: its load held the bodies' allowance out of it.
         if !self.pools.stated_whole() {
-            tracing::info!(
-                "outside: unsettled: this load states its pool as the chunks it backs, so no \
-                 last fit follows to size it by a settled reading; the reading at sizing stands"
-            );
             return Ok(());
         }
-        self.settle_outside()?;
         let resident = footprint(self, self.card.0, self.card.1);
         let before = (self.pools.declared_bytes(), self.pools.kept_back_bytes());
         let fitted = self
