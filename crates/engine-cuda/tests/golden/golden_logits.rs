@@ -1620,7 +1620,7 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
 }
 
 /// Every shape a parked set carries comes back bit for bit through the
-/// tiers below the device: the kv list, the window lists
+/// tiers below the device: the kv list, the ring and the window buffer
 /// (Gemma's miniature), the hybrid's rs-list rows and records (Qwen3.5's),
 /// and the guests' instance and channel slots, device -> disk -> device
 /// and host -> disk -> host (and on up to the device), into other slots,
@@ -1645,7 +1645,15 @@ fn a_tier_round_trip_is_bit_exact_for_every_parked_shape() {
         }
     }
     println!("parked shapes: {roles:?}");
-    for want in ["kv", "window", "record", "RsBuffer", "Instance", "Channel"] {
+    for want in [
+        "kv",
+        "Ring",
+        "WindowBuffer",
+        "record",
+        "RsBuffer",
+        "Instance",
+        "Channel",
+    ] {
         assert!(roles.contains(want), "a {want} shape parked: {roles:?}");
     }
     assert!(unaligned, "a slot off the 4 KiB boundary parked");
