@@ -163,7 +163,7 @@ pub(crate) fn take(
     }
 }
 
-fn current() -> Option<i32> {
+pub(crate) fn current() -> Option<i32> {
     let api = sys::api().ok()?;
     let mut ordinal: i32 = 0;
     // SAFETY: `ordinal` is a live local out-parameter.

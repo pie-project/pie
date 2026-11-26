@@ -6,18 +6,6 @@ api = 1
 [target]
 match = { name_contains = ["MI300X"] }
 
-[kernel]
-# One prefill attention block a CU (`kernel.sdpa.prefill.ctas_per_sm`, the
-# grid a split prefill fills and the floor a recorded one pads to), measured
-# against the default two: a captured prefill then splits its keys only where
-# its query tiles fill under half of 304 CUs' blocks, and the split (partials
-# and their fold) lost on every shape it changed. MI300X VF, time to the
-# first token, two runs each (ms; default -> one): Qwen3.5-9B 2048 rows
-# 76.1 / 75.6 -> 74.2 / 74.5, Qwen3-30B-A3B 512 rows 31.1 / 31.1 -> 29.8 /
-# 29.4; at 128, 512, 2048 and 4000 rows on Qwen3.5-9B, Qwen3-8B and
-# Qwen3-30B-A3B no shape slower past its runs' spread.
-sdpa.prefill.ctas_per_sm = 1
-
 [rates]
 # `pie tune cuda --rates` on this MI300X VF, each value the median of five
 # runs, point by point: the launch a captured dependent chain's per-node
