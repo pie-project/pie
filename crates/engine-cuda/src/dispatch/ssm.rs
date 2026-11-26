@@ -1068,9 +1068,8 @@ impl Run<'_> {
     /// ROCm's KDA decode step reads no buffered rows as a linear attention
     /// yet (its kernels re-step them from a carried scratch the buffer no
     /// longer lays): a buffering fire over a KDA layer is refused by name.
-
+    ///
     /// ROCm's Mamba-2 decode step, as [`Run::kda_carried`]'s: unported.
-
     #[allow(clippy::too_many_arguments)]
     fn conv1d_extended(
         &self,

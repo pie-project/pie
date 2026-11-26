@@ -82,12 +82,13 @@ pub struct Staged<'a> {
 /// slots; `pool(refs)` backs the pool pages a fire may name and gives their
 /// kernel page ids and base addresses. Returns the records and, per fault
 /// word, the lane and instance it faults.
+#[allow(clippy::type_complexity)]
 pub fn plan(
     groups: &[Group],
     staged: &Staged<'_>,
     translation: &dyn Fn(usize) -> Vec<u32>,
     folded: &dyn Fn(usize) -> u32,
-    #[allow(clippy::type_complexity)] pool: &mut dyn FnMut(&[u32]) -> Result<(Vec<u32>, Vec<u64>)>,
+    pool: &mut dyn FnMut(&[u32]) -> Result<(Vec<u32>, Vec<u64>)>,
 ) -> Result<(BeamRecords, Vec<(usize, engine::InstanceId)>)> {
     let mut records = BeamRecords::default();
     let mut faults: Vec<(usize, engine::InstanceId)> = Vec::new();

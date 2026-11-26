@@ -81,12 +81,12 @@ pub(crate) fn checkpoint_identity(path: &Path) -> String {
 fn content_hash(bytes: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
     let mut hash = bytes.len() as u64;
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        let word = u64::from_le_bytes(word.try_into().expect("an 8-byte chunk"));
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        let word = u64::from_le_bytes(*word);
         hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
     }
-    for &byte in words.remainder() {
+    for &byte in rest {
         hash = (hash.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
     }
     hash

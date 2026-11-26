@@ -756,7 +756,7 @@ impl Serve for Api {
                 // again.
                 shell.device.indirect_next(varying);
                 Plan::Walk {
-                    keep: Some(shape).filter(|_| shell.shelf.recorder.has_room()),
+                    keep: shell.shelf.recorder.has_room().then_some(shape),
                     split: false,
                 }
             }
@@ -1041,7 +1041,6 @@ impl Serve for Api {
         if frame.is_dry() {
             // An arm walk that filled a held family: nothing recorded, nothing
             // run.
-            drop(frame);
             shell.kept_none();
             return shell.device.landed(Some(on_done));
         }

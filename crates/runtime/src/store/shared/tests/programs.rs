@@ -338,13 +338,12 @@ async fn a_bind_the_engine_refuses_closes_its_term_as_if_it_never_happened() {
         .await
         .unwrap();
     assert_eq!(shared.lock().unwrap().pool().act_chunks(256), 4 + 8);
-    let refused: Result<(), ::engine::Error> = Err(::engine::Error::Exhausted {
+    // No instance is bound; the binder's error drops its guard.
+    let error = ::engine::Error::Exhausted {
         resource: "placement heap",
         wanted: 128 << 20,
         available: 0,
-    });
-    // No instance is bound; the binder's error drops its guard.
-    let error = refused.expect_err("the engine refused the bind");
+    };
     assert!(error.is_retryable());
     drop(open);
     {

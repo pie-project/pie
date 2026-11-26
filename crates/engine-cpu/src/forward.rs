@@ -839,6 +839,10 @@ impl Run<'_> {
         let group = heads / kv_heads.max(1);
         let observed = (observe as usize).min(q.rows);
         let share = 1.0 / (observed as f32 * q_heads as f32);
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "the index addresses more than one table"
+        )]
         for t in q.rows - observed..q.rows {
             let p = self.positions[t] as usize;
             for h in 0..heads {

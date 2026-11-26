@@ -955,6 +955,10 @@ pub fn beam_max_lanes(ctx: &Ctx) -> u32 {
     #[cfg(not(feature = "rocm"))]
     let optin: Option<u32> = None;
     let _ = ctx;
+    #[allow(
+        clippy::unnecessary_literal_unwrap,
+        reason = "without the rocm feature optin is None"
+    )]
     let room = optin.unwrap_or(48 << 10).saturating_sub(BEAM_STATIC_SHARED);
     let mut width = 1u32;
     while beam_step_shared_bytes(width + 1) <= room {

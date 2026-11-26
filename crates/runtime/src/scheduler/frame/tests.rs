@@ -691,6 +691,10 @@ fn no_parked_owner_s_complete_frame_waits_on_a_boundary_over_seeded_schedules() 
             }
             // A brief wait parked nowhere (a lock, a turn) ends: its
             // owner submits again next round.
+            #[allow(
+                clippy::needless_range_loop,
+                reason = "the index addresses more than one table"
+            )]
             for at in 0..lanes.len() {
                 if state[at] == 1 && rng.below(2) == 0 {
                     state[at] = 0;

@@ -748,6 +748,10 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
     let anc: Vec<(Vec<f64>, Vec<f64>)> = (0..folded)
         .map(|r| (row_of(1000 + r as u64), row_of(5000 + r as u64)))
         .collect();
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the index addresses more than one table"
+    )]
     for r in folded - R..folded {
         put(&mut pool, g.ring_at(0, r % R, false), &anc[r].0);
         put(&mut pool, g.ring_at(0, r % R, true), &anc[r].1);
@@ -770,6 +774,10 @@ fn beam_siblings_read_their_window_along_their_own_lineage() {
     let (pool_buf, _) = gpu.up(&pool);
     let record = [g.record0 as i32, (g.record0 + 1) as i32];
     let mut lanes_table = Vec::new();
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "the index addresses more than one table"
+    )]
     for l in 0..2usize {
         let shift = firsts[l] - folded - 8;
         lanes_table.extend([

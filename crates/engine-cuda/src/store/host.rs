@@ -610,6 +610,7 @@ impl HostTier {
     /// Copies each `(tier offset, device address, bytes)` to the device on
     /// `swap`, behind every move into those slots (the landing thread's
     /// order). Returns the event the last copy lands at on the stream.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_device(
         &mut self,
         swap: *mut core::ffi::c_void,

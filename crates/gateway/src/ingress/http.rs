@@ -60,6 +60,10 @@ fn token_event_stream(
     handle: SessionHandle,
     rx: TokenRx,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    #[allow(
+        clippy::large_enum_variant,
+        reason = "one state a stream, moved once an event"
+    )]
     enum St {
         Streaming { rx: TokenRx, handle: SessionHandle },
         End,

@@ -786,11 +786,12 @@ impl ResidencyPlanner {
         // or arrival event, never refused (only a need past the pool alone
         // is), and a debug build stops on it by name. The simulation's
         // progress invariant fails a run on it instead.
-        assert!(
-            !cfg!(all(debug_assertions, not(test))),
-            "planner bug: the queue's head {pid} ({kind}) fits the pool alone and is unserved \
-             with nothing in flight, no step found: {plan}"
-        );
+        if cfg!(all(debug_assertions, not(test))) {
+            panic!(
+                "planner bug: the queue's head {pid} ({kind}) fits the pool alone and is \
+                 unserved with nothing in flight, no step found: {plan}"
+            );
+        }
         // The progress invariant: a settled pass leaves every waiting head
         // served or something in flight that moves the generation. Broken,
         // tests fail by name; served, the next pass plans the head's need

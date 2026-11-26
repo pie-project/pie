@@ -569,7 +569,6 @@ fn windowed_of(recipe: &ChunkRecipe) -> Vec<engine::chunk::WindowedLayer> {
             layer: layer.layer.unwrap_or(u32::MAX),
             window: layer.window,
             bytes,
-            ..engine::chunk::WindowedLayer::default()
         })
         .collect()
 }

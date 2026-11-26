@@ -91,7 +91,6 @@ impl<B: Serve> Shell<B> {
     pub fn pool_facts(&self) -> Result<PoolFacts> {
         Ok(PoolFacts {
             adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
-            ..PoolFacts::default()
         })
     }
 

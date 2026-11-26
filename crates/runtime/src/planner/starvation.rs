@@ -71,7 +71,7 @@ impl ResidencyPlanner {
                 })
                 .map(|(pid, proc)| ((proc.rank(), proc.seq, *pid), *pid))
                 .collect();
-            residents.sort_by(|a, b| b.0.cmp(&a.0));
+            residents.sort_by_key(|a| std::cmp::Reverse(a.0));
             residents.into_iter().map(|(_, pid)| pid).collect()
         });
         let mut held_back = Vec::new();

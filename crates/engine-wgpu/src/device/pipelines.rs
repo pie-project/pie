@@ -770,7 +770,7 @@ fn build_rebased(
         &wgsl,
     )
     .map_err(shader)?;
-    let bytes = 16 * u32::try_from(declared.bindings.div_ceil(4).max(1)).unwrap_or(u32::MAX);
+    let bytes = 16 * declared.bindings.div_ceil(4).max(1);
     Ok(Arc::new(Rebased {
         pipeline: twin,
         layout,

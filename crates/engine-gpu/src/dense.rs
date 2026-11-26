@@ -621,6 +621,7 @@ fn weigh(
 /// only past the two kernels' measured spread, and a rung no kernel was
 /// timed at keeps it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn pick(
     target: Target,
     rungs: &[u32],
@@ -630,7 +631,7 @@ fn pick(
     planes: &[(u32, u32, u32, f64)],
     records: bool,
     full: Option<u32>,
-    #[allow(clippy::type_complexity)] incumbent: Option<&dyn Fn(u32) -> Tactic>,
+    incumbent: Option<&dyn Fn(u32) -> Tactic>,
 ) -> Result<(Vec<(u32, Tactic)>, Vec<Weighed>), &'static str> {
     let curves = rates.kernel_curves.as_deref().ok_or(UNREACHED)?;
     // The candidates at `kernel_rows` (a rung's, or a fire's own): each

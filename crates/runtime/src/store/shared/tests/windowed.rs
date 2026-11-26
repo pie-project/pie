@@ -46,13 +46,11 @@ fn windowed_facts() -> ChunkFacts {
             layer: 0,
             window: 8,
             bytes: 8 * 256,
-            ..WindowedLayer::default()
         },
         WindowedLayer {
             layer: 2,
             window: 8,
             bytes: 8 * 256,
-            ..WindowedLayer::default()
         },
     ];
     facts.record_bytes = facts.ring_bytes();
@@ -338,7 +336,6 @@ fn hybrid_facts() -> ChunkFacts {
         layer: 1,
         window: 8,
         bytes: 8 * 256,
-        ..WindowedLayer::default()
     }];
     facts.record_bytes = facts.ring_bytes() + 4096;
     // Each rung's rs scratch: its rows only, nothing past them laid.
@@ -384,7 +381,6 @@ fn a_hybrid_parks_both_buffers_and_its_whole_record() {
             slots: 1,
             pages: 4,
             wbuf: 2,
-            ..RsUnits::default()
         }
     );
     let txn = rs.prepare_suspend(&sets).expect("the host takes it");

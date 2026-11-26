@@ -505,12 +505,13 @@ impl RsStore {
     /// the folded index after the fire, rounded down to a slot. Otherwise
     /// (a carrying lane, a group, a device-counted fold) every row is
     /// buffered, from the folded index before the fire.
+    #[allow(clippy::type_complexity)]
     pub fn split_writes(
         &self,
         ws: RsWorkingSetId,
         alone: bool,
         fold: Option<u32>,
-        #[allow(clippy::type_complexity)] writes: Option<std::ops::Range<u32>>,
+        writes: Option<std::ops::Range<u32>>,
     ) -> Result<(Option<std::ops::Range<u32>>, Option<std::ops::Range<u32>>), RsError> {
         let entry = self.entry(ws)?;
         if !self.window_buffer {
@@ -1654,7 +1655,6 @@ impl RsStore {
             slots: u32::from(state),
             pages: self.targets_demand(&targets) + wbuf,
             wbuf,
-            ..RsUnits::default()
         })
     }
 
@@ -1866,7 +1866,6 @@ impl RsStore {
             pages: self.targets_demand(&buffer_targets_src)
                 + self.targets_demand(&wbuffer_targets_src),
             wbuf: self.targets_demand(&wbuffer_targets_src),
-            ..RsUnits::default()
         };
         let (slots, pages, wpages) = match reserved {
             Some(granted) => {

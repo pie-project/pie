@@ -2100,7 +2100,7 @@ impl Shell {
         // unmeasured by the loader: this load's own growth
         if self.hold_per_kib == 0
             && let (Some(before), Some(after)) = (resident, crate::device::resident_bytes())
-            && kept.code.len() > 0
+            && !kept.code.is_empty()
         {
             self.hold_per_kib =
                 after.saturating_sub(before).saturating_mul(1024) / kept.code.len() as u64;
@@ -4413,11 +4413,12 @@ impl Shell {
 
     /// The fire's returned planes as each real lane reads them.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn kept(
         &self,
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
-        #[allow(clippy::type_complexity)] buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
+        buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
         (readout_rows, readout_layout, plane_layout): (&[i32], &[(u32, u32)], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,

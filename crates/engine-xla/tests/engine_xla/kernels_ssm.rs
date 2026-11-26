@@ -3257,9 +3257,7 @@ fn a_biased_wide_conv_prompt_matches_the_direct_conv() {
     let rows = 40usize;
     let indptr = [0i32, 37];
     let mut slot_of_row = vec![DROP; rows];
-    for t in 0..37 {
-        slot_of_row[t] = 1;
-    }
+    slot_of_row[..37].fill(1);
     let mut rng = Rng(17);
     let xs = rng.bf16s(rows * c, 1.0);
     let ws = rng.bf16s(c * k, 0.5);

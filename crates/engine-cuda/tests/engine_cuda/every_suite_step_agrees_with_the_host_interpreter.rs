@@ -700,6 +700,10 @@ fn bf16_battery(rows: u32) -> Suite {
         log_softmax_out.put(flat(&log_softmax(&x)));
         let odd = reshape(&x, [7 * rows, 143]);
         cumsum_out.put(flat(&cumsum(&odd)));
+        #[allow(
+            clippy::erasing_op,
+            reason = "a DSL tensor times 0: zeros of iota's shape, the constant broadcast"
+        )]
         let reversed = (iota(7 * rows) * 0u32 + (7 * rows - 1)) - iota(7 * rows);
         gathered_out.put(flat(&gather(&odd, &reversed)));
         let cells = reshape(&x, [n]);

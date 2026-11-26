@@ -82,10 +82,11 @@ pub(super) fn set_token(ws: crate::store::kv::page_table::WorkingSetId) -> u64 {
 /// past rows the host cannot place; `spans` the first slot it writes and
 /// the lags of the media runs it carries. What it folds is not the
 /// cursor's: that is its KV working set's.
+#[allow(clippy::type_complexity)]
 pub(super) fn advance_cursor(
     cell: &CursorCell,
     tail: Option<u32>,
-    #[allow(clippy::type_complexity)] spans: Option<(u32, Vec<(u32, u32, u32)>)>,
+    spans: Option<(u32, Vec<(u32, u32, u32)>)>,
 ) {
     let mut cursor = cell.lock().unwrap();
     cursor.tail = tail;

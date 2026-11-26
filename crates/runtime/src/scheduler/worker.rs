@@ -782,6 +782,10 @@ struct PendingLaunchBatch {
 /// then fired again; none fails for it.
 struct HeldForPlacement {
     chunks: Vec<u32>,
+    #[allow(
+        clippy::vec_box,
+        reason = "as `PendingLaunchBatch::requests`: the box keeps each move of a 1408-byte request 8 bytes"
+    )]
     requests: Vec<Box<PendingRequest>>,
     /// Fired again one by one: refused again after the move landed, so
     /// only the fires the engine still refuses alone fail.

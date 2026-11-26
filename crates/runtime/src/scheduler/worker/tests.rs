@@ -249,6 +249,10 @@ fn refused_limits() -> SchedulerLimits {
 /// `requests` built into a frame the engine refused for where `chunks`
 /// lie before any step ran: its steps come back with the refusal, as
 /// the lane hands them (`LaunchRefusal::unfired`).
+#[allow(
+    clippy::vec_box,
+    reason = "as `PendingLaunchBatch::requests`: the box keeps each move of a 1408-byte request 8 bytes"
+)]
 fn refused_frame(requests: Vec<Box<PendingRequest>>, chunks: &[u32]) -> PendingLaunchBatch {
     let fires = requests.len();
     let (frame, requests) = batch::build_frame_submission(

@@ -2407,16 +2407,12 @@ impl Batch {
     /// upward, written through `host` (`(at, bytes)` to its host runs), and
     /// writes what a batch holds from its first fire; the caller drained
     /// every frame that read where it was. Returns where the next lies.
+    #[allow(clippy::type_complexity)]
     pub fn lay(
         &mut self,
         view: &Buffer,
         at: u64,
-        #[allow(clippy::type_complexity)] host: &dyn Fn(
-            u64,
-            u64,
-        ) -> Result<
-            Vec<(u64, u64, std::ptr::NonNull<u8>)>,
-        >,
+        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
     ) -> Result<u64> {
         let mut next = at;
         for region in self.regions_mut() {

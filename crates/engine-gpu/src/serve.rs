@@ -6265,6 +6265,7 @@ impl<B: Serve> Shell<B> {
     /// Plans the fire's beam groups over its staged tables
     /// ([`crate::beam::plan`]).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn plan_beams<'a, 'r>(
         &self,
         arm: usize,
@@ -6272,7 +6273,7 @@ impl<B: Serve> Shell<B> {
         geometries: &[poem_exec::store::kv::Geometry],
         seats: &[Seat],
         seat_of: &[Option<(usize, u32)>],
-        #[allow(clippy::type_complexity)] rs: Option<(
+        rs: Option<(
             &'r [i32],
             &'r dyn Fn(usize) -> Option<(usize, bool)>,
             &'r dyn Fn(usize) -> Option<(u32, &'r [u32])>,
@@ -7072,7 +7073,6 @@ impl<B: Serve> Shell<B> {
 
     /// Reads token seat row `row` of arm `arm`, as a fed check does once
     /// the fire there landed.
-    #[must_use]
     pub fn token_row_reader(&self, arm: usize) -> crate::settle::ReadRow {
         let (store, tokens) = self.inputs[arm].token_seat();
         let store = store.clone();

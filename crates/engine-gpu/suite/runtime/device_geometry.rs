@@ -449,7 +449,7 @@ fn answers_the_host_path(frames: u8) {
     let program = engine::Programs::register(
         &mut rig.engine,
         &ProgramRegistration {
-            program_hash: 0xbea3_9e0,
+            program_hash: 0x0bea_39e0,
             launch: eta_compiler::codegen::launch::build(&bound, &stages),
             ..Default::default()
         },

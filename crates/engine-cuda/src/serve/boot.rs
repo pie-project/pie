@@ -25,10 +25,7 @@ pub enum Graphs {
 impl Graphs {
     #[must_use]
     pub fn shaped(self) -> bool {
-        match self {
-            Graphs::Off => false,
-            _ => true,
-        }
+        !matches!(self, Graphs::Off)
     }
 
     #[must_use]
@@ -52,10 +49,7 @@ pub enum Recording {
 impl Recording {
     #[must_use]
     pub fn pad(self) -> bool {
-        match self {
-            Recording::Off => false,
-            _ => true,
-        }
+        !matches!(self, Recording::Off)
     }
 
     #[must_use]

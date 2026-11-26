@@ -79,6 +79,7 @@ pub struct Registered {
     step: Done,
 }
 
+#[allow(clippy::large_enum_variant, reason = "one a registration, moved once")]
 enum Done {
     Registered(ProgramId),
     Held(ExecPlan, Compiled),
@@ -90,6 +91,7 @@ enum Done {
 // thread) and a compile job (`compile::Job`); one thread holds it at a time.
 #[allow(unsafe_code)]
 unsafe impl Send for Registering {}
+// SAFETY: as for `Registering`: what it holds, one thread at a time.
 #[allow(unsafe_code)]
 unsafe impl Send for Registered {}
 

@@ -883,7 +883,6 @@ impl Device {
     }
 
     /// Whether the disk cache holds the program compiled from `text`.
-    #[must_use]
     /// The program the load compiled from `text` and parked in the disk
     /// cache (`serve::warm`), loaded for the first fire of its shape: from
     /// memory where it is held, else from the disk, never built. `None`:
@@ -1317,6 +1316,7 @@ fn touch(file: &std::path::Path) {
 fn free_bytes(dir: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is plain data, all zeros a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `path` is a valid C string and `stat` a writable statvfs.
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
@@ -1676,6 +1676,11 @@ impl Code {
             Code::Text(text) => text.len(),
             Code::Cached { len, .. } => *len,
         }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// What compiling the program's text takes of the host.

@@ -637,8 +637,10 @@ fn a_declared_context_is_cut_to_the_room_past_the_modules() {
 /// state pool aims near, so a miniature's records are cut into pieces as a
 /// full model's are. The logits are the same either way.
 pub(super) fn knobs() -> engine_cuda::Knobs {
-    let mut knobs = engine_cuda::Knobs::default();
-    knobs.profiles = Some(cache_dir().join("profiles"));
+    let mut knobs = engine_cuda::Knobs {
+        profiles: Some(cache_dir().join("profiles")),
+        ..engine_cuda::Knobs::default()
+    };
     if let Ok(bytes) = std::env::var("PIE_GOLDEN_CHUNK") {
         knobs.diagnostics.chunk_bytes = Some(bytes.parse().expect("PIE_GOLDEN_CHUNK is bytes"));
     }
@@ -781,13 +783,7 @@ fn served(fixture: &Fixture, cache: &Path) -> Vec<(u64, u32)> {
             facts
                 .shapes
                 .iter()
-                .map(|s| (
-                    s.id.0,
-                    s.role,
-                    s.slot_bytes,
-                    s.slots_per_chunk,
-                    s.kind.clone()
-                ))
+                .map(|s| (s.id.0, s.role, s.slot_bytes, s.slots_per_chunk, s.kind))
                 .collect::<Vec<_>>()
         );
     }
@@ -1459,7 +1455,7 @@ fn tier_round_trip(model: &str, cache: &Path) -> Vec<(String, u64)> {
         .expect("the segments commit");
     let committed = segments * facts.segment_chunks;
     assert!(
-        1 + 4 * parked.len() as u32 <= committed,
+        4 * parked.len() as u32 < committed,
         "{model}: four device chunks a shape in the {committed} committed"
     );
     assert!(
@@ -1774,8 +1770,10 @@ fn within_tolerance() -> bool {
         let bytes = std::fs::read(Path::new(dir).join(format!("{at}.f32"))).ok()?;
         Some(
             bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect(),
         )
     };
@@ -3706,13 +3704,11 @@ fn served_partial_fold(
 /// element): the root of the summed squared differences of the finite ones.
 fn bf16_apart(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len(), "two slots of one pool");
-    let value = |w: &[u8]| {
-        f64::from(f32::from_bits(
-            u32::from(u16::from_le_bytes([w[0], w[1]])) << 16,
-        ))
-    };
-    a.chunks_exact(2)
-        .zip(b.chunks_exact(2))
+    let value = |w: &[u8; 2]| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(*w)) << 16));
+    a.as_chunks::<2>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<2>().0)
         .map(|(x, y)| (value(x), value(y)))
         .filter(|(x, y)| x.is_finite() && y.is_finite())
         .map(|(x, y)| (x - y) * (x - y))

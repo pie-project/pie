@@ -166,7 +166,6 @@ fn not_committed(fired: &Fired) -> Option<String> {
 impl Session {
     /// The bind-time tables an instance of `compiled` takes, every
     /// launching stage's in order.
-    #[must_use]
     /// The value scratch one lane of the program takes in a fire at
     /// `extents`: the widest launching stage's. Stages fire one after
     /// another in one serial pass order and none reads another's scratch
@@ -1128,6 +1127,10 @@ impl Session {
     #[must_use]
     pub fn readiness(&self, plan: &ExecPlan) -> Option<Blocked> {
         let cursors = self.staging_cursors(plan);
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "the index addresses more than one table"
+        )]
         for channel in 0..self.shapes.len() {
             let needs = plan
                 .package

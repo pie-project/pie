@@ -379,8 +379,8 @@ pub struct Lane {
     /// order, by the shapes of the engine's [`crate::chunk::ChunkFacts`]
     /// (pinned shapes' refs where it pins its pools); a list the lane holds
     /// no slot of is left out. The window buffer's table starts at
-    /// [`WindowFold::base`]: entry `i` holds rows `[base + i * T, base + (i
-    /// + 1) * T)` (`T` its shape's tokens), every entry a real slot
+    /// [`WindowFold::base`]: entry `i` holds rows
+    /// `[base + i * T, base + (i + 1) * T)` (`T` its shape's tokens), every entry a real slot
     /// (CONTRACT-BC 19, 21).
     ///
     /// A window list's table (none from a runtime that serves windowed

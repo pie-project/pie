@@ -287,11 +287,12 @@ struct Port {
 /// A column's rows and default as a table change: rows by the keys this
 /// worker can name, `None` where deleted; keys naming nothing it could hold
 /// are passed over.
+#[allow(clippy::type_complexity)]
 fn rows<K, V, R, W>(
     column: usize,
     delta: plex_host::host::ColumnDelta<K, V>,
     key: impl Fn(K) -> Option<R>,
-    #[allow(clippy::type_complexity)] value: impl Fn(V) -> W,
+    value: impl Fn(V) -> W,
 ) -> (Vec<(R, Option<W>)>, Option<Option<W>>) {
     let mut out = Vec::with_capacity(delta.rows.len());
     for (k, row) in delta.rows {

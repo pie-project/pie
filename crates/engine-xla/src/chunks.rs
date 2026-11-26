@@ -22,7 +22,6 @@ impl Shell {
         // `Shell::serves_windowed_state`)
         PoolFacts {
             adapter_banks: u32::try_from(self.bank_seats().len()).unwrap_or(u32::MAX),
-            ..PoolFacts::default()
         }
     }
 

@@ -16,7 +16,6 @@ pub(super) enum Form {
 }
 
 impl Shell {
-    #[must_use]
     /// A windowed lane's window table for this fire (/// `store::windowed`): its ring's pages below the buffer's base, its
     /// window-buffer slots from it, and the fire's own rows past them: in
     /// their ring rows where none of them overwrites a row a query of the

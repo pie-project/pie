@@ -169,6 +169,10 @@ impl FireExtents {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::single_range_in_vec_init,
+    reason = "a list of ranges that holds one"
+)]
 mod tests {
     use super::{FireExtents, Written};
 
@@ -176,14 +180,10 @@ mod tests {
         (set, readable)
     }
 
+    #[allow(clippy::type_complexity)]
     fn fire(
         written: &mut Written,
-        #[allow(clippy::type_complexity)] lanes: &[(
-            u32,
-            (u64, u32),
-            Vec<std::ops::Range<u32>>,
-            u32,
-        )],
+        lanes: &[(u32, (u64, u32), Vec<std::ops::Range<u32>>, u32)],
     ) -> Result<(), String> {
         let mut extents = FireExtents::default();
         for (at, (seat, kv, writes, reach)) in lanes.iter().enumerate() {

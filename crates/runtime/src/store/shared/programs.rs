@@ -750,11 +750,12 @@ pub async fn check_moved(shared: &Shared, mover: &impl Mover, what: &str) {
         what,
         "store: the engine's chunk table and the runtime's are apart after a move"
     );
-    assert!(
-        !cfg!(debug_assertions),
-        "engine {}: after {what}, the engine's chunk table is apart from the runtime's: {apart}",
-        mover.engine()
-    );
+    if cfg!(debug_assertions) {
+        panic!(
+            "engine {}: after {what}, the engine's chunk table is apart from the runtime's: {apart}",
+            mover.engine()
+        );
+    }
 }
 
 /// After a refused raise: the engine's chunk table checked against the

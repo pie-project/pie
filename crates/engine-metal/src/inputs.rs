@@ -145,6 +145,7 @@ pub struct FaultReader {
 // fire that wrote it, and written again only by a fire staged on this arm
 // after the flight is harvested.
 unsafe impl Send for FaultReader {}
+// SAFETY: as for `Send`: no two fires touch the alias at once.
 unsafe impl Sync for FaultReader {}
 
 impl FaultReader {

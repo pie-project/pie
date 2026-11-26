@@ -191,7 +191,6 @@ impl Arena {
     /// own) at the reservation's end. The place each carve takes is fixed,
     /// so a body recorded at any rung stays good at every rung its fire
     /// fits.
-    #[must_use]
     pub fn fire_slots(
         &self,
         pools: &Pools,
@@ -269,7 +268,6 @@ impl Arena {
     }
 }
 
-#[must_use]
 /// `map`'s slots for a fire of `rows`, each value's rectangle at its
 /// place. A rectangle past the bytes the map laid its slot for is refused
 /// by name before anything is written: a carve wider than the layout (more

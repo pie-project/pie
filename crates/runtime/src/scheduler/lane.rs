@@ -1730,7 +1730,6 @@ impl Lane {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(
         clippy::too_many_arguments,
         reason = "the lane's state a frame reads, each its own"

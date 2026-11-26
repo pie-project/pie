@@ -2212,19 +2212,22 @@ async fn fire(
                 wait_resident(ctx, pid).await?;
                 continue;
             }
-            None => match {
+            None => {
                 ctx.at(pid, "acquire");
-                planner.acquire(pid, pid, demand).await
-            } {
-                Ok(Acquired::Granted(grant)) => grant,
-                Ok(Acquired::Yield) => {
-                    wait_resident(ctx, pid).await?;
-                    continue;
+                let acquired = planner.acquire(pid, pid, demand).await;
+                match acquired {
+                    Ok(Acquired::Granted(grant)) => grant,
+                    Ok(Acquired::Yield) => {
+                        wait_resident(ctx, pid).await?;
+                        continue;
+                    }
+                    Ok(Acquired::Requote) => continue,
+                    Err(PlannerError::Cancelled) if planner.registered(pid) => continue,
+                    Err(error) => {
+                        return Err(format!("acquire {} pages: {error}", demand.kv_pages));
+                    }
                 }
-                Ok(Acquired::Requote) => continue,
-                Err(PlannerError::Cancelled) if planner.registered(pid) => continue,
-                Err(error) => return Err(format!("acquire {} pages: {error}", demand.kv_pages)),
-            },
+            }
         };
         let leases: Result<Vec<_>, _> = sets.iter().map(|set| set.handle.fire_lease()).collect();
         let Ok(leases) = leases else {

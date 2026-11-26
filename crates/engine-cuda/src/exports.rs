@@ -73,19 +73,18 @@ fn mask_reader(op: &poem_ir::Operation) -> Option<&poem_ir::Attn> {
 /// Whether this backend's kernel for `attn` (which reads the masks) applies
 /// each lane's: a selection's and a relative bias's arms read none.
 fn applies_mask(attn: &poem_ir::Attn) -> bool {
-    match attn {
+    matches!(
+        attn,
         poem_ir::Attn::Prefill {
             selection: None,
             bias: None,
             ..
-        }
-        | poem_ir::Attn::Decode {
+        } | poem_ir::Attn::Decode {
             selection: None,
             bias: None,
             ..
-        } => true,
-        _ => false,
-    }
+        }
+    )
 }
 
 /// The classes whose fires stage every lane's mask entry, a mask or the

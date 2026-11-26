@@ -326,6 +326,10 @@ mod tests {
             first: 55,
             rows: 1,
             buffer: &[7, 9],
+            #[allow(
+                clippy::single_range_in_vec_init,
+                reason = "a list of ranges that holds one"
+            )]
             reads: &[50..55],
             fire: &[30],
             record: 0,

@@ -4218,10 +4218,10 @@ impl KvStore {
                     && !self.table.in_move_at(root)
                     && self.persisted_whole(entry)
             })
-            .filter_map(|(&id, entry)| {
+            .map(|(&id, entry)| {
                 let (lowest, _) = copies(entry);
                 let kept = self.tiers_of(id, keys) & retention::DISK != 0;
-                Some((kept, lowest, entry.last_use, id))
+                (kept, lowest, entry.last_use, id)
             })
             .collect();
         whole.sort_unstable();

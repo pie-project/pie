@@ -148,8 +148,8 @@ pub struct ChunkFacts {
     /// disk tier's byte budget covers every state shape, divided into
     /// chunks of `chunk_bytes` (each on the slot file's direct I/O
     /// boundary), ids from 0, none reserved, no table, any state shape
-    /// taking any chunk. A disk ref of shape s is `chunk * s.slots_per_chunk
-    /// + index`, laid out as the same slot on the device (and the host
+    /// taking any chunk. A disk ref of shape s is
+    /// `chunk * s.slots_per_chunk + index`, laid out as the same slot on the device (and the host
     /// tier): [`SlotShape::tier_offset`] of the engine's slot file with its
     /// disk chunk's bytes. The engine states the division at load.
     #[serde(default)]

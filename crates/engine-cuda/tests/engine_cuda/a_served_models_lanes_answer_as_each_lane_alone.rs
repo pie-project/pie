@@ -10,7 +10,6 @@
 /// row diffuse, and the decision's gap within twice its largest per-logit
 /// move). Run by hand on a served model:
 /// `PIE_CONTRACT_ARTIFACT=<.zt> PIE_CONTRACT_DEPLOYMENT=<row>`.
-
 mod eight_lanes {
     use std::path::Path;
 
@@ -149,7 +148,6 @@ mod eight_lanes {
 /// lane's own row in a fire mixing a prompt between decodes: each lane's
 /// last row is the one it answers alone. Run by hand on a served model:
 /// `PIE_CONTRACT_ARTIFACT=<.zt> PIE_CONTRACT_DEPLOYMENT=<row>`.
-
 mod mixed_readout {
     use std::path::Path;
 

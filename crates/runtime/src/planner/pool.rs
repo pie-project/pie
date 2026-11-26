@@ -88,7 +88,7 @@ impl RunNeed {
             Some((_, pieces)) => *pieces = with(*pieces),
             None => {
                 self.0.push((run, fresh));
-                self.0.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                self.0.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
             }
         }
     }

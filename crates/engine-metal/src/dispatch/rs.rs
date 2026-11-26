@@ -188,6 +188,10 @@ impl Run<'_> {
         let indptr = self.qo_indptr_host()?;
         let lane0 = self.window()?.span.lane_offset;
         let mut copies = Vec::new();
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "the index addresses more than one table"
+        )]
         for r in 0..indptr.len().saturating_sub(1) {
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;

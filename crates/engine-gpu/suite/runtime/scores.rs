@@ -102,13 +102,11 @@ fn oracle(trace: &Trace, context: u32, prompt: &[u32]) -> Vec<[Vec<f32>; 2]> {
         me.step(prompt, 0, word(trace, prompt.len() as u32, true))
             .expect("the oracle prefills"),
     )];
-    let mut at = prompt.len() as u32;
-    for token in DECODE {
+    for (at, token) in (prompt.len() as u32..).zip(DECODE) {
         steps.push(read(
             me.step(&[token], at, word(trace, 1, true))
                 .expect("the oracle decodes"),
         ));
-        at += 1;
     }
     steps
 }
