@@ -247,11 +247,15 @@ fn tell_planes(got: &[u8], want: &[u8], planes: &Planes) {
         let read = |b: &[u8]| -> Vec<f32> {
             match dtype {
                 poem_ir::Dtype::F32 => b
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
                 poem_ir::Dtype::Bf16 => b
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
                     .collect(),
                 _ => Vec::new(),
@@ -309,13 +313,17 @@ fn floats(bytes: &[u8], dtype: poem_ir::Dtype) -> Option<Vec<f64>> {
     match dtype {
         poem_ir::Dtype::F32 => Some(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
                 .collect(),
         ),
         poem_ir::Dtype::Bf16 => Some(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     f64::from(f32::from_bits(
                         u32::from(u16::from_le_bytes([c[0], c[1]])) << 16,

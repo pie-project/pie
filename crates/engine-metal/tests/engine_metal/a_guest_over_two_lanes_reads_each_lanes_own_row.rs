@@ -199,8 +199,10 @@ fn a_guest_over_two_lanes_reads_each_lanes_own_row() {
         .expect("a take")
         .expect("the epilogue put its argmaxes");
     let got: Vec<u32> = cell
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().expect("an i32 cell")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
         .collect();
     assert_eq!(
         got,

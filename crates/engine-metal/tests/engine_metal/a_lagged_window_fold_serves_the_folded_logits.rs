@@ -163,10 +163,7 @@ fn lagged(model: &str, fixture: &Fixture, context: u32, prompt: u32) {
     };
     let layout = shell.pool_layout();
     let facts = shell.pool_chunk_facts();
-    let window = layout
-        .window(0)
-        .expect("a ring load's window buffer")
-        .clone();
+    let window = *layout.window(0).expect("a ring load's window buffer");
     let page = window.tokens;
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk.max(1));
     let per_window = per(WINDOWS[0]);
