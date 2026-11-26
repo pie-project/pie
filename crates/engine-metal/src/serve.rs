@@ -3022,8 +3022,11 @@ impl engine::frame::Shell for Shell {
         crate::encode::reset_kernel_profile();
         let walked = self.walk_once(&prepared)?;
         fire_trace(|| "forward-encoded".to_string());
+        // A forced profile (`crate::encode::profile_kernels`: a check's
+        // dissection, the fire terms) is its caller's to read; the boot's
+        // diagnostic prints each fire's and lets it go.
         let profile = crate::encode::kernel_profile();
-        if !profile.is_empty() {
+        if !profile.is_empty() && crate::diag::on().kernel_profile.on() {
             let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
             eprintln!(
                 "kernels: fire of {} row(s), {:.1} ms on the device:",

@@ -78,6 +78,10 @@ impl Shell {
         if let Some(keepalive) = &self.keepalive {
             keepalive.end();
         }
+        {
+            let (start, end) = flight.pending.gpu_span_us();
+            crate::encode::landed_device_us(end.saturating_sub(start));
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(

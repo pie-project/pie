@@ -103,6 +103,10 @@ pub fn reset_kernel_profile() {
         .lock()
         .expect("kernel profile lock poisoned")
         .clear();
+    TERM_PROFILE
+        .lock()
+        .expect("term profile lock poisoned")
+        .clear();
 }
 
 #[cfg(target_vendor = "apple")]
@@ -123,11 +127,79 @@ fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(crate) fn record_kernel(name: &str, seconds: f64) {
+    record_kernel_of(name, None, seconds);
+}
+
+/// [`record_kernel`], the dispatch's Metal source `file` named for the
+/// fire-term rollup (else its name's first word).
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub(crate) fn record_kernel_of(name: &str, file: Option<&str>, seconds: f64) {
     let ns = (seconds * 1e9).max(0.0) as u64;
     let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     let row = table.entry(name.to_string()).or_insert((0, 0));
     row.0 += ns;
     row.1 += 1;
+    drop(table);
+    let term = TERM.with(|t| t.borrow().clone());
+    let mut terms = TERM_PROFILE.lock().expect("term profile lock poisoned");
+    let row = terms
+        .entry((
+            term,
+            file.unwrap_or_else(|| name.split(' ').next().unwrap_or(name))
+                .to_string(),
+        ))
+        .or_insert((0, 0));
+    row.0 += ns;
+    row.1 += 1;
+}
+
+/// What the kernel profile's dispatches are rolled up by beside their
+/// source (the fire terms, `crate::tune::terms`): the fire term the node
+/// dispatching them is, as the walk tags it (`Run`'s `DispatchProbe::enter`).
+static TERM_PROFILE: std::sync::Mutex<
+    std::collections::BTreeMap<(Term, String), (u64, u64)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A fire term a node's dispatches count toward: its kind
+/// ([`profile::curves::FireTerm`]'s) and shape; `None` past every node (a
+/// fire's own work: the readback, the frame's copies).
+pub type Term = Option<(u32, Vec<u32>)>;
+
+/// The device span (us) of the last fire to land, its first command
+/// buffer's start to its last's end: what a fire's wall time holds past
+/// its device work (the fire terms' fire fixed) is taken against.
+static LANDED_DEVICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn landed_device_us(us: u64) {
+    LANDED_DEVICE_US.store(us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The device span (us) of the last fire to land.
+#[must_use]
+pub fn last_device_us() -> u64 {
+    LANDED_DEVICE_US.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static TERM: std::cell::RefCell<Term> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tags the dispatches recorded on this thread from here as `term`'s,
+/// returning the tag it replaces (to restore with [`set_term`]).
+pub(crate) fn set_term(term: Term) -> Term {
+    TERM.with(|t| t.replace(term))
+}
+
+/// The dispatches' device time by fire term and Metal source since the last
+/// [`reset_kernel_profile`]: `(term, kernel, ns, dispatches)`.
+#[must_use]
+pub fn term_profile() -> Vec<(Term, String, u64, u64)> {
+    TERM_PROFILE
+        .lock()
+        .expect("term profile lock poisoned")
+        .iter()
+        .map(|((term, kernel), &(ns, n))| (term.clone(), kernel.clone(), ns, n))
+        .collect()
 }
 
 thread_local! {
@@ -176,7 +248,7 @@ impl Encode for Sink<'_> {
                     self.dispatch(&encoder, &pipeline, fire)?;
                 }
                 let seconds = own.commit_timed().map_err(refuse)?;
-                record_kernel(&profile_key(fire.entrypoint, args), seconds);
+                record_kernel_of(&profile_key(fire.entrypoint, args), Some(fire.file), seconds);
                 return Ok(());
             }
             {

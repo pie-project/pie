@@ -579,6 +579,26 @@ impl Run<'_> {
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
+        // Under the kernel profile a plane's matmul is its own fire term
+        // (`crate::encode::set_term`): its plane `[n, k, dtype]`.
+        #[cfg(target_vendor = "apple")]
+        if let Linear::Matmul { w, .. } = op
+            && crate::encode::profiling()
+        {
+            let plane = self.tensor(*w)?;
+            let term = Some((
+                profile::curves::FireTerm::GEMM,
+                vec![plane.rows, plane.width, crate::tune::terms::dtype_code(plane.dtype)],
+            ));
+            let was = crate::encode::set_term(term);
+            let ran = self.linear_untagged(op);
+            crate::encode::set_term(was);
+            return ran;
+        }
+        self.linear_untagged(op)
+    }
+
+    fn linear_untagged(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         // The register expert tiles' grouping landed the riding shared
         // expert's gate.
         if let Linear::Matmul { y, .. } = op

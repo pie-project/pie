@@ -3,6 +3,7 @@
 //! searched end to end on the served models.
 
 pub(crate) mod dense;
+pub mod terms;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -1608,7 +1609,8 @@ impl engine::load::check::Loaded for CheckLoad<'_> {
             .into_iter()
             .map(|(name, ns, n)| (name, ns as f64, u32::try_from(n).unwrap_or(u32::MAX)))
             .collect();
-        crate::encode::reset_kernel_profile();
+        // The profile stands until the next dissection resets it: the fire
+        // terms read it by term (`terms::points`).
         Ok(engine::load::check::Dissection {
             wall_ns,
             ops,

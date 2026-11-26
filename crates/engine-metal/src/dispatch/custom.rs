@@ -295,6 +295,46 @@ impl Run<'_> {
 }
 
 impl poem_exec::DispatchProbe for Run<'_> {
+    /// Under the kernel profile, tags `node`'s dispatches with the fire term
+    /// it is (`crate::encode::set_term`): an attention by its heads, a
+    /// recurrent layer's conv and scan (and a gated norm) by its layer,
+    /// every other node a row op of its layer (`u32::MAX` past every
+    /// layer); a matmul retags its own dispatches by its plane
+    /// (`Run::linear`).
+    fn enter(&mut self, node: &poem_ir::Node) {
+        #[cfg(target_vendor = "apple")]
+        if crate::encode::profiling() {
+            use profile::curves::FireTerm;
+            let layer = node.layer.unwrap_or(u32::MAX);
+            let term = match &node.op {
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                    q,
+                    window,
+                    head_dim,
+                    kv_heads,
+                    ..
+                }) => {
+                    let width = self.tensor(*q).map_or(0, |t| t.width);
+                    let q_heads = width / (*head_dim).max(1);
+                    (
+                        FireTerm::ATTENTION,
+                        vec![q_heads, *kv_heads, *head_dim, window.unwrap_or(0), 0],
+                    )
+                }
+                poem_ir::Operation::Ssm(_) | poem_ir::Operation::Conv(_) => {
+                    (FireTerm::SCAN, vec![layer])
+                }
+                // A gated norm: a recurrent layer's own (its scan's output
+                // norm), else a row op (`tune::terms` tells them by layer).
+                poem_ir::Operation::Elemwise(poem_ir::Elemwise::RmsnormGated { .. }) => {
+                    (FireTerm::SCAN, vec![layer, 1])
+                }
+                _ => (FireTerm::ROW_OPS, vec![layer]),
+            };
+            crate::encode::set_term(Some(term));
+        }
+    }
+
     fn probe(&mut self, node: &poem_ir::Node) {
         use poem_ir::Operands as _;
         if !crate::diag::on().nan_check {
