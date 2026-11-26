@@ -1,4 +1,46 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Process contexts made and not yet torn down: a context counts from
+/// [`Live::new`] until its teardown has closed what it held (its channels,
+/// its instances) and said it quiesced, on the fast path or at the end of
+/// the deferred task.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static QUIESCED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// One process context's place in [`LIVE`], given back where its teardown
+/// ends.
+pub(crate) struct Live(());
+
+impl Live {
+    pub(crate) fn new() -> Live {
+        LIVE.fetch_add(1, Ordering::AcqRel);
+        Live(())
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if LIVE.fetch_sub(1, Ordering::AcqRel) == 1 {
+            QUIESCED.notify_waiters();
+        }
+    }
+}
+
+/// Once every process context made has been torn down: what each held is
+/// closed on the schedulers. No timer: a shutdown waits on it after ending
+/// every process, before it stops the schedulers.
+pub(crate) async fn all_torn_down() {
+    loop {
+        let quiesced = QUIESCED.notified();
+        tokio::pin!(quiesced);
+        quiesced.as_mut().enable();
+        if LIVE.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        quiesced.await;
+    }
+}
 
 pub(crate) struct TeardownFireContext {
     process_id: uuid::Uuid,
@@ -41,6 +83,7 @@ pub(crate) fn defer_resource_teardown(
     bind_permit: Option<super::ordered::OrderedPermit>,
     scratch_dir: Option<std::path::PathBuf>,
     handles: Option<crate::handle::Bag>,
+    live: Option<Live>,
 ) {
     let capped_execution = terminate_fences.is_some();
     let snapshot = residency.lock().unwrap().teardown_snapshot();
@@ -60,6 +103,7 @@ pub(crate) fn defer_resource_teardown(
         settle_handles(handles, &mut context, &residency);
         drop(context);
         remove_scratch(scratch_dir.as_deref());
+        drop(live);
         return;
     }
     if !crate::rt::has_runtime() {
@@ -74,6 +118,7 @@ pub(crate) fn defer_resource_teardown(
         }
         std::mem::forget(context);
         remove_scratch(scratch_dir.as_deref());
+        drop(live);
         return;
     };
     let task = async move {
@@ -101,6 +146,7 @@ pub(crate) fn defer_resource_teardown(
             }
         }
         crate::scheduler::worker::notify_process_quiesced(process_id);
+        drop(live);
     };
     crate::rt::spawn(task);
 }

@@ -60,6 +60,9 @@ pub struct ProcessCtx {
     /// Whom its working sets share as (`working-set.share`): set from its
     /// arrival before it runs.
     keying: Option<Keying>,
+    /// This context's count among those a shutdown waits to see torn down
+    /// ([`super::teardown::all_torn_down`]).
+    live: Option<super::teardown::Live>,
 }
 
 /// How a process's working sets key what they share.
@@ -94,6 +97,7 @@ impl Drop for ProcessCtx {
             bind_permit,
             std::mem::take(&mut self.scratch_dir),
             self.handles.take(),
+            self.live.take(),
         );
     }
 }
@@ -268,6 +272,7 @@ impl ProcessCtx {
             residency_flag: None,
             cached_tokens: 0,
             keying: None,
+            live: Some(super::teardown::Live::new()),
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(policy.memory_limit)
                 .build(),

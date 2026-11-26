@@ -78,6 +78,23 @@ impl RuntimeShutdown {
                 "planner census at shutdown"
             );
         }
+        // Every process ends as the host ends it, and its teardown closes
+        // its channels and instances on the schedulers, before they stop:
+        // a step queued for a lane whose process went is dropped with the
+        // process, never fired into a ring the gone process fills no more.
+        let live = crate::inferlet::process::list();
+        for &pid in &live {
+            crate::inferlet::process::terminate_by(
+                pid,
+                Err("the server is shutting down".to_string()),
+                crate::policy::By::Host,
+            );
+        }
+        crate::inferlet::process::teardown::all_torn_down().await;
+        tracing::info!(
+            processes = live.len(),
+            "every process ended and its instances closed before the schedulers stop"
+        );
         let scheduler_result = self.scheduler.shutdown().await;
         for engine_id in self.engine_ids {
             let _ = engine::backend::unregister_engine(engine_id);
