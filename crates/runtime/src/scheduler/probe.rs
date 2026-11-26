@@ -2,14 +2,6 @@ use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Default)]
 pub struct FireProbes {
-    pub inter_fire_us: AtomicU64,
-
-    pub post_dispatch_to_fire_us: AtomicU64,
-
-    pub recv_block_wait_us: AtomicU64,
-
-    pub accumulate: AccumulateProbes,
-    pub pre_dispatch: PreDispatchProbes,
     pub execute: ExecuteProbes,
     pub post_dispatch: PostDispatchProbes,
     pub quorum: QuorumProbes,
@@ -71,28 +63,17 @@ pub struct QuorumProbes {
     pub lane_control_max_us: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-pub struct AccumulateProbes {
-    pub accum_loop_us: AtomicU64,
-}
-
-#[derive(Debug, Default)]
-pub struct PreDispatchProbes {
-    pub fire_prepare_us: AtomicU64,
-}
-
+/// A fire's execute times, fed under `profile-fire`.
 #[derive(Debug, Default)]
 pub struct ExecuteProbes {
-    pub total_us: AtomicU64,
-
     pub batch_build_us: AtomicU64,
 
     pub engine_fire_us: AtomicU64,
 }
 
+/// What a fire's stats take to record, fed under `profile-fire`.
 #[derive(Debug, Default)]
 pub struct PostDispatchProbes {
-    pub context_tick_us: AtomicU64,
     pub stats_update_us: AtomicU64,
 }
 

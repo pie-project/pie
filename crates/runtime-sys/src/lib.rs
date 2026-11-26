@@ -303,9 +303,10 @@ pub mod address {
         }
     }
 
-    /// The commit the system can still give (`ullAvailPageFile`) and what
-    /// this process has committed (`PrivateUsage`); `None` where either is
-    /// not read.
+    /// The commit the system can still give without growing its paging
+    /// file (`ullAvailPageFile`, within the physical memory free,
+    /// `ullAvailPhys`) and what this process has committed
+    /// (`PrivateUsage`); `None` where either is not read.
     #[cfg(windows)]
     #[must_use]
     pub fn commit() -> Option<(u64, u64)> {
@@ -325,7 +326,10 @@ pub mod address {
             {
                 return None;
             }
-            Some((status.avail_page_file, counters.private_usage as u64))
+            Some((
+                status.avail_page_file.min(status.avail_phys),
+                counters.private_usage as u64,
+            ))
         }
     }
 

@@ -20,7 +20,9 @@
 //! On Windows wasmtime commits its table pool whole as it lays it
 //! (`VirtualAlloc` with `MEM_COMMIT`): the pool is held to the commit the
 //! system has left once the engines loaded (a CUDA pool under WDDM is
-//! charged there too), less what the process committed before them.
+//! charged there too), within the physical memory free so that a
+//! system-managed paging file does not grow to back it, less what the
+//! process committed before them.
 
 use anyhow::{Result, bail};
 use std::sync::OnceLock;
@@ -198,7 +200,8 @@ pub(crate) struct AddressSpace {
 /// The system's commit as this process may take it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Commit {
-    /// What the system can still commit (`ullAvailPageFile`).
+    /// What the system can still commit without growing its paging file:
+    /// `ullAvailPageFile` within the physical memory free (`ullAvailPhys`).
     pub available: u64,
     /// What this process has committed (`PrivateUsage`).
     pub used: u64,
