@@ -2071,8 +2071,9 @@ impl Shell {
     /// never dropped (the program about to load).
     fn make_host_room(&mut self, need: u64, at: Option<[u8; 32]>) {
         let bound = self.host_bound;
-        let fits = |shell: &Shell| {
-            let pending = shell.dropper.pending();
+        // with `freed` more bytes on their way out
+        let fits_freed = |shell: &Shell, freed: u64| {
+            let pending = shell.dropper.pending().saturating_add(freed);
             crate::device::available_memory().is_none_or(|free| {
                 free.saturating_add(pending)
                     >= need.saturating_add(crate::guest::run::guest_reserve())
@@ -2081,31 +2082,32 @@ impl Shell {
                     .is_none_or(|held| held.saturating_sub(pending).saturating_add(need) <= bound)
             })
         };
-        let mut dropped = 0u32;
-        while !fits(self) {
-            // a fired program by its last fire; one the loader holds and no
-            // fire took, before any
-            let fired = (self.evictable.iter())
-                .filter(|(key, _)| Some(**key) != at)
-                .map(|(key, (_, _, used))| (*used + 1, *key));
-            let loaded = (self.parked.iter())
-                .filter(|(key, p)| Some(**key) != at && self.device.holds_key(&p.code.hash()))
-                .map(|(key, _)| (0, *key));
-            let Some((used, victim)) = loaded.chain(fired).min() else {
-                break;
-            };
+        let fits = |shell: &Shell| fits_freed(shell, 0);
+        // the droppable ones: a fired program by its last fire, one the
+        // loader holds and no fire took before any (`evict::choose`)
+        let candidates: Vec<evict::Droppable> = (self.evictable.iter())
+            .map(|(key, (p, _, used))| evict::Droppable {
+                key: *key,
+                used: *used + 1,
+                bytes: self.hold_of(p),
+            })
+            .chain(
+                (self.parked.iter())
+                    .filter(|(_, p)| self.device.holds_key(&p.code.hash()))
+                    .map(|(key, p)| evict::Droppable {
+                        key: *key,
+                        used: 0,
+                        bytes: self.hold_of(p),
+                    }),
+            )
+            .collect();
+        let (victims, _) = evict::choose(candidates, at, |freed| {
+            fits_freed(self, freed)
+        });
+        let dropped = victims.len();
+        for victim in victims {
             let mut held = Vec::new();
-            let bytes = if used == 0 {
-                let Some(parked) = self.parked.get(&victim) else {
-                    break;
-                };
-                let bytes = self.hold_of(parked);
-                held.extend(self.device.take_key(&parked.code.hash()));
-                bytes
-            } else {
-                let Some((again, shape, _)) = self.evictable.remove(&victim) else {
-                    break;
-                };
+            let bytes = if let Some((again, shape, _)) = self.evictable.remove(&victim) {
                 held.extend(self.traced.remove(&victim));
                 if let Some(shape) = shape {
                     held.extend(self.shaped.remove(&shape));
@@ -2114,9 +2116,13 @@ impl Shell {
                 let bytes = self.hold_of(&again);
                 self.parked.insert(victim, again);
                 bytes
+            } else if let Some(parked) = self.parked.get(&victim) {
+                held.extend(self.device.take_key(&parked.code.hash()));
+                self.hold_of(parked)
+            } else {
+                continue;
             };
             self.dropper.drop_later(held, bytes);
-            dropped += 1;
         }
         // the room the drops under way free, before the caller takes it
         while !fits(self) && self.dropper.pending() > 0 {
