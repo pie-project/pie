@@ -200,7 +200,7 @@ pub(crate) fn act_x_wt(
         && !lt_handle.is_null()
         && heuristic.workspaceSize <= ws_bytes
     {
-        if !run_lt(
+        let status = run_lt(
             lt_handle,
             plan,
             &heuristic.algo,
@@ -208,11 +208,12 @@ pub(crate) fn act_x_wt(
             call,
             ws,
             ws_bytes,
-        ) {
+        );
+        if status != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             clear_error();
             return Err(refuse(
                 op,
-                format!("cuBLASLt's first heuristic failed at M={m} N={n} K={k}"),
+                format!("cuBLASLt's first heuristic answered {status:?} at M={m} N={n} K={k}"),
             ));
         }
         return Ok(());
@@ -793,6 +794,9 @@ fn heuristics(
     Some(heuristics)
 }
 
+/// `call` on `algo`, answering cuBLASLt's status: a refusal names it, since
+/// each failure has its own cause (a capture the stream lost, a workspace
+/// short of the algorithm's, an operand off the algorithm's alignment).
 fn run_lt(
     lt_handle: lt::cublasLtHandle_t,
     plan: &LtPlan,
@@ -801,7 +805,7 @@ fn run_lt(
     call: Call,
     ws: *mut c_void,
     ws_bytes: usize,
-) -> bool {
+) -> lt::cublasStatus_t {
     let alpha = 1.0f32;
     let beta = 0.0f32;
     // SAFETY: `lt_handle` is the device's live handle and `plan`'s
@@ -835,7 +839,7 @@ fn run_lt(
             )
         }
     };
-    status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    status
 }
 
 /// [`run_lt`] with cuBLASLt's own `epilogue` landing `y`: a bias (`bias`,
