@@ -1480,7 +1480,11 @@ pub(crate) fn compile_need(text: &str) -> u64 {
 /// growth over its run, over the most that ran beside it) for every compile
 /// running and itself, and no more than twice as many as have ended run (the
 /// first ones measure what the next admit on). A compile that does not fit
-/// waits for one to end.
+/// waits for one to end. The growth read is what a compile still holds as
+/// it returns, below its peak (v6e Qwen3.5, programs compiled alone: the
+/// peak 1.0 to 2.5 times the growth held at the end); the margin is that the
+/// free memory read at a start counts again what the running ones already
+/// took. Qwen3.5's fresh boot, up to 40 at once: 132 GiB anon of 150.
 #[derive(Default)]
 pub(crate) struct CompileGate {
     state: Mutex<GateState>,
