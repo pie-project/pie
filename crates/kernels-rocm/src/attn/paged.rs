@@ -34,6 +34,8 @@ struct Args {
     kv_tile_indices: u64,
     kv_chunk_size: u64,
     block_valid: u64,
+    /// A captured prefill grid's live work items, staged each fire (null: all).
+    block_live: u64,
     o: u64,
     lse: u64,
     num_qo_heads: i32,
@@ -53,7 +55,7 @@ struct Args {
     stride_page: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<Args>() == 184);
+const _: () = assert!(core::mem::size_of::<Args>() == 192);
 
 /// A learned relative-position bias and Inkling's logit growth, as the
 /// matrix-core walks read it: `bias` f32 `[rows, heads · extent]`.
@@ -491,6 +493,7 @@ fn prefill_walk(
     });
     if info.enable_cuda_graph {
         args.block_valid = at(int, info.block_valid_mask_offset);
+        args.block_live = at(int, info.block_live_offset);
     }
     match &split {
         Some(parts) => {

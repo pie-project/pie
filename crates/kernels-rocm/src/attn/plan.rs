@@ -579,6 +579,9 @@ pub struct PrefillPlanInfo {
     pub v_offset: Option<u32>,
     pub s_offset: Option<u32>,
     pub block_valid_mask_offset: Option<u32>,
+    /// A captured grid's live work items, one i32 staged each fire: the
+    /// prefill lays them in the unpadded grid's order and the rest exit.
+    pub block_live_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
 }
