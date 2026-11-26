@@ -2990,6 +2990,18 @@ fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
     records.iter().flat_map(record_bytes).collect()
 }
 
+/// The kernel profile's row for a guest region: its entry, form, steps
+/// and the lanes it ran for.
+#[cfg(target_vendor = "apple")]
+fn guest_key(region: &Region, lanes: u32) -> String {
+    format!(
+        "guest {} {:?} steps={} lanes={lanes}",
+        region.module.entry(),
+        region.form,
+        region.steps.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3128,16 +3140,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The kernel profile's row for a guest region: its entry, form, steps
-/// and the lanes it ran for.
-#[cfg(target_vendor = "apple")]
-fn guest_key(region: &Region, lanes: u32) -> String {
-    format!(
-        "guest {} {:?} steps={} lanes={lanes}",
-        region.module.entry(),
-        region.form,
-        region.steps.len()
-    )
 }

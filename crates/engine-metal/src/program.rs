@@ -2202,9 +2202,6 @@ mod tests {
     /// what its guests' state takes past them.
     const GUEST_CHUNKS: u32 = 24;
 
-    /// The slots instance `nth` of `facts` takes: its tables from logical
-    /// chunk 1, its rings from chunk 2, each instance's apart.
-
     /// A contract case's logits as the engine seats them
     /// (`eta_compiler::contract::Case::seats`): `values`, `rows` rows of
     /// the vocabulary, laid in a bf16 plane where the case's seats put each

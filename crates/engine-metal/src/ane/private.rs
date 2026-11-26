@@ -419,6 +419,7 @@ impl Job {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     device: &Context,
     handles: &Handles,

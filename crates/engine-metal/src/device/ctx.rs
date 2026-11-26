@@ -1365,11 +1365,14 @@ pub fn wired_limit() -> Option<u64> {
 
 /// What this process holds on the host beside the `gpu` bytes Metal holds
 /// for it: its physical footprint (which counts its GPU memory on unified
-/// memory) less those. 0 where the footprint cannot be read.
+/// memory) less those. 0 where the footprint cannot be read: off macOS (iOS
+/// offers no `proc_pid_rusage`).
 #[must_use]
 pub fn host_resident(gpu: u64) -> u64 {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(target_os = "macos")]
     {
+        // SAFETY: `rusage_info_v2` is a plain C struct of integers, for
+        // which all-zero bytes are a valid value.
         let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a `rusage_info_v2`, the struct the
         // RUSAGE_INFO_V2 flavor writes, owned here for the call.
@@ -1382,7 +1385,7 @@ pub fn host_resident(gpu: u64) -> u64 {
             0
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(target_os = "macos"))]
     {
         let _ = gpu;
         0

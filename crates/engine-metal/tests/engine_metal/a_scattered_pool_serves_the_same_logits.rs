@@ -698,7 +698,12 @@ pub(super) fn close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
             .iter()
             .zip(want)
             .map(|(&a, &b)| ((a - b).abs(), bf16_bound(a, b, 2.0), a, b))
-            .filter(|&(apart, bound, ..)| !(apart <= bound))
+            .filter(|&(apart, bound, ..)| {
+                !matches!(
+                    apart.partial_cmp(&bound),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
+            })
             .collect::<Vec<_>>();
         assert!(
             worst.is_empty(),
