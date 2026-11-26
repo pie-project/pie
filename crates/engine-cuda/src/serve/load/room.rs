@@ -145,6 +145,12 @@ pub(super) fn room_line(
 /// working set is sized into them. A deployment whose banks exceed the room
 /// streams them, and its fires are sized in the room as it is.
 pub(super) fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
+    Ok(room - beside(boot, room)?.0)
+}
+
+/// What [`held_beside`] holds out of `room`, and the banks it names, as a
+/// refusal of the room left says them: nothing where the banks exceed it.
+pub(super) fn beside(boot: &Boot<'_>, room: u64) -> Result<(u64, String)> {
     let bytes = crate::weights::laid_bytes(&boot.trace)?;
     let cached: u64 = boot
         .residency
@@ -152,7 +158,25 @@ pub(super) fn held_beside(boot: &Boot<'_>, room: u64) -> Result<u64> {
         .iter()
         .map(|&param| bytes[param].next_multiple_of(crate::weights::ALIGN))
         .sum();
-    Ok(if cached < room { room - cached } else { room })
+    if cached >= room || cached == 0 {
+        return Ok((0, String::new()));
+    }
+    let names: Vec<String> = boot
+        .residency
+        .cached_experts()
+        .iter()
+        .filter_map(|&param| boot.trace.params.get(param))
+        .map(|param| format!("`{}`", param.name))
+        .collect();
+    Ok((
+        cached,
+        format!(
+            "; the weight cache seats the routed bank(s) {} ({} MiB) beside the fires, out of \
+             that room",
+            names.join(", "),
+            cached >> 20
+        ),
+    ))
 }
 
 /// The token and lane budgets fitted to what the card has with the weights

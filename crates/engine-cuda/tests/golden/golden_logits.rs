@@ -3968,9 +3968,14 @@ fn golden_staged_experts() {
             staging.banks(),
             "{model}: the same banks stage under the least budget"
         );
+        // The fit names the staging's bytes; where the rungs' check binds
+        // first (no rung's span fits beside the banks the weight cache
+        // seats), it names the banks it holds beside the fires instead.
         assert!(
-            said.contains(&format!("{} bytes of staged experts", least_staging.bytes())),
-            "{model}: and the bytes ({} for {} rows under the least budget): {said}",
+            said.contains(&format!("{} bytes of staged experts", least_staging.bytes()))
+                || said.contains("the weight cache seats the routed bank(s)"),
+            "{model}: and the bytes ({} for {} rows under the least budget), or the banks held \
+             beside the fires: {said}",
             least_staging.bytes(),
             least_staging.rows()
         );
