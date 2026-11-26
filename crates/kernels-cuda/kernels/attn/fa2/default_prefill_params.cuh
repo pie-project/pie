@@ -152,6 +152,9 @@ struct BatchPrefillPagedParams {
   uint32_t* maybe_split_live;
   DTypeO* maybe_o_whole;
   float* maybe_lse_whole;
+  // PIE: each head's sink logit as f32 (a checkpoint's), applied where
+  // `maybe_sinks` is (null: none, or `maybe_sinks` names them).
+  float* maybe_sinks_f32;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

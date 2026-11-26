@@ -135,6 +135,9 @@ pub struct PrefillPagedParams {
     pub maybe_split_live: DevicePtr,
     pub maybe_o_whole: DevicePtr,
     pub maybe_lse_whole: DevicePtr,
+    /// Each head's sink logit as f32, applied where `maybe_sinks` is
+    /// (null: none, or `maybe_sinks` names them).
+    pub maybe_sinks_f32: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

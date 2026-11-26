@@ -435,16 +435,16 @@ fn fa2_prefill_with(
         params.maybe_sinks = s.ptr;
     }
     // A split layout's fire that lands its rows whole folds none: the sinks
-    // the fold would land, the kernel lands there, and where it cannot (an
-    // f32 sink, the relative-bias arm) the fire keeps its split as laid.
+    // the fold would land, the kernel lands there (bf16 or f32, as the fold
+    // reads them).
     if plan.info.split_kv
         && let Some(s) = sinks
         && merge::lands_sinks(ctx, &sinked(split, Some(s)))
     {
-        if s.dtype == o.dtype && rel.is_none() {
-            params.maybe_sinks = s.ptr;
+        if s.dtype == Dtype::F32 {
+            params.maybe_sinks_f32 = s.ptr;
         } else {
-            params.maybe_split_live = 0;
+            params.maybe_sinks = s.ptr;
         }
     }
     // A bf16 pool's live widths, read out of its wider heads where the

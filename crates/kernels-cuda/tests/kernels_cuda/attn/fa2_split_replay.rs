@@ -8,16 +8,13 @@
 use crate::common::attn_ref::{pool, ten, wide};
 use crate::common::host::upload_to;
 use crate::common::{Gpu, Lcg, captured, forget, replay};
-use dtype::Dtype::{Bf16, I32, I64, U8};
+use dtype::Dtype::{Bf16, F32, I32, I64, U8};
 use kernels_cuda::attn;
 use kernels_cuda::attn::plan::{self, Device, Live, PrefillPlan, Shape, Workspace};
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
 
 const PAGE: usize = 16;
-const QH: usize = 16;
-const KVH: usize = 4;
-const D: usize = 128;
 /// The carve's rows: one lane.
 const ROWS: usize = 256;
 /// The most keys a fire here reads.
@@ -39,13 +36,22 @@ impl Fire {
     }
 }
 
-fn shape() -> Shape {
+/// Query heads, kv heads, head width and window.
+#[derive(Clone, Copy, Debug)]
+struct Heads {
+    qh: usize,
+    kvh: usize,
+    d: usize,
+    window: Option<u32>,
+}
+
+fn shape(h: Heads) -> Shape {
     Shape {
         num_requests: 1,
         lane_offset: 0,
-        num_q_heads: QH as u32,
-        num_kv_heads: KVH as u32,
-        head_dim: D as u32,
+        num_q_heads: h.qh as u32,
+        num_kv_heads: h.kvh as u32,
+        head_dim: h.d as u32,
         page_size: PAGE as u32,
         hnd_layout: false,
     }
@@ -62,6 +68,7 @@ fn live(fire: Fire) -> Live {
 
 #[allow(clippy::too_many_arguments)]
 fn plan_of(
+    h: Heads,
     fire: Fire,
     graph: bool,
     mask_indptr: kernels_cuda::tensor::Tensor,
@@ -76,9 +83,9 @@ fn plan_of(
         &kv_indptr,
         &kv_len,
         if graph { ROWS as u32 } else { fire.new as u32 },
-        shape(),
+        shape(h),
         live(fire),
-        None,
+        h.window,
         true,
         graph,
         Some(mask_indptr),
@@ -89,8 +96,18 @@ fn plan_of(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn a_captured_prefill_replays_whole_and_split_as_eager() {
+    for h in [
+        Heads { qh: 16, kvh: 4, d: 128, window: None },
+        Heads { qh: 16, kvh: 1, d: 512, window: Some(128) },
+    ] {
+        replays(h);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn replays(h: Heads) {
+    let Heads { qh, kvh, d, .. } = h;
     // Few live tiles over many keys split; a fire whose keys are one chunk's
     // least width lands whole.
     let split = Fire {
@@ -104,7 +121,7 @@ fn a_captured_prefill_replays_whole_and_split_as_eager() {
     let mut gpu = Gpu::open();
     let ctx = gpu.ctx().with_tuning(Tuning::DEFAULT);
     let device = Device::probe(&ctx).expect("the device answers");
-    let (width, qw) = (KVH * D, QH * D);
+    let (width, qw) = (kvh * d, qh * d);
     let cells = KEYS.div_ceil(PAGE) * PAGE;
     let mut lcg = Lcg::seeded(0x5917);
     let keys = ten(gpu.up(&lcg.row(cells * width).0), cells, width, Bf16);
@@ -127,7 +144,7 @@ fn a_captured_prefill_replays_whole_and_split_as_eager() {
     let kvp = KvPool {
         values,
         last_page_lens: ten(last_at, 1, 1, I32),
-        head_stride: D as i64,
+        head_stride: d as i64,
         ..pool(keys, ten(pages_at, KEYS.div_ceil(PAGE), 1, I32), ten(indptr_at, 2, 1, I32), PAGE)
     };
     let qt = RaggedTensor {
@@ -135,7 +152,7 @@ fn a_captured_prefill_replays_whole_and_split_as_eager() {
         indptr: ten(qo_at, 2, 1, I32),
     };
     let mask = ten(mask_at, bits.div_ceil(8), 1, U8);
-    let scale = (D as f32).sqrt().recip();
+    let scale = (d as f32).sqrt().recip();
     // A fire's inputs, fresh: its rows, its pages (scattered), its mask.
     let mut seat = |gpu: &Gpu, fire: Fire| {
         gpu.sync();
@@ -153,12 +170,25 @@ fn a_captured_prefill_replays_whole_and_split_as_eager() {
         upload_to(mask_at, &mask);
         upload_to(mask_ip_at, &[0i64, (fire.new * fire.keys()) as i64]);
     };
+    let (lse_at, lse_e) = (gpu.zeros(ROWS * qh * 4), gpu.zeros(ROWS * qh * 4));
+    let lse_of = |o: u64| if o == o_at { lse_at } else { lse_e };
     let fire = |plan: &PrefillPlan, o: u64| {
-        attn::masked(&ctx, qt, plan, mask, &kvp, None, D as u32, scale, &mut ten(o, ROWS, qw, Bf16))
+        attn::masked_lse(
+            &ctx,
+            qt,
+            plan,
+            mask,
+            &kvp,
+            h.window,
+            d as u32,
+            scale,
+            &mut ten(o, ROWS, qw, Bf16),
+            &mut ten(lse_of(o), ROWS, qh, F32),
+        )
     };
 
     seat(&gpu, split);
-    let first = plan_of(split, true, mask_ip, &device, ws_graph);
+    let first = plan_of(h, split, true, mask_ip, &device, ws_graph);
     assert!(first.info.split_kv, "the captured layout splits: {:?}", first.info);
     first.stage(&ctx).expect("the plan uploads");
     gpu.lay(&ctx, |_| fire(&first, o_at));
@@ -170,26 +200,34 @@ fn a_captured_prefill_replays_whole_and_split_as_eager() {
 
     for (pass, at) in [split, whole, split, whole].into_iter().enumerate() {
         seat(&gpu, at);
-        let eager = plan_of(at, false, mask_ip, &device, ws_eager);
+        let eager = plan_of(h, at, false, mask_ip, &device, ws_eager);
         eager.stage(&ctx).expect("the eager plan uploads");
         gpu.laid(&ctx, |_| fire(&eager, e_at)).expect("the eager twin");
-        let graph = plan_of(at, true, mask_ip, &device, ws_graph);
+        let graph = plan_of(h, at, true, mask_ip, &device, ws_graph);
         assert_eq!(graph.info, first.info, "one layout for every replay");
         graph.stage(&ctx).expect("the plan uploads");
         replay(&ctx, exec);
         gpu.sync();
         let word = graph.info.split_live_offset.expect("a split layout's word");
         let staged: Vec<i32> = gpu.down(ws_graph.int_ptr + u64::from(word), 1);
-        assert_eq!(
-            staged[0] == 1,
-            at.keys() > 128,
-            "replay {pass} of {at:?} splits its keys where they hold two chunks"
-        );
+        eprintln!("{h:?}: replay {pass} of {at:?} splits: {}", staged[0]);
+        if h.window.is_none() {
+            assert_eq!(
+                staged[0] == 1,
+                at.keys() > 128,
+                "replay {pass} of {at:?} splits its keys where they hold two chunks"
+            );
+        }
         let rows = at.new * qw;
         let got: Vec<u16> = gpu.down(o_at, rows);
         let want: Vec<u16> = gpu.down(e_at, rows);
-        let what = format!("replay {pass} of {at:?}");
-        if at.keys() <= 128 {
+        let what = format!("{h:?}: replay {pass} of {at:?}");
+        let (gl, wl): (Vec<f32>, Vec<f32>) =
+            (gpu.down(lse_at, at.new * qh), gpu.down(lse_e, at.new * qh));
+        let lworst = gl.iter().zip(&wl).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        eprintln!("{what}: lse worst {lworst} off the eager plan");
+        assert!(lworst <= 2e-2, "{what}: lse {lworst} off the eager plan");
+        if staged[0] == 0 {
             // One chunk, the eager plan's one too: the same sums.
             assert_eq!(got, want, "{what} lands the eager bits");
         } else {
