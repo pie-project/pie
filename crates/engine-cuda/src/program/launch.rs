@@ -1220,7 +1220,30 @@ impl Prepared {
             + self.offsets_host.len().max(size_of::<u32>())) as u64
             + LANE_HEADER_BYTES
             + SPANS * SPAN_ALIGN
-            + 6 * 16
+            // Each cell [`Prepared::lay`] lays is rounded up to 16 bytes.
+            + CELLS as u64 * 16
+    }
+
+    /// The bytes of each cell a stage lays for `lanes` lanes, before each
+    /// is rounded up to 16 ([`Prepared::lay`]): its intrinsics' bases,
+    /// modes, widths, strides, offsets and rows, its pending flags, its row
+    /// pointers and its lane scratch table. What sizes the pair's state and
+    /// what is laid in it are this one list.
+    fn cell_bytes(&self, lanes: u32) -> [usize; CELLS] {
+        let words = self.pitch * lanes as usize;
+        let rows = self.row_words as usize * lanes as usize;
+        let pending = (self.channel_count as usize * lanes as usize).max(1);
+        [
+            words * size_of::<u64>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            words * size_of::<u32>(),
+            pending,
+            rows * size_of::<u64>(),
+            LaneScratch::bytes(lanes) as usize,
+            words * size_of::<u32>(),
+        ]
     }
 
     /// The bytes each lane adds to the stage's tables: its record and
@@ -1229,14 +1252,13 @@ impl Prepared {
     /// [`lane_scratch`]).
     #[must_use]
     pub fn lane_bytes(&self) -> u64 {
-        let words = self.pitch as u64;
+        // Every cell grows a lane's share a lane (the pending flags at
+        // least one a lane, as one lane lays them).
+        let cells: usize = self.cell_bytes(1).iter().sum();
         LANE_RECORD_BYTES
             + u64::from(self.channel_count) * size_of::<LaneChannelSlot>() as u64
             + self.descriptor_row.len().max(1) as u64
-            + words * (size_of::<u64>() + 4 * size_of::<u32>()) as u64
-            + u64::from(self.channel_count).max(1)
-            + u64::from(self.row_words) * size_of::<u64>() as u64
-            + LaneScratch::bytes(1)
+            + cells as u64
     }
 
     /// A lane's value scratch: what the kernels step `dispatch_lane` by.
@@ -1337,22 +1359,8 @@ impl Prepared {
         let rows = self.row_words as usize * lanes as usize;
         self.row_pointers_host.resize(rows, 0u64);
         self.lane_scratch_host.resize(lanes as usize, 0u64);
-        let pending = (self.channel_count as usize * lanes as usize).max(1);
         let mut cell_at = 0usize;
-        for (cell, bytes) in [
-            words * size_of::<u64>(),
-            words * size_of::<u32>(),
-            words * size_of::<u32>(),
-            words * size_of::<u32>(),
-            words * size_of::<u32>(),
-            pending,
-            rows * size_of::<u64>(),
-            LaneScratch::bytes(lanes) as usize,
-            words * size_of::<u32>(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (cell, bytes) in self.cell_bytes(lanes).into_iter().enumerate() {
             self.cell_at[cell] = cell_at;
             cell_at += bytes.div_ceil(16) * 16;
         }
