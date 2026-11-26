@@ -74,18 +74,20 @@ pub fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
         .saturating_sub(safety_floor_bytes())
 }
 
-/// What may still be taken now: the card's room under `ceiling`
-/// ([`room_under`]), and, where the operator states a budget, no more than
-/// it less what this worker holds of the device as the driver counts it
-/// (its context, its driver's queues and modules, every allocation) and
+/// What may still be taken now of a `card` room ([`room_under`]): where
+/// the operator states a `budget` and the driver said what this worker
+/// holds beside the pool's committed pages (`outside`: its context, its
+/// driver's queues and modules, its weights and every allocation not the
+/// pool's), no more than the budget less that, the `committed` bytes and
 /// the safety floor. The card's free figure is every process's; the
-/// budget is this worker's alone ([`crate::device::own::used_now`]). Where
-/// the driver does not say what the worker holds, the card's room stands.
-#[cfg(feature = "device")]
-fn room_now(ceiling: u64, free: u64, total: u64) -> u64 {
-    let card = room_under(ceiling, free, total);
-    match (crate::device::card::budget(), crate::device::own::used_now()) {
-        (Some(budget), Some(used)) => card.min(within_budget(budget, used)),
+/// budget is this worker's alone. Where either is missing, the card's
+/// room stands.
+#[must_use]
+pub fn room_within(card: u64, budget: Option<u64>, outside: Option<u64>, committed: u64) -> u64 {
+    match (budget, outside) {
+        (Some(budget), Some(outside)) => {
+            card.min(within_budget(budget, outside.saturating_add(committed)))
+        }
         _ => card,
     }
 }
@@ -132,6 +134,14 @@ pub struct PhysicalPool {
     /// a load makes is made before: `kernels_rocm::hip::open`, the fan).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     beside: Beside,
+    /// What this worker holds of the device beside the pool's committed
+    /// pages, as the driver counted it: read once as the pool opens, and
+    /// raised to the load's settled reading ([`PhysicalPool::settle_outside`]);
+    /// the budget's room is figured from it and the pool's own count, the
+    /// driver never asked again. `None` where no budget is stated or the
+    /// driver does not say.
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    outside: Option<u64>,
 }
 
 /// What the driver holds beside a pool: the device's free figure already
@@ -185,7 +195,24 @@ impl PhysicalPool {
             if !beside.said.is_empty() {
                 tracing::info!("outside the pool, {}", beside.said);
             }
-            let budget = room_now(ceiling, free, total);
+            // The driver is asked what this worker holds only where a budget
+            // bounds it.
+            let outside = crate::device::card::budget().and_then(|_| {
+                crate::device::own::held_of(device)
+                    .map_err(|why| {
+                        tracing::info!(
+                            "outside: unmeasured at sizing: {why}; budget_device bounds the \
+                             card's free figure alone"
+                        );
+                    })
+                    .ok()
+            });
+            let budget = room_within(
+                room_under(ceiling, free, total),
+                crate::device::card::budget(),
+                outside,
+                0,
+            );
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -199,6 +226,7 @@ impl PhysicalPool {
                 committed_pages: 0,
                 ceiling,
                 beside,
+                outside,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -222,6 +250,7 @@ impl PhysicalPool {
             committed_pages: 0,
             ceiling: u64::MAX,
             beside: Beside::NONE,
+            outside: None,
         }
     }
 
@@ -254,13 +283,37 @@ impl PhysicalPool {
         #[cfg(feature = "device")]
         {
             let (free, total) = crate::device::card::memory()?;
-            Ok(room_now(self.ceiling, free, total).saturating_sub(reserve))
+            Ok(self.room_now(free, total).saturating_sub(reserve))
         }
         #[cfg(not(feature = "device"))]
         {
             let _ = reserve;
             Err(Fault::Runtimeless)
         }
+    }
+
+    /// What may still be taken now ([`room_within`]): the card's free
+    /// figure, and under a budget what this worker holds as the pool counts
+    /// it, the driver not asked.
+    #[cfg(feature = "device")]
+    fn room_now(&self, free: u64, total: u64) -> u64 {
+        room_within(
+            room_under(self.ceiling, free, total),
+            crate::device::card::budget(),
+            self.outside,
+            self.committed_pages * LOGICAL_PAGE_BYTES,
+        )
+    }
+
+    /// The load settled what this worker holds of the device at `used`
+    /// bytes, the pool's committed pages among them: what lies beside them
+    /// is held from here on, the larger of it and the reading at sizing.
+    /// Answers what it holds.
+    pub fn settle_outside(&mut self, used: u64) -> u64 {
+        let beside = used.saturating_sub(self.committed_pages * LOGICAL_PAGE_BYTES);
+        let held = self.outside.map_or(beside, |sized| sized.max(beside));
+        self.outside = Some(held);
+        held
     }
 
     #[must_use]
@@ -317,7 +370,7 @@ impl PhysicalPool {
         #[cfg(feature = "device")]
         {
             let (free, total) = crate::device::card::memory()?;
-            let available = room_now(self.ceiling, free, total) / LOGICAL_PAGE_BYTES;
+            let available = self.room_now(free, total) / LOGICAL_PAGE_BYTES;
             self.recalibrate_to(available);
         }
         Ok(())
@@ -1401,7 +1454,10 @@ fn allocation_granularity(device: i32) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arena, LOGICAL_PAGE_BYTES, PhysicalPool, Range, pages_for_bytes};
+    use super::{
+        Arena, LOGICAL_PAGE_BYTES, PhysicalPool, Range, SAFETY_FLOOR_BYTES, pages_for_bytes,
+        room_within,
+    };
 
     #[test]
     fn elastic_every_case() {
@@ -1409,6 +1465,29 @@ mod tests {
         a_promise_charges_the_budget_before_it_is_a_mapping();
         a_pledge_outlives_what_the_device_reports_free();
         a_partial_page_is_a_whole_page();
+        the_budget_room_takes_the_outside_and_the_pool_s_own_count();
+    }
+
+    /// Under a budget the room is the budget less what the worker holds
+    /// beside the pool, the pool's committed bytes and the floor, never past
+    /// the card's; with no budget or no reading, the card's room stands.
+    fn the_budget_room_takes_the_outside_and_the_pool_s_own_count() {
+        const MIB: u64 = 1 << 20;
+        let floor = SAFETY_FLOOR_BYTES;
+        assert_eq!(
+            room_within(10_000 * MIB, Some(4_000 * MIB), Some(500 * MIB), 1_000 * MIB),
+            4_000 * MIB - 500 * MIB - 1_000 * MIB - floor
+        );
+        assert_eq!(room_within(1_000 * MIB, Some(4_000 * MIB), Some(0), 0), 1_000 * MIB);
+        assert_eq!(room_within(1_000 * MIB, None, Some(500 * MIB), 0), 1_000 * MIB);
+        assert_eq!(room_within(1_000 * MIB, Some(100 * MIB), None, 0), 1_000 * MIB);
+        assert_eq!(room_within(1_000 * MIB, Some(100 * MIB), Some(90 * MIB), 0), 0);
+        // The settle raises what is held beside the pool, never lowers it.
+        let mut pool = PhysicalPool::stated(1 << 30);
+        pool.outside = Some(300 * MIB);
+        pool.committed_pages = (200 * MIB) / LOGICAL_PAGE_BYTES;
+        assert_eq!(pool.settle_outside(700 * MIB), 500 * MIB);
+        assert_eq!(pool.settle_outside(400 * MIB), 500 * MIB);
     }
 
     fn a_pledge_outlives_what_the_device_reports_free() {

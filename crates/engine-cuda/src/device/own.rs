@@ -4,45 +4,103 @@
 //! the context's own; the driver says whose they are.
 #![allow(unsafe_code)]
 
-use crate::error::{Fault, Result};
+use crate::error::Result;
 
 /// What this process took of the bound device before a load of its own
 /// resolved a ceiling: the context and what binding it puts down, which the
 /// card counts held and no other process put there. `latch` keeps the
 /// reading for the loads after the first, whose process holds an earlier
-/// load's bytes too. Refused where the driver does not answer for this
-/// process (no management library installed, another pid namespace).
-pub fn before_loads(latch: bool) -> Result<u64> {
+/// load's bytes too. `None`, said by name, where the driver does not answer
+/// for this process: the card's own figure is the load's bound, every
+/// byte held on it counted another's.
+pub fn before_loads(latch: bool) -> Result<Option<u64>> {
     static TAKEN: std::sync::Mutex<Vec<(i32, u64)>> = std::sync::Mutex::new(Vec::new());
     let device = bound()?;
     let mut taken = TAKEN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(&(_, bytes)) = taken.iter().find(|(of, _)| *of == device) {
-        return Ok(bytes);
+        return Ok(Some(bytes));
     }
-    let bytes = held(device).ok_or_else(|| {
-        Fault::program(
-            "device::own",
-            format!(
-                "the driver does not say what this process holds of device {device} \
-                 (NVML on CUDA, KFD on ROCm: the library is missing, or this process \
-                 runs in another pid namespace than the driver's)"
-            ),
-        )
-    })?;
+    let bytes = match held(device) {
+        Ok(bytes) => bytes,
+        Err(why) => {
+            tracing::info!(
+                "what this process holds of device {device} is unknown: {why}; the card's \
+                 free figure (cudaMemGetInfo) bounds the load, every byte held on it counted \
+                 another's"
+            );
+            return Ok(None);
+        }
+    };
     if latch {
         taken.push((device, bytes));
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// What this process holds of the device its thread is bound to now, as the
 /// driver counts it ([`held`]): its context, its driver's queues and module
-/// images, every allocation; `None` where the driver does not say.
-#[must_use]
-pub fn used_now() -> Option<u64> {
-    held(bound().ok()?)
+/// images, every allocation; why not, where the driver does not say.
+pub fn used_now() -> std::result::Result<u64, Unread> {
+    held(bound().map_err(|_| Unread::Unbound)?)
+}
+
+/// What this process holds of `device`, as the driver counts it ([`held`]).
+pub fn held_of(device: i32) -> std::result::Result<u64, Unread> {
+    held(device)
+}
+
+/// The reader that says what this process holds of a device: the
+/// management library on CUDA, the kernel driver's process list on ROCm.
+pub const READER: &str = if cfg!(feature = "rocm") {
+    "KFD (/sys/class/kfd/kfd/proc)"
+} else if cfg!(windows) {
+    "NVML (nvml.dll)"
+} else {
+    "NVML (libnvidia-ml.so.1)"
+};
+
+/// Why the driver does not say what this process holds of a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unread {
+    /// The reader is not there: the library is not installed or does not
+    /// start, or the kernel driver exposes no process list.
+    Missing(String),
+    /// The reader answers, but this process's pid is not among those it
+    /// lists: it runs in another pid namespace than the driver's (a
+    /// container), whose pids the driver lists.
+    NotListed(u32),
+    /// The reader lists this process without its usage: under WDDM the
+    /// driver keeps it, not the management library.
+    NotAvailable,
+    /// The reader was asked and failed.
+    Failed(String),
+    /// No device is bound to this thread.
+    Unbound,
+    /// This build has no reader.
+    NoReader,
+}
+
+impl std::fmt::Display for Unread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unread::Missing(why) => write!(f, "{READER} is missing: {why}"),
+            Unread::NotListed(pid) => write!(
+                f,
+                "{READER} lists no process {pid}: this process runs in another pid \
+                 namespace than the driver's (a container), whose pids it lists"
+            ),
+            Unread::NotAvailable => write!(
+                f,
+                "{READER} lists this process without its usage (NVML_VALUE_NOT_AVAILABLE, \
+                 as under WDDM)"
+            ),
+            Unread::Failed(why) => write!(f, "{READER} was asked and failed: {why}"),
+            Unread::Unbound => write!(f, "no device is bound to this thread"),
+            Unread::NoReader => write!(f, "this build reads no driver's process usage"),
+        }
+    }
 }
 
 /// The device this thread is bound to.
@@ -59,13 +117,13 @@ fn bound() -> Result<i32> {
     }
     #[cfg(not(feature = "device"))]
     {
-        Err(Fault::Runtimeless)
+        Err(crate::error::Fault::Runtimeless)
     }
 }
 
 /// The bytes of `device` the management library counts as this process's.
-#[cfg(all(feature = "cuda", unix))]
-fn held(device: i32) -> Option<u64> {
+#[cfg(all(feature = "cuda", any(unix, windows)))]
+fn held(device: i32) -> std::result::Result<u64, Unread> {
     use crate::device::rt;
     use core::ffi::{c_char, c_int, c_uint, c_void};
 
@@ -83,32 +141,58 @@ fn held(device: i32) -> Option<u64> {
     /// `NVML_VALUE_NOT_AVAILABLE`.
     const UNKNOWN: u64 = u64::MAX;
 
-    static LIBRARY: std::sync::OnceLock<Option<(ByBus, Processes)>> = std::sync::OnceLock::new();
-    let (by_bus, processes) = (*LIBRARY.get_or_init(|| {
-        // SAFETY: the names are NUL-terminated; each symbol is null-checked
-        // before it is read as the function the library documents under
-        // that name, and the library stays loaded for the process's life.
-        unsafe {
-            let library = libc::dlopen(c"libnvidia-ml.so.1".as_ptr(), libc::RTLD_NOW);
-            if library.is_null() {
-                return None;
-            }
-            let symbol = |name: &core::ffi::CStr| {
-                let at = libc::dlsym(library, name.as_ptr());
+    /// The library's symbol `name`, null where it has none.
+    #[cfg(unix)]
+    unsafe fn open() -> Option<impl Fn(&core::ffi::CStr) -> Option<*mut c_void>> {
+        // SAFETY: the name is NUL-terminated; the library stays loaded for
+        // the process's life.
+        let library = unsafe { libc::dlopen(c"libnvidia-ml.so.1".as_ptr(), libc::RTLD_NOW) };
+        (!library.is_null()).then(|| {
+            move |name: &core::ffi::CStr| {
+                // SAFETY: a live handle and a NUL-terminated name.
+                let at = unsafe { libc::dlsym(library, name.as_ptr()) };
                 (!at.is_null()).then_some(at)
-            };
-            let init = symbol(c"nvmlInit_v2")?;
-            let by_bus = symbol(c"nvmlDeviceGetHandleByPciBusId_v2")?;
-            let processes = symbol(c"nvmlDeviceGetComputeRunningProcesses_v3")?;
+            }
+        })
+    }
+    #[cfg(windows)]
+    unsafe fn open() -> Option<impl Fn(&core::ffi::CStr) -> Option<*mut c_void>> {
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+        // SAFETY: the name is NUL-terminated; the library stays loaded for
+        // the process's life (the driver puts it in System32).
+        let library = unsafe { LoadLibraryA(c"nvml.dll".as_ptr().cast()) };
+        (!library.is_null()).then(|| {
+            move |name: &core::ffi::CStr| {
+                // SAFETY: a live module and a NUL-terminated name.
+                unsafe { GetProcAddress(library, name.as_ptr().cast()) }
+                    .map(|at| at as *mut c_void)
+            }
+        })
+    }
+
+    static LIBRARY: std::sync::OnceLock<std::result::Result<(ByBus, Processes), &'static str>> =
+        std::sync::OnceLock::new();
+    let library = *LIBRARY.get_or_init(|| {
+        // SAFETY: each symbol is null-checked before it is read as the
+        // function the library documents under that name.
+        unsafe {
+            let symbol = open().ok_or("the library does not load")?;
+            let init = symbol(c"nvmlInit_v2").ok_or("it has no nvmlInit_v2")?;
+            let by_bus = symbol(c"nvmlDeviceGetHandleByPciBusId_v2")
+                .ok_or("it has no nvmlDeviceGetHandleByPciBusId_v2")?;
+            let processes = symbol(c"nvmlDeviceGetComputeRunningProcesses_v3")
+                .ok_or("it has no nvmlDeviceGetComputeRunningProcesses_v3")?;
             let init: unsafe extern "C" fn() -> c_int = core::mem::transmute(init);
-            (init() == 0).then(|| {
-                (
-                    core::mem::transmute::<*mut c_void, ByBus>(by_bus),
-                    core::mem::transmute::<*mut c_void, Processes>(processes),
-                )
-            })
+            if init() != 0 {
+                return Err("nvmlInit_v2 refused");
+            }
+            Ok((
+                core::mem::transmute::<*mut c_void, ByBus>(by_bus),
+                core::mem::transmute::<*mut c_void, Processes>(processes),
+            ))
         }
-    }))?;
+    });
+    let (by_bus, processes) = library.map_err(|why| Unread::Missing(why.to_string()))?;
 
     let mut bus = [0 as c_char; 32];
     let mut handle: *mut c_void = core::ptr::null_mut();
@@ -124,18 +208,31 @@ fn held(device: i32) -> Option<u64> {
     // entries of the library's layout.
     unsafe {
         let asked = rt::cudaDeviceGetPCIBusId(bus.as_mut_ptr(), bus.len() as c_int, device);
-        if asked != rt::cudaError::cudaSuccess
-            || by_bus(bus.as_ptr(), &raw mut handle) != 0
-            || processes(handle, &raw mut count, listed.as_mut_ptr()) != 0
-        {
-            return None;
+        if asked != rt::cudaError::cudaSuccess {
+            return Err(Unread::Failed(format!("device {device}'s PCI bus id: {asked:?}")));
+        }
+        let code = by_bus(bus.as_ptr(), &raw mut handle);
+        if code != 0 {
+            return Err(Unread::Failed(format!(
+                "nvmlDeviceGetHandleByPciBusId_v2 answered {code}"
+            )));
+        }
+        let code = processes(handle, &raw mut count, listed.as_mut_ptr());
+        if code != 0 {
+            return Err(Unread::Failed(format!(
+                "nvmlDeviceGetComputeRunningProcesses_v3 answered {code}"
+            )));
         }
     }
     let own = std::process::id();
-    listed[..(count as usize).min(listed.len())]
+    let process = listed[..(count as usize).min(listed.len())]
         .iter()
-        .find(|process| process.pid == own && process.used != UNKNOWN)
-        .map(|process| process.used)
+        .find(|process| process.pid == own)
+        .ok_or(Unread::NotListed(own))?;
+    if process.used == UNKNOWN {
+        return Err(Unread::NotAvailable);
+    }
+    Ok(process.used)
 }
 
 /// The bytes of the bound device KFD counts as this process's: every
@@ -143,11 +240,23 @@ fn held(device: i32) -> Option<u64> {
 /// ([`kernels_cuda::hip::kfd::process_vram`] reads the device the thread is
 /// bound to, which [`bound`] named).
 #[cfg(feature = "rocm")]
-fn held(_device: i32) -> Option<u64> {
-    kernels_cuda::hip::kfd::process_vram()
+fn held(_device: i32) -> std::result::Result<u64, Unread> {
+    use kernels_cuda::hip::kfd;
+    if let Some(bytes) = kfd::process_vram() {
+        return Ok(bytes);
+    }
+    let processes = std::path::Path::new(kfd::PROCESSES);
+    let own = std::process::id();
+    Err(if !processes.is_dir() {
+        Unread::Missing(format!("{} is not there", kfd::PROCESSES))
+    } else if !processes.join(own.to_string()).is_dir() {
+        Unread::NotListed(own)
+    } else {
+        Unread::Failed("this process's vram count for the bound device is not readable".to_string())
+    })
 }
 
-#[cfg(not(any(all(feature = "cuda", unix), feature = "rocm")))]
-fn held(_device: i32) -> Option<u64> {
-    None
+#[cfg(not(any(all(feature = "cuda", any(unix, windows)), feature = "rocm")))]
+fn held(_device: i32) -> std::result::Result<u64, Unread> {
+    Err(Unread::NoReader)
 }

@@ -212,20 +212,24 @@ impl Shell {
     /// read before and after each ([`crate::device::own::used_now`]). Two
     /// readings a fire apart within one of the device's allocation units
     /// settle it; else the largest stands, said so
-    /// ([`engine::memory::Outside::settle`]). The last fit then sizes the
-    /// pool by what the worker holds, this among it, under the budget
-    /// (`device::elastic::room_now`). Where the driver does not say, or the
-    /// load seats no slot to fire on, it is said by name and nothing is
-    /// settled.
+    /// ([`engine::memory::Outside::settle`]). The pool holds what of it lies
+    /// beside its committed pages from here on (the larger of it and its
+    /// reading at sizing), and the last fit sizes the pool by that and the
+    /// pool's own count under the budget: the driver is not asked again.
+    /// Where the driver does not say, before the fires or between them, or
+    /// the load seats no slot to fire on, it is said by name and nothing is
+    /// settled: the reading at sizing stands.
     pub(in super::super) fn settle_outside(&mut self) -> Result<()> {
         use engine::memory::Class;
-        let Some(first) = crate::device::own::used_now() else {
-            tracing::info!(
-                "outside: unmeasured: the driver does not say what this worker holds of the \
-                 device (NVML on CUDA, KFD on ROCm); budget_device bounds the card's free \
-                 figure alone"
-            );
-            return Ok(());
+        let first = match crate::device::own::used_now() {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                tracing::info!(
+                    "outside: unmeasured: {why}; budget_device bounds the card's free figure \
+                     and the reading at sizing, if any"
+                );
+                return Ok(());
+            }
         };
         if self.held.is_empty() || self.pools.by_refs() {
             tracing::info!("outside: unmeasured: this load seats no slot of its own to fire on");
@@ -247,13 +251,26 @@ impl Shell {
                 tokens,
             }])?;
             self.device.synchronize()?;
-            readings.push(crate::device::own::used_now().unwrap_or(first));
+            match crate::device::own::used_now() {
+                Ok(bytes) => readings.push(bytes),
+                Err(why) => {
+                    self.open(0)?;
+                    tracing::info!(
+                        "outside: unsettled: the reading after fire {} failed: {why}; nothing is \
+                         settled, the reading at sizing stands (readings so far {:?} MiB)",
+                        readings.len(),
+                        readings.iter().map(|&b| b >> 20).collect::<Vec<_>>(),
+                    );
+                    return Ok(());
+                }
+            }
         }
         self.open(0)?;
         let unit = self.pools.map_unit_bytes().max(1);
         let Some(outside) = engine::memory::Outside::settle(&readings, unit) else {
             return Ok(());
         };
+        let held = self.pools.settle_outside(outside.used);
         let ledger = self.ledger();
         let ledgered = [Class::Model, Class::State, Class::Fire]
             .iter()
@@ -263,13 +280,14 @@ impl Shell {
         tracing::info!(
             "outside: {} MiB this worker holds of the device past the ledger's own {} MiB, \
              {} over {} fires (each step kind once more after arming; readings {:?} MiB, a \
-             unit {} MiB){}",
+             unit {} MiB); {} MiB of it beside the pool's committed pages, held from here on{}",
             mib(outside.beyond(ledgered)),
             mib(ledgered),
             if outside.settled { "settled" } else { "unsettled, the largest reading taken" },
             outside.fires,
             readings.iter().map(|&b| mib(b)).collect::<Vec<_>>(),
             mib(unit),
+            mib(held),
             crate::device::card::budget().map_or_else(String::new, |budget| format!(
                 "; the pool is sized under budget_device {} MiB less all this worker holds \
                  and the {} MiB floor",
@@ -299,6 +317,10 @@ impl Shell {
         // A pool stated as the chunks it backs has nothing held back to
         // lift: its load held the bodies' allowance out of it.
         if !self.pools.stated_whole() {
+            tracing::info!(
+                "outside: unsettled: this load states its pool as the chunks it backs, so no \
+                 last fit follows to size it by a settled reading; the reading at sizing stands"
+            );
             return Ok(());
         }
         self.settle_outside()?;
