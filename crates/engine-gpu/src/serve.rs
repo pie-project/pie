@@ -626,6 +626,23 @@ pub enum CheckRungs {
 /// budgets and profile the fit left. One fit serves the naming load and the
 /// real one, each of which compiles from it at the top its device binds
 /// ([`Shell::raise`]), so neither can pick a rung the other does not.
+/// The pool's room the rungs were weighed by, and what made it up: the
+/// device's room less the weights it would hold, the reservations and the
+/// driver's share then ([`FIRST_ROOM`]).
+#[derive(Clone, Copy)]
+struct FirstRoom {
+    room: u64,
+    reserved: u64,
+    outside: u64,
+    weights: u64,
+}
+
+thread_local! {
+    /// The load's first weighing of the pool's room, said beside the room
+    /// it is sized to once every load-time reservation is up.
+    static FIRST_ROOM: std::cell::Cell<Option<FirstRoom>> = const { std::cell::Cell::new(None) };
+}
+
 struct Fitted<B: Serve> {
     device: B::Context,
     tuning: B::Tuning,
@@ -1958,10 +1975,17 @@ impl<B: Serve> Shell<B> {
                 .filter(|(at, _)| !streamed.contains(at))
                 .map(|(_, bytes)| *bytes)
                 .sum();
-            device
+            let left = device
                 .left()
                 .saturating_sub(held)
-                .saturating_sub(crate::weights::derived_bytes(&boot.trace))
+                .saturating_sub(crate::weights::derived_bytes(&boot.trace));
+            FIRST_ROOM.set(Some(FirstRoom {
+                room: left,
+                reserved: device.books().device(),
+                outside: device.outside(),
+                weights: held.saturating_add(crate::weights::derived_bytes(&boot.trace)),
+            }));
+            left
         };
         // The roofline the device's rates state (`engine::roofline`): where
         // the profile states them all, the top rung is the estimate's pick
@@ -3104,6 +3128,27 @@ impl<B: Serve> Shell<B> {
         // bytes the device leaves would hold up to a chunk a class past what
         // the device has.
         let left = device.left().min(device.books().ledger().room());
+        if let Some(first) = FIRST_ROOM.take() {
+            let mib = |bytes: u64| bytes >> 20;
+            let reserved = device
+                .books()
+                .device()
+                .saturating_sub(first.reserved);
+            let driver = device.outside().saturating_sub(first.outside);
+            tracing::info!(
+                "the pool's room: {} MiB, against the {} MiB the rungs were weighed by: since, the \
+                 load reserved {} MiB ({} MiB of it the weights, estimated at {} MiB then) and the \
+                 driver came to hold {} MiB more (pipelines, the shelf's buffers); the ledger \
+                 holds every class in whole chunks of {} MiB",
+                mib(left),
+                mib(first.room),
+                mib(reserved),
+                mib(device.books().ledger().bytes(engine::memory::Class::Model)),
+                mib(first.weights),
+                mib(driver),
+                mib(chunk),
+            );
+        }
         if let Some(budget) = kv_budget
             && budget > left
         {
