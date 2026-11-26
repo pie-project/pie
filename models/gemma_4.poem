@@ -1009,14 +1009,17 @@ def forward(m, inputs):
 
     y, tapped = inputs.fold_layers(m.layers, (y, None), block)
 
-    if tail != None:
+    # A trace folded short of the tail (a miniature cut to fewer layers)
+    # never split its rows: it reads them out as one without a tail does.
+    split = tail != None and hasattr(y, "all_rows")
+    if split:
         y = merge([ops.gather.gather_rows(y.all_rows, trunk_inputs.on(~read).readout_rows()), y.readouts])
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
         hb = arm(dr, inputs, tapped, h_block, block_rows(dr))
         x = merge([hb, x])
-    if tail == None:
+    if not split:
         x = ops.gather.gather_rows(x, inputs.readout_rows())
     logits = ops.attn.logit_softcap(ops.linear.lm_head(x, m.embed), m.softcap)
     if dr != None:
