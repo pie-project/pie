@@ -757,15 +757,13 @@ impl Shell {
         } = bake(&mut boot)?;
         // What shapes this deployment's bodies, beside the engine build
         // the record's key carries ([`super::measured`]).
-        let bodies_shape = format!(
-            "{}|{}|{:?}|{}|{}|{}|{:?}",
-            super::measured::checkpoint_identity(boot.checkpoint),
-            boot.trace.name,
-            profile,
-            boot.page_size,
-            boot.context,
-            boot.slots,
-            boot.kv_budget,
+        let bodies_shape = super::measured::bodies_shape(
+            &super::measured::checkpoint_identity(boot.checkpoint),
+            &boot.trace.name,
+            &profile,
+            (boot.page_size, boot.context, boot.slots),
+            &boot.kv_budget,
+            boot.knobs.weight_pin(),
         );
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
