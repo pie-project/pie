@@ -150,7 +150,7 @@ pub fn compile_wanted(
     let started = std::time::Instant::now();
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
-        .clamp(1, wanted.len().clamp(1, 8));
+        .clamp(1, wanted.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let built: Vec<Built> = wanted.iter().map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|scope| {
@@ -205,10 +205,12 @@ struct Ledger {
     /// The measured needs of the compiles running, and how many run.
     running: u64,
     count: u32,
+    /// The compiles ended so far.
+    ended: u64,
     /// A stage compiling alone to measure its need.
     measuring: bool,
     /// Stages waiting to compile: their measured needs, and how many have
-    /// none yet (each runs alone).
+    /// none yet (the first runs alone, the rest by the growth those ended had).
     waiting: u64,
     unmeasured: u32,
     /// Programs loading beside serving ([`LoadBeside`]).
@@ -225,6 +227,8 @@ static GUEST_LEDGER: std::sync::OnceLock<GuestLedger> = std::sync::OnceLock::new
 struct GuestAdmitted {
     need: u64,
     measuring: Option<u64>,
+    /// The resident set it started from, not measuring alone.
+    beside: Option<u64>,
 }
 
 fn guest_ledger() -> &'static GuestLedger {
@@ -242,6 +246,11 @@ fn peak_rss() -> Option<u64> {
     Some(kib << 10)
 }
 
+/// The cores this process may use.
+fn cores() -> u64 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u64)
+}
+
 /// Waits until a guest stage compile of measured `need` fits beside those
 /// running (refusing one that fits beside none), or, unmeasured, until
 /// nothing compiles or loads beside it.
@@ -255,7 +264,7 @@ fn guest_admit(need: Option<u64>) -> Result<GuestAdmitted, String> {
     }
     loop {
         let admitted = match need {
-            None if st.count == 0 && st.loads == 0 => {
+            None if st.count == 0 && st.loads == 0 && st.ended == 0 => {
                 st.unmeasured -= 1;
                 st.measuring = true;
                 st.count = 1;
@@ -265,6 +274,27 @@ fn guest_admit(need: Option<u64>) -> Result<GuestAdmitted, String> {
                 Some(GuestAdmitted {
                     need: 0,
                     measuring: peak_rss(),
+                    beside: None,
+                })
+            }
+            // Unmeasured beside others: what the ones ended grew the process
+            // by at most, twice as many as have ended at most (`CompileGate`).
+            None if !st.measuring
+                && st.loads == 0
+                && st.ended > 0
+                && u64::from(st.count) < (2 * st.ended).min(cores())
+                && (st.count == 0
+                    || available_memory().is_none_or(|free| {
+                        free.saturating_sub(st.waiting)
+                            >= st.largest.saturating_mul(u64::from(st.count) + 1)
+                    })) =>
+            {
+                st.unmeasured -= 1;
+                st.count += 1;
+                Some(GuestAdmitted {
+                    need: 0,
+                    measuring: None,
+                    beside: crate::device::resident_bytes(),
                 })
             }
             None => None,
@@ -289,6 +319,7 @@ fn guest_admit(need: Option<u64>) -> Result<GuestAdmitted, String> {
                     GuestAdmitted {
                         need: n,
                         measuring: None,
+                        beside: None,
                     }
                 })
             }
@@ -310,7 +341,12 @@ impl GuestAdmitted {
             .map(|(before, after)| after.saturating_sub(before).max(1));
         let ledger = guest_ledger();
         if let Ok(mut st) = ledger.state.lock() {
+            if let (Some(before), Some(after)) = (self.beside, crate::device::resident_bytes()) {
+                let grew = after.saturating_sub(before) / u64::from(st.count.max(1));
+                st.largest = st.largest.max(grew);
+            }
             st.running = st.running.saturating_sub(self.need);
+            st.ended += 1;
             st.count = st.count.saturating_sub(1);
             if self.measuring.is_some() {
                 st.measuring = false;

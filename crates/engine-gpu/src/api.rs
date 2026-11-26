@@ -1259,13 +1259,25 @@ where
                 "stated eager at load, each fire walked and never recorded: a fire past the \
                  bodies' allowance (named above where one is), one with a group mask, one \
                  landing a recurrent snapshot, one whose token table streams with no ring, one \
-                 whose lanes capture scores, a split step"
+                 whose lanes capture scores, a split step, a mixed fire of several prompts \
+                 beside decodes"
             );
         } else {
             tracing::info!(
                 engine = B::KIND,
                 "this backend keeps no recording: every fire is encoded as it is served, \
                  stated eager at load, and nothing is recorded or armed while serving"
+            );
+        }
+        // The device's memory as the load holds it, each owner under its
+        // class, against the device's own count of the reservations.
+        {
+            let books = crate::backend::Context::books(shell.device());
+            tracing::info!(
+                engine = B::KIND,
+                reserved_mib = books.device() >> 20,
+                "ledger: {}",
+                books.ledger()
             );
         }
         // What the load itself walked is the load's: serving counts from here.

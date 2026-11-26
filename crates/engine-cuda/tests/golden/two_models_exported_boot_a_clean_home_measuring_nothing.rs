@@ -13,10 +13,15 @@ use engine_cuda::Shell;
 
 use super::golden_logits::{Fixture, cache_dir, fixture, knobs, load_under};
 
-/// A load of `fixture` whose profiles and bodies records are `home`'s.
+/// A load of `fixture` whose profiles and bodies records are `home`'s, and
+/// only `home`'s: no pinned profile. The golden knobs pin one laid from the
+/// fixture cache's picks and its profiles (`picked`), whose rates a load
+/// takes as stated and so times and stores none of; a home would then
+/// measure or not by what earlier golden runs left in that cache.
 fn load(fixture: &Fixture, home: &Path) -> Shell {
     let mut knobs = knobs();
     knobs.profiles = Some(home.join("profiles"));
+    knobs.chip = None;
     load_under(fixture, &home.join("cache"), knobs, engine::Allowance::WHOLE)
         .unwrap_or_else(|why| panic!("{} loads: {why}", fixture.model))
 }

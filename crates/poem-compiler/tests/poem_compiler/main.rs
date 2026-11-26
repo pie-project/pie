@@ -17,6 +17,7 @@ mod a_fold_and_the_next_pre_mix_land_as_one_op;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
 mod a_kv_head_is_held_by_a_group_of_ranks;
 mod a_matmul_and_its_epilogue_fold_into_one_anchored_region;
+mod a_miniature_cut_short_of_its_shared_tail_traces;
 mod a_miniature_cut_to_other_counts_is_read_at_them;
 mod a_named_run_lowers_to_its_region;
 mod a_ptq1_0_trunk_traces_and_places;

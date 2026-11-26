@@ -967,6 +967,9 @@ impl Engine for Cuda {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        // The load serves from its first frame: no device buffer is made on
+        // this thread after (`device::alloc::serving_from_here`).
+        crate::device::alloc::serving_from_here();
         if self.torn {
             return Err(Error::Load(
                 "a weight reload failed partway, so this engine's weights are part old and \
@@ -1472,29 +1475,10 @@ impl WeightCache for Cuda {
     }
 
     fn reload(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
-        if self.expert.size > 1 {
-            return Err(Error::Unsupported {
-                verb: "reload_weights on a rank of an expert-parallel group",
-                engine: "cuda",
-            });
-        }
-        let target = self.target();
-        let path = reload.checkpoint.as_path();
-        let shell = self
-            .shell
-            .as_mut()
-            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))?;
-        refuse_an_artifact_for_another_deployment(
-            path,
-            shell.trace().platform.backend(),
-            width_free(&shell.trace().name),
-        )?;
-        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
-        let (planes, bytes) = shell
-            .reload_weights(&contract, path, target, &mut self.torn)
-            .map_err(fault)?;
-        Ok(engine::Reloaded { planes, bytes })
+        // A reload lays the new weights as a load does.
+        crate::device::alloc::as_load(|| self.reload_weights(reload))
     }
+
 }
 
 impl Tiers for Cuda {
@@ -1689,6 +1673,33 @@ impl Tiers for Cuda {
         self.loaded_mut()?
             .copy_kv_with(&moves, &windowed, !copy.moves.is_empty())
             .map_err(fault)
+    }
+}
+
+impl Cuda {
+    fn reload_weights(&mut self, reload: &engine::Reload) -> EngineResult<engine::Reloaded> {
+        if self.expert.size > 1 {
+            return Err(Error::Unsupported {
+                verb: "reload_weights on a rank of an expert-parallel group",
+                engine: "cuda",
+            });
+        }
+        let target = self.target();
+        let path = reload.checkpoint.as_path();
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))?;
+        refuse_an_artifact_for_another_deployment(
+            path,
+            shell.trace().platform.backend(),
+            width_free(&shell.trace().name),
+        )?;
+        let contract = (self.contract_for)(shell.trace(), path).map_err(Error::Load)?;
+        let (planes, bytes) = shell
+            .reload_weights(&contract, path, target, &mut self.torn)
+            .map_err(fault)?;
+        Ok(engine::Reloaded { planes, bytes })
     }
 }
 

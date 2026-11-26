@@ -19,6 +19,10 @@ const CONTEXT: u32 = 2048;
 const SLOTS: u32 = 8;
 
 fn shell(name: &str) -> Shell {
+    shell_of(name, None)
+}
+
+fn shell_of(name: &str, steps: Option<&engine::StepRules>) -> Shell {
     let deployment = poem_compiler::catalog::deployment(name).expect("the deployment is listed");
     let trace = deployment.trace(Platform::Xla);
     let paging =
@@ -49,7 +53,7 @@ fn shell(name: &str) -> Shell {
             kv_budget: Some(kv_budget),
             allowance: engine::Allowance::WHOLE,
             device: &DeviceBoot::default(),
-            steps: None,
+            steps,
         },
         None,
         false,
@@ -101,6 +105,140 @@ fn seated<'a>(
     seated.pages = &table[..pages.min(table.len())];
     seated.fixed = lane.record.pieces();
     seated
+}
+
+/// After the ladder, a prompt whose lanes state masks, folded or buffered,
+/// alone or beside decodes, a plain one beside a decode, and a drafting
+/// lane's masked window or fresh prompt, read whole, run programs it laid.
+#[test]
+fn a_masked_prompt_runs_the_ladders_programs() {
+    use engine::fire::{FoldLen, Lineage, Mask, Masking, RsVerb};
+    const HELD: u32 = 64;
+    const ROWS: [u32; 17] = [2, 3, 5, 7, 8, 14, 15, 16, 17, 29, 30, 31, 32, 63, 64, 100, 127];
+    let rules = engine::StepRules::runtime();
+    let mut shell = shell_of("qwen35-d0.8b-vision-mtp-bf16-kv-bf16", Some(&rules));
+    shell.warm_maintenance().expect("the maintenance programs lay");
+    let stated = shell.stated_steps(&rules);
+    let steps = stated.shapes.clone();
+    shell.set_steps(stated.shapes);
+    shell.prewarm().expect("the ladder lays");
+    let facts = shell.trace().facts.clone();
+    let mut refs = Refs::of_facts(shell.chunk_facts());
+    let tokens = vec![7u32; CONTEXT as usize];
+    let tables: Vec<engine::fire::Lane> = (0..SLOTS)
+        .map(|at| {
+            let word = facts.word(&Request::new(ROWS[ROWS.len() - 1], false));
+            let held = HELD + ROWS[ROWS.len() - 1];
+            Seq::new(at).lane_of(CONTEXT, word, &mut refs, vec![0; held as usize])
+        })
+        .collect();
+    let laid = shell.device().dry_texts().len();
+    let mut missed = Vec::new();
+    let (rs_shape, rs_tokens) = refs
+        .shapes(|s| s.role == engine::SlotRole::RsBuffer)
+        .into_iter()
+        .find_map(|s| match s.kind {
+            engine::SlotKind::List { tokens, .. } => Some((s.id, tokens)),
+            _ => None,
+        })
+        .expect("a hybrid's rs list");
+    // (nothing runs: every lane names the same slots)
+    let rs: Vec<u32> = (0..ROWS[ROWS.len() - 1].div_ceil(rs_tokens) + 1)
+        .map(|_| refs.take(rs_shape))
+        .collect();
+    let mut buffered_fires = 0;
+    let depth = shell.trace().facts.draft_depth.expect("the model drafts");
+    // (held, rows): a drafting window and fresh prompts, or a prompt's tail
+    let drafting = [(HELD, 1 + depth), (0, 2), (0, 16), (0, 29), (0, 31)];
+    let tails = ROWS.map(|rows| (HELD, rows));
+    for (prompts, decodes, masked, buffers, drafts) in [
+        (1u32, 0u32, false, false, false),
+        (1, 0, true, false, false),
+        (2, 0, true, false, false),
+        (4, 0, true, false, false),
+        (1, 1, false, false, false),
+        (1, 1, true, false, false),
+        (2, 6, true, false, false),
+        (4, 4, true, false, false),
+        (1, 0, true, true, false),
+        (2, 0, true, true, false),
+        (4, 0, true, true, false),
+        (1, 1, true, true, false),
+        (1, 0, false, false, true),
+        (1, 0, true, false, true),
+        (2, 0, true, false, true),
+        (4, 0, true, false, true),
+    ] {
+        for &(held, rows) in if drafts { &drafting[..] } else { &tails[..] } {
+            let lanes: Vec<_> = (0..prompts + decodes)
+                .map(|at| {
+                    let rows = if at < prompts { rows } else { 1 };
+                    shell.open(at).expect("the slot opens");
+                    let masked = masked && at < prompts;
+                    let request = Request::new(rows, masked).drafting(drafts && at < prompts);
+                    (&tables[at as usize], facts.word(&request), rows)
+                })
+                .collect();
+            let every: Vec<u32> = (0..rows).collect();
+            let mask = Masking::Extent(Mask::new(vec![0, held + rows], u64::from(held + rows)));
+            let verbs: Vec<RsVerb> = (0..lanes.len())
+                .map(|_| RsVerb::Buffer {
+                    pages: rs.clone(),
+                    base: HELD,
+                    folded: HELD,
+                    fold: FoldLen::Host(0),
+                    lineage: Lineage::Set,
+                })
+                .collect();
+            if buffers {
+                let step = engine::StepComposition {
+                    treatment: engine::Treatment::Buffers,
+                    decode_lanes: decodes,
+                    prompt_lanes: prompts,
+                    prompt_rows: prompts * rows,
+                    rows: prompts * rows + decodes,
+                    lane_rows: engine::shapes::Span { lo: rows, hi: rows },
+                    readout_rows: prompts + decodes,
+                    attachments: engine::Attachments {
+                        mask: true,
+                        ..Default::default()
+                    },
+                    ..engine::StepComposition::default()
+                };
+                let Ok(shape) = steps.fire_shape(&step) else {
+                    continue;
+                };
+                shell.shape_next(Some(shape));
+                buffered_fires += 1;
+            }
+            let seated: Vec<Seated<'_>> = lanes
+                .iter()
+                .enumerate()
+                .map(|(at, (lane, word, rows))| {
+                    let mut lane = seated(lane, *word, &tokens[..*rows as usize], held + rows);
+                    lane.held = Some(held);
+                    if drafts && (at as u32) < prompts {
+                        lane.readout = Some(&every);
+                    }
+                    lane.mask = (masked && (at as u32) < prompts).then_some(&mask);
+                    if buffers {
+                        lane.rs = &verbs[at];
+                    }
+                    lane
+                })
+                .collect();
+            let before = shell.device().dry_texts().len();
+            shell.fire_full(&seated).expect("the fire lays");
+            if shell.device().dry_texts().len() > before {
+                missed.push((prompts, decodes, masked, buffers, drafts, rows));
+            }
+        }
+    }
+    assert!(buffered_fires > 0, "the set states buffered prompts");
+    assert!(
+        missed.is_empty(),
+        "fires (prompts, decodes, masked, buffered, drafting, rows) past the {laid} programs laid: {missed:?}"
+    );
 }
 
 #[test]

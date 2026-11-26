@@ -277,9 +277,10 @@ pub(crate) struct Parked {
     code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
-    /// Where it loads behind serving: (its ladder part's rank, the fire's
-    /// lanes, its rows), ascending (`warm::use_rank`).
-    order: (u8, u32, u32),
+    /// Where it loads behind serving: (a masked fire's program, its ladder
+    /// part's rank, the fire's lanes, its rows), ascending (`warm::use_rank`):
+    /// the programs only masked fires run after every plain one.
+    order: (bool, u8, u32, u32),
 }
 
 pub(crate) struct Deferred {
@@ -290,7 +291,7 @@ pub(crate) struct Deferred {
     probed: Vec<ValueId>,
     rows: u32,
     /// Set by the ladder as it traces the fire (`Parked::order`).
-    order: (u8, u32, u32),
+    order: (bool, u8, u32, u32),
 }
 
 /// The width a load's cached programs load behind serving at
@@ -3060,9 +3061,12 @@ impl Shell {
         // or not, every row's flag off where none is: the mask is data of
         // the fire's shape, so a masked lane's mixed fire (a beam's rescore
         // beside other groups' decodes) is the program the warm ladder laid
-        // for the plain one.
-        let mixed = descriptor.lanes.iter().any(|l| l.rows > 1)
-            && descriptor.lanes.iter().any(|l| l.rows == 1);
+        // for the plain one. Its own lanes say so, not its padding: a
+        // padding lane of one row is no decode. A prompt alone stages it
+        // where a lane of it is masked (its program is the ladder's masked
+        // twin of the plain one).
+        let mixed = lanes.iter().any(|s| s.lane.tokens.len() > 1)
+            && lanes.iter().any(|s| s.lane.tokens.len() == 1);
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {
             Some(staged) => (staged.bytes.clone(), staged.enabled.clone(), staged.stride),
             None if mixed && !self.masked.is_empty() => (Vec::new(), Vec::new(), mask_width),
@@ -3665,7 +3669,7 @@ impl Shell {
                     sig,
                     probed,
                     rows: descriptor.rows,
-                    order: (u8::MAX, 0, descriptor.rows),
+                    order: (true, u8::MAX, 0, descriptor.rows),
                 });
             }
             // A fire returning the readout entries: its row count's readout
