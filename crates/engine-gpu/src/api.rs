@@ -1273,7 +1273,13 @@ where
         // reading before arming (`Books::outside`), so what it grew by since
         // is held back of the pool's chunks, and the settled figure is the
         // load's outside.
-        if let Some(outside) = shell.settle_outside().map_err(fault)? {
+        let settled = shell.settle_outside().map_err(fault)?;
+        // The settle's fires are the load's, as the walks before them: a
+        // fill they walked is no serving fire's.
+        if settled.is_some() {
+            shell.filled_serving();
+        }
+        if let Some(outside) = settled {
             let chunk = shell.pools().chunk_bytes().max(1);
             let sized = crate::backend::Context::books(shell.device())
                 .ledger()
