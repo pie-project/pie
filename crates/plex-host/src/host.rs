@@ -1164,7 +1164,9 @@ impl Host {
             prefix,
             |v| json!(v),
         );
-        column(&mut out, tables::SHARE_GROUPS, d.share_groups, id, |v| json!(v));
+        column(&mut out, tables::SHARE_GROUPS, d.share_groups, id, |v| {
+            json!(v)
+        });
         if !d.terminate.is_empty() {
             out.insert("terminate".into(), json!(d.terminate));
         }
