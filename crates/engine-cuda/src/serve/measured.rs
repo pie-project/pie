@@ -108,7 +108,8 @@ pub(crate) fn bodies_shape(
     kv_budget: &dyn std::fmt::Debug,
     pin: super::boot::WeightPin,
 ) -> String {
-    let shape = format!("{identity}|{trace}|{profile:?}|{page_size}|{context}|{slots}|{kv_budget:?}");
+    let shape =
+        format!("{identity}|{trace}|{profile:?}|{page_size}|{context}|{slots}|{kv_budget:?}");
     match pin {
         super::boot::WeightPin::Cached => shape,
         pin => format!("{shape}|{pin:?}"),
