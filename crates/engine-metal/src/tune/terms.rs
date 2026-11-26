@@ -24,6 +24,36 @@ use poem_ir::{Attn, Dtype, Operation, Ssm, Trace};
 use profile::curves::FireTerm;
 
 use super::CheckBench;
+
+/// The keys each rung's attention is timed at, below the model's context
+/// (those no fewer than the rung's rows), and the context itself.
+pub const KEYS: [u32; 3] = [4096, 16384, 32768];
+
+/// The context the checkpoint `artifact` carries the config of states
+/// (`max_position_embeddings`, its text model's where it has one).
+#[must_use]
+pub fn context_of(artifact: &std::path::Path) -> Option<u32> {
+    let metadata = checkpoint::file::read::parse_metadata(artifact).ok()?;
+    let config = checkpoint::file::read::read_meta(&metadata, "model/config")
+        .ok()
+        .flatten()?;
+    let config: serde_json::Value = serde_json::from_slice(&config).ok()?;
+    let text = config
+        .get("text_config")
+        .filter(|text| text.is_object())
+        .unwrap_or(&config);
+    text.get("max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// The keys a model of `context` is timed at: [`KEYS`] below it, then it.
+#[must_use]
+pub fn keys_to(context: u32) -> Vec<u32> {
+    let mut keys: Vec<u32> = KEYS.iter().copied().filter(|&k| k < context).collect();
+    keys.push(context);
+    keys
+}
 use crate::encode::Term;
 
 /// The fires timed a point as serving runs them (their median wall and
@@ -134,7 +164,7 @@ impl Point {
 }
 
 /// The rolled-up term of one dissected dispatch group: its kind and shape
-/// as the point keys it, and whether it is the output head's matmul.
+/// as the point keys it (the output head's matmul still marked).
 fn rolled(term: &Term, layers: &Layers, rows: u32, keys: u32) -> (u32, Vec<u32>) {
     let Some((kind, shape)) = term else {
         return (FireTerm::ROW_OPS, vec![layers.hidden, layers.inter]);
@@ -162,19 +192,36 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-/// Times each of `rows` (the rungs) at each of `keys` no fewer than its
-/// rows on `bench`'s model, saying each point.
+/// Times each of `rows` at each of `keys` no fewer than its rows on
+/// `bench`'s model, saying each point; `rows` `None`: the prompt-shaped
+/// rungs the served load's weighing lays (to four times its fire top, as a
+/// check lays them), the decode-shaped ones being the product times'.
 ///
 /// # Errors
 ///
 /// A load or a fire refused.
 pub fn points(
     bench: &mut CheckBench<'_>,
-    rows: &[u32],
+    rows: Option<&[u32]>,
     keys: &[u32],
     say: &mut dyn FnMut(&str),
 ) -> Result<(Layers, Vec<Point>), String> {
-    let fires: Vec<CheckFire> = rows
+    // The served load's weighing first: the check's shells are laid as its
+    // pool lays them.
+    let rungs: Vec<u32> = {
+        let weighing = bench.load(Run::Walked, None)?;
+        match rows {
+            Some(rows) => rows.to_vec(),
+            None => weighing
+                .weighed()?
+                .rungs
+                .iter()
+                .filter(|r| !r.decode_shaped() && r.infeasible.is_none())
+                .map(|r| r.tokens)
+                .collect(),
+        }
+    };
+    let fires: Vec<CheckFire> = rungs
         .iter()
         .flat_map(|&r| {
             keys.iter().filter(move |&&k| k >= r).map(move |&k| CheckFire {
@@ -186,9 +233,6 @@ pub fn points(
             })
         })
         .collect();
-    // The served load's weighing first: the check's shells are laid as its
-    // pool lays them.
-    drop(bench.load(Run::Walked, None)?);
     let counts = crate::top::counts(&bench.trace).map_err(|e| e.to_string())?;
     let layers = Layers::of(&bench.trace, &counts);
     say(&format!(
@@ -258,17 +302,19 @@ pub fn points(
 /// The terms `points` measure, each a layer's or a launch's (as
 /// [`FireTerm`] states its kind), by rows: an attention at each keys of its
 /// own, the others the median over the points' keys; the output head's
-/// matmul (`head`: its `[n, k]`) at one row; the fire fixed its wall less
+/// matmul at its one sampled row; the fire fixed its wall less
 /// its device span.
 #[must_use]
-pub fn terms(layers: &Layers, points: &[Point], head: Option<(u32, u32)>) -> Vec<FireTerm> {
+pub fn terms(layers: &Layers, points: &[Point]) -> Vec<FireTerm> {
     // (kind, shape) -> rows -> [ns over the points' keys], with sources.
     let mut by: BTreeMap<(u32, Vec<u32>), BTreeMap<u32, Vec<f64>>> = BTreeMap::new();
     let mut files: BTreeMap<(u32, Vec<u32>), BTreeSet<String>> = BTreeMap::new();
     for p in points {
         for ((kind, shape), (ns, n, sources)) in &p.terms {
-            let is_head = *kind == FireTerm::GEMM
-                && head.is_some_and(|(hn, hk)| shape.first() == Some(&hn) && shape.get(1) == Some(&hk));
+            // The output head's matmul is marked by a fourth field
+            // (`Run::linear`), its rows the fire's sampled ones.
+            let is_head = *kind == FireTerm::GEMM && shape.len() == 4;
+            let shape = &if is_head { shape[..3].to_vec() } else { shape.clone() };
             let share = match *kind {
                 FireTerm::ATTENTION => f64::from(layers.attention.max(1)),
                 FireTerm::SCAN => layers.scan.len().max(1) as f64,
@@ -303,6 +349,66 @@ pub fn terms(layers: &Layers, points: &[Point], head: Option<(u32, u32)>) -> Vec
         .collect()
 }
 
+/// `pie tune metal --fire-terms`: each of `models` (an artifact and its
+/// deployment) loaded and its fire terms timed ([`points`] at its rungs
+/// and [`keys_to`] its context, [`terms`]), the device's user file with them laid over
+/// its `[rates]` (an entry of the same kind and shape replaced, a later
+/// model's over an earlier's).
+///
+/// # Errors
+///
+/// No device, or a model that does not load or fire.
+pub fn measure(
+    profiles: Option<&std::path::Path>,
+    models: &[(std::path::PathBuf, String)],
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let began = std::time::Instant::now();
+    let name = crate::device::Context::bind()
+        .map_err(|e| e.to_string())?
+        .name()
+        .to_string();
+    let mut all: Vec<FireTerm> = Vec::new();
+    for (artifact, deployment) in models {
+        say(&format!("{name}: the fire terms of {deployment}"));
+        let context = context_of(artifact).ok_or_else(|| {
+            format!(
+                "{deployment}: its artifact carries no config stating a context \
+                 (`max_position_embeddings`) to time its attention to; import it again"
+            )
+        })?;
+        say(&format!("  keys {:?} (its context {context})", keys_to(context)));
+        let mut bench = super::check_bench(profiles, artifact, deployment)?;
+        let (layers, points) = points(&mut bench, None, &keys_to(context), say)?;
+        for term in terms(&layers, &points) {
+            all.retain(|t| t.id() != term.id());
+            all.push(term);
+        }
+    }
+    let count = all.len();
+    let stored = profile::rates::Rates {
+        fire_terms: Some(all),
+        measured_on: Some(crate::stored::measured_on(&name)),
+        ..profile::rates::Rates::default()
+    };
+    let how = crate::rates::provenance(&name);
+    let file = engine::rates::saved_text(super::user_file(profiles, &name).as_deref(), &stored, &how);
+    let seconds = began.elapsed().as_secs_f64();
+    let block = format!(
+        "{}\n[provenance]\nrates.{} = {}\n",
+        stored.toml().trim_end(),
+        how.0,
+        how.1
+    );
+    say(&format!("{name}: {count} fire terms of {} model(s) in {seconds:.0} s", models.len()));
+    Ok(engine::rates::Rated {
+        device: name,
+        file,
+        block,
+        seconds,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,10 +425,10 @@ mod tests {
         let artifact = std::path::PathBuf::from(env("PIE_FT_ARTIFACT"));
         let mut bench = super::super::check_bench(None, &artifact, &env("PIE_FT_DEPLOYMENT")).unwrap();
         let mut say = |line: &str| eprintln!("{line}");
-        let (layers, points) = points(&mut bench, &list("PIE_FT_ROWS"), &list("PIE_FT_KEYS"), &mut say).unwrap();
+        let rows = std::env::var("PIE_FT_ROWS").ok().map(|_| list("PIE_FT_ROWS"));
+        let (layers, points) = points(&mut bench, rows.as_deref(), &list("PIE_FT_KEYS"), &mut say).unwrap();
         let counts = crate::top::counts(&bench.trace).unwrap();
-        let head = Some((counts.head_bytes as u32 / 2 / counts.readout_depth.max(1), counts.readout_depth));
-        let terms = terms(&layers, &points, head);
+        let terms = terms(&layers, &points);
         let mut out = String::from("{\"layers\": ");
         out += &format!(
             "{{\"layers\": {}, \"attention\": {}, \"scan\": {}, \"hidden\": {}, \"inter\": {}}}",

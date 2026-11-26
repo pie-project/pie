@@ -580,16 +580,19 @@ impl Run<'_> {
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_metal::Error> {
         // Under the kernel profile a plane's matmul is its own fire term
-        // (`crate::encode::set_term`): its plane `[n, k, dtype]`.
+        // (`crate::encode::set_term`): its plane `[n, k, dtype]`, the
+        // output head's marked.
         #[cfg(target_vendor = "apple")]
-        if let Linear::Matmul { w, .. } = op
+        if let Linear::Matmul { w, logits, .. } = op
             && crate::encode::profiling()
         {
             let plane = self.tensor(*w)?;
-            let term = Some((
-                profile::curves::FireTerm::GEMM,
-                vec![plane.rows, plane.width, crate::tune::terms::dtype_code(plane.dtype)],
-            ));
+            let mut shape = vec![plane.rows, plane.width, crate::tune::terms::dtype_code(plane.dtype)];
+            // The output head, read at the fire's sampled rows alone.
+            if *logits {
+                shape.push(1);
+            }
+            let term = Some((profile::curves::FireTerm::GEMM, shape));
             let was = crate::encode::set_term(term);
             let ran = self.linear_untagged(op);
             crate::encode::set_term(was);
