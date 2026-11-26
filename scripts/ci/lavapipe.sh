@@ -32,6 +32,17 @@ echo "== inferlets (wasm32-wasip3)"
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
 
+# The device budget, derived: the model's bytes (its artifact for this
+# engine), what the load's rates step lays to measure the roofline rates no
+# profile states for llvmpipe (`engine::rates::step_bytes()`, 1792 MiB: the
+# refusal reads "measuring them needs 1792 MiB of device memory where the
+# load's budget leaves ..."), and the floor kept under every device's
+# capacity (`engine::memory::SAFETY_FLOOR_BYTES`, 64 MiB).
+model_bytes=$(find "$PIE_HOME/artifacts" -name "*.$engine.zt" -printf '%s\n' | head -1)
+[ -n "$model_bytes" ] || { echo "no $engine artifact under $PIE_HOME/artifacts"; exit 1; }
+budget_device=$(( model_bytes + (1792 << 20) + (64 << 20) ))
+echo "budget_device = $budget_device bytes: model $model_bytes + rates step $((1792 << 20)) + floor $((64 << 20))"
+
 case "$engine" in
   wgpu)   engine_toml=$'type = "wgpu"\nbackends = "vulkan"\ndevice = ["wgpu:0"]' ;;
   vulkan) engine_toml=$'type = "vulkan"\ndevice = ["vulkan:0"]' ;;
@@ -46,7 +57,7 @@ source = "snapshot"
 [engine]
 $engine_toml
 [engine.memory]
-budget_device = "1GiB"
+budget_device = "${budget_device}B"
 [sandbox]
 allow_fs = false
 allow_network = true
