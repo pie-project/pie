@@ -318,7 +318,7 @@ pub struct KvStore {
     order: Option<KeptOrder>,
     /// The owners (an entry of none, by its id) whose entries joined or left
     /// the cache, or were used, since the kept order read them.
-    reorder: HashSet<Result<ProcessId, u64>>,
+    reorder: rustc_hash::FxHashSet<Result<ProcessId, u64>>,
     /// Device pages a reclaim freed that wait on a fire's retirement: they
     /// are returning, and count toward what a waiter is short of, so a
     /// reclaim for the same shortfall frees none past them
@@ -459,7 +459,42 @@ struct IdleChunk {
 struct KeptOrder {
     table: u64,
     keys: u64,
-    groups: Vec<(i64, Vec<u64>)>,
+    order: Order,
+}
+
+/// A group of the reclaim order: its retention key, its entries, and the
+/// owner they are of (an entry of none, by its id).
+type OrderGroup = (i64, Vec<u64>, Result<ProcessId, u64>);
+
+/// Where a group stands in the order: the lowest retention key first, the
+/// least recently used, the oldest entry.
+type Place = (i64, Instant, u64);
+
+/// The reclaim order's groups by where they stand, and where each owner's
+/// stand: an owner's groups go and come back without the rest being read.
+#[derive(Debug, Default, PartialEq)]
+struct Order {
+    groups: BTreeMap<Place, OrderGroup>,
+    of: rustc_hash::FxHashMap<Result<ProcessId, u64>, Vec<Place>>,
+}
+
+impl Order {
+    fn insert(&mut self, place: Place, group: OrderGroup) {
+        self.of.entry(group.2).or_default().push(place);
+        self.groups.insert(place, group);
+    }
+
+    /// Takes out the groups of `of`.
+    fn remove_of(&mut self, of: &Result<ProcessId, u64>) {
+        for place in self.of.remove(of).into_iter().flatten() {
+            self.groups.remove(&place);
+        }
+    }
+
+    /// The groups, lowest place first.
+    fn groups(&self) -> impl Iterator<Item = &OrderGroup> {
+        self.groups.values()
+    }
 }
 
 /// A set's domain: where its keys chain from at row 0. A set that asked
@@ -567,7 +602,7 @@ impl KvStore {
             below_cached: std::cell::Cell::new(None),
             droppable_below: std::cell::Cell::new(None),
             order: None,
-            reorder: HashSet::new(),
+            reorder: rustc_hash::FxHashSet::default(),
             returning: HashSet::new(),
             reclaiming: None,
             guest_disk_slots: 0,
@@ -1070,19 +1105,17 @@ impl KvStore {
         let mut order = self.kept_order(&keys);
         // Groups that free no device page go last; the walk stops as soon as
         // what is short is freed, so it reads only the groups it reaches.
-        let mut later = Vec::new();
+        let mut later: Vec<Place> = Vec::new();
         let mut reached = Vec::new();
         let reads = self.table.live_reads();
         'passes: for last in [false, true] {
-            let walk = if last {
-                std::mem::take(&mut later)
+            let walk: Box<dyn Iterator<Item = Place>> = if last {
+                Box::new(std::mem::take(&mut later).into_iter())
             } else {
-                Vec::new()
+                Box::new(order.groups.keys().copied())
             };
-            let count = if last { walk.len() } else { order.len() };
-            for at in 0..count {
-                let at = if last { walk[at] } else { at };
-                let (key, ids) = &order[at];
+            for at in walk {
+                let (key, ids, _) = &order.groups[&at];
                 let ids = self.at_rest(ids, &reads);
                 if ids.is_empty() {
                     continue;
@@ -1134,11 +1167,17 @@ impl KvStore {
                 }
             }
         }
+        // A group's dropped entries leave it; the owner they were of reads
+        // again at the next reclaim (its drops are noted).
         for at in reached {
             let cache = &self.cache;
-            order[at].1.retain(|id| cache.contains_key(id));
+            if let Some((_, ids, _)) = order.groups.get_mut(&at) {
+                ids.retain(|id| cache.contains_key(id));
+                if ids.is_empty() {
+                    order.groups.remove(&at);
+                }
+            }
         }
-        order.retain(|(_, ids)| !ids.is_empty());
         self.keep_order(order, &keys);
         let mut let_go: HashSet<PhysicalKvPageId> =
             self.reclaiming.take().unwrap_or_default().into_iter().collect();
@@ -1223,8 +1262,11 @@ impl KvStore {
         let base = self.pool.base();
         let mut ids: Vec<u64> = Vec::new();
         let mut opens: Vec<(Instant, IdleChunk)> = Vec::new();
-        for level in order.chunk_by(|a, b| a.0 == b.0) {
-            for (_, group) in level {
+        let mut groups = order.groups().peekable();
+        while let Some((key, group, _)) = groups.next() {
+            let key = *key;
+            ids.extend(self.at_rest(group, &reads));
+            while let Some((_, group, _)) = groups.next_if(|(other, ..)| *other == key) {
                 ids.extend(self.at_rest(group, &reads));
             }
             if ids.is_empty() {
@@ -1237,7 +1279,7 @@ impl KvStore {
                 }
             }
             let mut held: HashMap<u32, IdleChunk> = HashMap::new();
-            let above = self.above(level[0].0, keys);
+            let above = self.above(key, keys);
             for (at, page) in self.table.cache_only_pages(&self.roots(&ids), &above) {
                 let chunk = held.entry(page.0.saturating_sub(base) / spc).or_default();
                 chunk.pages.push((at, page));
@@ -1258,6 +1300,7 @@ impl KvStore {
                 break;
             }
         }
+        drop(groups);
         self.keep_order(order, keys);
         opens.sort_by_key(|(newest, _)| *newest);
         opens.truncate(want as usize);
@@ -1286,7 +1329,7 @@ impl KvStore {
     /// a decode's appends and a fork move the order not at all. All of it is
     /// walked where a column's default changed, or where pages of persisted
     /// heads, which split entries too, moved.
-    fn kept_order(&mut self, keys: &impl Keys) -> Vec<(i64, Vec<u64>)> {
+    fn kept_order(&mut self, keys: &impl Keys) -> Order {
         let copies = self.persisted.as_ref().is_some_and(|p| !p.by_key.is_empty());
         if let Some(kept) = self.order.take()
             && (!copies || (kept.table == self.table.revision() && self.reorder.is_empty()))
@@ -1294,12 +1337,16 @@ impl KvStore {
         {
             let mut changed = std::mem::take(&mut self.reorder);
             changed.extend(rows.into_iter().map(Ok));
-            return self.reordered(kept.groups, changed, keys);
+            return self.reordered(kept.order, changed, keys);
         }
         self.split_at_steps(keys, self.cache.keys().copied().collect());
         self.split_persisted();
         self.reorder.clear();
-        self.order_of(keys, self.cache.keys().copied())
+        let mut order = Order::default();
+        for (place, group) in self.placed(keys, self.cache.keys().copied()) {
+            order.insert(place, group);
+        }
+        order
     }
 
     /// The entries of an owner (or one of none, by its id) changed: the kept
@@ -1313,18 +1360,16 @@ impl KvStore {
     /// `groups` with those of the owners `changed` read again.
     fn reordered(
         &mut self,
-        mut groups: Vec<(i64, Vec<u64>)>,
-        changed: HashSet<Result<ProcessId, u64>>,
+        mut order: Order,
+        changed: rustc_hash::FxHashSet<Result<ProcessId, u64>>,
         keys: &impl Keys,
-    ) -> Vec<(i64, Vec<u64>)> {
+    ) -> Order {
         if changed.is_empty() {
-            return groups;
+            return order;
         }
-        groups.retain(|(_, ids)| {
-            ids.iter()
-                .find_map(|id| Some((id, self.cache.get(id)?)))
-                .is_some_and(|(&id, entry)| !changed.contains(&entry.owner.ok_or(id)))
-        });
+        for of in &changed {
+            order.remove_of(of);
+        }
         let owned = |store: &Self| -> Vec<u64> {
             changed
                 .iter()
@@ -1337,19 +1382,10 @@ impl KvStore {
         };
         self.split_at_steps(keys, owned(self));
         self.reorder.clear();
-        for group in self.order_of(keys, owned(self).into_iter()) {
-            let place = self.place_of(&group);
-            let at = groups.partition_point(|other| self.place_of(other) < place);
-            groups.insert(at, group);
+        for (place, group) in self.placed(keys, owned(self).into_iter()) {
+            order.insert(place, group);
         }
-        groups
-    }
-
-    /// Where a group stands in the order: the lowest retention key first, the
-    /// least recently used, the oldest entry.
-    fn place_of(&self, (key, ids): &(i64, Vec<u64>)) -> (i64, Option<Instant>, Option<u64>) {
-        let used = ids.iter().filter_map(|id| Some(self.cache.get(id)?.last_use)).max();
-        (*key, used, ids.first().copied())
+        order
     }
 
     /// Of a kept order's group, what no live set reads, at rest on the
@@ -1371,14 +1407,14 @@ impl KvStore {
     /// Keeps what of `order` a reclaim left (its dropped entries taken out),
     /// under the revisions it leaves: its settles move pages down, which the
     /// next reclaim reads as it goes; nothing else it does reorders the rest.
-    fn keep_order(&mut self, groups: Vec<(i64, Vec<u64>)>, keys: &impl Keys) {
+    fn keep_order(&mut self, order: Order, keys: &impl Keys) {
         let Some(revision) = keys.revision() else {
             return;
         };
         self.order = Some(KeptOrder {
             table: self.table.revision(),
             keys: revision,
-            groups,
+            order,
         });
     }
 
@@ -1539,7 +1575,7 @@ impl KvStore {
         &self,
         keys: &impl Keys,
         held: fn(&KvPageTable, NodeId) -> bool,
-    ) -> Vec<(i64, Vec<u64>)> {
+    ) -> Vec<OrderGroup> {
         let unused: HashSet<NodeId> = self.table.unused_cache_roots().into_iter().collect();
         if unused.is_empty() {
             return Vec::new();
@@ -1557,7 +1593,16 @@ impl KvStore {
         &self,
         keys: &impl Keys,
         ids: impl Iterator<Item = u64>,
-    ) -> Vec<(i64, Vec<u64>)> {
+    ) -> Vec<OrderGroup> {
+        self.placed(keys, ids).into_iter().map(|(_, group)| group).collect()
+    }
+
+    /// [`Self::order_of`], each group with its [`Place`].
+    fn placed(
+        &self,
+        keys: &impl Keys,
+        ids: impl Iterator<Item = u64>,
+    ) -> Vec<(Place, OrderGroup)> {
         type Group = (Vec<u64>, Instant);
         // An owner's entries group by their row's key; an entry no process
         // owns (a sealed prefix an exited set left) is a group of its own,
@@ -1579,18 +1624,18 @@ impl KvStore {
         // oldest entry first, never by the map's order.
         let mut order: Vec<_> = groups
             .into_iter()
-            .map(|((_, key), (mut ids, last_use))| {
+            .map(|((of, key), (mut ids, last_use))| {
                 ids.sort_unstable();
-                ((key, last_use, ids.first().copied()), (key, ids))
+                ((key, last_use, ids[0]), (key, ids, of))
             })
             .collect();
         order.sort_unstable_by_key(|(order, _)| *order);
         tracing::debug!(
             target: "pie::retention",
-            order = ?order.iter().map(|((key, ..), (_, ids))| (*key, ids.len())).collect::<Vec<_>>(),
+            order = ?order.iter().map(|((key, ..), (_, ids, _))| (*key, ids.len())).collect::<Vec<_>>(),
             "idle cache, lowest key first"
         );
-        order.into_iter().map(|(_, group)| group).collect()
+        order
     }
 
     fn roots(&self, keys: &[u64]) -> Vec<NodeId> {
@@ -1680,7 +1725,7 @@ impl KvStore {
         // row keeps off the device whatever lies below.
         let mut floor = None;
         let mut below = Vec::new();
-        for (key, ids) in &order {
+        for (key, ids, _) in order.groups() {
             let ids = self.at_rest(ids, &reads);
             if ids.is_empty() {
                 continue;
@@ -1881,7 +1926,7 @@ impl KvStore {
         let mut pages: Vec<(TriePageLocation, HostKvSlotId)> = Vec::new();
         let mut taken: HashSet<TriePageLocation> = HashSet::new();
         let mut records = HashMap::new();
-        for (key, ids) in self.order_where(&keys, KvPageTable::holds_on_host) {
+        for (key, ids, _) in self.order_where(&keys, KvPageTable::holds_on_host) {
             if pages.len() >= wanted || room == 0 {
                 break;
             }

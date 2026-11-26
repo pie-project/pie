@@ -2126,7 +2126,12 @@ fn the_kept_order_is_the_whole_orders() {
             let keys = &rows;
             let kept = store.kept_order(&keys);
             let whole = store.order_of(&keys, store.cache.keys().copied().collect::<Vec<_>>().into_iter());
-            assert_eq!(kept, whole, "seed {seed} op {op}");
+            assert_eq!(kept.groups().cloned().collect::<Vec<_>>(), whole, "seed {seed} op {op}");
+            // Each owner's places are of its own groups, and every group's
+            // owner names it.
+            for (place, group) in &kept.groups {
+                assert!(kept.of[&group.2].contains(place), "seed {seed} op {op}");
+            }
             store.keep_order(kept, &keys);
         }
         assert!(!store.cache.is_empty());

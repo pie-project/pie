@@ -108,6 +108,20 @@ pub(super) enum Attach {
     Checkpoint(crate::store::rs::RsWorkingSetId),
 }
 
+/// Whether a pass from `held` rows that keys `keyed` more ends no page past
+/// the held rows while starting inside one: it can map, claim or bring up
+/// nothing, no whole page of it being keyed beyond what the set holds.
+pub(super) fn ends_no_page(held: u64, keyed: u64, page_size: u32) -> bool {
+    let page = u64::from(page_size.max(1));
+    !held.is_multiple_of(page) && (held + keyed) / page == held / page
+}
+
+/// Whether a pass reads its keys ([`supply`]): one that may map, or one
+/// that keeps recurrent state (its checkpoints are named by them).
+pub(super) fn takes_supply(attach: Attach, keeps_state: bool) -> bool {
+    !matches!(attach, Attach::No) || keeps_state
+}
+
 #[derive(Default)]
 pub(super) struct Supplied {
     pub(super) rows: u32,
@@ -441,5 +455,31 @@ pub(crate) fn resume(
             }
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A decode step inside a page ends none and maps nothing; the step that
+    /// ends a page, one starting on a page, and a prefill are still keyed.
+    #[test]
+    fn a_pass_inside_a_page_ends_none_and_one_ending_a_page_is_keyed() {
+        assert!(ends_no_page(33, 1, 16), "mid-page decode");
+        assert!(ends_no_page(17, 14, 16), "up to the page's last row but one");
+        assert!(!ends_no_page(47, 1, 16), "ends its page");
+        assert!(!ends_no_page(32, 1, 16), "starts on a page");
+        assert!(!ends_no_page(0, 300, 16), "a prefill");
+        assert!(!ends_no_page(20, 40, 16), "crosses pages");
+    }
+
+    /// A pass that maps nothing and keeps no recurrent state reads no keys;
+    /// one that keeps state, or may map, does.
+    #[test]
+    fn a_pass_that_maps_nothing_and_keeps_no_state_reads_no_keys() {
+        assert!(!takes_supply(Attach::No, false));
+        assert!(takes_supply(Attach::No, true), "its checkpoints are named by them");
+        assert!(takes_supply(Attach::Kv, false));
     }
 }
