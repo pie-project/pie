@@ -787,7 +787,12 @@ impl Shell {
                         full.store(true, SeqCst);
                         return None;
                     };
-                    let program = device.load_behind(code, sig.clone());
+                    // a traced text whose file does not load (corrupt, or
+                    // gone) is built again here, before ready
+                    let program = match device.load_behind(code, sig.clone()) {
+                        Ok(None) if code.text().is_some() => device.prepare_code(code, sig.clone()),
+                        loaded => loaded,
+                    };
                     room.done(reserved, matches!(program, Ok(Some(_))));
                     match program {
                         Ok(Some(_)) => {
@@ -988,7 +993,8 @@ impl Shell {
         // beside those under way. The rest are parked: compiled onto the disk
         // cache (not held) where they are not there yet, loaded (~1 s, never
         // compiled) by the first fire that takes their shape. With a disk
-        // cache the ladder holds none it compiles while it compiles: a held
+        // cache the ladder holds none, compiled now or found there (the loader
+        // behind the guest stages takes them, `load_behind`): a held
         // program's memory is a compile's room (Qwen3.6-35B-A3B's v5e ladder
         // held 25 GB of a 47 GB host by its end, its last compiles one at a
         // time); those the free memory holds load once the compiles are done.
@@ -1002,12 +1008,6 @@ impl Shell {
         // by (`CompileGate`): as many as the cores, the free memory waiting
         // for a compile to end where it would not hold another.
         let admission = CompileGate::default();
-        // A program found in the disk cache loads, on as many threads at once
-        // as the loader behind serving takes (the device's stated width, else
-        // one): each held load takes the host's memory as it goes, so many at
-        // once outran the room (Qwen3.5, programs cached without records: 137
-        // GiB held before the guest stages on a thread a core).
-        let loads = Slots::new(self.load_width.stated.map_or(1, |w| w.max(1) as usize));
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .clamp(1, texts.len().max(1));
@@ -1034,7 +1034,7 @@ impl Shell {
                             parked.fetch_add(1, SeqCst);
                             continue;
                         }
-                        let reserved = if !parks || device.code_on_disk(text) {
+                        let reserved = if !parks {
                             host_room.take(text.len())
                         } else {
                             None
@@ -1048,8 +1048,7 @@ impl Shell {
                         }
                         let program = {
                             // a cached program loads, never compiled
-                            let _admitted = (!device.code_on_disk(text)).then(|| admission.admit());
-                            let _loading = device.code_on_disk(text).then(|| loads.take());
+                            let _admitted = text.text().map(|_| admission.admit());
                             device.prepare_code(text, (*sig).clone())
                         };
                         if let Some(r) = reserved {
@@ -1492,35 +1491,3 @@ fn keep_width(width: &super::LoadWidth, knee: usize) {
     }
 }
 
-/// At most `n` held at once; one taken waits for one to be given back.
-struct Slots {
-    free: std::sync::Mutex<usize>,
-    given: std::sync::Condvar,
-}
-
-struct Slot<'a>(&'a Slots);
-
-impl Slots {
-    fn new(n: usize) -> Slots {
-        Slots {
-            free: std::sync::Mutex::new(n),
-            given: std::sync::Condvar::new(),
-        }
-    }
-
-    fn take(&self) -> Slot<'_> {
-        let mut free = self.free.lock().expect("the slots' lock poisoned");
-        while *free == 0 {
-            free = self.given.wait(free).expect("the slots' lock poisoned");
-        }
-        *free -= 1;
-        Slot(self)
-    }
-}
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        *self.0.free.lock().expect("the slots' lock poisoned") += 1;
-        self.0.given.notify_one();
-    }
-}
