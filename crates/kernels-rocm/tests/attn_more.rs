@@ -435,7 +435,6 @@ fn check_selected(gpu: &Gpu, case: Sel) {
             false,
             None,
             &device,
-            plan::Toggles::default(),
             plan::Workspace {
                 int_ptr: int.ptr,
                 int_bytes: 64 << 20,
@@ -676,7 +675,6 @@ fn score_capture_averages_the_observed_rows_mass() {
         false,
         None,
         &device,
-        plan::Toggles::default(),
         plan::Workspace {
             int_ptr: int.ptr,
             int_bytes: 16 << 20,

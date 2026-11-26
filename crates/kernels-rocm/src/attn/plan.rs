@@ -370,11 +370,10 @@ pub fn plan_prefill(
     enable_cuda_graph: bool,
     mask_indptr: Option<Tensor>,
     device: &Device,
-    toggles: Toggles,
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
     const OP: &str = "attn.plan_prefill";
-    let _ = (kv_len, toggles);
+    let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
     some_requests(OP, &shape)?;
     window_left(OP, window)?;
@@ -432,10 +431,8 @@ pub fn prefill_graph_float_bytes(
     page_size: u32,
     window: Option<u32>,
     device: &Device,
-    toggles: Toggles,
 ) -> Result<usize, Error> {
     const OP: &str = "attn.plan_prefill";
-    let _ = toggles;
     window_left(OP, window)?;
     // The live request carries a row: the layout reads the carve's rows
     // (`total_num_rows`), and the live rows only fill its index tables.

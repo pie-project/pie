@@ -380,7 +380,6 @@ fn run_prefill_window(
         graph,
         None,
         &device,
-        plan::Toggles::default(),
         workspace(gpu),
     )
     .unwrap();
@@ -924,7 +923,6 @@ fn run_rel(
             false,
             None,
             &device,
-            plan::Toggles::default(),
             workspace(gpu),
         )
         .unwrap();
@@ -1107,7 +1105,6 @@ fn attn_paged_masked_prefill() {
             false,
             Some(gpu.upload(&indptr, n + 1, 1, Dtype::I64)),
             &device,
-            plan::Toggles::default(),
             workspace(&gpu),
         )
         .unwrap();
@@ -1228,7 +1225,6 @@ fn attn_paged_padded_prefill_replays_as_unpadded() {
             graph,
             None,
             &device,
-            plan::Toggles::default(),
             ws,
         )
         .unwrap()
@@ -1380,7 +1376,6 @@ fn attn_paged_captured_prefill_splits_per_fire() {
             graph,
             None,
             &device,
-            plan::Toggles::default(),
             ws,
         )
         .unwrap()
