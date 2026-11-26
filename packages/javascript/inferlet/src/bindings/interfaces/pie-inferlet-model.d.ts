@@ -47,6 +47,12 @@ export function outputVocabSize(): number;
  */
 export function kvPageSize(): number;
 /**
+ * Tokens one sequence may hold before a fire growing it is refused:
+ * the engine's context in whole KV pages, the least across engines; 0
+ * when no engine sets one.
+ */
+export function maxSequenceTokens(): number;
+/**
  * Waves per frame (k) for this deployment — a static constant fixed at
  * engine start, exactly like kv-page-size. `forward.submit` takes exactly
  * this many ordered slots; slot i executes in wave i. Guests must be
