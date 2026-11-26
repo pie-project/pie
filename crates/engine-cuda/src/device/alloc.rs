@@ -14,7 +14,10 @@ pub struct Buffer {
 
 thread_local! {
     /// Whether this thread's load serves: from its first submitted frame on
-    /// ([`serving_from_here`]), no device buffer is made on it.
+    /// ([`serving_from_here`]), no device buffer is made on it. It is the
+    /// engine's lane thread's alone: a buffer asked on another thread (a fan
+    /// or side stream's, an expert-parallel rank's) after ready is not
+    /// caught here; none is asked there on the loads the census traced.
     static SERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
