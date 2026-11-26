@@ -74,6 +74,31 @@ pub fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
         .saturating_sub(safety_floor_bytes())
 }
 
+/// What may still be taken now: the card's room under `ceiling`
+/// ([`room_under`]), and, where the operator states a budget, no more than
+/// it less what this worker holds of the device as the driver counts it
+/// (its context, its driver's queues and modules, every allocation) and
+/// the safety floor. The card's free figure is every process's; the
+/// budget is this worker's alone ([`crate::device::own::used_now`]). Where
+/// the driver does not say what the worker holds, the card's room stands.
+#[cfg(feature = "device")]
+fn room_now(ceiling: u64, free: u64, total: u64) -> u64 {
+    let card = room_under(ceiling, free, total);
+    match (crate::device::card::budget(), crate::device::own::used_now()) {
+        (Some(budget), Some(used)) => card.min(within_budget(budget, used)),
+        _ => card,
+    }
+}
+
+/// Of a worker's `budget`, what is left past the `used` bytes it holds of
+/// the device and the safety floor.
+#[must_use]
+pub fn within_budget(budget: u64, used: u64) -> u64 {
+    budget
+        .saturating_sub(used)
+        .saturating_sub(SAFETY_FLOOR_BYTES)
+}
+
 #[must_use]
 pub const fn pages_for_bytes(bytes: u64) -> u64 {
     bytes.div_ceil(LOGICAL_PAGE_BYTES)
@@ -160,7 +185,7 @@ impl PhysicalPool {
             if !beside.said.is_empty() {
                 tracing::info!("outside the pool, {}", beside.said);
             }
-            let budget = room_under(ceiling, free, total);
+            let budget = room_now(ceiling, free, total);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -229,7 +254,7 @@ impl PhysicalPool {
         #[cfg(feature = "device")]
         {
             let (free, total) = crate::device::card::memory()?;
-            Ok(room_under(self.ceiling, free, total).saturating_sub(reserve))
+            Ok(room_now(self.ceiling, free, total).saturating_sub(reserve))
         }
         #[cfg(not(feature = "device"))]
         {
@@ -292,7 +317,7 @@ impl PhysicalPool {
         #[cfg(feature = "device")]
         {
             let (free, total) = crate::device::card::memory()?;
-            let available = room_under(self.ceiling, free, total) / LOGICAL_PAGE_BYTES;
+            let available = room_now(self.ceiling, free, total) / LOGICAL_PAGE_BYTES;
             self.recalibrate_to(available);
         }
         Ok(())

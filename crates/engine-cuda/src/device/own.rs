@@ -37,6 +37,14 @@ pub fn before_loads(latch: bool) -> Result<u64> {
     Ok(bytes)
 }
 
+/// What this process holds of the device its thread is bound to now, as the
+/// driver counts it ([`held`]): its context, its driver's queues and module
+/// images, every allocation; `None` where the driver does not say.
+#[must_use]
+pub fn used_now() -> Option<u64> {
+    held(bound().ok()?)
+}
+
 /// The device this thread is bound to.
 fn bound() -> Result<i32> {
     #[cfg(feature = "device")]

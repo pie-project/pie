@@ -1519,6 +1519,7 @@ impl Shell {
             arm_cold: false,
             arm_rs: crate::record::RsBody::Folds,
             arm_deferred: false,
+            outside: None,
             preseated_as: None,
             card: (0, 0),
             held_for_fires: 0,
