@@ -25,4 +25,7 @@ pub use encode::{
 };
 pub use error::Error;
 pub use sources::{CENSUS, SPIRV, WGSL, key, spirv, wgsl};
-pub use tensor::{Bank, Comm, KvPool, RaggedTensor, Ring, SEGMENTS, Segments, Tensor, words_of};
+pub use tensor::{
+    Bank, Comm, KvPool, RaggedTensor, Ring, SEGMENT_UNITS, SEGMENT_WORDS, SEGMENTS, Segments, Tensor,
+    segment_word, unit_id, words_of,
+};

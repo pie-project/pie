@@ -28,14 +28,13 @@ PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 2)
 static const uint LAYER_INTS = 9u;
 
 struct Params {
-    uint seg_words;
     uint pieces;
     uint slot_stride;
     uint layers;
 };
 PIE_PARAMS(6, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
-PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_READ(uint)
+PIE_POOL_WRITE(uint)
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -62,7 +61,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     int dst = jobs[at + 2u];
     uint dst_row = uint(jobs[at + 3u]);
     uint origin = uint(jobs[l + (values ? 1u : 0u)]);
-    uint src = origin + src_unit * page_stride + src_row * row_words + i;
+    uint src = origin + pie_unit_at(src_unit, page_stride) + src_row * row_words + i;
     uint to;
     if (dst < 0) {
         uint lane = uint(-1 - dst);
@@ -72,10 +71,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
         }
         dst_row = dst_row % ring_rows;
         uint piece = uint(jobs[l + (values ? 5u : 4u)]);
-        uint rec = uint(lanes[at_lane + 6u + piece]) * params.slot_stride;
+        uint rec = pie_unit_at(uint(lanes[at_lane + 6u + piece]), params.slot_stride);
         to = rec + uint(jobs[l + (values ? 7u : 6u)]) + dst_row * row_words + i;
     } else {
-        to = origin + uint(dst) * page_stride + dst_row * row_words + i;
+        to = origin + pie_unit_at(uint(dst), page_stride) + dst_row * row_words + i;
     }
     pie_pool_set(to, pie_pool_get(src));
 }

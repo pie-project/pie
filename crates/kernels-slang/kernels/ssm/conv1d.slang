@@ -61,7 +61,6 @@ PIE_POOL_SEGMENTS(RWStructuredBuffer, float, SEGMENTS_AT)
 #define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
-    uint seg_words;
     uint state_origin;
     uint slot_stride;
     uint pieces;
@@ -94,8 +93,8 @@ int csr(uint i) {
     return indptr[uint(PIE_FIRE(indptr_at)) + i];
 }
 #endif
-PIE_POOL_READ(float, params.seg_words)
-PIE_POOL_WRITE(float, params.seg_words)
+PIE_POOL_READ(float)
+PIE_POOL_WRITE(float)
 PIE_POOL_VIEW(state, float, params.state_origin)
 PIE_STATE_PIECES
 #if defined(PIE_SNAPS)
@@ -112,7 +111,7 @@ struct Column {
 
 Column column(uint at, uint chans, uint c) {
     Column out;
-    out.slab = pie_piece_unit(at, c) * params.slot_stride;
+    out.slab = pie_unit_at(pie_piece_unit(at, c), params.slot_stride);
     out.pitch = min(params.piece_atoms, chans);
     out.col = c % params.piece_atoms;
     return out;
@@ -185,7 +184,7 @@ void walk(Column slab, int begin, int span, int keep, uint chans, uint c, int sn
             break;
         }
         Column into;
-        into.slab = pie_snap_unit(uint(snap), n, c) * params.slot_stride;
+        into.slab = pie_unit_at(pie_snap_unit(uint(snap), n, c), params.slot_stride);
         into.pitch = slab.pitch;
         into.col = slab.col;
         for (int s = 0; s < hist; s++) {

@@ -82,7 +82,6 @@ fn append(
                 pool.page_size.arg(),
                 stated(op, heads)?.arg(),
                 0_i32.arg(),
-                pool.pool.words.arg(),
                 pool.origin[0].arg(),
                 pool.origin[1].arg(),
                 pool.page_stride[0].arg(),

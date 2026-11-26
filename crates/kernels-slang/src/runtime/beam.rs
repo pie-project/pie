@@ -100,7 +100,7 @@ pub struct Records {
 }
 
 impl Records {
-    fn args(self) -> [crate::encode::ArgValue; 9] {
+    fn args(self) -> [crate::encode::ArgValue; 8] {
         let seg = self.pool.args(true);
         [
             self.store.arg_mut(),
@@ -108,7 +108,6 @@ impl Records {
             seg[1],
             seg[2],
             seg[3],
-            self.pool.words.arg(),
             self.runs.arg(),
             self.count.arg(),
             self.planes.arg(),

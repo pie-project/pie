@@ -306,7 +306,6 @@ pub fn kv_append(
             &[kv_c.arg(), k_pe.arg(), write_page.arg(), write_offset.arg()][..],
             &pool.pool.args(true),
             &[
-                pool.pool.words.arg(),
                 pool.origin[0].arg(),
                 pool.origin[values].arg(),
                 pool.page_stride[0].arg(),
@@ -380,7 +379,6 @@ fn flash(
         request_of_token.arg(),
         pool.page_indices.arg(),
         pool.page_indptr.arg(),
-        pool.pool.words.arg(),
         pool.origin[0].arg(),
         pool.origin[values].arg(),
         pool.page_stride[0].arg(),

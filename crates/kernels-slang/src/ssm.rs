@@ -108,14 +108,13 @@ impl StatePool {
         }
     }
 
-    /// The pool's four segment bindings, then its scalars (segment words,
-    /// origin, slot stride): what a state kernel takes after its own
+    /// The pool's four segment bindings, then its scalars (origin, slot
+    /// stride): what a state kernel takes after its own
     /// buffers; [`StatePool::piece_args`] adds the pieces.
     #[must_use]
     pub fn args(&self, mutable: bool) -> Vec<ArgValue> {
         let mut args = self.pool.args(mutable).to_vec();
         args.extend([
-            self.pool.words.arg(),
             self.origin.arg(),
             self.slot_stride.arg(),
         ]);

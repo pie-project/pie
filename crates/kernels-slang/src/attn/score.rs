@@ -287,7 +287,6 @@ pub fn capture(
 
     let scalars = |into: bool, tile: u32| -> Result<Vec<ArgValue>, Error> {
         Ok(vec![
-            pool.pool.words.arg(),
             pool.origin[0].arg(),
             pool.page_stride[0].arg(),
             stated(OP, page_size)?.arg(),

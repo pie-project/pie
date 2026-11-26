@@ -273,7 +273,6 @@ fn args(
     }
     args.extend(pool.pool.args(false));
     args.extend([
-        pool.pool.words.arg(),
         pool.origin[0].arg(),
         pool.origin[1].arg(),
         pool.page_stride[0].arg(),

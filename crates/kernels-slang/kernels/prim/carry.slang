@@ -20,9 +20,9 @@
 //   commit  how many rows of its run (carried, then own) the state is
 //           committed at
 //
-// A page is a slot of the pool's rs list: plane `p` of token `t` lies at
-// virtual word `page * stride_words + plane_at + (t % page_tokens) *
-// plane_row` (`prim/pool.slang`). Needs `carry` (an int buffer), the pool's
+// A page is a slot of the pool's rs list, a unit id: plane `p` of token `t`
+// lies at word address `pie_unit_at(page, stride_words) + plane_at + (t %
+// page_tokens) * plane_row` (`prim/pool.slang`). Needs `carry` (an int buffer), the pool's
 // `pie_pool_get` and `params.page_tokens`, `params.stride_words` declared
 // before.
 //
@@ -32,7 +32,7 @@
 
 #define PIE_CARRY_HEADER 5u
 
-// Virtual word `v` of the pool: an includer whose pool reads vectors states
+// Word address `v` of the pool: an includer whose pool reads vectors states
 // its own word read.
 #ifndef PIE_CARRY_POOL_WORD
 #define PIE_CARRY_POOL_WORD(v) pie_pool_get(v)
@@ -87,7 +87,7 @@ uint carry_page(CarryLane l, uint t) {
     return PIE_CARRY_POOL_WORD(bases + (sigma - base) / params.page_tokens);
 }
 
-// The virtual word buffer token `t`'s row of a plane starts at.
+// The word address buffer token `t`'s row of a plane starts at.
 uint carry_word(CarryLane l, uint t, uint plane_at, uint plane_row) {
-    return carry_page(l, t) * params.stride_words + plane_at + (t % params.page_tokens) * plane_row;
+    return pie_unit_at(carry_page(l, t), params.stride_words) + plane_at + (t % params.page_tokens) * plane_row;
 }

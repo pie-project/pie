@@ -46,7 +46,6 @@
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint4, 7)
 
 struct Params {
-    uint seg_words;
     uint state_origin;
     uint slot_stride;
     uint pieces;
@@ -72,17 +71,17 @@ struct Params {
 };
 PIE_PARAMS_FIRED(11, Params, params);
 
-PIE_POOL_READ(uint4, params.seg_words / 4u)
+PIE_POOL_READ(uint4)
 PIE_STATE_PIECES
 
-// Virtual word `v` of the pool.
+// Word address `v` of the pool.
 uint pool_word(uint v) {
-    return pie_pool_get(v >> 2)[v & 3u];
+    return pie_pool_get(pie_pool_quarter(v))[v & 3u];
 }
 
 void pool_set_word(uint v, uint x) {
     uint seg, at;
-    pie_pool_find(v >> 2, seg, at);
+    pie_pool_find(pie_pool_quarter(v), seg, at);
 #define GDN_WORD_SET(buf_) buf_[at][v & 3u] = x;
     PIE_POOL_BRANCH(seg, GDN_WORD_SET)
 }
@@ -166,7 +165,7 @@ struct Staged {
 void resolve(CarryLane cl, uint base, uint rows, uint tid) {
     if (tid < rows) {
         uint t = carry_tok(cl, base + tid);
-        spage[tid] = carry_page(cl, t) * params.stride_words;
+        spage[tid] = pie_unit_at(carry_page(cl, t), params.stride_words);
         stok[tid] = t % params.page_tokens;
     }
 }
@@ -260,7 +259,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint seg = 0u;
     uint cell = 0u;
     if (tid < dv) {
-        pie_pool_find((params.state_origin + pie_state_atom(lane, hv, dv * dk) + tid * dk) / 4u, seg, cell);
+        pie_pool_find(pie_pool_quarter(params.state_origin + pie_state_atom(lane, hv, dv * dk) + tid * dk), seg, cell);
 #define GDN_CARRIED_LOAD(buf_) \
         [ForceUnroll] for (uint m = 0u; m < uint(PIE_DK) / 4u; m++) { \
             uint4 v = buf_[cell + m]; \

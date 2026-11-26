@@ -187,7 +187,6 @@ pub fn block_mean(
             keys.pool.args(false)[1],
             keys.pool.args(false)[2],
             keys.pool.args(false)[3],
-            keys.pool.words.arg(),
             keys.origin[0].arg(),
             keys.page_stride[0].arg(),
             stated(OP, head_dim)?.arg(),
@@ -280,7 +279,6 @@ pub fn topk(
             ][..],
             &keys.pool.args(false),
             &[
-                keys.pool.words.arg(),
                 keys.origin[0].arg(),
                 keys.page_stride[0].arg(),
                 stated(OP, heads)?.arg(),

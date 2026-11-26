@@ -24,7 +24,6 @@
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 1)
 
 struct Params {
-    uint seg_words;
     // The first record's word in the store, and the records.
     uint runs;
     uint count;
@@ -32,8 +31,8 @@ struct Params {
     uint planes;
 };
 PIE_PARAMS(5, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
-PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_READ(uint)
+PIE_POOL_WRITE(uint)
 
 #define PIE_PAGES_PAST_RESERVE 1u
 #define PIE_PAGES_SHORT 2u
@@ -513,8 +512,8 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     }
     const uint offset = store[params.planes + 2u * group.y];
     const uint cell = store[params.planes + 2u * group.y + 1u];
-    const uint from = store[ids + src] * unit + offset + k * cell;
-    const uint to = store[ids + dst] * unit + offset + k * cell;
+    const uint from = pie_unit_at(store[ids + src], unit) + offset + k * cell;
+    const uint to = pie_unit_at(store[ids + dst], unit) + offset + k * cell;
     for (uint at = local.x; at < cell; at += PIE_GROUP_X) {
         pie_pool_set(to + at, pie_pool_get(from + at));
     }
@@ -597,8 +596,8 @@ void main(uint3 local : SV_GroupThreadID, uint3 group : SV_GroupID) {
     const uint cell = store[params.planes + 2u * group.y + 1u];
     const uint fe = (from_slot - base) / rows_a_page;
     const uint te = (to_slot - base) / rows_a_page;
-    const uint from = pie_pool_get(bases + fe) * unit + offset + ((from_slot - base) % rows_a_page) * cell;
-    const uint to = pie_pool_get(bases + te) * unit + offset + ((to_slot - base) % rows_a_page) * cell;
+    const uint from = pie_unit_at(pie_pool_get(bases + fe), unit) + offset + ((from_slot - base) % rows_a_page) * cell;
+    const uint to = pie_unit_at(pie_pool_get(bases + te), unit) + offset + ((to_slot - base) % rows_a_page) * cell;
     for (uint at = local.x; at < cell; at += PIE_GROUP_X) {
         pie_pool_set(to + at, pie_pool_get(from + at));
     }

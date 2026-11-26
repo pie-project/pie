@@ -117,7 +117,6 @@ pub fn embed_tabled(
                 stated(OP, y.width)?.arg(),
                 stated(OP, vocab)?.arg(),
                 table.block_rows.arg(),
-                table.pool.words.arg(),
                 table.unit_words.arg(),
                 table.origin.arg(),
                 table.atom_words.arg(),

@@ -46,7 +46,6 @@ struct Params {
     int experts_per_token;
 #endif
 #if defined(PIE_TABLED)
-    uint seg_words;
     uint unit_words;
     uint atom_words;
     uint atom_first;
@@ -77,7 +76,7 @@ float combined(uint i) {
         int expert = expert_ids[base + e];
         if (expert >= 0) {
 #if defined(PIE_TABLED)
-            pie_xt_at(uint(expert), params.atom_first, params.seg_words, params.unit_words,
+            pie_xt_at(uint(expert), params.atom_first, params.unit_words,
                       params.atom_words);
             acc += expert_weights[base + e] * pie_xt_bf16(params.origin, c);
 #else

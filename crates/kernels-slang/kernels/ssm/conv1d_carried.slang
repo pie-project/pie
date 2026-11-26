@@ -25,7 +25,6 @@
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 5)
 
 struct Params {
-    uint seg_words;
     uint state_origin;
     uint slot_stride;
     uint pieces;
@@ -46,8 +45,8 @@ struct Params {
 };
 PIE_PARAMS_FIRED(9, Params, params);
 
-PIE_POOL_READ(uint, params.seg_words)
-PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_READ(uint)
+PIE_POOL_WRITE(uint)
 PIE_STATE_PIECES
 
 #include "prim/carry.slang"
@@ -90,7 +89,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     uint first = 0u;
     float2 past[HIST_MAX];
     if (active && !none) {
-        uint slab = pie_piece_unit(lane, c) * params.slot_stride;
+        uint slab = pie_unit_at(pie_piece_unit(lane, c), params.slot_stride);
         pie_pool_find(params.state_origin + slab, seg, first);
 #define CONV_CARRIED_LOAD(buf_) \
         for (int s = 0; s < hist; s++) { \

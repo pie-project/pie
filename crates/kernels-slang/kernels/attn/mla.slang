@@ -100,7 +100,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 4)
 
 struct Params {
-    uint seg_words;
     uint ckv_origin;
     uint kpe_origin;
     uint ckv_stride;
@@ -111,8 +110,8 @@ struct Params {
     int rows;
 };
 PIE_PARAMS(8, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
-PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_READ(uint)
+PIE_POOL_WRITE(uint)
 PIE_POOL_VIEW(ckv_pages, uint, params.ckv_origin)
 PIE_POOL_VIEW(kpe_pages, uint, params.kpe_origin)
 
@@ -130,10 +129,10 @@ void main(uint3 gid : SV_DispatchThreadID) {
         return;
     }
     if (d < params.kv_lora) {
-        ckv_pages[uint(page) * params.ckv_stride + ((uint(off) * uint(params.kv_lora) + uint(d)) >> 1)] = kv_c[(row * uint(params.kv_lora) + uint(d)) >> 1];
+        ckv_pages[pie_unit_at(uint(page), params.ckv_stride) + ((uint(off) * uint(params.kv_lora) + uint(d)) >> 1)] = kv_c[(row * uint(params.kv_lora) + uint(d)) >> 1];
     }
     if (d < params.rope) {
-        kpe_pages[uint(page) * params.kpe_stride + ((uint(off) * uint(params.rope) + uint(d)) >> 1)] = k_pe[(row * uint(params.rope) + uint(d)) >> 1];
+        kpe_pages[pie_unit_at(uint(page), params.kpe_stride) + ((uint(off) * uint(params.rope) + uint(d)) >> 1)] = k_pe[(row * uint(params.rope) + uint(d)) >> 1];
     }
 }
 
@@ -235,7 +234,6 @@ PIE_POOL_SEGMENTS(StructuredBuffer, uint, MLA_SEGMENTS_AT)
 #define PIE_PARAMS_AT (MLA_SEGMENTS_AT + 4)
 
 struct Params {
-    uint seg_words;
     uint ckv_origin;
     uint kpe_origin;
     uint ckv_stride;
@@ -250,7 +248,7 @@ struct Params {
 #endif
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_READ(uint)
 PIE_POOL_VIEW_RO(ckv_pages, uint, params.ckv_origin)
 PIE_POOL_VIEW_RO(kpe_pages, uint, params.kpe_origin)
 
@@ -335,8 +333,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (live) {
             uint page = kv_page_indices[page_base + uint(j / params.page_size)];
             uint tok = uint(j % params.page_size);
-            uint ckv_j = page * params.ckv_stride + ((tok * ckv) >> 1);
-            uint kpe_j = page * params.kpe_stride + ((tok * kpe) >> 1);
+            uint ckv_j = pie_unit_at(page, params.ckv_stride) + ((tok * ckv) >> 1);
+            uint kpe_j = pie_unit_at(page, params.kpe_stride) + ((tok * kpe) >> 1);
             for (uint p = 0u; p < uint(MAX_CKV_PAIRS); p++) {
                 if (p < pairs) {
                     kv[p] = word_pair(ckv_pages[ckv_j + lane + p * uint(MLA_LANES)]);

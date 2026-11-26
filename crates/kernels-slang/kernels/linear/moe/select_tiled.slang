@@ -47,7 +47,6 @@ PIE_EXPERT_TABLE(3)
 struct Params {
     int k;
     int n;
-    uint seg_words;
     uint unit_words;
     uint atom_words;
     uint atom_first;
@@ -109,7 +108,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (expert < 0) return;
     uint e = uint(expert);
 #if defined(PIE_TABLED)
-    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    pie_xt_at(e, params.atom_first, params.unit_words, params.atom_words);
     if (params.count != 0u && group.x == 0u && local.x == 0u && local.y == 0u) {
         pie_xt_count(e, params.atom_first);
     }
@@ -255,7 +254,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (expert < 0) return;
     uint e = uint(expert);
 #if defined(PIE_TABLED)
-    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    pie_xt_at(e, params.atom_first, params.unit_words, params.atom_words);
     if (params.count != 0u && group.x == 0u && local.x == 0u && local.y == 0u) {
         pie_xt_count(e, params.atom_first);
     }
@@ -374,7 +373,6 @@ PIE_EXPERT_TABLE(3)
 struct Params {
     int k;
     int n;
-    uint seg_words;
     uint unit_words;
     uint atom_words;
     uint atom_first;
@@ -420,7 +418,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     uint e = uint(expert);
 #if defined(PIE_TABLED)
-    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    pie_xt_at(e, params.atom_first, params.unit_words, params.atom_words);
     if (params.count != 0u && group.x == 0u && flat == 0u) {
         pie_xt_count(e, params.atom_first);
     }

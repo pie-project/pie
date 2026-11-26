@@ -104,19 +104,19 @@ impl Heads {
 }
 
 /// Refuses a pool a register-state kernel cannot read its state rows from
-/// four words a vector: its segments, the state's origin and its slot stride
-/// whole vectors.
+/// four words a vector: the state's origin and its slot stride whole
+/// vectors (a segment's words count from its own first).
 fn vectors(op: &'static str, state: &StatePool) -> Result<(), Error> {
-    if [state.pool.words, state.origin, state.slot_stride]
+    if [state.origin, state.slot_stride]
         .iter()
         .any(|words| !words.is_multiple_of(4))
     {
         return Err(refuse(
             op,
             format!(
-                "the state pool's segments of {} words, origin {} and slot stride {} are not \
-                 whole vectors of four words, which a register-state scan reads its state rows by",
-                state.pool.words, state.origin, state.slot_stride
+                "the state pool's origin {} and slot stride {} are not whole vectors of four \
+                 words, which a register-state scan reads its state rows by",
+                state.origin, state.slot_stride
             ),
         ));
     }

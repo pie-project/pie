@@ -214,7 +214,6 @@ PIE_POOL_SEGMENTS(StructuredBuffer, SDPA_KV, SDPA_POOL_AT)
 #define PIE_PARAMS_AT (SDPA_POOL_AT + 4)
 
 struct Params {
-    uint seg_words;
     uint k_origin;
     uint v_origin;
     uint page_stride;
@@ -261,7 +260,7 @@ struct Params {
 #endif
 };
 PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
-PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
+PIE_POOL_READ(SDPA_KV)
 
 // The window's first rows, read from the fire block once at the top of
 // `main` (`HOIST_FIRE`), ahead of the address math they feed.
@@ -279,14 +278,6 @@ uint fire_row(uint row) {
 // The tables' row a window's row `row` is.
 uint table_row(uint row) {
     return fired_table0 + row;
-}
-
-// The bf16 element key `kp` of request `req` starts at in its plane: its
-// page, `page_stride` words a page, then the token's row in it.
-uint page_row(int req, int kp) {
-    uint phys = kv_page_indices[kv_page_indptr[req] + uint(kp / params.page_size)];
-    return phys * (2u * params.page_stride)
-        + uint(kp % params.page_size) * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM);
 }
 
 // Where a row's keys lie: its lane's buffer base and first row of the
@@ -316,8 +307,8 @@ Keys keys_of(int req) {
     at.first = ring_lanes[lane + 2u];
     at.shift = ring_lanes[lane + 4u];
     at.run_at = ring_lanes[lane + 5u];
-    uint rec_k = uint(ring_lanes[lane + 6u + params.ring_piece]) * params.slot_stride;
-    uint rec_v = uint(ring_lanes[lane + 6u + params.ring_piece_v]) * params.slot_stride;
+    uint rec_k = pie_unit_at(uint(ring_lanes[lane + 6u + params.ring_piece]), params.slot_stride);
+    uint rec_v = pie_unit_at(uint(ring_lanes[lane + 6u + params.ring_piece_v]), params.slot_stride);
     at.ring_k = rec_k + params.ring_k;
     at.ring_v = rec_v + params.ring_v;
     int buffered = max(at.first - at.base + params.page_size - 1, 0) / params.page_size;
@@ -354,10 +345,9 @@ int key_page(Keys at, int kp, out uint row) {
 #endif
 }
 
-// The u32 word of the pool key `kp` of request `req` starts at, its key
-// then its value (the head's offset not added). Words, not bf16 elements:
-// a pool past 8 GiB (the fire's own slots lie at its top) passes a u32 of
-// elements.
+// The pool word address key `kp` of request `req` starts at, its key then
+// its value (the head's offset not added): words, which a bf16 reading
+// doubles once it has the segment (`ring_find`).
 void key_at(int req, Keys at, int kp, out uint k_w, out uint v_w) {
     uint row;
     int page = key_page(at, kp, row);
@@ -368,29 +358,19 @@ void key_at(int req, Keys at, int kp, out uint k_w, out uint v_w) {
         return;
     }
     uint phys = kv_page_indices[kv_page_indptr[req] + uint(page)];
-    uint w = phys * params.page_stride + cell;
+    uint w = pie_unit_at(phys, params.page_stride) + cell;
     k_w = params.k_origin + w;
     v_w = params.v_origin + w;
 }
 
-// The segment pool word `w` lies in and its index there as the kernel's
-// storage counts it (`SDPA_KV_SCALE` a word): `pie_pool_find` over words.
+// The segment pool word address `w` lies in and its index there as the
+// kernel's storage counts it (`SDPA_KV_SCALE` a word).
 void ring_find(uint w, out uint seg, out uint local) {
-    uint s = params.seg_words;
-    seg = 0u;
-    if (w >= s) {
-        w -= s;
-        seg = 1u;
-        if (w >= s) {
-            w -= s;
-            seg = 2u;
-            if (w >= s) {
-                w -= s;
-                seg = 3u;
-            }
-        }
-    }
-    local = SDPA_KV_SCALE * w;
+#if defined(SDPA_NARROW_STORAGE)
+    pie_pool_half(w, seg, local);
+#else
+    pie_pool_find(w, seg, local);
+#endif
 }
 
 // Row `row`'s boundary, read once a row: `MASK_NONE` where it states no mask.
@@ -531,8 +511,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // The lane's ring lies in its record's one chunk, so in one segment:
     // found once, its rows' words then past its first.
     uint ring_k_seg = 0u, ring_k_at = 0u, ring_v_seg = 0u, ring_v_at = 0u;
-    pie_pool_at(SDPA_KV_SCALE * ring.ring_k, ring_k_seg, ring_k_at);
-    pie_pool_at(SDPA_KV_SCALE * ring.ring_v, ring_v_seg, ring_v_at);
+    pie_pool_at(ring.ring_k, ring_k_seg, ring_k_at);
+    pie_pool_at(ring.ring_v, ring_v_seg, ring_v_at);
 #endif
     for (int kp = first_key; kp <= last; kp++) {
         bool take = live && keeps(row, origin, kp, q_pos, start);
@@ -549,13 +529,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 // next table entry.
                 uint cell_words = (in_page * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)) >> 1;
 #if defined(PIE_ONE_SEGMENT)
-                k_page = SDPA_KV_SCALE * (ring.ring_k + cell_words);
-                v_page = SDPA_KV_SCALE * (ring.ring_v + cell_words);
+                k_page = ring.ring_k + cell_words;
+                v_page = ring.ring_v + cell_words;
 #else
                 k_seg = ring_k_seg;
                 v_seg = ring_v_seg;
-                k_page = ring_k_at + SDPA_KV_SCALE * cell_words;
-                v_page = ring_v_at + SDPA_KV_SCALE * cell_words;
+                k_page = ring_k_at + cell_words;
+                v_page = ring_v_at + cell_words;
 #endif
                 page_at = -1;
                 in_page = 0u;
@@ -566,15 +546,15 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
                 uint phys = kv_page_indices[kv_page_indptr[req] + uint(page)];
 #if defined(PIE_ONE_SEGMENT)
-                k_page = SDPA_KV_SCALE * params.k_origin + phys * params.page_stride;
-                v_page = SDPA_KV_SCALE * params.v_origin + phys * params.page_stride;
+                k_page = params.k_origin + pie_unit_at(phys, params.page_stride);
+                v_page = params.v_origin + pie_unit_at(phys, params.page_stride);
 #else
-                pie_pool_at(SDPA_KV_SCALE * params.k_origin + phys * params.page_stride, k_seg, k_page);
-                pie_pool_at(SDPA_KV_SCALE * params.v_origin + phys * params.page_stride, v_seg, v_page);
+                pie_pool_at(params.k_origin + pie_unit_at(phys, params.page_stride), k_seg, k_page);
+                pie_pool_at(params.v_origin + pie_unit_at(phys, params.page_stride), v_seg, v_page);
 #endif
                 page_at = page;
             }
-            // The token's row in the page, then the head's: `page_row`'s
+            // The token's row in the page, then the head's: the key's
             // words past the page's first.
 #if defined(PIE_RING)
             uint row_words = (in_page * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)
@@ -692,9 +672,7 @@ float bf16_of(uint16_t h) {
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint subgroups) {
     int req = req_of_token[table_row(row)];
-#if defined(PIE_RING)
     Keys ring = keys_of(req);
-#endif
     uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
@@ -751,16 +729,10 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
                 continue;
             }
             uint k_seg, k_at, v_seg, v_at;
-#if defined(PIE_RING)
             uint k_w, v_w;
             key_at(req, ring, kp, k_w, v_w);
             ring_find(k_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), k_seg, k_at);
             ring_find(v_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), v_seg, v_at);
-#else
-            uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
-            pie_pool_find(SDPA_KV_SCALE * params.k_origin + base, k_seg, k_at);
-            pie_pool_find(SDPA_KV_SCALE * params.v_origin + base, v_seg, v_at);
-#endif
             // The row's elements first, from its one segment; then the sum
             // as the pool view read it.
             uint16_t kh[DPL];
@@ -917,9 +889,7 @@ groupshared int sdpa_start;
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint walkers) {
     int req = req_of_token[table_row(row)];
-#if defined(PIE_RING)
     Keys ring = keys_of(req);
-#endif
     uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
@@ -970,20 +940,13 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
         int kp = k_lo + n;
         bool take = n < steps && keeps(row, origin, kp, q_pos, start);
 #endif
-        uint base = 0u;
         float partial = 0.0;
         uint k_seg = 0u, k_at = 0u, v_seg = 0u, v_at = 0u;
         if (take) {
-#if defined(PIE_RING)
             uint k_w, v_w;
             key_at(req, ring, kp, k_w, v_w);
             ring_find(k_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), k_seg, k_at);
             ring_find(v_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), v_seg, v_at);
-#else
-            base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
-            pie_pool_find(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);
-            pie_pool_find(SDPA_KV_SCALE * params.v_origin + (base >> 1), v_seg, v_at);
-#endif
             // The row's words first, from its one segment; then the sum as
             // the pool view read it.
             uint kw[PPL];

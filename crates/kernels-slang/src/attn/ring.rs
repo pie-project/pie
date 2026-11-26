@@ -86,7 +86,6 @@ pub fn fold(ctx: &Ctx<'_>, layers: &[&KvPool], jobs: Tensor, most: u32) -> Resul
             &[jobs.arg(), ring.lanes.arg()][..],
             &first.pool.args(true),
             &[
-                first.pool.words.arg(),
                 ring.pieces.arg(),
                 ring.slot_stride.arg(),
                 count.arg(),

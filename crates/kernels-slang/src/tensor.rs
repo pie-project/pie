@@ -62,10 +62,33 @@ pub struct RaggedTensor {
 /// (`kernels/prim/pool.slang`).
 pub const SEGMENTS: usize = 4;
 
-/// A chunk pool as a kernel binds it: up to [`SEGMENTS`] buffers, each
-/// `words` u32 words of one virtual address space (segment `s` from word
-/// `s * words`), a chunk never straddling two. A segment the pool does not
-/// have is [`crate::ABSENT`].
+/// The most u32 words one segment holds as kernels address it: a word's
+/// address carries its segment in bits 30-31 and its index there below
+/// (`kernels/prim/pool.slang`), so a segment of up to 4 GiB.
+pub const SEGMENT_WORDS: u64 = 1 << 30;
+
+/// The most units of a shape one segment holds as a unit id names them: a
+/// unit id carries its segment in bits 27-30 and its unit there below, bit
+/// 31 clear (`kernels/prim/pool.slang`).
+pub const SEGMENT_UNITS: u64 = 1 << 27;
+
+/// The address kernels read word `word` of segment `segment` by.
+#[must_use]
+pub const fn segment_word(segment: u32, word: u32) -> u32 {
+    (segment << 30) | word
+}
+
+/// The unit id kernels name unit `unit` of segment `segment` by.
+#[must_use]
+pub const fn unit_id(segment: u32, unit: u32) -> u32 {
+    (segment << 27) | unit
+}
+
+/// A chunk pool as a kernel binds it: up to [`SEGMENTS`] buffers of
+/// `words` u32 words each, no more than [`SEGMENT_WORDS`], a chunk never
+/// straddling two. A kernel addresses a word by its segment and its index
+/// there ([`segment_word`]); a slot by a unit id ([`unit_id`]). A segment
+/// the pool does not have is [`crate::ABSENT`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Segments {
     pub bufs: [u32; SEGMENTS],
@@ -207,7 +230,9 @@ impl KvPool {
                 stride(keys, seq_stride),
                 stride(values, u64::from(values.width)),
             ],
-            origin: [0, if shared { 0 } else { words }],
+            // Separate planes: the values in segment 1, their origin
+            // the address of its first word.
+            origin: [0, if shared { 0 } else { segment_word(1, 0) }],
             ring: None,
         }
     }

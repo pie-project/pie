@@ -48,7 +48,6 @@ PIE_POOL_SEGMENTS(RWStructuredBuffer, int, NGRAM_SEGMENTS_AT)
 #define PIE_PARAMS_AT (NGRAM_SEGMENTS_AT + 4)
 
 struct Params {
-    uint seg_words;
     uint state_origin;
     uint slot_stride;
     uint pieces;
@@ -64,8 +63,8 @@ struct Params {
     int lanes;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
-PIE_POOL_READ(int, params.seg_words)
-PIE_POOL_WRITE(int, params.seg_words)
+PIE_POOL_READ(int)
+PIE_POOL_WRITE(int)
 PIE_POOL_VIEW(state, int, params.state_origin)
 PIE_STATE_PIECES
 
@@ -116,7 +115,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
     int span = params.ngram - 1;
 #if defined(PIE_UPDATE)
-    uint slab = pie_piece_unit(r, 0u) * params.slot_stride;
+    uint slab = pie_unit_at(pie_piece_unit(r, 0u), params.slot_stride);
     int window[MAX_NGRAM] = { 0, 0, 0, 0 };
     int fresh = ids[r];
     window[0] = fresh;
@@ -140,7 +139,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (rows <= 0 || pie_state_none(lane)) {
         return;
     }
-    uint slab = pie_piece_unit(lane, 0u) * params.slot_stride;
+    uint slab = pie_unit_at(pie_piece_unit(lane, 0u), params.slot_stride);
     for (int t = replayed; t < rows; t++) {
         int window[MAX_NGRAM] = { 0, 0, 0, 0 };
         window[0] = ids[uint(begin + t)];
@@ -168,7 +167,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     if (rows <= 0) {
         return;
     }
-    uint slab = pie_piece_unit(uint(begin), 0u) * params.slot_stride;
+    uint slab = pie_unit_at(pie_piece_unit(uint(begin), 0u), params.slot_stride);
     for (int t = 0; t < rows; t++) {
         int window[MAX_NGRAM] = { 0, 0, 0, 0 };
         window[0] = ids[uint(begin + t)];

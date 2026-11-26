@@ -75,7 +75,6 @@ PIE_POOL_SEGMENTS(RWStructuredBuffer, float, SEGMENTS_AT)
 #define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
-    uint seg_words;
     uint state_origin;
     uint slot_stride;
     uint pieces;
@@ -108,8 +107,8 @@ int csr(uint i) {
     return indptr[uint(PIE_FIRE(indptr_at)) + i];
 }
 #endif
-PIE_POOL_READ(float, params.seg_words)
-PIE_POOL_WRITE(float, params.seg_words)
+PIE_POOL_READ(float)
+PIE_POOL_WRITE(float)
 PIE_POOL_VIEW(rstate, float, params.state_origin)
 PIE_STATE_PIECES
 #if defined(PIE_SNAPS)

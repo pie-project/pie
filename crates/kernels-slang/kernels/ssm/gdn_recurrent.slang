@@ -85,7 +85,6 @@ PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, SEGMENTS_AT)
 #define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
-    uint seg_words;
     uint state_origin;
     uint slot_stride;
     uint pieces;
@@ -135,17 +134,17 @@ int csr(uint i) {
 }
 #endif
 #if defined(PIE_DK_REG)
-PIE_POOL_READ(uint4, params.seg_words / 4u)
-// Virtual word `v` of the pool, set.
+PIE_POOL_READ(uint4)
+// Word address `v` of the pool, set.
 void pie_pool_set(uint v, uint x) {
     uint seg, at;
-    pie_pool_find(v >> 2, seg, at);
+    pie_pool_find(pie_pool_quarter(v), seg, at);
 #define GDN_WORD_SET(buf_) buf_[at][v & 3u] = x;
     PIE_POOL_BRANCH(seg, GDN_WORD_SET)
 }
 #else
-PIE_POOL_READ(uint, params.seg_words)
-PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_READ(uint)
+PIE_POOL_WRITE(uint)
 // The state from its origin on, as f32.
 struct rstate_pool_view {
     __subscript(uint i)->float {
@@ -159,10 +158,10 @@ static rstate_pool_view rstate;
 PIE_STATE_PIECES
 #if defined(PIE_COMMITTED)
 #if defined(PIE_DK_REG)
-#define PIE_CARRY_POOL_WORD(v) (pie_pool_get((v) >> 2)[(v) & 3u])
+#define PIE_CARRY_POOL_WORD(v) (pie_pool_get(pie_pool_quarter(v))[(v) & 3u])
 #endif
 #include "prim/carry.slang"
-// The virtual word the token's `u` lands at (its head's), `CARRY_NONE`
+// The word address the token's `u` lands at (its head's), `CARRY_NONE`
 // where it lands none.
 #define CARRY_NONE 0xffffffffu
 static uint u_into = CARRY_NONE;
@@ -307,7 +306,7 @@ void reg_load(uint tid, uint base) {
         return;
     }
     uint seg, at;
-    pie_pool_find((params.state_origin + base + tid * dk) / 4u, seg, at);
+    pie_pool_find(pie_pool_quarter(params.state_origin + base + tid * dk), seg, at);
 #define GDN_REG_LOAD(buf_) \
     [ForceUnroll] for (uint m = 0; m < uint(PIE_DK_REG) / 4u; m++) { \
         uint4 v = buf_[at + m]; \
@@ -323,7 +322,7 @@ void reg_store(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid < uint(params.v_dim)) {
         uint seg, at;
-        pie_pool_find((params.state_origin + base + tid * dk) / 4u, seg, at);
+        pie_pool_find(pie_pool_quarter(params.state_origin + base + tid * dk), seg, at);
 #define GDN_REG_STORE(buf_) \
         [ForceUnroll] for (uint m = 0; m < uint(PIE_DK_REG) / 4u; m++) { \
             buf_[at + m] = uint4(asuint(st[4u * m]), asuint(st[4u * m + 1u]), \

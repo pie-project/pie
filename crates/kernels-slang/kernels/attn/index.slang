@@ -127,7 +127,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
 PIE_POOL_SEGMENTS(StructuredBuffer, uint, 8)
 
 struct Params {
-    uint seg_words;
     uint k_origin;
     uint page_stride;
     int heads;
@@ -139,7 +138,7 @@ struct Params {
     int has_weights;
 };
 PIE_PARAMS(12, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_READ(uint)
 PIE_POOL_VIEW_RO(key_pages, uint, params.k_origin)
 
 groupshared float key_acc[PIE_GROUP_X];
@@ -177,12 +176,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (j < nkeys) {
             int cell = (j + 1) * stride - 1;
             uint page = kv_page_indices[pages_first + uint(cell / params.page_size)];
-            uint kj = page * (2u * params.page_stride) + uint(cell % params.page_size) * hd;
+            uint kj = pie_unit_at(page, params.page_stride) + ((uint(cell % params.page_size) * hd) >> 1);
             for (uint h = uint(hh); h < heads; h += uint(LANES_PER_KEY)) {
                 uint qh = qi + h * hd;
                 float d_ = 0.0;
                 for (uint d = 0u; d < hd; d += 2u) {
-                    d_ += dot(word_pair(idx_q[(qh + d) >> 1]), word_pair(key_pages[(kj + d) >> 1]));
+                    d_ += dot(word_pair(idx_q[(qh + d) >> 1]), word_pair(key_pages[kj + (d >> 1)]));
                 }
                 float weight = params.has_weights != 0 ? bf16_at(idx_w, wi + h) : 1.0;
                 acc += max(d_, 0.0) * weight;

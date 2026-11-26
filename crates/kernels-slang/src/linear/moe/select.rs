@@ -52,11 +52,10 @@ impl ExpertTable {
         out
     }
 
-    /// The scalars after a kernel's own: where the pool's segments split,
-    /// a unit's and an atom's words, the layer's first atom.
-    pub(crate) fn place(&self) -> [ArgValue; 4] {
+    /// The scalars after a kernel's own: a unit's and an atom's words, the
+    /// layer's first atom.
+    pub(crate) fn place(&self) -> [ArgValue; 3] {
         [
-            self.pool.words.arg(),
             self.unit_words.arg(),
             self.atom_words.arg(),
             self.atom_first.arg(),

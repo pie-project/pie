@@ -40,7 +40,6 @@ struct Params {
     int x_row_stride;
     int slots_per_row;
 #if defined(PIE_TABLED)
-    uint seg_words;
     uint unit_words;
     uint atom_words;
     uint atom_first;
@@ -188,7 +187,7 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     uint e = uint(expert);
     uint x_base = row * uint(params.x_row_stride) + slot * uint(params.x_slot_stride);
 #if defined(PIE_TABLED)
-    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    pie_xt_at(e, params.atom_first, params.unit_words, params.atom_words);
     if (params.count != 0u && block == 0u && lane == 0u && local_out == 0u) {
         pie_xt_count(e, params.atom_first);
     }
@@ -365,7 +364,7 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
     uint e = uint(max(expert, 0));
     uint x_base = row * uint(params.x_row_stride) + slot * uint(params.x_slot_stride);
 #if defined(PIE_TABLED)
-    pie_xt_at(e, params.atom_first, params.seg_words, params.unit_words, params.atom_words);
+    pie_xt_at(e, params.atom_first, params.unit_words, params.atom_words);
     if (routed && params.count != 0u && block == 0u && lane == 0u && local_out == 0u) {
         pie_xt_count(e, params.atom_first);
     }

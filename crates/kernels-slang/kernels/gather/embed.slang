@@ -109,14 +109,13 @@ struct Params {
     int hidden;
     int vocab;
     uint block_rows;
-    uint seg_words;
     uint unit_words;
     uint origin;
     uint atom_words;
     uint first;
 };
 PIE_PARAMS(10, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_READ(uint)
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
@@ -136,7 +135,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint unit = blocks[block];
     if (unit != NOT_HELD) {
         y[n * words + c] = pie_pool_get(
-            unit * params.unit_words + params.origin + (id % params.block_rows) * params.atom_words + c);
+            pie_unit_at(unit, params.unit_words) + params.origin + (id % params.block_rows) * params.atom_words + c);
     } else {
         uint at = staged[params.first + n];
         y[n * words + c] = at != NOT_HELD ? stage[at * words + c] : 0u;

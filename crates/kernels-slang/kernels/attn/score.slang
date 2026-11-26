@@ -90,7 +90,6 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 PIE_POOL_SEGMENTS(StructuredBuffer, uint, PIE_SEG_AT)
 
 struct Params {
-    uint seg_words;
     uint k_origin;
     uint page_stride;
     int page_size;
@@ -110,7 +109,7 @@ struct Params {
     int tile;
 };
 PIE_PARAMS(PIE_PARAMS_AT, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_READ(uint)
 
 #if defined(PIE_NORM)
 groupshared float score_q[PIE_HEAD_DIM_MAX];
@@ -156,10 +155,10 @@ void stage_q(int qi, int head, uint tid) {
 float key_dot(int j, uint kv_head, int page_first) {
     uint head_dim = uint(params.head_dim);
     uint page = kv_page_indices[uint(page_first + j / params.page_size)];
-    uint half_at = page * (2u * params.page_stride)
-        + (uint(j % params.page_size) * uint(params.kv_heads) + kv_head) * head_dim;
+    uint word_at = pie_unit_at(page, params.page_stride)
+        + (((uint(j % params.page_size) * uint(params.kv_heads) + kv_head) * head_dim) >> 1);
     uint seg, at;
-    pie_pool_find(params.k_origin + (half_at >> 1), seg, at);
+    pie_pool_find(params.k_origin + word_at, seg, at);
     float dot = 0.0;
     uint pairs = head_dim >> 1;
     // Eight words loaded before any is summed: a load at a time, each
@@ -300,10 +299,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 uint within = i % (kv_heads * pairs);
                 int j = first + int(k);
                 uint page = kv_page_indices[uint(page_first + j / params.page_size)];
-                uint half_at = page * (2u * params.page_stride)
-                    + uint(j % params.page_size) * kv_heads * head_dim;
+                uint word_at = pie_unit_at(page, params.page_stride)
+                    + ((uint(j % params.page_size) * kv_heads * head_dim) >> 1);
                 mass_rows[k * key_words + (within / pairs) * run + within % pairs] =
-                    pie_pool_get(params.k_origin + (half_at >> 1) + within);
+                    pie_pool_get(params.k_origin + word_at + within);
             }
             for (int w = 0; w < rows; w++) {
                 int qi = qo_hi - rows + w;

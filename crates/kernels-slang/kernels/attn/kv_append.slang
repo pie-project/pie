@@ -19,7 +19,6 @@ struct Params {
     int page_size;
     int n_kv_heads;
     int src_row_stride;
-    uint seg_words;
     uint k_origin;
     uint v_origin;
     uint k_page_stride;
@@ -30,8 +29,8 @@ struct Params {
     uint w0;
 };
 PIE_PARAMS_FIRED(8, Params, params);
-PIE_POOL_READ(uint, params.seg_words)
-PIE_POOL_WRITE(uint, params.seg_words)
+PIE_POOL_READ(uint)
+PIE_POOL_WRITE(uint)
 PIE_POOL_VIEW(k_pages, uint, params.k_origin)
 PIE_POOL_VIEW(v_pages, uint, params.v_origin)
 
@@ -51,8 +50,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint row = uint(params.n_kv_heads) * head_dim;
     uint dst = w_off[w] * row + h * head_dim + d;
     uint src = i * (params.src_row_stride > 0 ? uint(params.src_row_stride) : row) + h * head_dim + d;
-    k_pages[w_page[w] * params.k_page_stride + (dst >> 1)] = k_new[src >> 1];
-    v_pages[w_page[w] * params.v_page_stride + (dst >> 1)] = v_new[src >> 1];
+    k_pages[pie_unit_at(w_page[w], params.k_page_stride) + (dst >> 1)] = k_new[src >> 1];
+    v_pages[pie_unit_at(w_page[w], params.v_page_stride) + (dst >> 1)] = v_new[src >> 1];
 }
 
 // pie:instantiate attn_kv_append_bf16 PIE_GROUP_X=64
