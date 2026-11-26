@@ -582,10 +582,11 @@ impl Serve for Api {
             );
         }
         shell.shelf.derived = None;
-        shell.device().name_descriptor_sets();
         shell
             .device()
-            .seal_descriptor_pools(shell.readout.len() + 3)
+            .seal_descriptor_pools(shell.readout.len() + 3)?;
+        shell.device().name_descriptor_sets();
+        Ok(())
     }
 
     fn command_buffers(shell: &Shell<Api>) -> (u64, Option<u64>) {
