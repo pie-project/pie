@@ -25,9 +25,11 @@ param WFORCE: u32 = 0;  // (diagnostics) != 0: the root's winner is (s WFORCE + 
 param WFN: u32 = 1;
 param FIFOW: u16 = 32;  // the reduction's FIFO depth (words)
 param TB: u16 = 0;      // 1: the token bus (see the header)
+param SEATS: u16 = 1;   // a ring of seats (ops/seats.csl): pass s is seat s % SEATS's lap s / SEATS //+seats
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
+const seats = @import_module("ops/seats.csl", .{ .M = SEATS }); //+seats
 const tile_config = @import_module("<tile_config>");
 const color_config = tile_config.color_config;
 const tgt = tile_config.target;
@@ -84,7 +86,8 @@ var ring_ptr: [*]u32 = &ring;
 // instead of the argmax: a prompt and the decode loop in one launch
 var force = @zeros([CAP]u32);
 var force_ptr: [*]u32 = &force;
-var nforce = @zeros([1]u32);
+var nforce = @zeros([1]u32); //-seats
+var nforce = @zeros([SEATS]u32);   // (seats: a seat's laps under force, force by pass) //+seats
 var nforce_ptr: [*]u32 = &nforce;
 var wrole: u16 = 0;              // 0 start, 1 add-forward, 2 group end, 3 farthest end, 4 root (| 8 low, | 16 high)
 var wl_on = false;
@@ -112,7 +115,8 @@ fn wloop(s: u32, best: f32, id: f32) void {
     if ((wrole & 16) != 0) { @fmovs(wr_d, fab.fin(q_w2, 2)); wmerge(); }
     if (s < CAP) { ring[s] = @as(u32, wm[1]); }   // the argmax (also under a forced step)
     if (WFORCE != 0) { wm[1] = @as(f32, (s * WFORCE + 7) % (@as(u32, VR) * @as(u32, WFN))); }   // (diagnostics)
-    if (s < nforce[0] and s < CAP) { wm[1] = @as(f32, force[s]); }   // the host's forced tokens
+    if (s < nforce[0] and s < CAP) { wm[1] = @as(f32, force[s]); }   // the host's forced tokens //-seats
+    if (seats.lap < nforce[seats.seat] and s < CAP) { wm[1] = @as(f32, force[s]); }   // the host's forced tokens //+seats
     if (s < 64) { stamp(2 + @as(u16, s)); }
     @fmovs(fab.fout(q_wo, 2), wm_d);
   } else {
@@ -124,7 +128,8 @@ fn wloop(s: u32, best: f32, id: f32) void {
   stamp(68);
   const win = @as(u32, wm[1]);
   const base = rcfg[RQ + 4];
-  if (s + 1 >= n_steps) { wo[0] = -1.0e9; }
+  if (s + 1 >= n_steps) { wo[0] = -1.0e9; } //-seats
+  if (s + SEATS >= n_steps) { wo[0] = -1.0e9; }   // no pass takes the last laps' tokens //+seats
   else if (win >= base and win < base + @as(u32, VR)) { wo[0] = @as(f32, win - base); }
   else { wo[0] = -(1.0 + @as(f32, win / @as(u32, VR))); }
   @fmovs(fab.fout(q_ww, 1), wo_d);
@@ -151,12 +156,14 @@ task pass_task() void {
     res[2] += 1.0;
     stamp(67);
     if (wl_on) { wloop(s, am.best, res[1]); }
+    seats.next(); //+seats
     stamp(1);
   }
   sys_mod.unblock_cmd_stream();
 }
 fn compute(steps: u32, start_pos: u32) void {
   n_steps = steps;
+  seats.begin(); //+seats
   @activate(pass_id);
 }
 

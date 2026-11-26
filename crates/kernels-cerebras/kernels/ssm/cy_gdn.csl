@@ -21,12 +21,14 @@ param HK: u16 = 128;
 param HV: u16 = 128;
 param CONVQK: u16 = 1;
 param GDEC: u16 = 1;
+param SEATS: u16 = 1; //+seats
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 const NCH: u16 = 2 * DK + DV;              // conv channels a column
 const L2EPS: f32 = 1.0e-6;                 // q / k's l2 norms
 const NW: u16 = if (NL > 0) NL * (CONV - 1) * NCH else 1;
-var cwin = @zeros([NW]f32);
+var cwin = @zeros([NW]f32); //-seats
+var cwin = @zeros([SEATS * NW]f32);        // a window a seat //+seats
 var cw = @zeros([if (NL > 0) NL * CONV * NCH else 1]f32);
 var gpar = @zeros([if (NL > 0) NL * 2 else 1]f32);
 var gnw = @zeros([if (NL > 0) NL * DV else 1]f32);
@@ -35,6 +37,8 @@ const vz_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * mx(DV, 1)} -> vz[i]
 var gsc = @zeros([4]f32);                  // the norms' scalars ([2..]: the segment all-reduce's)
 var gdec: f32 = 1.0;
 var wp: u16 = 0;                           // the conv window's oldest row
+var wps = @zeros([SEATS]u16);              // each seat's wp //+seats
+var sb: u16 = 0;                           // the pass's seat's window //+seats
 
 fn init() void {
   var g: u16 = 0;
@@ -42,19 +46,24 @@ fn init() void {
 }
 // A pass's start: a new sequence restarts the conv windows (the PEs reset state on u[2 DK + 1]).
 fn pass_start() void {
+  sb = @as(u16, pe.tab[1]) * NW; //+seats
+  wp = wps[pe.tab[1]]; //+seats
   if (pe.tab[0] == 0) {
-    @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NW} -> cwin[i] }), 0.0);
+    @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NW} -> cwin[i] }), 0.0); //-seats
+    @fmovs(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NW} -> cwin[i] }), @as(i16, sb), f32), 0.0); //+seats
     wp = 0;
   }
 }
 fn pass_end() void {
   if (CONVQK == 1) { wp = if (wp + 1 >= CONV - 1) 0 else wp + 1; }
+  wps[pe.tab[1]] = wp; //+seats
 }
 
 // conv1d (CONV taps) over channels [o, o + n): u[o..) = the window's taps and t's new value; the
 // window is a ring (row wp the oldest, advancing once a pass): the new value replaces the oldest
 fn conv(g: u16, o: u16, n: u16) void {
-  const wb = g * (CONV - 1) * NCH;
+  const wb = g * (CONV - 1) * NCH; //-seats
+  const wb = sb + g * (CONV - 1) * NCH; //+seats
   const cwb = g * CONV * NCH;
   const cwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cw[i] });
   const cwn = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cwin[i] });
@@ -78,7 +87,8 @@ fn pre0(g: u16) f32 {
   const rr = math.rsqrt(pe.t[NQG] / pe.HID + pe.EPS);
   @fmuls(pe.tv(0, NQG), pe.tv(0, NQG), rr);
   // conv1d over the window and the new value (vector ops over the column's channels), SiLU
-  const wb = g * (CONV - 1) * NCH;
+  const wb = g * (CONV - 1) * NCH; //-seats
+  const wb = sb + g * (CONV - 1) * NCH; //+seats
   const cwb = g * CONV * NCH;
   const cwd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cw[i] });
   const cwn = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NCH} -> cwin[i] });
@@ -103,7 +113,8 @@ fn pre0(g: u16) f32 {
   @fmovs(pe.uv(0, DK), pe.tv(DK, DK));          // k
   @fmovs(pe.uv(DK, DK), pe.tv(0, DK));          // q
   pe.u[2 * DK] = dec;
-  pe.u[2 * DK + 1] = if (pe.tab[0] == 0) 1.0 else 0.0;
+  pe.u[2 * DK + 1] = if (pe.tab[0] == 0) 1.0 else 0.0; //-seats
+  pe.u[2 * DK + 1] = @as(f32, 2 * pe.tab[1] + (if (pe.tab[0] == 0) @as(u32, 1) else 0));   // the seat, the reset //+seats
   @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[i] }), DV), pe.tv(2 * DK, DV));
   @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{DV} -> vz[@as(i16, DV) + i] }), DV), pe.tv(2 * DK + DV, DV));
   pe.mcast(2 * DK + 2);
@@ -126,7 +137,8 @@ fn pre1(g: u16) f32 {
   @fmovs(pe.uv(0, DK), pe.tv(DK, DK));          // k
   @fmovs(pe.uv(DK, DK), pe.tv(0, DK));          // q
   pe.u[2 * DK] = if (GDEC == 0) gdec else 0.0;
-  pe.u[2 * DK + 1] = if (pe.tab[0] == 0) 1.0 else 0.0;   // position 0: the PEs zero the state
+  pe.u[2 * DK + 1] = if (pe.tab[0] == 0) 1.0 else 0.0;   // position 0: the PEs zero the state //-seats
+  pe.u[2 * DK + 1] = @as(f32, 2 * pe.tab[1] + (if (pe.tab[0] == 0) @as(u32, 1) else 0));   // the seat, the reset //+seats
   pe.mcast(2 * DK + 2);
   pe.stamp(1 + 6 * pe.cl + 1);
   if (GDEC == 1) { gdec = math.exp1(gpar[2 * g] * math.softplus(pe.t[2 * DK + 2 * DV + 1] * rr + gpar[2 * g + 1])); }   // (off the path: see post)

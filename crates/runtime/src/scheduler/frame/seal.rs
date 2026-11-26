@@ -483,15 +483,23 @@ impl FramePolicy {
                 !self.boundary_open(),
                 "the wait-all gate is evaluated only against a closed boundary"
             );
+            let capped = crate::inferlet::process::execution_slot_capacity().is_some();
             for (lane_id, lane) in self.lanes.iter() {
                 let owes = self.in_flight_lanes.contains(lane_id)
                     || lane
                         .owner
                         .is_some_and(|owner| self.pending_binds.contains_key(&owner));
-                let blocking = match lane.gate_verdict() {
-                    GateVerdict::Blocking => true,
-                    GateVerdict::Waits | GateVerdict::Satisfied => false,
-                };
+                // (a process still waiting for an execution seat submits nothing until it has one)
+                let unseated = capped
+                    && lane.frames.is_empty()
+                    && lane
+                        .owner
+                        .is_some_and(|owner| !self.slotted.contains(&owner));
+                let blocking = !unseated
+                    && match lane.gate_verdict() {
+                        GateVerdict::Blocking => true,
+                        GateVerdict::Waits | GateVerdict::Satisfied => false,
+                    };
                 if !blocking {
                     continue;
                 }

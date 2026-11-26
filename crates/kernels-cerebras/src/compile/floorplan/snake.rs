@@ -14,7 +14,7 @@ type R<T> = Result<T, String>;
 /// Preset keys: weight columns and rows a unit (PX, PY), unit slots (UNX x UNY; one short of the
 /// units leaves a gap slot), layers a unit (K), head rows and vocabulary rows a head PE (HR, VR),
 /// KV entries a row (NE). Overrides: the reduction groups (`G2`, `G2X` / `G2Y` / `G2H`, `G2W`,
-/// `G3W`), RoPE levels and digit bits (`RLV`, `RBITS`), `CTX`, `CAP`, `LOOP`, `WL`.
+/// `G3W`), RoPE levels and digit bits (`RLV`, `RBITS`), `CTX`, `CAP`, `LOOP`, `WL`, `SEATS`.
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (px, py, k) = (pr.need("PX")?, pr.need("PY")?, pr.need("K")?);
     let unit_grid = (pr.need("UNX")?, pr.need("UNY")?);
@@ -68,6 +68,14 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     }
     let g2 = pr.int("G2").unwrap_or(0);
     let ne = pr.need("NE")?;
+    // a ring of seats shares the KV pool, NE PY: a sequence holds what the others' least
+    // windows (a launch's laps, whole rows) leave
+    let seats = pr.int("SEATS").unwrap_or(1).max(1);
+    let cap = pr.int("CAP").unwrap_or(256);
+    let least = (cap / seats).max(1).div_ceil(py) * py;
+    if seats > ne || (seats - 1) * least >= ne * py {
+        return Err(format!("snake: {seats} seats over {ne} KV entries a row"));
+    }
     // a position is RLV digits of RBITS bits, enough for the context NE PY (at least 4 levels)
     let rope_bits = pr.int("RBITS").unwrap_or(3);
     let reach = pr.int("CTX").map_or(ne * py, |c| c.min(ne * py));
@@ -114,10 +122,10 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     };
     let contract = Contract {
         // bounded by the CY's RoPE tables: RLV digits of RBITS bits
-        positions: (ne * py).min(1 << (rope_bits * rope_levels).min(31)),
+        positions: (ne * py - (seats - 1) * least).min(1 << (rope_bits * rope_levels).min(31)),
         rope_levels,
         rope_bits,
-        cap: pr.int("CAP").unwrap_or(256),
+        cap,
         loop_len: pr.int("LOOP").unwrap_or(crate::compile::cold::LOOP),
         token_loop: pr.int("WL").unwrap_or(0) != 0,
         logit_scale: 1.0,
@@ -127,6 +135,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         partition,
         contract,
         levers: pr.levers.clone(),
+        seats,
     })
 }
 

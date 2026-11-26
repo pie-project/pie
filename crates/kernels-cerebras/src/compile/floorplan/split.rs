@@ -128,5 +128,6 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         partition,
         contract,
         levers: pr.levers.clone(),
+        seats: 1,
     })
 }

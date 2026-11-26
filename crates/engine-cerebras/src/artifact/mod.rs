@@ -89,6 +89,11 @@ pub struct ArtifactModel {
     eps: f32,
     /// `lgt`'s prescale (the plan's: the band head's 2^15 logits; 1 without one).
     lgt_scale: f32,
+    /// A ring's seats' KV windows in its shared pool: (first position, positions), the pool split
+    /// evenly until [`ArtifactModel::windows`] states others (empty: fixed windows or one seat).
+    wins: Vec<(usize, usize)>,
+    /// The wafer holds `wins`' first positions (`sbase`): put again only once they change.
+    wins_put: bool,
 }
 
 /// Where a token's embedding row comes from: the head's tiles (`hemb`), else (a tied head with
@@ -142,6 +147,19 @@ impl Rows {
     }
 }
 
+/// A ring's pool split evenly over its seats, each window from a multiple of the rows (none
+/// without a pool).
+fn even_windows(hl: &HostLayout) -> Vec<(usize, usize)> {
+    let Some(s) = hl.seats.as_ref().filter(|s| s.pool > 0 && s.m > 1) else {
+        return Vec::new();
+    };
+    let rows = hl.rows.max(1) as usize;
+    let span = s.pool as usize / s.m as usize / rows * rows;
+    (0..s.m as usize)
+        .map(|j| (j * span, span.min(hl.positions as usize)))
+        .collect()
+}
+
 impl ArtifactModel {
     /// Places the prep on `dev` by `art`'s bindings ([`place::place`]) and runs init.
     pub fn open(
@@ -186,6 +204,8 @@ impl ArtifactModel {
             embed,
             eps: model.eps,
             lgt_scale: model.logit_scale,
+            wins: even_windows(&hl),
+            wins_put: false,
             hl,
             dev,
         })
@@ -341,6 +361,158 @@ impl ArtifactModel {
         Ok(out)
     }
 
+    /// The seats' KV windows from here on, (first position, positions) a seat: each within the
+    /// pool, from a multiple of the rows, none over another. A seat's window changes only as it
+    /// starts again at position 0 (the attention learns a window's first entry there).
+    pub fn windows(&mut self, wins: &[(usize, usize)]) -> R<()> {
+        let pool = self.hl.seats.as_ref().map_or(0, |s| s.pool as usize);
+        let rows = self.hl.rows.max(1) as usize;
+        if pool == 0 || wins.len() != self.seats() {
+            return Err(format!(
+                "artifact: {} windows for {} seats over a pool of {pool}",
+                wins.len(),
+                self.seats()
+            ));
+        }
+        let mut by: Vec<(usize, usize)> = wins.to_vec();
+        by.sort_unstable();
+        let fits = by
+            .iter()
+            .all(|&(b, n)| b % rows == 0 && b + n <= pool && n <= self.positions)
+            && by.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0);
+        if !fits {
+            return Err(format!(
+                "artifact: windows {wins:?} over a pool of {pool} (rows {rows}, a seat at most {})",
+                self.positions
+            ));
+        }
+        self.wins_put &= self.wins == wins;
+        self.wins = wins.to_vec();
+        Ok(())
+    }
+
+    /// The positions seat `j` may run: its window's, else the program's.
+    pub fn room(&self, j: usize) -> usize {
+        self.wins.get(j).map_or(self.positions, |w| w.1)
+    }
+
+    /// The ring's shared KV pool: its positions and rows (none: fixed windows or one seat).
+    pub fn pool(&self) -> Option<(usize, usize)> {
+        let s = self.hl.seats.as_ref().filter(|s| s.pool > 0 && s.m > 1)?;
+        Some((s.pool as usize, self.hl.rows.max(1) as usize))
+    }
+
+    /// The sequences the program holds at once: its ring's seats (1 without one).
+    pub fn seats(&self) -> usize {
+        self.hl.seats.as_ref().map_or(1, |s| s.m as usize)
+    }
+
+    /// One launch of `n` passes round the seats (pass `s` seat `s % seats`'s): seat `j` starts at position `pos[j]` with token
+    /// `first[j]`, its first `force[j].len()` laps take `force[j]` as their next token (then its
+    /// own argmax). Every pass's winner (forced passes too). A program of
+    /// one seat runs one sequence so (its x and its launch's position).
+    pub fn ring_launch(
+        &mut self,
+        first: &[u32],
+        pos: &[usize],
+        force: &[Vec<u32>],
+        n: usize,
+    ) -> R<Vec<u32>> {
+        let m = self.seats();
+        if first.len() != m || pos.len() != m || force.len() != m {
+            return Err(format!(
+                "artifact: a ring launch of {} seats, the program's {m}",
+                first.len()
+            ));
+        }
+        if n == 0 || n > self.cap {
+            return Err(format!("artifact: {n} passes past the ring's {}", self.cap));
+        }
+        let laps = n.div_ceil(m);
+        if let Some(j) = (0..m).find(|&j| pos[j] + laps > self.room(j)) {
+            return Err(format!(
+                "artifact: {laps} laps from {} past seat {j}'s {} positions",
+                pos[j],
+                self.room(j)
+            ));
+        }
+        let mut fw = vec![0u32; laps * m];
+        let mut nf = vec![0u32; m];
+        for (j, f) in force.iter().enumerate() {
+            let k = f.len().min(laps);
+            nf[j] = k as u32;
+            for (lap, &t) in f[..k].iter().enumerate() {
+                fw[lap * m + j] = t;
+            }
+        }
+        let root = rect(&floor::Rect::new(self.hl.root.x, self.hl.root.y, 1, 1));
+        let t0 = Instant::now();
+        self.dev.put("force", root, n, &fw[..n])?;
+        self.dev.put("nforce", root, m, &nf)?;
+        self.host_ns[1] += ns(t0);
+        match self.hl.seats.clone() {
+            None => {
+                self.put_x(first[0])?;
+                self.put_token(first[0])?;
+                self.launch(n, pos[0])?;
+            }
+            // (the token bus hands a pass's token to the next pass, another seat's)
+            Some(_) if self.hl.token_in.is_some() => {
+                return Err(
+                    "artifact: a ring of seats with per-layer inputs: its token bus is not by seat"
+                        .into(),
+                );
+            }
+            Some(s) => {
+                let t0 = Instant::now();
+                let total = *self.x_off.last().unwrap();
+                let mut es = Vec::with_capacity(m);
+                for &t in first {
+                    let mut e: Vec<u32> = self.embedding(t)?.into_iter().map(|b| b << 16).collect();
+                    e.resize(total.max(e.len()), 0);
+                    es.push(e);
+                }
+                self.host_ns[0] += ns(t0);
+                let t0 = Instant::now();
+                let cx = self.hl.first_cx;
+                for &(r0, r1, dims, ly) in &self.hl.x_runs {
+                    let mut w = Vec::with_capacity((r1 - r0) as usize * m * dims as usize);
+                    for r in r0 as usize..r1 as usize {
+                        for e in &es {
+                            w.extend_from_slice(&e[self.x_off[r]..self.x_off[r + 1]]);
+                        }
+                    }
+                    let r = floor::Rect::new(cx.x, cx.y + ly, 1, r1 - r0);
+                    self.dev.put("xs", rect(&r), m * dims as usize, &w)?;
+                }
+                let sp: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
+                let sb: Vec<u32> = self.wins.iter().map(|w| w.0 as u32).collect();
+                for r in &s.cy {
+                    let words: Vec<u32> = (0..r.w * r.h).flat_map(|_| sp.iter().copied()).collect();
+                    self.dev.put("spos", rect(r), m, &words)?;
+                    if !sb.is_empty() && !self.wins_put {
+                        let words: Vec<u32> =
+                            (0..r.w * r.h).flat_map(|_| sb.iter().copied()).collect();
+                        self.dev.put("sbase", rect(r), m, &words)?;
+                    }
+                }
+                self.wins_put = true;
+                self.host_ns[1] += ns(t0);
+                self.launch(n, 0)?;
+            }
+        }
+        // (the one-sequence history no longer stands)
+        self.fed.clear();
+        self.ring(n)
+    }
+
+    /// The head's logits of the last pass as read (`lgt`, f32 bits, the final norm's 1/rms left
+    /// out).
+    pub fn last_logits(&mut self) -> R<Vec<u32>> {
+        let r = rect(&self.hl.logits);
+        self.dev.get("lgt", r, self.hl.vocab_rows as usize)
+    }
+
     /// `tokens` at `start..`; with `logits`, the last row's (`lgt` scaled by the final norm's
     /// 1/rms).
     pub fn forward(
@@ -354,6 +526,16 @@ impl ArtifactModel {
         if !logits {
             return Ok((vec![0; tokens.len()], None));
         }
+        let l = self.logits()?;
+        let mut am = vec![0u32; tokens.len()];
+        if let Some(best) = argmax(&l) {
+            *am.last_mut().unwrap() = best;
+        }
+        Ok((am, Some(l)))
+    }
+
+    /// The last pass's logits (`lgt` scaled by the final norm's 1/rms).
+    pub fn logits(&mut self) -> R<Vec<f32>> {
         let w = self
             .dev
             .get("lgt", rect(&self.hl.logits), self.hl.vocab_rows as usize)?;
@@ -379,11 +561,7 @@ impl ArtifactModel {
                 *v = c * (*v / c).tanh();
             }
         }
-        let mut am = vec![0u32; tokens.len()];
-        if let Some(best) = argmax(&l) {
-            *am.last_mut().unwrap() = best;
-        }
-        Ok((am, Some(l)))
+        Ok(l)
     }
 }
 

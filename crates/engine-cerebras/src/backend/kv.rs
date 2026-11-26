@@ -8,7 +8,7 @@ use crate::wafer;
 /// What the KV cache holds, as tokens: every lane's cache is kept as the tokens that made it (by
 /// slot, and by page for `copy_kv`), and the model's one-sequence cache is brought to a lane's
 /// history before its rows run: kept as far as it agrees, the rest replayed. A lane's history is
-/// its slot's, unless a copy landed in its pages since: then its pages'.
+/// its pages', its slot's where it has none.
 
 #[derive(Default)]
 pub(super) struct Kv {
@@ -17,8 +17,6 @@ pub(super) struct Kv {
     pub(super) pages: std::collections::HashMap<u32, Vec<Option<u32>>>,
     /// The slot's tokens.
     pub(super) slots: std::collections::HashMap<u32, Vec<u32>>,
-    /// Pages a copy wrote since a lane last fired on them.
-    pub(super) copied: std::collections::HashSet<u32>,
     /// The model's own cache: its tokens by position, and the argmax after each where a token loop
     /// told it.
     pub(super) cached: Cached,
@@ -36,35 +34,35 @@ impl Kv {
     /// The lane's first `n` positions' tokens.
     pub(super) fn history(&self, slot: u32, pages: &[u32], n: u32) -> EngineResult<Vec<u32>> {
         let size = self.page_size.max(1);
-        let copied_in = pages
-            .iter()
-            .take(n.div_ceil(size) as usize)
-            .any(|page| self.copied.contains(page));
-        let slot_holds = self.slots.get(&slot).is_some_and(|h| h.len() >= n as usize);
-        if pages.is_empty() || (slot_holds && !copied_in) {
-            let have = self.slots.get(&slot).map_or(&[][..], Vec::as_slice);
-            return have.get(..n as usize).map(<[u32]>::to_vec).ok_or_else(|| {
-                Error::Invalid(format!(
-                    "slot {slot} fires at position {n} and the spatial engine holds {} of its \
-                     tokens",
-                    have.len()
-                ))
-            });
+        // The pages say what a lane's positions hold: a slot's next lane may start on a prefix
+        // another wrote. A lane of no pages, or one whose pages were not written, is its slot's.
+        let mut have: Vec<u32> = Vec::with_capacity(n as usize + 1);
+        for page in pages.iter().take(n.div_ceil(size) as usize) {
+            let want = (n as usize - have.len()).min(size as usize);
+            let cells = self.pages.get(page).map_or(&[][..], Vec::as_slice);
+            let written = cells.iter().take(want).map_while(|&t| t);
+            let before = have.len();
+            have.extend(written);
+            if have.len() < before + want {
+                break;
+            }
         }
-        (0..n)
-            .map(|p| {
-                let page = pages.get((p / size) as usize).copied();
-                page.and_then(|page| self.pages.get(&page))
-                    .and_then(|cells| cells.get((p % size) as usize).copied().flatten())
-                    .ok_or_else(|| {
-                        Error::Invalid(format!(
-                            "position {p} of slot {slot} (page {page:?}) holds no token this \
-                             engine wrote or copied: the cerebras engine keeps a cache as the \
-                             tokens that made it"
-                        ))
-                    })
+        if have.len() == n as usize {
+            return Ok(have);
+        }
+        let at = have.len();
+        let slot_holds = self.slots.get(&slot).map_or(&[][..], Vec::as_slice);
+        slot_holds
+            .get(..n as usize)
+            .map(<[u32]>::to_vec)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "position {at} of slot {slot} (page {:?}; a fire at {n}) holds no token this \
+                     engine wrote or copied: the cerebras engine keeps a cache as the tokens that \
+                     made it",
+                    pages.get(at / size as usize)
+                ))
             })
-            .collect()
     }
 
     /// `tokens` written at positions `start..` of the lane.
@@ -79,9 +77,6 @@ impl Kv {
         let mut have = history;
         have.extend_from_slice(tokens);
         self.slots.insert(slot, have);
-        for page in pages {
-            self.copied.remove(page);
-        }
         if pages.is_empty() {
             return Ok(());
         }
@@ -158,5 +153,26 @@ impl CerebrasEngine {
             self.kv.cached.extend(&history[agree..]);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slots_next_lane_holds_the_prefix_its_pages_hold() {
+        let mut kv = Kv {
+            page_size: 2,
+            ..Kv::default()
+        };
+        kv.write(0, &[7, 8], Vec::new(), &[1, 2, 3]).unwrap();
+        kv.write(1, &[9, 5], Vec::new(), &[4, 5, 6, 7]).unwrap();
+        // slot 1's next lane on slot 0's first page
+        assert_eq!(kv.history(1, &[7, 6], 2).ok(), Some(vec![1, 2]));
+        assert_eq!(kv.history(0, &[7, 8], 3).ok(), Some(vec![1, 2, 3]));
+        // no pages: the slot's
+        assert_eq!(kv.history(1, &[], 3).ok(), Some(vec![4, 5, 6]));
+        assert!(kv.history(2, &[7, 6], 3).is_err());
     }
 }

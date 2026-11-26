@@ -114,6 +114,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
             logit_scale: 1.0,
         },
         levers: pr.levers.clone(),
+        seats: 1,
     };
     // the kernels' shape of it (q heads a segment, the MLP's columns) must hold
     Dims::of(&plan)?;

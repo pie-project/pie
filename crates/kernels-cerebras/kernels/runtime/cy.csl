@@ -70,6 +70,7 @@ param EPS: f32 = 1.0e-6; // the RMSNorms' eps
 param PLOG: u16 = 0;   // (PLE 1) 1: the full model logs each step's PLE words too
 param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
 param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
+param SEATS: u16 = 1;  // a ring of seats (ops/seats.csl) //+seats
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
@@ -102,13 +103,20 @@ var tab_ptr: [*]u32 = &pe.tab;
 const act = @import_module("ops/act.csl", .{ .pe = pe, .math = math, .AN = if (MIXK <= 1) TN else 1, .Ic = Ic,
   .SILU = if (MIXK <= 1 and ACT == 0 and SILU16 == 1) 1 else 0, .GELU = if (MIXK <= 1 and ACT == 1) 1 else 0,
   .SILUQ = SILUQ, .SLW = SLW, .GELUT = GELUT });
-const gdn = @import_module("ops/cy_gdn.csl", .{ .pe = pe, .act = act, .math = math, .NL = NLG, .NQG = NQG, .DK = DK,
-  .DV = DV, .CONV = CONV, .HK = HK, .HV = HV, .CONVQK = CONVQK, .GDEC = GDEC });
+const gdn = @import_module("ops/cy_gdn.csl", .{ .pe = pe, .act = act, .math = math, .NL = NLG, .NQG = NQG, .DK = DK, //-seats
+  .DV = DV, .CONV = CONV, .HK = HK, .HV = HV, .CONVQK = CONVQK, .GDEC = GDEC }); //-seats
+const gdn = @import_module("ops/cy_gdn.csl", .{ .pe = pe, .act = act, .math = math, .NL = NLG, .NQG = NQG, .DK = DK, //+seats
+  .DV = DV, .CONV = CONV, .HK = HK, .HV = HV, .CONVQK = CONVQK, .GDEC = GDEC, .SEATS = SEATS }); //+seats
 var cw_ptr: [*]f32 = &gdn.cw;
 var gpar_ptr: [*]f32 = &gdn.gpar;
 var gnw_ptr: [*]f32 = &gdn.gnw;
-const att = @import_module("ops/cy_att.csl", .{ .pe = pe, .math = math, .NL = NLA, .NQA = NQA, .Qh = Qh, .Dc = Dc,
-  .NROT = NROT, .RLV = RLV, .RBITS = RBITS, .GATE = GATE, .ATTV = ATTV, .ATTL = ATTL, .ROPEP = ROPEP });
+const att = @import_module("ops/cy_att.csl", .{ .pe = pe, .math = math, .NL = NLA, .NQA = NQA, .Qh = Qh, .Dc = Dc, //-seats
+  .NROT = NROT, .RLV = RLV, .RBITS = RBITS, .GATE = GATE, .ATTV = ATTV, .ATTL = ATTL, .ROPEP = ROPEP }); //-seats
+const att = @import_module("ops/cy_att.csl", .{ .pe = pe, .math = math, .NL = NLA, .NQA = NQA, .Qh = Qh, .Dc = Dc, //+seats
+  .NROT = NROT, .RLV = RLV, .RBITS = RBITS, .GATE = GATE, .ATTV = ATTV, .ATTL = ATTL, .ROPEP = ROPEP }); //+seats
+const seats = @import_module("ops/seats.csl", .{ .M = SEATS }); //+seats
+var spos_ptr: [*]u32 = &seats.spos; //+seats
+var sbase_ptr: [*]u32 = &seats.sbase; //+seats
 const kv = @import_module("ops/cy_kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM,
   .Qh = Qh, .DcS = DcS, .DcG = DcG, .SH = SH, .KEV = KEV, .KVS = KVS });
 const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K });
@@ -197,7 +205,8 @@ task pass_task() void {
       pe.stamp(0);
       while ((DIAG & 1) == 0 and (DIAG & 4) == 0 and l < nl) : (l += 1) { moe.layer(l); }
     } else if (MIXK == 0) {
-      pe.tab[0] = pos0 + s;   // the pass's position (launch argument)
+      pe.tab[0] = pos0 + s;   // the pass's position (launch argument) //-seats
+      seats.at(@ptrcast([*]u32, &pe.tab));   // the pass's position, seat and the next pass's //+seats
       gdn.pass_start();
       pe.stamp(0);
       var la: u16 = 0;
@@ -212,6 +221,7 @@ task pass_task() void {
         pe.stamp(1 + 6 * l + 5);
       }
       gdn.pass_end();
+      seats.next(); //+seats
     } else {
       pe.tab[0] = pos0 + s;
       pe.stamp(0);
@@ -240,6 +250,7 @@ fn compute(steps: u32, start_pos: u32) void {
   if (MIXK == 2) { swa.launch(); }
   n_steps = steps;
   pos0 = start_pos;
+  seats.begin(); //+seats
   @activate(pass_id);
 }
 
@@ -268,6 +279,8 @@ comptime {
     @export_symbol(gb_ptr, "gb");
     @export_symbol(ps_ptr, "ps");
   }
+  @export_symbol(spos_ptr, "spos"); //+seats
+  @export_symbol(sbase_ptr, "sbase"); //+seats
   @export_symbol(tdbg_ptr, "tdbg");
   @export_symbol(rcfg_ptr, "rcfg");
   @export_symbol(init);

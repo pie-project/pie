@@ -1,0 +1,28 @@
+// wafer/ops/seats.csl: a ring of M seats (block/seats.rs). Pass s of a launch is seat s % M's
+// lap s / M; each seat holds its own sequence. The host writes each seat's position at the
+// launch's first lap (spos) and its KV window's first position (sbase, changed only at a seat's
+// position 0); a seat at position 0 restarts its own state alone.
+//
+// Params: M (seats).
+param M: u16;
+
+var spos = @zeros([M]u32);   // host-written: each seat's position at the launch's first lap
+var spos_ptr: [*]u32 = &spos;
+var sbase = @zeros([M]u32);  // host-written: each seat's KV window's first position (rows aligned)
+var sbase_ptr: [*]u32 = &sbase;
+var seat: u16 = 0;           // the pass's seat and lap
+var lap: u32 = 0;
+
+fn begin() void { seat = 0; lap = 0; }
+// tab[0] the pass's position, tab[1] its seat, tab[2] the next pass's position, tab[3] its seat's
+// window's first position
+fn at(tab: [*]u32) void {
+  tab[0] = spos[seat] + lap;
+  tab[1] = @as(u32, seat);
+  tab[2] = if (seat + 1 < M) spos[seat + 1] + lap else spos[0] + lap + 1;
+  tab[3] = sbase[seat];
+}
+fn next() void {
+  seat += 1;
+  if (seat >= M) { seat = 0; lap += 1; }
+}

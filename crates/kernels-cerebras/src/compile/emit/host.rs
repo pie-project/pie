@@ -53,6 +53,23 @@ pub struct HostLayout {
     pub token_in: Option<Rect>,
     /// The final logit softcap the host applies (monotone: the wafer's argmax stands).
     pub softcap: Option<f32>,
+    /// A ring of seats ([`crate::compile::block::seats`]); `None`: one sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seats: Option<SeatsHost>,
+}
+
+/// Where a ring's host words go: its seats, and every unit's CY row (`spos`) as rectangles (the
+/// CX corner left out). Each seat's first x goes to unit 0's CX column (`xs`, `[seat][dims]` a
+/// PE), its forced laps to the root (`nforce`, a seat's laps; `force` by pass).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SeatsHost {
+    pub m: u32,
+    pub cy: Vec<Rect>,
+    /// The positions the seats' shared KV pool holds (its entries a row by the rows); each seat's
+    /// window starts at a position the host states (`sbase`), a multiple of the rows. 0: a
+    /// program of fixed windows (`NE / m` entries a row each), no `sbase`.
+    #[serde(default)]
+    pub pool: u32,
 }
 
 /// A unit's CX column.
@@ -63,6 +80,21 @@ fn cx_rect(u: &Unit) -> Rect {
         w: 1,
         h: u.rect.h,
     }
+}
+
+/// A unit's CY row, either side of its CX column.
+fn cy_rects(u: &Unit) -> Vec<Rect> {
+    let (x0, x1, cx) = (u.rect.x, u.rect.x + u.rect.w, u.cx_x());
+    [(x0, cx), (cx + 1, x1)]
+        .into_iter()
+        .filter(|(a, b)| b > a)
+        .map(|(a, b)| Rect {
+            x: a,
+            y: u.cy_y(),
+            w: b - a,
+            h: 1,
+        })
+        .collect()
 }
 
 impl HostLayout {
@@ -148,6 +180,11 @@ impl HostLayout {
             logits,
             token_in: prog.plan.shape.ple.map(|_| logits),
             softcap: prog.plan.shape.head.final_softcap,
+            seats: (prog.plan.seats > 1).then(|| SeatsHost {
+                m: prog.plan.seats,
+                cy: f.units.iter().flat_map(cy_rects).collect(),
+                pool: p.kv_entries.per_row * p.rows,
+            }),
         })
     }
 

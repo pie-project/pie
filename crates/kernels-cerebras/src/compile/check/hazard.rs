@@ -8,11 +8,21 @@
 //! - **Line windows** ([`lines`]): a GEMM-regime queue rebound among a line's colours: H1-H4.
 //! - **Hub loops** ([`hub_loops`]): a tiled-regime blocking send of more words than the hub's
 //!   loop holds before its receive is posted.
+//! - **Re-binds**: an output queue re-coloured during a launch with no drain wait in the
+//!   function (a send still in it would leave on the new colour).
+//! - **Late inputs** ([`late_inputs`]): a ring's input queue re-coloured during a launch to a
+//!   colour another unit (or the head) sends on: nothing holds the next pass's words back.
+//! - **Seats** ([`seats`]): a ring of more seats than the units' hand-offs hold.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::code::{Code, Module};
 use super::{call_args, eval};
+use crate::compile::abi::Kernels;
+use crate::compile::fabric::Colour;
+use crate::compile::floor::Coord;
+use crate::compile::program::Program;
+use crate::compile::wiring::Link;
 
 /// The hazards of `file` at `params` (its imports from `files`), one line each.
 #[must_use]
@@ -26,7 +36,220 @@ pub fn hazards(
     startup(&c, file, &mut out);
     host_words(&c, file, &mut out);
     overlaps(&c, file, &mut out);
+    rebinds(&c, file, &mut out);
     out.into_iter().collect()
+}
+
+/// A ring of `m` seats over `units` units: every hand-off is synchronous, so a pass waits for the
+/// next unit to take the one before; `m` passes in flight over `units` units and the head close
+/// the loop only while one unit is free (`m <= units - 1`), else they deadlock.
+#[must_use]
+pub fn seats(m: u32, units: u32) -> Option<String> {
+    (m > 1 && m >= units).then(|| {
+        format!(
+            "a ring of {m} seats over {units} units: past units - 1, the synchronous hand-offs \
+             deadlock"
+        )
+    })
+}
+
+/// The input queues of a ring of seats re-coloured during a launch to a colour whose words come
+/// from outside the PE's unit, one line a kernel's host word. A pass ahead sends on that colour
+/// whenever its own unit is done (the hand-offs carry no credit), so its words may be at the
+/// queue when it is re-coloured; an input from within the unit waits for the PE's own pass.
+/// Such an input holds a queue bound at the start. A colour the unit's own CX sends on after the
+/// PE's last partial ([`Late::Posted`]) may be bound once no later word of the queue's own colour
+/// can come, which is before that partial is sent: bound after it, the order is only timing's.
+pub fn late_inputs(
+    prog: &Program,
+    kinds: &Kernels,
+    own: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let files: BTreeMap<String, String> = own.iter().cloned().collect();
+    let mut binds: BTreeMap<&str, (String, BTreeMap<i64, bool>)> = BTreeMap::new();
+    let mut out = BTreeSet::new();
+    for (at, colour, late) in late_links(prog)? {
+        let kind = prog.floor.roles.get(at).kind;
+        if !binds.contains_key(kind.stem) {
+            let file = format!("{}.csl", kind.stem);
+            let params = (kinds.get(&kind).into_iter())
+                .flat_map(|k| &k.params.items)
+                .filter_map(|(n, v)| Some((n.to_string(), eval(&v.render(), &BTreeMap::new())?)))
+                .collect();
+            let words = bound_words(&super::code::code(&files, &file, &params))
+                .map_err(|e| format!("`{file}` {e}"))?;
+            binds.insert(kind.stem, (file, words));
+        }
+        let (file, words) = &binds[kind.stem];
+        if words.is_empty() {
+            continue;
+        }
+        let rcfg = crate::compile::emit::rcfg::of(prog, at)?;
+        for (&i, &before) in words {
+            if late == Late::Posted && before {
+                continue;
+            }
+            if usize::try_from(i).ok().and_then(|i| rcfg.get(i)) == Some(&u32::from(colour.0)) {
+                let why = match late {
+                    Late::Outside => {
+                        "a colour from outside the PE's unit (a later pass's words may come on it \
+                         before the queue is restored)"
+                    }
+                    Late::Posted => {
+                        "a colour the unit's CX sends on, after the PE's last partial (a later \
+                         pass's words may come on the queue's own colour before it is re-coloured)"
+                    }
+                };
+                out.insert(format!(
+                    "`{file}`: an input queue re-coloured during a launch to rcfg[{i}], {why}"
+                ));
+            }
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// When a unit PE's input from another PE comes, seen from the PE's own pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Late {
+    /// From outside the unit: at any time.
+    Outside,
+    /// The unit's CX sends it once it holds the PE's last partial of a pass.
+    Posted,
+}
+
+/// The unit PEs a link from outside their unit, or a path from their unit's CX, delivers to, and
+/// its colour.
+fn late_links(prog: &Program) -> Result<Vec<(Coord, Colour, Late)>, String> {
+    let unit = |c: Coord| prog.floor.units.iter().position(|u| u.rect.contains(c));
+    let mut out = Vec::new();
+    for l in &prog.wiring.links {
+        let (src, class, to): (Option<&Coord>, _, Vec<Coord>) = match l {
+            Link::Path(p) => (
+                p.pts.first(),
+                p.class,
+                p.pts.last().copied().into_iter().collect(),
+            ),
+            Link::Multicast(m) => (m.pts.get(m.src), m.class, m.pts.clone()),
+            Link::Broadcast(b) => {
+                let to = b.pts.iter().zip(&b.recv).filter(|(_, r)| **r);
+                (b.pts.get(b.src), b.class, to.map(|(c, _)| *c).collect())
+            }
+            _ => continue,
+        };
+        let Some(&src) = src else { continue };
+        let colour = prog.palette.get(class)?;
+        let path = matches!(l, Link::Path(_));
+        for c in to {
+            let Some(u) = unit(c) else { continue };
+            if unit(src) != Some(u) {
+                out.push((c, colour, Late::Outside));
+            } else if path && src.x == prog.floor.units[u].cx_x() {
+                out.push((c, colour, Late::Posted));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The rcfg words a task's input-queue re-binds (`iqc`) take their colours from, a function's
+/// parameter by each of its call sites: whether a row partial's send (`send_x`) follows at every
+/// one, in the function or after its call.
+fn bound_words(c: &Code) -> Result<BTreeMap<i64, bool>, String> {
+    let reached = c.task_reached();
+    let mut out = BTreeMap::new();
+    for (m, func) in &reached {
+        let f = &c.modules[*m].funcs[func];
+        for (at, _) in f.body.match_indices("iqc(") {
+            let args = call_args(&f.body[at..]).unwrap_or_default();
+            let Some(colour) = args.get(1).filter(|_| args.len() == 2) else {
+                continue;
+            };
+            for (w, _) in colour.match_indices("rcfg[") {
+                let e = &colour[w + 5..];
+                let e = &e[..e.find(']').unwrap_or(e.len())];
+                for (mut env, after) in site_envs(c, &reached, *m, func) {
+                    // (a name of an imported module: `pe.RQ`)
+                    let mut flat = e.to_string();
+                    for (alias, inst) in &c.modules[*m].aliases {
+                        for (n, v) in &c.modules[*inst].env {
+                            let q = format!("{alias}.{n}");
+                            if flat.contains(&q) {
+                                flat = flat.replace(&q, n);
+                                env.insert(n.clone(), *v);
+                            }
+                        }
+                    }
+                    let word = eval(&flat, &env)
+                        .ok_or_else(|| format!("{func}(): a queue's colour from rcfg[{e}]"))?;
+                    *out.entry(word).or_insert(true) &= after || f.body[at..].contains(SEND_ROW);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A row partial's send.
+const SEND_ROW: &str = "send_x(";
+
+/// The values of `func`'s (module `m`'s) names at each call of it from what a task reaches, and
+/// whether its caller sends a row partial after it.
+fn site_envs(
+    c: &Code,
+    reached: &BTreeSet<(usize, String)>,
+    m: usize,
+    func: &str,
+) -> Vec<(BTreeMap<String, i64>, bool)> {
+    let (base, params) = (&c.modules[m].env, &c.modules[m].funcs[func].params);
+    let mut out = Vec::new();
+    for (at, caller) in reached {
+        let body = &c.modules[*at].funcs[caller].body;
+        for (i, _) in body.match_indices(&format!("{func}(")) {
+            let before = &body[..i];
+            if before.ends_with(ident) {
+                continue;
+            }
+            let qual = before.strip_suffix('.').map(|b| {
+                let s = b.rfind(|ch| !ident(ch)).map_or(0, |p| p + 1);
+                &b[s..]
+            });
+            if c.resolve(*at, qual, func) != Some((m, func.to_string())) {
+                continue;
+            }
+            let args = call_args(&body[i..]).unwrap_or_default();
+            let mut env = base.clone();
+            for (p, a) in params.iter().zip(&args) {
+                if let Some(v) = eval(a, &c.modules[*at].env) {
+                    env.insert(p.clone(), v);
+                }
+            }
+            out.push((env, body[i..].contains(SEND_ROW)));
+        }
+    }
+    if out.is_empty() {
+        out.push((base.clone(), false));
+    }
+    out
+}
+
+/// Output queues re-coloured by what a task runs (`oqc`), in a function with no drain wait
+/// (`output_queue_status`) of its own or of a function it calls.
+fn rebinds(c: &Code, file: &str, out: &mut BTreeSet<String>) {
+    let spins = |m: usize, f: &str| c.modules[m].funcs[f].body.contains("output_queue_status");
+    for (m, func) in c.task_reached() {
+        let body = &c.modules[m].funcs[&func].body;
+        if !body.contains("oqc(") {
+            continue;
+        }
+        if spins(m, &func) || c.callees(m, &func).iter().any(|(t, g)| spins(*t, g)) {
+            continue;
+        }
+        out.insert(format!(
+            "`{file}` {func}(): an output queue re-bound during a launch with no drain wait (a \
+             send still in it leaves on the new colour)"
+        ));
+    }
 }
 
 /// Data tasks and activations at startup.
@@ -918,6 +1141,71 @@ mod tests {
         );
         assert!(h.iter().any(|l| l.contains("a data task")));
         assert!(h.iter().any(|l| l.contains("activation at startup")));
+    }
+
+    #[test]
+    fn a_queue_rebound_in_a_task_without_a_drain_and_too_many_seats_are_found() {
+        let pe = "const fab = @import_module(\"ops/fabric.csl\");\n\
+                  const tile_config = @import_module(\"<tile_config>\");\n\
+                  fn init() void { fab.oqc(4, 9); }\n\
+                  fn send() void { fab.oqc(4, 7); }\n\
+                  fn wait() void { while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {} }\n\
+                  fn safe() void { wait(); fab.oqc(4, 7); }\n\
+                  task go() void { send(); safe(); }\n\
+                  comptime {\n  @bind_local_task(go, @get_local_task_id(8));\n  @export_symbol(init);\n}\n";
+        let h = hazards(&files(pe), "pe.csl", &BTreeMap::new());
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert!(h[0].contains("send(): an output queue re-bound"), "{h:?}");
+        assert_eq!(seats(1, 1), None);
+        assert_eq!(seats(7, 8), None);
+        assert!(seats(8, 8).is_some());
+    }
+
+    #[test]
+    fn a_handoff_taken_on_a_queue_rebound_in_a_ring_is_found() {
+        let mut plan = crate::compile::target::searched("llama31-8b-bf16-kv-bf16").plan;
+        plan.seats = 2;
+        let levers = crate::compile::emit::params::Levers::of(&plan.levers, "").unwrap();
+        let prog = Program::of(plan).unwrap();
+        let kinds = crate::compile::emit::params::kernels(&prog, &levers).unwrap();
+        let mut own: Vec<(String, String)> = kinds
+            .iter()
+            .filter(|(_, kb)| !kb.source.is_empty())
+            .map(|(k, kb)| {
+                let text = prog.source(kb.source, crate::sources::get(kb.source).unwrap());
+                (format!("{}.csl", k.stem), text.unwrap())
+            })
+            .collect();
+        for (n, s) in crate::sources::OPS {
+            own.extend(prog.source(n, s).map(|s| (format!("ops/{n}"), s)));
+        }
+        assert_eq!(late_inputs(&prog, &kinds, &own), Ok(Vec::new()));
+        // the pass-end turn's colour bound after the last partial, and the pass-start turn's during
+        // a launch
+        let send = "pe.send_x(Hc);\n  }\n  return bo";
+        for (from, to, found) in [
+            (
+                format!("if (l + 1 == K) {{ pe.post_in(); }}\n  {send}"),
+                send.replace("send_x(Hc);", "send_x(Hc); pe.post_in();"),
+                "rcfg[55]",
+            ),
+            (
+                "pe.relay_in(18)".into(),
+                "pe.relay(18, 1)".into(),
+                "rcfg[52]",
+            ),
+        ] {
+            let mut own = own.clone();
+            for (_, s) in &mut own {
+                *s = s.replace(&from, &to);
+                if found == "rcfg[52]" {
+                    let oq = "fab.oqc(4, rcfg[RQ + o + 2]);";
+                    *s = s.replacen(oq, &format!("fab.iqc(6, rcfg[RQ + o + 1]); {oq}"), 1);
+                }
+            }
+            let h = late_inputs(&prog, &kinds, &own).unwrap();
+            assert!(h.iter().any(|h| h.contains(found)), "{from}: {h:?}");
+        }
     }
 
     /// klein's tiled decode at a 4 x 4 latent, first 19 ops: with the sends blocking, its

@@ -67,6 +67,7 @@ param NR: u16 = 16;    // rcfg's route slots, its words past them
 param RCW: u16 = 25;
 param DONEG: u16 = 0;  // 1: bind_iqs's bookkeeping in memory
 param FIFOW: u16 = 32; // the reductions' FIFO depth (words)
+param SEATS: u16 = 1;  // a ring of seats: a state and a KV window a seat (ops/seats.csl) //+seats
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6, .DONE_GLOBAL = DONEG == 1 });
@@ -126,10 +127,14 @@ var w_ptr: [*]u16 = &pe.w;
 var rcfg_ptr: [*]u32 = &pe.rcfg;
 
 // ---------------------------------------------------------------- the mixers
-const att = @import_module("ops/att.csl", .{ .pe = pe, .fab = fab, .math = math, .NL = if (MIXK == 0 and ATT == 1) NLA else 0,
-  .Qh = Qh, .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .HD = HD, .QKN = QKN, .ATTL = ATTL });
-const gdn = @import_module("ops/gdn.csl", .{ .pe = pe, .fab = fab, .NL = if (MIXK == 0 and GDN == 1) NLG else 0,
-  .DV = DV, .DK = DK, .GDEC = GDEC });
+const att = @import_module("ops/att.csl", .{ .pe = pe, .fab = fab, .math = math, .NL = if (MIXK == 0 and ATT == 1) NLA else 0, //-seats
+  .Qh = Qh, .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .HD = HD, .QKN = QKN, .ATTL = ATTL }); //-seats
+const gdn = @import_module("ops/gdn.csl", .{ .pe = pe, .fab = fab, .NL = if (MIXK == 0 and GDN == 1) NLG else 0, //-seats
+  .DV = DV, .DK = DK, .GDEC = GDEC }); //-seats
+const att = @import_module("ops/att.csl", .{ .pe = pe, .fab = fab, .math = math, .NL = if (MIXK == 0 and ATT == 1) NLA else 0, //+seats
+  .Qh = Qh, .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .HD = HD, .QKN = QKN, .ATTL = ATTL, .SEATS = SEATS }); //+seats
+const gdn = @import_module("ops/gdn.csl", .{ .pe = pe, .fab = fab, .NL = if (MIXK == 0 and GDN == 1) NLG else 0, //+seats
+  .DV = DV, .DK = DK, .GDEC = GDEC, .SEATS = SEATS }); //+seats
 const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM, .SH = SH,
   .AROW = AROW, .KEV = KEV, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PYW, .HDS = HDS, .HDG = HDG,
   .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG });
@@ -189,6 +194,7 @@ fn layer0(l: u16, b: u32) u32 {
   stamp(8 + 9 * l);
   pe.mv32(bo + @as(u32, QO) * Hc + @as(u32, Hc) * 2 * Ic, Ic, Hc);
   stamp(9 + 9 * l);
+  if (l + 1 == K) { pe.post_in(); } //+seats
   pe.send_x(Hc);
   }
   return bo + LWM;
@@ -303,7 +309,8 @@ task pass_task() void {
   while (i < n_steps) : (i += 1) {
     var l: u16 = 0;
     // (RCW 26, flags bit 0: the pass-start relay is the token loop's embedding: none before step 1)
-    if (RCW < 26 or i > 0 or (pe.rcfg[pe.RQ + 25] & 1) == 0) { pe.relay(18, if (MIXK == 1) 0 else 1); }
+    if (RCW < 26 or i > 0 or (pe.rcfg[pe.RQ + 25] & 1) == 0) { pe.relay(18, if (MIXK == 1) 0 else 1); } //-seats
+    pe.relay_in(18); //+seats
     if (MIXK == 1 and SH == 1) { kv.pass_start(pos0 + i, i); }
     stamp(0);
     const nl: u16 = if ((DIAG & 2) != 0) 1 else K;

@@ -5,6 +5,7 @@
 //! ```text
 //! wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden <golden.json>
 //!             [--steps N] [--tokens N] [--logits <out.json>] [--times <out.json>]
+//!             [--seats M [--laps N] [--windows FIRST:POSITIONS,...]]
 //! wafer-bench --reading <dir> --program <dir> --inputs <dir> [--grid T,H,W] [--steps N]
 //!             [--golden <dir>] [--save <dir>] [--statics <dir> | --checkpoint <dir | .zt>]
 //!             [--stamps <dir>] [--poll 1]
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 
 const USAGE: &str = "usage: wafer-bench --program <dir> --weights <dir>[:<prefix>] --golden \
                      <golden.json> [--steps N] [--tokens N] [--cmaddr <addr>] [--logits <out.json>] \
-                     [--times <out.json>]\n       wafer-bench --reading <dir> --program <dir> --inputs \
+                     [--times <out.json>] [--seats M [--laps N] [--windows F:P,...]]\n       wafer-bench --reading <dir> --program <dir> --inputs \
                      <dir> [--grid T,H,W] [--steps N] [--golden <dir>] [--save <dir>] [--cmaddr <addr>] \
                      [--statics <dir> | --checkpoint <dir | .zt>] [--stamps <dir>] [--poll 1]\n       \
                      wafer-bench --decode <golden.json> --checkpoint <dir | .zt> (--reading <dir> \
@@ -130,6 +131,137 @@ fn mean(rows: &[Vec<f64>]) -> Vec<f64> {
         }
     }
     m.iter().map(|v| v.round()).collect()
+}
+
+/// `--seats M`: M sequences, seat `j` the prompt and the golden's first `j` tokens, each greedy
+/// for the golden's next `n - (M - 1)`: on a ring of M seats at once, on a program of one seat
+/// one after another, `laps` laps a launch (0: as many as the ring holds). Each seat's tokens
+/// against the golden's; the ring's ms a lap (wall, and its `compute` alone) over the launches
+/// after the first; a hash of the last pass's logits (seat M - 1's), as read.
+fn ring(
+    m: &mut ArtifactModel,
+    prompt: &[u32],
+    want: &[u32],
+    n: usize,
+    seats: usize,
+    laps: usize,
+) -> Result<bool, String> {
+    let ring = m.seats();
+    if ring > 1 && ring != seats {
+        return Err(format!("--seats {seats}: the program's ring has {ring}"));
+    }
+    if seats == 0 || seats > n {
+        return Err(format!("--seats {seats} of {n} golden tokens"));
+    }
+    let made = n - (seats - 1);
+    // (a seat makes what its window holds; one done runs its own tokens again from 0)
+    let room: Vec<usize> = (0..seats)
+        .map(|j| if ring > 1 { m.room(j) } else { m.positions })
+        .collect();
+    let groups: Vec<Vec<usize>> = if ring > 1 {
+        vec![(0..seats).collect()]
+    } else {
+        (0..seats).map(|j| vec![j]).collect()
+    };
+    let mut seq: Vec<Vec<u32>> = (0..seats)
+        .map(|j| prompt.iter().chain(&want[..j]).copied().collect())
+        .collect();
+    let known: Vec<usize> = seq.iter().map(Vec::len).collect();
+    let made_j: Vec<usize> = (0..seats)
+        .map(|j| made.min(room[j].saturating_sub(known[j])))
+        .collect();
+    let (mut ms, mut compute_ms, mut timed, mut launches) = (0.0, 0.0, 0usize, 0usize);
+    for g in &groups {
+        let mut at = vec![0usize; g.len()];
+        let mut done = vec![false; g.len()];
+        let per = if laps > 0 { laps } else { m.cap / g.len() };
+        let mut first_launch = true;
+        loop {
+            for (i, &j) in g.iter().enumerate() {
+                done[i] |= at[i] + 1 >= known[j] + made_j[j];
+            }
+            let left: Vec<usize> = (g.iter().zip(&at).zip(&done))
+                .map(|((&j, &a), &d)| {
+                    if d {
+                        0
+                    } else {
+                        (known[j] + made_j[j]).saturating_sub(a + 1)
+                    }
+                })
+                .collect();
+            // (no more laps than a seat still making tokens has room for)
+            let fits = (g.iter().zip(&at).zip(&done))
+                .filter(|(_, d)| !**d)
+                .map(|((&j, &a), _)| room[j] - a)
+                .min()
+                .unwrap_or(per);
+            let l = per.min(fits).min(left.iter().copied().max().unwrap_or(0));
+            if l == 0 {
+                break;
+            }
+            for (i, &j) in g.iter().enumerate() {
+                if at[i] + l > room[j] {
+                    at[i] = 0;
+                }
+            }
+            let first: Vec<u32> = g.iter().zip(&at).map(|(&j, &a)| seq[j][a]).collect();
+            let force: Vec<Vec<u32>> = (g.iter().zip(&at))
+                .map(|(&j, &a)| {
+                    seq[j][(a + 1).min(seq[j].len())..seq[j].len().min(a + 1 + l)].to_vec()
+                })
+                .collect();
+            let (t0, c0) = (std::time::Instant::now(), m.host_ns[2]);
+            let r = m.ring_launch(&first, &at, &force, l * seats)?;
+            if !first_launch {
+                ms += t0.elapsed().as_secs_f64() * 1e3;
+                compute_ms += (m.host_ns[2] - c0) as f64 / 1e6;
+                timed += l;
+            }
+            first_launch = false;
+            launches += 1;
+            for (i, &j) in g.iter().enumerate() {
+                for k in 0..l {
+                    if at[i] + k + 1 >= seq[j].len() {
+                        seq[j].push(r[k * g.len() + i]);
+                    }
+                }
+                at[i] += l;
+            }
+        }
+    }
+    let mut ok = true;
+    for (j, s) in seq.iter().enumerate() {
+        let made = made_j[j];
+        let got = &s[known[j]..(known[j] + made).min(s.len())];
+        let w = &want[j..j + made];
+        let mis = got.iter().zip(w).filter(|(a, b)| a != b).count() + made - got.len();
+        let from = got.iter().zip(w).position(|(a, b)| a != b);
+        ok &= mis == 0;
+        println!(
+            "SEAT {j}: {mis} mismatches of {made}{} from position {} got {got:?}",
+            from.map_or(String::new(), |i| format!(" from {i}")),
+            known[j]
+        );
+    }
+    let lgt = m.last_logits()?;
+    let h = lgt.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &w| {
+        (h ^ u64::from(w)).wrapping_mul(0x100_0000_01b3)
+    });
+    let a_lap = |v: f64| {
+        if timed > 0 {
+            v / timed as f64
+        } else {
+            f64::NAN
+        }
+    };
+    println!(
+        "RING {seats} seats on a ring of {ring}: {launches} launches; {:.4} ms a lap ({:.4} compute), \
+         {:.1} tokens/s; last logits {h:016x}",
+        a_lap(ms),
+        a_lap(compute_ms),
+        (if ring > 1 { seats * timed } else { timed }) as f64 / ms * 1e3
+    );
+    Ok(ok)
 }
 
 /// A greedy sequence as [`greedy`], every probe's `tdbg` read after each launch; the cycles of
@@ -805,6 +937,25 @@ fn run() -> Result<bool, String> {
     rt.run();
     let vocab = art.header.model.vocab as usize;
     let mut m = ArtifactModel::open(Box::new(rt), &weights, &art, vocab)?;
+    // each seat's KV window in the ring's pool: its first position and positions
+    let wins = |w: &str| {
+        w.split(',')
+            .map(|x| {
+                let (a, b) = x.split_once(':').ok_or(format!("windows {w}"))?;
+                Ok((
+                    a.parse().map_err(|_| format!("windows {w}"))?,
+                    b.parse().map_err(|_| format!("windows {w}"))?,
+                ))
+            })
+            .collect::<Result<Vec<(usize, usize)>, String>>()
+    };
+    if let Some(w) = get.get("windows") {
+        m.windows(&wins(w)?)?;
+    }
+    if get.contains_key("seats") {
+        let (seats, laps) = (num("seats", 1)?, num("laps", 0)?);
+        return ring(&mut m, &prompt, &want, n, seats, laps);
+    }
     let mut ok = true;
     for rep in 0..2 {
         let t0 = std::time::Instant::now();

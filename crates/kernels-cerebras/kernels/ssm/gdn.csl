@@ -14,9 +14,12 @@ param NL: u16;
 param DV: u16;
 param DK: u16;
 param GDEC: u16;
+param SEATS: u16 = 1; //+seats
 
 const ON: bool = NL > 0;   // (NL 0: a unit with no GDN layer, every buffer one word)
-var st = @zeros([if (ON) NL * DV else 1]f32);
+var st = @zeros([if (ON) NL * DV else 1]f32); //-seats
+var st = @zeros([if (ON) SEATS * NL * DV else 1]f32);   // a state a seat //+seats
+var sbase: u16 = 0;   // the pass's seat's first layer //+seats
 var dl = @zeros([if (ON) DV else 1]f32);
 var gb = @zeros([if (ON) 2 * DK + 2 else 1]f32);   // CY's multicast: k DK, q DK, decay, pad
 var kq = @zeros([2]f32);
@@ -28,10 +31,14 @@ const gdec_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> gdecw[i] });
 
 // GDN layer g's mixer: the column partial sent, o (the out_proj's x) in xh
 fn mix(g: u16) void {
-  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32); //-seats
   const gsrc = pe.word;
   @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{2 * DK + 2} -> gb[i] }), fab.fin(pe.q_ym, 2 * DK + 2));
-  if (gb[2 * DK + 1] != 0.0) { @fmovs(@set_dsd_length(s, DV), 0.0); }   // position 0: a new sequence
+  if (gb[2 * DK + 1] != 0.0) { @fmovs(@set_dsd_length(s, DV), 0.0); }   // position 0: a new sequence //-seats
+  const sw = @as(u16, gb[2 * DK + 1]);   // 2 seat + reset //+seats
+  sbase = (sw >> 1) * NL; //+seats
+  const s = @increment_dsd_offset(st_d, @as(i16, (sbase + g) * DV), f32); //+seats
+  if ((sw & 1) != 0) { @fmovs(@set_dsd_length(s, DV), 0.0); }   // position 0: a new sequence //+seats
   if ((gsrc & 0x4000) != 0) {
     const j = gsrc & 0xff;
     kq[0] = if ((gsrc & 0x8000) != 0) gb[j] else 0.0;
@@ -64,7 +71,8 @@ fn mix(g: u16) void {
 }
 // GDN layer g's state update (after the out_proj send)
 fn update(g: u16) void {
-  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32);
+  const s = @increment_dsd_offset(st_d, @as(i16, g * DV), f32); //-seats
+  const s = @increment_dsd_offset(st_d, @as(i16, (sbase + g) * DV), f32); //+seats
   if (GDEC == 1) { @fmuls(s, s, gdecw[0]); }
   @fmacs(s, s, dl_d, kq[0]);
 }

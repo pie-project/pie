@@ -7,7 +7,7 @@ use crate::wafer;
 pub(super) use wafer::MODEL_NS;
 
 /// A wafer model error as the engine's.
-fn device(e: String) -> Error {
+pub(super) fn device(e: String) -> Error {
     Error::Device(format!("the wafer model: {e}"))
 }
 

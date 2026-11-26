@@ -70,6 +70,11 @@ impl Moving {
                         att += entries * (4.0 * dc + 4.0);
                     }
                 }
+                // a ring's other seats: their GDN states and log-sum-exp references (f32)
+                if plan.seats > 1 {
+                    let (gdn, nla) = seat_state(plan, unit);
+                    att += f64::from(plan.seats - 1) * 4.0 * (gdn + nla * f64::from(qh));
+                }
                 let mut w = if split { att.max(mlp) } else { att + mlp };
                 if !split && run.attention {
                     w += 10.0 * f64::from(qh * entries);
@@ -81,6 +86,15 @@ impl Moving {
         let head = 4.0 * f64::from(p.head.vocab_rows) * hdc;
         Moving { weight, head }
     }
+}
+
+/// A unit's GDN state words a weight PE (its layers' v dims a column) and its attention layers.
+fn seat_state(plan: &Plan, unit: &[LayerKind]) -> (f64, f64) {
+    let dv = plan.shape.gdn.map_or(0, |g| {
+        (g.value_heads * g.value_dim).div_ceil(plan.partition.cols.max(1))
+    });
+    let gdn = unit.iter().filter(|l| matches!(l, LayerKind::Gdn)).count() as f64;
+    (gdn * f64::from(dv), unit.len() as f64 - gdn)
 }
 
 /// A layer's projection outputs (q, k, v and gates, or GDN's) and its q heads' dims (the

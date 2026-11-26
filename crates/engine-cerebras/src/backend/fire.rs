@@ -10,14 +10,14 @@ use engine::program::InstanceId;
 use eta_exec::Value;
 use eta_ir::registry::{GeometryClass, Stage};
 
-use super::CerebrasEngine;
 use super::kv::Kv;
 use super::launch::{self, MODEL_NS};
+use super::{CerebrasEngine, ring};
 use crate::guest::{port_error, refusal};
 use crate::wafer;
 
 /// Steps a sequence's first token loop runs past its row.
-const FIRST_LOOP: usize = 8;
+pub(super) const FIRST_LOOP: usize = 8;
 
 /// The token loop's most steps past a greedy lane's row when the config states none and the
 /// program names no loop of its own.
@@ -153,11 +153,16 @@ fn causal(mask: &engine::fire::Mask, position: u64) -> bool {
     admitted == want.min(mask.len())
 }
 
+/// What a lane's rows are answered with: the last one's argmax (a greedy lane's), or their logits.
+pub(super) enum Forward {
+    Argmax(u32),
+    Logits(Vec<Vec<f32>>),
+}
+
 impl CerebrasEngine {
     /// Runs `tokens` at positions `start..` for the lane (`slot`, its `pages`), the cache first
     /// brought to the lane's history; the logits of `rows`, each the vocabulary wide. `greedy`: the
-    /// model runs its token loop `lookahead` steps past the row and returns a one-hot of its
-    /// argmax.
+    /// model runs its token loop `lookahead` steps past the row and returns its argmax alone.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward(
         &mut self,
@@ -168,13 +173,12 @@ impl CerebrasEngine {
         rows: &[u32],
         greedy: bool,
         ahead: Option<u32>,
-    ) -> EngineResult<(Vec<Vec<f32>>, bool)> {
+    ) -> EngineResult<Forward> {
         let history = self.kv.history(slot, pages, start)?;
         self.model()?;
         let last_only = rows.len() == 1 && rows[0] as usize + 1 == tokens.len();
         let lookahead = self.lookahead();
         let greedy = greedy && last_only && lookahead > 0;
-        let width = self.readout()?.1 as usize;
         let fed: Vec<u32> = history.iter().chain(tokens).copied().collect();
         // The wafer program runs its token loops back to back: the next
         // is posted as one lands, so the wafer runs while rows are answered.
@@ -196,7 +200,7 @@ impl CerebrasEngine {
                     if posting {
                         self.post_loop()?;
                     }
-                    return Ok((vec![one_hot(width, Some(token))], true));
+                    return Ok(Forward::Argmax(token));
                 }
             }
             // Nothing else runs while a posted loop is out: it lands first.
@@ -262,23 +266,20 @@ impl CerebrasEngine {
             if posting {
                 self.post_loop()?;
             }
-            return Ok((vec![one_hot(width, Some(token))], true));
+            return Ok(Forward::Argmax(token));
         }
         let which = logits_wanted(rows, tokens.len());
         let logits = launch::forward(self.model()?, tokens, start, which)?;
         self.kv.cached.extend(tokens);
         self.kv.write(slot, pages, history, tokens)?;
-        Ok((
-            match which {
-                wafer::Logits::None => Vec::new(),
-                wafer::Logits::Last => logits,
-                wafer::Logits::All => rows
-                    .iter()
-                    .map(|&r| logits.get(r as usize).cloned().unwrap_or_default())
-                    .collect(),
-            },
-            false,
-        ))
+        Ok(Forward::Logits(match which {
+            wafer::Logits::None => Vec::new(),
+            wafer::Logits::Last => logits,
+            wafer::Logits::All => rows
+                .iter()
+                .map(|&r| logits.get(r as usize).cloned().unwrap_or_default())
+                .collect(),
+        }))
     }
 
     /// Whether the model is a unit program (its lanes' rows run together, each over its lane's
@@ -488,10 +489,13 @@ impl CerebrasEngine {
         let (name, width) = self.readout()?;
         let mut logits: Vec<Vec<Vec<f32>>> = Vec::with_capacity(lanes.len());
         let mut read_rows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
-        // Lanes a token loop answered (their row a one-hot of the argmax).
-        let mut fast: Vec<bool> = Vec::with_capacity(lanes.len());
+        // Greedy lanes the model answered with their argmax alone (no logits row made).
+        let mut known: Vec<Option<u32>> = vec![None; lanes.len()];
         // a unit program's lanes, run together after: (lane, its first position, greedy)
         let mut paged: Vec<(usize, u32, bool)> = Vec::new();
+        // a ring's, run together after, and each one's lane and history
+        let mut wants: Vec<ring::Want> = Vec::new();
+        let mut seated: Vec<(usize, Vec<u32>)> = Vec::new();
         for (at, lane) in lanes.iter().enumerate() {
             let n = tokens[at].len() as u32;
             let rows: Vec<u32> = match &lane.readout {
@@ -500,8 +504,8 @@ impl CerebrasEngine {
                 Readout::None if attached.contains_key(&at) && n > 0 => vec![n - 1],
                 _ => Vec::new(),
             };
-            let (out, ran_ahead) = if tokens[at].is_empty() || lane_faulted(&outcome, at) {
-                (Vec::new(), false)
+            let out = if tokens[at].is_empty() || lane_faulted(&outcome, at) {
+                Vec::new()
             } else {
                 // The rows' positions: stated (consecutive), else after what the lane holds.
                 let start = match positions[at].first() {
@@ -526,7 +530,7 @@ impl CerebrasEngine {
                 };
                 if let Err(refused) = runs {
                     fault_lane(&mut outcome, step, at, &refused.to_string());
-                    (Vec::new(), false)
+                    Vec::new()
                 } else {
                     // Greedy: the lane's one reader takes only the argmax of
                     // the logits.
@@ -534,13 +538,29 @@ impl CerebrasEngine {
                         .get(&at)
                         .is_some_and(|&instance| self.programs.greedy_reads(instance, &name))
                         && one_reader(step, at);
-                    if self.paged() {
+                    if self.ring.is_some() {
+                        // the lanes' rows run together below, each lane on its seat
+                        let history = self.kv.history(lane.slot, &pages[at], start)?;
+                        let last = greedy && self.lookahead() > 0 && rows == [n - 1];
+                        wants.push(ring::Want {
+                            slot: lane.slot,
+                            instance: attached.get(&at).copied(),
+                            fed: history.iter().chain(&tokens[at]).copied().collect(),
+                            logits: if last {
+                                Vec::new()
+                            } else {
+                                rows.iter().map(|&r| (start + r) as usize).collect()
+                            },
+                        });
+                        seated.push((at, history));
+                        Vec::new()
+                    } else if self.paged() {
                         // the lanes' rows run together below (a launch B rows, each over its
                         // lane's pages)
                         paged.push((at, start, greedy));
-                        (Vec::new(), false)
+                        Vec::new()
                     } else {
-                        self.forward(
+                        match self.forward(
                             lane.slot,
                             &pages[at],
                             &tokens[at],
@@ -548,13 +568,34 @@ impl CerebrasEngine {
                             &rows,
                             greedy,
                             lane.fires_after,
-                        )?
+                        )? {
+                            Forward::Argmax(token) => {
+                                known[at] = Some(token);
+                                vec![Vec::new()]
+                            }
+                            Forward::Logits(rows) => rows,
+                        }
                     }
                 }
             };
             logits.push(out);
-            fast.push(ran_ahead);
             read_rows.push(rows);
+        }
+        if !wants.is_empty() {
+            let ahead = self.lookahead() > 0;
+            let (Some(ring), Some(model)) = (self.ring.as_mut(), self.model.as_mut()) else {
+                return Err(Error::Load("the wafer program has no ring".into()));
+            };
+            let got = ring.rows(model, &wants, ahead).map_err(launch::device)?;
+            for ((at, history), got) in seated.into_iter().zip(got) {
+                known[at] = got.argmax.filter(|_| !read_rows[at].is_empty());
+                logits[at] = match known[at] {
+                    Some(_) => vec![Vec::new()],
+                    None => got.logits,
+                };
+                self.kv
+                    .write(lanes[at].slot, &pages[at], history, &tokens[at])?;
+            }
         }
         if !paged.is_empty() {
             // A lane's kv refs are the pool's: the wafer's pages they name. Its
@@ -594,10 +635,10 @@ impl CerebrasEngine {
                 let mine = &argmax[k..k + n];
                 k += n;
                 if greedy {
-                    // its one reader takes the argmax: the row a one-hot of it
+                    // its one reader takes the argmax: no logits row is made
                     let last = read_rows[at].first().map_or(n - 1, |&r| r as usize);
-                    logits[at] = vec![one_hot(width as usize, mine.get(last).copied())];
-                    fast[at] = true;
+                    known[at] = mine.get(last).copied();
+                    logits[at] = vec![Vec::new()];
                 } else {
                     logits[at] = read_rows[at]
                         .iter()
@@ -618,13 +659,23 @@ impl CerebrasEngine {
                 fault_pass(&mut outcome, attachment, "epilogue", &why);
                 continue;
             }
-            match self.epilogue_outputs(attachment, &name, &mut logits, &fast) {
-                Ok(outputs) => {
-                    if let Err(refused) = self.programs.fire_interpreted(
-                        attachment.instance,
-                        &outputs,
-                        Stage::Epilogue,
-                    ) {
+            match self.epilogue_outputs(attachment, &name, width, &mut logits, &known) {
+                Ok((outputs, argmaxed)) => {
+                    let fired = if argmaxed.is_empty() {
+                        self.programs.fire_interpreted(
+                            attachment.instance,
+                            &outputs,
+                            Stage::Epilogue,
+                        )
+                    } else {
+                        self.programs.fire_argmaxed(
+                            attachment.instance,
+                            &outputs,
+                            &argmaxed,
+                            Stage::Epilogue,
+                        )
+                    };
+                    if let Err(refused) = fired {
                         fault_pass(&mut outcome, attachment, "epilogue", &refused.to_string());
                     }
                 }
@@ -650,7 +701,7 @@ impl CerebrasEngine {
                 // answer is in its program's channels, as a device guest's.
                 if matches!(lane.readout, Readout::None)
                     || logits[at].is_empty()
-                    || fast[at]
+                    || known[at].is_some()
                     || lane_faulted(&outcome, at)
                 {
                     return LaneReadout::default();
@@ -745,10 +796,13 @@ impl CerebrasEngine {
         &self,
         attachment: &engine::fire::Attachment,
         name: &str,
+        width: u32,
         logits: &mut [Vec<Vec<f32>>],
-        fast: &[bool],
-    ) -> EngineResult<Vec<(String, u32, Value)>> {
+        known: &[Option<u32>],
+    ) -> EngineResult<Argmaxed> {
         let mut outputs: Vec<(String, u32, Value)> = Vec::new();
+        // outputs answered by their argmax alone (a greedy lane the model told only that)
+        let mut argmaxed: Vec<(String, u32, Vec<i32>)> = Vec::new();
         for (out_name, k) in self.programs.outputs_of(attachment.instance) {
             let lane = attachment.lane as usize + k as usize;
             if out_name != name && out_name.starts_with("attn.") {
@@ -764,8 +818,23 @@ impl CerebrasEngine {
             // A pass over several lanes reads its rows as one output: the
             // lane's, then the pass's later lanes'.
             let end = attachment.lane as usize + attachment.lanes.max(1) as usize;
+            let lanes_of = lane..end.max(lane + 1);
+            if lanes_of
+                .clone()
+                .all(|l| known.get(l).copied().flatten().is_some())
+            {
+                let ids = lanes_of.map(|l| known[l].unwrap_or(0) as i32).collect();
+                argmaxed.push((out_name.clone(), k, ids));
+                continue;
+            }
+            for l in lanes_of {
+                // (a lane known by its argmax read beside others: its one-hot row)
+                if let Some(token) = known.get(l).copied().flatten() {
+                    logits[l] = vec![one_hot(width as usize, Some(token))];
+                }
+            }
             if logits.get(lane).is_some() {
-                let flat: Vec<f32> = if fast.get(lane) == Some(&true)
+                let flat: Vec<f32> = if known.get(lane).copied().flatten().is_some()
                     && end <= lane + 1
                     && logits[lane].len() == 1
                 {
@@ -780,9 +849,12 @@ impl CerebrasEngine {
                 outputs.push((out_name.clone(), k, Value::F32(flat)));
             }
         }
-        Ok(outputs)
+        Ok((outputs, argmaxed))
     }
 }
+
+/// An epilogue's outputs: its logits rows, and those answered by their argmax alone.
+type Argmaxed = (Vec<(String, u32, Value)>, Vec<(String, u32, Vec<i32>)>);
 
 /// The tokens, positions and masks of a step's lanes, as their instances
 /// resolve them.

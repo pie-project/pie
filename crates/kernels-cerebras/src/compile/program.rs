@@ -148,7 +148,11 @@ impl Program {
             roles,
             schedule,
         };
-        prog.kernels = super::kernels::of(&prog)?;
+        let mut ks = super::kernels::of(&prog)?;
+        for b in &prog.blocks {
+            b.kernels(&prog, &mut ks)?;
+        }
+        prog.kernels = ks;
         prog.fabric.check_route_slots(&prog.floor, &|k| {
             prog.kernels.get(&k).map(|kb| kb.route_slots)
         })?;
@@ -158,6 +162,25 @@ impl Program {
         }
         prog.overrides = o;
         Ok(prog)
+    }
+
+    /// Every name the kernels export, with its element type, in export order: the kernel set's,
+    /// then the blocks' ([`Block::symbols`]).
+    pub fn symbols(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = super::kernels::symbols(self.roles).to_vec();
+        for b in &self.blocks {
+            out.extend_from_slice(b.symbols());
+        }
+        out
+    }
+
+    /// A kernel or op source as the program writes it ([`Block::source`]; `None`: not written).
+    pub fn source(&self, name: &str, text: &str) -> Option<String> {
+        let mut t = text.to_string();
+        for b in &self.blocks {
+            t = b.source(name, t)?;
+        }
+        Some(t)
     }
 
     /// Every copy onto the wafer: the blocks' in order.

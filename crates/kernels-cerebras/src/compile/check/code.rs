@@ -458,6 +458,36 @@ pub(super) struct Code {
 }
 
 impl Code {
+    /// The functions a task reaches (the tasks too): what runs during a launch.
+    pub(super) fn task_reached(&self) -> BTreeSet<(usize, String)> {
+        let mut work: Vec<(usize, String)> = (self.modules.iter().enumerate())
+            .flat_map(|(at, m)| {
+                (m.funcs.iter())
+                    .filter(|(_, f)| f.task)
+                    .map(move |(n, _)| (at, n.clone()))
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        while let Some(k) = work.pop() {
+            if !seen.insert(k.clone()) {
+                continue;
+            }
+            for (q, n) in &self.modules[k.0].funcs[&k.1].refs {
+                if let Some(t) = self.resolve(k.0, q.as_deref(), n) {
+                    work.push(t);
+                }
+            }
+        }
+        seen
+    }
+
+    /// The functions `f` of module `m` calls.
+    pub(super) fn callees(&self, m: usize, f: &str) -> Vec<(usize, String)> {
+        (self.modules[m].funcs[f].refs.iter())
+            .filter_map(|(q, n)| self.resolve(m, q.as_deref(), n))
+            .collect()
+    }
+
     /// The function `(q, n)` names from module `at`.
     pub(super) fn resolve(&self, at: usize, q: Option<&str>, n: &str) -> Option<(usize, String)> {
         let target = match q {

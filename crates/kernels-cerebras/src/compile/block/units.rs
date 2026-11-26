@@ -151,19 +151,53 @@ pub fn unit_chains(plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
         }
     }
     for i in 1..floor.units.len() {
-        handoff(floor, i - 1, i, w)?;
+        handoff(floor, i - 1, i, &turns(plan, &floor.units[i]), w)?;
     }
     Ok(())
 }
 
+/// The weight column each row's handoff turns in on arriving at `u`: column r, but over a ring a
+/// turn takes a level-2 input its reduction roles leave idle ([`common::weight`]), so a row whose
+/// column heads a group of both reductions swaps columns with the nearest row it can.
+///
+/// [`common::weight`]: crate::compile::kernels::common::weight
+pub fn turns(plan: &Plan, u: &Unit) -> Vec<u32> {
+    let mut col: Vec<u32> = (0..u.rows()).collect();
+    let red = &plan.partition.reduce;
+    if plan.seats <= 1 || red.row == 0 || red.col == 0 {
+        return col;
+    }
+    // (a chain's member k from its root heads a level-2 group at k = 1 mod g)
+    let heads = |k: u32, g: u32| k >= 1 && (k - 1).is_multiple_of(g);
+    let both = |r: u32, c: u32| {
+        heads((u.col_x(c) - u.rect.x).abs_diff(u.cx), red.row)
+            && heads((u.row_y(r) - u.rect.y).abs_diff(u.cy), red.col)
+    };
+    let n = col.len();
+    for r in 0..n {
+        if !both(r as u32, col[r]) {
+            continue;
+        }
+        // the nearest row the two can swap columns with
+        let swap = (1..n)
+            .flat_map(|d| [r + d, r.wrapping_sub(d)])
+            .filter(|&o| o < n)
+            .find(|&o| !both(r as u32, col[o]) && !both(o as u32, col[r]));
+        if let Some(o) = swap {
+            col.swap(r, o);
+        }
+    }
+    col
+}
+
 /// The x handoff between consecutive units `a` -> `b`, one path a weight row `r`. Units in one
-/// unit column (equal rect x): along row r from `a`'s CX to the weight PE at column r
+/// unit column (equal rect x): along row r from `a`'s CX to the weight PE at column `cols[r]`
 /// ([`HANDOFF_OUT`]), down / up that column to `b`'s row r ([`HANDOFF_VERT`] by `a`'s parity; a
 /// gap slot between them only relays), back along the row into `b`'s CX ([`HANDOFF_IN`]); the
 /// turning weight PEs relay ([`RELAY_POST`] leaving `a`, [`RELAY_PRE`] arriving at `b`). Units
 /// in different columns must share rows: one path along the row ([`HANDOFF_ACROSS`]). CX ends
 /// bind [`X_OUT`] / [`X_IN`].
-pub fn handoff(floor: &Floor, a: usize, b: usize, w: &mut Wiring) -> R<()> {
+pub fn handoff(floor: &Floor, a: usize, b: usize, cols: &[u32], w: &mut Wiring) -> R<()> {
     let (ua, ub): (&Unit, &Unit) = match (floor.units.get(a), floor.units.get(b)) {
         (Some(ua), Some(ub)) => (ua, ub),
         _ => return Err(format!("wiring: handoff {a} -> {b} past the units")),
@@ -179,7 +213,7 @@ pub fn handoff(floor: &Floor, a: usize, b: usize, w: &mut Wiring) -> R<()> {
     for r in 0..ua.rows() {
         let (xa, ya) = (ua.cx_x(), ua.row_y(r));
         if vertical {
-            let xcc = ua.col_x(r);
+            let xcc = ua.col_x(cols[r as usize]);
             let st: i64 = if xcc > xa { 1 } else { -1 };
             let yb = ub.row_y(r);
             let vs: i64 = if yb > ya { 1 } else { -1 };
