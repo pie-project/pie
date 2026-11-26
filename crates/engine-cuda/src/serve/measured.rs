@@ -92,6 +92,29 @@ fn content_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// What shapes a deployment's bodies, beside the engine build [`path`]
+/// keys: the checkpoint, the trace, the profile, the pages, context and
+/// slots, the stated kv, and a test build's weight pin where it sets one
+/// (serving's is always the cache's, so its keys, and the committed
+/// records', are as before): a load whose routed banks are staged arms
+/// other bodies than one whose banks are resident, and never holds the
+/// other's record.
+#[must_use]
+pub(crate) fn bodies_shape(
+    identity: &str,
+    trace: &str,
+    profile: &dyn std::fmt::Debug,
+    (page_size, context, slots): (u32, u32, u32),
+    kv_budget: &dyn std::fmt::Debug,
+    pin: super::boot::WeightPin,
+) -> String {
+    let shape = format!("{identity}|{trace}|{profile:?}|{page_size}|{context}|{slots}|{kv_budget:?}");
+    match pin {
+        super::boot::WeightPin::Cached => shape,
+        pin => format!("{shape}|{pin:?}"),
+    }
+}
+
 /// The record at `path`, else the committed record of the same key
 /// ([`COMMITTED`]: a measured profile's bodies, carried by the build); none
 /// where neither is there and whole.
@@ -241,4 +264,33 @@ pub(crate) fn export(cache_dir: &Path, out: &Path) -> std::io::Result<Vec<String
     }
     copied.sort();
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Measured, bodies_shape, path, read, write};
+    use crate::serve::boot::WeightPin;
+
+    #[test]
+    fn loads_differing_only_by_the_weight_pin_key_their_own_records() {
+        let dir = std::env::temp_dir().join(format!("pie-bodies-pin-{}", std::process::id()));
+        let at = |pin| {
+            let shape = bodies_shape("zt:1", "trace", &"profile", (16, 4096, 8), &None::<u32>, pin);
+            path(&dir, &shape)
+        };
+        let resident = at(WeightPin::Cached);
+        let staged = at(WeightPin::UntabledExperts);
+        assert_ne!(resident, staged, "the pin is in the key");
+        // The resident load armed whole and recorded; the staged one finds
+        // no record of its own, so it holds the ceiling and measures.
+        let measured = Measured {
+            bytes: 404 << 20,
+            bodies: 161,
+            captured: 500 << 20,
+        };
+        write(&resident, measured).expect("the record is written");
+        assert_eq!(read(&staged), None, "the staged load reads no resident record");
+        assert_eq!(read(&resident), Some(measured));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
