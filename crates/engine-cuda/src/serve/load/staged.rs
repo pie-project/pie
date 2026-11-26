@@ -84,6 +84,7 @@ impl Staged {
             if shell.measuring {
                 shell.measured_refit(device_total, free_before)?;
             }
+            shell.settle_outside()?;
         }
         let resident = footprint(&shell, device_total, free_before);
         // Whatever armed a body, the range stays where it lies: the bodies
