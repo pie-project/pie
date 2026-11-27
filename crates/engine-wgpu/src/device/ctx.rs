@@ -271,8 +271,12 @@ impl Core {
     /// kernels' four pool segments beside their own: the load then takes
     /// their one-segment forms and lays the pool in one binding
     /// ([`super::pipelines::one_segment`]).
+    /// In the tab the pool is one segment whatever the adapter binds: its
+    /// WebGPU refuses two bindings of a buffer that overlap, which the
+    /// one-segment forms are laid out to avoid (`pipelines::exact_views`).
     pub(crate) fn one_segment(&self) -> bool {
-        super::pipelines::one_segment(self.limits.max_storage_buffers_per_shader_stage)
+        cfg!(target_arch = "wasm32")
+            || super::pipelines::one_segment(self.limits.max_storage_buffers_per_shader_stage)
     }
 
     /// `what` refused for `why`: a mapping refused marks the device lost,

@@ -141,6 +141,9 @@ pub fn sized(
             "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
              {act}, and this device binds {} of {} MiB",
             match segs {
+                1 if cfg!(target_arch = "wasm32") => {
+                    "one segment (the tab's pool is always one)".to_string()
+                }
                 1 => "one segment (its stage binds too few storage buffers for four)".to_string(),
                 4 => "four segments".to_string(),
                 n => format!("{n} segments"),

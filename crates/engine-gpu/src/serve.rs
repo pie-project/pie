@@ -3207,9 +3207,15 @@ impl<B: Serve> Shell<B> {
             tracing::info!(
                 pool_bytes = u64::from(total) * chunk,
                 cap_bytes = device.max_buffer(),
-                "the chunk pool is one segment, capped at one binding: this device binds a \
-                 shader stage too few storage buffers for four segments beside a kernel's own, \
-                 so the kernels take their one-segment forms"
+                "the chunk pool is one segment, capped at one binding: {}, so the kernels take \
+                 their one-segment forms",
+                if cfg!(target_arch = "wasm32") {
+                    "in the tab the pool is always one segment (its WebGPU refuses two bindings \
+                     of a buffer that overlap)"
+                } else {
+                    "this device binds a shader stage too few storage buffers for four \
+                     segments beside a kernel's own"
+                }
             );
         }
         let paging = Paging {
