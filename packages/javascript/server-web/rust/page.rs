@@ -39,6 +39,7 @@ pub fn pie_init(log_filter: Option<String>) {
     web_std::time::set_wall_clock(js_sys::Date::now);
     web_std::executor::set_wake_hook(wake);
     wasmtime_web::set_clock(clock_ns);
+    wasmtime_web::set_wall_clock(|| (js_sys::Date::now() * 1_000_000.0) as u64);
     tracing::info!("pie web host initialised");
 }
 
