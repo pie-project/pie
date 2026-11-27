@@ -1,0 +1,33 @@
+{
+  "source": "engine-wgpu guest/session.rs Library::build -> build_call(call=0), as of sc/gpu-pool-seg-forms 79ba744d0",
+  "order": [
+    "bind_layout: device.createBindGroupLayout (below)",
+    "device.createPipelineLayout({label:'pie guest', bindGroupLayouts:[that layout]}); then core.take_error",
+    "per call, sequentially: pushErrorScope('validation'); createShaderModule; createComputePipeline (sync, not Async); popErrorScope awaited (block_on: the green thread yields until the promise resolves)"
+  ],
+  "bindGroupLayout": {
+    "label": "pie guest",
+    "entries": [
+      {"binding": 0, "visibility": "COMPUTE", "buffer": {"type": "storage", "hasDynamicOffset": false, "minBindingSize": 0}, "wgsl": "var<storage, read_write> status : array<atomic<u32>>"},
+      {"binding": 1, "visibility": "COMPUTE", "buffer": {"type": "storage", "hasDynamicOffset": false, "minBindingSize": 0}, "wgsl": "var<storage, read_write> tables : array<u32>  (widened from read)"},
+      {"binding": 4, "visibility": "COMPUTE", "buffer": {"type": "storage", "hasDynamicOffset": false, "minBindingSize": 0}, "wgsl": "var<storage, read_write> heap : array<u32>"},
+      {"binding": 6, "visibility": "COMPUTE", "buffer": {"type": "storage", "hasDynamicOffset": true, "minBindingSize": 48}, "wgsl": "var<storage, read_write> pie_step : PieStep  (widened from uniform; 12 u32 = 48 bytes)"}
+    ]
+  },
+  "pipelineLayout": {"label": "pie guest", "bindGroupLayouts": ["pie guest"], "immediateSize": 0},
+  "shaderModule": {"label": "pie guest", "code": "ci/debug/guest-step0.wgsl (74,496 B whole; the tab logged 74,477 B)"},
+  "computePipeline": {
+    "label": "pie guest",
+    "layout": "pie guest (explicit, not 'auto')",
+    "compute": {"module": "pie guest", "entryPoint": "main", "constants": {}},
+    "compilationOptions": "default (no overrides, zero_initialize_workgroup_memory default)",
+    "cache": null
+  },
+  "workgroupSize": [256, 1, 1],
+  "workgroupMemory": "module-scope var<workgroup>: sel_wg_hist array<atomic<u32>,256>, sel_wg_fill array<atomic<u32>,2>, sel_wg_key array<u32,1024>, sel_wg_idx array<u32,1024> (not reached from call 0's entry)",
+  "deviceHandlers": ["on_uncaptured_error (logs 'wgpu: …')", "set_device_lost_callback (marks lost)"],
+  "notes": [
+    "No buffer is created and no mapAsync is in flight at this create: the outboxes (readback buffers) and the widen's table are the shelf's, made before the pool was sized; the guest's segment bind groups are made after all 49 pipelines.",
+    "The 42 kernel pipelines before load phases go through the same pushErrorScope / sync create / popErrorScope pattern (pipelines.rs build) and succeed."
+  ]
+}
