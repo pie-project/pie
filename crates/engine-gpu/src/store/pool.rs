@@ -60,26 +60,34 @@ fn binding_chunks(chunk_bytes: u64, binding: u64) -> u32 {
 }
 
 /// The most segments a pool of `total_chunks` is cut into with its top
-/// `span` whole in the last ([`segment_chunks`]).
-fn spanned_segments(total_chunks: u32, span: u32) -> u32 {
+/// `span` whole in the last ([`segment_chunks`]), of the `segs` the
+/// kernels bind.
+fn spanned_segments(total_chunks: u32, span: u32, segs: u32) -> u32 {
     if span == 0 {
-        SEGMENTS as u32
+        segs
     } else {
-        (total_chunks / (span + SEGMENTS as u32 - 1)).min(SEGMENTS as u32)
+        (total_chunks / (span + segs - 1)).min(segs)
     }
 }
 
 /// The chunks a segment holds for a pool of `total_chunks` whose top `span`
 /// lie in its last segment: the pool cut into as many segments as it may
-/// be (the kernels bind [`SEGMENTS`]), so commits stay fine, with each
-/// segment within one binding and the last at least the span. Cut into `n`
-/// segments of `ceil(total / n)`, the last holds at least `total / n -
-/// (n - 1)`, so `n <= total / (span + SEGMENTS - 1)` keeps the span whole.
-/// `None`: no count of segments does both (the load is refused).
+/// be (the kernels bind `segs`: [`SEGMENTS`], or one where the device
+/// binds a stage too few storage buffers for four), so commits stay fine,
+/// with each segment within one binding and the last at least the span. Cut
+/// into `n` segments of `ceil(total / n)`, the last holds at least
+/// `total / n - (n - 1)`, so `n <= total / (span + segs - 1)` keeps the span
+/// whole. `None`: no count of segments does both (the load is refused).
 #[must_use]
-pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64, span: u32) -> Option<u32> {
+pub fn segment_chunks(
+    chunk_bytes: u64,
+    total_chunks: u32,
+    binding: u64,
+    span: u32,
+    segs: u32,
+) -> Option<u32> {
     let fits = binding_chunks(chunk_bytes, binding);
-    let most = spanned_segments(total_chunks, span);
+    let most = spanned_segments(total_chunks, span, segs);
     let least = total_chunks.div_ceil(fits);
     (most > 0 && least <= most).then(|| total_chunks.div_ceil(most))
 }
@@ -97,9 +105,8 @@ pub struct Sized {
 
 /// The pool `left` bytes hold (or `kv_budget` of state beside the span,
 /// within `left`) in chunks of `chunk_bytes`: `least_chunks` of state (one
-/// working set) beside a top rung's `act` chunks, bound in at most
-/// [`SEGMENTS`] segments of no more than `binding` bytes, with the span in
-/// the last.
+/// working set) beside a top rung's `act` chunks, bound in at most `segs`
+/// segments of no more than `binding` bytes, with the span in the last.
 pub fn sized(
     left: u64,
     kv_budget: Option<u64>,
@@ -107,6 +114,7 @@ pub fn sized(
     act: u32,
     least_chunks: u32,
     binding: u64,
+    segs: u32,
 ) -> Result<Sized> {
     let chunk = chunk_bytes;
     let room = kv_budget.map_or(left, |budget| {
@@ -115,12 +123,10 @@ pub fn sized(
     let total = engine::chunk::fit(room, chunk, act, least_chunks)
         .map_err(|short| Fault::Residency(short.to_string()))?;
     let binds =
-        u32::try_from((binding / chunk).saturating_mul(SEGMENTS as u64)).unwrap_or(u32::MAX);
-    // Whole segments of a quarter of the pool, all four within the
+        u32::try_from((binding / chunk).saturating_mul(u64::from(segs))).unwrap_or(u32::MAX);
+    // Whole segments of an equal share of the pool, all within the
     // bf16-element index the kernels address the pool by.
-    let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX)
-        / SEGMENTS as u32
-        * SEGMENTS as u32;
+    let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX) / segs * segs;
     // State lies within that index; the span past it is the fire's
     // alone (bound by offset, never indexed), at every rung.
     let total = total.min(binds).min(words.saturating_add(act));
@@ -128,16 +134,21 @@ pub fn sized(
     // binding: chunks past what those bind are not laid. A span near a
     // binding cuts the pool into few segments, and a pool between whole
     // counts of them binds only the lower count's.
-    let total =
-        total.min(spanned_segments(total, act).saturating_mul(binding_chunks(chunk, binding)));
+    let total = total
+        .min(spanned_segments(total, act, segs).saturating_mul(binding_chunks(chunk, binding)));
     let span_short = || {
         Fault::Residency(format!(
             "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
-             {act}, and this device binds four segments of {} MiB",
+             {act}, and this device binds {} of {} MiB",
+            match segs {
+                1 => "one segment (its stage binds too few storage buffers for four)".to_string(),
+                4 => "four segments".to_string(),
+                n => format!("{n} segments"),
+            },
             binding >> 20
         ))
     };
-    let segment_chunks = segment_chunks(chunk, total, binding, act).ok_or_else(span_short)?;
+    let segment_chunks = segment_chunks(chunk, total, binding, act, segs).ok_or_else(span_short)?;
     if total < least_chunks + act {
         return Err(span_short());
     }
@@ -181,6 +192,7 @@ pub fn infeasible(
     chunk_bytes: u64,
     least_chunks: u32,
     binding: u64,
+    segs: u32,
 ) -> Option<&'static str> {
     if rung.widest > binding {
         Some(PAST_ONE_BINDING)
@@ -191,6 +203,7 @@ pub fn infeasible(
         rung.act,
         least_chunks,
         binding,
+        segs,
     )
     .is_err()
     {
@@ -209,10 +222,13 @@ pub fn widest_rung(
     chunk_bytes: u64,
     least_chunks: u32,
     binding: u64,
+    segs: u32,
 ) -> Option<u32> {
     rungs
         .iter()
-        .filter(|rung| infeasible(rung, kv_budget, chunk_bytes, least_chunks, binding).is_none())
+        .filter(|rung| {
+            infeasible(rung, kv_budget, chunk_bytes, least_chunks, binding, segs).is_none()
+        })
         .map(|rung| rung.tokens)
         .max()
 }
@@ -663,12 +679,12 @@ mod tests {
         };
         let top = crate::arena::bound_top(&spans, binding).expect("a rung lies in one binding");
         assert_eq!(top, 256);
-        let pool = super::sized(left, None, chunk, act(top), least, binding)
+        let pool = super::sized(left, None, chunk, act(top), least, binding, 4)
             .expect("the bounded load boots");
         assert!(u64::from(pool.segment_chunks) * chunk <= binding);
         assert!(pool.total >= least + act(top));
         // The top asked is refused as the load refused it.
-        let refused = super::sized(left, None, chunk, act(10240), least, binding)
+        let refused = super::sized(left, None, chunk, act(10240), least, binding, 4)
             .expect_err("a span past one binding");
         assert_eq!(
             refused.to_string(),

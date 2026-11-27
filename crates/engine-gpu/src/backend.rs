@@ -125,6 +125,14 @@ pub trait Context<B: Backend> {
     /// The bytes one buffer may span.
     fn max_buffer(&self) -> u64;
 
+    /// The segments the state pool is laid in, as the kernels this device
+    /// runs bind it: [`kernels_slang::SEGMENTS`], or one where a stage
+    /// binds too few storage buffers for four beside a kernel's own (the
+    /// kernels' one-segment form, `kernels/prim/pool.slang`).
+    fn pool_segments(&self) -> u32 {
+        kernels_slang::SEGMENTS as u32
+    }
+
     fn name(&self) -> &str;
 
     fn cores(&self) -> u32;

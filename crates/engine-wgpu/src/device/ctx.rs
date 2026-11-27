@@ -267,6 +267,14 @@ impl Lost {
 }
 
 impl Core {
+    /// Whether this adapter binds a stage too few storage buffers for the
+    /// kernels' four pool segments beside their own: the load then takes
+    /// their one-segment forms and lays the pool in one binding
+    /// ([`super::pipelines::one_segment`]).
+    pub(crate) fn one_segment(&self) -> bool {
+        super::pipelines::one_segment(self.limits.max_storage_buffers_per_shader_stage)
+    }
+
     /// `what` refused for `why`: a mapping refused marks the device lost,
     /// and a lost device answers with its loss.
     pub(crate) fn fault(&self, what: &'static str, why: impl ToString) -> Fault {
@@ -710,6 +718,21 @@ impl Context {
         // can make.
         #[cfg(feature = "test-limits")]
         let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
+        // A test run's adapter binding a stage fewer storage buffers
+        // (`PIE_TEST_STORAGE_BUFFERS`, as SwiftShader's 10): the kernels'
+        // one-segment forms, forced on a device with room. Test builds only.
+        #[cfg(feature = "test-limits")]
+        let limits = {
+            let mut limits = limits;
+            if let Some(fewer) = std::env::var("PIE_TEST_STORAGE_BUFFERS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                limits.max_storage_buffers_per_shader_stage =
+                    limits.max_storage_buffers_per_shader_stage.min(fewer);
+            }
+            limits
+        };
         let subgroup_min = enabled.subgroups.then_some(info.subgroup_min_size);
         let poller = host::Poller::start(device.clone());
         let core = Arc::new(Core {
@@ -885,6 +908,17 @@ impl Context {
     #[must_use]
     pub fn storage_buffers(&self) -> u32 {
         self.core.limits.max_storage_buffers_per_shader_stage
+    }
+
+    /// The segments the state pool is laid in: one where this adapter
+    /// binds a stage too few storage buffers for four ([`Core::one_segment`]).
+    #[must_use]
+    pub fn pool_segments(&self) -> u32 {
+        if self.core.one_segment() {
+            1
+        } else {
+            kernels_slang::SEGMENTS as u32
+        }
     }
 
     /// What the capacity has left now, past every reservation and the

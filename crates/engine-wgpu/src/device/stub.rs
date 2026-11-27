@@ -80,6 +80,10 @@ impl Context {
         match self.never {}
     }
 
+    pub fn pool_segments(&self) -> u32 {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn resident(&self) -> Option<u32> {
         match self.never {}

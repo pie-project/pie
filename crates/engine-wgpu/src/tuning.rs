@@ -187,7 +187,11 @@ impl Tuning {
                         why: format!("not instantiated at the {} tier", fire.tier.name()),
                     },
                 )?;
-                let (own, pool) = crate::device::pipelines::storage(fire.file, key)?;
+                let (own, pool) = crate::device::pipelines::storage(
+                    fire.file,
+                    key,
+                    crate::device::pipelines::one_segment(limit),
+                )?;
                 Ok::<_, engine_gpu::Fault>((key, own, pool))
             });
             let (key, own, pool) = whole?;
@@ -457,30 +461,57 @@ mod tests {
         }
     }
 
-    /// An adapter binding a stage 10 storage buffers (Chrome on macOS,
-    /// SwiftShader) cannot bind the plain decode, 8 buffers of its own and
-    /// the pool's 4 segments as its module declares them: the load is
-    /// refused by that kernel, both counts and the limit.
+    /// An adapter binding a stage too few storage buffers for every pool
+    /// kernel's own beside four segments (fewer than
+    /// `kernels_slang::POOL_OWN_MAX` + 4) takes the one-segment forms: the
+    /// pool is one binding.
     #[test]
-    fn an_adapter_of_10_storage_buffers_refuses_the_plain_decode_by_name() {
+    fn the_pool_is_one_segment_below_every_kernels_four() {
+        let four = kernels_slang::POOL_OWN_MAX + kernels_slang::SEGMENTS as u32;
+        for (limit, one) in [
+            (8, true),
+            (10, true),
+            (four - 1, true),
+            (four, false),
+            (48, false),
+        ] {
+            assert_eq!(
+                crate::device::pipelines::one_segment(limit),
+                one,
+                "at {limit}"
+            );
+        }
+    }
+
+    /// An adapter binding a stage 10 storage buffers (Chrome on macOS,
+    /// SwiftShader) takes the decode's one-segment form: 8 buffers of its
+    /// own and one segment bind, the split walk's 10 and one do not. At 8
+    /// (WebGPU's default) not even that binds: the load is refused by the
+    /// kernel, its counts and the limit.
+    #[test]
+    fn an_adapter_of_10_storage_buffers_takes_the_one_segment_decode() {
         let mut tuning = tuning();
-        let refused = tuning
+        tuning
             .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], &[], 10)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false));
+        let refused = tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], &[], 8)
             .unwrap_err();
         assert_eq!(
             refused.to_string(),
-            "`attn_sdpa_decode_bf16_d_64` binds 12 storage buffers in its shader stage (8 of \
-             its own and 4 pool segments) and this adapter binds a stage 10 \
+            "`attn_sdpa_decode_bf16_d_64` binds 9 storage buffers in its shader stage (8 of \
+             its own and 1 pool segments) and this adapter binds a stage 8 \
              (`maxStorageBuffersPerShaderStage`)"
         );
-        assert!(!tuning.binds_split(64, false));
     }
 
-    /// At 16 the load is taken and every decode splits; between the whole
-    /// walk's count and the split's the load is taken with the rows walked
-    /// whole, each form by its own count.
+    /// At 16 (every pool kernel's own and four segments) the load is taken
+    /// with four segments and every decode splits; below it the forms bind
+    /// one segment, so the split walk (10 own, its LSE form 11) splits down
+    /// to 12, and at 10 the decode is walked whole.
     #[test]
-    fn an_adapter_of_16_storage_buffers_loads_and_splits_by_the_same_count() {
+    fn an_adapter_splits_by_the_forms_it_takes() {
         let decodes = [(64, false), (64, true)];
         let mut tuning = tuning();
         tuning
@@ -489,55 +520,45 @@ mod tests {
         assert!(tuning.binds_split(64, false) && tuning.binds_split(64, true));
         // A decode the load did not hold is not split.
         assert!(!tuning.binds_split(128, false));
-
-        // The split walk binds 14, its LSE form 15; the whole LSE walk 13.
+        for limit in [14, 13, 12] {
+            tuning
+                .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], limit)
+                .unwrap();
+            assert!(
+                tuning.binds_split(64, false) && tuning.binds_split(64, true),
+                "at {limit}"
+            );
+        }
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 14)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 11)
             .unwrap();
         assert!(tuning.binds_split(64, false) && !tuning.binds_split(64, true));
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 13)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 10)
             .unwrap();
         assert!(!tuning.binds_split(64, false) && !tuning.binds_split(64, true));
-        let refused = tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 12)
-            .unwrap_err();
-        assert!(
-            matches!(
-                &refused,
-                engine_gpu::Fault::StorageBuffers { kernel, own: 9, pool: 4, limit: 12 }
-                    if kernel == "attn_sdpa_decode_lse_bf16_d_64"
-            ),
-            "{refused:?}"
-        );
     }
 
     /// A windowed decode's ring form binds one table more than the plain
-    /// form: at 14 both whole walks and the plain split bind and the ring
-    /// split does not, so the decode is walked whole; at 15 it splits; at
-    /// 12 the ring walk is refused by name.
+    /// form: with one segment its split binds from 12, so the decode splits
+    /// there; at 10 both whole walks bind and neither split does.
     #[test]
     fn a_windowed_decode_splits_where_its_ring_form_binds() {
         let decodes = [(64, false)];
         let mut tuning = tuning();
+        for limit in [12, 14, 15] {
+            tuning
+                .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, limit)
+                .unwrap();
+            assert!(tuning.binds_split(64, false), "at {limit}");
+        }
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 14)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 11)
             .unwrap();
         assert!(!tuning.binds_split(64, false));
         tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 15)
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 10)
             .unwrap();
-        assert!(tuning.binds_split(64, false));
-        let refused = tuning
-            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 12)
-            .unwrap_err();
-        assert!(
-            matches!(
-                &refused,
-                engine_gpu::Fault::StorageBuffers { kernel, own: 9, pool: 4, limit: 12 }
-                    if kernel == "attn_sdpa_decode_ring_bf16_d_64"
-            ),
-            "{refused:?}"
-        );
+        assert!(!tuning.binds_split(64, false));
     }
 }

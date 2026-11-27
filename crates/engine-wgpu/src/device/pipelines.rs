@@ -184,8 +184,11 @@ fn reflect(wgsl: &str) -> std::result::Result<Declared, String> {
         stride[b as usize] = step;
         names[b as usize] = name;
     }
+    // Past every storage binding: right after them, or, in a kernel's
+    // one-segment form, where its four segments would end (the three it
+    // does not declare leave their bindings unused).
     if let Some(u) = uniform
-        && u != bindings
+        && u < bindings
     {
         return Err(format!(
             "the uniform block sits at binding {u} but the storage bindings end at {bindings}"
@@ -446,7 +449,7 @@ impl Pipelines {
     /// Holds kernel `key` of `file` to the storage buffers `device` binds a
     /// shader stage, both counts read from the module it is compiled from.
     pub fn hold(device: &Context, file: &'static str, key: &'static str) -> Result<()> {
-        let (own, pool) = storage(file, key)?;
+        let (own, pool) = storage(file, key, device.core().one_segment())?;
         engine_gpu::storage_buffers(key, own, pool, device.storage_buffers())
     }
 
@@ -500,7 +503,7 @@ impl Pipelines {
         if let Some(pipeline) = self.built.borrow().get(key) {
             return Ok(Arc::clone(pipeline));
         }
-        let wgsl = module(file, key)?;
+        let wgsl = module(file, key, device.core().one_segment())?;
         let pipeline = Arc::new(build(device.core(), &self.layouts, file, key, wgsl)?);
         self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));
@@ -543,8 +546,22 @@ impl Pipelines {
     }
 }
 
-/// kernels-slang's module `key` of `file`, as this shell compiles it.
-fn module(file: &'static str, key: &'static str) -> Result<String> {
+/// The pool's segments a kernel binds where an adapter binds a shader stage
+/// `limit` storage buffers: the four of the kernels' four-segment forms
+/// where every pool kernel's own buffers and four fit, else one (their
+/// one-segment forms, `kernels/prim/pool.slang`'s `PIE_POOL_SEG_COUNT=1`),
+/// the pool laid whole in one binding.
+#[must_use]
+pub fn one_segment(limit: u32) -> bool {
+    limit < kernels_slang::POOL_OWN_MAX + kernels_slang::SEGMENTS as u32
+}
+
+/// kernels-slang's module `key` of `file`, as this shell compiles it: its
+/// one-segment form where `one` (and `key` binds the pool).
+fn module(file: &'static str, key: &'static str, one: bool) -> Result<String> {
+    if one && let Some(wgsl) = kernels_slang::wgsl_one_segment(key) {
+        return Ok(without_subgroup_enable(&promote_storage(wgsl)));
+    }
     let wgsl = kernels_slang::wgsl(key).ok_or(Fault::Shader {
         file,
         entrypoint: key,
@@ -559,8 +576,8 @@ fn module(file: &'static str, key: &'static str) -> Result<String> {
 /// read from the module it is compiled from: those it declares for itself,
 /// then the pool segments beside them. Only what `main` reaches counts, as
 /// only that is in the pipeline's layout.
-pub fn storage(file: &'static str, key: &'static str) -> Result<(u32, u32)> {
-    let declared = reflect(&module(file, key)?).map_err(|why| Fault::Shader {
+pub fn storage(file: &'static str, key: &'static str, one: bool) -> Result<(u32, u32)> {
+    let declared = reflect(&module(file, key, one)?).map_err(|why| Fault::Shader {
         file,
         entrypoint: key,
         why,

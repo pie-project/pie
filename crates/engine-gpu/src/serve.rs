@@ -1924,6 +1924,7 @@ impl<B: Serve> Shell<B> {
         // An arm's inputs store for fires of a budget: where each input lies,
         // and its bytes.
         let binding = device.max_buffer();
+        let segs = device.pool_segments();
         let lay_inputs = |budget: &poem_compiler::Budget,
                           compiled: &CompiledModel,
                           feeds: &poem_exec::feeds::Feeds,
@@ -2018,7 +2019,7 @@ impl<B: Serve> Shell<B> {
             let state = pool_left.saturating_sub(u64::from(least_chunks) * chunk);
             kv_budget
                 .map_or(state, |budget| budget.min(state))
-                .min(binding.saturating_mul(kernels_slang::SEGMENTS as u64))
+                .min(binding.saturating_mul(u64::from(segs)))
         };
         // The dense tactic to the asked top (rungs: every power of two of
         // rows, then the top): the vector or the tiled kernels, whichever the
@@ -2379,6 +2380,7 @@ impl<B: Serve> Shell<B> {
                             chunk,
                             least_chunks,
                             binding,
+                            segs,
                         )
                     })
             };
@@ -2417,6 +2419,7 @@ impl<B: Serve> Shell<B> {
                         rung.act,
                         least_chunks,
                         binding,
+                        segs,
                     )
                 });
                 return Err(Fault::Residency(match least {
@@ -2524,8 +2527,14 @@ impl<B: Serve> Shell<B> {
                 .copied()
                 .filter(|rung| laid.is_none_or(|laid| rung.tokens <= laid))
                 .collect();
-            let widest =
-                crate::store::pool::widest_rung(&held, kv_budget, chunk, least_chunks, binding);
+            let widest = crate::store::pool::widest_rung(
+                &held,
+                kv_budget,
+                chunk,
+                least_chunks,
+                binding,
+                segs,
+            );
             match widest {
                 Some(widest) if widest < top => {
                     budgets.tokens = crate::arena::bounded_budget(&budgets.tokens, widest);
@@ -3142,6 +3151,7 @@ impl<B: Serve> Shell<B> {
             act,
             least_chunks,
             device.max_buffer(),
+            device.pool_segments(),
         )?;
         // No rung lends a chunk past the kernels' index to state.
         let unindexed = total.saturating_sub(words);
@@ -3193,6 +3203,15 @@ impl<B: Serve> Shell<B> {
             "the chunk pool is sized to its budget or what the weights and the working set leave; \
              a fire's activation takes its top chunks"
         );
+        if device.pool_segments() == 1 {
+            tracing::info!(
+                pool_bytes = u64::from(total) * chunk,
+                cap_bytes = device.max_buffer(),
+                "the chunk pool is one segment, capped at one binding: this device binds a \
+                 shader stage too few storage buffers for four segments beside a kernel's own, \
+                 so the kernels take their one-segment forms"
+            );
+        }
         let paging = Paging {
             pages: pages.max(1),
             slots,
