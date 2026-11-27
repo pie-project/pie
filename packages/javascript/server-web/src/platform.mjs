@@ -7,6 +7,17 @@ let wasm = null;
 let fiberEntry = null;
 const slots = new Map();
 let onWake = () => {};
+// The last fiber switches, for a tick that never returns (worker.mjs's watch):
+// which stack each switch left and which it went to.
+const switches = [];
+function noteSwitch(what) {
+  switches.push(`${performance.now().toFixed(1)} ${what}`);
+  if (switches.length > 24) switches.shift();
+}
+export function fiberState() {
+  const parked = [...slots.entries()].map(([top, s]) => `${top}:${s.init ? "init" : "parked"}`);
+  return { switches: switches.slice(), parked };
+}
 
 export function attach(exports, wakeHook) {
   wasm = exports;
@@ -15,6 +26,7 @@ export function attach(exports, wakeHook) {
 }
 
 function finishFiber(top) {
+  noteSwitch(`fiber ${top} finished`);
   const parked = slots.get(top);
   slots.delete(top);
   if (!parked || parked.init) {
@@ -36,6 +48,7 @@ export const pie_fiber_switch = new WebAssembly.Suspending((top) => {
   const me = { sp: wasm.__stack_pointer.value, resolve: null };
   const resumed = new Promise((r) => (me.resolve = r));
   slots.set(top, me);
+  noteSwitch(`switch to ${top}${parked.init ? " (its first run)" : ""}`);
   if (parked.init) {
     const { entry, arg0 } = parked.init;
     queueMicrotask(() => {
