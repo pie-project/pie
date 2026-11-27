@@ -4,8 +4,9 @@
 //! reading's program as compile on load chooses it.
 //!
 //! ```text
-//! wafer-compile plan (--model <deployment> | --shape <shape.json>) [--set K=V,...]
-//!                [--positions N] --out <dir>
+//! wafer-compile plan (--model <deployment> | --shape <shape.json> | --plan <plan.json>)
+//!                [--set K=V,...] [--positions N] [--seats N|auto [--min-positions N]
+//!                [--stream-len L] [--link simulator|system]] --out <dir>
 //! wafer-compile build --plan <plan.json> --out <dir> [--emit floor,rcfg,kernels,layout,host,plan,
 //!                 bindings,program] [--levers K:V,...] [--kernels <kernels dir>]
 //! wafer-compile link --build <dir> [--fabric simulator|system]
@@ -20,7 +21,11 @@
 //! `plan` writes `<dir>/plan.json` (the [`Plan`]) and names the preset it took.
 //! `--model` names a catalog deployment (`qwen35-d9b-bf16-kv-bf16`); `--set` pins the search's
 //! keys; `--positions` the positions the program must serve. The plan carries the kernel levers
-//! its program ships with; `build --levers` sets more over them.
+//! its program ships with; `build --levers` sets more over them. `--seats N` is `--set SEATS=N`;
+//! `--seats auto` takes the plan (searched, or `--plan`'s) to the ring the memory model fits with
+//! the most seats, of those the largest KV pool ([`kernels_cerebras::compile::search::seats`]):
+//! each sequence at least `--min-positions`, a stream of `--stream-len` positions a seat at once;
+//! `--link` links the picks in turn into `<dir>/build` until one leaves the stack room.
 //!
 //! `build` writes everything the plan builds into `<dir>` (the sources, the artifact), its
 //! kernels the embedded ones unless `--kernels` names a directory. `link` compiles a build
@@ -34,11 +39,13 @@ use kernels_cerebras::compile::build::{self, EMITS, Fabric};
 use kernels_cerebras::compile::emit::params::Levers;
 use kernels_cerebras::compile::plan::{Plan, Shape};
 use kernels_cerebras::compile::program::Program;
+use kernels_cerebras::compile::search::{self, Seated, Want};
 use kernels_cerebras::compile::target::{self, Ask};
 use kernels_cerebras::compile::toolchain::{Arch, Cslc, Toolchain};
 
-const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json>) \
-     [--set K=V,...] [--positions N] --out <dir>\n       wafer-compile build --plan <plan.json> \
+const USAGE: &str = "usage: wafer-compile plan (--model <deployment> | --shape <shape.json> | \
+     --plan <plan.json>) [--set K=V,...] [--positions N] [--seats N|auto [--min-positions N] \
+     [--stream-len L] [--link simulator|system]] --out <dir>\n       wafer-compile build --plan <plan.json> \
      --out <dir> [--emit a,b] [--levers K:V,...] [--kernels <dir>]\n       wafer-compile link \
      --build <dir> [--fabric simulator|system]\n       wafer-compile stream --model <deployment> \
      [--reading R] [--rows N] [--class-rows c=N,..] [--ieee] [--positions N] [--lanes B] \
@@ -84,20 +91,48 @@ fn mkdir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
-/// `plan`: the plan of a deployment's trace (or of a shape file).
+/// `plan`: the plan of a deployment's trace (or of a shape file), or a plan's ring.
 fn plan(args: &[String]) -> Result<(), String> {
     let f = flags(
         args,
-        &["--model", "--shape", "--set", "--positions", "--out"],
+        &[
+            "--model",
+            "--shape",
+            "--plan",
+            "--set",
+            "--positions",
+            "--seats",
+            "--min-positions",
+            "--stream-len",
+            "--link",
+            "--out",
+        ],
     )?;
-    let ask = Ask {
-        set: get(&f, "--set").unwrap_or("").to_string(),
-        positions: get(&f, "--positions")
-            .map(|n| n.parse().map_err(|e| format!("--positions {n}: {e}")))
-            .transpose()?,
+    let num = |k: &str| {
+        get(&f, k)
+            .map(|n| n.parse::<u32>().map_err(|e| format!("{k} {n}: {e}")))
+            .transpose()
     };
-    let planned = match (get(&f, "--model"), get(&f, "--shape")) {
-        (Some(name), None) => {
+    let seats = get(&f, "--seats");
+    let fixed = match seats {
+        None | Some("auto") => None,
+        Some(n) => Some(n.parse::<u32>().map_err(|e| format!("--seats {n}: {e}"))?),
+    };
+    let mut set = get(&f, "--set").unwrap_or("").to_string();
+    if let (Some(m), None) = (fixed, get(&f, "--plan")) {
+        set = if set.is_empty() {
+            format!("SEATS={m}")
+        } else {
+            format!("{set},SEATS={m}")
+        };
+    }
+    let ask = Ask {
+        set,
+        positions: num("--positions")?,
+    };
+    let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
+    let planned = match (get(&f, "--model"), get(&f, "--shape"), get(&f, "--plan")) {
+        (Some(name), None, None) => {
             let catalog = poem_compiler::catalog::repository();
             let d = catalog
                 .parse(name)
@@ -105,20 +140,112 @@ fn plan(args: &[String]) -> Result<(), String> {
             let trace = d
                 .try_trace(poem_ir::Platform::Cerebras)
                 .map_err(|e| format!("--model {name}: {e}"))?;
-            target::plan(&trace, &ask)?
+            Some(target::plan(&trace, &ask)?)
         }
-        (None, Some(path)) => target::plan_shape(read::<Shape>(path)?, &ask)?,
-        _ => return Err(format!("--model or --shape, one of them\n{USAGE}")),
+        (None, Some(path), None) => Some(target::plan_shape(read::<Shape>(path)?, &ask)?),
+        (None, None, Some(_)) if seats.is_some() => None,
+        _ => {
+            return Err(format!(
+                "--model, --shape or --plan (with --seats), one of them\n{USAGE}"
+            ));
+        }
     };
-    let out = PathBuf::from(get(&f, "--out").ok_or(USAGE)?);
     mkdir(&out)?;
-    eprintln!(
-        "wafer-compile plan: the {} kernels, preset {}",
-        kernels_cerebras::compile::kernels::KernelSet::of_shape(&planned.plan.shape).name(),
-        planned.preset.name
-    );
-    json(&out, "plan.json", &planned.plan)
+    let mut plan = match planned {
+        Some(planned) => {
+            eprintln!(
+                "wafer-compile plan: the {} kernels, preset {}",
+                kernels_cerebras::compile::kernels::KernelSet::of_shape(&planned.plan.shape).name(),
+                planned.preset.name
+            );
+            planned.plan
+        }
+        None => read::<Plan>(get(&f, "--plan").ok_or(USAGE)?)?,
+    };
+    if seats == Some("auto") || get(&f, "--plan").is_some() {
+        let want = Want {
+            positions: num("--min-positions")?,
+            stream: num("--stream-len")?,
+        };
+        let picks = search::seats(&plan, &want, fixed)?;
+        let line = |s: &Seated| {
+            let (p, c) = (&s.plan.partition, &s.plan.contract);
+            format!(
+                "seats {} over {} KV entries a row (a pool of {}, {} positions a sequence): the \
+                 memory model's room {:.0} B",
+                s.plan.seats,
+                p.kv_entries.per_row,
+                p.kv_entries.per_row * p.kv_rows,
+                c.positions,
+                s.room
+            )
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for s in picks.iter().filter(|s| seen.insert(s.plan.seats)) {
+            eprintln!("wafer-compile plan: the most at {}", line(s));
+        }
+        plan = match get(&f, "--link") {
+            None => picks[0].plan.clone(),
+            Some(fabric) => confirm(&picks, fabric, &out.join("build"), &line)?,
+        };
+        eprintln!(
+            "wafer-compile plan: picked {} seats over {} KV entries a row",
+            plan.seats, plan.partition.kv_entries.per_row
+        );
+    }
+    json(&out, "plan.json", &plan)
 }
+
+/// The first of `picks` (at most [`TRIES`]) that builds and links on `fabric` in `dir`.
+fn confirm(
+    picks: &[Seated],
+    fabric: &str,
+    dir: &Path,
+    line: &dyn Fn(&Seated) -> String,
+) -> Result<Plan, String> {
+    let fabric = match fabric {
+        "simulator" => Fabric::Simulator,
+        "system" => Fabric::System,
+        other => return Err(format!("--link {other}: simulator or system")),
+    };
+    let cslc = Cslc::find(&Toolchain::default()).map_err(|e| e.to_string())?;
+    let mut why = Vec::new();
+    for s in picks.iter().take(TRIES) {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let linked = Levers::of(&s.plan.levers, "").and_then(|levers| {
+            let prog = Program::of(s.plan.clone())?;
+            kernels_cerebras::compile::check::keep();
+            build::emit(&prog, &levers, None, dir, &EMITS)?;
+            if let Some(rep) = kernels_cerebras::compile::check::last() {
+                rep.ok()?;
+            }
+            build::link(dir, &cslc, Arch::Wse3, fabric)
+        });
+        match linked {
+            Ok(room) => {
+                eprintln!(
+                    "wafer-compile plan: linked {}; STACK_ROOM min {room} B",
+                    line(s)
+                );
+                return Ok(s.plan.clone());
+            }
+            Err(e) => {
+                eprintln!("wafer-compile plan: refused {}: {e}", line(s));
+                why.push(e);
+            }
+        }
+    }
+    Err(format!(
+        "--link: none of {} picks linked: {}",
+        why.len(),
+        why.join("; ")
+    ))
+}
+
+/// The picks `--link` tries before it gives up.
+const TRIES: usize = 8;
 
 /// `build`: everything a plan builds.
 fn build(args: &[String]) -> Result<(), String> {

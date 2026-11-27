@@ -349,6 +349,94 @@ impl Search<'_> {
     }
 }
 
+/// What a ring is chosen for: each sequence's positions at least, and `stream` positions a
+/// sequence for as many seats at once (the pool holding each a window of them, whole rows).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Want {
+    pub positions: Option<u32>,
+    pub stream: Option<u32>,
+}
+
+/// A ring the memory model fits: its plan and its predicted stack room.
+#[derive(Clone, Debug)]
+pub struct Seated {
+    pub plan: Plan,
+    pub room: f64,
+}
+
+/// The rings of `plan`'s partition that plan, build, serve `want` and fit (the memory model's room
+/// at least [`STACK_ROOM`]), the most seats first and of those the largest pool: seats from 1 to
+/// the units' bound (or `seats` alone) over KV entries a row from the seats to those a sequence of
+/// [`POSITIONS`] takes (or the plan's). A pick is confirmed by its link.
+pub fn seats(plan: &Plan, want: &Want, seats: Option<u32>) -> R<Vec<Seated>> {
+    let p = &plan.partition;
+    let anchor = memory::anchor(&plan.shape);
+    let rows = p.kv_rows.max(1);
+    let top = p.units.saturating_sub(1).max(1);
+    let most = POSITIONS.div_ceil(rows).max(p.kv_entries.per_row);
+    let mut out = Vec::new();
+    for m in seats.map_or(1..=top, |m| m..=m).rev() {
+        for ne in (m..=most).rev() {
+            let Some(q) = ring(plan, m, ne) else {
+                continue;
+            };
+            let pool = ne * rows;
+            let least = (q.contract.cap / m).max(1).div_ceil(rows) * rows;
+            let serves = want.positions.is_none_or(|n| q.contract.positions >= n)
+                && want.stream.is_none_or(|l| {
+                    l <= q.contract.positions && m * l.div_ceil(rows).max(least / rows) <= ne
+                });
+            let room = memory::room(&q, anchor);
+            if serves
+                && room >= f64::from(STACK_ROOM)
+                && crate::compile::check::hazard::seats(m, p.units).is_none()
+                && crate::compile::check::hazard::seat_pool(pool).is_none()
+                && Program::build(q.clone())
+                    .and_then(|g| crate::compile::emit::rcfg::all(&g).map(|_| ()))
+                    .is_ok()
+            {
+                out.push(Seated { plan: q, room });
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "seats: no ring of {} serves {want:?} and fits",
+            p.units
+        ));
+    }
+    Ok(out)
+}
+
+/// `plan` as a ring of `m` seats over `ne` KV entries a row (its global cache's too): a sequence
+/// holds what the others' least windows (a launch's laps, whole rows) leave, within the RoPE
+/// tables' reach and the positions the plan serves or [`POSITIONS`].
+fn ring(plan: &Plan, m: u32, ne: u32) -> Option<Plan> {
+    let mut q = plan.clone();
+    let rows = q.partition.kv_rows.max(1);
+    let e = &mut q.partition.kv_entries;
+    if e.sliding.is_some_and(|n| n > ne) {
+        return None;
+    }
+    e.per_row = ne;
+    if e.global.is_some() {
+        e.global = Some(ne);
+    }
+    let c = &mut q.contract;
+    let least = (c.cap / m).max(1).div_ceil(rows) * rows;
+    let pool = ne * rows;
+    if m > ne || (m - 1) * least >= pool {
+        return None;
+    }
+    let reach = 1u32 << (c.rope_bits * c.rope_levels).min(31);
+    c.positions = (pool - (m - 1) * least)
+        .min(reach)
+        .min(POSITIONS.max(plan.contract.positions));
+    q.seats = m;
+    q.validate().ok()?;
+    Some(q)
+}
+
 /// Whether `plan` builds (its blocks compose, its fabric fits the wafer, its routes and colours
 /// hold).
 fn builds(plan: &Plan) -> bool {
