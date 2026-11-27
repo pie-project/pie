@@ -347,7 +347,11 @@ mod tests {
             captured: 500 << 20,
         };
         write(&streaming, measured).expect("the record is written");
-        assert_eq!(read(&held), None, "the held load reads no streaming load's record");
+        assert_eq!(
+            read(&held),
+            None,
+            "the held load reads no streaming load's record"
+        );
         assert_eq!(read(&streaming), Some(measured));
         let _ = std::fs::remove_dir_all(&dir);
     }
