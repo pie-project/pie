@@ -53,6 +53,7 @@ impl SchedulerHandle {
     ) -> Result<T> {
         let (response, receiver) = tokio::sync::oneshot::channel();
         self.send(make(response))?;
+        crate::rt::tab_step("sent; awaits the answer", "a scheduler request");
         receiver
             .await
             .map_err(|_| anyhow!("scheduler channel closed"))
@@ -72,6 +73,7 @@ impl SchedulerHandle {
         crate::rt::tab_step("its host codegen", "a program's registration");
         let program = match self.inner.codegen_backend.clone() {
             Some(backend) => crate::rt::spawn_blocking(move || {
+                crate::rt::tab_step("host codegen runs", "a program's registration");
                 let coded = match crate::pipeline::program::with_host_codegen(
                     &program,
                     Some(backend.as_str()),
@@ -79,6 +81,7 @@ impl SchedulerHandle {
                     std::borrow::Cow::Owned(coded) => Some(coded),
                     std::borrow::Cow::Borrowed(_) => None,
                 };
+                crate::rt::tab_step("host codegen done", "a program's registration");
                 coded.unwrap_or(program)
             })
             .await
