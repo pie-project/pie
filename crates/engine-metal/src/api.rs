@@ -402,6 +402,7 @@ impl Engine for Metal {
             )
         };
         let util = residency.device_memory_share;
+        let mut budgets = budgets;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
         let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
             .map_err(|error| fault(Fault::from(error)))?;
@@ -409,9 +410,34 @@ impl Engine for Metal {
         // or one sequence when the pool fills what is left.
         let kv_pool = match residency.device_kv_budget {
             Some(budget) => budget,
-            None => crate::store::PoolDemand::of(&trace, paging, None)
-                .map_err(fault)?
-                .bytes(u64::from(paging.pages_per_slot)),
+            None => {
+                let demand = crate::store::PoolDemand::of(&trace, paging, None).map_err(fault)?;
+                let mut pages = u64::from(paging.pages_per_slot);
+                if budgets.context_declared {
+                    use crate::store::accounting::Accounting;
+
+                    let room = Accounting::of(working_set, elsewhere, util, weights, 0).pool / 2;
+                    let fitted =
+                        engine::fit::pages_within(pages, room, |pages| demand.bytes(pages));
+                    if fitted < pages {
+                        pages = fitted.max(1);
+                        let declared = budgets.max_context;
+                        let fits = u32::try_from(pages)
+                            .unwrap_or(u32::MAX)
+                            .saturating_mul(paging.page_size);
+                        if fits < declared {
+                            eprintln!(
+                                "engine-metal: the model declares a {declared}-token context and one \
+                                 sequence at it takes more than half of what `[model] device_memory_share` \
+                                 leaves past the weights; serving {fits} tokens. State `[engine] \
+                                 max_model_len` to choose."
+                            );
+                        }
+                        budgets.max_context = fits;
+                    }
+                }
+                demand.bytes(pages)
+            }
         };
         let accounting = |weights: u64, scratch: u64| {
             crate::store::accounting::Accounting::with_scratch(
@@ -431,7 +457,6 @@ impl Engine for Metal {
         // reserves pushes the load past the device (a 12B on a 16 GB Mac),
         // the width halves until it fits: a narrower prefill fire is slower,
         // a refused load serves nothing.
-        let mut budgets = budgets;
         let mut prepared = loop {
             let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
             let mut fitted = poem_compiler::fit_voxels(
