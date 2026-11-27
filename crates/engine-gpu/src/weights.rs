@@ -195,6 +195,7 @@ impl<B: Backend> Weights<B> {
         device_cap: u64,
         max_tokens: u32,
         streamed: &[usize],
+        widened: &BTreeMap<usize, u32>,
     ) -> Result<Weights<B>> {
         readable_plane_orders(trace)?;
 
@@ -218,9 +219,11 @@ impl<B: Backend> Weights<B> {
 
         let pairings = pairings(&landing, &index)?;
 
+        let leads = leads(trace, widened);
         let reserved: Vec<u64> = plane_bytes(trace)?
             .iter()
-            .map(|bytes| bytes.next_multiple_of(ALIGN))
+            .zip(&leads)
+            .map(|(bytes, lead)| (lead + bytes).next_multiple_of(ALIGN))
             .collect();
         let mut planes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (name, pairing) in &pairings {
@@ -239,7 +242,7 @@ impl<B: Backend> Weights<B> {
                 "routed expert banks stream from the host tier"
             );
         }
-        let places = places(trace, &layout)?;
+        let places = places(trace, &layout, &leads, widened)?;
 
         let spans = |tier: Tier| -> Vec<(u64, u64)> {
             places
@@ -327,7 +330,14 @@ impl<B: Backend> Weights<B> {
             }
             let dense = |place: &Place, at: usize| -> Result<Tensor> {
                 let handle = match place.tier {
-                    Tier::Device => store.bind(handles, place.offset, place.bytes)?,
+                    Tier::Device => store.bind(handles, place.offset, place.lead + place.bytes)?,
+                    Tier::Host if place.lead > 0 => {
+                        return Err(Fault::Param {
+                            name: trace.params[at].name.clone(),
+                            why: "is laid wider than it is stored, which only the device tier \
+                                  lays",
+                        });
+                    }
                     Tier::Host => *phantom.get(&at).ok_or(Fault::Ceiling {
                         what: "bytes of the host tier",
                         need: place.bytes,
@@ -803,9 +813,15 @@ pub fn serves_this_deployment(path: &Path, backend: &str, deployment: &str) -> R
 #[derive(Debug, Clone, Copy)]
 struct Place {
     tier: Tier,
+    /// Where the plane's view starts: its `lead` zero bytes, then its
+    /// published bytes.
     offset: u64,
 
     bytes: u64,
+
+    /// The zero bytes a plane laid wider than it is stored takes before its
+    /// own (`crate::dense::widened`): its extra rows, first.
+    lead: u64,
 
     reserved: u64,
     rows: u32,
@@ -965,25 +981,53 @@ fn rectangle(shape: &[u64]) -> (u64, u64) {
     }
 }
 
-fn places(trace: &Trace, layout: &Layout) -> Result<Vec<Place>> {
+/// The zero bytes each param's plane is laid behind: a widened one's extra
+/// rows (`widened`, each by the rows it is laid at), at its row's bytes.
+fn leads(trace: &Trace, widened: &BTreeMap<usize, u32>) -> Vec<u64> {
+    trace
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, param)| {
+            let (rows, width) = rectangle(&param.shape);
+            widened.get(&at).map_or(0, |&laid| {
+                let element = poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0);
+                u64::from(laid).saturating_sub(rows) * width * element
+            })
+        })
+        .collect()
+}
+
+fn places(
+    trace: &Trace,
+    layout: &Layout,
+    leads: &[u64],
+    widened: &BTreeMap<usize, u32>,
+) -> Result<Vec<Place>> {
     let bytes = plane_bytes(trace)?;
     let mut out = Vec::with_capacity(trace.params.len());
     let mut at = [0u64; 2];
     for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
         let full = bytes[index];
+        let lead = leads[index];
         let tier = layout.tier[index];
         let cursor = &mut at[usize::from(tier == Tier::Host)];
+        let reserved = (lead + full).next_multiple_of(ALIGN);
         out.push(Place {
             tier,
             offset: *cursor,
             bytes: full,
-            reserved: full.next_multiple_of(ALIGN),
-            rows: u32::try_from(rows).unwrap_or(u32::MAX),
+            lead,
+            reserved,
+            rows: widened
+                .get(&index)
+                .copied()
+                .unwrap_or(u32::try_from(rows).unwrap_or(u32::MAX)),
             width: u32::try_from(width).unwrap_or(u32::MAX),
             dtype: param.dtype,
         });
-        *cursor += full.next_multiple_of(ALIGN);
+        *cursor += reserved;
     }
     Ok(out)
 }
@@ -1044,8 +1088,14 @@ impl<B: Backend> TensorSink for Landing<'_, B> {
         }
         match place.tier {
             Tier::Device => {
+                if place.lead > 0 {
+                    let zeros = vec![0u8; usize::try_from(place.lead).unwrap_or(usize::MAX)];
+                    self.store
+                        .write(place.offset, &zeros)
+                        .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+                }
                 self.store
-                    .write(place.offset, bytes)
+                    .write(place.offset + place.lead, bytes)
                     .map_err(|fault| LoadError::Internal(fault.to_string()))?;
                 // The write lands and its staging goes before the next plane
                 // stages: the load holds one plane staged at most.

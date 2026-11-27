@@ -153,6 +153,7 @@ impl Rung {
         routers: &[u32],
         planes: &[u64],
         max_buffer: u64,
+        target: kernels_slang::Target,
     ) -> Result<Rung> {
         let map = if tokens >= budgets.tokens.max_tokens {
             compiled.arena.clone()
@@ -166,6 +167,7 @@ impl Rung {
         };
         let rooms = Rooms::lay(
             trace, compiled, &map, budgets, tokens, paging, tuning, routers, planes, max_buffer,
+            target,
         );
         let rooms_at = map.bytes.next_multiple_of(ALIGN);
         let bytes = (rooms_at + rooms.bytes()).next_multiple_of(ALIGN);
@@ -245,6 +247,7 @@ impl<B: Backend> Span<B> {
         paging: Paging,
         tuning: &B::Tuning,
         max_buffer: u64,
+        target: kernels_slang::Target,
     ) -> Result<Span<B>> {
         let routers = crate::scratch::routers(trace);
         // A projection whose bank outgrows one binding lands its logits in
@@ -255,7 +258,8 @@ impl<B: Backend> Span<B> {
             .iter()
             .map(|&tokens| {
                 Rung::lay(
-                    trace, compiled, budgets, tokens, paging, tuning, &routers, &planes, max_buffer,
+                    trace, compiled, budgets, tokens, paging, tuning, &routers, &planes,
+                    max_buffer, target,
                 )
             })
             .collect::<Result<Vec<_>>>()?;

@@ -78,6 +78,21 @@ pub fn lm_head(
     act_x_wt(ctx, tactic, "linear.matmul", act, w, y, window)
 }
 
+/// The columns a bf16 projection of `n` columns lands on `target`: its own,
+/// except a one-column projection on WGSL, whose kernels land column pairs
+/// as words. That one is laid two wide: its weight a zero row before its
+/// own, so the column lands as the high half of each row's word, which read
+/// as an f32 is the column's value exactly (`bf16.slang`'s `bf16_to_f32`).
+/// A wider odd projection lands nowhere on WGSL ([`matmul`] refuses it).
+#[must_use]
+pub fn laid_columns(target: Target, n: u32) -> u32 {
+    if target == Target::Wgsl && n == 1 {
+        2
+    } else {
+        n
+    }
+}
+
 /// `y = act * w^T` on bf16.
 /// The kernel a bf16 matmul of `m` rows, `n` columns and depth `k` runs
 /// on `target` under `tactic`: the pick [`act_x_wt`]'s dispatch makes

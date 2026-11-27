@@ -94,6 +94,9 @@ impl<B: Backend> Run<'_, B> {
                         block,
                         self.tensor(*y),
                     ),
+                    None if self.tensor(*w).rows != self.tensor(*y).width => {
+                        self.laid_matmul(*act, *w, *y)
+                    }
                     None => self.gemm(*act, *w, |tactic| {
                         let ([act, y], window) = self.windowed([*act, *y]);
                         kernels_slang::linear::gemm::matmul(
@@ -718,6 +721,54 @@ impl<B: Backend> Run<'_, B> {
 }
 
 impl<B: Backend> Run<'_, B> {
+    /// A dense matmul by a weight laid wider than the columns it lands
+    /// (`crate::dense::widened`): the kernel lands the laid columns in the
+    /// fire's laid room, and the column is read out of them. A one-column
+    /// projection is laid two wide, its zero row first, so each row's word
+    /// holds the column in its high half: that word read as an f32 is the
+    /// column's value, which a cast lands as bf16 exactly.
+    fn laid_matmul(
+        &self,
+        act: ValueId,
+        w: ValueId,
+        y: ValueId,
+    ) -> Result<(), kernels_slang::Error> {
+        const OP: &str = "linear.matmul";
+        let (plane, out) = (self.tensor(w), self.tensor(y));
+        let laid = kernels_slang::linear::gemm::laid_columns(self.ctx.target(), out.width);
+        if plane.rows != laid || laid != 2 * out.width {
+            return Err(kernels_slang::Error::Backend {
+                op: OP,
+                detail: format!(
+                    "the weight is laid {} rows for a projection of {} columns, which lands {laid}",
+                    plane.rows, out.width
+                ),
+            });
+        }
+        let room =
+            self.laid_scratch(out.rows, laid)
+                .ok_or_else(|| kernels_slang::Error::Backend {
+                    op: OP,
+                    detail: format!(
+                        "the load reserved no room for {} rows of a projection laid {laid} wide",
+                        out.rows
+                    ),
+                })?;
+        let rows = self.tensor(act);
+        self.gemm(act, w, |tactic| {
+            kernels_slang::linear::gemm::matmul(
+                self.ctx,
+                tactic,
+                rows,
+                plane,
+                room,
+                kernels_slang::ssm::RowSpan::whole(room),
+            )
+        })?;
+        let words = kernels_slang::Tensor::new(room.buf, room.rows, 1, poem_ir::Dtype::F32);
+        kernels_slang::elemwise::pointwise::cast_f32_to_bf16(self.ctx, words, out)
+    }
+
     /// A dense matmul from `act` by the weight `w` at its plane's tactic at
     /// the rows ([`crate::dense`]). A naming sink is told every way it goes: `matmul`
     /// at each tactic some fire of up to the load's most rows takes, each

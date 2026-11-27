@@ -584,6 +584,13 @@ fn a_windowed_miniature_serves_two_lanes() {
     seats("gemma4-e4b-mini-l1", None);
 }
 
+/// A routed miniature whose shared expert's gate projects one column: on
+/// WGSL that plane is laid two wide and its column read out.
+#[test]
+fn a_routed_miniature_serves_two_lanes() {
+    seats("qwen3-a3b-micro", None);
+}
+
 /// Every fire is served from what the load built: on each family, at every
 /// rung the load admits (one lane of the rung's rows, every seat sharing
 /// them, then a decode of those seats), and on a hybrid the fires that

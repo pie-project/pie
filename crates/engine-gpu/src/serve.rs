@@ -1631,10 +1631,11 @@ impl<B: Serve> Shell<B> {
         }
         let multiplied = crate::dense::multiplied(&boot.trace);
         let counts = crate::top::counts(&boot.trace)?;
-        let shapes: Vec<(u32, u32)> = crate::dense::planes(&counts, Some(&multiplied))
-            .into_iter()
-            .map(|(n, k, ..)| (n, k))
-            .collect();
+        let shapes: Vec<(u32, u32)> =
+            crate::dense::laid(B::TARGET, crate::dense::planes(&counts, Some(&multiplied)))
+                .into_iter()
+                .map(|(n, k, ..)| (n, k))
+                .collect();
         let before = fitted.tuning.profile().rates().kernel_curves;
         fitted.tuning = B::rate_shapes(
             &fitted.device,
@@ -2031,9 +2032,12 @@ impl<B: Serve> Shell<B> {
                 device_profile.rates().missing(&crate::rates::KEYS)
             ))
         })?;
-        let dense_planes = crate::dense::planes(
-            counts_of_rates,
-            Some(&crate::dense::multiplied(&boot.trace)),
+        let dense_planes = crate::dense::laid(
+            B::TARGET,
+            crate::dense::planes(
+                counts_of_rates,
+                Some(&crate::dense::multiplied(&boot.trace)),
+            ),
         );
         // The rungs to `chunk`, the most rows a fire takes and the rows the
         // chunker cuts a prompt by (every full chunk lands at its rung's top,
@@ -2185,6 +2189,7 @@ impl<B: Serve> Shell<B> {
                 least,
                 &tuning,
                 device.max_buffer(),
+                B::TARGET,
             )?;
             // A fire's own windowed rows lie in slots of its activation
             // span, laid as the window buffer's (CONTRACT-BC 19).
@@ -2914,6 +2919,7 @@ impl<B: Serve> Shell<B> {
             device_cap,
             boot.budget.max_tokens,
             &streamed,
+            &crate::dense::widened(&boot.trace, B::TARGET),
         )?;
 
         weights.decode_absorbed(&device, &handles, &boot.trace)?;

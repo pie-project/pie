@@ -108,6 +108,10 @@ pub struct Rooms {
     /// of its rows at a time, side by side, before they take their columns.
     logits: Option<Room>,
 
+    /// What a projection laid wider than it lands (`crate::dense::widened`)
+    /// lands at its kernel's columns, before it reads its own out.
+    laid: Option<Room>,
+
     copy: Option<CopyRoom>,
 
     bytes: u64,
@@ -129,6 +133,7 @@ impl Rooms {
         routers: &[u32],
         planes: &[u64],
         max_buffer: u64,
+        target: kernels_slang::Target,
     ) -> Rooms {
         let budget = &budgets.tokens;
         let narrow = narrowed(budget, tokens);
@@ -324,13 +329,36 @@ impl Rooms {
                 )
             });
 
+        let widened = crate::dense::widened(trace, target);
+        let laid = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Linear(Linear::Matmul { w, y, .. }) => {
+                    match trace.values.get(w.0 as usize).map(|decl| &decl.def) {
+                        Some(Def::Weight(at)) => {
+                            let laid = *widened.get(&(*at as usize))?;
+                            of(*y).map(|rect| (u64::from(rect.rows), u64::from(laid)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .max_by_key(|&(rows, width)| rows * width)
+            .map(|(rows, width)| {
+                let mut at = 0u64;
+                Room::lay(&mut at, rows, width, Dtype::Bf16)
+            });
+
         let union = routed
             .map_or(0, |r| r.y.at + r.y.bytes())
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(split.map_or(0, |r| r.part_lse.at + r.part_lse.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()))
             .max(score.map_or(0, |r| r.at + r.bytes()))
-            .max(logits.map_or(0, |r| r.at + r.bytes()));
+            .max(logits.map_or(0, |r| r.at + r.bytes()))
+            .max(laid.map_or(0, |r| r.at + r.bytes()));
 
         let copy =
             copy_ceiling(trace, compiled, map, budget, narrow.max_tokens).map(|bytes| CopyRoom {
@@ -347,6 +375,7 @@ impl Rooms {
             spatial,
             score,
             logits,
+            laid,
             copy,
             bytes,
         }
@@ -489,6 +518,20 @@ impl<'a, B: Backend> FireScratch<'a, B> {
     /// logits in a run of rows at a time.
     pub fn logits(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {
         Some(self.bind(handles, self.rooms.logits?))
+    }
+
+    /// The room a projection laid wider than it lands lands `rows` of its
+    /// kernel's `width` columns in; `None` where the load laid none that
+    /// holds them.
+    pub fn laid(&self, handles: &Handles<B>, rows: u32, width: u32) -> Option<Result<Tensor>> {
+        let room = self.rooms.laid?;
+        let wanted = Room {
+            at: room.at,
+            rows,
+            width,
+            dtype: Dtype::Bf16,
+        };
+        (wanted.bytes() <= room.bytes()).then(|| self.bind(handles, wanted))
     }
 
     pub fn index_scores(&self, handles: &Handles<B>) -> Option<Result<Tensor>> {

@@ -1321,6 +1321,19 @@ impl<'c, B: Backend> Run<'c, B> {
         }))
     }
 
+    /// The room a projection laid wider than it lands
+    /// (`crate::dense::widened`) lands `rows` of its kernel's `width`
+    /// columns in.
+    pub fn laid_scratch(&self, rows: u32, width: u32) -> Option<Tensor> {
+        Some(
+            self.scratch
+                .laid(self.handles, rows, width)?
+                .unwrap_or_else(|fault| {
+                    panic!("the laid room this load reserved does not mint: {fault}")
+                }),
+        )
+    }
+
     pub fn split_scratch(&self) -> Option<kernels_slang::attn::sdpa::Split> {
         Some(self.scratch.split(self.handles)?.unwrap_or_else(|fault| {
             panic!("the split partials this load reserved do not mint: {fault}")

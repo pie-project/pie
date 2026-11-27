@@ -441,6 +441,71 @@ pub fn multiplied(trace: &poem_ir::Trace) -> Vec<(u32, u32)> {
     out
 }
 
+/// The params `target` lays wider than they are stored
+/// ([`gemm::laid_columns`]), each by the rows it is laid at: each bf16
+/// weight that only a dense matmul of a bf16 activation multiplies by,
+/// landing fewer columns than its kernel lands. The load lays such a plane its extra rows first, zero
+/// (`crate::weights`); the matmul lands its kernel's columns in a room of
+/// the fire's and reads its own out of them (`crate::dispatch::linear`).
+#[must_use]
+pub fn widened(trace: &poem_ir::Trace, target: Target) -> std::collections::BTreeMap<usize, u32> {
+    use poem_ir::{Def, Dtype, Linear, Operands as _, Operation, Ty};
+    let param_of = |id: poem_ir::ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
+        Some(Def::Weight(at)) => Some(*at as usize),
+        _ => None,
+    };
+    let bf16 = |id: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|v| &v.ty),
+            Some(Ty::Tensor {
+                dtype: Dtype::Bf16,
+                ..
+            })
+        )
+    };
+    let mut wide = std::collections::BTreeMap::new();
+    let mut other = std::collections::BTreeSet::new();
+    let mut inputs = Vec::new();
+    for node in &trace.nodes {
+        if let Operation::Linear(Linear::Matmul {
+            act,
+            w,
+            quant: None,
+            logits: false,
+            input_scales: None,
+            scales: None,
+            ..
+        }) = &node.op
+            && let Some(at) = param_of(*w)
+            && let Some(param) = trace.params.get(at)
+            && param.dtype == Dtype::Bf16
+            && bf16(*act)
+        {
+            let n = u32::try_from(engine::load::rectangle(&param.shape).0).unwrap_or(u32::MAX);
+            let laid = gemm::laid_columns(target, n);
+            if laid != n {
+                wide.insert(at, laid);
+            }
+            continue;
+        }
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        other.extend(inputs.iter().filter_map(|&id| param_of(id)));
+    }
+    wide.retain(|at, _| !other.contains(at));
+    wide
+}
+
+/// `planes` as `target` lays them: each `n` the columns its kernel lands
+/// ([`gemm::laid_columns`]), what a dense fire at the plane runs.
+#[must_use]
+pub fn laid(target: Target, planes: Vec<(u32, u32, u32, f64)>) -> Vec<(u32, u32, u32, f64)> {
+    planes
+        .into_iter()
+        .map(|(n, k, count, bytes)| (gemm::laid_columns(target, n), k, count, bytes))
+        .collect()
+}
+
 /// `(n, k, planes, bytes a plane)` of every dense plane a row of the model
 /// `counts` describes reads: each dense shape a matmul multiplies by (of
 /// `multiplied`, [`multiplied`]; every one where `None`), and the output
