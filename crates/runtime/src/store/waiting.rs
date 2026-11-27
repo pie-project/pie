@@ -23,10 +23,10 @@
 //! run cannot go while a later one stays, the keys being chained).
 
 use crate::policy::share::ShareAs;
+use crate::rt::wall::Instant;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use crate::rt::wall::Instant;
 
 use client_api::props::{self, Props};
 
