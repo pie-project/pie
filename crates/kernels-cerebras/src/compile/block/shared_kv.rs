@@ -2,7 +2,8 @@
 //! it from the source unit (the unit of the layer they read), whose CY row sends it north up each
 //! weight column through the sharers above it in its unit column ([`LINE`]; the sharers' weight
 //! PEs take a copy, the source's weight PEs and the sharers' CY PEs pass it). The sharers' kernels
-//! skip their own KV (`SH 1`) and run their own MLP width (`Ic`).
+//! skip their own KV (`SH 1`) and run their own MLP width (`Ic`). In a ring of seats the source
+//! sends a pass's words only once the last sharer's CY has credited the previous pass's ([`ack`]).
 
 use crate::compile::abi::{Overrides, Param};
 use crate::compile::floor::{Coord, Dir, Floor};
@@ -17,6 +18,11 @@ type R<T> = Result<T, String>;
 
 /// The shared-KV line.
 pub const LINE: Class = Class::new("KVS");
+/// (A ring of seats) its credit, a column's: a word a pass from the last sharer's CY back to the
+/// source's (each column its own class: they meet different colours).
+pub const fn ack(col: u32) -> Class {
+    Class::at("KVA", col as u8)
+}
 
 /// The params the sharers differ in: they read another layer's KV, their MLP width a column.
 pub const SH: Param = Param("SH");
@@ -91,6 +97,26 @@ impl Block for SharedKv {
                     from: Port::Dir(Dir::S),
                     to,
                 });
+            }
+        }
+        // a ring: the last sharer's CY credits each pass's words back down to the source's
+        if plan.seats > 1 {
+            let (ylast, ysrc) = (unit(*dst.iter().max().unwrap_or(&src))?.cy_y(), s.cy_y());
+            for c in 0..plan.partition.cols {
+                let x = s.col_x(c);
+                for y in ylast..=ysrc {
+                    let (from, to) = match y {
+                        _ if y == ylast => (Port::Ramp, Port::Dir(Dir::S)),
+                        _ if y == ysrc => (Port::Dir(Dir::N), Port::Ramp),
+                        _ => (Port::Dir(Dir::N), Port::Dir(Dir::S)),
+                    };
+                    w.turn(Turn {
+                        at: Coord::new(x, y),
+                        class: ack(c),
+                        from,
+                        to: vec![to],
+                    });
+                }
             }
         }
         Ok(())

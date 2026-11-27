@@ -211,14 +211,15 @@ impl ArtifactModel {
         })
     }
 
-    /// The launch's first token id to the PLE storage's lookup (`tin`), where the program has one.
-    fn put_token(&mut self, v: u32) -> R<()> {
+    /// The launch's first lap's token ids (a ring's seats', else one) to the PLE storage's lookup
+    /// (`tin`), where the program has one.
+    fn put_token(&mut self, v: &[u32]) -> R<()> {
         let Some(r) = self.hl.token_in else {
             return Ok(());
         };
-        let words = vec![v; (r.w * r.h) as usize];
+        let words: Vec<u32> = (0..r.w * r.h).flat_map(|_| v.iter().copied()).collect();
         let t0 = Instant::now();
-        let r = self.dev.put("tin", rect(&r), 1, &words);
+        let r = self.dev.put("tin", rect(&r), v.len(), &words);
         self.host_ns[1] += ns(t0);
         r
     }
@@ -314,7 +315,7 @@ impl ArtifactModel {
     fn feed(&mut self, tokens: &[u32], start: usize) -> R<()> {
         for (i, &t) in tokens.iter().enumerate() {
             self.put_x(t)?;
-            self.put_token(t)?;
+            self.put_token(&[t])?;
             self.launch(1, start + i)?;
             self.fed.push(t);
         }
@@ -351,7 +352,7 @@ impl ArtifactModel {
         self.feed(&tokens[..n - 1], start)?;
         let last = start + n - 1;
         self.put_x(tokens[n - 1])?;
-        self.put_token(tokens[n - 1])?;
+        self.put_token(&tokens[n - 1..n])?;
         self.launch(1 + extra, last)?;
         self.fed.push(tokens[n - 1]);
         let ring = self.ring(1 + extra)?;
@@ -453,17 +454,11 @@ impl ArtifactModel {
         match self.hl.seats.clone() {
             None => {
                 self.put_x(first[0])?;
-                self.put_token(first[0])?;
+                self.put_token(&first[..1])?;
                 self.launch(n, pos[0])?;
             }
-            // (the token bus hands a pass's token to the next pass, another seat's)
-            Some(_) if self.hl.token_in.is_some() => {
-                return Err(
-                    "artifact: a ring of seats with per-layer inputs: its token bus is not by seat"
-                        .into(),
-                );
-            }
             Some(s) => {
+                self.put_token(first)?;
                 let t0 = Instant::now();
                 let total = *self.x_off.last().unwrap();
                 let mut es = Vec::with_capacity(m);

@@ -235,12 +235,13 @@ fn kv_post() void {
 }
 var chk = @zeros([1]f32);
 fn kv_take(pos: u32, s: u32) void {
-  posq(pos);
-  const want = q_pf;
+  posq(pos); //-seats
+  const want = q_pf; //-seats
   const cd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> chk[i] });
   const sd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> kvb[@as(i16, 16) + i] });
   @fmovs(cd, sd);
-  while (chk[0] != want) { @fmovs(cd, sd); }   // (a DSD read each turn: the async receive writes kvb)
+  while (chk[0] != want) { @fmovs(cd, sd); }   // (a DSD read each turn: the async receive writes kvb) //-seats
+  while (chk[0] < 0.0) { @fmovs(cd, sd); }   // (seats: the words end in the pass's seat word + 1) //+seats
   fab.iqc(7, pe.rcfg[pe.RQ + 5]);
   if (DIAG != 0 or PLOG == 1) {
     var t: f32 = 0.0;
@@ -249,11 +250,23 @@ fn kv_take(pos: u32, s: u32) void {
     if (s < 64) { kvlog[2 * @as(u16, s)] = t; kvlog[2 * @as(u16, s) + 1] = kvb[16]; }
     if (DIAG != 0) { return; }
   }
-  if (pos == 0) { cache_reset(0); cache_reset(1); }
-  if (q_row == pe.myrow) {
-    cache_put(0, pos, @ptrcast([*]f32, &kvb[0]), @ptrcast([*]f32, &kvb[DcS]), kvb[2 * DcS], kvb[2 * DcS + 1]);
+  if (pos == 0) { cache_reset(0); cache_reset(1); } //-seats
+  if (q_row == pe.myrow) { //-seats
+    cache_put(0, pos, @ptrcast([*]f32, &kvb[0]), @ptrcast([*]f32, &kvb[DcS]), kvb[2 * DcS], kvb[2 * DcS + 1]); //-seats
+  // (seats: the window's position, 2 seat + its reset above, as CY's multicast carries it) //+seats
+  const sw = @as(u32, kvb[16]) - 1; //+seats
+  const p = sw & 0xffff; //+seats
+  const st = @as(u16, sw >> 17); //+seats
+  posq(p); //+seats
+  if (((sw >> 16) & 1) != 0) { wb[st] = q_ent; } //+seats
+  cw0 = wb[st]; //+seats
+  if (FIX) { crb = st * NES; } //+seats
+  if (q_row == 0) { cache_clear(1, q_ent); if (q_ent - cw0 < NES) { cache_clear(0, cslot(0, p)); } } //+seats
+  if (q_row == pe.myrow) { //+seats
+    cache_put(0, p, @ptrcast([*]f32, &kvb[0]), @ptrcast([*]f32, &kvb[DcS]), kvb[2 * DcS], kvb[2 * DcS + 1]); //+seats
     const g0 = 2 * DcS + 2;
-    cache_put(1, pos, @ptrcast([*]f32, &kvb[g0]), @ptrcast([*]f32, &kvb[g0 + DcG]), kvb[g0 + 2 * DcG], kvb[g0 + 2 * DcG + 1]);
+    cache_put(1, pos, @ptrcast([*]f32, &kvb[g0]), @ptrcast([*]f32, &kvb[g0 + DcG]), kvb[g0 + 2 * DcG], kvb[g0 + 2 * DcG + 1]); //-seats
+    cache_put(1, p, @ptrcast([*]f32, &kvb[g0]), @ptrcast([*]f32, &kvb[g0 + DcG]), kvb[g0 + 2 * DcG], kvb[g0 + 2 * DcG + 1]); //+seats
   }
 }
 // a pass's start and end (a KVS consumer)

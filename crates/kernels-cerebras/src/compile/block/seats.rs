@@ -4,9 +4,12 @@
 //! GDN states and conv windows, its first x at a launch (CX's `xs`), its position (CY's `spos`)
 //! and its forced tokens (the head's `nforce`); the head marks
 //! the last `m` passes' tokens as taken by none. Seats ride the own caches' kernels
-//! ([`KernelSet::Own`]) or the windowed rows' ([`KernelSet::Windows`]: each seat's sliding ring
-//! within its window's entries) and the token loop, at most `units - 1` of them
-//! ([`crate::compile::check::hazard::seats`]).
+//! ([`KernelSet::Own`]), the windowed rows' ([`KernelSet::Windows`]) or the shared caches'
+//! ([`KernelSet::Shared`]: the shared-KV line carries the pass's seat word, each pass's credited
+//! back before the next; the per-layer-input bus a launch's first lap first, into a lap of words
+//! a CY) and the token loop, at most
+//! `units - 1` of them ([`crate::compile::check::hazard::seats`]). A sliding cache holds a ring a
+//! seat, or each seat's ring within its window's entries where those take fewer.
 //!
 //! The kernels' seat code is in their sources' lines marked `//+seats` (written only for a ring)
 //! and the one-sequence lines they replace, `//-seats` (written only without one): a program of
@@ -65,10 +68,10 @@ impl Block for Seats {
             return Ok(());
         }
         let (plan, p) = (&prog.plan, &prog.plan.partition);
-        if !matches!(prog.roles, KernelSet::Own | KernelSet::Windows) || !plan.contract.token_loop {
+        if matches!(prog.roles, KernelSet::Experts) || !plan.contract.token_loop {
             return Err(format!(
-                "seats: {m} seats want the own caches' or windowed rows' kernels and the token \
-                 loop ({} here)",
+                "seats: {m} seats want the own caches', windowed rows' or shared caches' kernels \
+                 and the token loop ({} here)",
                 prog.roles.name()
             ));
         }
@@ -97,6 +100,22 @@ impl Block for Seats {
                 .ok_or_else(|| format!("seats: no {} kernel", kind.name))?;
             kb.params.set("SEATS", Value::Int(i64::from(m)));
             kb.owns.extend(owns.iter().copied());
+        }
+        // the per-layer inputs' token bus: the stores take a launch's first lap first, each CY
+        // holds a lap of the bus's words
+        if let Some(kb) = ks.get_mut(&super::ple::STORE) {
+            kb.params.set("SEATS", Value::Int(i64::from(m)));
+            let lv = prog
+                .floor
+                .stores
+                .iter()
+                .map(|st| super::ple::levels(plan, st.units.len()));
+            let lv = lv.max().unwrap_or(0);
+            if let Some(e) = crate::compile::check::hazard::seat_bus(plan.contract.cap, lv) {
+                return Err(format!("seats: {e}"));
+            }
+            let cy = ks.get_mut(&Kind::CY).ok_or("seats: no CY kernel")?;
+            cy.params.set("PLV", Value::Int(i64::from(lv)));
         }
         Ok(())
     }

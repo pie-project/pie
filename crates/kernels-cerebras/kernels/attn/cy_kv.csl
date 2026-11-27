@@ -43,7 +43,21 @@ var posf1: f32 = 0.0;
 // (KVS 1) the source unit's KVS colour: rcfg[RQ + 15]
 fn init() void {
   if (KVS == 1 and (pe.word & 2) != 0) { fab.oqc(5, pe.rcfg[pe.RQ + 15]); }
+  if (KVS == 1 and (pe.word & 8) != 0) { fab.oqc(5, pe.rcfg[pe.RQ + 16]); }   // (seats: the last sharer's credit) //+seats
 }
+// (seats) a pass's KVS words wait for the last sharer's credit of the previous pass's (its CY's, //+seats
+// once its column's partials of them are in: rcfg[RQ + 16], taken on the idle loop-back queue) //+seats
+const LF: u16 = if (LS < LG) LS else LG; //+seats
+var owed: bool = false; //+seats
+var ackw = @zeros([1]f32); //+seats
+const ack_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ackw[i] }); //+seats
+fn drain() void { //+seats
+  if (!owed) { return; } //+seats
+  fab.iqc(4, pe.rcfg[pe.RQ + 16]); //+seats
+  @fmovs(ack_d, fab.fin(pe.q_lb, 1)); //+seats
+  fab.iqc(4, pe.rcfg[pe.RQ + 2]); //+seats
+  owed = false; //+seats
+} //+seats
 fn rope_tables(kd: u16, p: u32) void {
   if (rope_at[kd] == p) { return; }
   rope_at[kd] = p;
@@ -57,7 +71,8 @@ fn pass_start(p: u32) void {
   posf = @as(f32, p);
   // (seats: 2 seat + its reset, 65536 a step, over the window's position) //+seats
   posf = @as(f32, (2 * pe.tab[1] + (if (p == 0) @as(u32, 1) else 0)) * 65536 + pe.tab[3] + p); //+seats
-  if (KVS == 1) { posf1 = @as(f32, p + 1); }
+  if (KVS == 1) { posf1 = @as(f32, p + 1); } //-seats
+  if (KVS == 1) { posf1 = posf + 1.0; }   // (seats: the seat word + 1, under 2^24) //+seats
   if (LS != 0xff) { rope_tables(0, p); }
   if (LG != 0xff) { rope_tables(1, p); }
 }
@@ -73,6 +88,7 @@ fn attk(l: u16, comptime g: bool) void {
   const np: u16 = dc / 2;
   const AB: u16 = QD + 2 * dc + Qh + 4;
   pe.reduce(2 * NQ + 4);
+  if (KVS == 1 and l == 0 and (pe.word & 8) != 0) { @fmovs(fab.fout(pe.q_kv, 1), ack_d); } //+seats
   pe.stamp(1 + 6 * pe.cl + 0);
   const s = pe.combinec(NQ);
   const qkb = l * QKS;
@@ -117,6 +133,7 @@ fn attk(l: u16, comptime g: bool) void {
     pe.u[QD + 2 * dc] = ksv;
     pe.u[QD + 2 * dc + 1] = vsv;
     pe.u[QD + 2 * dc + 2] = posf1;
+    if (l == LF) { drain(); owed = true; } //+seats
     @fmovs(fab.fout(pe.q_kv, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)), pe.uv(QD, 2 * dc + 2 + (if (l == LG) @as(u16, 1) else 0)));
   }
   var pass: u16 = 0;

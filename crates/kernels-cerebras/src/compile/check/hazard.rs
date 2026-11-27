@@ -11,9 +11,11 @@
 //! - **Re-binds**: an output queue re-coloured during a launch with no drain wait in the
 //!   function (a send still in it would leave on the new colour).
 //! - **Late inputs** ([`late_inputs`]): a ring's input queue re-coloured during a launch to a
-//!   colour another unit (or the head) sends on: nothing holds the next pass's words back.
+//!   colour another unit (or the head) sends on, a link's or a line's of turns: nothing holds the
+//!   next pass's words back, unless a line back to the sender credits each pass's.
 //! - **Seats** ([`seats`]): a ring of more seats than the units' hand-offs hold; ([`seat_pool`]) a
-//!   KV pool of more positions than CY's word to the attention carries.
+//!   KV pool of more positions than CY's word to the attention carries; ([`seat_bus`]) a launch's
+//!   per-layer-input words past what one receive of CY's takes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,7 +25,7 @@ use crate::compile::abi::Kernels;
 use crate::compile::fabric::Colour;
 use crate::compile::floor::Coord;
 use crate::compile::program::Program;
-use crate::compile::wiring::Link;
+use crate::compile::wiring::{Link, Port};
 
 /// The hazards of `file` at `params` (its imports from `files`), one line each.
 #[must_use]
@@ -63,6 +65,17 @@ pub fn seat_pool(pool: u32) -> Option<String> {
     })
 }
 
+/// A ring's per-layer-input bus of `words` words a pass (and its sequence word) over launches of
+/// up to `cap` passes: each CY takes a launch's passes past its first lap in one receive, whose
+/// extent (u16) holds no more than 65535 words.
+#[must_use]
+pub fn seat_bus(cap: u32, words: u32) -> Option<String> {
+    let n = u64::from(cap) * u64::from(words + 1);
+    (n > 0xffff).then(|| {
+        format!("{cap} passes of {words} per-layer-input words: past the 65535 a CY receive takes")
+    })
+}
+
 /// The input queues of a ring of seats re-coloured during a launch to a colour whose words come
 /// from outside the PE's unit, one line a kernel's host word. A pass ahead sends on that colour
 /// whenever its own unit is done (the hand-offs carry no credit), so its words may be at the
@@ -76,21 +89,24 @@ pub fn late_inputs(
     own: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     let files: BTreeMap<String, String> = own.iter().cloned().collect();
-    let mut binds: BTreeMap<&str, (String, BTreeMap<i64, bool>)> = BTreeMap::new();
+    let mut binds: BTreeMap<(&str, Env), (String, Words)> = BTreeMap::new();
     let mut out = BTreeSet::new();
     for (at, colour, late) in late_links(prog)? {
         let kind = prog.floor.roles.get(at).kind;
-        if !binds.contains_key(kind.stem) {
+        // (its kind's params and the PE's overrides)
+        let params: Env = crate::compile::emit::params::tile(prog, kinds, at)?
+            .into_iter()
+            .flat_map(|(_, p)| p.items)
+            .filter_map(|(n, v)| Some((n.to_string(), eval(&v.render(), &BTreeMap::new())?)))
+            .collect();
+        let key = (kind.stem, params);
+        if !binds.contains_key(&key) {
             let file = format!("{}.csl", kind.stem);
-            let params = (kinds.get(&kind).into_iter())
-                .flat_map(|k| &k.params.items)
-                .filter_map(|(n, v)| Some((n.to_string(), eval(&v.render(), &BTreeMap::new())?)))
-                .collect();
-            let words = bound_words(&super::code::code(&files, &file, &params))
+            let words = bound_words(&super::code::code(&files, &file, &key.1))
                 .map_err(|e| format!("`{file}` {e}"))?;
-            binds.insert(kind.stem, (file, words));
+            binds.insert(key.clone(), (file, words));
         }
-        let (file, words) = &binds[kind.stem];
+        let (file, words) = &binds[&key];
         if words.is_empty() {
             continue;
         }
@@ -118,6 +134,11 @@ pub fn late_inputs(
     }
     Ok(out.into_iter().collect())
 }
+
+/// A kernel's params, evaluated.
+type Env = BTreeMap<String, i64>;
+/// The rcfg words a kernel's queues are re-bound to, and whether each is before the last partial.
+type Words = BTreeMap<i64, bool>;
 
 /// When a unit PE's input from another PE comes, seen from the PE's own pass.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,6 +177,36 @@ fn late_links(prog: &Program) -> Result<Vec<(Coord, Colour, Late)>, String> {
                 out.push((c, colour, Late::Outside));
             } else if path && src.x == prog.floor.units[u].cx_x() {
                 out.push((c, colour, Late::Posted));
+            }
+        }
+    }
+    // a line laid by turns: its ramps' sends to its ramps' receives, unless a line back from a
+    // receive's unit to the send's credits each word (the sender waits for it)
+    let mut lines: BTreeMap<_, (Vec<Coord>, Vec<Coord>)> = BTreeMap::new();
+    for l in &prog.wiring.links {
+        if let Link::Turn(t) = l {
+            let e = lines.entry(t.class).or_default();
+            if t.from == Port::Ramp {
+                e.0.push(t.at);
+            }
+            if t.to.contains(&Port::Ramp) && t.from != Port::Ramp {
+                e.1.push(t.at);
+            }
+        }
+    }
+    let units = |cs: &[Coord]| cs.iter().filter_map(|&c| unit(c)).collect::<BTreeSet<_>>();
+    for (class, (srcs, to)) in &lines {
+        let (su, tu) = (units(srcs), units(to));
+        let credited = lines.iter().any(|(k, (s2, t2))| {
+            k != class && !units(s2).is_disjoint(&tu) && !units(t2).is_disjoint(&su)
+        });
+        if credited {
+            continue;
+        }
+        let colour = prog.palette.get(*class)?;
+        for &c in to {
+            if unit(c).is_some_and(|u| !su.contains(&u)) {
+                out.push((c, colour, Late::Outside));
             }
         }
     }
@@ -1234,6 +1285,8 @@ mod tests {
         assert!(seats(8, 8).is_some());
         assert_eq!(seat_pool(1 << 16), None);
         assert!(seat_pool((1 << 16) + 1).is_some());
+        assert_eq!(seat_bus(256, 24), None);
+        assert!(seat_bus(4096, 24).is_some());
     }
 
     #[test]

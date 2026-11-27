@@ -61,7 +61,9 @@ pub const ANCHORS: &[Anchor] = &[
 /// The shared kernels' weight image (`kv.csl`): positions over KV rows not a power of two take
 /// software multiplies and divides; a sliding ring that is not the window exactly masks its
 /// entries; sliding entries not a power of two index by multiplies (the e2b links: 692, 268 and
-/// 224 B over the e4b anchor's 128 rows, exact ring and 4 entries).
+/// 224 B over the e4b anchor's 128 rows, exact ring and 4 entries); a ring of seats' code past
+/// what its caches and references give, and its sliding rings a seat's where those take fewer
+/// than the pool's entries (the e4b links at 2 to 6 seats: 734 and 120 B).
 const SHARED: &[Code] = &[
     Code {
         what: "KV rows not a power of two",
@@ -87,6 +89,18 @@ const SHARED: &[Code] = &[
         anchor: false,
         bytes: 224.0,
     },
+    Code {
+        what: "a ring of seats",
+        on: |p: &Plan| p.seats > 1,
+        anchor: false,
+        bytes: 734.0,
+    },
+    Code {
+        what: "sliding rings a seat",
+        on: fixed_rings,
+        anchor: false,
+        bytes: 120.0,
+    },
 ];
 
 /// A ring of seats whose sliding rings, a seat's each, take fewer entries than the pool's.
@@ -99,7 +113,7 @@ fn fixed_rings(p: &Plan) -> bool {
 
 /// The windowed rows' weight image (`kv.csl`): a ring of seats' code past what its attention
 /// rows' moving bytes give (the 12B links at 2 seats and 13 entries a row: 168 B), and its
-/// sliding rings a seat's (the shared kernels' measure: 120 B).
+/// sliding rings a seat's (the shared kernels' measure).
 const WINDOWS: &[Code] = &[
     Code {
         what: "a ring of seats",

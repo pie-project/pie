@@ -71,6 +71,7 @@ param PLOG: u16 = 0;   // (PLE 1) 1: the full model logs each step's PLE words t
 param TSTAMP: u16 = 0; // 1 (diagnostics): phase stamps into tdbg (on the critical path)
 param FIFOW: u16 = 32; // the reduction's FIFO depth (words)
 param SEATS: u16 = 1;  // a ring of seats (ops/seats.csl) //+seats
+param PLV: u16 = 63;   // (PLE 1) the most PLE bus words (a pass's, but the sequence word) //+seats
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = 6 });
@@ -91,7 +92,8 @@ const TN: u16 = if (MIXK == 0) mx(mx(mx(NQA + 1, NQG + 1), mx(2 * Ic + 1, 2 * DV
 const UN: u16 = if (MIXK <= 1) TN else if (MIXK == 2) mx(Qh * Dc + 2 * Dc + 1 + (if (QKN == 1) Qh + 1 else 0), Qh * Dc + 1 + Qh)
                 else mx(TK * Ic, 2 * TK);
 const NTD: u16 = if (MIXK <= 1) 1 + 6 * K else 1 + 4 * K;
-const RCW: u16 = if (MIXK == 0) 11 else if (MIXK == 1) 16 else 12;
+const RCW: u16 = if (MIXK == 0) 11 else if (MIXK == 1) 16 else 12; //-seats
+const RCW: u16 = if (MIXK == 0) 11 else if (MIXK == 1) 17 else 12;   // (seats: the KVS credit's colour) //+seats
 const pe = @import_module("ops/cpe.csl", .{ .fab = fab, .math = math, .TN = TN, .UN = UN, .RCW = RCW, .NTD = NTD,
   .TSTAMP = TSTAMP, .HR = HR, .EPS = EPS, .KVQ = if (MIXK == 1) KVS else 0, .FIFOW = FIFOW,
   .TA = if (MIXK <= 1) 16 else 4 });
@@ -119,7 +121,8 @@ var spos_ptr: [*]u32 = &seats.spos; //+seats
 var sbase_ptr: [*]u32 = &seats.sbase; //+seats
 const kv = @import_module("ops/cy_kv.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 1, .K = K, .KM = KM,
   .Qh = Qh, .DcS = DcS, .DcG = DcG, .SH = SH, .KEV = KEV, .KVS = KVS });
-const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K });
+const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K }); //-seats
+const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K, .SEATS = SEATS, .LV = PLV }); //+seats
 var pl_ptr: [*]f32 = &ple.pl;
 var plog_ptr: [*]f32 = &ple.plog;
 const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh,
@@ -142,7 +145,8 @@ fn init() void {
   timestamp.enable_tsc();
   if (MIXK <= 1) { act.init(); }
   if (MIXK == 0) { gdn.init(); }
-  if (PLE == 1 and ple.on_bus() and (DIAG & 32) == 0) { ple.post(); }   // step 0's words
+  if (PLE == 1 and ple.on_bus() and (DIAG & 32) == 0) { ple.post(); }   // step 0's words //-seats
+  if (PLE == 1 and ple.on_bus() and (DIAG & 32) == 0) { ple.post_lap(); }   // the first lap's words //+seats
   sys_mod.unblock_cmd_stream();
 }
 
@@ -228,7 +232,8 @@ task pass_task() void {
       pe.stamp(0);
       kv.pass_start(pe.tab[0]);
       const bus = PLE == 1 and ple.on_bus() and (DIAG & 32) == 0;   // DIAG 32: no PLE words
-      if (bus) { ple.wait(pe.tab[0]); }
+      if (bus) { ple.wait(pe.tab[0]); } //-seats
+      if (bus) { ple.take(s, n_steps); } //+seats
       if (PLE == 1 and PLOG == 1) { ple.log(s); }
       if ((DIAG & 1) != 0) {
         probes(s);
@@ -242,10 +247,12 @@ task pass_task() void {
         }
         if ((pe.word & 4) != 0) { flush(); }
       }
-      if (bus) { ple.post(); }   // (the next pass's, this launch's or the next one's)
+      if (bus) { ple.post(); }   // (the next pass's, this launch's or the next one's) //-seats
+      if (bus and s + 1 == n_steps) { ple.post_lap(); }   // (the next launch's first lap) //+seats
       seats.next(); //+seats
     }
   }
+  if (MIXK == 1 and (pe.word & 2) != 0) { kv.drain(); }   // (seats: the launch's last credit) //+seats
   sys_mod.unblock_cmd_stream();
 }
 fn compute(steps: u32, start_pos: u32) void {
