@@ -33,15 +33,19 @@ macro_rules! seeded {
     };
 }
 
-seeded!("nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml");
+seeded!(
+    "nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml",
+    "nvidia-rtx-pro-4500-blackwell.measured.toml",
+);
 
 /// The host covers committed for the adapters native wgpu serves
 /// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
 /// listed here: the runtime takes a cover whose key matches where the
 /// home's own cache holds none (`engine::Engine::committed_covers`).
-pub const COVERS: &[&str] = &[include_str!(
-    "../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"
-)];
+pub const COVERS: &[&str] = &[
+    include_str!("../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"),
+    include_str!("../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"),
+];
 
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",

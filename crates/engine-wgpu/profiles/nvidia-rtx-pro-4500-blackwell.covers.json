@@ -1,0 +1,14 @@
+[
+  {
+    "key": "Wgsl|wgpu Vulkan 10de:2c31 driver NVIDIA 595.112.07|kernels 26 0xeeb626a7|emitter wgsl 13 compiler 3 plan 9 lanes 5|tuning 0x6684dca9|qwen3-0.6b-bf16-kv-bf16|sampler source 04109ae88192a247|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 5365.25,
+    "turnaround_us": 100.75
+  },
+  {
+    "key": "Wgsl|wgpu Vulkan 10de:2c31 driver NVIDIA 595.112.07|kernels 49 0xf82fcbb4|emitter wgsl 13 compiler 3 plan 9 lanes 5|tuning 0xc3fb5acd|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 04109ae88192a247|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 8009.5,
+    "turnaround_us": 185.5
+  }
+]
