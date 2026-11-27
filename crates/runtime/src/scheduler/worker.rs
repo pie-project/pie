@@ -448,8 +448,41 @@ pub(crate) enum HostKvOp {
     ReloadWeights(std::path::PathBuf),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
+#[cfg(not(target_arch = "wasm32"))]
 type SchedRx = tokio::sync::mpsc::UnboundedReceiver<SchedulerItem>;
+
+/// The tab's scheduler mailbox: web_std's channel, as the lane's control
+/// queue is, so a send while the scheduler sleeps on it wakes it through the
+/// page's executor (a tokio mailbox's send there left it asleep).
+#[cfg(target_arch = "wasm32")]
+type SchedTx = crate::rt::channel::Sender<SchedulerItem>;
+#[cfg(target_arch = "wasm32")]
+struct SchedRx(crate::rt::channel::Receiver<SchedulerItem>);
+
+#[cfg(target_arch = "wasm32")]
+impl SchedRx {
+    async fn recv(&mut self) -> Option<SchedulerItem> {
+        self.0.recv_async().await.ok()
+    }
+
+    fn try_recv(&mut self) -> Result<SchedulerItem, crate::rt::channel::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+fn sched_channel() -> (SchedTx, SchedRx) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::sync::mpsc::unbounded_channel::<SchedulerItem>()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let (tx, rx) = crate::rt::channel::unbounded::<SchedulerItem>();
+        (tx, SchedRx(rx))
+    }
+}
 #[derive(Default)]
 struct LaneReplies {
     next_control_id: u64,
@@ -1140,7 +1173,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         frame_size: usize,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SchedulerItem>();
+        let (tx, rx) = sched_channel();
         let stats = Arc::new(SchedulerStats::default());
         let handle = SchedulerHandle {
             inner: Arc::new(SchedulerControl {
