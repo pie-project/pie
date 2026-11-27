@@ -26,13 +26,22 @@ pub enum Finish {
     /// The turn ended with tool calls.
     ToolCalls,
     StopSequence,
+    /// The host stopped it (a policy's terminate): the tokens so far stand,
+    /// and [`Outcome::stop_reason`] says why.
+    Abort,
 }
+
+/// How a fire refused because the host stopped the process reads: this,
+/// then the reason. The runtime's `policy::STOPPED`.
+pub const STOPPED: &str = "stopped by policy: ";
 
 #[derive(Clone, Debug)]
 pub struct Outcome {
     pub finish: Finish,
     /// The stop sequence that ended generation, when one did.
     pub stop_sequence: Option<String>,
+    /// Why the host stopped it, when it did ([`Finish::Abort`]).
+    pub stop_reason: Option<String>,
     pub stop_token: Option<u32>,
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
@@ -163,13 +172,6 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     let sink = RefCell::new(sink);
     let mut prompt = prompt::build(req)?;
     let prompt_len = prompt.tokens.len();
-    // How long the system turn is, which only this process counts: a client
-    // that asks it kept on disk (`persist-system`) names it so.
-    if let Some(system) = prompt.system {
-        let props = inferlet::serde_json::json!({ "system-tokens": system }).to_string();
-        // Refused, it costs only the persisting.
-        let _ = inferlet::session::set_props(&props);
-    }
     // A turn continued here goes on after what the client was sent.
     let continued = crate::continuation::get()
         .map(|c| c.tokens)
@@ -184,7 +186,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         req.choice,
         callable,
     );
-    if req.raw_prompt.is_some() {
+    if req.raw_prompt.is_some() || req.prompt_tokens.is_some() {
         demux.verbatim();
     }
     let mut out = Output::new(req);
@@ -266,7 +268,10 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         }
         flow
     };
-    let done = generate(
+    // Its passes state their rows final, stop sequences or
+    // none: a stop sequence only cuts the output (`Output::deliver`), the
+    // set ends with the request, and nothing is taken back.
+    let ran = generate(
         &prompt,
         req.sampling,
         req.max_tokens.saturating_sub(continued.len()),
@@ -274,8 +279,19 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         &mut on_prompt,
         &mut on_token,
     )
-    .await?;
-    let sampled = done.sampled;
+    .await;
+    // Stopped by the host, it ends here with what it sampled.
+    let mut stop_reason = None;
+    let sampled = match ran {
+        Ok(done) => done.sampled,
+        Err(e) => match e.find(STOPPED) {
+            Some(at) => {
+                stop_reason = Some(e[at + STOPPED.len()..].to_string());
+                generated as usize - continued.len()
+            }
+            None => return Err(e),
+        },
+    };
     let cached_tokens = inferlet::session::cached_tokens() as usize;
     let mut sink = sink.into_inner();
     if let Some(e) = error {
@@ -285,6 +301,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
     out.end(demux.finish(), &mut sink);
 
     let mut finish = match out.finish {
+        _ if stop_reason.is_some() => Finish::Abort,
         Some(f) => f,
         None if guide.as_ref().is_some_and(|g| g.is_terminated()) => Finish::Stop,
         None => Finish::Length,
@@ -300,6 +317,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         finish,
         stop_sequence: out.stop_sequence,
         stop_token: out.stop_token,
+        stop_reason,
         prompt_tokens: prompt.tokens.len() - continued,
         cached_tokens: cached_tokens.min(prompt.tokens.len() - continued),
         completion_tokens: sampled + continued,

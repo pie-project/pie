@@ -4,6 +4,7 @@
 //! lands what it lands over the `[gate | up]` rows of the same values, bit
 //! for bit, an unclamped one clamped at the largest finite f32.
 
+use crate::common::bf16_bytes;
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -15,13 +16,6 @@ fn unit(at: u64) -> f32 {
     x ^= x >> 33;
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     ((x >> 32) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
 }
 
 struct Rig {
@@ -64,6 +58,7 @@ impl Rig {
 
 #[test]
 fn a_gate_and_an_up_apart_land_what_they_land_packed() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

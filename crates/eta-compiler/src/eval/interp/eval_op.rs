@@ -1,5 +1,6 @@
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use eta_ir::op::Op;
 use eta_ir::rng;
@@ -8,7 +9,112 @@ use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueTyp
 use super::numeric::*;
 use super::{ChanEffect, Evaled, PassInputs, StepError, Value, value_matches};
 
-pub(crate) fn eval_op(
+/// One op over `vals` (indexed by the op's value ids), `ty_of` its
+/// operands' types: its result(s), or the effect it asks of the caller (a
+/// channel, a kernel, a sink). The one evaluator of an op on the host: the
+/// tier-0 interpreter here and eta-exec's both run it.
+///
+/// A `bf16` operand is widened to f32 exactly, the op computes in f32, and
+/// a `bf16` result is rounded once, to nearest even (`eta_ir::types`' bf16
+/// rules): a reduction's or a scan's running value is f32 throughout.
+pub fn eval_op(
+    op: &Op,
+    vals: &[Value],
+    ty_of: &dyn Fn(ValueId) -> ValueType,
+    inputs: &PassInputs,
+    names: &[String],
+) -> Result<Evaled, StepError> {
+    let operands = op.operands();
+    let effect = op.is_effectful() || matches!(op, Op::Output { .. });
+    let bf16 = |id: &ValueId| vals[*id as usize].dtype() == Dtype::Bf16;
+    let casts_to_bf16 = matches!(
+        op,
+        Op::Cast {
+            dtype: Dtype::Bf16,
+            ..
+        }
+    );
+    if effect || !(casts_to_bf16 || operands.iter().any(bf16)) {
+        return eval_wide(op, vals, ty_of, inputs, names);
+    }
+    // The op over its operands widened, numbered 0.. in its operand order.
+    let local: Vec<Value> = operands
+        .iter()
+        .map(|&id| widen(&vals[id as usize]))
+        .collect();
+    let mut wide = op.clone();
+    let mut next = 0;
+    wide.map_operands(|_| {
+        next += 1;
+        next - 1
+    });
+    if let Op::Cast { dtype, .. } = &mut wide
+        && *dtype == Dtype::Bf16
+    {
+        *dtype = Dtype::F32;
+    }
+    let wide_ty = |id: ValueId| {
+        let ty = ty_of(operands[id as usize]);
+        if ty.dtype == Dtype::Bf16 {
+            ValueType::new(ty.shape, Dtype::F32)
+        } else {
+            ty
+        }
+    };
+    let narrow = narrows(op, |id| bf16(&id));
+    let round = |value: Value| match value {
+        Value::F32(x) if narrow => Value::bf16_of(&x),
+        other => other,
+    };
+    Ok(match eval_wide(&wide, &local, &wide_ty, inputs, names)? {
+        Evaled::One(value) => Evaled::One(round(value)),
+        Evaled::Two(values, indices) => Evaled::Two(round(values), indices),
+        other => other,
+    })
+}
+
+/// `value` with a `bf16` value widened to its exact f32s.
+fn widen(value: &Value) -> Value {
+    match value {
+        Value::Bf16(x) => Value::F32(x.iter().map(|&b| eta_ir::types::bf16_to_f32(b)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Whether `op`'s (first) result is `bf16`, given which of its operands are
+/// (`eta_ir::infer`'s rules): a cast to it; the result of a reduction, a
+/// product, a comparison, a pivot or an argmax never; a gather's, a
+/// scatter's or a mask's where its source, base or logits is; an
+/// elementwise op's, a scan's, an order op's values and a shape op's where
+/// any operand is.
+pub(crate) fn narrows(op: &Op, bf16: impl Fn(ValueId) -> bool) -> bool {
+    match *op {
+        Op::Cast { dtype, .. } => dtype == Dtype::Bf16,
+        Op::ReduceSum(_)
+        | Op::ReduceMax(_)
+        | Op::ReduceMin(_)
+        | Op::ReduceArgmax(_)
+        | Op::GumbelArgmax { .. }
+        | Op::MatMul(..)
+        | Op::Gt(..)
+        | Op::Ge(..)
+        | Op::Eq(..)
+        | Op::Ne(..)
+        | Op::Lt(..)
+        | Op::Le(..)
+        | Op::And(..)
+        | Op::Or(..)
+        | Op::Not(_)
+        | Op::PivotThreshold { .. } => false,
+        Op::Gather { src, .. } | Op::GatherRow { src, .. } => bf16(src),
+        Op::ScatterAdd { base, .. } | Op::ScatterSet { base, .. } => bf16(base),
+        Op::MaskApply { logits, .. } => bf16(logits),
+        Op::Select { a, b, .. } => bf16(a) || bf16(b),
+        _ => op.operands().into_iter().any(bf16),
+    }
+}
+
+fn eval_wide(
     op: &Op,
     vals: &[Value],
     ty_of: &dyn Fn(ValueId) -> ValueType,
@@ -39,12 +145,14 @@ pub(crate) fn eval_op(
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_neg()).collect()),
             Value::U32(x) => Value::U32(x.iter().map(|&a| a.wrapping_neg()).collect()),
             Value::Bool(_) => return Err(fault("neg on bool".into())),
+            Value::Bf16(_) => return Err(unwidened()),
         }),
         Op::Abs(a) => One(match v(a) {
             Value::F32(x) => Value::F32(x.iter().map(|&a| a.abs()).collect()),
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.wrapping_abs()).collect()),
             Value::U32(x) => Value::U32(x.clone()),
             Value::Bool(x) => Value::Bool(x.clone()),
+            Value::Bf16(_) => return Err(unwidened()),
         }),
         Op::Sign(a) => One(match v(a) {
             Value::F32(x) => Value::F32(
@@ -63,6 +171,7 @@ pub(crate) fn eval_op(
             Value::I32(x) => Value::I32(x.iter().map(|&a| a.signum()).collect()),
             Value::U32(x) => Value::U32(x.iter().map(|&a| (a != 0) as u32).collect()),
             Value::Bool(_) => return Err(fault("sign on bool".into())),
+            Value::Bf16(_) => return Err(unwidened()),
         }),
         Op::Cast { value, dtype } => One(match dtype {
             Dtype::F32 => Value::F32(lanes_f32(v(value))),
@@ -280,8 +389,45 @@ pub(crate) fn eval_op(
                         .collect()
                 }
                 Value::Bool(_) => return Err(fault("argmax on bool".into())),
+                Value::Bf16(_) => return Err(unwidened()),
             };
             One(Value::I32(result))
+        }
+
+        Op::GumbelArgmax {
+            logits,
+            keep,
+            scale,
+            state,
+        } => {
+            // Each lane as `select(keep, logits * scale, -inf) +
+            // rng_keyed(state)` holds it, in f32, then the argmax.
+            let t = ty_of(logits);
+            let x = lanes_f32(v(logits));
+            let Value::Bool(k) = v(keep) else {
+                return Err(fault("gumbel_argmax keep".into()));
+            };
+            let s = lanes_f32(v(scale))[0];
+            let st = lanes_i64(v(state));
+            let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);
+            let seed64 = rng::keyed_seed(key as u32, ctr as u32);
+            let noise = rng_lanes(seed64, x.len(), RngKind::Gumbel);
+            let perturbed: Vec<f32> = (0..x.len())
+                .map(|i| {
+                    if k[pick(k.len(), i)] {
+                        x[i] * s + noise[i]
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect();
+            let rows = rows_of(t.shape);
+            let len = perturbed.len().checked_div(rows).unwrap_or(0);
+            One(Value::I32(
+                (0..rows)
+                    .map(|row| argmax_row(&perturbed[row * len..(row + 1) * len]))
+                    .collect(),
+            ))
         }
 
         Op::Broadcast { value, shape } => {
@@ -377,6 +523,15 @@ pub(crate) fn eval_op(
             let rows = rows_of(t.shape);
             let x = lanes_f32(v(input));
             let len = x.len().checked_div(rows).unwrap_or(0);
+            let payload = match predicate {
+                Predicate::RankLe(id) | Predicate::CummassLe(id) | Predicate::ProbGe(id) => id,
+            };
+            if v(payload).is_empty() {
+                return Err(fault(format!(
+                    "pivot_threshold reads value {payload} as its predicate payload and that \
+                     value has no lanes"
+                )));
+            }
             let mut keep = vec![false; x.len()];
             for r in 0..rows {
                 let row = &x[r * len..(r + 1) * len];
@@ -385,23 +540,18 @@ pub(crate) fn eval_op(
                     Predicate::RankLe(kid) => {
                         let kv = lanes_i64(v(kid));
                         let kk = kv[pick(kv.len(), r)].clamp(0, len as i64);
-                        for (i, &xi) in row.iter().enumerate() {
-                            if xi.is_nan() {
-                                continue;
-                            }
-                            let greater =
-                                row.iter().filter(|&&y| !y.is_nan() && y > xi).count() as i64;
-                            k[i] = greater < kk;
-                        }
+                        eta_ir::rank::rank_cut(row, kk as usize, |i| k[i] = true);
                     }
                     Predicate::CummassLe(pid) => {
                         let pv = lanes_f32(v(pid));
                         let p = pv[pick(pv.len(), r)];
-                        let order = sort_desc_order(row);
-                        let mut excl = 0.0f32;
-                        for &i in &order {
-                            k[i as usize] = excl < p;
-                            excl += row[i as usize];
+                        if !nucleus_prefix(row, p, k) {
+                            let order = sort_desc_order(row);
+                            let mut excl = 0.0f32;
+                            for &i in &order {
+                                k[i as usize] = excl < p;
+                                excl += row[i as usize];
+                            }
                         }
                     }
                     Predicate::ProbGe(tid) => {
@@ -588,29 +738,16 @@ pub(crate) fn eval_op(
             stream,
             shape,
             kind,
-        } => One(Value::F32(rng_ambient(
-            0,
-            stream,
-            kind,
+        } => One(Value::F32(rng_lanes(
+            rng::seed_eff_stream(0, stream),
             shape.numel() as usize,
+            kind,
         ))),
         Op::RngKeyed { state, shape, kind } => {
             let st = lanes_i64(v(state));
             let (key, ctr) = (st[0] as u64 & 0xFFFF_FFFF, st[1] as u64 & 0xFFFF_FFFF);
             let seed64 = rng::keyed_seed(key as u32, ctr as u32);
-            let n = shape.numel() as usize;
-            One(Value::F32(
-                (0..n as u32)
-                    .map(|j| {
-                        let u = rng::hash_uniform(seed64, j);
-                        match kind {
-                            RngKind::Uniform => u,
-                            RngKind::Gumbel => -((-(u.ln())).ln()),
-                            RngKind::Normal => rng::hash_normal(seed64, j),
-                        }
-                    })
-                    .collect(),
-            ))
+            One(Value::F32(rng_lanes(seed64, shape.numel() as usize, kind)))
         }
 
         Op::ChanTake(c) => Evaled::Chan(ChanEffect::Take(c)),
@@ -663,6 +800,7 @@ pub(super) fn gather_flat(v: &Value, idx: &[usize]) -> Value {
         Value::I32(x) => Value::I32(idx.iter().map(|&i| x[i]).collect()),
         Value::U32(x) => Value::U32(idx.iter().map(|&i| x[i]).collect()),
         Value::Bool(x) => Value::Bool(idx.iter().map(|&i| x[i]).collect()),
+        Value::Bf16(x) => Value::Bf16(idx.iter().map(|&i| x[i]).collect()),
     }
 }
 
@@ -684,7 +822,18 @@ pub(super) fn gather_flat_fill0(v: &Value, idx: &[usize]) -> Value {
                 .collect(),
         ),
         Value::Bool(x) => Value::Bool(idx.iter().map(|&i| i != usize::MAX && x[i]).collect()),
+        Value::Bf16(x) => Value::Bf16(
+            idx.iter()
+                .map(|&i| if i == usize::MAX { 0 } else { x[i] })
+                .collect(),
+        ),
     }
+}
+
+/// A `bf16` value reached the f32 evaluator, which [`eval_op`] widens
+/// every one before.
+fn unwidened() -> StepError {
+    StepError::Fault("a bf16 operand reached the interpreter's f32 evaluator unwidened".into())
 }
 
 pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) -> Value {
@@ -696,15 +845,19 @@ pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) ->
     for i in (0..r.saturating_sub(1)).rev() {
         sstride[i] = sstride[i + 1] * sdim(i + 1) as u64;
     }
+    let mut tstride = vec![1u64; r.max(1)];
+    for i in (0..r.saturating_sub(1)).rev() {
+        tstride[i] = tstride[i + 1] * td[i + 1] as u64;
+    }
     let n = target.numel() as usize;
     let src_idx: Vec<usize> = (0..n as u64)
         .map(|lin| {
             let mut rem = lin;
             let mut sidx = 0u64;
             for i in 0..r {
-                let stride: u64 = td[i + 1..].iter().map(|&d| d as u64).product();
-                let coord = rem / stride.max(1);
-                rem %= stride.max(1);
+                let stride = tstride[i].max(1);
+                let coord = rem / stride;
+                rem %= stride;
                 if sdim(i) != 1 {
                     sidx += coord * sstride[i];
                 }
@@ -715,16 +868,189 @@ pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) ->
     gather_flat(value, &src_idx)
 }
 
-pub(super) fn rng_ambient(seed: u32, stream: u32, kind: RngKind, len: usize) -> Vec<f32> {
-    let seed_eff = rng::seed_eff_stream(seed, stream);
-    (0..len as u32)
-        .map(|j| {
-            let u = rng::hash_uniform(seed_eff, j);
-            match kind {
-                RngKind::Uniform => u,
-                RngKind::Gumbel => -((-(u.ln())).ln()),
-                RngKind::Normal => rng::hash_normal(seed_eff, j),
+/// `n` draws of `kind` from the stream `seed_eff`, lane `j` the stream's
+/// `j`th: the same lanes however they are split, a long run's chunks on
+/// threads of their own.
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::disallowed_methods,
+        reason = "available_parallelism is Err on wasm32, so one worker: the serial branch returns before the scope"
+    )
+)]
+pub(super) fn rng_lanes(seed_eff: u64, n: usize, kind: RngKind) -> Vec<f32> {
+    const SPLIT_ABOVE: usize = 1 << 15;
+    let lane = |j: usize| {
+        let j = j as u32;
+        match kind {
+            RngKind::Uniform => rng::hash_uniform(seed_eff, j),
+            RngKind::Gumbel => -((-(rng::hash_uniform(seed_eff, j).ln())).ln()),
+            RngKind::Normal => rng::hash_normal(seed_eff, j),
+        }
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, core::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    if n <= SPLIT_ABOVE || threads == 1 {
+        return (0..n).map(lane).collect();
+    }
+    let mut out = vec![0.0f32; n];
+    let chunk = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (c, slice) in out.chunks_mut(chunk).enumerate() {
+            let lane = &lane;
+            scope.spawn(move || {
+                let base = c * chunk;
+                for (k, slot) in slice.iter_mut().enumerate() {
+                    *slot = lane(base + k);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The nucleus cut of a row whose mass `p` lies within its 64 largest
+/// values: those values kept in `keep` as the full sort's walk keeps them
+/// (the same order, NaN last, ties by index; the same running sum), and
+/// `true`. `false`, `keep` untouched, where the row is no wider than that,
+/// holds a NaN or a negative value (its running sum then not rising), `p`
+/// is NaN, the 64 hold less than `p`, or finding them took too many
+/// inserts: the caller sorts the whole row.
+fn nucleus_prefix(row: &[f32], p: f32, keep: &mut [bool]) -> bool {
+    const WIDE: usize = 64;
+    const GIVE_UP: usize = 32 * WIDE;
+    if p.is_nan() || WIDE >= row.len() {
+        return false;
+    }
+    let mut best: Vec<u32> = Vec::with_capacity(WIDE + 1);
+    let mut inserts = 0usize;
+    for (i, &value) in row.iter().enumerate() {
+        if value.is_nan() || value < 0.0 {
+            return false;
+        }
+        let i = i as u32;
+        if best.len() == WIDE && desc_by_value(row, i, best[WIDE - 1]) != Ordering::Less {
+            continue;
+        }
+        let at = best.partition_point(|&b| desc_by_value(row, b, i) == Ordering::Less);
+        best.insert(at, i);
+        best.truncate(WIDE);
+        inserts += 1;
+        if inserts > GIVE_UP {
+            return false;
+        }
+    }
+    let mut excl = 0.0f32;
+    for &i in &best {
+        if excl >= p {
+            return true;
+        }
+        keep[i as usize] = true;
+        excl += row[i as usize];
+    }
+    if excl >= p {
+        return true;
+    }
+    for &i in &best {
+        keep[i as usize] = false;
+    }
+    false
+}
+
+/// [`sort_desc_order`]'s order of two of `row`'s indices.
+fn desc_by_value(row: &[f32], a: u32, b: u32) -> Ordering {
+    let (x, y) = (row[a as usize], row[b as usize]);
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => a.cmp(&b),
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => y.partial_cmp(&x).unwrap_or(Ordering::Equal).then(a.cmp(&b)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{nucleus_prefix, rng_lanes, sort_desc_order};
+    use eta_ir::RngKind;
+
+    /// The full sort's nucleus walk, the fast prefix's reference.
+    fn walk(row: &[f32], p: f32) -> Vec<bool> {
+        let mut keep = vec![false; row.len()];
+        let mut excl = 0.0f32;
+        for i in sort_desc_order(row) {
+            keep[i as usize] = excl < p;
+            excl += row[i as usize];
+        }
+        keep
+    }
+
+    /// Where the 64-wide prefix answers, it answers what the full sort's
+    /// walk does: softmax-like rows with ties, peaked and flat, at masses
+    /// from none to all of the row; where it does not, it leaves `keep`
+    /// untouched.
+    #[test]
+    fn the_nucleus_prefix_keeps_what_the_full_walk_keeps() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut answered = 0;
+        for width in [65usize, 128, 1000, 4096] {
+            for peak in [1.0f32, 8.0, 64.0] {
+                let mut row: Vec<f32> = (0..width)
+                    .map(|_| ((next() % 1000) as f32 / 1000.0 * peak).exp())
+                    .collect();
+                row[(next() as usize) % width] = row[0];
+                let total: f32 = row.iter().sum();
+                for value in &mut row {
+                    *value /= total;
+                }
+                for p in [-1.0f32, 0.0, 0.001, 0.1, 0.5, 0.9, 0.999, 1.5, f32::NAN] {
+                    let mut keep = vec![false; width];
+                    if nucleus_prefix(&row, p, &mut keep) {
+                        answered += 1;
+                        assert_eq!(keep, walk(&row, p), "width {width}, peak {peak}, p {p}");
+                    } else {
+                        assert!(keep.iter().all(|&k| !k), "a refused prefix keeps nothing");
+                    }
+                }
             }
-        })
-        .collect()
+        }
+        assert!(answered > 0, "the prefix answers some rows");
+        let mut negative = vec![0.01f32; 100];
+        negative[3] = -0.5;
+        let mut keep = vec![false; 100];
+        assert!(!nucleus_prefix(&negative, 0.0, &mut keep));
+    }
+
+    /// A long draw's threads make the lanes one thread would.
+    #[test]
+    fn a_split_draw_is_the_serial_draw() {
+        let serial = |seed: u64, n: usize, kind: RngKind| -> Vec<f32> {
+            (0..n)
+                .map(|j| match kind {
+                    RngKind::Uniform => eta_ir::rng::hash_uniform(seed, j as u32),
+                    RngKind::Gumbel => -(-eta_ir::rng::hash_uniform(seed, j as u32).ln()).ln(),
+                    RngKind::Normal => eta_ir::rng::hash_normal(seed, j as u32),
+                })
+                .collect()
+        };
+        for &n in &[1usize, 1 << 15, (1 << 15) + 1, 100_003, 262_144] {
+            for kind in [RngKind::Uniform, RngKind::Gumbel, RngKind::Normal] {
+                let want = serial(0x9E37_79B9_7F4A_7C15, n, kind);
+                let got = rng_lanes(0x9E37_79B9_7F4A_7C15, n, kind);
+                assert_eq!(got.len(), want.len(), "length at n={n}");
+                for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.to_bits(), w.to_bits(), "lane {j} of {n} ({kind:?})");
+                }
+            }
+        }
+    }
 }

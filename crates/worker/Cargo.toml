@@ -19,7 +19,9 @@ default = ["net"]
 # in-process runtime an app embeds (`embedded`, `Server` without `listen`).
 net = [
     "dep:client",
+    "controller-api/client",
     "dep:mimalloc",
+    "dep:libmimalloc-sys",
     "dep:reqwest",
     "dep:tarpc",
     "dep:tokio-tungstenite",
@@ -43,6 +45,7 @@ cerebras = ["runtime/cerebras"]
 nixl = ["dep:transport", "transport/nixl", "engine-cpu?/nixl"]
 
 profile-fire = ["runtime/profile-fire"]
+test-slot-fill = ["runtime/test-slot-fill"]
 
 [dependencies]
 units = { path = "../units" }
@@ -77,6 +80,7 @@ tarpc = { version = "0.38", optional = true, features = [
 tokio-tungstenite = { version = "0.30.0", optional = true }
 futures = "0.3.33"
 mimalloc = { version = "0.1", features = ["local_dynamic_tls", "no_thp"], optional = true }
+libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 tracing = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"], optional = true }
 
@@ -92,6 +96,9 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The blob fetch's test builds reqwest's client, which takes its TLS provider
+# from the process, as `standalone` installs it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
 
 [lints]
 workspace = true

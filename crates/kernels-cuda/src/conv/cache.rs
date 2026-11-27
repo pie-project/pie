@@ -22,12 +22,15 @@ pub fn cache_rows(grid: &[i32], frames: u32) -> u64 {
 type Checked = (i32, i32, i32, i64, i64, u32, StateRows);
 
 /// The frame slab's rows (`pool.slab`, `[slots, frames * plane * C]`)
-/// cut along their frame-position rows: `pool.segments` lays a lane's row
+/// as every recurrent op reads them, through the pool's lane table
+/// (`pool.slot_ids`, its rows window-local): clip `l` is lane
+/// `clip_lanes[l] - lane_base` of it. They are cut along their
+/// frame-position rows: `pool.segments` lays a lane's row
 /// out in pieces of whole rows of `C`, `pool.slot_stride_elems` apart.
 fn check(
     op: &'static str,
     pool: &RecurrentPool,
-    slot_ids: Tensor,
+    clip_lanes: Tensor,
     grid: Tensor,
     cache: Tensor,
     frames: u32,
@@ -38,12 +41,12 @@ fn check(
         return Err(refuse(op, "the slab is not bf16"));
     }
     let lanes = lanes_of(op, "input", grid)?;
-    if slot_ids.dtype != Dtype::I32 || slot_ids.elements() < lanes as u64 {
+    if clip_lanes.dtype != Dtype::I32 || clip_lanes.elements() < lanes as u64 {
         return Err(refuse(
             op,
             format!(
-                "the slot table is {}x{} {:?}; one i32 per lane is needed",
-                slot_ids.rows, slot_ids.width, slot_ids.dtype
+                "the clips' lane table is {}x{} {:?}; one i32 per clip is needed",
+                clip_lanes.rows, clip_lanes.width, clip_lanes.dtype
             ),
         ));
     }
@@ -53,7 +56,7 @@ fn check(
     let rows = pool.segments.rows(
         op,
         slab,
-        slot_ids,
+        pool.slot_ids,
         pool.slot_stride_elems,
         slab.width.div_ceil(cache.width.max(1)),
     )?;
@@ -64,14 +67,15 @@ fn check(
 pub fn cache_gather(
     ctx: &Ctx,
     pool: &RecurrentPool,
-    slot_ids: Tensor,
+    clip_lanes: Tensor,
+    lane_base: u32,
     grid: Tensor,
     frames: u32,
     cache: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cache_gather";
     let (lanes, frames, c, stride, total, blocks, rows) =
-        check(OP, pool, slot_ids, grid, *cache, frames)?;
+        check(OP, pool, clip_lanes, grid, *cache, frames)?;
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, "::pie::conv::cache_gather<::pie::bf16>"))
@@ -79,6 +83,8 @@ pub fn cache_gather(
         &[
             rows.arg(),
             grid.arg(),
+            clip_lanes.arg(),
+            stated(OP, lane_base)?.arg(),
             cache.arg(),
             lanes.arg(),
             frames.arg(),
@@ -96,14 +102,15 @@ pub fn cache_store(
     x: Tensor,
     cache: Tensor,
     pool: &RecurrentPool,
-    slot_ids: Tensor,
+    clip_lanes: Tensor,
+    lane_base: u32,
     grid: Tensor,
     frames: u32,
     x_base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cache_store";
     let (lanes, frames, c, stride, total, blocks, rows) =
-        check(OP, pool, slot_ids, grid, cache, frames)?;
+        check(OP, pool, clip_lanes, grid, cache, frames)?;
     if x.dtype != Dtype::Bf16 || x.width != cache.width {
         return Err(refuse(OP, "the input is not `[rows, C_in]` bf16"));
     }
@@ -116,6 +123,8 @@ pub fn cache_store(
             cache.arg(),
             rows.arg(),
             grid.arg(),
+            clip_lanes.arg(),
+            stated(OP, lane_base)?.arg(),
             lanes.arg(),
             frames.arg(),
             c.arg(),

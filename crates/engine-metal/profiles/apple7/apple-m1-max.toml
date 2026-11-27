@@ -1,0 +1,13 @@
+api = 1
+
+[target]
+device = "Apple M1 Max"
+assumes = { cores = 24 }
+
+[kernel]
+# kernel.gdn.carried, measured on 2026-11-23: Qwen3.5-0.8B served decode, every lane
+# carrying 7 rows (the bench at its own window), ABBA against the plain decode of
+# 7bb8ff574. The prepared form ran -9.2% at one lane where inline ran -4.5%, and
+# ahead from eight lanes (-11.6% against -13.4%; c64 -14.1% against -19.8%).
+# A short carry's rows are its lanes, one a lane.
+gdn.carried = [{ when = "rows >= 4", use = "prepared" }, { use = "inline" }]

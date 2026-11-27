@@ -271,19 +271,23 @@ pub struct Lane {
 pub struct RsCaps {
     pub state_size: u64,
     pub buffer_page_size: u32,
-    /// The window the model's state is read through, when it is one:
-    /// its bounded half is then its window lists of kv rows, not a slot.
-    pub window_tokens: u32,
+    /// The engine serves the model's windowed layers as ring + buffer
+    /// (CONTRACT-BC 19, 21; `Capabilities::windowed_state`): each ring is
+    /// record bytes (in `state_size`), the unfolded rows sit in the window
+    /// buffer, the rs store's buffer pages. A windowed layer replays no
+    /// buffered row: its buffered K/V are read, not recomputed, so a fire
+    /// carries no recurrent rows for them.
+    pub window_state: bool,
 }
 
 impl RsCaps {
-    /// The model has a bounded half beside its kv: a folded state or a window.
+    /// The model has a bounded half beside its kv: a folded state.
     pub fn has_state(&self) -> bool {
-        self.state_size > 0 || self.window_tokens > 0
+        self.state_size > 0
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EtaCaps {
     pub draft_block: u32,
     pub draft_mask_token: u32,
@@ -293,6 +297,44 @@ pub struct EtaCaps {
     pub adapter_attachments: bool,
     /// [`::engine::Capabilities::rs_snapshots`], the least of the engines'.
     pub rs_snapshots: u32,
+    /// What a guest program's registration binds within
+    /// ([`eta_ir::validate::bind_within`]): the least of the engines'
+    /// ([`guest_budget`]).
+    pub budget: eta_ir::validate::Budget,
+}
+
+/// The budget a guest program binds within on an engine whose pools
+/// `chunks` states and whose guest stages `cost` holds: an instance's state
+/// room is its state chunks' bytes less what the engine holds back of them;
+/// where the device states a bound on one submission, a stage is held to it
+/// at the rates the load measured, which must then be stated (refused by
+/// name otherwise: a bound with nothing to cost against it holds nothing).
+pub fn guest_budget(
+    chunks: &::engine::chunk::ChunkFacts,
+    cost: &::engine::GuestCost,
+) -> Result<eta_ir::validate::Budget, String> {
+    let submit = match cost.submit_bound_ns {
+        None => None,
+        Some(bound_ns) => {
+            let launch_ns = cost.launch_ns.ok_or(
+                "the device states a bound on one submission and its load measured no \
+                 launch_ns to cost a guest stage against it",
+            )?;
+            let gbps = cost.elementwise_gbps.filter(|gbps| *gbps > 0.0).ok_or(
+                "the device states a bound on one submission and its load measured no \
+                     elementwise_gbps to cost a guest stage against it",
+            )?;
+            Some(eta_ir::validate::SubmitBound {
+                bound_ns,
+                launch_ns: launch_ns as f64,
+                elementwise_bytes_per_ns: gbps,
+            })
+        }
+    };
+    Ok(eta_ir::validate::Budget {
+        room_bytes: chunks.guest_room_bytes(),
+        submit,
+    })
 }
 
 impl std::fmt::Debug for Model {

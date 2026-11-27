@@ -21,8 +21,9 @@
 //! an assistant message's `reasoning_content` replayed where the template
 //! replays reasoning.
 //!
-//! Refused with 400: content parts other than text and images. Every other
-//! unknown field is ignored, as OpenAI does.
+//! Refused with 400: content parts other than text and images, and a
+//! non-empty `logit_bias`. Every other unknown field is ignored, as OpenAI
+//! does.
 
 use compat::{
     ApiError, Effort, Envelope, Event, Finish, Message, Request, Role, Thinking, ToolCall,
@@ -31,7 +32,10 @@ use compat::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{chat_logprob, choices, invalid, run_choices, stop_reason, stop_sequences, usage_of};
+use crate::{
+    chat_logprob, choices, invalid, no_logit_bias, run_choices, stop_reason, stop_sequences,
+    usage_of,
+};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -67,6 +71,7 @@ struct Body {
     repetition_penalty: Option<f32>,
     reasoning_effort: Option<String>,
     chat_template_kwargs: Option<Value>,
+    logit_bias: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -149,6 +154,7 @@ fn parse(body: Value) -> Result<(Request, bool, u32, bool), ApiError> {
     if body.messages.is_empty() {
         return Err(invalid("`messages` must not be empty", Some("messages")));
     }
+    no_logit_bias(&body.logit_bias)?;
     let n = choices(body.n)?;
     let logprobs = match (body.logprobs.unwrap_or(false), body.top_logprobs) {
         (false, Some(k)) if k > 0 => {
@@ -348,6 +354,7 @@ fn finish_reason(finish: Finish) -> &'static str {
         Finish::Stop | Finish::StopSequence => "stop",
         Finish::Length => "length",
         Finish::ToolCalls => "tool_calls",
+        Finish::Abort => "abort",
     }
 }
 
@@ -546,4 +553,22 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         body["prompt_token_ids"] = json!(prompt);
     }
     Ok(body.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_logit_bias_is_refused_by_name() {
+        let messages = json!([{"role": "user", "content": "Hi"}]);
+        let refused = parse(json!({"messages": messages, "logit_bias": {"50256": -100}}))
+            .err()
+            .expect("a logit_bias is refused");
+        assert_eq!(refused.status, 400);
+        assert!(refused.body.to_string().contains("logit_bias is not supported"));
+        for bias in [json!(null), json!({})] {
+            assert!(parse(json!({"messages": messages, "logit_bias": bias})).is_ok());
+        }
+    }
 }

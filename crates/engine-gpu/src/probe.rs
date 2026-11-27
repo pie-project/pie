@@ -1,12 +1,6 @@
 #![allow(unsafe_code)]
 use std::any::TypeId;
 use std::cell::Cell;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-static DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The frame this thread records into, and its type.
 #[derive(Clone, Copy)]
@@ -24,22 +18,6 @@ impl Recording {
 
 thread_local! {
     static FRAME: Cell<Recording> = const { Cell::new(Recording::NONE) };
-}
-
-fn slot() -> &'static Mutex<Option<PathBuf>> {
-    DIR.get_or_init(|| Mutex::new(None))
-}
-
-pub fn stop() {
-    *slot().lock().expect("lock poisoned") = None;
-}
-
-pub fn dir() -> Option<PathBuf> {
-    slot().lock().expect("lock poisoned").clone()
-}
-
-pub fn next_seq() -> u64 {
-    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Points this thread's probes at `frame` and returns what they pointed at

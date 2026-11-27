@@ -1,41 +1,13 @@
 #![cfg(target_vendor = "apple")]
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
 
-fn bf(x: f32) -> f32 {
-    let b = x.to_bits();
-    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)
-}
-fn vals(n: usize, s: u64) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let mut x = (i as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ s;
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-            bf(((x >> 40) as f32 / 16777216. - 0.5) * 4.)
-        })
-        .collect()
-}
-fn bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-        .collect()
-}
-fn u32s(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-fn f32s(v: &[u8]) -> Vec<f32> {
-    v.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
-        .collect()
-}
-
 #[test]
 fn mma_attention_matches_fp64() {
+    let _device = crate::device_alone();
     let Ok(dev) = Context::bind() else {
         return;
     };
@@ -91,17 +63,28 @@ fn mma_attention_matches_fp64() {
             page_stride: [0; 2],
         }
         .paged_densely();
-        // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys.
-        for (window, mode) in [(None, 0u8), (Some(19u32), 1), (None, 1), (None, 2)] {
+        // mode 0 is plain causal, 1 a sparse mask, 2 a mask that also admits later keys,
+        // 3 a sparse mask past a committed boundary: every key below `base` is read
+        // whatever the plane says, and the plane's column `c` is key `base + c`.
+        for (window, mode) in [
+            (None, 0u8),
+            (Some(19u32), 1),
+            (None, 1),
+            (None, 2),
+            (None, 3),
+            (Some(19u32), 3),
+        ] {
+            let origin = if mode == 3 { base } else { 0 };
             let mask: Vec<u8> = (0..m * np * page).map(|i| u8::from(i % 7 != 0)).collect();
             let mb = upload(&mask);
-            let eb = upload(&vec![mode; m]);
+            let flag = if mode == 3 { 1 } else { u32::from(mode) };
+            let eb = upload(&mask_words(&vec![flag | ((origin as u32) << 2); m]));
             let plan = PrefillPlan {
                 positions: tensor(&po, m, 1, Dtype::I32),
                 last_page_len: tensor(&po, m, 1, Dtype::I32),
                 request_of_token: tensor(&ow, m, 1, Dtype::I32),
                 mask: tensor(&mb, mask.len(), 1, Dtype::U8),
-                mask_enabled: tensor(&eb, m, 1, Dtype::U8),
+                mask_enabled: tensor(&eb, m, 1, Dtype::U32),
                 mask_stride: (np * page) as u32,
             };
             let scale = 1. / (d as f32).sqrt();
@@ -116,9 +99,12 @@ fn mma_attention_matches_fp64() {
                     };
                     let mut scores = vec![];
                     for t in 0..=last {
-                        if window.is_some_and(|w| t + (w as usize) <= pos[row] as usize)
-                            || mode != 0 && mask[row * np * page + t] == 0
-                        {
+                        let hidden = match mode {
+                            0 => false,
+                            3 => t >= origin && mask[row * np * page + (t - origin)] == 0,
+                            _ => mask[row * np * page + t] == 0,
+                        };
+                        if window.is_some_and(|w| t + (w as usize) <= pos[row] as usize) || hidden {
                             continue;
                         }
                         let slot =
@@ -174,7 +160,6 @@ fn mma_attention_matches_fp64() {
                 .sum::<f64>()
                 / reference.iter().map(|b| b * b).sum::<f64>().max(1e-30))
             .sqrt();
-            eprintln!("d={d} rows={m} window={window:?} mode={mode}: relative rms {rms:.6}");
             if mode == 0 {
                 let l = upload(&vec![0u8; m * qh * 4]);
                 let y2 = upload(&vec![0u8; q.len() * 2]);

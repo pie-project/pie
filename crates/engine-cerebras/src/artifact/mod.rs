@@ -301,8 +301,9 @@ impl ArtifactModel {
         Ok(())
     }
 
-    /// The ring's first `n` winners. An id past the vocabulary (a padded head row) is refused
-    /// rather than handed on.
+    /// The ring's first `n` winners. An id past the vocabulary (a padded
+    /// head row: the prep pads with the last real row so none can win) is
+    /// refused rather than handed on.
     fn ring(&mut self, n: usize) -> R<Vec<u32>> {
         let root = floor::Rect::new(self.hl.root.x, self.hl.root.y, 1, 1);
         let t0 = Instant::now();

@@ -208,9 +208,6 @@ fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config::schema:
     if let Some(found) = fields.iter().find(|f| f.key == key) {
         return Ok(found.clone());
     }
-    if let Some(refusal) = worker::config::removed::refusal_for(key) {
-        bail!("{refusal}");
-    }
     let leaf = key.rsplit('.').next().unwrap_or(key);
     let near: Vec<&str> = fields
         .iter()
@@ -374,7 +371,7 @@ fn typed_by_schema(content: &str, key: &str, value: &str) -> Result<(String, tom
             toml::from_str(content).map_err(|e| anyhow!("parse config: {e}"))?;
         set_nested(&mut root, key, candidate.clone())?;
         let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-        match worker::standalone::derive_standalone(&serialized) {
+        match worker::standalone::derive_standalone(&serialized, None) {
             Ok(_) => {
                 let mut doc: toml_edit::DocumentMut =
                     content.parse().map_err(|e| anyhow!("parse config: {e}"))?;
@@ -478,7 +475,7 @@ fn edit(global: &crate::args::GlobalArgs) -> Result<Answer> {
     }
 
     let edited = std::fs::read_to_string(&scratch).map_err(|e| anyhow!("read {scratch:?}: {e}"))?;
-    if let Err(error) = worker::standalone::derive_standalone(&edited) {
+    if let Err(error) = worker::standalone::derive_standalone(&edited, Some(&cfg_path)) {
         return Err(error).with_context(|| {
             format!(
                 "the edit is invalid and was NOT saved; it is kept at {}",
@@ -508,7 +505,7 @@ fn unset(global: &crate::args::GlobalArgs, key: String) -> Result<Answer> {
         return Ok(Answer::noop(format!("{key} was already unset")));
     }
     let serialized = toml::to_string(&root).map_err(|e| anyhow!("serialize TOML: {e}"))?;
-    worker::standalone::derive_standalone(&serialized)
+    worker::standalone::derive_standalone(&serialized, None)
         .with_context(|| format!("unsetting {key}"))?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()

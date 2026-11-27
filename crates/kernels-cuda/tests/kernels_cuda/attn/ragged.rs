@@ -6,7 +6,7 @@
 use crate::common::attn_ref::{landed, ten, wide};
 use crate::common::host::{indptr, ragged_attention, upload_to};
 use crate::common::{Gpu, Lcg, captured, forget, replay};
-use dtype::Dtype::{Bf16, F32, I32, U8};
+use dtype::Dtype::{Bf16, F32, I32, I64, U8};
 use kernels_cuda::attn::ragged::{RaggedMask, ragged};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,9 +44,9 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     let mut gpu = Gpu::open();
     let o_at = gpu.up(&fill);
     // Each group's bits, query-major, from a byte of its own.
-    let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
+    let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i64>::new());
     for g in 0..qt.len() - 1 {
-        starts.push(bits.len() as i32);
+        starts.push(bits.len() as i64);
         let (q0, q1, k0, k1) = (
             qt[g] as usize,
             qt[g + 1] as usize,
@@ -64,12 +64,13 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
             }
         }
     }
-    starts.push(bits.len() as i32);
+    starts.push(bits.len() as i64);
     bits.push(0);
     // Every table ends where mapped memory ends: a padded query tile's read
     // past one faults, as it once read a neighbour's bytes.
     let mut edge = |v: &[i32]| ten(gpu.up_at_edge(v), v.len(), 1, I32);
-    let (qtab, ktab, starts) = (edge(&qt), edge(&kt), edge(&starts));
+    let (qtab, ktab) = (edge(&qt), edge(&kt));
+    let starts = ten(gpu.up_at_edge(&starts), starts.len(), 1, I64);
     let (table, max_len) = (ten(gpu.up(&bias), qh, span, F32), MAX_LEN as u32);
     let custom = RaggedMask::Custom {
         bits: ten(gpu.up_at_edge(&bits), bits.len(), 1, U8),
@@ -87,7 +88,10 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     if extra > 0 {
         ctx.arm_stage(gpu.up(&[qr as u32, 0, 2, 1]));
     }
-    ragged(&ctx, qp, kp, vp, qtab, ktab, hd32, scale, arm, o).expect("the arm fires");
+    gpu.laid(&ctx, |ctx| {
+        ragged(ctx, qp, kp, vp, qtab, ktab, hd32, scale, arm, o)
+    })
+    .expect("the arm fires");
     // A row past every group keeps its noise.
     let past = (qr - extra) * qh * hd;
     want[past..].copy_from_slice(&wide(&fill[past..]));
@@ -160,6 +164,7 @@ fn the_ragged_arm_replays_from_a_captured_graph() {
     };
     fresh(&gpu);
     ctx.arm_stage(win_at);
+    gpu.lay(&ctx, |_| fire(o_at));
     fire(o_at).expect("the warm fire");
     gpu.sync();
     let mut fired = None;

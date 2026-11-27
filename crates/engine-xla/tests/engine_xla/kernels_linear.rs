@@ -456,9 +456,10 @@ fn a_lora_correction_adds_each_rows_own_adapter() {
 #[test]
 fn the_glu_gemm_kernel_answers_the_host() {
     // A GeGLU's gate-up over its `[K, 2·I]` landing and the GLU in one
-    // Mosaic kernel: two 512-wide column blocks of each half; 48 rows as one
-    // block.
-    for (m, k, i) in [(64usize, 256usize, 1024usize), (48, 128, 512)] {
+    // Mosaic kernel, at the narrowest rows it takes (`glu_gemm::LEAST_K`,
+    // 3840: measured, narrower ones run faster as two GEMMs): 512- and
+    // 256-wide column blocks of each half; 48 rows as one block.
+    for (m, k, i) in [(64usize, 3840usize, 512usize), (48, 3840, 256)] {
         let xs = data(m * k, 11);
         // `w` row-major `[2i, k]` (gate rows, then up rows), landed `[k, 2i]`.
         let ws: Vec<f32> = data(2 * i * k, 12).iter().map(|v| v * 0.125).collect();

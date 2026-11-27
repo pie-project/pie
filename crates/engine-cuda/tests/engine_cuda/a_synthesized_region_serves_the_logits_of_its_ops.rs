@@ -135,6 +135,11 @@ fn packed_fixture_kv(model: &'static str, kv: Dtype) -> Fixture {
 fn fixture_of(model: &'static str, trace: Trace) -> Fixture {
     let dir = std::env::temp_dir().join(format!("pie-synth-{model}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    // Owned from before its first byte is written: a checkpoint write that
+    // panics (a full disk) or a contract that does not read unwinds through
+    // this guard and takes the directory, ~10 GB for the largest models,
+    // with it.
+    let scratch = Scratch(dir.clone());
     std::fs::create_dir_all(&dir).unwrap_or_else(|why| panic!("{}: {why}", dir.display()));
     let container = dir.join("model.zt");
     write_checkpoint(&container, &trace);
@@ -147,7 +152,7 @@ fn fixture_of(model: &'static str, trace: Trace) -> Fixture {
         trace,
         contract,
         container,
-        _dir: Scratch(dir),
+        _dir: scratch,
     }
 }
 
@@ -164,11 +169,18 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         page_size: PAGE,
         context: 2 * tokens,
         slots: 1,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
+        // The fixture's own profile directory: the first load times each
+        // decode product's kernels and keeps its picks there, and every
+        // later load of the model serves them. Unkept, each load picks
+        // again by times a few percent apart, and a product another kernel
+        // runs rounds its sums another way.
         knobs: engine_cuda::Knobs {
             chip: Some(engine_cuda::chip::profile(overrides)),
+            profiles: Some(fixture._dir.0.clone()),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -177,6 +189,7 @@ fn load(fixture: &Fixture, overrides: &str, tokens: u32) -> Shell {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
     .unwrap_or_else(|why| panic!("{} loads under {overrides:?}: {why}", fixture.model))
 }
@@ -309,12 +322,22 @@ fn close_within(
 /// A step's logits within this share of their spread of the reference's.
 const SPREAD: f32 = 2e-2;
 
-/// [`SPREAD`] over an e4m3 cache: each cached element rounds to 3 mantissa
-/// bits, so a bf16 place apart before the cache (the epilogue's own order)
-/// can land a whole e4m3 place apart (2^-3, sixteen of bf16's), the
-/// reference's own append rounding the row it is handed so too.
+/// E4m3's unit roundoff: half a place of its 3 mantissa bits, 2^-4. A
+/// cached element a bf16 place apart before the cache (the epilogue's own
+/// order) can round to the neighbouring e4m3 value, one such roundoff of
+/// its magnitude apart beyond what bf16 kept.
 #[cfg(feature = "cuda")]
-const SPREAD_FP8: f32 = 4e-2;
+const E4M3_ROUNDOFF: f32 = 1.0 / (1 << (3 + 1)) as f32;
+
+/// [`SPREAD`] over an e4m3 cache: the bf16 rule's share, and the cache's
+/// own roundoff carried to the logits. A cached key or value
+/// [`E4M3_ROUNDOFF`] of its magnitude apart moves the attention output it
+/// feeds by at most that share of the output (a convex mix of the values;
+/// a score's move is renormalized by the softmax), and each later norm
+/// rescales what follows, so to first order a step's logits move by at most
+/// that share of their spread.
+#[cfg(feature = "cuda")]
+const SPREAD_FP8: f32 = SPREAD + E4M3_ROUNDOFF;
 
 /// The norms' register forms: the unfused ops summing in another order.
 #[cfg(feature = "cuda")]

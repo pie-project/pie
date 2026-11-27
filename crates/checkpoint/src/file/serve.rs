@@ -261,6 +261,13 @@ impl Artifact {
         Ok(())
     }
 
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(
+            clippy::disallowed_methods,
+            reason = "hash() hashes serially on wasm32 and never calls this"
+        )
+    )]
     fn hash_across_readers(&self, work: &[Work<'_>]) -> Result<Vec<Vec<u8>>, Error> {
         let width = READERS.min(work.len().max(1));
         let per = work.len().div_ceil(width);

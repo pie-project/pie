@@ -247,17 +247,19 @@ fn run_topk(
     };
     let weights = weighted.then(|| gpu.tensor(&wv, total as u32, heads as u32, Dtype::Bf16));
     let mut sel = gpu.zeros(total as u32, top_k as u32, Dtype::I32);
-    index::topk(
-        &ctx,
-        q,
-        weights,
-        &p.pool,
-        heads as u32,
-        d as u32,
-        top_k as u32,
-        ratio as u32,
-        &mut sel,
-    )
+    gpu.laid(&ctx, |ctx| {
+        index::topk(
+            ctx,
+            q,
+            weights,
+            &p.pool,
+            heads as u32,
+            d as u32,
+            top_k as u32,
+            ratio as u32,
+            &mut sel,
+        )
+    })
     .unwrap();
     let got = gpu.read_as::<i32>(&sel);
     let what = format!("topk h{heads} d{d} ratio{ratio}");
@@ -359,17 +361,19 @@ fn topk_breaks_ties_by_key_order() {
             indptr: gpu.column(&[0, 1]),
         };
         let mut sel = gpu.zeros(1, top_k as u32, Dtype::I32);
-        index::topk(
-            &ctx,
-            q,
-            None,
-            &p.pool,
-            heads as u32,
-            d as u32,
-            top_k as u32,
-            1,
-            &mut sel,
-        )
+        gpu.laid(&ctx, |ctx| {
+            index::topk(
+                ctx,
+                q,
+                None,
+                &p.pool,
+                heads as u32,
+                d as u32,
+                top_k as u32,
+                1,
+                &mut sel,
+            )
+        })
         .unwrap();
         let got = gpu.read_as::<i32>(&sel);
         assert_eq!(got, (0..top_k as i32).collect::<Vec<_>>(), "{n} ties");
@@ -666,9 +670,9 @@ fn run_pool_lse(
     let (positions_t, req_t) = (gpu.column(positions), gpu.column(req));
     let selection = top_k.map(|k| gpu.ints_shaped(&sel, t as u32, k as u32));
     let attend = |pool: &KvPool, mut o: Tensor, mut lse: Tensor| {
-        match (top_k, selection) {
+        gpu.laid(&ctx, |ctx| match (top_k, selection) {
             (Some(k), Some(selection)) => pool::attention_lse_selected(
-                &ctx,
+                ctx,
                 q,
                 positions_t,
                 req_t,
@@ -683,7 +687,7 @@ fn run_pool_lse(
                 &mut lse,
             ),
             _ => pool::attention_lse(
-                &ctx,
+                ctx,
                 q,
                 positions_t,
                 req_t,
@@ -695,7 +699,7 @@ fn run_pool_lse(
                 &mut o,
                 &mut lse,
             ),
-        }
+        })
         .unwrap();
     };
     let o = gpu.zeros(t as u32, (heads * d) as u32, Dtype::Bf16);
@@ -813,16 +817,18 @@ fn run_block_max(
         indptr: gpu.column(&indptr_of(qo_lens)),
     };
     let mut sel = gpu.zeros(total as u32, (heads * top_k) as u32, Dtype::I32);
-    index::topk_block_max(
-        &ctx,
-        q,
-        &p.pool,
-        heads as u32,
-        d as u32,
-        top_k as u32,
-        block as u32,
-        &mut sel,
-    )
+    gpu.laid(&ctx, |ctx| {
+        index::topk_block_max(
+            ctx,
+            q,
+            &p.pool,
+            heads as u32,
+            d as u32,
+            top_k as u32,
+            block as u32,
+            &mut sel,
+        )
+    })
     .unwrap();
     let got = gpu.read_as::<i32>(&sel);
     let what = format!("block max h{heads} d{d} block{block}");

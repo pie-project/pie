@@ -5,19 +5,93 @@ use core::fmt::Write as _;
 use eta_ir::op::tags;
 
 use crate::codegen::op_view::{OpView, result_bases};
+use crate::codegen::steps::{self, Call, Finish, Reduce, StepUniform};
+pub use crate::codegen::steps::{REDUCE_LEVELS, SORT_ROUNDS, STEP_BYTES};
+use crate::codegen::steps::{is_reduce, is_sort, reduce_levels, sort_rounds};
 use crate::plan::{CompiledStage, Region};
 
 pub const RUNTIME: &str = include_str!("../../runtime/wgsl/ptir_runtime.wgsl");
 
+/// The pivot finish's 32-element block as [`RUNTIME`] spells it: its loads
+/// then its stores, one line each.
+fn pivot_block_spelled() -> String {
+    let mut out = String::new();
+    for k in 0..32 {
+        let _ = writeln!(
+            out,
+            "        let v{k} = bitcast<f32>(hld(vals + t + {k}u));"
+        );
+    }
+    for k in 0..32 {
+        let _ = writeln!(
+            out,
+            "        hst(flags + t + {k}u, select(0u, 1u, excl < cut));"
+        );
+        let _ = writeln!(out, "        excl = excl + v{k};");
+    }
+    out
+}
+
+/// The same block as a loop: each element loaded, its flag stored and its
+/// mass added in turn, the same additions in the same order.
+const PIVOT_BLOCK_ROLLED: &str = "        for (var k : u32 = 0u; k < PIVOT_UNROLL; k = k + 1u) {
+          let v = bitcast<f32>(hld(vals + t + k));
+          hst(flags + t + k, select(0u, 1u, excl < cut));
+          excl = excl + v;
+        }
+";
+
+/// `source` with the pivot finish's block rolled, as the tab's runtime has
+/// it: a native test compares the two forms through this.
+pub fn roll_pivot(source: &str) -> String {
+    source.replacen(&pivot_block_spelled(), PIVOT_BLOCK_ROLLED, 1)
+}
+
+/// The runtime a step's module carries on this target: [`RUNTIME`], but in
+/// the tab with the pivot finish's block rolled, which SwiftShader in Chrome
+/// otherwise grew past 11 GiB compiling. Native drivers take it as spelled.
+fn runtime() -> alloc::borrow::Cow<'static, str> {
+    if cfg!(target_arch = "wasm32") {
+        alloc::borrow::Cow::Owned(roll_pivot(RUNTIME))
+    } else {
+        alloc::borrow::Cow::Borrowed(RUNTIME)
+    }
+}
+
 pub const WORKGROUP: u32 = 256;
-
-const REDUCE_LEVELS: u32 = 7;
-
-const SORT_ROUNDS: u32 = 28;
 
 /// Words the runtime's one-row select keeps just below the temporary area
 /// (`SEL_WORDS` in the runtime), which a scratch layout must leave free.
 pub const SELECT_WORDS: u32 = 10320;
+
+/// The bytes the runtime keeps in a lane's temporary area while it runs a
+/// node of `tag` whose first argument holds `len` elements in `rows` rows,
+/// as its cells lay them: a sort, a top-k or a pivot two buffers of two
+/// words an element of that argument (`sort_cell`; a pivot's `pivot_*`
+/// lie within them), a reduction two buffers of two words a group of each
+/// row its first level folds (`tmp_v`; 32 elements, a `gumbel_argmax`'s 8:
+/// `steps::first_fan`), any other node none. Saturates past a
+/// `u64`, which no scratch holds.
+#[must_use]
+pub const fn temporary_bytes(tag: u8, len: u64, rows: u64) -> u64 {
+    if is_sort(tag) {
+        len.saturating_mul(16)
+    } else if is_reduce(tag) {
+        let rows = if rows == 0 { 1 } else { rows };
+        rows.saturating_mul((len / rows).div_ceil(steps::first_fan(tag)))
+            .saturating_mul(16)
+    } else {
+        0
+    }
+}
+
+/// Whether a node of `tag` may run the one-row select, which keeps its
+/// state in the [`SELECT_WORDS`] just below the temporary area (`sel_at`):
+/// a pivot's select ladder, and a one-row top-k's.
+#[must_use]
+pub const fn selects(tag: u8) -> bool {
+    tag == tags::PIVOT_THRESHOLD || tag == tags::TOP_K
+}
 
 const BARRIER: &str = "  storageBarrier();\n";
 
@@ -85,6 +159,7 @@ pub fn emits(tag: u8) -> bool {
             | tags::REDUCE_MAX
             | tags::REDUCE_MIN
             | tags::REDUCE_ARGMAX
+            | tags::GUMBEL_ARGMAX
             | tags::CUMSUM
             | tags::CUMPROD
             | tags::BROADCAST
@@ -111,17 +186,6 @@ pub fn emits(tag: u8) -> bool {
     )
 }
 
-const fn is_reduce(tag: u8) -> bool {
-    matches!(
-        tag,
-        tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN | tags::REDUCE_ARGMAX
-    )
-}
-
-const fn is_sort(tag: u8) -> bool {
-    matches!(tag, tags::SORT_DESC | tags::TOP_K | tags::PIVOT_THRESHOLD)
-}
-
 #[must_use]
 pub fn is_boundary(tag: u8) -> bool {
     if tag == tags::OUTPUT {
@@ -130,82 +194,27 @@ pub fn is_boundary(tag: u8) -> bool {
     eta_ir::op::spec(tag).is_some_and(|row| row.family == eta_ir::op::Family::Channel)
 }
 
-fn sort_rounds(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
-    let Some(op) = plan.ops.get(at) else {
-        return SORT_ROUNDS;
-    };
-    let Some(&arg) = op.args.first() else {
-        return SORT_ROUNDS;
-    };
-    let Some(value) = plan.value_types.get(arg as usize) else {
-        return SORT_ROUNDS;
-    };
-    let mut total: u64 = 1;
-    for axis in &value.axes {
-        let crate::plan::Dimension::Static(extent) = axis else {
-            return SORT_ROUNDS;
-        };
-        total *= u64::from(*extent);
-    }
-    let mut need = 0u32;
-    while (1u64 << need) < total {
-        need += 1;
-        if need >= SORT_ROUNDS {
-            return SORT_ROUNDS;
-        }
-    }
-    let rounds = need + (need & 1);
-    rounds.min(SORT_ROUNDS)
-}
-
-/// The fold levels a reduce over `at`'s argument needs: one per 32-fold
-/// until a row is one cell. A row of unknown length gets the full ladder.
-fn reduce_levels(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> u32 {
-    let Some(mut len) = last_extent(plan, at) else {
-        return REDUCE_LEVELS;
-    };
-    let mut levels = 0;
-    while len > 1 && levels < REDUCE_LEVELS {
-        len = len.div_ceil(32);
-        levels += 1;
-    }
-    levels
-}
-
-fn arg_axes(
-    plan: &crate::codegen::launch::LaunchStagePlan,
-    at: usize,
-) -> Option<&[crate::plan::Dimension]> {
-    let arg = *plan.ops.get(at)?.args.first()?;
-    Some(&plan.value_types.get(arg as usize)?.axes)
-}
-
-fn last_extent(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> Option<u64> {
-    match arg_axes(plan, at)?.last() {
-        Some(crate::plan::Dimension::Static(extent)) => Some(u64::from(*extent)),
-        None => Some(1),
-        _ => None,
-    }
-}
-
-/// Whether `at`'s argument is one row, which the runtime's select handles.
-fn one_row(plan: &crate::codegen::launch::LaunchStagePlan, at: usize) -> bool {
-    let Some(axes) = arg_axes(plan, at) else {
-        return false;
-    };
-    let Some((_, leading)) = axes.split_last() else {
-        return true;
-    };
-    leading
+/// The nodes of `plan` its WGSL launches, in the order it runs them: every
+/// op but a boundary one (the host stages or reads its value) and a
+/// reshape its source covers (its result is its source's bytes).
+#[must_use]
+pub fn launched_nodes(plan: &crate::codegen::launch::LaunchStagePlan) -> Vec<u32> {
+    let fusion = crate::codegen::wgsl_analysis::analyze_stage(plan);
+    plan.ops
         .iter()
-        .all(|axis| matches!(axis, crate::plan::Dimension::Static(1)))
+        .enumerate()
+        .filter(|&(at, op)| !is_boundary(op.tag) && fusion.emits_node(at))
+        .map(|(at, _)| at as u32)
+        .collect()
 }
 
-// Native drivers recompile everything an entry point reaches per pipeline, so
-// naming the op cuts a stage's build from minutes to seconds; Dawn reuses the
-// compile of the shared switch instead, and specialising defeats that.
+// A compiler builds everything an entry point reaches, per pipeline, so each
+// step names its op rather than calling the shared switch: natively that cuts
+// a stage's build from minutes to seconds, and SwiftShader in Chrome compiled
+// the shared switch per pipeline too, its GPU process growing to 11 GiB on
+// the first before it was killed.
 fn specialize() -> bool {
-    !cfg!(target_arch = "wasm32")
+    true
 }
 
 fn step_call(at: usize, tag: u8) -> String {
@@ -249,6 +258,7 @@ fn reduce_kind(tag: u8) -> Option<&'static str> {
         tags::REDUCE_MAX => Some("RED_MAX"),
         tags::REDUCE_MIN => Some("RED_MIN"),
         tags::REDUCE_ARGMAX => Some("RED_ARGMAX"),
+        tags::GUMBEL_ARGMAX => Some("RED_GUMBEL"),
         _ => None,
     }
 }
@@ -301,8 +311,9 @@ fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32, levels: u32) {
 pub const ENTRY_MARKER: &str = "// ---- the entry point ----";
 
 fn wrap(entry_name: &str, body: &str) -> String {
-    let mut source = String::with_capacity(RUNTIME.len() + body.len() + 256);
-    source.push_str(RUNTIME);
+    let runtime = runtime();
+    let mut source = String::with_capacity(runtime.len() + body.len() + 256);
+    source.push_str(&runtime);
     source.push('\n');
     source.push_str(ENTRY_MARKER);
     source.push_str("\n\n@compute @workgroup_size(");
@@ -365,12 +376,10 @@ pub fn emit_launch_stage(
     if !valid_identifier(entry_name) {
         return Err(Refused::EntryName(entry_name.to_string()));
     }
-    let fusion = crate::codegen::wgsl_analysis::analyze_stage(plan);
     let mut body = String::new();
-    for (at, op) in plan.ops.iter().enumerate() {
-        if is_boundary(op.tag) || !fusion.emits_node(at) {
-            continue;
-        }
+    for at in launched_nodes(plan) {
+        let at = at as usize;
+        let op = &plan.ops[at];
         if !emits(op.tag) {
             return Err(Refused::Op {
                 tag: op.tag,
@@ -388,16 +397,258 @@ pub fn emit_launch_stage(
     Ok(wrap(entry_name, &body))
 }
 
+/// One dispatch of a stepwise stage: call `call` of [`step_calls`] (the
+/// closed set, [`steps`]) on node `node` at `rung`, with `selector`. The
+/// call reads all three from the step's uniform ([`STEP_BINDING`]), so its
+/// pipeline names no program: every pipeline a stage can dispatch is one of
+/// [`step_calls`], and a backend builds them all before it serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
+    /// What the step is, for a reader: the prefix, the node and the rung.
     pub entry: String,
     pub node: u32,
+    /// Its call's index in [`step_calls`].
+    pub call: u32,
+    pub rung: u32,
+    pub selector: u32,
+}
+
+impl Step {
+    /// What the step's uniform holds.
+    #[must_use]
+    /// The step's uniform, its node's temporary area at word `area` of the
+    /// stage's heap as the bind lays it.
+    pub fn uniform(&self, area: u32) -> StepUniform {
+        StepUniform {
+            node: self.node,
+            rung: self.rung,
+            selector: self.selector,
+            area,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stepwise {
-    pub source: String,
     pub steps: Vec<Step>,
+}
+
+/// The version of what the stepwise emitter writes ([`step_calls`],
+/// [`step_module`], [`emit_launch_steps`]): it moves with the emitted bytes,
+/// pinned beside the other emitters' in `tests/eta_compiler/emitter_version.rs`.
+/// 1: every step a call of the closed set, reading its node, rung and
+/// selector from a uniform; before, each stage one module with its nodes
+/// spelled in.
+/// 3: every heap, descriptor, offset and op-param access is bounded by its
+/// stage's cfg (the heap's words, its values, its ops), indices read from
+/// the heap by their own bounds, and a refused access writes the runtimes'
+/// fault status (state 3, `OUT_OF_BOUNDS`, the index, the limit).
+/// 4: a step reads its tables, status and heap at the bases its record
+/// states, in the two pool segments a backend binds whole (the instance's
+/// slots, its heap), and its config from its config table: one bind group
+/// serves every instance whose slots and heap share two segments.
+/// 5: a node keeps its temporaries in an area of its own, at the heap word
+/// its step's record carries (`pie_step.area`), in place of the stage's one
+/// area its config table named.
+/// 6: a reshape that covers its source is read as its source whatever the
+/// stage's channel slots number, and launches nothing.
+/// 7: `bf16` values (`DT_BF16`, wire tag 5): loaded a half of a word,
+/// computed in f32, and stored rounded to nearest even a word at a time,
+/// an invocation owning both elements of every word it writes.
+/// 8: `gumbel_argmax` (`RED_GUMBEL`): a reduce ladder whose first level
+/// makes each Gumbel-perturbed lane in f32 from the logits, the keep mask,
+/// the scale and the keyed rng, with no noise row.
+/// 9: a `gumbel_argmax`'s first level folds 8 lanes a job, not 32
+/// (`red_fan0`), so its hashes spread over four times the invocations.
+/// 10: a `gumbel_argmax` lane multiplies its logit by the op's `scale`
+/// (the temperature's reciprocal) where it divided by a divisor.
+/// 11: a one-row `top_k` takes the select ladder (`sel_top_k`), and every
+/// NaN test reads the value's bits (`f32_is_nan`): the compiler took `x != x`
+/// as false, so the sort keyed NaN first.
+/// 12: the runtime's max / min combines (`cmax`, `cmin`) and the pivot's
+/// monotone test read NaN off its bits too (`f32_is_nan`).
+/// 13: every function that returns a value ends on a return statement
+/// after its switch or if chain (FXC, which wgpu's DX12 path compiles
+/// through, sees no other way out of a switch whose cases all return).
+pub const WGSL_STEP_EMITTER_VERSION: u16 = 13;
+
+/// The binding of the record a step module reads its node, rung, selector
+/// and bases from ([`StepUniform`]), beside the runtime's (0, 1 and 4): a
+/// backend binds each step's at its own dynamic offset.
+pub const STEP_BINDING: u32 = 6;
+
+const NODE: &str = "pie_step.node";
+const RUNG: &str = "pie_step.rung";
+const SELECTOR: &str = "pie_step.selector";
+
+/// The ops this backend steps: every one it emits but a boundary op.
+fn stepped(tag: u8) -> bool {
+    emits(tag) && !is_boundary(tag)
+}
+
+/// The closed set's calls, in [`step_calls`]' order.
+fn calls() -> Vec<Call> {
+    steps::calls_of(stepped)
+}
+
+/// The jobs call `call` of [`step_calls`] runs at `rung` over its node's
+/// first operand (`len` elements in `rows` rows): its grid-stride loop's
+/// bound, where that is not the operand's length. A reduction's level runs
+/// a job a group of `fan` inputs it folds (`op_reduce_level`: `rows *
+/// n_out`), and its finish a job a row (`op_reduce_finish`). `None` for a
+/// call whose loop bound is its widest value's length, which a stage's grid
+/// is already sized by. The WGSL these mirror is pinned
+/// (`the_job_counts_mirror_the_runtime`): a change there fails that test.
+#[must_use]
+pub fn step_jobs(call: u32, rung: u32, len: u32, rows: u32) -> Option<u64> {
+    let rows = rows.max(1);
+    let row = len / rows;
+    match calls().get(call as usize)? {
+        Call::ReduceLevel(reduce) => {
+            // `red_n_in`: the row folded by each level below this one.
+            let fan0 = if matches!(reduce, Reduce::GumbelArgmax) {
+                8
+            } else {
+                32
+            };
+            let fan_at = |level: u32| if level == 0 { fan0 } else { 32 };
+            let mut n_in = row;
+            for level in 0..rung {
+                n_in = n_in.div_ceil(fan_at(level));
+            }
+            if n_in <= 1 {
+                return Some(0);
+            }
+            Some(u64::from(rows) * u64::from(n_in.div_ceil(fan_at(rung))))
+        }
+        Call::ReduceFinish(_) => Some(u64::from(rows)),
+        _ => None,
+    }
+}
+
+fn reduce_name(reduce: Reduce) -> &'static str {
+    match reduce {
+        Reduce::Sum => "RED_SUM",
+        Reduce::Max => "RED_MAX",
+        Reduce::Min => "RED_MIN",
+        Reduce::Argmax => "RED_ARGMAX",
+        Reduce::GumbelArgmax => "RED_GUMBEL",
+    }
+}
+
+/// `call` in WGSL: the runtime function it runs, on the uniform's node,
+/// rung and selector. Where the ops are not named (Dawn, which reuses the
+/// compile of the runtime's switch), a call that runs one op's step runs
+/// the switch instead.
+fn call_text(call: Call) -> String {
+    let (p, k, j) = (NODE, RUNG, SELECTOR);
+    let flag = |name: &str| alloc::format!("{name}({p}, {j} != 0u)");
+    let named = specialize();
+    let body = match call {
+        Call::ReduceLevel(reduce) if named => {
+            alloc::format!("op_reduce_level({p}, {}, {k})", reduce_name(reduce))
+        }
+        Call::ReduceLevel(_) => alloc::format!("ptir_reduce_level({p}, {k})"),
+        Call::ReduceFinish(reduce) if named => {
+            alloc::format!("op_reduce_finish({p}, {})", reduce_name(reduce))
+        }
+        Call::ReduceFinish(_) => alloc::format!("ptir_reduce_finish({p})"),
+        Call::SortSeed { .. } => alloc::format!("ptir_sort_seed({p})"),
+        Call::SortRound { .. } => alloc::format!("ptir_sort_round({p}, {k})"),
+        Call::SortPre { .. } => alloc::format!("ptir_sort_pre({p})"),
+        Call::PivotPack { .. } => alloc::format!("ptir_pivot_pack({p})"),
+        Call::SelInit => alloc::format!("sel_init({p})"),
+        Call::SelHist => alloc::format!("sel_hist({p}, {k})"),
+        Call::SelPick => alloc::format!("sel_pick({p}, {k})"),
+        Call::SelRankMask => alloc::format!("sel_rank_mask({p})"),
+        Call::SelTally => alloc::format!("sel_tally({p})"),
+        Call::SelPlace => alloc::format!("sel_place({p})"),
+        Call::SelWalk => alloc::format!("sel_walk({p})"),
+        Call::SelTopK => alloc::format!("sel_top_k({p})"),
+        _ if !named => alloc::format!("ptir_step({p})"),
+        Call::Unary => alloc::format!("map_unary({p}, {j})"),
+        Call::Arith => alloc::format!("bin_arith({p}, {j})"),
+        Call::Compare => alloc::format!("cmp_op({p}, {j})"),
+        Call::Logic => alloc::format!("logic_op({p}, {j})"),
+        Call::Select => alloc::format!("op_select({p})"),
+        Call::Cumulative => flag("op_cumulative"),
+        Call::Broadcast => alloc::format!("op_broadcast({p})"),
+        Call::Copy => alloc::format!("op_copy({p})"),
+        Call::Transpose => alloc::format!("op_transpose({p})"),
+        Call::Gather => alloc::format!("op_gather({p})"),
+        Call::GatherRow => alloc::format!("op_gather_row({p})"),
+        Call::Scatter => flag("op_scatter"),
+        Call::Iota => alloc::format!("op_iota({p})"),
+        Call::MaskApply => alloc::format!("op_mask_apply({p})"),
+        Call::StructMask => alloc::format!("op_struct_mask({p}, {j})"),
+        Call::Rng => flag("op_rng"),
+        Call::Matmul => alloc::format!("op_matmul({p})"),
+        Call::Const => alloc::format!("op_const({p})"),
+        Call::Finish { finish, .. } => match finish {
+            Finish::SortDesc => alloc::format!("op_sort_desc_finish({p})"),
+            Finish::TopK => alloc::format!("op_top_k_finish({p})"),
+            Finish::Pivot => alloc::format!("op_pivot_finish({p})"),
+        },
+    };
+    let guarded = matches!(
+        call,
+        Call::SortSeed { guarded: true }
+            | Call::SortRound { guarded: true }
+            | Call::SortPre { guarded: true }
+            | Call::Finish { guarded: true, .. }
+            | Call::PivotPack { guarded: true }
+    );
+    if guarded {
+        // The ladder runs only for a row the select handed over.
+        alloc::format!("  if (sel_ladder_idle()) {{ return; }}\n  {body};\n")
+    } else {
+        alloc::format!("  {body};\n")
+    }
+}
+
+/// Every call a stepwise stage can dispatch, each once, in WGSL: the steps
+/// of every ladder of every op this backend emits ([`steps::calls_of`]). A
+/// stage's steps index it, so the pipelines a shell builds from it are
+/// every one a guest program can run.
+#[must_use]
+pub fn step_calls() -> Vec<String> {
+    calls().into_iter().map(call_text).collect()
+}
+
+/// The module of call `call` of [`step_calls`]: the runtime, the step's
+/// uniform, and one entry point, `entry`, that runs the call across the
+/// whole grid.
+#[must_use]
+pub fn step_module(entry: &str, call: &str) -> String {
+    let runtime = runtime();
+    let mut source = String::with_capacity(runtime.len() + 1024);
+    source.push_str(&runtime);
+    source.push('\n');
+    // The words [`StepUniform::bytes`] lays.
+    source.push_str(
+        "struct PieStep {\n  node : u32,\n  rung : u32,\n  selector : u32,\n  area : u32,\n  \
+         status_base : u32,\n  descs_base : u32,\n  params_base : u32,\n  offs_base : u32,\n  \
+         cfg_base : u32,\n  heap_base : u32,\n  pad1 : u32,\n  pad2 : u32,\n}\n",
+    );
+    let _ = writeln!(
+        source,
+        "@group(0) @binding({STEP_BINDING}) var<uniform> pie_step : PieStep;"
+    );
+    source.push_str(ENTRY_MARKER);
+    source.push('\n');
+    wrap_step(&mut source, entry, call);
+    source
+}
+
+/// `call` as one step's own text: what it runs, spelled with its node,
+/// rung and selector in place of the uniform's reads.
+#[must_use]
+pub fn spelled(call: &str, step: &Step) -> String {
+    let flag = if step.selector != 0 { "true" } else { "false" };
+    call.replace(NODE, &alloc::format!("{}u", step.node))
+        .replace(&alloc::format!("{SELECTOR} != 0u"), flag)
+        .replace(SELECTOR, &alloc::format!("{}u", step.selector))
+        .replace(RUNG, &alloc::format!("{}u", step.rung))
 }
 
 fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
@@ -413,88 +664,22 @@ fn wrap_step(source: &mut String, entry_name: &str, call: &str) {
     );
     let _ = writeln!(source, "  lanes = grid.x * {WORKGROUP}u;");
     source.push_str("  sel_lt = lid.x;\n  sel_group = wid.x;\n  sel_groups = grid.x;\n");
+    // The step's bases, its heap bound ([`RUNTIME`]'s `hld` / `hst`) and
+    // its node's temporary area's first word, read once: the area from the
+    // record, as uniform as the node, with no table load ahead of it.
+    source.push_str(
+        "  b_status = pie_step.status_base;\n  b_descs = pie_step.descs_base;\n  \
+         b_params = pie_step.params_base;\n  b_offs = pie_step.offs_base;\n  \
+         b_heap = pie_step.heap_base;\n  \
+         lim_heap = tables[pie_step.cfg_base + CFG_HEAP_WORDS];\n  \
+         tmp_base = pie_step.area;\n",
+    );
     source.push_str(call);
-    source.push_str("}\n");
+    source.push_str("  heap_flush();\n}\n");
 }
 
-fn step_op(
-    source: &mut String,
-    steps: &mut Vec<Step>,
-    prefix: &str,
-    plan: &crate::codegen::launch::LaunchStagePlan,
-    at: usize,
-    tag: u8,
-) {
-    let mut push = |call: String, suffix: &str| {
-        let entry = alloc::format!("{prefix}_{at}_{suffix}");
-        wrap_step(source, &entry, &call);
-        steps.push(Step {
-            entry,
-            node: at as u32,
-        });
-    };
-    let pivot = (tag == tags::PIVOT_THRESHOLD).then(|| plan.ops[at].pred_tag);
-    if pivot.is_some_and(|pred| pred > 1) {
-        // ProbGe compares each lane with the threshold; nothing to order.
-        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
-    } else if pivot.is_some() && one_row(plan, at) {
-        let rank = pivot == Some(0);
-        push(alloc::format!("  sel_init({at}u);\n"), "sel");
-        for pass in 0..4 {
-            push(
-                alloc::format!("  sel_hist({at}u, {pass}u);\n"),
-                &alloc::format!("h{pass}"),
-            );
-            push(
-                alloc::format!("  sel_pick({at}u, {pass}u);\n"),
-                &alloc::format!("p{pass}"),
-            );
-        }
-        if rank {
-            push(alloc::format!("  sel_rank_mask({at}u);\n"), "mask");
-        } else {
-            push(alloc::format!("  sel_tally({at}u);\n"), "tally");
-            push(alloc::format!("  sel_place({at}u);\n"), "place");
-            push(alloc::format!("  sel_walk({at}u);\n"), "walk");
-            let guard = "  if (sel_ladder_idle()) { return; }\n";
-            push(alloc::format!("{guard}  ptir_sort_seed({at}u);\n"), "seed");
-            for round in 0..sort_rounds(plan, at) {
-                push(
-                    alloc::format!("{guard}  ptir_sort_round({at}u, {round}u);\n"),
-                    &alloc::format!("r{round}"),
-                );
-            }
-            push(alloc::format!("{guard}  ptir_sort_pre({at}u);\n"), "pre");
-            push(alloc::format!("{guard}  {};\n", step_call(at, tag)), "step");
-            push(alloc::format!("{guard}  ptir_pivot_pack({at}u);\n"), "pack");
-        }
-    } else if is_sort(tag) {
-        push(alloc::format!("  ptir_sort_seed({at}u);\n"), "seed");
-        for round in 0..sort_rounds(plan, at) {
-            push(
-                alloc::format!("  ptir_sort_round({at}u, {round}u);\n"),
-                &alloc::format!("r{round}"),
-            );
-        }
-        push(alloc::format!("  ptir_sort_pre({at}u);\n"), "pre");
-        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
-        push(alloc::format!("  ptir_pivot_pack({at}u);\n"), "pack");
-    } else if is_reduce(tag) {
-        for level in 0..reduce_levels(plan, at) {
-            push(
-                alloc::format!("  {};\n", reduce_level_call(at, tag, level)),
-                &alloc::format!("l{level}"),
-            );
-        }
-        push(
-            alloc::format!("  {};\n", reduce_finish_call(at, tag)),
-            "fin",
-        );
-    } else {
-        push(alloc::format!("  {};\n", step_call(at, tag)), "step");
-    }
-}
-
+/// `plan`'s launches as steps of the closed set; a node no call serves is
+/// refused by its op's name.
 pub fn emit_launch_steps(
     prefix: &str,
     plan: &crate::codegen::launch::LaunchStagePlan,
@@ -502,25 +687,34 @@ pub fn emit_launch_steps(
     if !valid_identifier(prefix) {
         return Err(Refused::EntryName(prefix.to_string()));
     }
-    let fusion = crate::codegen::wgsl_analysis::analyze_stage(plan);
-    let mut source = String::from(RUNTIME);
-    source.push('\n');
-    source.push_str(ENTRY_MARKER);
-    source.push('\n');
-    let mut steps = Vec::new();
-    for (at, op) in plan.ops.iter().enumerate() {
-        if is_boundary(op.tag) || !fusion.emits_node(at) {
-            continue;
-        }
+    let calls = calls();
+    let mut out = Vec::new();
+    for at in launched_nodes(plan) {
+        let at = at as usize;
+        let op = &plan.ops[at];
+        let refused = || Refused::Op {
+            tag: op.tag,
+            name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
+        };
         if !emits(op.tag) {
-            return Err(Refused::Op {
-                tag: op.tag,
-                name: eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
+            return Err(refused());
+        }
+        let ladder = steps::ladder_of(plan, at, op.tag);
+        for step in steps::steps_of(op.tag, ladder).ok_or_else(refused)? {
+            let index = calls
+                .iter()
+                .position(|listed| *listed == step.call)
+                .ok_or_else(refused)?;
+            out.push(Step {
+                entry: alloc::format!("{prefix}_{at}_{}", step.suffix),
+                node: at as u32,
+                call: index as u32,
+                rung: step.rung,
+                selector: step.selector,
             });
         }
-        step_op(&mut source, &mut steps, prefix, plan, at, op.tag);
     }
-    Ok(Stepwise { source, steps })
+    Ok(Stepwise { steps: out })
 }
 
 #[cfg(test)]
@@ -568,6 +762,17 @@ mod tests {
             "the runtime folds {declared} rungs and the emitter spells {}",
             super::REDUCE_LEVELS
         );
+    }
+
+    /// The block the tab rolls is the runtime's as spelled, once, and the
+    /// rolled runtime holds the loop instead.
+    #[test]
+    fn the_pivot_block_the_tab_rolls_is_the_runtimes() {
+        let spelled = super::pivot_block_spelled();
+        assert_eq!(RUNTIME.matches(&spelled).count(), 1);
+        let rolled = RUNTIME.replacen(&spelled, super::PIVOT_BLOCK_ROLLED, 1);
+        assert!(!rolled.contains("let v31 ="));
+        assert_eq!(rolled.matches(super::PIVOT_BLOCK_ROLLED).count(), 1);
     }
 
     fn every_arm_of_the_runtime_switch_is_spelled_directly() {
@@ -764,7 +969,10 @@ mod tests {
 
 #[cfg(test)]
 mod stepwise_tests {
-    use super::{ENTRY_MARKER, RUNTIME, Refused, WORKGROUP, emit_launch_stage, emit_launch_steps};
+    use super::{
+        ENTRY_MARKER, RUNTIME, Refused, Stepwise, WORKGROUP, emit_launch_stage, emit_launch_steps,
+        spelled, step_calls, step_module,
+    };
     use crate::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
     use crate::plan::Dimension;
     use alloc::format;
@@ -821,6 +1029,50 @@ mod stepwise_tests {
             .collect()
     }
 
+    /// What `many`'s steps run, each with its node and rung spelled in.
+    fn run(many: &Stepwise) -> String {
+        let calls = step_calls();
+        many.steps
+            .iter()
+            .map(|step| spelled(&calls[step.call as usize], step))
+            .collect()
+    }
+
+    /// Every op the guest IR carries is refused at admission (this backend
+    /// emits no WGSL for it), a boundary the host serves, or has a call of
+    /// the closed set for every step of every ladder it can take; where the
+    /// ops are named, none of those calls is the runtime's whole switch, a
+    /// driver's seconds for every op at once. The negative control: a set
+    /// short of any one call fails.
+    #[test]
+    fn the_closed_set_holds_every_step_of_every_op() {
+        use eta_ir::op::OP_TABLE;
+        let calls = super::calls();
+        assert_eq!(super::steps::unlisted(&calls, super::stepped), None);
+        let stepped = OP_TABLE
+            .iter()
+            .filter(|row| super::stepped(row.tag))
+            .count();
+        assert!(stepped > 40, "{stepped} ops take steps");
+        if super::specialize() {
+            for call in step_calls() {
+                assert!(
+                    !call.contains("ptir_step("),
+                    "`{}` is the whole switch",
+                    call.trim()
+                );
+            }
+        }
+        for gone in 0..calls.len() {
+            let mut short = calls.clone();
+            let call = short.remove(gone);
+            assert!(
+                super::steps::unlisted(&short, super::stepped).is_some(),
+                "the set without {call:?} still passes"
+            );
+        }
+    }
+
     #[test]
     fn wgsl_1_every_case() {
         the_two_shapes_sequence_the_same_calls();
@@ -850,12 +1102,12 @@ mod stepwise_tests {
 
         assert_eq!(
             calls(&one),
-            calls(&many.source),
+            calls(&run(&many)),
             "the two shapes ask the runtime for different work"
         );
         assert_eq!(
             many.steps.len(),
-            calls(&many.source).len(),
+            calls(&run(&many)).len(),
             "every step is one dispatch of one call"
         );
     }
@@ -890,11 +1142,14 @@ mod stepwise_tests {
             ],
         );
         let many = emit_launch_steps("s", &stage).expect("emits");
-        let emitted = &many.source[RUNTIME.len()..];
-        assert!(
-            !emitted.contains("Barrier("),
-            "a stepwise entry point must not pretend a barrier orders the grid"
-        );
+        let calls = step_calls();
+        for step in &many.steps {
+            let module = step_module("s", &calls[step.call as usize]);
+            assert!(
+                !module[RUNTIME.len()..].contains("Barrier("),
+                "a stepwise entry point must not pretend a barrier orders the grid"
+            );
+        }
         assert!(
             emit_launch_stage("whole", &stage)
                 .expect("emits")
@@ -903,13 +1158,71 @@ mod stepwise_tests {
         );
     }
 
+    /// The runtime's temporaries are what [`super::temporary_bytes`] states
+    /// of them: a sort's, top-k's or pivot's two buffers of two words an
+    /// element of the value it runs over, a reduction's two buffers of two
+    /// words a 32-element group of a row, and a pivot's select state below
+    /// the area ([`super::selects`]).
+    #[test]
+    fn the_runtimes_temporaries_lie_within_what_each_node_states() {
+        use super::{selects, temporary_bytes};
+        for tag in [tags::SORT_DESC, tags::TOP_K, tags::PIVOT_THRESHOLD] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 151_936 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 151_936 * 16);
+        }
+        for tag in [
+            tags::REDUCE_SUM,
+            tags::REDUCE_MAX,
+            tags::REDUCE_MIN,
+            tags::REDUCE_ARGMAX,
+        ] {
+            assert_eq!(temporary_bytes(tag, 151_936, 1), 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 4 * 151_936, 4), 4 * 4748 * 16);
+            assert_eq!(temporary_bytes(tag, 5, 0), 16, "a row of one group");
+        }
+        // A draw's first level folds 8 lanes a job.
+        assert_eq!(
+            temporary_bytes(tags::GUMBEL_ARGMAX, 151_936, 1),
+            18_992 * 16
+        );
+        assert_eq!(
+            temporary_bytes(tags::GUMBEL_ARGMAX, 4 * 151_936, 4),
+            4 * 18_992 * 16
+        );
+        assert_eq!(temporary_bytes(tags::ADD, 151_936, 1), 0);
+        assert_eq!(temporary_bytes(tags::SORT_DESC, u64::MAX, 1), u64::MAX);
+        assert!(selects(tags::PIVOT_THRESHOLD) && selects(tags::TOP_K));
+        assert!(!selects(tags::SORT_DESC) && !selects(tags::REDUCE_ARGMAX));
+        for cell in [
+            "return tmp_base + ((buf * n) + c) * 2u;",
+            "return tmp_base + (buf * span + row * stride + c) * 2u;",
+            "fn pivot_flag(n : u32, t : u32) -> u32 { return tmp_base + t; }",
+            "fn pivot_meta(n : u32, row : u32) -> u32 { return tmp_base + n + row; }",
+            "fn pivot_val(n : u32, t : u32) -> u32 { return tmp_base + 2u * n + t; }",
+            "fn pivot_pos(n : u32, i : u32) -> u32 { return tmp_base + 3u * n + i; }",
+            "fn sel_at(k : u32) -> u32 { return tmp_base - SEL_WORDS + k; }",
+        ] {
+            assert!(
+                RUNTIME.contains(cell),
+                "the runtime no longer lays `{cell}`"
+            );
+        }
+        let named = RUNTIME.matches("tmp_base +").count() + RUNTIME.matches("tmp_base -").count();
+        assert_eq!(named, 7, "a temporary cell this statement has not read");
+        assert!(RUNTIME.contains(&alloc::format!(
+            "const SEL_WORDS : u32 = {}u;",
+            super::SELECT_WORDS
+        )));
+    }
+
     fn a_stepwise_entry_point_strides_by_the_whole_grid() {
         let stage = plan(
             vec![op(tags::IOTA, 0, &[])],
             vec![value(&[Dimension::Static(64)])],
         );
         let many = emit_launch_steps("s", &stage).expect("emits");
-        let emitted = &many.source[RUNTIME.len()..];
+        let module = step_module("s", &step_calls()[many.steps[0].call as usize]);
+        let emitted = &module[RUNTIME.len()..];
         assert!(emitted.contains("global_invocation_id"));
         assert!(emitted.contains("num_workgroups"));
         assert!(emitted.contains("tid = gid.x;"));
@@ -938,7 +1251,7 @@ mod stepwise_tests {
         let one = emit_launch_stage("whole", &stage).expect("emits");
         let many = emit_launch_steps("s", &stage).expect("emits");
         let one_body = one.split(ENTRY_MARKER).nth(1).unwrap();
-        let many_body = many.source.split(ENTRY_MARKER).nth(1).unwrap();
+        let many_body = run(&many);
         assert!(
             !one_body.contains("(1u)") && !one_body.contains("(1u,"),
             "the reshape reads no bytes"
@@ -948,7 +1261,7 @@ mod stepwise_tests {
             many.steps.iter().all(|step| step.node != 1),
             "an elided node gets no dispatch of its own"
         );
-        assert_eq!(calls(&one), calls(&many.source));
+        assert_eq!(calls(&one), calls(&run(&many)));
     }
 
     fn a_stepwise_prefix_must_be_an_identifier() {
@@ -1053,7 +1366,7 @@ mod sort_bound_tests {
 
 #[cfg(test)]
 mod select_tests {
-    use super::{RUNTIME, SELECT_WORDS, emit_launch_steps};
+    use super::{RUNTIME, SELECT_WORDS, emit_launch_steps, spelled, step_calls};
     use crate::codegen::launch::{LaunchOp, LaunchPlanValue, LaunchStagePlan};
     use crate::plan::Dimension;
     use alloc::string::String;
@@ -1113,7 +1426,13 @@ mod select_tests {
         );
         assert_eq!(steps[12], "seed");
         assert_eq!(steps.last().map(String::as_str), Some("pack"));
-        let source = emit_launch_steps("main", &pivot(1, &ROW)).unwrap().source;
+        let calls = step_calls();
+        let source: String = emit_launch_steps("main", &pivot(1, &ROW))
+            .unwrap()
+            .steps
+            .iter()
+            .map(|step| spelled(&calls[step.call as usize], step))
+            .collect();
         assert!(
             source.contains("if (sel_ladder_idle()) { return; }\n  ptir_sort_seed(0u);"),
             "the ladder runs only for a row the select handed over"
@@ -1145,5 +1464,36 @@ mod select_tests {
         // State, a histogram per workgroup, a tally pair per workgroup, and
         // the candidates' keys and indices.
         assert_eq!(SELECT_WORDS, 16 + 32 * 256 + 32 * 2 + 1024 * 2);
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::RUNTIME;
+
+    /// The WGSL `step_jobs` mirrors, line for line: where the runtime's
+    /// loop bounds or fans change, this fails, and `step_jobs` follows.
+    #[test]
+    fn the_job_counts_mirror_the_runtime() {
+        for line in [
+            "fn red_fan0(kind : u32) -> u32 { return select(32u, 8u, kind == RED_GUMBEL); }",
+            "    let fan = select(32u, red_fan0(kind), l == 0u);",
+            "    n = (n + fan - 1u) / fan;",
+            "  let n_in = red_n_in(len, kind, level);",
+            "  if (n_in <= 1u) { return; }",
+            "  let fan = select(32u, red_fan0(kind), level == 0u);",
+            "  let n_out = (n_in + fan - 1u) / fan;",
+            "  let total = rows * n_out;",
+            "  for (var job : u32 = tid; job < total; job = job + lanes) {",
+            "  for (var row : u32 = tid; row < rows; row = row + lanes) {",
+            "  let len = d_len(a) / max(rows, 1u);",
+            "  if (rank < 2u) { return 1u; }",
+            "  for (var k : u32 = 0u; k + 1u < rank; k = k + 1u) { n = n * d_dim(v, k); }",
+        ] {
+            assert!(
+                RUNTIME.lines().any(|have| have == line),
+                "the runtime no longer reads `{line}`: step_jobs mirrors it"
+            );
+        }
     }
 }

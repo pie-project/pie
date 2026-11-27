@@ -5,5 +5,5 @@ export const {
   name, architecture,
   outputVocabSize, kvPageSize, frameSize, channelCapacity,
   rsStateSize,
-  submitDeadlineUs, runAheadWindow, draftBlock, switches, lane,
+  runAheadWindow, draftBlock, draftDepth, switches, lane,
 } = modelStub;

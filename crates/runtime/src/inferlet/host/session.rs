@@ -14,13 +14,15 @@ use wasmtime_wasi::WasiView;
 /// is the one whose KV the planner may move off the device first.
 async fn idle_while<T>(pid: crate::inferlet::ProcessId, wait: impl Future<Output = T>) -> T {
     let planner = crate::planner::planner_of(pid);
+    crate::policy::report(crate::policy::Event::Idle(pid, true));
     if let Some(planner) = &planner {
         planner.set_idle(pid, true);
     }
-    let out = wait.await;
+    let out = process::away_while(pid, wait).await;
     if let Some(planner) = planner {
         planner.set_idle(pid, false);
     }
+    crate::policy::report(crate::policy::Event::Idle(pid, false));
     out
 }
 
@@ -217,7 +219,12 @@ impl pie::inferlet::session::Host for ProcessCtx {
         let Some(client_id) = process::get_client_id(process_id).await.ok().flatten() else {
             return Ok(None);
         };
-        match crate::server::receive_file(client_id, process_id).await {
+        match process::away_while(
+            process_id,
+            crate::server::receive_file(client_id, process_id),
+        )
+        .await
+        {
             Ok(data) => Ok(Some(data.to_vec())),
             Err(error) => {
                 tracing::warn!(
@@ -250,7 +257,12 @@ impl pie::inferlet::session::HostWithStore<ProcessCtx> for HasSelf<ProcessCtx> {
         let Some(client_id) = process::get_client_id(process_id).await.ok().flatten() else {
             return Ok(None);
         };
-        match crate::server::receive_file(client_id, process_id).await {
+        match process::away_while(
+            process_id,
+            crate::server::receive_file(client_id, process_id),
+        )
+        .await
+        {
             Ok(data) => Ok(Some(data.to_vec())),
             Err(error) => {
                 tracing::warn!(

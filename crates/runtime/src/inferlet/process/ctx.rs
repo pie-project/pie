@@ -11,7 +11,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 use super::ProcessId;
-use super::output::LogStream;
+use super::output::{LogStream, StderrTail};
 use super::residency::ProcessResidency;
 use crate::inferlet::program::Script;
 use crate::inferlet::sandbox::InstancePolicy;
@@ -27,6 +27,8 @@ pub struct ProcessCtx {
     id: ProcessId,
 
     wasi_ctx: WasiCtx,
+    /// What the guest last wrote to stderr: said beside a trap.
+    stderr_tail: StderrTail,
     resource_table: ResourceTable,
     #[cfg(not(target_arch = "wasm32"))]
     http_ctx: WasiHttpCtx,
@@ -55,6 +57,21 @@ pub struct ProcessCtx {
     limits: wasmtime::StoreLimits,
     /// Prompt tokens this process's fires found cached and mapped in.
     cached_tokens: u64,
+    /// Whom its working sets share as (`working-set.share`): set from its
+    /// arrival before it runs.
+    keying: Option<Keying>,
+    /// This context's count among those a shutdown waits to see torn down
+    /// ([`super::teardown::all_torn_down`]).
+    live: Option<super::teardown::Live>,
+}
+
+/// How a process's working sets key what they share.
+#[derive(Debug, Clone)]
+pub(crate) enum Keying {
+    /// Under the scope a set asks, as its authenticated tenant and session.
+    Asker(crate::policy::share::Asker),
+    /// A pass a peer offloaded here: under the asking set's domain.
+    OnBehalf(crate::store::kv::hash::Hash256),
 }
 
 impl Drop for ProcessCtx {
@@ -80,6 +97,7 @@ impl Drop for ProcessCtx {
             bind_permit,
             std::mem::take(&mut self.scratch_dir),
             self.handles.take(),
+            self.live.take(),
         );
     }
 }
@@ -96,6 +114,9 @@ impl WasiView for ProcessCtx {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct PieHttpHooks {
     network_allowed: bool,
+    /// The process whose guest sends: it waits on the outside until the
+    /// response comes back ([`crate::inferlet::process::away_while`]).
+    pid: ProcessId,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,6 +124,40 @@ impl WasiHttpHooks for PieHttpHooks {
     fn is_supported_scheme(&mut self, scheme: &http::uri::Scheme) -> bool {
         self.network_allowed
             && (*scheme == http::uri::Scheme::HTTP || *scheme == http::uri::Scheme::HTTPS)
+    }
+
+    /// The default send, its response awaited as outside input: the
+    /// process's lanes leave the frame while the guest waits on it.
+    fn send_request(
+        &mut self,
+        request: http::Request<wasmtime_wasi_http::WasiBody>,
+        options: Option<wasmtime_wasi_http::RequestOptions>,
+        fut: Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+    ) -> Box<
+        dyn Future<
+                Output = Result<
+                    (
+                        http::Response<wasmtime_wasi_http::WasiBody>,
+                        Box<dyn Future<Output = Result<(), wasmtime_wasi_http::Error>> + Send>,
+                    ),
+                    wasmtime_wasi_http::Error,
+                >,
+            > + Send,
+    > {
+        _ = fut;
+        let pid = self.pid;
+        Box::new(async move {
+            use http_body_util::BodyExt;
+            let (response, io) = crate::inferlet::process::away_while(
+                pid,
+                wasmtime_wasi_http::default_send_request(request, options),
+            )
+            .await?;
+            Ok((
+                response.map(BodyExt::boxed_unsync),
+                Box::new(io) as Box<dyn Future<Output = _> + Send>,
+            ))
+        })
     }
 }
 
@@ -128,19 +183,18 @@ impl ProcessCtx {
         policy: &InstancePolicy,
         script: Option<Arc<Script>>,
     ) -> anyhow::Result<Self> {
+        let stderr_tail = StderrTail::default();
+        let streamed = matches!(output, OutputMode::Stream);
+        let err = LogStream::new_stderr(id, stderr_tail.clone(), streamed);
+
         #[cfg(target_arch = "wasm32")]
         let wasi_ctx = {
             let mut builder = WasiCtx::builder();
-            match output {
-                OutputMode::Discard => {}
-                OutputMode::Stream => {
-                    let (out, err) = (LogStream::new_stdout(id), LogStream::new_stderr(id));
-                    builder = builder
-                        .stdout(move |bytes| out.write_bytes(bytes))
-                        .stderr(move |bytes| err.write_bytes(bytes));
-                }
+            if streamed {
+                let out = LogStream::new_stdout(id);
+                builder = builder.stdout(move |bytes| out.write_bytes(bytes));
             }
-            builder.build()
+            builder.stderr(move |bytes| err.write_bytes(bytes)).build()
         };
         #[cfg(target_arch = "wasm32")]
         let scratch_dir: Option<PathBuf> = None;
@@ -161,22 +215,24 @@ impl ProcessCtx {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        match output {
-            OutputMode::Discard => {}
-            OutputMode::Stream => {
+        {
+            if streamed {
                 builder.stdout(LogStream::new_stdout(id));
-                builder.stderr(LogStream::new_stderr(id));
             }
+            builder.stderr(err);
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         let scratch_dir = if policy.fs.allow {
             let scratch_dir = policy.fs.base_dir.join(id.to_string());
-            std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
-
+            std::fs::create_dir_all(&scratch_dir).map_err(|why| {
+                anyhow::anyhow!("scratch dir {}: not created: {why}", scratch_dir.display())
+            })?;
             builder
                 .preopened_dir(&scratch_dir, "/scratch", FsPerms::ReadWrite)
-                .expect("failed to preopen scratch dir");
+                .map_err(|why| {
+                    anyhow::anyhow!("scratch dir {}: not opened: {why}", scratch_dir.display())
+                })?;
             Some(scratch_dir)
         } else {
             None
@@ -188,12 +244,14 @@ impl ProcessCtx {
         Ok(ProcessCtx {
             id,
             wasi_ctx,
+            stderr_tail,
             resource_table: ResourceTable::new(),
             #[cfg(not(target_arch = "wasm32"))]
             http_ctx: WasiHttpCtx::new(),
             #[cfg(not(target_arch = "wasm32"))]
             http_hooks: PieHttpHooks {
                 network_allowed: policy.network.allow,
+                pid: id,
             },
             scratch_dir,
             script,
@@ -213,6 +271,8 @@ impl ProcessCtx {
             admission_wait_us: 0,
             residency_flag: None,
             cached_tokens: 0,
+            keying: None,
+            live: Some(super::teardown::Live::new()),
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(policy.memory_limit)
                 .build(),
@@ -225,6 +285,11 @@ impl ProcessCtx {
 
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// What the guest last wrote to stderr; `None` if nothing.
+    pub(crate) fn stderr_said(&self) -> Option<String> {
+        self.stderr_tail.said()
     }
 
     pub(crate) fn tokens_cached(&self) -> u64 {
@@ -272,14 +337,15 @@ impl ProcessCtx {
         self.files = files;
     }
 
+    pub(crate) fn set_keying(&mut self, keying: Keying) {
+        self.keying = Some(keying);
+    }
+
+    pub(crate) fn keying(&self) -> Option<&Keying> {
+        self.keying.as_ref()
+    }
+
     pub(crate) fn set_props(&mut self, props: client_api::Props) {
-        let tokens = client_api::props::persist_tokens(&props);
-        let owner = crate::policy::schedule::plex_id(self.id());
-        for stores in crate::store::registry::all_for_model(0) {
-            crate::store::registry::with_kv_lock(&stores.kv, "persist-hint", |kv| {
-                kv.set_persist_hint(owner, tokens);
-            });
-        }
         self.props = props;
     }
 
@@ -316,11 +382,16 @@ impl ProcessCtx {
     }
 
     pub(crate) fn register_kv_working_set(&self, ws: &crate::store::kv::working_set::KvWorkingSet) {
-        self.residency
-            .lock()
-            .unwrap()
-            .kv_working_sets
-            .insert((ws.model, ws.engine, ws.id), ws.suspend_handle());
+        match crate::planner::planner_for(ws.model, ws.engine) {
+            Some(planner) => planner.register_kv_working_set(self.id(), &self.residency, ws),
+            None => {
+                self.residency
+                    .lock()
+                    .unwrap()
+                    .kv_working_sets
+                    .insert((ws.model, ws.engine, ws.id), ws.suspend_handle());
+            }
+        }
         if let Some(departure) = &self.departure {
             ws.hold_departure(departure.clone());
         }

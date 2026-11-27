@@ -6,8 +6,8 @@ namespace pie::conv {
 
 using namespace ::pie::voxels;
 
-// Where element `local` (row `local_row`, column `col`) of lane `l`'s frame
-// slab lives: the slab cuts along its frame-position rows, `rows.atoms` of
+// Where element `local` (row `local_row`, column `col`) of the frame slab of
+// the lane at row `l` of the pool's lane table lives: the slab cuts along its frame-position rows, `rows.atoms` of
 // them a piece.
 template <class T>
 __device__ __forceinline__ T* cache_cell(
@@ -39,6 +39,8 @@ template <class T>
 __global__ __launch_bounds__(256) void cache_gather(
     StateRows rows,
     const int* __restrict__ grid,
+    const int* __restrict__ clip_lanes,
+    int lane_base,
     T* __restrict__ cache,
     int lanes,
     int frames,
@@ -62,7 +64,7 @@ __global__ __launch_bounds__(256) void cache_gather(
         cache[e] = T{static_cast<unsigned short>(0)};
         return;
     }
-    cache[e] = *cache_cell<const T>(rows, l, static_cast<int>(row - base), c, col);
+    cache[e] = *cache_cell<const T>(rows, clip_lanes[l] - lane_base, static_cast<int>(row - base), c, col);
 }
 
 template <class T>
@@ -71,6 +73,8 @@ __global__ __launch_bounds__(256) void cache_store(
     const T* __restrict__ cache,
     StateRows rows,
     const int* __restrict__ grid,
+    const int* __restrict__ clip_lanes,
+    int lane_base,
     int lanes,
     int frames,
     int c,
@@ -102,7 +106,7 @@ __global__ __launch_bounds__(256) void cache_store(
     } else {
         value = cache[(static_cast<long long>(base) + static_cast<long long>(f + g.t) * plane + hw) * c + col];
     }
-    *cache_cell<T>(rows, l, local_row, c, col) = value;
+    *cache_cell<T>(rows, clip_lanes[l] - lane_base, local_row, c, col) = value;
 }
 
 }

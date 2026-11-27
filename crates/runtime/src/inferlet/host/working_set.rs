@@ -16,21 +16,237 @@ use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
 
 #[derive(Clone, Debug)]
+/// Where a working set's rows end. What it folded is not here, nor whether
+/// that is known: both are its KV working set's, one length the recurrent
+/// state follows.
 pub struct Cursor {
-    pub folded: u32,
-    /// False while a fold the host could not place at submit is on its
-    /// way: `folded` is then a lower bound.
-    pub folded_exact: bool,
-    /// Fires in flight whose fold is placed when they settle; the last to
-    /// settle makes `folded` exact again.
-    pub unsettled: u32,
     pub tail: Option<u32>,
     pub reserved: u32,
+    /// One past the highest slot a fire is known to have written: a mark
+    /// that only rises, since a lane that rewinds leaves the rows it wrote
+    /// further on in its buffer, where a mask may still admit them.
+    pub written: u32,
+    /// One past the slots the set holds written without a gap, by its own
+    /// fires or in the prefix it shares: what a fire staged now may read
+    /// ([`engine::KvDelta::readable`]). A page holds what its last owner
+    /// left until the set writes it, so unlike [`Self::written`] it never
+    /// counts what the set only reserved. Rows the host places count from
+    /// their fire's submission (and stop counting if it fails); rows the
+    /// device places, from where their fire reported they ended.
+    pub readable: u32,
+    /// A fire whose rows the device placed settled with no end told: what
+    /// it wrote is known to its engine alone, which from then on holds the
+    /// set's lanes to what the set wrote ([`engine::extent`]).
+    pub untold: bool,
+    /// The fires staged on the set whose rows land where the device says,
+    /// and which have not settled: where they land is not known until they
+    /// do. A fork shares them, as it does the rows they write.
+    pub staged: Vec<Arc<StagedRows>>,
     /// M-RoPE spans `(start_slot, end_slot, lag)`, `lag = token_count - position_span`.
     pub spans: Vec<(u32, u32, u32)>,
+    /// The run-ahead fires on the set whose rows the program has not
+    /// accepted yet, oldest first: a fold never passes their first row, so
+    /// a stop can take them back ([`Cursor::accepted`]).
+    pub unaccepted: std::collections::VecDeque<Unaccepted>,
+    /// The run-ahead bound accepted the rows below this the program had not
+    /// read: they fold, and a retract never reaches them.
+    pub bound_accepted: u32,
+}
+
+/// One run-ahead fire's rows on a set, `start..end`, not yet accepted: the
+/// program accepts them as it takes each of `reads`, the outputs the fire
+/// publishes to the host.
+#[derive(Clone, Debug)]
+pub struct Unaccepted {
+    pub start: u32,
+    pub end: u32,
+    pub reads: Vec<HostRead>,
+}
+
+/// The `index`th cell a ring the host reads holds (counted from its first):
+/// taken once the host has taken more than `index` of its cells.
+#[derive(Clone)]
+pub struct HostRead {
+    pub cell: std::sync::Weak<Mutex<crate::pipeline::channel::ChannelCell>>,
+    pub index: u64,
+}
+
+impl std::fmt::Debug for HostRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRead")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostRead {
+    /// The host has taken the cell, or its ring is gone (nothing will).
+    fn taken(&self) -> bool {
+        self.cell
+            .upgrade()
+            .is_none_or(|cell| cell.lock().unwrap().taken() > self.index)
+    }
+}
+
+impl Unaccepted {
+    fn accepted(&self) -> bool {
+        self.reads.iter().all(HostRead::taken)
+    }
+}
+
+/// The rows of one fire on a working set that land where the device says,
+/// from its staging until it settles.
+#[derive(Debug)]
+pub struct StagedRows {
+    rows: u32,
+    settled: std::sync::OnceLock<Option<u32>>,
+}
+
+impl StagedRows {
+    #[must_use]
+    pub fn new(rows: u32) -> Arc<StagedRows> {
+        Arc::new(StagedRows {
+            rows,
+            settled: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The fire settled: its rows ended at `end`, one past the last slot
+    /// they landed at, as its engine reported; `None` where none was
+    /// reported (a fire that failed, or never ran).
+    pub fn settle(&self, end: Option<u32>) {
+        let _ = self.settled.set(end);
+    }
 }
 
 impl Cursor {
+    /// `fire` is staged on the set, its rows to land where the device says.
+    pub fn stage(&mut self, fire: Arc<StagedRows>) {
+        let (written, _) = self.standing();
+        self.written = written;
+        self.readable = self.readable();
+        self.untold |= self
+            .staged
+            .iter()
+            .any(|fire| matches!(fire.settled.get(), Some(None)));
+        self.staged.retain(|fire| fire.settled.get().is_none());
+        self.staged.push(fire);
+    }
+
+    /// The written end as far as settled fires tell it, and the rows of
+    /// the fires still to settle. A fire that settled with no end reported
+    /// wrote inside what the set reserved, as every such fire does.
+    pub fn standing(&self) -> (u32, u32) {
+        let (mut written, mut staged) = (self.written, 0u32);
+        for fire in &self.staged {
+            match fire.settled.get() {
+                Some(end) => written = written.max(end.unwrap_or(self.reserved)),
+                None => staged = staged.saturating_add(fire.rows),
+            }
+        }
+        (written, staged)
+    }
+
+    /// The written end a fire staged now may read: [`Self::readable`] as
+    /// far as the device-placed fires that settled reported it. A fire that
+    /// reported no end moves it nowhere.
+    pub fn readable(&self) -> u32 {
+        self.staged
+            .iter()
+            .filter_map(|fire| fire.settled.get().copied().flatten())
+            .fold(self.readable, u32::max)
+    }
+
+    /// Whether the host knows the set's written end: no device-placed fire
+    /// is still to settle on it, and every one that settled told its end.
+    pub fn readable_known(&self) -> bool {
+        !self.untold
+            && self
+                .staged
+                .iter()
+                .all(|fire| fire.settled.get().is_some_and(Option::is_some))
+    }
+
+    /// The host placed rows ending at `end` on the set, in a fire just
+    /// submitted.
+    pub fn wrote(&mut self, end: u32) {
+        self.readable = self.readable.max(end);
+    }
+
+    /// A fire that wrote from `start` failed: its rows may never have
+    /// landed, so nothing from there on counts as written.
+    pub fn unwrote(&mut self, start: u32) {
+        self.readable = self.readable.min(start);
+    }
+
+    /// No more than this many rows stand unfolded in the set's buffer when
+    /// a fire staged now runs, its recurrent state folded through `frozen`:
+    /// those written past `frozen` by fires that settled, and every row of
+    /// the fires still to settle ([`engine::fire::rung_holds`], device
+    /// geometry).
+    pub fn unfolded(&self, frozen: u32) -> u32 {
+        let (written, staged) = self.standing();
+        written.saturating_sub(frozen).saturating_add(staged)
+    }
+
+    /// The written end a snapshot states: what the set reserved while a
+    /// fire is still to settle.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn written_end(&self) -> u32 {
+        match self.standing() {
+            (written, 0) => written,
+            _ => self.reserved.max(self.written),
+        }
+    }
+
+    /// Where the rows the program has accepted end on a set written to
+    /// `end`: the first row of the oldest run-ahead fire whose outputs it
+    /// has not taken, else `end`. No more than `bound` fires stand
+    /// unaccepted: past it the oldest are accepted unread, and
+    /// [`Self::bound_accepted`] marks them.
+    pub fn accepted(&mut self, end: u32, bound: usize) -> u32 {
+        while self.unaccepted.front().is_some_and(Unaccepted::accepted) {
+            self.unaccepted.pop_front();
+        }
+        while self.unaccepted.len() > bound {
+            if let Some(fire) = self.unaccepted.pop_front() {
+                self.bound_accepted = self.bound_accepted.max(fire.end);
+            }
+        }
+        self.unaccepted
+            .front()
+            .map_or(end, |fire| fire.start.min(end))
+    }
+
+    /// The program accepted every row the set holds: it placed the tokens
+    /// that follow them.
+    pub fn accept_all(&mut self) {
+        self.unaccepted.clear();
+    }
+
+    /// A run-ahead fire wrote `start..end`, accepted as `reads` are taken.
+    pub fn run_ahead(&mut self, start: u32, end: u32, reads: Vec<HostRead>) {
+        if start < end {
+            self.unaccepted.push_back(Unaccepted { start, end, reads });
+        }
+    }
+
+    /// The rows from `cut` on are taken back: no fire stands unaccepted
+    /// past it. `Err` where the bound accepted rows past `cut`.
+    pub fn take_back(&mut self, cut: u32) -> Result<(), String> {
+        if cut < self.bound_accepted {
+            return Err(format!(
+                "the run-ahead bound accepted the rows below {} unread, past the cut at {cut}",
+                self.bound_accepted
+            ));
+        }
+        self.unaccepted.retain(|fire| fire.start < cut);
+        if let Some(last) = self.unaccepted.back_mut() {
+            last.end = last.end.min(cut);
+        }
+        Ok(())
+    }
+
     /// The last write wins from `start` on.
     pub fn rewrite(&mut self, start: u32, spans: impl IntoIterator<Item = (u32, u32, u32)>) {
         self.spans.retain(|&(from, _, _)| from < start);
@@ -50,12 +266,15 @@ pub fn lag(spans: &[(u32, u32, u32)], slot: u32) -> u32 {
 impl Default for Cursor {
     fn default() -> Self {
         Cursor {
-            folded: 0,
-            folded_exact: true,
-            unsettled: 0,
             tail: Some(0),
             reserved: 0,
+            written: 0,
+            readable: 0,
+            untold: false,
+            staged: Vec::new(),
             spans: Vec::new(),
+            unaccepted: std::collections::VecDeque::new(),
+            bound_accepted: 0,
         }
     }
 }
@@ -177,7 +396,12 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
     }
 
     async fn folded(&mut self, this: Resource<WorkingSet>) -> Result<u32> {
-        Ok(self.ctx().table.get(&this)?.cursor().folded)
+        let kv_rep = self.ctx().table.get(&this)?.kv;
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let folded =
+            store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.folded(kv.id))?;
+        Ok(u32::try_from(folded).unwrap_or(u32::MAX))
     }
 
     async fn fork(
@@ -186,16 +410,20 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
         on: Resource<Pipeline>,
     ) -> Result<Result<Resource<WorkingSet>, String>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        let (scope, failure) = {
+        let (scope, failure, fires) = {
             let pipeline = self.ctx().table.get(&on)?;
-            (pipeline.scope.clone(), pipeline.failure.clone())
+            (
+                pipeline.scope.clone(),
+                pipeline.failure.clone(),
+                pipeline.fires.clone(),
+            )
         };
         if scope.is_closed() {
             return Ok(Err("pipeline is closed".to_string()));
         }
-        let (kv_rep, rs_rep, cursor) = {
+        let (kv_rep, rs_rep) = {
             let ws = self.ctx().table.get(&this)?;
-            (ws.kv, ws.rs, ws.cursor())
+            (ws.kv, ws.rs)
         };
         let kv = kv_of(self, kv_rep)?;
         let rs = match rs_rep {
@@ -209,16 +437,28 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
             Some(rs) => rs.claim_pipeline_scope(&scope),
             None => Ok(()),
         });
-        if let Err(owner) = claimed {
-            return Ok(Err(format!(
-                "working set is scoped to pipeline {owner:#x}, not supplied pipeline {:#x}",
-                scope.id()
-            )));
+        match claimed {
+            Ok(()) => {}
+            Err(crate::store::ScopeRefusal::Held(owner)) => {
+                return Ok(Err(format!(
+                    "working set is scoped to pipeline {owner:#x}, not supplied pipeline {:#x}",
+                    scope.id()
+                )));
+            }
+            Err(failed) => return Ok(Err(format!("working set {failed}"))),
         }
-        if let Some(reason) = failure.lock().unwrap().clone() {
-            return Ok(Err(format!("pipeline failed: {reason}")));
-        }
+        // The child starts from the frozen length the fires on their way
+        // leave, or the fork is refused: never from a bound.
         let stores = store_registry::get(kv.model, kv.engine);
+        let at_rest = {
+            let cell = self.ctx().table.get(&this)?.cursor.clone();
+            let rs = rs.as_ref().map(|rs| rs.id);
+            crate::pipeline::fire::cursor_at_rest(self, &fires, &failure, &kv, rs, &cell).await?
+        };
+        let cursor = match at_rest {
+            Ok(cursor) => cursor,
+            Err(why) => return Ok(Err(why)),
+        };
         let kv_child =
             match store_registry::with_kv_lock(&stores.kv, "host-working-set", |s| s.fork(kv.id)) {
                 Ok(id) => kv.forked(id),
@@ -251,6 +491,39 @@ impl pie::inferlet::working_set::HostWorkingSet for ProcessCtx {
             rs: rs_rep,
             cursor: Arc::new(Mutex::new(cursor)),
         })?))
+    }
+
+    async fn share(
+        &mut self,
+        this: Resource<WorkingSet>,
+        scope: pie::inferlet::working_set::ShareScope,
+    ) -> Result<Result<(), String>> {
+        use crate::policy::share::{ShareAs, ShareScope};
+        use pie::inferlet::working_set::ShareScope as Wit;
+        let ask = match self.keying() {
+            Some(crate::inferlet::process::Keying::Asker(asker)) => ShareAs::Scope(
+                match scope {
+                    Wit::Session => ShareScope::Session,
+                    Wit::Tenant => ShareScope::Tenant,
+                    Wit::Group(name) => ShareScope::Group(name),
+                },
+                asker.clone(),
+            ),
+            Some(crate::inferlet::process::Keying::OnBehalf(domain)) => ShareAs::OnBehalf(*domain),
+            None => {
+                return Ok(Err(
+                    "share: this process has no authenticated tenant".to_string()
+                ));
+            }
+        };
+        let kv_rep = self.ctx().table.get(&this)?.kv;
+        let kv = kv_of(self, kv_rep)?;
+        let stores = store_registry::get(kv.model, kv.engine);
+        Ok(store_registry::with_kv_lock(
+            &stores.kv,
+            "host-working-set",
+            |s| s.share(kv.id, ask),
+        ))
     }
 
     async fn drop(&mut self, this: Resource<WorkingSet>) -> Result<()> {
@@ -292,10 +565,80 @@ pub(crate) fn grow_pages(kv: &KvWorkingSet, end: u32) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A run-ahead fire's rows are accepted once the host takes what it
+    /// published, oldest first; no more than the bound stand unaccepted,
+    /// the oldest past it accepted unread and never taken back; a stop
+    /// takes back the fires past its cut.
+    #[test]
+    fn acceptance_every_case() {
+        let ring = Arc::new(Mutex::new(crate::pipeline::channel::ChannelCell::new(
+            vec![1],
+            eta_ir::types::Dtype::I32,
+            8,
+        )));
+        let read = |index| HostRead {
+            cell: Arc::downgrade(&ring),
+            index,
+        };
+        let mut set = Cursor::default();
+        assert_eq!(set.accepted(20, 4), 20, "nothing run ahead: all accepted");
+        for (at, start) in (20..24).enumerate() {
+            set.run_ahead(start, start + 1, vec![read(at as u64)]);
+        }
+        assert_eq!(set.accepted(24, 4), 20);
+        ring.lock().unwrap().set_taken(2);
+        assert_eq!(set.accepted(24, 4), 22, "two taken");
+        // A fifth and sixth past the bound of four: the oldest goes unread.
+        set.run_ahead(24, 25, vec![read(4)]);
+        set.run_ahead(25, 26, vec![read(5)]);
+        assert_eq!(set.accepted(26, 3), 23);
+        assert_eq!(set.bound_accepted, 23);
+        assert!(set.take_back(22).unwrap_err().contains("run-ahead bound"));
+        set.take_back(24).unwrap();
+        assert_eq!(set.accepted(24, 3), 23, "the fires past the cut are gone");
+        ring.lock().unwrap().set_taken(4);
+        assert_eq!(set.accepted(24, 3), 24);
+        // A fire whose tokens the host places accepts everything before it.
+        set.run_ahead(24, 25, vec![read(9)]);
+        set.accept_all();
+        assert_eq!(set.accepted(25, 3), 25);
+    }
+
     #[test]
     fn lag_every_case() {
         a_row_lags_the_spans_ending_before_it();
         a_write_drops_the_spans_from_where_it_starts();
+    }
+
+    /// What a set holds written, as a fire staged now may read it: never
+    /// what it only reserved, nor what a failed fire may not have landed.
+    #[test]
+    fn readable_every_case() {
+        let mut set = Cursor {
+            reserved: 64,
+            ..Cursor::default()
+        };
+        set.wrote(10);
+        assert_eq!((set.readable(), set.readable_known()), (10, true));
+        // A device-placed fire in flight: the host knows nothing past 10.
+        let told = StagedRows::new(2);
+        set.stage(told.clone());
+        assert!(!set.readable_known());
+        told.settle(Some(12));
+        assert_eq!((set.readable(), set.readable_known()), (12, true));
+        // One that told no end: its engine alone knows, and the set's lanes
+        // are its engine's to hold from then on.
+        let untold = StagedRows::new(2);
+        set.stage(untold.clone());
+        untold.settle(None);
+        assert_eq!(set.readable(), 12, "nothing it only reserved");
+        assert!(!set.readable_known());
+        set.stage(StagedRows::new(1));
+        assert!(set.untold && !set.readable_known(), "kept past the fire");
+        // A failed host fire's rows count no more.
+        set.wrote(20);
+        set.unwrote(14);
+        assert_eq!(set.readable(), 14);
     }
 
     fn a_row_lags_the_spans_ending_before_it() {

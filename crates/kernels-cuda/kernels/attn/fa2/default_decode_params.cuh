@@ -137,6 +137,13 @@ struct BatchDecodeParams {
 
   IdType* q_indptr;
 
+  // PIE: the fire's masks, per request (`variants.cuh`): its bits from byte
+  // `maybe_mask_indptr[r]`, its word (boundary, wide bit) at
+  // `maybe_mask_origin[r]`. Read by a custom-mask variant alone.
+  uint8_t* maybe_custom_mask;
+  int64_t* maybe_mask_indptr;
+  uint32_t* maybe_mask_origin;
+
   __device__ __host__ BatchDecodeParams()
       : q(nullptr),
         q_rope_offset(nullptr),
@@ -159,7 +166,10 @@ struct BatchDecodeParams {
         kv_chunk_size_ptr(nullptr),
         block_valid_mask(nullptr),
         partition_kv(false),
-        q_indptr(nullptr) {}
+        q_indptr(nullptr),
+        maybe_custom_mask(nullptr),
+        maybe_mask_indptr(nullptr),
+        maybe_mask_origin(nullptr) {}
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_rope_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
@@ -188,7 +198,10 @@ struct BatchDecodeParams {
         kv_chunk_size_ptr(nullptr),
         block_valid_mask(nullptr),
         partition_kv(false),
-        q_indptr(nullptr) {}
+        q_indptr(nullptr),
+        maybe_custom_mask(nullptr),
+        maybe_mask_indptr(nullptr),
+        maybe_mask_origin(nullptr) {}
 
   __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }
 

@@ -149,6 +149,7 @@ impl Build {
                 q,
                 plan,
                 cache,
+                mask: None,
                 window: None,
                 head_dim: 4,
                 sm_scale: 1.0,
@@ -193,6 +194,7 @@ impl Build {
             value: v,
             layer: None,
             grid: None,
+            planes: Vec::new(),
         });
         self
     }

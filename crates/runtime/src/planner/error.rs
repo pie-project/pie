@@ -23,7 +23,7 @@ impl StarveCause {
                 "this process alone holds what the pool holds and nothing of it is running \
                  to free any: its parked ask cannot be placed beside what it holds, and a \
                  restart would replay the same asks into the same wall — run fewer lanes at \
-                 once or raise device_kv_budget"
+                 once or raise [engine.memory] budget_device"
             }
             StarveCause::NoRsSlots => {
                 "every RS folded slot is held and no admitted process is still \
@@ -47,21 +47,16 @@ pub enum PlannerError {
         need: u32,
         room: crate::store::shared::PoolRoom,
     },
+    /// A process's end (the declared context, in kv pages: it states none
+    /// of its own) past what the device holds alone: as the finisher it
+    /// would grow there and never finish ([`super::inner::CapacityGate`]).
+    EndPastDevice {
+        end: u32,
+        room: crate::store::shared::PoolRoom,
+    },
     Hog {
         need: u32,
         held: u32,
-        total: u32,
-    },
-    /// One process's pages and its parked asks together past the pool:
-    /// what it waits on is only its own, so no eviction of others and no
-    /// restart (which asks for the same again) makes the room.
-    /// `held` and `need` are kv pages; `state` is the kv pages the chunks
-    /// of its state, held and asked, would hold on a shared pool (else 0).
-    Overcommit {
-        asks: u32,
-        need: u32,
-        held: u32,
-        state: u32,
         total: u32,
     },
     Starved {
@@ -79,16 +74,92 @@ pub enum PlannerError {
         held: RsUnits,
         total: RsUnits,
     },
-    /// Parked short of room only the policy can make (`tier-pressure`), and
-    /// none came by the seat deadline: no discard, no new retention keys,
-    /// no growth.
-    Short {
-        tier: crate::policy::pressure::Tier,
-        bytes: u64,
-        waited: std::time::Duration,
+    /// A waiter whose need could never fit the device pool, even with
+    /// nothing else resident: its kv pages and the pages that free the runs
+    /// of whole chunks it asks (`runs`, as `(run, pieces)`), together past
+    /// the pool's `total` pages. Refused by name at once; every need short
+    /// of this waits, however long, while the planner makes room.
+    PastDevice {
+        need: u32,
+        total: u32,
+        runs: Option<(u32, u32)>,
+    },
+    /// A waiter asking a run of `run` adjacent chunks longer than any
+    /// arrangement of the pool lays for state: a run lies inside one
+    /// segment, below the narrowest rung's activation and past the reserved
+    /// chunks, and no segment holds `run` such chunks (`longest` at most).
+    /// Refused by name at once; moving every holder never opens it.
+    RunPastPool {
+        run: u32,
+        longest: u32,
+    },
+    /// An activation raise whose rung could never fit the pool, even with
+    /// every other process moved off it: the reserved chunks, the rung's
+    /// span and the `own` chunks its owner's state takes at that rung
+    /// (`need` chunks) past the pool's `total` chunks. Refused by name at
+    /// once; every raise short of this waits, funded, while the planner
+    /// makes room.
+    PastRung {
+        rung: u32,
+        need: u32,
+        own: u32,
+        total: u32,
+    },
+    /// Contention found every tier full with no move left to free the
+    /// head's room: this process, the lowest in the policy's order, fails
+    /// so the others proceed ([`super::ResidencyPlanner::fail_tiers_full`]). Each
+    /// tier's free and total pages.
+    TiersFull {
+        device: (u32, u32),
+        host: (u32, u32),
+        disk: (u32, u32),
+    },
+    /// A newcomer's first ask that fits nowhere: past what the device has
+    /// free and what the tiers below could take of the evictions it would
+    /// force. Refused by name at admission; admitted processes wait and
+    /// move instead. Its pages, and each tier's free and total pages.
+    AdmissionRefused {
+        need: u32,
+        device: (u32, u32),
+        host: (u32, u32),
+        disk: (u32, u32),
     },
     Cancelled,
 }
+
+impl PlannerError {
+    /// A stable code a client reads by machine, carried at the head of the
+    /// error's text (`[code] ...`) through the process's result, the
+    /// worker's reply and the gateway's error body (`code`): an admission
+    /// refusal a client retries, a wedge failure it does not. `None` for
+    /// errors with no code of their own.
+    #[must_use]
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            PlannerError::AdmissionRefused { .. } => Some(ADMISSION_REFUSED),
+            PlannerError::TiersFull { .. } => Some(TIERS_FULL),
+            _ => None,
+        }
+    }
+}
+
+impl PlannerError {
+    /// `text` led by this error's code (`[code] text`) where it has one:
+    /// a result or reply that wraps the error in context keeps the code
+    /// first, where a client reads it by machine.
+    #[must_use]
+    pub fn lead(&self, text: String) -> String {
+        match self.code() {
+            Some(code) if !text.starts_with(&format!("[{code}] ")) => format!("[{code}] {text}"),
+            _ => text,
+        }
+    }
+}
+
+/// [`PlannerError::code`] of an admission refusal: retried by the client.
+pub const ADMISSION_REFUSED: &str = "admission_refused";
+/// [`PlannerError::code`] of a wedge failure: every tier full.
+pub const TIERS_FULL: &str = "tiers_full";
 
 impl std::fmt::Display for PlannerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,37 +173,17 @@ impl std::fmt::Display for PlannerError {
                 "allocation of {need} kv pages can never fit: {}",
                 room.describe(*need)
             ),
+            PlannerError::EndPastDevice { end, room } => write!(
+                f,
+                "a process may grow to the declared context, {end} kv pages, and it states no \
+                 end of its own: that never fits the device alone, so it could never finish: {}",
+                room.describe(*end)
+            ),
             PlannerError::Hog { need, held, total } => write!(
                 f,
                 "KV pool exhausted by this process alone: it holds {held} pages and asks \
                  {need} more of a {total}-page pool — no eviction of others can cover it"
             ),
-            PlannerError::Overcommit {
-                asks,
-                need,
-                held,
-                state,
-                total,
-            } => {
-                let sum = held.saturating_add(*need).saturating_add(*state);
-                write!(
-                    f,
-                    "KV pool too small for this process's concurrent asks: it holds {held} kv \
-                     pages and its {asks} parked ask(s) need {need} more"
-                )?;
-                if *state > 0 {
-                    write!(
-                        f,
-                        ", and its state (held and asked) takes {state} pages' worth"
-                    )?;
-                }
-                write!(
-                    f,
-                    ": {sum} of a {total}-page pool even with every other holder evicted, so no \
-                     eviction or restart (which asks for the same again) can make room — run \
-                     fewer lanes at once or raise device_kv_budget"
-                )
-            }
             PlannerError::Starved {
                 need,
                 free,
@@ -159,26 +210,54 @@ impl std::fmt::Display for PlannerError {
                 "recurrent pools exhausted by this process alone: it holds {held} and asks \
                  {need} more of {total}, and no move of others can cover it"
             ),
-            PlannerError::Short {
-                tier: crate::policy::pressure::Tier::Host,
-                bytes,
-                waited,
-            } => write!(
+            PlannerError::RunPastPool { run, longest } => write!(
                 f,
-                "quota: the host tier is full (host_kv_budget): short by {bytes} bytes for \
-                 {waited:?} of room to park state, and no policy let a set at rest go; close a \
-                 set at rest or raise host_kv_budget"
+                "device memory can never lay this need: a run of {run} adjacent chunks, past the \
+                 {longest} any segment of the pool holds for state — a run lies inside one \
+                 segment, so no move ever opens it; raise [engine.memory] budget_device or ask \
+                 for less"
             ),
-            PlannerError::Short {
-                tier,
-                bytes,
-                waited,
+            PlannerError::PastDevice { need, total, runs } => {
+                write!(f, "device memory can never hold this need: {need} pages")?;
+                if let Some((run, pieces)) = runs {
+                    write!(f, " (its kv, and {pieces} runs of {run} adjacent chunks)")?;
+                }
+                write!(
+                    f,
+                    " past the whole {total}-page device pool, even with every other process \
+                     moved off it — raise [engine.memory] budget_device or ask for less"
+                )
+            }
+            PlannerError::PastRung {
+                rung,
+                need,
+                own,
+                total,
             } => write!(
                 f,
-                "{} memory short by {bytes} bytes for {waited:?}: the runtime drops no state \
-                 on its own, and no policy discard, retention change or memory growth made \
-                 room in time",
-                tier.name()
+                "the activation rung of {rung} tokens can never fit: with the reserved \
+                 chunks and the {own} chunks the process's own state takes beside it, it \
+                 takes {need} chunks of a {total}-chunk pool, even with every other \
+                 process moved off it"
+            ),
+            PlannerError::TiersFull { device, host, disk } => write!(
+                f,
+                "[tiers_full] every tier is full (device {} of {} pages free, host {} of {}, disk {} of {}) \
+                 and no move frees room for the process waiting: this one, the lowest in the \
+                 policy's order, fails so the others proceed",
+                device.0, device.1, host.0, host.1, disk.0, disk.1
+            ),
+            PlannerError::AdmissionRefused {
+                need,
+                device,
+                host,
+                disk,
+            } => write!(
+                f,
+                "[admission_refused] refused at admission: the first ask of {need} kv pages fits nowhere \
+                 (device {} of {} pages free, host {} of {}, disk {} of {}): the device \
+                 cannot hold it and the tiers below cannot take the evictions it would force",
+                device.0, device.1, host.0, host.1, disk.0, disk.1
             ),
             PlannerError::Cancelled => f.write_str("planner request cancelled"),
         }

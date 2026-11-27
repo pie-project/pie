@@ -53,7 +53,7 @@ pub(crate) fn gemv_bf16(
     // not fill the device a wavefront per row) one row split four ways on K.
     const WAVES: u32 = 4;
     let rows = n.unsigned_abs();
-    let (instantiation, grid) = if rows <= ctx.tuning().gemv_splitk_max_n {
+    let (instantiation, grid) = if rows <= ctx.tuning().gemv_splitk_max_n() {
         ("::pie::linear::gemv_bf16<4, true>", rows)
     } else {
         ("::pie::linear::gemv_bf16<4, false>", rows.div_ceil(WAVES))
@@ -64,20 +64,6 @@ pub(crate) fn gemv_bf16(
             .apply(Launch::grid([grid, 1, 1], [64, WAVES, 1])),
         &values,
     )
-}
-
-/// The current device's compute units, asked once per process (every device
-/// a process drives is the same part).
-pub(crate) fn compute_units() -> u32 {
-    static CUS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *CUS.get_or_init(|| {
-        let mut device = 0i32;
-        // SAFETY: writes one int.
-        unsafe { crate::hip::rt::hipGetDevice(&raw mut device) };
-        crate::hip::multiprocessors(device.unsigned_abs())
-            .unwrap_or(304)
-            .max(1)
-    })
 }
 
 /// The skinny kernel's wavefronts a block.
@@ -125,6 +111,177 @@ pub(crate) fn skinny_swiglu_bf16(
     skinny(ctx, weight, act, out, m, n, k, SkinnyEpilogue::Swiglu)
 }
 
+/// `pie::linear::SkinnyNorm`, field for field: the rows a skinny kernel
+/// multiplies normed where it stages them (`x + y` landed in `y_out`, then
+/// the RMS norm by `w`), all null for a plain activation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SkinnyNorm {
+    pub x: u64,
+    pub y: u64,
+    pub w: u64,
+    pub y_out: u64,
+    pub out: u64,
+    pub eps: f32,
+    pub plus_one: i32,
+}
+
+/// `out[m, n] = rmsnorm(x + y) · w[n, k]ᵀ` on the skinny kernel, the norm
+/// computed by every block where it stages the rows (`x + y` landed in
+/// `norm.y_out`, the normed rows in `norm.out`, by the first): one launch
+/// where the norm and the product were two. Under a gated `epilogue` the
+/// bank is a packed `[gate | up]` of 2n rows and `out` the n gated columns. `Ok(false)`, launching nothing, where that does not pay: the
+/// blocks' redundant reads (`grid · m · k` rows of x, y and the norm's
+/// weight) take longer at the device's copy rate than the launch they save
+/// (the profile's measured `[rates]`), or the plan stages no rows in LDS.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn skinny_norm_bf16(
+    ctx: &Ctx,
+    weight: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    norm: SkinnyNorm,
+    epilogue: SkinnyEpilogue,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.skinny";
+    let gated = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
+    let Some(plan) = skinny_norm_plan(ctx, m, n, k, gated)? else {
+        return Ok(false);
+    };
+    norm_aligned(OP, weight, &norm)?;
+    skinny_launch(ctx, weight, 0, out, m, n, k, epilogue, plan, Some(norm))?;
+    Ok(true)
+}
+
+/// The skinny kernel's walk of a normed product, where it stages the rows
+/// and the fold pays ([`fold_pays`]); `None` where it does not.
+pub(crate) fn skinny_norm_plan(
+    ctx: &Ctx,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+) -> Result<Option<SkinnyPlan>, Error> {
+    if !super::skinny::fits(m, n, k) {
+        return Ok(None);
+    }
+    let plan = skinny_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs() * if gated { 2 } else { 1 },
+        k.unsigned_abs(),
+        gated,
+        ctx.tuning().gemm_skinny_quad_from(),
+        ctx.multiprocessors("linear.skinny")?,
+    );
+    // The staged rows and, beside them in the same LDS, the prologue's
+    // per-row partial sums (`gemv.hip`'s `sums[ROWS * kNormGroups]` floats):
+    // a fold whose rows fill the LDS on their own has no room for those, and
+    // its launch asks the device for more than a block holds.
+    let staged = m.unsigned_abs() * k.unsigned_abs() * 2 + m.unsigned_abs() * NORM_GROUPS * 4;
+    // The prologue sums a row as `residual_add_rmsnorm`'s packed path does,
+    // a row of at most NORM_ROW_PACKS packs (`gemv.hip`'s kNormBlock x
+    // kNormPpt); a wider one stays apart.
+    if plan.quad || plan.act_global || staged > SKINNY_LDS || k / 8 > NORM_ROW_PACKS {
+        return Ok(None);
+    }
+    Ok(fold_pays(ctx, "skinny", m, n, k, gated, plan.grid).then_some(plan))
+}
+
+/// Whether a norm folded into a product of `grid` blocks pays: every block
+/// reads the rows' addends and residuals and the norm's weight again, the
+/// same few kilobytes each, which the last-level caches serve after the
+/// first block (priced at device memory's rate where the profile states no
+/// cached one), against the norm's own launch.
+#[allow(clippy::too_many_arguments)]
+fn fold_pays(
+    ctx: &Ctx,
+    kernel: &'static str,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+    grid: u32,
+) -> bool {
+    let t = ctx.tuning();
+    let redundant = f64::from(grid) * f64::from(2 * m + 1) * f64::from(k) * 2.0;
+    let gbps = if t.cached_gbps > 0 {
+        t.cached_gbps
+    } else {
+        t.hbm_gbps
+    };
+    // GB/s is bytes a nanosecond.
+    let folds = t.launch_ns > 0 && gbps > 0 && redundant / f64::from(gbps) < f64::from(t.launch_ns);
+    told_fold(
+        kernel,
+        m,
+        n,
+        k,
+        gated,
+        grid,
+        redundant,
+        t.launch_ns,
+        gbps,
+        folds,
+    );
+    folds
+}
+
+/// Refuses a fold whose operands are null or not 16-byte aligned.
+fn norm_aligned(op: &'static str, weight: u64, norm: &SkinnyNorm) -> Result<(), Error> {
+    for (address, what) in [
+        (norm.x, "the residual's addend"),
+        (norm.y, "the residual"),
+        (norm.w, "the norm's weight"),
+        (norm.y_out, "the residual's sum"),
+        (norm.out, "the normed rows"),
+        (weight, "the weight"),
+    ] {
+        if address == 0 || !aligned16(address) {
+            return Err(refuse(op, format!("{what} is null or not 16-byte aligned")));
+        }
+    }
+    Ok(())
+}
+
+/// The fold's choice for a shape, said once.
+#[allow(clippy::too_many_arguments)]
+fn told_fold(
+    kernel: &'static str,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+    grid: u32,
+    bytes: f64,
+    launch_ns: u32,
+    gbps: u32,
+    folds: bool,
+) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    /// The shapes said: (kernel, m, n, k, gated, grid).
+    type Shape = (&'static str, i32, i32, i32, bool, u32);
+    static TOLD: Mutex<Option<HashSet<Shape>>> = Mutex::new(None);
+    let mut told = TOLD.lock().expect("told lock poisoned");
+    if told
+        .get_or_insert_with(HashSet::new)
+        .insert((kernel, m, n, k, gated, grid))
+    {
+        tracing::debug!(
+            "the norm {} the {m}x{n}x{k} {kernel}{} product: {grid} blocks' redundant {:.2} MB at {gbps} GB/s against a {launch_ns} ns launch",
+            if folds {
+                "folds into"
+            } else {
+                "stays apart from"
+            },
+            if gated { " gated" } else { "" },
+            bytes / 1e6
+        );
+    }
+}
+
 /// What the skinny kernel lands of each product: it as is, the gated
 /// activation of a packed `[gate | up]` bank of 2n rows (`n` columns),
 /// `cap · tanh(v / cap)`, or the f32 product unrounded into an f32 plane.
@@ -168,8 +325,29 @@ pub struct SkinnyPlan {
     pub ks: u32,
 }
 
+/// The registers a lane of the diagonal skinny kernel holds its sums and
+/// reads in: of the 128 a lane of a 1024-thread block has, the rest for its
+/// row pointers and indices. Past them the kernel spills into scratch.
+const SKINNY_REGISTERS: u32 = 112;
+
+/// The registers a lane holds for `m` activation rows, `wr` weight rows and
+/// `unrl` reads of each in flight: a 4-float sum per row pair, a 16-byte
+/// read per row and round.
+const fn skinny_registers(m: u32, wr: u32, unrl: u32) -> u32 {
+    4 * (m * wr + (wr + m) * unrl)
+}
+
 /// The LDS the skinny kernel stages its activation rows in.
 pub(crate) const SKINNY_LDS: u32 = 64 << 10;
+
+/// The most packs (eight bf16) a row a normed skinny kernel's prologue sums:
+/// `gemv.hip`'s kNormBlock virtual threads of kNormPpt packs, the unfused
+/// `residual_add_rmsnorm`'s packed path, whose sums it reproduces.
+const NORM_ROW_PACKS: i32 = 256 * 4;
+
+/// The partial sums a row the normed prologue keeps in LDS beside the staged
+/// rows: `gemv.hip`'s kNormGroups, kNormBlock (256) over the wavefront (64).
+const NORM_GROUPS: u32 = 256 / 64;
 
 /// The whole-product kernel's banks: at least this many weight rows (a
 /// short bank leaves its four-row tiles too few to fill the card, where the
@@ -185,8 +363,14 @@ const QUAD_SPLIT_K: u32 = 12288;
 /// `quad_from` rows. The summation order depends only on `m`, `rows`, `k`
 /// and `quad_from` (never on `n` or the epilogue), so a fused GLU lands the
 /// bits its bank's plain projection would.
-pub(crate) fn skinny_plan(m: u32, rows: u32, k: u32, swiglu: bool, quad_from: u32) -> SkinnyPlan {
-    let cus = compute_units();
+pub(crate) fn skinny_plan(
+    m: u32,
+    rows: u32,
+    k: u32,
+    swiglu: bool,
+    quad_from: u32,
+    cus: u32,
+) -> SkinnyPlan {
     let n = if swiglu { rows / 2 } else { rows };
     let act_global = m * k * 2 > SKINNY_LDS;
     if m >= quad_from && rows >= QUAD_MIN_ROWS {
@@ -264,6 +448,19 @@ pub(crate) fn skinny_plan(m: u32, rows: u32, k: u32, swiglu: bool, quad_from: u3
         (yt, unrl)
     };
     let (yt, unrl) = if swiglu && m > 4 { (1, 1) } else { (yt, unrl) };
+    // Within the registers a lane of a 1024-thread block has: fewer reads in
+    // flight first, then fewer rows a wavefront (neither moves the order a
+    // lane sums its packs in).
+    let (mut yt, mut unrl) = (yt, unrl);
+    while skinny_registers(m, if swiglu { 2 * yt } else { yt }, unrl) > SKINNY_REGISTERS {
+        if unrl > 1 {
+            unrl -= 1;
+        } else if yt > 1 {
+            yt /= 2;
+        } else {
+            break;
+        }
+    }
     let rounds = |waves: u32| n.div_ceil(cus * waves * yt);
     let target = rounds(SKINNY_WAVES);
     let waves = (1..=SKINNY_WAVES)
@@ -299,7 +496,8 @@ pub(crate) fn skinny(
         rows,
         k.unsigned_abs(),
         swiglu,
-        ctx.tuning().gemm_skinny_quad_from,
+        ctx.tuning().gemm_skinny_quad_from(),
+        ctx.multiprocessors("linear.skinny")?,
     );
     skinny_planned(ctx, weight, act, out, m, n, k, epilogue, plan)
 }
@@ -317,7 +515,6 @@ pub(crate) fn skinny_planned(
     plan: SkinnyPlan,
 ) -> Result<(), Error> {
     const OP: &str = "linear.skinny";
-    let (mu, ku) = (m.unsigned_abs(), k.unsigned_abs());
     if !super::skinny::fits(m, n, k) {
         return Err(refuse(
             OP,
@@ -333,15 +530,72 @@ pub(crate) fn skinny_planned(
             return Err(refuse(OP, format!("{what} is null or not 16-byte aligned")));
         }
     }
+    skinny_launch(ctx, weight, act, out, m, n, k, epilogue, plan, None)
+}
+
+/// The skinny kernel's launch, its rows normed where it stages them under
+/// `norm` (`act` then unread).
+#[allow(clippy::too_many_arguments)]
+fn skinny_launch(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    epilogue: SkinnyEpilogue,
+    plan: SkinnyPlan,
+    norm: Option<SkinnyNorm>,
+) -> Result<(), Error> {
+    const OP: &str = "linear.skinny";
+    let (kernel, block_waves, smem) = skinny_kernel(m, k, epilogue, plan, norm.is_some())?;
+    let SkinnyPlan { waves, grid, .. } = plan;
+    let cap = match epilogue {
+        SkinnyEpilogue::Softcap(cap) => cap,
+        _ => 0.0,
+    };
+    let norm = norm.unwrap_or_default();
+    let mut args = vec![
+        ArgValue::Ptr(weight),
+        ArgValue::Ptr(act),
+        ArgValue::Ptr(out),
+        ArgValue::I32(n),
+        ArgValue::I32(k),
+        ArgValue::I32(waves.min(block_waves) as i32),
+        ArgValue::F32(cap),
+    ];
+    // The whole-product kernel takes no norm.
+    if !plan.quad {
+        args.push(ArgValue::of(&norm));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel).apply(Launch::grid([grid, 1, 1], [64, block_waves, 1]).smem(smem)),
+        &args,
+    )
+}
+
+/// The skinny kernel `plan` walks `m` rows of K `k` on with `epilogue`, its
+/// block's wavefronts and its dynamic LDS bytes.
+fn skinny_kernel(
+    m: i32,
+    k: i32,
+    epilogue: SkinnyEpilogue,
+    plan: SkinnyPlan,
+    normed: bool,
+) -> Result<(&'static crate::jit::Kernel, u32, u32), Error> {
+    const OP: &str = "linear.skinny";
+    let (mu, ku) = (m.unsigned_abs(), k.unsigned_abs());
     let SkinnyPlan {
         yt,
         unrl,
         waves,
         block_waves,
-        grid,
         act_global,
         quad,
         ks,
+        ..
     } = plan;
     let swiglu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
     // The whole-product kernel pads each LDS row a chunk, and its K slices
@@ -373,29 +627,37 @@ pub(crate) fn skinny_planned(
         )
     } else {
         format!(
-            "::pie::linear::skinny_bf16<{m}, {yt}, {unrl}, {}, {act_global}>",
+            "::pie::linear::skinny_bf16<{m}, {yt}, {unrl}, {}, {act_global}, {normed}>",
             epilogue.code()
         )
     };
-    let cap = match epilogue {
-        SkinnyEpilogue::Softcap(cap) => cap,
-        _ => 0.0,
-    };
     let smem = if act_global { red } else { staged + red };
-    ctx.fire(
-        OP,
-        Fire::at(kernel("linear/gemv.hip", &symbol))
-            .apply(Launch::grid([grid, 1, 1], [64, block_waves, 1]).smem(smem)),
-        &[
-            ArgValue::Ptr(weight),
-            ArgValue::Ptr(act),
-            ArgValue::Ptr(out),
-            ArgValue::I32(n),
-            ArgValue::I32(k),
-            ArgValue::I32(waves.min(block_waves) as i32),
-            ArgValue::F32(cap),
-        ],
-    )
+    Ok((kernel("linear/gemv.hip", &symbol), block_waves, smem))
+}
+
+/// The blocks of the skinny kernel serving walks `m` rows (1..=8) of a
+/// plain `n x k` bank with one compute unit of the current device holds at
+/// once, at its launch's threads (64 a wavefront, its block's wavefronts)
+/// and LDS: HIP's occupancy calculator over the kernel's registers and LDS
+/// against the compute unit's (`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`).
+pub(crate) fn skinny_resident_blocks(ctx: &Ctx, m: i32, n: i32, k: i32) -> Result<u32, Error> {
+    const OP: &str = "linear.skinny";
+    if !super::skinny::fits(m, n, k) {
+        return Err(refuse(
+            OP,
+            format!("covers 1..=8 rows of K in whole eights, not m={m} n={n} k={k}"),
+        ));
+    }
+    let plan = skinny_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs(),
+        k.unsigned_abs(),
+        false,
+        ctx.tuning().gemm_skinny_quad_from(),
+        ctx.multiprocessors(OP)?,
+    );
+    let (kernel, block_waves, smem) = skinny_kernel(m, k, SkinnyEpilogue::Store, plan, false)?;
+    kernel.resident_blocks(64 * block_waves, smem)
 }
 
 /// The turned kernel's LDS a wavefront: a 16 x 256 bf16 turn.
@@ -405,16 +667,22 @@ const TURN_WAVE_LDS: u32 = 8 << 10;
 /// `[gate | up]` one) over K `k`: wavefronts a block (`ks`, a 256-element
 /// slice of K each, up to four), slices a wavefront (`r`, up to two) and
 /// blocks (as many as the LDS keeps resident, at most a 16-row tile each).
-/// `None` past K 2048.
-pub(crate) fn turn_plan(m: u32, rows: u32, k: u32) -> Option<(u32, u32, u32)> {
-    if !(1..=32).contains(&m) || k == 0 || !k.is_multiple_of(256) || k > 2048 || rows == 0 {
+/// `None` past K 2048 ([`turn_fits`]).
+pub(crate) fn turn_plan(m: u32, rows: u32, k: u32, cus: u32) -> Option<(u32, u32, u32)> {
+    if !turn_fits(m, rows, k) {
         return None;
     }
     let slices = k / 256;
     let ks = slices.min(if m > 16 { 8 } else { 4 });
     let r = slices.div_ceil(ks);
-    let resident = compute_units() * ((64 << 10) / (ks * TURN_WAVE_LDS));
+    let resident = cus * ((64 << 10) / (ks * TURN_WAVE_LDS));
     Some((ks, r, rows.div_ceil(16).min(resident)))
+}
+
+/// Whether the turned kernel covers `m` rows over `rows` weight rows of K
+/// `k`: 1 to 32 rows, K in whole 256s up to 2048.
+pub(crate) fn turn_fits(m: u32, rows: u32, k: u32) -> bool {
+    (1..=32).contains(&m) && k != 0 && k.is_multiple_of(256) && k <= 2048 && rows != 0
 }
 
 /// `y[m, n] = act[m, k] · w[n, k]ᵀ` for 1 ≤ m ≤ 32 on the turned kernel
@@ -431,12 +699,82 @@ pub(crate) fn skinnyt(
     k: i32,
     epilogue: SkinnyEpilogue,
 ) -> Result<(), Error> {
+    turn_launch(ctx, weight, act, out, m, n, k, epilogue, None)
+}
+
+/// [`skinnyt`] over rows normed where the turned kernel stages them (in its
+/// turn's LDS with their partial sums, within its wavefronts' 8 KB each: 15
+/// rows at K 1024 under four), the rows' sums and
+/// normed rows landed as `norm` says; `Ok(false)` where it does not cover
+/// the shape or the fold does not pay ([`fold_pays`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn skinnyt_norm(
+    ctx: &Ctx,
+    weight: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    norm: SkinnyNorm,
+    epilogue: SkinnyEpilogue,
+) -> Result<bool, Error> {
+    const OP: &str = "linear.skinnyt";
+    let gated = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
+    if !skinnyt_norm_covers(ctx, m, n, k, gated)? {
+        return Ok(false);
+    }
+    norm_aligned(OP, weight, &norm)?;
+    turn_launch(ctx, weight, 0, out, m, n, k, epilogue, Some(norm))?;
+    Ok(true)
+}
+
+/// Whether the turned kernel stages a normed product's rows (they and their
+/// sums within its turn) and the fold pays ([`fold_pays`]).
+pub(crate) fn skinnyt_norm_covers(
+    ctx: &Ctx,
+    m: i32,
+    n: i32,
+    k: i32,
+    gated: bool,
+) -> Result<bool, Error> {
+    if m <= 0 || n <= 0 || k <= 0 || k / 8 > NORM_ROW_PACKS {
+        return Ok(false);
+    }
+    let Some((ks, _, grid)) = turn_plan(
+        m.unsigned_abs(),
+        n.unsigned_abs() * if gated { 2 } else { 1 },
+        k.unsigned_abs(),
+        ctx.multiprocessors("linear.skinnyt")?,
+    ) else {
+        return Ok(false);
+    };
+    // The normed rows (each padded a 16-byte pack, spread over the LDS
+    // banks) and their partial sums (four floats a row) in the turn.
+    Ok(
+        m.unsigned_abs() * (k.unsigned_abs() * 2 + 32) <= ks * TURN_WAVE_LDS
+            && fold_pays(ctx, "turned", m, n, k, gated, grid),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn turn_launch(
+    ctx: &Ctx,
+    weight: u64,
+    act: u64,
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    epilogue: SkinnyEpilogue,
+    norm: Option<SkinnyNorm>,
+) -> Result<(), Error> {
     const OP: &str = "linear.skinnyt";
     let glu = matches!(epilogue, SkinnyEpilogue::Swiglu | SkinnyEpilogue::Geglu);
     let plan = turn_plan(
         m.unsigned_abs(),
         n.unsigned_abs() * if glu { 2 } else { 1 },
         k.unsigned_abs(),
+        ctx.multiprocessors(OP)?,
     );
     let (Some((ks, r, grid)), true) = (plan, n > 0 && k > 0) else {
         return Err(refuse(
@@ -446,7 +784,7 @@ pub(crate) fn skinnyt(
     };
     for (address, what) in [
         (weight, "the weight"),
-        (act, "the activation"),
+        (if norm.is_some() { weight } else { act }, "the activation"),
         (out, "the output"),
     ] {
         if address == 0 || (what != "the output" && !aligned16(address)) {
@@ -458,8 +796,9 @@ pub(crate) fn skinnyt(
         _ => 0.0,
     };
     let symbol = format!(
-        "::pie::linear::skinnyt_bf16<{m}, {r}, {ks}, {}>",
-        epilogue.code()
+        "::pie::linear::skinnyt_bf16<{m}, {r}, {ks}, {}, {}>",
+        epilogue.code(),
+        norm.is_some()
     );
     ctx.fire(
         OP,
@@ -471,6 +810,36 @@ pub(crate) fn skinnyt(
             ArgValue::I32(n),
             ArgValue::I32(k),
             ArgValue::F32(cap),
+            ArgValue::of(&norm.unwrap_or_default()),
+        ],
+    )
+}
+
+/// The rates step's probe of the on-chip read rate (`[rates] cached_gbps`,
+/// engine-cuda `rates`): `blocks` blocks each read one `set_packs`-pack
+/// (16-byte) set of the `sets` at `sets_base` once, block b the set b %
+/// `sets`, as a normed skinny product's blocks read its rows. `sink` holds
+/// `blocks` floats and is written by none.
+pub fn cached_read_probe(
+    ctx: &Ctx,
+    sets_base: u64,
+    set_packs: u32,
+    sets: u32,
+    blocks: u32,
+    sink: u64,
+) -> Result<(), Error> {
+    ctx.fire(
+        "linear.cached_read_probe",
+        Fire::at(kernel(
+            "linear/gemv.hip",
+            "::pie::linear::cached_read_probe",
+        ))
+        .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
+        &[
+            ArgValue::Ptr(sets_base),
+            ArgValue::I32(set_packs as i32),
+            ArgValue::I32(sets as i32),
+            ArgValue::Ptr(sink),
         ],
     )
 }

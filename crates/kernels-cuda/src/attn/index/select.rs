@@ -73,7 +73,7 @@ pub(super) fn ranked_split(
 ) -> Result<bool, Error> {
     const OP: &str = "attn.index_topk";
     let rows = selection.rows;
-    if !ctx.tuning().index_radix || rows > ctx.tuning().index_split_until || rows == 0 {
+    if !ctx.tuning().index_radix() || rows > ctx.tuning().index_split_until() || rows == 0 {
         return Ok(false);
     }
     let stride = score_stride.unsigned_abs();
@@ -103,7 +103,7 @@ pub(super) fn ranked_split(
     };
     let launch = Launch::grid([rows * ranks, 1, 1], [THREADS, 1, 1])
         .smem(HEADER + chunk(stride, ranks) * 4)
-        .programmatic(ctx.tuning().pdl);
+        .programmatic(ctx.tuning().pdl());
     let launch = if ranks > 1 {
         launch.cluster(ranks)
     } else {

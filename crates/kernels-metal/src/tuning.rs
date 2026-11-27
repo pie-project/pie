@@ -91,13 +91,21 @@ pub fn fill(rows: u32, n: u32, cores: u32) -> i64 {
     i64::try_from(tiles * 8 / u64::from(cores.max(1))).unwrap_or(i64::MAX)
 }
 
+/// Whether a GPU of Apple `family` is Apple10 or later (M5 on): per-core
+/// neural accelerators behind the Metal 4 tensor ops, and their register
+/// layout.
+#[must_use]
+pub fn apple10(family: u32) -> bool {
+    family >= 10
+}
+
 impl Qmm {
     /// Whether this kernel answers right on a GPU of `family`: the staged
     /// tile fills its operands in Apple10's register layout, which earlier
     /// families with the same tensor ops lay otherwise.
     #[must_use]
     pub fn runs_on(&self, family: u32) -> bool {
-        !matches!(self, Qmm::Staged) || family >= 10
+        !matches!(self, Qmm::Staged) || apple10(family)
     }
 
     fn fits_shape(&self, at: &QmmAt) -> bool {
@@ -116,6 +124,65 @@ impl Qmm {
             Qmm::Tiled { .. } => at.k % i64::from(crate::linear::qmm::tiled::QMM_BK) == 0,
             Qmm::Qmv { .. } => true,
         }
+    }
+}
+
+/// The kernel a bf16 dense matmul (`act x W^T`, bf16 columns) of two or
+/// more rows runs: the first rung whose shape it fits. One row always takes
+/// the vector kernels. Where the tensor-op tile wins over the simdgroup
+/// kernels depends on the chip, the rows and the weight's shape (on an M5
+/// Pro, Qwen3-0.6B's 8-row decode matmuls take 6.9 ms on the tile where the
+/// 8-row simdgroup kernels take 5.6), so `pie tune metal` measures it; the
+/// default is the route before it was measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.dense",
+    shape(rows; n, k),
+    tune = search,
+    default = r#"[{ when = "rows >= 8", use = "mpp" }, { use = "rows" }, { use = "tile" }]"#,
+    fits = Dense::fits_shape
+)]
+pub enum Dense {
+    /// The Metal 4 tensor-op tile, on a GPU with tensor ops: from 8 rows,
+    /// the contraction whole 64-wide steps and the columns whole 64-wide
+    /// tiles.
+    #[partial]
+    Mpp,
+    /// The few-row vector forms, each weight row read once for every row:
+    /// up to 8 rows.
+    #[partial]
+    Rows,
+    /// The simdgroup-matrix row tiles: an 8-row tile below 32 rows, a
+    /// 32-row tile from there.
+    Tile,
+}
+
+impl Dense {
+    /// The most rows the few-row vector forms take.
+    pub const ROWS_MAX: u32 = 8;
+    /// The fewest rows the tensor-op tile lands: its smallest row tile.
+    pub const MPP_MIN_ROWS: u32 = 8;
+    /// The contraction the tensor-op tile walks per multiply, and its
+    /// narrowest column tile.
+    pub const MPP_STEP: u32 = 64;
+
+    fn fits_shape(&self, at: &DenseAt) -> bool {
+        match self {
+            Dense::Mpp => {
+                at.rows >= i64::from(Dense::MPP_MIN_ROWS)
+                    && at.n % i64::from(Dense::MPP_STEP) == 0
+                    && at.k % i64::from(Dense::MPP_STEP) == 0
+            }
+            Dense::Rows => at.rows >= 2 && at.rows <= i64::from(Dense::ROWS_MAX),
+            Dense::Tile => true,
+        }
+    }
+
+    /// Whether this kernel runs on a GPU of `family`: the tensor-op tile
+    /// needs the tensor ops ([`apple10`]).
+    #[must_use]
+    pub fn runs_on(&self, family: u32) -> bool {
+        !matches!(self, Dense::Mpp) || apple10(family)
     }
 }
 
@@ -267,7 +334,7 @@ pub enum SdpaPrefill {
 )]
 pub struct SdpaTileRowsPerRequest(pub u32);
 
-/// Whether 64-, 256- and 512-wide heads attend through the simdgroup-matrix kernels.
+/// Whether 64-, 128-, 256- and 512-wide heads attend through the simdgroup-matrix kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.mma", flag, default = true, tune = search)]
 pub struct SdpaMma;
@@ -302,10 +369,33 @@ pub enum GdnScan {
     },
 }
 
+/// How a short carry (each lane a decode row over at most a chunk of
+/// carried rows) runs its gated-delta scan: `prepared`, a pass a lane and
+/// value head ahead of it making the scan's inputs once and the scan
+/// reading them dense, or `inline`, every simdgroup of the scan making its
+/// own. The prepared form's two more launches a layer are a fixed cost a
+/// fire of few lanes does not win back, so where it pays is the chip's and
+/// the lanes': `pie tune metal` measures it, and a chip's file states what
+/// was measured on it (the M1 Max's). The default is the form before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(
+    id = "kernel.gdn.carried",
+    shape(rows; carried),
+    tune = search,
+    default = r#"[{ use = "inline" }]"#
+)]
+pub enum GdnCarried {
+    /// The scan over a record a lane, made by `gated_delta_carried_prep`.
+    Prepared,
+    /// Every simdgroup makes its own inputs.
+    Inline,
+}
+
 /// Register every decision this crate reads.
 pub fn register(registry: &mut Registry) {
     registry
         .add::<Qmm>()
+        .add::<Dense>()
         .add::<QmmFp16>()
         .add::<QmmSplitK>()
         .add::<QmmPrecastMinBm>()
@@ -327,7 +417,8 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaMma>()
         .add::<SdpaKvQ8>()
         .add::<SdpaSplitBf16>()
-        .add::<GdnScan>();
+        .add::<GdnScan>()
+        .add::<GdnCarried>();
 }
 
 #[derive(Clone, Debug)]
@@ -335,7 +426,18 @@ pub struct Tuning {
     profile: Profile,
     wide_range: bool,
     cores: Option<u32>,
+    family: u32,
+    /// `kernel.dense`'s pick per `(rows, n, k)` once read: every bf16
+    /// matmul of a fire asks it, and a ladder measured per shape holds a
+    /// rung a shape and row band (Gemma 4 E4B's, 30-50), which a scan on
+    /// every encode pays for on the host. Shared by this tuning's clones;
+    /// a new profile or family starts its own.
+    dense_picks: DensePicks,
 }
+
+/// `kernel.dense`'s picks a tuning has read, by `(rows, n, k)`.
+type DensePicks =
+    std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(u32, u32, u32), Dense>>>;
 
 impl Tuning {
     /// `wide_range`: the model's activations leave the fp16 range (diffusion
@@ -347,7 +449,27 @@ impl Tuning {
             profile,
             wide_range,
             cores,
+            family: 0,
+            dense_picks: std::sync::Arc::default(),
         }
+    }
+
+    /// The GPU's Apple family, where the device says: 0, the default, is a
+    /// device with no tensor-op matmul.
+    #[must_use]
+    pub fn with_family(self, family: u32) -> Tuning {
+        Tuning {
+            family,
+            dense_picks: std::sync::Arc::default(),
+            ..self
+        }
+    }
+
+    /// Whether the GPU multiplies on the tensor ops' neural accelerators
+    /// ([`apple10`]): a fact of the device, not a tuned choice.
+    #[must_use]
+    pub fn tensor_ops(&self) -> bool {
+        apple10(self.family)
     }
 
     #[must_use]
@@ -365,6 +487,51 @@ impl Tuning {
                 "emulated"
             },
         }
+    }
+
+    /// The kernel a bf16 dense matmul of `rows` rows (two or more) into `n`
+    /// columns over `k` runs: the first rung of `kernel.dense` that fits
+    /// and that this GPU runs, else the simdgroup tiles.
+    #[must_use]
+    pub fn dense(&self, rows: u32, n: u32, k: u32) -> Dense {
+        if let Some(pick) = self
+            .dense_picks
+            .read()
+            .ok()
+            .and_then(|picks| picks.get(&(rows, n, k)).copied())
+        {
+            return pick;
+        }
+        let at = DenseAt {
+            rows: i64::from(rows),
+            n: i64::from(n),
+            k: i64::from(k),
+        };
+        let pick = self
+            .profile
+            .ladder::<Dense>()
+            .candidates(&at)
+            .find(|d| d.runs_on(self.family))
+            .copied()
+            .unwrap_or(Dense::Tile);
+        if let Ok(mut picks) = self.dense_picks.write() {
+            picks.insert((rows, n, k), pick);
+        }
+        pick
+    }
+
+    /// The row counts at which `kernel.dense`'s pick may change, past one:
+    /// what a load's walk visits beside its rungs so it builds every
+    /// matmul kernel a fire's rows can be routed to.
+    #[must_use]
+    pub fn dense_row_starts(&self) -> Vec<u32> {
+        self.profile
+            .ladder::<Dense>()
+            .starts(0)
+            .into_iter()
+            .filter_map(|r| u32::try_from(r).ok())
+            .filter(|&r| r > 1)
+            .collect()
     }
 
     /// The GPU's cores, where the device says.
@@ -533,6 +700,22 @@ impl Tuning {
     #[must_use]
     pub fn gdn_scan(&self) -> GdnScan {
         *self.profile.get::<GdnScan>()
+    }
+
+    /// The form a short carry of `lanes` lanes (its rows: one a lane), each
+    /// carrying up to `carried` rows, runs its gated-delta scan in.
+    #[must_use]
+    pub fn gdn_carried(&self, lanes: u32, carried: u32) -> GdnCarried {
+        let at = GdnCarriedAt {
+            rows: i64::from(lanes),
+            carried: i64::from(carried),
+        };
+        self.profile
+            .ladder::<GdnCarried>()
+            .candidates(&at)
+            .next()
+            .copied()
+            .unwrap_or(GdnCarried::Inline)
     }
 }
 

@@ -69,6 +69,7 @@ fn reference(
 
 #[test]
 fn every_prompt_row_and_carried_state_answers_a_running_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -79,7 +80,6 @@ fn every_prompt_row_and_carried_state_answers_a_running_reference() {
         buffer.write(0, bytes).expect("upload");
         buffer
     };
-    let mut checked = 0usize;
     for (channels, dilation, spans) in [
         (10240u32, 1u32, vec![557u32]),
         (8192, 1, vec![3, 600, 1, 17, 16]),
@@ -190,7 +190,5 @@ fn every_prompt_row_and_carried_state_answers_a_running_reference() {
                 f32::from_le_bytes(carried[4 * at..4 * at + 4].try_into().expect("four bytes"));
             assert_eq!(actual, *want, "{spans:?}: carried state at {at}");
         }
-        checked += want_y.len() + want_state.len();
     }
-    eprintln!("checked {checked} conv outputs and carried states against a running reference");
 }

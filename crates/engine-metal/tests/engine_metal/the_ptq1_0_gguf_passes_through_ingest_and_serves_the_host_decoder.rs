@@ -7,8 +7,8 @@
 //!
 //! The loop this closes is file -> ingest -> bank -> kernel, on real data:
 //!   1. Build a GGUF whose tensors are ggml type 143, filled with REAL 28-byte
-//!      blocks lifted from Ternary-Bonsai-2-27B-PTQ1_0.gguf (the frozen M1a
-//!      fixture). This is the actual on-disk shape M0 confirmed.
+//!      blocks lifted from Ternary-Bonsai-2-27B-PTQ1_0.gguf (a frozen
+//!      fixture): the actual on-disk shape.
 //!   2. Run it through the REAL ingest: `parse_metadata` recognises type 143 as
 //!      `Ptq1_0`, `materialize_contract` classifies it PASS-THROUGH (not decoded),
 //!      and `convert` writes the served `.zt` artifact.
@@ -23,8 +23,8 @@
 //!      probes and assert every decoded weight equals the M1a host decoder
 //!      (`checkpoint::codec::ptq1_0::decode_block`) bit-for-bit.
 //!
-//! M1c is weights-only: the served output is NOT yet the full-model answer (the
-//! Hadamard-rotation undo is M3). What is proven here is decode correctness of the
+//! Weights only: the served output is not the full-model answer (the
+//! Hadamard-rotation undo is not here). What is proven here is decode correctness of the
 //! ingested ternary bank versus the host reference — the file->kernel byte path.
 
 use std::collections::BTreeMap;
@@ -120,7 +120,7 @@ fn gguf(tensors: &[(&str, Vec<u64>, u32, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("m1c_ptq1_0_{tag}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pie_ptq1_0_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -234,6 +234,7 @@ fn the_fixture_blocks_are_the_fork_oracle() {
 
 #[test]
 fn the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder_every_case() {
+    let _device = crate::device_alone();
     the_fixture_blocks_are_the_fork_oracle();
 
     // A few real tensors under their GGUF names (attn_q, ffn_down, token_embd),
@@ -343,8 +344,8 @@ fn the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder_every_case(
     }
 
     // --- Materialise the served bank through the executor -----------------------
-    // A Metal-backed plan must COMPILE: this proves the bind gate now accepts a
-    // stored PTQ1_0 block on Metal (the M1b decode-in-dot kernel reads it), where
+    // A Metal-backed plan must COMPILE: the bind gate accepts a stored PTQ1_0
+    // block on Metal (the decode-in-dot kernel reads it), where
     // it would reject every other self-contained scheme as "has to be decoded".
     checkpoint::plan::compile(
         &artifact,
@@ -363,26 +364,20 @@ fn the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder_every_case(
         );
     }
 
-    // --- Serve the ingested bank through the M1b kernel = the host decoder ------
+    // --- Serve the ingested bank through the decode-in-dot kernel = the host decoder
     let Ok(device) = Context::bind() else {
-        eprintln!("m1c: no Metal device; ingest+declare asserted, serve skipped");
+        eprintln!("no Metal device: ingest and declare asserted, serve skipped");
         std::fs::remove_dir_all(&dir).ok();
         return;
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("m1c device: {}", device.name());
 
     let mut served = 0usize;
     for t in &tensors {
         let bank_bytes = &storage.tensors[t.name];
         served += serve_and_check(&device, &handles, &pipelines, t, bank_bytes);
     }
-    eprintln!(
-        "m1c: {served} elements served from the ingested banks match the host \
-         decoder bit-exact, across {} real tensors",
-        tensors.len()
-    );
     assert!(served > 0);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -437,7 +432,7 @@ fn serve_and_check(
     let sink = Sink::new(device, &frame, pipelines, handles);
     sink.fire(
         Fire::at(PTQ1_0_FILE, "ptq1_0_qmv_bfloat16_f32").apply(Grid::of(
-            qmv::qmv_grid("m1c.readback", mi, ni).expect("grid"),
+            qmv::qmv_grid("ptq1_0.readback", mi, ni).expect("grid"),
             QMV_GROUP,
         )),
         &[

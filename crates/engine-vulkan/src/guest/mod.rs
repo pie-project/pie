@@ -18,23 +18,23 @@ impl engine_gpu::guest::Lower for crate::device::Api {
 pub enum Slot {
     Storage,
     Uniform,
+    /// A uniform bound at a dynamic offset a dispatch: a step's node, rung
+    /// and selector.
+    Stepped,
 }
 
-/// The layout every guest stage's pipelines bind (group 0): storage
-/// buffers, the config a uniform.
+/// The layout every guest pipeline binds (group 0): the status, the
+/// tables and the heap storage buffers, and the step's record a uniform at
+/// its offset.
 #[must_use]
 pub fn stage_layout() -> Vec<(u32, Slot)> {
-    use engine_gpu::guest::session::{BINDINGS, CFG_BINDING};
-    (0..BINDINGS)
-        .map(|at| {
-            let slot = if at == CFG_BINDING {
-                Slot::Uniform
-            } else {
-                Slot::Storage
-            };
-            (at, slot)
-        })
-        .collect()
+    use engine_gpu::guest::session::{HEAP_BINDING, STATUS_BINDING, STEP_BINDING, TABLES_BINDING};
+    vec![
+        (STATUS_BINDING, Slot::Storage),
+        (TABLES_BINDING, Slot::Storage),
+        (HEAP_BINDING, Slot::Storage),
+        (STEP_BINDING, Slot::Stepped),
+    ]
 }
 
 /// The descriptor type a layout binds `slot` as.
@@ -44,6 +44,7 @@ pub fn descriptor_type(slot: Slot) -> ash::vk::DescriptorType {
     match slot {
         Slot::Storage => ash::vk::DescriptorType::STORAGE_BUFFER,
         Slot::Uniform => ash::vk::DescriptorType::UNIFORM_BUFFER,
+        Slot::Stepped => ash::vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
     }
 }
 
@@ -67,7 +68,10 @@ pub fn lower(stage: usize, source: &str, layout: &[(u32, Slot)]) -> Result<Vec<u
         let bound = (binding.group == 0)
             .then(|| layout.iter().find(|(at, _)| *at == binding.binding))
             .flatten()
-            .map(|&(_, slot)| slot);
+            .map(|&(_, slot)| match slot {
+                Slot::Stepped => Slot::Uniform,
+                other => other,
+            });
         if bound != Some(declared) {
             return Err(refuse(format!(
                 "binding {}.{} is declared {declared:?} and the pipeline layout binds {bound:?}",
@@ -81,8 +85,20 @@ pub fn lower(stage: usize, source: &str, layout: &[(u32, Slot)]) -> Result<Vec<u
     )
     .validate(&module)
     .map_err(|e| refuse(e.emit_to_string(source)))?;
-    naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
-        .map_err(|e| refuse(e.to_string()))
+    // Restrict clamps every index into its binding, as wgpu's checked naga does:
+    // the heap binding is this instance's range of a pool segment it shares, and
+    // robustBufferAccess, where present, only keeps a stray access in the buffer.
+    let restrict = naga::proc::BoundsCheckPolicy::Restrict;
+    let options = naga::back::spv::Options {
+        bounds_check_policies: naga::proc::BoundsCheckPolicies {
+            index: restrict,
+            buffer: restrict,
+            image_load: restrict,
+            binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+        },
+        ..naga::back::spv::Options::default()
+    };
+    naga::back::spv::write_vec(&module, &info, &options, None).map_err(|e| refuse(e.to_string()))
 }
 
 #[cfg(not(feature = "vulkan"))]

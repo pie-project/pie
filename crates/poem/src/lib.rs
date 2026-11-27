@@ -32,3 +32,10 @@ pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, restate, switc
 pub fn output(name: &str, value: &Value, grid: Option<&Value>) {
     value.rec().output(name, value, grid);
 }
+
+/// [`output`], each entry's width laid out as `planes`, outermost first
+/// (`[q_heads, kv_max]` for attention scores): what the guest reads the
+/// entry's runs by, not a count it guesses.
+pub fn output_in_planes(name: &str, value: &Value, grid: Option<&Value>, planes: &[u32]) {
+    value.rec().output_in_planes(name, value, grid, planes);
+}

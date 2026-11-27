@@ -1,5 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::attn::voxel;
@@ -22,28 +23,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
-fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-        .collect()
 }
 
 struct Rig {
@@ -136,7 +115,6 @@ fn within_a_bf16_ulp(what: &str, want: &[f32], got: &[f32]) {
             at = i;
         }
     }
-    eprintln!("{what}: worst {worst:.3} ulp at {at}");
     assert!(
         worst <= 1.0,
         "{what}: parts from the reference by {worst:.2} bf16 ulp at {at} \
@@ -164,6 +142,7 @@ fn voxels(extents: &[[i32; 3]]) -> usize {
 
 #[test]
 fn the_voxel_axis_answers_its_host_reference_every_case() {
+    let _device = crate::device_alone();
     every_grid_rule_maps_the_box_its_host_twin_maps();
     the_convolution_answers_the_tap_walk();
     the_spread_and_lone_channel_convolutions_answer_the_tap_walk();
@@ -178,7 +157,6 @@ fn every_grid_rule_maps_the_box_its_host_twin_maps() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
     let grid = boxes(&[[2, 8, 6], [3, 4, 4]]);
     let (_gb, hg) = rig.i32s(&grid);
     let (_ob, ho) = rig.empty(grid.len() as u64 * 4);
@@ -255,7 +233,6 @@ fn every_grid_rule_maps_the_box_its_host_twin_maps() {
             assert_eq!(got[clip * 4 + 3], off, "{name}: clip {clip}'s row offset");
             off += want[0] * want[1] * want[2];
         }
-        eprintln!("{name}: {:?}", got);
     }
 }
 
@@ -586,7 +563,6 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
             .zip(&got)
             .map(|(w, g)| (w - g).abs())
             .fold(0.0f32, f32::max);
-        eprintln!("spatial attention {name}: worst absolute {worst:.3e}");
         assert!(worst < 6e-3, "spatial attention {name}: {worst:.3e}");
     }
 }
@@ -770,7 +746,6 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
         want, got,
         "a frame-cache store moves its rows and rounds nothing"
     );
-    eprintln!("cache store: bit-exact over {} slabbed elements", got.len());
 
     let (_rb, hround) = rig.empty((cache_rows * C) as u64 * 2);
     rig.fire(|s| {
@@ -798,9 +773,5 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
     assert_eq!(
         back, round,
         "a gather is the store's inverse, slot for slot"
-    );
-    eprintln!(
-        "cache gather: bit-exact over {} cached elements",
-        round.len()
     );
 }

@@ -12,16 +12,42 @@ struct Slab {
     bytes: usize,
 }
 
+/// One arena's slabs, each laid in memory its caller holds ([`place`]):
+/// nothing here allocates or frees device memory.
 #[derive(Default)]
 struct Arena {
-    slabs: HashMap<(&'static str, u32, usize), Slab>,
-    retired: Vec<*mut c_void>,
+    placed: HashMap<(&'static str, u32, usize), Slab>,
 }
 
-// SAFETY: the only pointers here are device allocations this map owns
-// outright. `cudaMalloc`/`cudaFree` are thread-safe and the map is behind a
-// mutex; nothing else holds a slab except a launch that has already been
-// enqueued.
+use super::ctx::{PLACED_ALIGN, SlabKey};
+
+/// [`super::Slabs::place`].
+pub(crate) fn place(base: *mut c_void, slabs: &[(SlabKey, usize)]) {
+    let mut arenas = locked();
+    let mut at = 0usize;
+    for (key, bytes) in slabs {
+        let bytes = bytes.next_multiple_of(PLACED_ALIGN);
+        arenas.entry(key.arena).or_default().placed.insert(
+            (key.name, key.region, key.scope),
+            Slab {
+                // SAFETY: inside the span the caller holds, by `placed_bytes`.
+                ptr: unsafe { base.byte_add(at) },
+                bytes,
+            },
+        );
+        at += bytes;
+    }
+}
+
+/// [`super::Slabs::unplaced_bytes`].
+pub(crate) fn unplaced_bytes() -> usize {
+    UNPLACED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+static UNPLACED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+// SAFETY: the pointers here are spans of memory the placing caller holds;
+// the map is behind a mutex and never dereferences them.
 unsafe impl Send for Arena {}
 
 fn arenas() -> &'static Mutex<HashMap<u32, Arena>> {
@@ -33,44 +59,67 @@ fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
     arenas().lock().expect("lock poisoned")
 }
 
+/// A size-only walk's slabs (`crate::sizing`): the most each key asked.
+#[derive(Default)]
+struct Sized {
+    asked: HashMap<(u32, &'static str, u32, usize), usize>,
+}
+
+thread_local! {
+    static SIZED: core::cell::RefCell<Sized> = core::cell::RefCell::new(Sized::default());
+}
+
+pub(crate) fn sizing_reset() {
+    SIZED.with(|sized| *sized.borrow_mut() = Sized::default());
+}
+
+pub(crate) fn sizing_take() -> crate::sizing::Footprint {
+    SIZED.with(|sized| {
+        let sized = core::mem::take(&mut *sized.borrow_mut());
+        crate::sizing::Footprint::of(
+            sized
+                .asked
+                .into_iter()
+                .map(
+                    |((arena, name, region, scope), asked)| crate::sizing::Sized {
+                        key: SlabKey {
+                            arena,
+                            name,
+                            region,
+                            scope,
+                        },
+                        asked,
+                    },
+                )
+                .collect(),
+        )
+    })
+}
+
+/// [`take`] in a size-only walk: the ask counted, and a stand-in address.
+fn take_sized(
+    arena: u32,
+    owner: *mut c_void,
+    name: &'static str,
+    region: u32,
+    bytes: usize,
+) -> *mut c_void {
+    let key = (arena, name, region, scope_of(owner, region));
+    SIZED.with(|sized| {
+        let mut sized = sized.borrow_mut();
+        let asked = sized.asked.entry(key).or_insert(0);
+        *asked = (*asked).max(bytes);
+    });
+    crate::sizing::STAND_IN as *mut c_void
+}
+
 pub(crate) fn attach(arena: u32, stream: *mut c_void) {
     let _ = (arena, stream);
 }
 
+/// Forgets the arena's slabs; their memory is the placing caller's.
 pub(crate) fn release(arena: u32) {
-    let mut arenas = locked();
-    let Some(held) = arenas.remove(&arena) else {
-        return;
-    };
-    for (_, slab) in held.slabs {
-        if !slab.ptr.is_null() {
-            // SAFETY: an address this map allocated with `cudaMalloc` and
-            // handed to nobody who outlives the arena.
-            let _ = unsafe { rt::cudaFree(slab.ptr) };
-        }
-    }
-    for ptr in held.retired {
-        if !ptr.is_null() {
-            // SAFETY: as above — an address this map allocated and never
-            // handed to anything that outlives the arena.
-            let _ = unsafe { rt::cudaFree(ptr) };
-        }
-    }
-}
-
-pub(crate) fn capture_status(stream: *mut c_void) -> Option<rt::cudaStreamCaptureStatus> {
-    let mut status = rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
-    // SAFETY: `stream` is a `Ctx`'s stream, live by `Ctx::on`'s contract;
-    // `status` is a local out-pointer.
-    if unsafe { rt::cudaStreamIsCapturing(stream.cast(), &raw mut status) }
-        != rt::cudaError::cudaSuccess
-    {
-        // SAFETY: takes no arguments; it only clears the sticky error the
-        // failed query left on this thread.
-        let _ = unsafe { rt::cudaGetLastError() };
-        return None;
-    }
-    Some(status)
+    locked().remove(&arena);
 }
 
 fn scope_of(stream: *mut c_void, region: u32) -> usize {
@@ -81,11 +130,14 @@ fn scope_of(stream: *mut c_void, region: u32) -> usize {
     }
 }
 
+/// The slab laid for `(name, region)` in `arena`, at least `bytes` long.
 /// `owner` is the stream a stream-scoped slab belongs to: the launching
-/// stream, or the one whose order it launches in.
+/// stream, or the one whose order it launches in. A slab is laid zeroed
+/// ([`super::Slabs::place`]), so counters a launch puts back to zero
+/// (tickets) read zero at every take. A take past what is laid is a fire
+/// no walk sized, and faults.
 pub(crate) fn take(
     arena: u32,
-    stream: *mut c_void,
     owner: *mut c_void,
     name: &'static str,
     region: u32,
@@ -94,142 +146,24 @@ pub(crate) fn take(
     if bytes == 0 {
         return Ok(core::ptr::null_mut());
     }
-    let mut arenas = locked();
-    let held = arenas.entry(arena).or_default();
-    let scope = scope_of(owner, region);
-    if let Some(slab) = held.slabs.get(&(name, region, scope))
-        && slab.bytes >= bytes
-    {
-        return Ok(slab.ptr);
+    if crate::sizing::active() {
+        return Ok(take_sized(arena, owner, name, region, bytes));
     }
-    if capture_status(stream)
-        .is_some_and(|s| s != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
-    {
-        return Err(Fault::Unwarmed {
-            name,
-            have: held
-                .slabs
-                .get(&(name, region, scope))
-                .map_or(0, |slab| slab.bytes),
-            need: bytes,
-        });
-    }
-    grow(held, name, region, scope, bytes)?;
-    Ok(held.slabs[&(name, region, scope)].ptr)
-}
-
-/// [`take`], a slab zeroed on `stream` whenever it is fresh: for counts its
-/// kernels leave at zero between launches, so a slab is cleared once, not a
-/// launch. (A capture never grows a slab, so the clear is never captured.)
-pub(crate) fn take_zeroed(
-    arena: u32,
-    stream: *mut c_void,
-    owner: *mut c_void,
-    name: &'static str,
-    region: u32,
-    bytes: usize,
-) -> Result<*mut c_void, Fault> {
-    let key = (name, region, scope_of(owner, region));
-    let before = locked()
-        .get(&arena)
-        .and_then(|held| held.slabs.get(&key))
-        .map(|slab| slab.ptr);
-    let ptr = take(arena, stream, owner, name, region, bytes)?;
-    if ptr.is_null() || before == Some(ptr) {
-        return Ok(ptr);
-    }
-    let size = locked()
-        .get(&arena)
-        .and_then(|held| held.slabs.get(&key))
-        .map_or(bytes, |slab| slab.bytes);
-    // SAFETY: the slab `take` just allocated, `size` bytes, on the stream
-    // that launches what reads it.
-    let code = unsafe { rt::cudaMemsetAsync(ptr, 0, size, stream.cast()) };
-    if code != rt::cudaError::cudaSuccess {
-        return Err(Fault::Device {
-            call: "cudaMemsetAsync",
-            code: code as i32,
-        });
-    }
-    Ok(ptr)
-}
-
-#[must_use]
-pub fn census() -> Vec<(&'static str, usize)> {
     let arenas = locked();
-    let mut by_name: HashMap<&'static str, usize> = HashMap::new();
-    for arena in arenas.values() {
-        for ((name, _, _), slab) in &arena.slabs {
-            *by_name.entry(name).or_insert(0) += slab.bytes;
+    let have = arenas
+        .get(&arena)
+        .and_then(|held| held.placed.get(&(name, region, scope_of(owner, region))));
+    match have {
+        Some(slab) if slab.bytes >= bytes => Ok(slab.ptr),
+        _ => {
+            UNPLACED.fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+            Err(Fault::Unplaced {
+                name,
+                have: have.map_or(0, |slab| slab.bytes),
+                need: bytes,
+            })
         }
     }
-    let mut out: Vec<(&'static str, usize)> = by_name.into_iter().collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    out
-}
-
-const SLAB_GRAIN: usize = 8 << 20;
-const SMALL_SLAB_GRAIN: usize = 256 << 10;
-
-fn grow(
-    arena: &mut Arena,
-    name: &'static str,
-    region: u32,
-    scope: usize,
-    bytes: usize,
-) -> Result<(), Fault> {
-    let (old_ptr, old_bytes) = arena
-        .slabs
-        .get(&(name, region, scope))
-        .map_or((core::ptr::null_mut(), 0), |slab| (slab.ptr, slab.bytes));
-    if old_bytes >= bytes {
-        return Ok(());
-    }
-    // A slab under the grain takes its own size to the small grain: one a
-    // region (Gemma-4-26B's 30 MoE route orders of 0.1 MiB each) held 8 MiB
-    // apiece, 240 MiB the cache rows never saw.
-    let grain = if bytes < SLAB_GRAIN {
-        SMALL_SLAB_GRAIN
-    } else {
-        SLAB_GRAIN
-    };
-    let want = bytes.div_ceil(grain).saturating_mul(grain);
-    let mut fresh: *mut c_void = core::ptr::null_mut();
-
-    // SAFETY: a live local out-parameter and a byte count this caller checked
-    // is non-zero.
-    let code = unsafe { rt::cudaMalloc(&raw mut fresh, want) };
-    if code == rt::cudaError::cudaErrorMemoryAllocation {
-        // SAFETY: takes no arguments; it only clears the failed allocation's
-        // error so the next call does not report it.
-        let _ = unsafe { rt::cudaGetLastError() };
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: two live locals; the call only writes them.
-        let _ = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-        return Err(Fault::Exhausted {
-            name,
-            have: old_bytes,
-            need: want,
-            free,
-        });
-    }
-    if code != rt::cudaError::cudaSuccess || fresh.is_null() {
-        return Err(Fault::Device {
-            call: "cudaMalloc",
-            code: code as i32,
-        });
-    }
-    if !old_ptr.is_null() {
-        arena.retired.push(old_ptr);
-    }
-    arena.slabs.insert(
-        (name, region, scope),
-        Slab {
-            ptr: fresh,
-            bytes: want,
-        },
-    );
-    Ok(())
 }
 
 fn current() -> Option<i32> {
@@ -309,16 +243,6 @@ pub(crate) fn max_shared_memory_per_block_optin() -> Option<u32> {
             o,
         )
     })
-}
-
-pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
-    // SAFETY: `cudaDeviceProp` is a C struct of integers, arrays and a
-    // UUID, for which all-zero bytes are a valid value.
-    let mut prop: rt::cudaDeviceProp = unsafe { core::mem::zeroed() };
-    // SAFETY: `prop` is a local out-pointer of the struct's own type; a bad
-    // `ordinal` comes back as an error code.
-    let code = unsafe { rt::cudaGetDeviceProperties(&raw mut prop, ordinal) };
-    (code == rt::cudaError::cudaSuccess).then_some(prop)
 }
 
 fn attribute(which: rt::cudaDeviceAttr, ordinal: i32) -> Option<u32> {

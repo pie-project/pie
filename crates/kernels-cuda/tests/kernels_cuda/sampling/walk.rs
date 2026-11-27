@@ -298,18 +298,11 @@ fn the_markov_walk_biases_each_row_by_the_pick_before_it() {
             &mut t(picks_at, rows, 1, Dtype::I32),
         );
         let logits_t = t(logits_at, rows, vocab, dtype);
-        let fired = sampling::markov_walk(
-            &gpu.ctx(),
-            logits_t,
-            tok_t,
-            pos_t,
-            ends_t,
-            embed_t,
-            head_t,
-            5,
-            biased,
-            picks,
-        );
+        let fired = gpu.laid(&gpu.ctx(), |ctx| {
+            sampling::markov_walk(
+                ctx, logits_t, tok_t, pos_t, ends_t, embed_t, head_t, 5, biased, picks,
+            )
+        });
         fired.expect("the walk fires");
         gpu.sync();
         let got: Vec<f32> = match bf {

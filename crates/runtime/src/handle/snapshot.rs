@@ -25,9 +25,9 @@ use crate::store::kv::page_table::{ExportedPage, ExportedSet, HostKvSlotId, KvPa
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::registry as store_registry;
 use crate::store::rs::working_set::RsWorkingSet;
-use crate::store::rs::{RsExport, RsGeometry, RsSlotId, WindowState};
+use crate::store::rs::{RsExport, RsGeometry, RsSlotId};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Names are file names here, written out in hex.
 pub(crate) const MAX_NAME_BYTES: usize = 100;
 /// Pages read or written at a time: each passes through host slots of the
@@ -130,6 +130,7 @@ fn store() -> Result<(PathBuf, u64), HandleError> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
     name: String,
@@ -156,15 +157,22 @@ struct Spent {
     bytes: u64,
 }
 
+/// Where the rows end. What is folded is the manifest's `folded`, the one
+/// length there is.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedCursor {
-    folded: u32,
     tail: Option<u32>,
     reserved: u32,
+    /// One past the highest slot written ([`Cursor::written`]).
+    written: u32,
+    /// One past the slots written without a gap ([`Cursor::readable`]).
+    readable: u32,
     spans: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SavedState {
     state_size: u64,
     buffer_page_tokens: u32,
@@ -173,12 +181,17 @@ struct SavedState {
     base: u32,
     frozen: u32,
     bytes: u64,
-    /// The windows' position, for a model whose state is one window list:
-    /// `buffer` is then its table, and `window_tokens` the window.
+    /// The model's windowed layers are ring + buffer (CONTRACT-BC 19, 21):
+    /// the record holds the rings and `buffer` is the window buffer's
+    /// unfolded slots, saved as a recurrent state's are; no window table.
     #[serde(default)]
-    window: Option<WindowState>,
+    window_state: bool,
+    /// A hybrid's window-buffer table (CONTRACT-BC 19, 21), beside the rs
+    /// list's `buffer`, its slots' bytes after the buffer's, and its base.
     #[serde(default)]
-    window_tokens: u32,
+    window_buffer: Vec<bool>,
+    #[serde(default)]
+    window_base: u32,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -422,14 +435,15 @@ async fn read_state(
 ) -> Result<(SavedState, Vec<u8>), HandleError> {
     let stores = store_registry::get(rs.model, rs.engine);
     let held: Vec<RsSlotId> = set.folded.iter().copied().collect();
-    if set.windows.len() > 1 {
-        return Err(HandleError::invalid(
-            "a state of several window lists is not saved to the host",
-        ));
-    }
-    // A window list's table rides as the buffer.
-    let table = set.windows.first().unwrap_or(&set.buffer);
-    let pages: Vec<RsSlotId> = table.iter().flatten().copied().collect();
+    // A ring + buffer set's buffer is its window buffer's unfolded slots,
+    // its rings in its record.
+    let table = &set.buffer;
+    let pages: Vec<RsSlotId> = table
+        .iter()
+        .chain(&set.wbuffer)
+        .flatten()
+        .copied()
+        .collect();
     if !stores.rs.lock().unwrap().is_shared() {
         return Err(HandleError::invalid(
             "a state outside a shared pool is not saved to the host",
@@ -445,8 +459,9 @@ async fn read_state(
             base: set.base,
             frozen: set.frozen,
             bytes: bytes.len() as u64,
-            window: set.window,
-            window_tokens: crate::model::model().rs_caps().window_tokens,
+            window_state: crate::model::model().rs_caps().window_state,
+            window_buffer: set.wbuffer.iter().map(Option::is_some).collect(),
+            window_base: set.wbase,
         },
         bytes,
     ))
@@ -467,6 +482,12 @@ async fn read_tier_state(
 ) -> Result<Vec<u8>, HandleError> {
     let (copies, refs, scratch) = {
         let mut store = stores.rs.lock().unwrap();
+        // Parked on the disk tier: read back with its process's restore.
+        if held.iter().chain(pages).any(|&id| store.on_disk(id)) {
+            return Err(HandleError::quota(
+                "this recurrent state is parked on disk; it is read once its process is restored",
+            ));
+        }
         let off = |ids: &[RsSlotId], store: &crate::store::rs::RsStore| {
             ids.iter().filter(|&&id| !store.on_host(id)).count()
         };
@@ -573,10 +594,26 @@ pub(super) async fn save(held: &Held, tenant: &str, name: &str) -> Result<Value,
     }
     let Parts { kv, rs, cursor } = held.parts();
     let stores = store_registry::get(kv.model, kv.engine);
+    // What is kept states the frozen length too, and a load takes it as
+    // exact: a bound is not kept, and is refused before any byte is read.
+    let exact = store_registry::with_kv_lock(&stores.kv, "snapshot-host", |store| {
+        store.folded_exact(kv.id)
+    })
+    .map_err(|error| failed("reading the frozen length", error))?;
+    if !exact {
+        return Err(failed(
+            "reading the frozen length",
+            crate::store::kv::page_table::UNPLACED,
+        ));
+    }
     let (pin, set) = held.pinned().await.map_err(HandleError::moving)?;
     let wrote = async {
         let rs_set = match rs {
             Some(rs) => {
+                // What is kept states the frozen length a fold the device
+                // counts leaves: it settles first, and one that failed
+                // refuses the save by name.
+                crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
                 let set = stores.rs.lock().unwrap().export(rs.id);
                 let set = set.map_err(|error| failed("reading recurrent state", error))?;
                 Some((rs, set))
@@ -798,7 +835,7 @@ async fn finish(
         Some((saved, bytes)) => (Some(saved), bytes),
         None => (None, Vec::new()),
     };
-    let tokens = u64::from(cursor.tail.unwrap_or(cursor.folded));
+    let tokens = cursor.tail.map_or(set.folded, u64::from);
     let bytes = spent.bytes + state_bytes.len() as u64;
     let manifest = Manifest {
         version: VERSION,
@@ -808,9 +845,10 @@ async fn finish(
         tokens,
         bytes,
         cursor: SavedCursor {
-            folded: cursor.folded,
             tail: cursor.tail,
             reserved: cursor.reserved,
+            written: cursor.written_end(),
+            readable: cursor.readable(),
             spans: cursor.spans.clone(),
         },
         page_len: set.page_len,
@@ -843,9 +881,29 @@ async fn finish(
 fn sync_disk(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        std::fs::File::open(entry.path())?.sync_all()?;
+        if entry.file_type()?.is_dir() {
+            sync_dir(&entry.path())?;
+            continue;
+        }
+        // Flushing a file asks for write access on Windows; unix takes either.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(entry.path())?
+            .sync_all()?;
     }
+    sync_dir(dir)
+}
+
+/// A directory's entries, synced: unix syncs the directory itself; Windows
+/// opens no directory as a file, and its file system journals the entries.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// A working set as `name` stands, off the device: the next process to bind
@@ -963,12 +1021,14 @@ pub(super) async fn load(holder: ProcessId, tenant: &str, name: &str) -> Result<
     .map_err(|error| failed("taking the pages in", error))?;
     let kv = KvWorkingSet::new(0, engine, id, stores.kv_page_size);
     let cursor = Cursor {
-        folded: cursor.folded,
-        folded_exact: true,
-        unsettled: 0,
         tail: cursor.tail,
         reserved: cursor.reserved,
+        written: cursor.written,
+        readable: cursor.readable,
+        untold: false,
+        staged: Vec::new(),
         spans: cursor.spans,
+        ..Cursor::default()
     };
     Ok(Held::park(holder, kv, rs, cursor))
 }
@@ -987,8 +1047,7 @@ async fn load_state(
     if !caps.has_state()
         || caps.state_size != geom.state_size
         || caps.buffer_page_size != geom.buffer_page_tokens
-        || caps.window_tokens != saved.window_tokens
-        || (caps.window_tokens > 0) != saved.window.is_some()
+        || caps.window_state != saved.window_state
     {
         return Err(HandleError::invalid(
             "its recurrent state is not this model's",
@@ -996,10 +1055,11 @@ async fn load_state(
     }
     let slots = usize::from(saved.folded);
     let pages = saved.buffer.iter().filter(|&&page| page).count();
+    let wpages = saved.window_buffer.iter().filter(|&&page| page).count();
     let rows = {
         let mut store = stores.rs.lock().unwrap();
         store
-            .take_host(slots, pages)
+            .take_host_of(slots, pages, wpages)
             .ok_or_else(|| HandleError::quota("the host has no room for this recurrent state"))?
     };
     let tier = {
@@ -1024,14 +1084,18 @@ async fn load_state(
         .iter()
         .map(|&page| page.then(|| buffered.next().expect("counted above")))
         .collect();
-    let windowed = saved.window.is_some();
+    let wbuffer: Vec<Option<RsSlotId>> = saved
+        .window_buffer
+        .iter()
+        .map(|&page| page.then(|| buffered.next().expect("counted above")))
+        .collect();
     let set = RsExport {
         folded: saved.folded.then(|| rows[0]),
-        buffer: if windowed { Vec::new() } else { table.clone() },
+        buffer: table,
         base: saved.base,
         frozen: saved.frozen,
-        windows: if windowed { vec![table] } else { Vec::new() },
-        window: saved.window,
+        wbuffer,
+        wbase: saved.window_base,
     };
     let id = store.import(geom, set);
     Ok(RsWorkingSet::new(0, engine, id, geom))
@@ -1151,6 +1215,61 @@ mod tests {
         assert!(shared.join("theirs").exists(), "a snapshot links it");
         assert!(shared.join("unnamed").exists(), "not this save's");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// What a save keeps states the frozen length: it waits for a fold the
+    /// device counts, and one that failed refuses it by name, before any
+    /// byte of the record is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_waits_for_a_fold_the_device_counts_and_is_refused_by_its_failure() {
+        use futures::FutureExt;
+
+        use crate::handle::held::tests::{DEVICE_LOST, folding};
+        configure(
+            std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
+            u64::MAX,
+        );
+        let (held, stores, rs) = folding();
+        let mut saving = Box::pin(save(&held, "tenant", "kept"));
+        assert!(
+            saving.as_mut().now_or_never().is_none(),
+            "the frozen length is behind the record until the fold settles"
+        );
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .end_device_fold(rs, None, Some(DEVICE_LOST));
+        let refused = saving.await.expect_err("its length is not known");
+        assert!(
+            refused.message.contains("reading recurrent state")
+                && refused.message.contains(DEVICE_LOST),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// What a save keeps states the cursor's frozen length, and a load
+    /// takes it as exact: a set whose length a fold left unknown is refused
+    /// by name, before any byte of it is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_save_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
+        use crate::handle::held::tests::unplaced;
+        configure(
+            std::env::temp_dir().join(format!("pie-snapshots-{}", Uuid::new_v4())),
+            u64::MAX,
+        );
+        let held = unplaced();
+        let refused = save(&held, "tenant", "bound").await;
+        let refused = refused.expect_err("a bound is not kept");
+        assert!(
+            refused.message.contains("reading the frozen length")
+                && refused
+                    .message
+                    .contains(crate::store::kv::page_table::UNPLACED),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]

@@ -516,6 +516,119 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
             },
             attn,
         ),
+        (
+            // A four-row candidates step whose vocabulary-wide reductions
+            // split across a lane's blocks (`splits_rows`): the split-row
+            // kernels' streams, meets and shared folds are emitted bytes.
+            "extended_split_reduce",
+            TraceContainer {
+                names: vec!["logits".into()],
+                ..staged(
+                    Stage::Epilogue,
+                    vec![
+                        chan(Shape::vector(4), Dtype::F32, HostRole::Writer, true),
+                        write(4),
+                    ],
+                    vec![
+                        Op::ChanTake(0),
+                        Op::Output {
+                            index: 0,
+                            lane: 0,
+                            shape: Shape::matrix(4, 65_536),
+                            dtype: Dtype::F32,
+                        },
+                        Op::ReduceMax(1),
+                        Op::Reshape {
+                            value: 2,
+                            shape: Shape::matrix(4, 1),
+                        },
+                        Op::Broadcast {
+                            value: 3,
+                            shape: Shape::matrix(4, 65_536),
+                        },
+                        Op::Sub(1, 4),
+                        Op::Exp(5),
+                        Op::ReduceSum(6),
+                        Op::Log(7),
+                        Op::Reshape {
+                            value: 8,
+                            shape: Shape::matrix(4, 1),
+                        },
+                        Op::Broadcast {
+                            value: 9,
+                            shape: Shape::matrix(4, 65_536),
+                        },
+                        Op::Sub(5, 10),
+                        Op::Reshape {
+                            value: 0,
+                            shape: Shape::matrix(4, 1),
+                        },
+                        Op::Broadcast {
+                            value: 12,
+                            shape: Shape::matrix(4, 65_536),
+                        },
+                        Op::Add(11, 13),
+                        Op::ReduceMax(14),
+                        Op::ChanPut { chan: 1, value: 15 },
+                    ],
+                )
+            },
+            Served::of(65_536),
+        ),
+        (
+            // A bare argmax and a log-softmax's argmax over seventeen
+            // 65,536-wide rows, in one region whose reductions split across
+            // a lane's blocks (`splits_rows`): more rows than the lane
+            // arena's candidate banks hold (`LANE_SAMPLER_BLOCKS`), so a
+            // launch puts each row on one block. The argmax's in-place store
+            // there and its banked candidates otherwise are emitted bytes.
+            "extended_split_argmax",
+            TraceContainer {
+                names: vec!["logits".into()],
+                ..staged(
+                    Stage::Epilogue,
+                    vec![
+                        chan(Shape::vector(17), Dtype::I32, HostRole::Reader, false),
+                        chan(Shape::vector(17), Dtype::I32, HostRole::Reader, false),
+                    ],
+                    vec![
+                        Op::Output {
+                            index: 0,
+                            lane: 0,
+                            shape: Shape::matrix(17, 65_536),
+                            dtype: Dtype::F32,
+                        },
+                        Op::ReduceArgmax(0),
+                        Op::ReduceMax(0),
+                        Op::Reshape {
+                            value: 2,
+                            shape: Shape::matrix(17, 1),
+                        },
+                        Op::Broadcast {
+                            value: 3,
+                            shape: Shape::matrix(17, 65_536),
+                        },
+                        Op::Sub(0, 4),
+                        Op::Exp(5),
+                        Op::ReduceSum(6),
+                        Op::Log(7),
+                        Op::Reshape {
+                            value: 8,
+                            shape: Shape::matrix(17, 1),
+                        },
+                        Op::Broadcast {
+                            value: 9,
+                            shape: Shape::matrix(17, 65_536),
+                        },
+                        Op::Sub(5, 10),
+                        Op::ReduceArgmax(11),
+                        Op::ChanPut { chan: 0, value: 1 },
+                        Op::ChanPut { chan: 1, value: 12 },
+                    ],
+                )
+            },
+            Served::of(65_536),
+        ),
     ]
 }
 

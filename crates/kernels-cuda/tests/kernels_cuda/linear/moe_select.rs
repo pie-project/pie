@@ -9,7 +9,7 @@ use crate::common::{SM100, TC5, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, E4m3, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{AlphaFrom, Bank, Format, Source, read_back, select};
 use kernels_cuda::linear::gemm_sm100::{Elem, Glu, supported};
-use kernels_cuda::linear::moe::{self, ExpertTable, GluBank, GroupSeat};
+use kernels_cuda::linear::moe::{self, ExpertTable, GluBank, GroupSeat, Leg};
 use kernels_cuda::tuning::Tuning;
 
 const RES: ExpertTable = ExpertTable::RESIDENT;
@@ -40,7 +40,8 @@ fn bank(codes: u64, atoms: u64, [e, n, k]: [usize; 3], alpha: Option<[u64; 3]>) 
 /// One case: the arm, its tuning, `[experts, tokens, top, n, k]`, whether
 /// a route reads its token's row, the GLU, and flags: 1 a live window, 2
 /// scales past f16's range, 4 activations past it, 8 the route order kept
-/// for a select after.
+/// for a select after; a bf16 select's leg 32 the GEMV, 64 the grouped
+/// mma.sync select, 128 the tiled GEMM (none: the leg it prices cheapest).
 type Case = (K, Tuning, [usize; 5], bool, Option<Glu>, u8);
 
 /// Whether the W4A8 select's block-scaled mma.sync is this card's.
@@ -108,7 +109,8 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
     let (cw, sw) = (rows * k / 2, rows * k / gran);
     let (mx, sc) = (t(c, ex, cw, U8), t(sc, ex, sw, U8));
     let (nvc, nvt) = (t(c, ex, cw, Nvfp4), t(tsv, ex, rows * 4, U8));
-    let ctx = b.ctx().with_tuning(tuning);
+    let roof = crate::common::roof();
+    let ctx = b.ctx().with_tuning(Tuning { roof, ..tuning });
     let r = t(b.up(&routes), tokens, top, I32);
     let mut y = t(b.up(&vec![0x7f7fu16; count * rows]), count, n, Bf16);
     let back = b.zeros(count * k * 2);
@@ -126,28 +128,52 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
                 K::Nv => GluBank::Nvfp4 { codes: nvc, scales: sc, tensor_scales: nvt },
                 _ => GluBank::Mxfp4 { codes: mx, scales: sc, bias },
             };
-            moe::select_glu(&ctx, x, bank, r, &mut y, g, RES).map(took)
+            b.laid(&ctx, |ctx| moe::select_glu(ctx, x, bank, r, &mut y, g, RES))
+                .map(took)
         }
-        (K::Bf16, _) => moe::matmul_select(&ctx, x, t(c, ex, n * k, Bf16), r, &mut y, RES),
+        (K::Bf16, _) => b.laid(&ctx, |ctx| {
+            let bank = t(c, ex, n * k, Bf16);
+            let leg = [(32, Leg::Gemv), (64, Leg::Mma), (128, Leg::Tiled)]
+                .into_iter()
+                .find(|&(bit, _)| flags & bit != 0);
+            match leg {
+                Some((_, leg)) => moe::matmul_select_on(ctx, leg, x, bank, r, &mut y, RES),
+                None => moe::matmul_select(ctx, x, bank, r, &mut y, RES),
+            }
+        }),
         (K::Affine, _) => {
             let (fs, zs) = (t(fz.0, ex, n * k / 32, U8), t(fz.1, ex, n * k / 32, U8));
-            moe::matmul_select_quant(&ctx, x, mx, fs, Some(zs), r, &mut y, SEAT, RES)
+            b.laid(&ctx, |ctx| {
+                moe::matmul_select_quant(ctx, x, mx, fs, Some(zs), r, &mut y, SEAT, RES)
+            })
         }
         (K::Mx, _) if tuning.mxfp4_w4a8_from > 0 => {
             let gran = pick(flags & 16 != 0, 128, 32);
-            moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, gran, RES)
-                .map(|took| assert_eq!(took, w4a8_here(), "the arm takes the fire"))
+            b.laid(&ctx, |ctx| {
+                moe::select_mxfp4_w4a8(ctx, x, mx, sc, r, &mut y, gran, RES)
+            })
+            .map(took)
         }
-        (K::Mx, _) => moe::matmul_select_quant(&ctx, x, mx, sc, None, r, &mut y, SEAT, RES),
+        (K::Mx, _) => b.laid(&ctx, |ctx| {
+            moe::matmul_select_quant(ctx, x, mx, sc, None, r, &mut y, SEAT, RES)
+        }),
         (K::MxBias, _) => {
             let bias = t(bias, ex, n, Bf16);
-            moe::matmul_select_bias(&ctx, x, mx, sc, bias, r, &mut y, SEAT, RES)
+            b.laid(&ctx, |ctx| {
+                moe::matmul_select_bias(ctx, x, mx, sc, bias, r, &mut y, SEAT, RES)
+            })
         }
-        (K::Nv, _) => moe::select_nvfp4(&ctx, x, nvc, sc, nvt, r, &mut y, SEAT, RES),
+        (K::Nv, _) => b.laid(&ctx, |ctx| {
+            moe::select_nvfp4(ctx, x, nvc, sc, nvt, r, &mut y, SEAT, RES)
+        }),
         (K::Atoms, _) => {
             let xb = read_back(&ctx, "test", fmt, Source::rows(x, None), back).expect("reads");
             a = b.read(back, rows_x * k);
-            let mut go = || moe::select_mxfp4_atoms(&ctx, xb, mx, atoms, r, &mut y, RES);
+            let mut go = || {
+                b.laid(&ctx, |ctx| {
+                    moe::select_mxfp4_atoms(ctx, xb, mx, atoms, r, &mut y, RES)
+                })
+            };
             let keep = flags & 8 != 0;
             (if keep { moe::keeping_order(go) } else { go() }).map(took)
         }
@@ -155,7 +181,9 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
             let globals = nv.then(|| t(inputs, ex, 1, F32));
             let alpha = nv.then(|| [b.zeros(ex * 4), inputs, tsv]);
             let bank = bank(c, atoms, [ex, n, k], alpha);
-            let fired = select(&ctx, "test", fmt, x, r, globals, bank, &mut y);
+            let fired = b.laid(&ctx, |ctx| {
+                select(ctx, "test", fmt, x, r, globals, bank, &mut y)
+            });
             ctx.disarm_stage();
             // Each route's rows as the select reads them back.
             let (rows, div) = (live as u32, div as u32);
@@ -199,7 +227,7 @@ fn routed((kind, tuning, [ex, tokens, top, n, k], by_token, f, flags): Case) {
 fn the_routed_selects_answer_the_routed_dot() {
     let d = Tuning::DEFAULT;
     #[rustfmt::skip]
-    let (gemv, fp32) = (Tuning { moe_grouped: false, ..d }, Tuning { mxfp4_wmma: false, ..d });
+    let fp32 = Tuning { mxfp4_wmma: false, ..d };
     #[rustfmt::skip]
     let mma = Tuning { mxfp4_mma_until: 65_536, mxfp4_mma_from: 1, ..d };
     #[rustfmt::skip]
@@ -212,8 +240,6 @@ fn the_routed_selects_answer_the_routed_dot() {
         mxfp4_select_lean: true,
         ..d
     };
-    #[rustfmt::skip]
-    let bf16mma = Tuning { moe_grouped: false, bf16_mma_from: 1, bf16_mma_until: 65_536, ..d };
     #[rustfmt::skip]
     let cvt = Tuning { mxfp4_cvt: true, mxfp4_a8_until: 65_536, mxfp4_cvt_ksplit_until: 6, ..mma };
     #[rustfmt::skip]
@@ -228,23 +254,30 @@ fn the_routed_selects_answer_the_routed_dot() {
     #[rustfmt::skip]
     let mut cases: Vec<Case> = vec![
         // bf16: the GEMV by token and by route (past grid.y's 65535 routes),
-        // the grouped cuBLAS leg, tcgen05 and its GLU.
+        // the leg each prices cheapest, tcgen05 and its GLU.
+        (K::Bf16, d, [8, 1, 2, 96, 64], t, None, 32),
+        (K::Bf16, d, [8, 8192, 8, 32, 32], f, None, 32),
         (K::Bf16, d, [8, 1, 2, 96, 64], t, None, 0),
-        (K::Bf16, gemv, [8, 8192, 8, 32, 32], f, None, 0),
         (K::Bf16, d, [8, 48, 2, 96, 64], f, None, 0),
         (K::Bf16, TC5, [16, 70, 4, 192, 256], t, None, 0),
         (K::Bf16, TC5, [16, 48, 4, 128, 256], t, sw, 0),
         // Bf16 on the graph-safe grouped mma.sync: eight, four and one 8-route
         // blocks, by token and by route, a partial 128-row tile.
-        (K::Bf16, bf16mma, [8, 64, 8, 128, 256], t, None, 0),
-        (K::Bf16, bf16mma, [8, 64, 8, 128, 256], f, None, 0),
-        (K::Bf16, bf16mma, [16, 40, 8, 256, 128], f, None, 0),
-        (K::Bf16, bf16mma, [8, 12, 4, 96, 512], t, None, 0),
-        // Few routes an expert (not the tiled GEMM's): Hopper's wgmma select
-        // at its 16- and 32-route slices.
-        (K::Bf16, bf16mma, [64, 16, 4, 256, 512], t, None, 0),
-        (K::Bf16, bf16mma, [16, 40, 4, 128, 256], f, None, 0),
-        (K::Bf16, bf16mma, [32, 16, 4, 256, 192], t, None, 0),
+        (K::Bf16, d, [8, 64, 8, 128, 256], t, None, 64),
+        (K::Bf16, d, [8, 64, 8, 128, 256], f, None, 64),
+        (K::Bf16, d, [16, 40, 8, 256, 128], f, None, 64),
+        (K::Bf16, d, [8, 12, 4, 96, 512], t, None, 64),
+        // Few routes an expert: Hopper's wgmma select at its 16- and 32-route
+        // slices.
+        (K::Bf16, d, [64, 16, 4, 256, 512], t, None, 64),
+        (K::Bf16, d, [16, 40, 4, 128, 256], f, None, 64),
+        (K::Bf16, d, [32, 16, 4, 256, 192], t, None, 64),
+        // The tiled GEMM at a few routes an expert, at 64 by token and by
+        // route, and at its wide tile's 128.
+        (K::Bf16, d, [8, 12, 4, 96, 512], t, None, 128),
+        (K::Bf16, d, [8, 128, 4, 128, 256], t, None, 128),
+        (K::Bf16, d, [8, 128, 4, 128, 256], f, None, 128),
+        (K::Bf16, d, [4, 256, 2, 256, 256], t, None, 128),
         // Affine u4: per route, grouped, tcgen05.
         (K::Affine, d, [16, 1, 8, 1408, 2816], t, None, 0),
         (K::Affine, d, [16, 3, 8, 704, 704], f, None, 0),
@@ -285,7 +318,7 @@ fn the_routed_selects_answer_the_routed_dot() {
         (K::Mx, mma, [8, 48, 4, 384, 1024], t, None, 0),
         // Hopper's wide slice (128 routes, two warpgroups) on gpt-oss's K.
         (K::MxBias, mma, [8, 400, 4, 192, 2880], t, alpha, 8),
-        // W4A8 on sm_120a's block-scaled mma.sync (elsewhere the bf16 arms):
+        // W4A8 on sm_120a's block-scaled mma.sync (elsewhere no arm):
         // by route over a partial 256-row tile, its GLU under scales past
         // f16's range, V4-Flash's leg, a few routes under a live window.
         (K::Mx, w4a8, [8, 400, 4, 320, 1024], f, None, 0),
@@ -344,7 +377,9 @@ fn the_routed_selects_answer_the_routed_dot() {
                 (kind, d, [8, 70, 3, 256, 512], f, None, 0), (kind, d, [8, 5, 3, 256, 512], f, None, 1)]);
         }
     }
-    // The tcgen05 arms are Blackwell's; elsewhere their cases have no arm.
+    // The tcgen05 arms are Blackwell's and W4A8's block-scaled mma.sync
+    // sm_120a's; elsewhere their cases have no arm.
+    cases.retain(|case| w4a8_here() || case.1.mxfp4_w4a8_from == 0);
     cases.retain(|case| supported() || !(case.1 == TC5 || case.1 == SM100));
     // Each tcgen05 case again with a swapped launch's units dealt evenly.
     let even = cases
@@ -552,9 +587,11 @@ fn the_w8a16_selects_answer_the_routed_dot() {
         let mut y = b.out(count, n);
         let ctx = b.ctx();
         let x = t(x, rows_x, k, Bf16);
-        select_fp8_w8a16(
-            &ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None, RES,
-        )
+        b.laid(&ctx, |ctx| {
+            select_fp8_w8a16(
+                ctx, "test", x, codes, atoms, ex as u32, 128, r, &mut y, None, RES,
+            )
+        })
         .expect("the W8A16 select fires");
         let w = |r: usize, c: usize, i: usize| f64::from(s.value(routes[r] as usize * n + c, k, i));
         let want = dot([count, n, k], |r, i| a[r / div * k + i], w);
@@ -583,7 +620,7 @@ fn the_bf16_prefill_selects_answer_the_routed_dot() {
         let (bank, wv) = b.bf16(ex * rows * k);
         let mut y = b.out(count, n);
         let ctx = b.ctx();
-        let took = moe::select_bf16_held(
+        let took = moe::select_bf16_tiled(
             &ctx,
             "test",
             t(x, tokens, k, Bf16),
@@ -653,7 +690,11 @@ fn w4a8_select_timing() {
         let r = t(b.up(&routes), tokens, top, I32);
         let mut y = b.out(tokens * top, n);
         for _ in 0..5 {
-            assert!(moe::select_mxfp4_w4a8(&ctx, x, mx, sc, r, &mut y, 128, RES).expect("fires"));
+            // Its scratch sized by a walk of the fire, as every select here.
+            let fired = b.laid(&ctx, |ctx| {
+                moe::select_mxfp4_w4a8(ctx, x, mx, sc, r, &mut y, 128, RES)
+            });
+            assert!(fired.expect("fires"));
         }
         b.sync();
     }

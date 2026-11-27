@@ -40,10 +40,217 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         let _ = prev;
+        // A step refused here fires nothing: what its lanes' device-counted
+        // folds left ahead goes back to where the step found it.
+        let ahead = self.rs_ahead.clone();
+        // Nor does it carry any set's written end.
+        let written = self.written.clone();
+        let built = kernels_cuda::tally::counts().built;
+        let prepared = self.prepare_step(step);
+        self.count_built_in_fire(built);
+        if prepared.is_err() {
+            self.rs_ahead = ahead;
+            self.written = written;
+        }
+        prepared
+    }
+
+    fn enqueue<'a>(&mut self, prepared: Prepared<'a>) -> Result<Enqueued<'a>>
+    where
+        Self: 'a,
+    {
+        let mut p = prepared;
+        let slot = p
+            .slot
+            .take()
+            .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
+        let built = kernels_cuda::tally::counts().built;
+        let enqueued = self.enqueue_on(&mut p, &slot);
+        self.count_built_in_fire(built);
+        match enqueued {
+            Ok((launches, readback)) => {
+                p.slot = Some(slot);
+                Ok(Enqueued {
+                    prepared: p,
+                    launches,
+                    readback,
+                })
+            }
+            Err(fault) => {
+                let _ = self.device.synchronize();
+                drop(slot);
+                Err(fault)
+            }
+        }
+    }
+
+    fn settle<'a>(&mut self, enqueued: Enqueued<'a>) -> Result<Settled>
+    where
+        Self: 'a,
+    {
+        self.settle_step(enqueued, None)
+    }
+}
+
+impl Shell {
+    /// Counts what this thread built since `before` (the kernels' tally) as
+    /// built on a serving fire's path: an instantiation no walk of the load
+    /// resolved (`engine::live::Tally::BuiltInFire`). An arming fire, and
+    /// any before the load sealed its bodies, builds as the load does.
+    pub(super) fn count_built_in_fire(&mut self, before: u64) {
+        if self.arming || !self.cache.bodies_sealed() {
+            return;
+        }
+        let built = kernels_cuda::tally::counts().built - before;
+        if built == 0 {
+            return;
+        }
+        self.live.tally(engine::live::Tally::BuiltInFire, built);
+        let total = self.live.tallied(engine::live::Tally::BuiltInFire);
+        if total.is_power_of_two() || built >= total {
+            tracing::warn!(
+                "a serving fire built {built} kernel instantiation(s) no \
+                 walk of the load resolved; {total} so far (Tally::BuiltInFire). Every one a \
+                 fire can reach is built before ready"
+            );
+        }
+    }
+}
+
+fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
+    Ok(match len {
+        FoldLen::Host(n) => n,
+        FoldLen::Device => {
+            let cells = port.ok_or_else(|| {
+                Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {lane} states a device-resident fold length, and the program \
+                         attached to it resolved no `fold` port"
+                    ),
+                )
+            })?;
+            fold_cell(cells, lane).ok_or_else(|| {
+                Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {lane} states a device-resident fold length on a `fold` port \
+                         whose cell carries {} entries",
+                        cells.len()
+                    ),
+                )
+            })?
+        }
+    })
+}
+
+/// Lane `lane`'s fold in a `fold` port's cell: a cell of one entry states
+/// every lane's fold, a longer one a fold a lane, and a lane past it none.
+fn fold_cell(cells: &[u32], lane: usize) -> Option<u32> {
+    match cells {
+        [every] => Some(*every),
+        cells => cells.get(lane).copied(),
+    }
+}
+
+/// The slots the state in record `slot` holds as a lane's fire finds it.
+/// A buffered lane states `folded`, which a device-counted fold not yet
+/// settled has left behind what `ahead` holds; a lane that starts fresh, or
+/// folds its rows itself (`None`: a working set new to the record starts
+/// with such a fire), leaves nothing ahead.
+fn fold_held(
+    ahead: &mut std::collections::HashMap<u32, u32>,
+    slot: u32,
+    folded: Option<u32>,
+    fresh: bool,
+) -> u32 {
+    match (ahead.get(&slot), folded) {
+        (Some(&at), Some(folded)) if at > folded && !fresh => at,
+        (_, folded) => {
+            ahead.remove(&slot);
+            folded.unwrap_or(0)
+        }
+    }
+}
+
+fn narrow(n: u64) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// What a class of a body's ladder reads out at its rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyReads {
+    /// Its lanes' last rows, through the readout plane: one a lane.
+    Last,
+    /// A drafter's verify (a class no plain request lands): a row it checks
+    /// a lane, up to the readouts a lane takes, through the readout plane.
+    Verify,
+    /// Every row of its rung, off a tokens-shaped plane.
+    Rows,
+}
+
+/// The readout rows a body carries, and what makes them up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BodyReadouts {
+    last: u32,
+    verified: u32,
+    every: u32,
+    ceiling: u32,
+}
+
+/// The readout rows a body of `reads` (each class's reading at its rung)
+/// carries. The readout plane's rows (last rows and verified rows) are the
+/// lanes', which every class of the fire shares: summed over the classes,
+/// they are capped once at `plane`, the rows the arena lays the plane for,
+/// so the carve never passes the slot. Rows read off a tokens-shaped plane
+/// add on; no readout passes the fire's `bucket`.
+fn body_readouts(
+    reads: &[(BodyReads, u32)],
+    lane_ceiling: u32,
+    max_lanes: u32,
+    per_lane: u32,
+    plane: u32,
+    bucket: u32,
+) -> BodyReadouts {
+    let (mut last, mut verified, mut every) = (0u32, 0u32, 0u32);
+    for &(reads, rung) in reads {
+        match reads {
+            BodyReads::Last => last += rung.min(lane_ceiling),
+            BodyReads::Verify => verified += rung.min(lane_ceiling.saturating_mul(per_lane)),
+            BodyReads::Rows => every += rung,
+        }
+    }
+    let readout = (last.min(max_lanes) + verified).min(plane);
+    BodyReadouts {
+        last,
+        verified,
+        every,
+        ceiling: (readout + every).min(bucket),
+    }
+}
+
+/// The rows a fire's kernels write through its readout plane: a readout as
+/// tall as the fire is launched at the fire's bucket, so the plane must
+/// hold the bucket, not only the rows read out.
+/// A fire that reads nothing out (an idle expert-parallel rank's) writes
+/// nothing through it.
+fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
+    if readouts == 0 {
+        return 0;
+    }
+    let pad = kernels_cuda::Pad { rows, bucket };
+    u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
+}
+
+impl Shell {
+    /// Prepares a step: its lanes' pages, records and tables, ahead of its
+    /// fire.
+    fn prepare_step<'a>(&mut self, step: StepView<'a>) -> Result<Prepared<'a>> {
         let StepView {
             lanes,
             attachments,
             media,
+            shape,
             ..
         } = step;
         let arming = self.arming;
@@ -153,6 +360,14 @@ impl FrameShell for Shell {
         let mut mask_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         // The lanes whose positions the program computes on the device.
         let mut positions_on_device = vec![false; lanes.len()];
+        // A decode envelope's beam groups (`serve::pages`): each one's lanes,
+        // its parents cell and its state; and each lane's group.
+        let mut page_groups: Vec<super::pages::PageGroup> = Vec::new();
+        let mut group_of: Vec<Option<usize>> = vec![None; lanes.len()];
+        // Each beam's entry of the fire's beam rows (`channel::RsRows`):
+        // its group's first, then the group's beams in order.
+        let mut beam_row: Vec<u32> = vec![0; lanes.len()];
+        let mut beam_rows = 0u32;
         for attached in attachments {
             let first = attached.lane as usize;
             let src = self.programs.token_device_source(attached.instance);
@@ -221,6 +436,45 @@ impl FrameShell for Shell {
                     at += seated.lane.tokens.len() as u32;
                 }
             }
+            if envelope_class
+                && let Some((parents, native)) =
+                    self.programs.parents_device_source(attached.instance)?
+            {
+                let Some((state, layout)) = self.programs.beam_state(attached.instance) else {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} states parents and holds no beam state",
+                            attached.instance
+                        ),
+                    ));
+                };
+                if native != layout.lanes * 4 || spanned.len() as u32 != layout.lanes {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "instance {} states parents for {} beam(s) in a {native}-byte cell \
+                             and runs {} lane(s); every beam runs every fire",
+                            attached.instance,
+                            layout.lanes,
+                            spanned.len()
+                        ),
+                    ));
+                }
+                for lane in 0..spanned.len() {
+                    group_of[first + lane] = Some(page_groups.len());
+                    beam_row[first + lane] = beam_rows + lane as u32;
+                }
+                page_groups.push(super::pages::PageGroup {
+                    instance: attached.instance,
+                    parents,
+                    state,
+                    layout,
+                    rows_at: beam_rows,
+                    lanes: Vec::new(),
+                });
+                beam_rows += spanned.len() as u32;
+            }
             if can_runahead && envelope_class {
                 if first < lanes.len() {
                     fold_at[first] = self
@@ -240,6 +494,16 @@ impl FrameShell for Shell {
                 .map(|seated| seated.lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            // The ports state this attachment's lanes alone: one describing
+            // more would set the next lanes' positions and slots.
+            let owned = attached.lanes.max(1);
+            if carried > owned as usize {
+                return Err(Fault::Overreach {
+                    instance: attached.instance,
+                    lanes: attached.lane..attached.lane.saturating_add(owned),
+                    carried,
+                });
+            }
             if first + carried > lanes.len() {
                 return Err(Fault::program(
                     "serve::prepare",
@@ -265,9 +529,6 @@ impl FrameShell for Shell {
                     ));
                 }
                 envelope_of[first + lane] = Some((held, lane));
-            }
-            if first < lanes.len() {
-                token_src_of[first] = src;
             }
             resolved.push(envelope);
         }
@@ -321,6 +582,15 @@ impl FrameShell for Shell {
                             .map(|&page| window.get(page as usize).copied().unwrap_or(0))
                             .collect(),
                     );
+                }
+                // The table is the working set's whole, to read through: a
+                // row lands only in the slots the lane may write.
+                let writable = lanes[source].folded..lanes[source].write_end;
+                if let Some(why) = engine::fire::misplaced_write(writable, slots) {
+                    return Err(Fault::KvWrite {
+                        lane: source as u32,
+                        why,
+                    });
                 }
                 device_writes[source] = Some((
                     slots
@@ -463,16 +733,20 @@ impl FrameShell for Shell {
                 ),
             })
             .collect();
-        // A buffering fire, or one of a drafter's class, pads to a bucket the
-        // lattice records it at (`Shell::rs_rungs`).
-        let buffering = lanes.iter().any(|seated| {
-            matches!(seated.rs, RsVerb::Buffer { .. }) || self.drafts_only(seated.lane.word)
-        });
-        let at = self.forced_bucket.take().or_else(|| {
-            let rows: u32 = lane_rows.iter().sum();
-            buffering
-                .then(|| self.rs_rungs().into_iter().find(|&bucket| bucket >= rows))
-                .flatten()
+        // A buffering step with a prompt's rows composes at its stated rung,
+        // where the walk recorded it: the stamped shape's,
+        // else the rung its lanes' rows make (`Shell::buffered_rung`).
+        let at = self.forced_bucket.take().or_else(|| match shape {
+            Some(shape) => self.stamped_bucket(shape),
+            None => {
+                let buffers = lanes
+                    .iter()
+                    .any(|seated| matches!(seated.rs, RsVerb::Buffer { .. }));
+                let prompts = lane_rows.iter().any(|&rows| rows > 1);
+                (buffers && prompts)
+                    .then(|| self.buffered_rung(lane_rows.iter().sum()))
+                    .flatten()
+            }
         });
         let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -711,7 +985,7 @@ impl FrameShell for Shell {
                 Some(store) if store.seat().token_patch.is_some() => crate::voxels::Tables {
                     grid: vec![0; 4],
                     token_grid: vec![0; 4],
-                    slots: vec![0],
+                    clip_lanes: vec![0],
                     ..crate::voxels::Tables::default()
                 },
                 _ => crate::voxels::Tables::default(),
@@ -730,16 +1004,15 @@ impl FrameShell for Shell {
                            runs over the whole voxel rectangle (M0: one voxel class per fire)",
                 });
             }
-            // A clip's conv caches are State rows: the lane's recurrent-state row.
-            let slot_of: Vec<u32> = lanes
-                .iter()
-                .map(|seated| seated.rs_slot.unwrap_or(seated.lane.slot))
-                .collect();
+            // A clip's conv caches are State rows, read as every recurrent
+            // row is: through the fire's lane table, which names each
+            // lane's record. A clip names its lane.
+            let lane_of: Vec<u32> = (0..lanes.len() as u32).collect();
             crate::voxels::Tables::of(
                 &store.seat(),
                 composition.lanes(),
                 &clips_of,
-                &slot_of,
+                &lane_of,
                 fed_width,
             )?
         };
@@ -808,9 +1081,11 @@ impl FrameShell for Shell {
         let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut window_ids: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         // Each lane's slot refs of the window lists past the first.
-        let mut more_windows: Vec<&[&[u32]]> = Vec::with_capacity(lanes.len());
         let mut kv_less_seats: Vec<bool> = Vec::with_capacity(lanes.len());
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
+        // Whether some lane's class reads the fire's masks: then every lane
+        // states its entry, a mask or none.
+        let mut reads_masks = false;
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut token_injects: Vec<crate::inputs::TokenInject> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -821,8 +1096,27 @@ impl FrameShell for Shell {
         let mut rs_pages: Vec<u32> = Vec::new();
         let mut rs_reads: Vec<Vec<std::ops::Range<u32>>> = vec![Vec::new(); lanes.len()];
         let mut rs_folded: Vec<Option<u32>> = vec![None; lanes.len()];
+        // Each beam group's fold: the slot its
+        // set's state is folded to before any of its lanes reads it, as its
+        // first lane states it; and the folds the fire runs, a representative
+        // fire lane and its rows (buffer tokens) each.
+        let mut beam_to: Vec<Option<u32>> = vec![None; page_groups.len()];
+        let mut group_folds: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
+        // Per lane, one past the last slot its rows land at, where a port
+        // says where they land: what its report tells the runtime.
+        let mut rs_ends: Vec<Option<u32>> = vec![None; lanes.len()];
         let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut rs_order: Vec<u32> = vec![0; lanes.len()];
+        // Each lane's rs buffer's first slot and its pages, where it buffers
+        // rows (a hybrid beam's page table starts there, and its rows lie on
+        // any of the set's pages, `serve::pages`).
+        let mut rs_bases: Vec<Option<(u32, &[u32])>> = vec![None; lanes.len()];
+        // Each seat's lane, and where its rings stand and how far its fire
+        // folds them (`super::ring`), a seat each.
+        let mut seat_sources: Vec<usize> = Vec::with_capacity(lanes.len());
+        let mut window_folds: Vec<Option<(u32, u32)>> = Vec::with_capacity(lanes.len());
+        let mut seat_masked: Vec<bool> = Vec::with_capacity(lanes.len());
+        let ringed_load = self.pools.ring().is_some();
         let mut snapshots = crate::store::rs::SnapTable {
             indptr: vec![0],
             ..Default::default()
@@ -844,6 +1138,8 @@ impl FrameShell for Shell {
             .collect();
         // `(the lane's index in masks, its row of the device cell, keys)`.
         let mut pending_mask_injects: Vec<(usize, u64, u32)> = Vec::new();
+        // What each lane writes and reads of its set (`engine::extent`).
+        let mut extents = engine::extent::FireExtents::default();
         for row in composition.lanes() {
             let source = row.source as usize;
             let seated = &lanes[source];
@@ -904,6 +1200,15 @@ impl FrameShell for Shell {
             if begins {
                 fresh.push(seated.rs_slot.unwrap_or(lane.slot));
             }
+            if let Some(group) = group_of[source] {
+                page_groups[group].lanes.push(super::pages::GroupLane {
+                    source,
+                    seat: seats.len(),
+                    row_offset: row.row_offset,
+                    have,
+                    rows: row.rows,
+                });
+            }
             seats.push(Seat {
                 slot: lane.slot,
                 have,
@@ -919,7 +1224,6 @@ impl FrameShell for Shell {
                 (Some(_), None) => std::borrow::Cow::Borrowed(&[][..]),
                 (None, None) => std::borrow::Cow::Borrowed(seated.window),
             });
-            more_windows.push(seated.more_windows);
             // A kv-less lane's mask goes to the group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
                 None
@@ -966,22 +1270,39 @@ impl FrameShell for Shell {
                         ),
                     ));
                 }
-                pending_mask_injects.push((masks.len(), src, have.saturating_add(row.rows)));
+                // The guest's cell holds the lane's buffer, then its row:
+                // columns from its committed boundary on.
+                let extent = have
+                    .saturating_sub(seated.folded.min(have))
+                    .saturating_add(row.rows);
+                pending_mask_injects.push((masks.len(), src, extent));
             }
             let runs_masked_arm = self.masked.contains(row.class as usize);
-            if masking.is_some() && self.masked.is_empty() {
+            reads_masks |= self.mask_read.contains(row.class as usize);
+            let reads_group_mask = self.group_masked.contains(row.class as usize);
+            if masking.is_some() && self.masked.is_empty() && self.group_masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if masking.is_some() != runs_masked_arm {
-                return Err(Fault::MaskWord {
+            // The mask is per-lane data: a lane stating none reads every key
+            // in a masked arm too. One stated where no arm applies it is
+            // refused; a group's mask is the lane's to state on any class
+            // that reads one.
+            if masking.is_some() && !runs_masked_arm && !reads_group_mask {
+                return Err(Fault::MaskUnread {
                     lane: row.source,
                     word: lane.word,
-                    runs_masked_arm,
                 });
             }
+            // Whether the lane tells its rows apart by a mask of its own,
+            // however it came (stated, carried, or resolved on the device),
+            // or a group's (`super::ring::shared_pool`).
+            seat_masked.push(masking.is_some() || seated.group.is_some());
             masks.push(crate::mask::LaneMask {
-                mask: masking,
+                // A mask a group's rows read only is staged with the group
+                // masks (`group_masks`), not over the lane's keys.
+                mask: masking.filter(|_| runs_masked_arm),
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -998,7 +1319,10 @@ impl FrameShell for Shell {
                     ),
                 ));
             }
-            for snap in seated.rs_snapshots {
+            // A load of rings alone lands them itself (`super::ring`): no
+            // kernel reads the table, and its length bounds no fire.
+            let in_table = self.lands_snapshots();
+            for snap in seated.rs_snapshots.iter().filter(|_| in_table) {
                 snapshots.rows.push(narrow(u64::from(snap.row)));
                 snapshots.slots.push(narrow(u64::from(snap.slot)));
             }
@@ -1006,6 +1330,30 @@ impl FrameShell for Shell {
             let fire_lane = rs_moves.len();
             rs_order[row.source as usize] = fire_lane as u32;
             let port = envelope_of[source].and_then(|(held, _)| resolved[held].fold.as_deref());
+            // The lane's rings: folded where its runtime states, or where a
+            // fold counted on the device not yet settled left them, and
+            // advanced by the fold its fire states.
+            seat_sources.push(source);
+            window_folds.push(match &seated.window_fold {
+                Some(stated) if ringed_load => {
+                    let slot = seated.rs_slot.unwrap_or(lane.slot);
+                    let held = fold_held(
+                        &mut self.rs_ahead,
+                        slot,
+                        Some(seated.folded),
+                        seated.rs_reset == RsReset::Fresh,
+                    );
+                    let cell = envelope_of[source].map_or(rs_moves.len(), |(_, at)| at);
+                    let to = held
+                        .saturating_add(stated_fold(stated.fold, cell, port)?)
+                        .min(have + row.rows);
+                    if stated.fold == FoldLen::Device && matches!(seated.rs, RsVerb::Fold) {
+                        self.rs_ahead.insert(slot, to);
+                    }
+                    Some((held, to - held))
+                }
+                _ => None,
+            });
             let (verb, folded) = match &seated.rs {
                 RsVerb::Fold => {
                     // A lane that folds its rows itself leaves nothing ahead:
@@ -1019,8 +1367,10 @@ impl FrameShell for Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     rs_pages.extend_from_slice(pages);
+                    rs_bases[row.source as usize] = Some((*base, pages.as_slice()));
                     // A device-counted fold not yet settled left the state
                     // past the runtime's length.
                     let slot = seated.rs_slot.unwrap_or(lane.slot);
@@ -1048,16 +1398,47 @@ impl FrameShell for Shell {
                             ),
                         ));
                     }
-                    let reads = engine::fire::buffered_reads(masking, *folded, first, row.rows)
+                    let reads = engine::fire::buffered_reads(masking, *folded, first, *lineage)
                         .map_err(|error| {
                             Fault::program("serve::rs", format!("lane {}: {error}", row.source))
                         })?;
-                    let replay = crate::run::replayed(&reads);
                     let cell = envelope_of[source].map_or(fire_lane, |(_, at)| at);
                     let to = folded
                         .saturating_add(stated_fold(*fold, cell, port)?)
                         .min(first + row.rows);
-                    rs_folded[source] = Some(to - folded);
+                    // A beam group's lanes share their set's state: what its
+                    // first lane folds is folded once for all of them, from
+                    // its buffered rows, before any reads. Each lane
+                    // then replays only the rows past it and folds none
+                    // itself.
+                    let (reads, to, beam) = match group_of[source] {
+                        Some(group) => {
+                            let group_to = match beam_to[group] {
+                                Some(group_to) => group_to,
+                                None => {
+                                    let group_to = to.min(first);
+                                    if group_to > *folded {
+                                        group_folds
+                                            .push((fire_lane, *folded - base..group_to - base));
+                                    }
+                                    beam_to[group] = Some(group_to);
+                                    group_to
+                                }
+                            };
+                            let reads: Vec<std::ops::Range<u32>> = reads
+                                .iter()
+                                .filter(|span| span.end > group_to)
+                                .map(|span| span.start.max(group_to)..span.end)
+                                .collect();
+                            (reads, to, true)
+                        }
+                        None => (reads, to, false),
+                    };
+                    let replay = crate::run::replayed(&reads);
+                    // A beam group's fold moves its set's state and buffer, never its
+                    // kv working set's folded point, which anchors its pool.
+                    rs_folded[source] = Some(if beam { 0 } else { to - folded });
+                    rs_ends[source] = Some(first + row.rows);
                     if *fold == FoldLen::Device {
                         self.rs_ahead.insert(slot, to);
                     }
@@ -1065,7 +1446,11 @@ impl FrameShell for Shell {
                         .iter()
                         .map(|span| span.end.min(to).saturating_sub(span.start))
                         .sum();
-                    let fold = below + to.saturating_sub(first).min(row.rows);
+                    let fold = if beam {
+                        0
+                    } else {
+                        below + to.saturating_sub(first).min(row.rows)
+                    };
                     rs_reads[fire_lane] = reads
                         .iter()
                         .map(|span| span.start - base..span.end - base)
@@ -1092,7 +1477,10 @@ impl FrameShell for Shell {
             // A lane that folds nothing reads the state as it stood before
             // the fire, while the lane beside it folds into the record the
             // fire writes: the two never meet in one row.
+            // A beam group's lanes read the record the fire writes, which
+            // its fold, if any, has written before them.
             if matches!(verb, RsMove::Scatter { fold: 0, .. })
+                && group_of[source].is_none()
                 && let Some(read) = seated.rs_read
                 && let Some(named) = slot_ids.last_mut()
             {
@@ -1184,7 +1572,39 @@ impl FrameShell for Shell {
                     writes.extend(std::iter::repeat_n(None, rows_here));
                 }
             }
+            if !seated.kv_less {
+                let reach = have.saturating_add(row.rows);
+                let set = (seated.set, seated.readable);
+                match ports
+                    .as_ref()
+                    .map(|ports| ports.slots(rows_here))
+                    .transpose()?
+                {
+                    Some(Some(slots)) => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                        reach,
+                    ),
+                    _ => extents.lane(
+                        &self.written,
+                        source,
+                        lane.slot,
+                        set,
+                        std::iter::once(have..reach),
+                        reach,
+                    ),
+                }
+            }
         }
+        // A page holds what its last owner left until its set writes it: no
+        // lane reads past what its set holds written.
+        extents
+            .check()
+            .map_err(|why| Fault::program("serve::prepare", why))?;
+        self.written.commit(extents);
 
         let mut mrope_positions = if !self.mrope_seat {
             Vec::new()
@@ -1252,51 +1672,250 @@ impl FrameShell for Shell {
             }
         }
         let paging = self.pools.paging();
-        // Each window list's table a lane, narrowest window first. Where
-        // lanes name slot refs a list has refs of its own; today's windowed
-        // page ids name a slot of every list.
-        let window_lists = if self.pools.has_windowed() {
-            self.pools.geometries() - usize::from(!self.pools.windowed_geometry(0))
-        } else {
-            0
-        };
-        let mut window_tables: Vec<Vec<Vec<u32>>> = Vec::with_capacity(window_lists);
-        for window in 0..window_lists {
-            let retained = self.pools.window_tokens(window);
-            window_tables.push(
-                seats
+        // A load with windowed rows serves them as ring + buffer and
+        // composes each lane's one windowed table (`super::ring`): its
+        // entries are page ids already, and its window pages the buffer
+        // slots it names.
+        let mut window_tables: Vec<Vec<Vec<u32>>> = Vec::with_capacity(1);
+        let mut ring_work = super::ring::Work::default();
+        let mut ring_buffers: Vec<u64> = Vec::new();
+        let ringed = self.pools.ring_window();
+        if let Some((window, page)) = ringed {
+            ring_work.page_bytes = self.pools.ring().map_or(0, |(_, ring)| ring.page_bytes);
+            let planes = self.pools.ring_planes();
+            let keys: Vec<u32> = seat_sources
+                .iter()
+                .map(|&source| lanes[source].rs_slot.unwrap_or(lanes[source].lane.slot))
+                .collect();
+            let mut null = [0i32];
+            self.pools.page_ids(1, &mut null)?;
+            let null = null[0];
+            let mut own_next = 0u32;
+            // A record a group of lanes shares folds once: the group's
+            // common rows, which its lanes read from slots they share. Each record's fold, as its first lane states.
+            let mut record_folds: std::collections::HashMap<u32, (u32, u32)> =
+                std::collections::HashMap::new();
+            let pooled: Vec<(u64, u32, bool)> = (0..seats.len())
+                .map(|lane| {
+                    let seated = &lanes[seat_sources[lane]];
+                    (
+                        seated.set,
+                        keys[lane],
+                        seated.window_fold.is_some()
+                            && seat_masked.get(lane).copied().unwrap_or(false),
+                    )
+                })
+                .collect();
+            if let Some((one, other)) = super::ring::shared_pool(&pooled) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "lanes {} and {} read one pool of buffered rows as separate hypotheses \
+                         (one working set, each lane's rows told apart by its mask) on a model \
+                         with windowed layers: a window cuts such a pool by its slots, not by \
+                         each hypothesis's positions. Windowed beams are served by a page list \
+                         a lane",
+                        seat_sources[one], seat_sources[other]
+                    ),
+                });
+            }
+            let mut composed_tables: Vec<Vec<u32>> = Vec::with_capacity(seats.len());
+            for (lane, seat) in seats.iter().enumerate() {
+                let seated = &lanes[seat_sources[lane]];
+                if kv_less_seats[lane] {
+                    composed_tables.push(tables[lane].to_vec());
+                    continue;
+                }
+                let buffer_empty = window_ids[lane].is_empty();
+                let (base, folded, fold) = match (&seated.window_fold, window_folds[lane]) {
+                    // A lane with no buffer slot reads every row below its
+                    // fire from its ring: its buffer starts at its fold's
+                    // page, whatever base it states.
+                    (Some(_), Some((folded, fold))) if buffer_empty => {
+                        (folded / page * page, folded, fold)
+                    }
+                    (Some(stated), Some((folded, fold))) => (stated.base, folded, fold),
+                    // A runtimeless lane folds every row it writes.
+                    _ => {
+                        let base = seat.have / page * page;
+                        (base, seat.have, seat.rows)
+                    }
+                };
+                let ring = self.pools.ring_pages(keys[lane])?;
+                // A lane no runtime states a fold for (a runtimeless or an
+                // arming lane) buffers nothing: it folds every row it
+                // writes, on a record of its own.
+                let stated = seated.window_fold.is_some();
+                let buffer = window_ids[lane]
                     .iter()
-                    .enumerate()
-                    .map(|(lane, seat)| {
-                        let (table, ids) = (&tables[lane], &window_ids[lane]);
-                        if kv_less_seats[lane] {
-                            Ok(table.to_vec())
-                        } else if self.pools.by_refs() {
-                            let ids: &[u32] = match window {
-                                0 => ids,
-                                past => more_windows[lane].get(past - 1).copied().unwrap_or(&[]),
-                            };
-                            window_refs(&paging, retained, seat, ids)
-                        } else {
-                            kv::window_table(&paging, seat, table, ids)
-                        }
+                    .filter(|_| stated)
+                    .map(|&slot| {
+                        ring_buffers.push(u64::from(slot));
+                        self.pools.window_slot(slot)
                     })
-                    .collect::<Result<Vec<_>>>()?,
-            );
-        }
-        // The windowed pages this fire's tables name, a list's apart, backed
-        // as they are first used.
-        let window_pages: Vec<Vec<u64>> = window_tables
-            .iter()
-            .map(|tables| {
-                tables
+                    .collect::<Result<Vec<_>>>()?;
+                let alone = !stated || keys.iter().filter(|&&key| key == keys[lane]).count() == 1;
+                if !alone && folded + fold > seat.have {
+                    return Err(Fault::program(
+                        "serve::ring",
+                        format!(
+                            "lanes sharing a record fold rows [{folded}, {}) into it, past \
+                             row {} where one of them computes its own in this fire: a group \
+                             folds only the rows its lanes share",
+                            folded + fold,
+                            seat.have
+                        ),
+                    ));
+                }
+                let first_fold = match record_folds.get(&keys[lane]).filter(|_| stated) {
+                    None => {
+                        record_folds.insert(keys[lane], (folded, fold));
+                        true
+                    }
+                    Some(&stated) if stated == (folded, fold) => false,
+                    Some(&(was, by)) => {
+                        return Err(Fault::program(
+                            "serve::ring",
+                            format!(
+                                "lanes sharing a record fold it from {was} by {by} and from \
+                                 {folded} by {fold}: a record folds once a fire"
+                            ),
+                        ));
+                    }
+                };
+                // The snapshots the lane's fire lands: each onto its
+                // record's ring pages.
+                let snap_rings = seated
+                    .rs_snapshots
                     .iter()
-                    .zip(&kv_less_seats)
-                    .filter(|(_, kv_less)| !**kv_less)
-                    .flat_map(|(table, _)| table.iter().map(|&page| u64::from(page)))
-                    .collect()
-            })
-            .collect();
+                    .map(|snap| Ok((snap.row, self.pools.ring_pages(snap.slot)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                let snapshots: Vec<(u32, &[(i32, u64)])> = snap_rings
+                    .iter()
+                    .map(|(row, rings)| (*row, rings.as_slice()))
+                    .collect();
+                let pools = &self.pools;
+                let mut own = || {
+                    let at = own_next;
+                    own_next += 1;
+                    Ok((pools.own_page_id(at)?, pools.own_page_at(at)?))
+                };
+                let composed = super::ring::compose(
+                    &super::ring::RingLane {
+                        ring: &ring,
+                        buffer: &buffer,
+                        base,
+                        have: seat.have,
+                        rows: seat.rows,
+                        folded,
+                        fold,
+                        alone,
+                        snapshots: &snapshots,
+                    },
+                    page,
+                    window,
+                    null,
+                    &mut own,
+                )?;
+                self.ring_seen.direct += u64::from(composed.direct);
+                self.ring_seen.own += u64::from(composed.own);
+                self.ring_seen.read_then_folded += u64::from(composed.read_then_folded);
+                // The group's fold is its first lane's; the others read.
+                if first_fold {
+                    ring_work.add(&composed, &planes);
+                    self.ring_seen.snapshots += snapshots.len() as u64;
+                } else {
+                    // A record's ring work is its first lane's; another's
+                    // snapshot would be dropped with the rest of its work.
+                    // (The runtime snapshots a pass of one lane only.)
+                    if !snapshots.is_empty() {
+                        return Err(Fault::program(
+                            "serve::ring",
+                            format!(
+                                "lane {} snapshots the rings of a record another lane of the \
+                                 fire folds: a record's snapshots are its folding lane's",
+                                seat_sources[lane]
+                            ),
+                        ));
+                    }
+                    ring_work.fills.extend_from_slice(&composed.fills);
+                }
+                composed_tables.push(composed.table.iter().map(|&id| id as u32).collect());
+            }
+            window_tables.push(composed_tables);
+        }
+        // The window buffer's pages this fire's tables name, backed as they
+        // are first used.
+        let window_pages: Vec<Vec<u64>> = if ringed.is_some() {
+            vec![ring_buffers]
+        } else {
+            Vec::new()
+        };
+        // A fire's extended run holds the widest bucket's tokens of
+        // replayed rows (`store::rs::Buffers::rows_ext`), what each rung
+        // states it holds (`ChunkFacts::act_replay`'s `carried_max`, the
+        // runtime choosing a rung by the same `engine::fire::rung_holds`):
+        // one that replays more is refused here, before a page is committed
+        // or a row written.
+        // A decoding lane's carried rows take none of the run: its decode
+        // steps read them as a linear attention.
+        let in_run = |fire_lane: usize| {
+            composition
+                .lanes()
+                .get(fire_lane)
+                .is_none_or(|row| !self.decoding.contains(row.class as usize))
+        };
+        let replayed: u32 = rs_reads
+            .iter()
+            .enumerate()
+            .filter(|(fire_lane, _)| in_run(*fire_lane))
+            .map(|(_, reads)| crate::run::replayed(reads))
+            .sum();
+        let holds = engine::RungReplay {
+            carried_max: Some(self.budget.max_tokens),
+            own_max: None,
+            scratch: engine::ScratchBytes {
+                slot_bytes: Vec::new(),
+                lane_bytes: 0,
+                room_bytes: 0,
+                pad: 1,
+            },
+        };
+        let count = engine::ReplayRows {
+            carried: replayed,
+            ..engine::ReplayRows::default()
+        };
+        // The runtime's count of this fire's replay against this one, in
+        // debug builds or under PIE_CHECK_REPLAY (`engine::fire::replay_agrees`):
+        // the runtime counting less (a fire it priced held that this engine
+        // refuses, or compact where this one lays it wide) is a contract bug,
+        // named with both counts. Compactness here is the load's alone
+        // (`ChunkFacts::rs_scratch_per_fire` is false: a decoding lane's
+        // carried rows never take the run).
+        if engine::fire::replay_check_on() {
+            let snapshots = lanes.iter().any(|seated| !seated.rs_snapshots.is_empty());
+            // As `Shell::chunk_facts` states it (`ChunkFacts::rs_compact`).
+            let compact = self.buffers.is_some();
+            engine::fire::replay_agrees(
+                composition
+                    .lanes()
+                    .iter()
+                    .map(|row| (row.rows, lanes[row.source as usize].replay_stated)),
+                &holds,
+                count,
+                compact,
+                compact,
+                false,
+                snapshots,
+            )
+            .map_err(|why| Fault::program("serve::prepare", why))?;
+        }
+        if let Err(past) = engine::fire::rung_holds(&holds, count) {
+            return Err(Fault::Ceiling {
+                what: "buffered recurrent rows a fire replays ahead of its own",
+                need: past.rows,
+                have: past.max,
+            });
+        }
         self.pools.commit_frame(demand, &kv_ranges, &window_pages)?;
         // The rs buffer pages the lanes name, seated before a row lands.
         self.pools.seat_rs(&rs_pages)?;
@@ -1309,40 +1928,131 @@ impl FrameShell for Shell {
             .iter()
             .map(|reads| crate::run::replayed(reads))
             .collect();
-        let rs_lands = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        // Whether a lane buffers rows: the stamped shape's treatment, else
+        // the lanes' moves (a fire built by hand); the two agree.
+        let moves = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        let rs_lands = shape.map_or(moves, |shape| shape.treatment == engine::Treatment::Buffers);
+        debug_assert_eq!(
+            rs_lands,
+            moves,
+            "a fire stamped {shape:?} whose lanes {} buffer rows",
+            if moves { "do" } else { "do not" }
+        );
+        // A decoding lane replays its carried rows in its decode step's own
+        // kernels (`dispatch::ssm`, `kernels_cuda::ssm::Carry`), in the body
+        // that buffers; only a wider lane's replay runs extended.
+        let rs_extends = composition
+            .lanes()
+            .iter()
+            .zip(&rs_replays)
+            .any(|(row, replay)| *replay > 0 && !self.decoding.contains(row.class as usize));
+        // A decoding lane carrying more than a chunk of rows (a beam lane's
+        // run-ahead) splits its carried reads, in a body of its own: a
+        // fire at the natural lag keeps the plain grid.
+        let rs_splits = self
+            .buffers
+            .as_ref()
+            .is_some_and(|buffers| rs_replays.iter().any(|&replay| buffers.splits(replay)));
         let rs_body = match self.arm_rs {
             armed if arming && armed.buffers() => armed,
-            _ if rs_replays.iter().any(|replay| *replay > 0) => record::RsBody::Replays,
+            _ if rs_extends => record::RsBody::Replays,
+            _ if rs_lands && rs_splits => record::RsBody::Splits,
             _ if rs_lands => record::RsBody::Buffers,
             _ => record::RsBody::Folds,
         };
         let mut rs_lanes: Vec<kernels_cuda::runtime::channel::RsLane> = Vec::new();
-        let mut rs_slots: Vec<u64> = Vec::new();
-        let mut rs_tokens: Vec<u32> = Vec::new();
+        // The slot addresses of the pages the lanes alone on their sets read
+        // or write, a lane's after another's.
+        let mut lane_pages: Vec<u64> = Vec::new();
+        // Each lane's replayed rows as (start, count) spans of its buffer
+        // tokens, in order (`kernels_cuda::ssm::Carry::replay_spans`).
+        let mut rs_spans: Vec<u32> = Vec::new();
+        let mut rs_folds: Vec<kernels_cuda::ssm::GroupFold> = Vec::new();
         if rs_body.buffers() {
             let buffers = self.buffers.as_ref().ok_or_else(|| Fault::Unbound {
                 what: "the rs buffer of a fire whose lanes buffer recurrent rows, against a \
                        plan that declares no chunked recurrence to buffer"
                     .to_string(),
             })?;
-            for (fire_lane, verb) in rs_moves.iter().enumerate() {
+            // Each lane's extended rows, its replayed then its own, lie past
+            // every earlier lane's in the fire's extended run.
+            let mut ext = 0u32;
+            for (fire_lane, (verb, row)) in rs_moves.iter().zip(composition.lanes()).enumerate() {
+                let begin = ext;
+                ext += if in_run(fire_lane) {
+                    rs_replays[fire_lane]
+                } else {
+                    0
+                } + row.rows;
                 let RsMove::Scatter { pages, at, .. } = verb else {
-                    rs_lanes.push(kernels_cuda::runtime::channel::RsLane::INERT);
+                    rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
+                        ext: begin,
+                        ..kernels_cuda::runtime::channel::RsLane::INERT
+                    });
                     continue;
                 };
-                let replay_off = rs_tokens.len() as u32;
+                let replay_off = rs_spans.len() as u32;
+                // No table holds an entry a row. A beam's rows resolve on the
+                // device through its entry of the fire's lane rows
+                // (`channel::RsRows`), through its group's list; any
+                // other lane's through the pages of its buffer the fire reads
+                // or writes, from the one holding its first replayed or own
+                // row (its tokens then count from that page), laid beside
+                // the beams' sets' pages (`PageWork::bases`).
+                let (page_off, skip) = if group_of[row.source as usize].is_some() {
+                    (
+                        kernels_cuda::runtime::channel::RsLane::ROWS
+                            | beam_row[row.source as usize],
+                        0,
+                    )
+                } else {
+                    let tokens = buffers.page_tokens().max(1);
+                    let reads = &rs_reads[fire_lane];
+                    let first = reads
+                        .iter()
+                        .map(|span| span.start)
+                        .chain([*at])
+                        .min()
+                        .unwrap_or(0);
+                    let reach = reads
+                        .iter()
+                        .map(|span| span.end)
+                        .chain([*at + row.rows])
+                        .max()
+                        .unwrap_or(0)
+                        .div_ceil(tokens)
+                        .max(1) as usize;
+                    let from = (first / tokens) as usize;
+                    let slots = pages
+                        .iter()
+                        .take(reach)
+                        .skip(from)
+                        .map(|&page| buffers.slot(&self.pools, page))
+                        .collect::<Result<Vec<u64>>>()?;
+                    let page_off = lane_pages.len() as u32;
+                    lane_pages.extend(slots);
+                    (page_off, from as u32 * tokens)
+                };
                 for span in &rs_reads[fire_lane] {
-                    rs_tokens.extend(span.clone());
+                    rs_spans.extend([span.start - skip, span.end - span.start]);
                 }
                 rs_lanes.push(kernels_cuda::runtime::channel::RsLane {
-                    at: *at,
+                    at: *at - skip,
                     replay: rs_replays[fire_lane],
                     replay_off,
-                    page_off: rs_slots.len() as u32,
+                    page_off,
+                    ext: begin,
                 });
-                for &page in pages.iter() {
-                    rs_slots.push(buffers.slot(&self.pools, page)?);
-                }
+            }
+            // Each beam group's fold rows, past every lane's replayed
+            // ones, read through its representative lane's pages.
+            for (lane, rows) in &group_folds {
+                rs_folds.push(kernels_cuda::ssm::GroupFold {
+                    lane: *lane as u32,
+                    fold_off: rs_spans.len() as u32,
+                    rows: rows.len() as u32,
+                });
+                rs_spans.extend([rows.start, rows.end - rows.start]);
             }
         }
         // The records as the kernels read them: each row's pieces by the
@@ -1433,10 +2143,83 @@ impl FrameShell for Shell {
                 .pools
                 .geometry_window(table)
                 .map_or(0, |window| window as u8 + 1);
+            // A composed windowed table names page ids already.
+            if list > 0 {
+                continue;
+            }
             self.pools.page_ids(list, &mut geometry.indices)?;
             self.pools.page_ids(list, &mut geometry.write_page)?;
         }
-
+        let page_work = if page_groups.is_empty() {
+            super::pages::PageWork::of_lanes(lane_pages)
+        } else {
+            // A group's lanes are seated in lane order: its beams.
+            for group in &mut page_groups {
+                group.lanes.sort_by_key(|lane| lane.source);
+                let Some(first) = group.lanes.first() else {
+                    continue;
+                };
+                let seated = &lanes[first.source];
+                let f0 = (seated.folded / paging.page_size.max(1)) as usize;
+                if let Some(whole) = seated.translation.get(f0..) {
+                    let backed = super::pages::backed(
+                        group.layout.lanes,
+                        first.have,
+                        seated.folded,
+                        paging.page_size,
+                        group.layout.frames,
+                        whole.len() as u32,
+                    );
+                    self.pools.seat_kv_pages(&whole[..backed as usize])?;
+                }
+            }
+            let windowed = (0..device_geometries.len())
+                .any(|table| self.pools.geometry_window(table).is_some());
+            let planes = self.pools.page_planes();
+            let pools = &self.pools;
+            // A hybrid's beams: their rs page tables as this fire
+            // stages them, and the planes a fork copies.
+            let rs_fire = match self.buffers.as_ref() {
+                Some(buffers) if !rs_lanes.is_empty() => Some(super::pages::RsFire {
+                    lanes: &rs_lanes,
+                    order: &rs_order,
+                    page_tokens: buffers.page_tokens(),
+                    base: &|source| {
+                        rs_bases
+                            .get(source)
+                            .copied()
+                            .flatten()
+                            .map(|(base, _)| base)
+                    },
+                    set: &|source| {
+                        rs_bases.get(source).copied().flatten().map_or_else(
+                            || Ok(Vec::new()),
+                            |(_, pages)| {
+                                pages
+                                    .iter()
+                                    .map(|&page| buffers.slot(pools, page))
+                                    .collect()
+                            },
+                        )
+                    },
+                    planes: buffers.page_planes()?,
+                }),
+                _ => None,
+            };
+            super::pages::plan(
+                &page_groups,
+                &device_geometries,
+                windowed,
+                paging.page_size,
+                &|source| lanes[source].translation.to_vec(),
+                &|source| lanes[source].folded,
+                &planes,
+                rs_fire.as_ref(),
+                &mut |ids| pools.page_ids(0, ids),
+                &mut |page| pools.page_base(0, page),
+                lane_pages,
+            )?
+        };
         super::btrace::mark("admit");
         let bucket = self
             .budget
@@ -1458,20 +2241,35 @@ impl FrameShell for Shell {
             _ => self.budget.max_lanes,
         };
         let lane_ceiling = self.lane_ceiling().min(max_lanes);
-        let patches = composition.axis(poem_ir::RowAxis::Patches);
-        let key = record::BodyKey::of_axes(
-            &token_axis.classes,
-            token_axis.bucket,
+        let key = record::BodyKey::for_fire(
+            &composition,
             &self.decoding,
             lane_ceiling,
             &self.tiers,
-            self.towered.then_some((&patches.classes, patches.bucket)),
-        )
-        .with_rs(rs_body);
+            self.towered,
+            rs_body,
+        );
         let copies_here = copies
-            && key.classes.rungs().iter().all(|(class, _)| {
-                !self.masked.contains(*class as usize) && !self.wide.contains(*class as usize)
-            });
+            && key
+                .classes
+                .rungs()
+                .iter()
+                .all(|(class, _)| !self.wide.contains(*class as usize));
+        let staged = crate::mask::stage(&masks, reads_masks)
+            .map_err(|fault| fault.of_rows(composition.lanes()))?;
+        let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
+            Some(staged) => pending_mask_injects
+                .iter()
+                .map(|&(at, src, bits)| crate::inputs::MaskInject {
+                    dst_off: staged.indptr[at] as u64,
+                    src,
+                    bits,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        super::btrace::mark("mask");
+
         let class_tables = [
             composition.table(poem_ir::RowAxis::Tokens),
             composition.table(poem_ir::RowAxis::Patches),
@@ -1500,6 +2298,9 @@ impl FrameShell for Shell {
                         bucket,
                         enabled: copies_here,
                         page_tables: &device_geometries,
+                        mask: staged
+                            .as_ref()
+                            .map(|staged| (&staged.indptr[..], &staged.origins[..])),
                     },
                     self.inputs.window_slots(),
                 )?;
@@ -1526,20 +2327,6 @@ impl FrameShell for Shell {
         };
         super::btrace::mark("windows_of");
 
-        let staged = crate::mask::stage(&masks)?;
-        let mask_injects: Vec<crate::inputs::MaskInject> = match &staged {
-            Some(staged) => pending_mask_injects
-                .iter()
-                .map(|&(at, src, bits)| crate::inputs::MaskInject {
-                    dst_off: staged.indptr[at] as u64,
-                    src,
-                    bits,
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        super::btrace::mark("mask");
-
         let totals = poem_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
         // The widened table, as `segmentation` holds it: what a body was
         // recorded under is what it replays under.
@@ -1547,8 +2334,6 @@ impl FrameShell for Shell {
             &self.compiled,
             &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
         ));
-        let ladder = key.classes.clone();
-        let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
         let records_bodies = self.records_bodies();
         let (admits, world): (std::sync::Arc<[crate::window::Admit]>, bool) = if records_bodies {
             self.segmentation(&key, &windows, totals, copies_here)
@@ -1558,20 +2343,19 @@ impl FrameShell for Shell {
         super::btrace::mark("segmentation");
         // A tapped fire is walked, so the walk can mark where each layer
         // ends on the stream.
+        let snapshots_fit = snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize;
+        // A fire with an adapted lane is stated eager: it keys no body, and
+        // its key past the plain classes is its bucket alone, which names
+        // another composition's.
+        let stated_eager = composition
+            .axis(poem_ir::RowAxis::Tokens)
+            .classes
+            .present_in_order()
+            .any(|class| self.eager_classes.contains(class as usize));
         let bodied = records_bodies
+            && !stated_eager
             && !tapped
-            // A body's window holds its own rows twice and at least
-            // `REPLAYED` replayed (`Run::rs_layout`): a fire whose lanes
-            // replay more in a window than its rows or `REPLAYED` walks.
-            && windows.spans().all(|span| {
-                rs_replays
-                    .iter()
-                    .skip(span.lane_offset as usize)
-                    .take(span.lanes as usize)
-                    .sum::<u32>()
-                    <= span.rows.max(crate::store::rs::REPLAYED)
-            })
-            && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
+            && snapshots_fit
             && Self::keyable_units(&self.compiled)
             && world
             && !self.cache.body_refused(&key)
@@ -1586,31 +2370,88 @@ impl FrameShell for Shell {
         // the classes do (a mixed bucket-256 fire's two classes rung 256
         // each), and the carve a fire of the bucket takes (the forked arena,
         // an activation rung) holds no more readout rows than its tokens.
-        let (last_rows, every_row) =
-            ladder
-                .rungs()
-                .iter()
-                .fold((0, 0), |(last, every), &(class, rung)| {
-                    match self.exports.readback(class as usize) {
-                        Some(out) if !out.decl.readout => (last, every + rung),
-                        None if !self.exports.reads_readout_rows() => (last, every + rung),
-                        _ if !self.landing[class as usize]
-                            .iter()
-                            .any(crate::exports::plain_or_adapted) =>
-                        {
-                            let per_lane = self.budget.readouts_per_lane.max(1);
-                            (
-                                last,
-                                every + rung.min(lane_ceiling.saturating_mul(per_lane)),
-                            )
-                        }
-                        _ => (last + rung.min(lane_ceiling), every),
+        // An unlisted ladder (a class no plain request lands, as a DiT's) is
+        // the whole-bucket body: every class present at the bucket.
+        let whole: Vec<(u32, u32)>;
+        let rungs = if key.classes.rungs().is_empty() {
+            whole = token_axis
+                .classes
+                .present_in_order()
+                .map(|class| (class, token_axis.bucket))
+                .collect();
+            whole.as_slice()
+        } else {
+            key.classes.rungs()
+        };
+        let per_lane = self.budget.readouts_per_lane.max(1);
+        let reads: Vec<(BodyReads, u32)> = rungs
+            .iter()
+            .map(|&(class, rung)| {
+                let reads = match self.exports.readback(class as usize) {
+                    Some(out) if !out.decl.readout => BodyReads::Rows,
+                    None if !self.exports.reads_readout_rows() => BodyReads::Rows,
+                    _ if !self.landing[class as usize]
+                        .iter()
+                        .any(poem_ir::Request::plain) =>
+                    {
+                        BodyReads::Verify
+                    }
+                    _ => BodyReads::Last,
+                };
+                (reads, rung)
+            })
+            .collect();
+        let BodyReadouts {
+            last: last_rows,
+            verified,
+            every: every_row,
+            ceiling: readout_ceiling,
+        } = body_readouts(
+            &reads,
+            lane_ceiling,
+            max_lanes,
+            per_lane,
+            u32::try_from(poem_compiler::arena::readouts_ceiling(&self.budget)).unwrap_or(u32::MAX),
+            composition.bucket(),
+        );
+        let readouts_fit = readout_rows.len() <= readout_ceiling as usize;
+        let lanes_fit = composition.lane_count() <= crate::window::lane_capacity(max_lanes);
+        // Why a fire of a load that records bodies walks its plan, for the
+        // warning it raises (`Bodies::eager_unbodied`).
+        let unbodied =
+            (records_bodies && !arming && !stated_eager && !(bodied && readouts_fit && lanes_fit))
+                .then(|| {
+                    let why = if tapped {
+                        "it is tapped"
+                    } else if !snapshots_fit {
+                        "it takes more snapshots than a body holds"
+                    } else if !Self::keyable_units(&self.compiled) {
+                        "the plan's units key no body"
+                    } else if !world {
+                        "its expert group is not whole"
+                    } else if self.cache.body_refused(&key) {
+                        "its body was refused when it was captured"
+                    } else if !bodied {
+                        "its admitted set cannot be cut to a body"
+                    } else if !readouts_fit {
+                        "it reads out more rows than its bucket's body carries"
+                    } else {
+                        "it has more lanes than a body's window table holds"
+                    };
+                    if bodied && !readouts_fit {
+                        format!(
+                            "{key}: {why} ({} rows read out over {} lanes; the body carries {}: \
+                         {last_rows} last rows under {max_lanes} lanes, {verified} verified \
+                         rows, {every_row} every row, lane ceiling {lane_ceiling})",
+                            readout_rows.len(),
+                            composition.lane_count(),
+                            readout_ceiling,
+                        )
+                    } else {
+                        format!("{key}: {why}")
                     }
                 });
-        let readout_ceiling = (last_rows.min(max_lanes) + every_row).min(composition.bucket());
-        let bodied = bodied
-            && readout_rows.len() <= readout_ceiling as usize
-            && composition.lane_count() <= crate::window::lane_capacity(max_lanes);
+        let bodied = bodied && readouts_fit && lanes_fit;
         let readout_live = readout_rows.len() as u32;
         if bodied {
             readout_rows.resize(readout_ceiling as usize, 0);
@@ -1692,23 +2533,19 @@ impl FrameShell for Shell {
                 packings: &packing_fires,
                 rs: rs_body.buffers().then_some(crate::inputs::RsFire {
                     lanes: &rs_lanes,
-                    pages: &rs_slots,
-                    replay_tok: &rs_tokens,
+                    replay_spans: &rs_spans,
+                    folds: &rs_folds,
                 }),
             },
         )?;
 
         // A buffering fire's recurrences take its commit lengths and its
         // fold predicate whatever its lanes fold, so one body serves every
-        // fold; its extended rows reach a body's ceiling (`Run::rs_layout`).
-        let rs_rows_ext = if rs_body == record::RsBody::Replays {
-            // Each window's region holds its own rows twice and at least
-            // `REPLAYED` more.
-            let own = launched.max(rows);
-            let regions = u32::try_from(windows.len()).unwrap_or(u32::MAX).max(1);
-            own.saturating_mul(2)
-                .saturating_add(regions.saturating_mul(crate::store::rs::REPLAYED))
-                .saturating_add(rs_replays.iter().sum::<u32>())
+        // fold; its extended run is the widest bucket's, whatever its rows
+        // and whatever its lanes replay, and its decode steps' carried
+        // scratch lies in it.
+        let rs_rows_ext = if rs_body.buffers() {
+            crate::store::rs::Buffers::rows_ext(self.budget.max_tokens)
         } else {
             0
         };
@@ -1724,7 +2561,7 @@ impl FrameShell for Shell {
                 let fold = rs_folded[row.source as usize].or_else(|| {
                     envelope_of[row.source as usize].and_then(|(held, at)| {
                         let cells = resolved[held].fold.as_ref()?;
-                        cells.get(at).or_else(|| cells.first()).copied()
+                        fold_cell(cells, at)
                     })
                 });
                 let report = super::KvReport {
@@ -1736,6 +2573,7 @@ impl FrameShell for Shell {
                     offsets: Vec::new(),
                     fold,
                     fold_at: fold_at[row.source as usize].filter(|_| fold.is_none()),
+                    end: rs_ends[row.source as usize],
                 };
                 let Some(table) = placed else {
                     return report;
@@ -1755,18 +2593,20 @@ impl FrameShell for Shell {
             })
             .collect();
         Ok(Prepared {
+            ring_work,
             slot: Some(slot),
             lengths: staged_lens,
             token_injects,
             mask_injects,
+            page_work,
+            page_faults: None,
             kv_reports,
             bodied,
+            unbodied,
+            stated_eager,
             admits,
-            islands: key.islands.clone(),
-            ladder,
+            key,
             lane_ceiling,
-            patch_ladder,
-            towered: self.towered,
             lanes,
             attachments,
             composition,
@@ -1800,163 +2640,32 @@ impl FrameShell for Shell {
                     || rs_moves
                         .iter()
                         .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
-                predicated: rs_body.buffers()
-                    || attachments.iter().any(|attached| {
-                        !attached.adapter_only && self.programs.prologue_runs(attached.instance)
-                    }),
+                // Every fire on a load with recurrent state is gated, whatever
+                // its lanes: a prologue's commit holds back its lane's fold on
+                // any body, so every body the load records lays the gate
+                // (`Run::lay_gate`) and none is keyed by whether a lane gates.
+                // A load with none reads no gate.
+                predicated: self.pools.has_state(),
                 truncates: rs_body.buffers(),
                 body: rs_body,
+                group_folds: !rs_folds.is_empty(),
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
-                replays: rs_replays,
                 rows_ext: rs_rows_ext,
                 snapshots,
             },
         })
     }
 
-    fn enqueue<'a>(&mut self, prepared: Prepared<'a>) -> Result<Enqueued<'a>>
-    where
-        Self: 'a,
-    {
-        let mut p = prepared;
-        let slot = p
-            .slot
-            .take()
-            .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
-        match self.enqueue_on(&mut p, &slot) {
-            Ok((launches, readback)) => {
-                p.slot = Some(slot);
-                Ok(Enqueued {
-                    prepared: p,
-                    launches,
-                    readback,
-                })
-            }
-            Err(fault) => {
-                let _ = self.device.synchronize();
-                drop(slot);
-                Err(fault)
-            }
-        }
-    }
-
-    fn settle<'a>(&mut self, enqueued: Enqueued<'a>) -> Result<Settled>
-    where
-        Self: 'a,
-    {
-        self.settle_step(enqueued, None)
-    }
-}
-
-fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
-    Ok(match len {
-        FoldLen::Host(n) => n,
-        FoldLen::Device => {
-            let cells = port.ok_or_else(|| {
-                Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {lane} states a device-resident fold length, and the program \
-                         attached to it resolved no `fold` port"
-                    ),
-                )
-            })?;
-            *cells.get(lane).or_else(|| cells.first()).ok_or_else(|| {
-                Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {lane} states a device-resident fold length on a `fold` port \
-                         whose cell carries {} entries",
-                        cells.len()
-                    ),
-                )
-            })?
-        }
-    })
-}
-
-/// The slots the state in record `slot` holds as a lane's fire finds it.
-/// A buffered lane states `folded`, which a device-counted fold not yet
-/// settled has left behind what `ahead` holds; a lane that starts fresh, or
-/// folds its rows itself (`None`: a working set new to the record starts
-/// with such a fire), leaves nothing ahead.
-fn fold_held(
-    ahead: &mut std::collections::HashMap<u32, u32>,
-    slot: u32,
-    folded: Option<u32>,
-    fresh: bool,
-) -> u32 {
-    match (ahead.get(&slot), folded) {
-        (Some(&at), Some(folded)) if at > folded && !fresh => at,
-        (_, folded) => {
-            ahead.remove(&slot);
-            folded.unwrap_or(0)
-        }
-    }
-}
-
-/// A lane's table of a window list retaining `retained` tokens, where it
-/// names the list's slot refs: a page wholly behind the window of the lane's
-/// first row reads the null slot, the rest the refs the lane was handed, one
-/// a page of its table.
-fn window_refs(
-    paging: &kv::Paging,
-    retained: Option<u32>,
-    seat: &kv::Seat,
-    refs: &[u32],
-) -> Result<Vec<u32>> {
-    let Some(retained) = retained.filter(|_| paging.window.is_some()) else {
-        return Ok(refs.to_vec());
-    };
-    let page_size = u64::from(paging.page_size);
-    let pages = (u64::from(seat.have) + u64::from(seat.rows))
-        .div_ceil(page_size)
-        .max(1);
-    let first = u64::from(seat.have.saturating_sub(retained)) / page_size;
-    (0..pages)
-        .map(|page| {
-            if page < first {
-                return Ok(0);
-            }
-            match refs.get(page as usize) {
-                Some(&slot) if slot != 0 => Ok(slot),
-                Some(_) => Err(Fault::Unbound {
-                    what: format!(
-                        "windowed page {page} of a lane holding {} tokens, which its window \
-                         still reads and the runtime has released",
-                        seat.have
-                    ),
-                }),
-                None => Err(Fault::Ceiling {
-                    what: "window list slot refs this lane stated",
-                    need: page + 1,
-                    have: refs.len() as u64,
-                }),
-            }
-        })
-        .collect()
-}
-
-fn narrow(n: u64) -> i32 {
-    i32::try_from(n).unwrap_or(i32::MAX)
-}
-
-/// The rows a fire's kernels write through its readout plane: a readout as
-/// tall as the fire is launched at the fire's bucket, so the plane must
-/// hold the bucket, not only the rows read out.
-/// A fire that reads nothing out (an idle expert-parallel rank's) writes
-/// nothing through it.
-fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
-    if readouts == 0 {
-        return 0;
-    }
-    let pad = kernels_cuda::Pad { rows, bucket };
-    u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
-}
-
-impl Shell {
+    /// A fire's group masks, one a packing an attention stating a mask
+    /// reads, in the load's order (`Shell::stated_feeds`;
+    /// `Inputs::stage_group_masks` stages the `i`th in the `i`th stretch),
+    /// where some lane's class reads them (`group_masked`): the masks are
+    /// data its one body reads, every ragged attention's. A group no lane of
+    /// which states a mask has the offset -1, which the kernel reads as
+    /// "none" (every row of the group admitted, no bit read); a lane stating
+    /// none in a group beside one stating a mask admits every row.
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],
@@ -1986,15 +2695,34 @@ impl Shell {
                     })
             })
             .collect();
-        if stated.iter().all(Option::is_none) {
+        let reads = composition
+            .lanes()
+            .iter()
+            .any(|row| self.group_masked.contains(row.class as usize));
+        if !reads && stated.iter().all(Option::is_none) {
             return Ok(Vec::new());
         }
-        if self.feeds.ragged.is_empty() {
+        if self.stated_feeds.is_empty() {
             return Err(Fault::program(
                 "serve::mask",
-                "a kv-less lane states an attention mask and this model packs no attention \
-                 group; the mask applies to group-packed `attention.ragged` only",
+                "a kv-less lane states an attention mask and this model states none on any \
+                 attention: only a group-packed `attention.ragged` its text spells \
+                 `stated_group_mask()` reads one",
             ));
+        }
+        // No lane states one: every group's offset says "none".
+        let unmasked = || poem_exec::fire::GroupMask {
+            bits: Vec::new(),
+            indptr: std::iter::repeat_n(-1, poem_exec::fire::groups_of(group_of_lane) as usize)
+                .chain([0])
+                .collect(),
+        };
+        if stated.iter().all(Option::is_none) {
+            return Ok(self
+                .stated_feeds
+                .iter()
+                .map(|&(q, kv)| (q, kv, unmasked()))
+                .collect());
         }
         let patch = self
             .voxels
@@ -2010,8 +2738,16 @@ impl Shell {
             guests[row.source as usize] =
                 poem_exec::fire::guest_rows(row, clips, patch).map_err(poem_exec::Error::Fire)?;
         }
-        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
-            stated.iter().map(Option::as_ref).collect();
+        let stated: Vec<poem_exec::fire::LaneMask> = stated
+            .into_iter()
+            .zip(&guests)
+            .map(|(mask, guest)| {
+                mask.unwrap_or_else(|| poem_exec::fire::LaneMask {
+                    rows: vec![vec![0..u64::MAX]; guest.count as usize],
+                })
+            })
+            .collect();
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> = stated.iter().map(Some).collect();
         let packed = |select: poem_ir::Selection| {
             packings
                 .iter()
@@ -2024,8 +2760,10 @@ impl Shell {
                 })
         };
         let mut staged = Vec::new();
-        for &(q, kv) in &self.feeds.ragged {
-            if let Some(mask) = poem_exec::fire::group_mask(
+        for &(q, kv) in &self.stated_feeds {
+            // An attention none of the fire's lanes reach reads no row of
+            // its stretch.
+            let mask = poem_exec::fire::group_mask(
                 composition.lanes(),
                 group_of_lane,
                 packed(q)?,
@@ -2034,9 +2772,8 @@ impl Shell {
                 &guests,
             )
             .map_err(poem_exec::Error::Fire)?
-            {
-                staged.push((q, kv, mask));
-            }
+            .unwrap_or_else(unmasked);
+            staged.push((q, kv, mask));
         }
         Ok(staged)
     }
@@ -2044,7 +2781,16 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_held, readout_extent};
+    use super::{fold_cell, fold_held, readout_extent};
+
+    #[test]
+    fn a_fold_cell_states_every_lanes_fold_or_a_fold_a_lane() {
+        assert_eq!(fold_cell(&[3], 0), Some(3));
+        assert_eq!(fold_cell(&[3], 5), Some(3));
+        assert_eq!(fold_cell(&[3, 4], 1), Some(4));
+        assert_eq!(fold_cell(&[3, 4], 2), None);
+        assert_eq!(fold_cell(&[], 0), None);
+    }
 
     #[test]
     fn a_readout_as_tall_as_the_fire_holds_the_bucket() {

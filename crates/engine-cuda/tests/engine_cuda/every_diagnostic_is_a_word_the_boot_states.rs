@@ -23,11 +23,11 @@ const WORDS: &[(&str, Reads)] = &[
         d.graph_dot.as_deref() == Some(std::path::Path::new("/tmp/dots"))
     }),
     ("fuse-chains=off", |d| !d.fuse_chains),
-    ("gumbel-direct=off", |d| !d.gumbel_direct),
     ("sync-guard=panic", |d| {
         d.sync_guard == Some(SyncGuard::Panic)
     }),
     ("chunk-bytes=1048576", |d| d.chunk_bytes == Some(1 << 20)),
+    ("unwritten-nan", |d| d.unwritten_nan),
 ];
 
 #[test]

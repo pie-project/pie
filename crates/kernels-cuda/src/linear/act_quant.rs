@@ -208,7 +208,7 @@ fn launch(
             let lanes = if v8 { u64::from(gran / 8) } else { 32 };
             let wide = if v8 { "_v8" } else { "" };
             // The eight-a-lane kernels wait on their producer in-kernel.
-            let pdl = v8 && ctx.tuning().pdl;
+            let pdl = v8 && ctx.tuning().pdl();
             // Codes for a token's routes: each token's blocks quantized once
             // and landed at each of its routes' rows.
             let fan = mode == 0 && src.div > 1 && src.pos != 0 && src.rows.is_multiple_of(src.div);
@@ -287,7 +287,7 @@ pub fn swiglu_quant(
     ctx.fire(
         op,
         Fire::at(kernel(ACT_QUANT, "::pie::linear::swiglu_quant_e4m3_v8"))
-            .apply(Launch::flat(threads, BLOCK).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::flat(threads, BLOCK).programmatic(ctx.tuning().pdl())),
         &[
             ArgValue::Ptr(h),
             int(rows)?,
@@ -403,7 +403,14 @@ pub fn scales_to_atoms(
 
 fn zero(ctx: &Ctx, op: &'static str, ptr: u64, bytes: usize) -> Result<(), Error> {
     // SAFETY: a slab of `bytes` the caller owns, on this context's stream.
-    let code = unsafe { rt::cudaMemsetAsync(ptr as *mut _, 0, bytes, ctx.stream().cast()) };
+    let code = unsafe {
+        if crate::sizing::active() {
+            // A size-only walk (`crate::sizing`) moves nothing.
+            rt::cudaError::cudaSuccess
+        } else {
+            rt::cudaMemsetAsync(ptr as *mut _, 0, bytes, ctx.stream().cast())
+        }
+    };
     if code != rt::cudaError::cudaSuccess {
         return Err(refuse(op, format!("cudaMemsetAsync answered {code:?}")));
     }
@@ -814,7 +821,7 @@ pub(crate) fn lay_out_quant_nvfp4(
         Fire::at(kernel(ROUTE, "::pie::linear::route_lay_out_quant_nvfp4")).apply(
             Launch::grid([grid, 1, 1], [256, 1, 1])
                 .smem(smem)
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
         ),
         &[
             routes.arg(),
@@ -1088,7 +1095,7 @@ pub(crate) fn weighted_gather(
     // A normed fire of `kernel.moe.gather_ahead_until` tokens or fewer has
     // eight routes in flight a round (its blocks too few to fill the
     // multiprocessors), else two.
-    let ahead = if tokens <= ctx.tuning().moe_gather_ahead_until {
+    let ahead = if tokens <= ctx.tuning().moe_gather_ahead_until() {
         8
     } else {
         2

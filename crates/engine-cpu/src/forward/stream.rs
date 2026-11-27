@@ -393,6 +393,7 @@ impl Forward {
             lanes: &mut self.lanes,
             group: self.group.as_ref(),
             placed: &self.placed,
+            context: self.context,
             rows: Some(&rows),
         };
         let (mut ins, mut outs, mut aliases) = (Vec::new(), Vec::new(), Vec::new());

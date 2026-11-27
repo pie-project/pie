@@ -7,8 +7,14 @@
 //! the segments as one virtual space (`kernels/prim/pool.slang`): virtual
 //! byte `p * chunk_bytes` is chunk `p`'s first.
 //!
-//! Segments come and go from the top, a whole buffer at a time and never on
-//! a fire's path ([`Pool::commit_segments`], [`Pool::release_segments`]).
+//! The top `span` chunks are the activation span ([`crate::arena`]): they
+//! lie in the last segment, never across two, and every segment holding
+//! one of them is backed from the load on (`Growth::TwoEnded`). Below
+//! them, segments come and go as a prefix, a whole buffer at a time and
+//! never on a fire's path ([`Pool::commit_segments`],
+//! [`Pool::release_segments`]). A rung lower than the largest lends the
+//! span under its carve to state; raising it moves that state out first
+//! ([`Pool::evacuate`]).
 //! The runtime names chunks logically; the pool places each on a physical
 //! chunk through its [`ChunkTable`], so emptying the top segment
 //! ([`Pool::evacuate`]) moves bytes and never renames a held slot.
@@ -23,27 +29,234 @@ use crate::handles::Handles;
 #[derive(Debug)]
 pub struct Pool<B: Backend> {
     segments: Vec<Option<B::Buffer>>,
+    /// A buffer of a few bytes for each segment, bound in its place while
+    /// it is not backed: what a fire binds of the pool is the same places
+    /// whatever is backed, and a backend that keeps recordings rebinds each
+    /// place as its segment comes and goes ([`Pool::placed`]). Laid with the
+    /// load's first commit.
+    stand_ins: Vec<B::Buffer>,
+    /// Whether segments commit and release while serving: the backend's
+    /// statement ([`Backend::RESIZES_POOL`]), unless its device lays the
+    /// pool whole ([`Pool::lay_whole`]).
+    resizes: bool,
     chunk_bytes: u64,
     total_chunks: u32,
     segment_chunks: u32,
-    /// Segments backed, the first ones.
-    committed: u32,
+    /// The u32 words of one whole segment, as kernels are told it.
+    segment_words: u32,
+    /// The activation span's chunks, the top ones.
+    span: u32,
+    /// The first segment holding a chunk of the span (the segment count
+    /// where there is none): it and every one above are backed for good.
+    top: u32,
     table: ChunkTable,
 }
 
-/// The chunks a segment holds: a quarter of the pool (the kernels bind four
-/// segments), never more than one binding spans, one at least.
+/// The chunks one binding holds, at least one.
+fn binding_chunks(chunk_bytes: u64, binding: u64) -> u32 {
+    u32::try_from(binding / chunk_bytes.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// The most segments a pool of `total_chunks` is cut into with its top
+/// `span` whole in the last ([`segment_chunks`]), of the `segs` the
+/// kernels bind.
+fn spanned_segments(total_chunks: u32, span: u32, segs: u32) -> u32 {
+    if span == 0 {
+        segs
+    } else {
+        (total_chunks / (span + segs - 1)).min(segs)
+    }
+}
+
+/// The chunks a segment holds for a pool of `total_chunks` whose top `span`
+/// lie in its last segment: the pool cut into as many segments as it may
+/// be (the kernels bind `segs`: [`SEGMENTS`], or one where the device
+/// binds a stage too few storage buffers for four), so commits stay fine,
+/// with each segment within one binding and the last at least the span. Cut
+/// into `n` segments of `ceil(total / n)`, the last holds at least
+/// `total / n - (n - 1)`, so `n <= total / (span + segs - 1)` keeps the span
+/// whole. `None`: no count of segments does both (the load is refused).
 #[must_use]
-pub fn segment_chunks(chunk_bytes: u64, total_chunks: u32, binding: u64) -> u32 {
-    let quarter = total_chunks.div_ceil(SEGMENTS as u32).max(1);
-    let fits = u32::try_from(binding / chunk_bytes.max(1)).unwrap_or(u32::MAX);
-    quarter.min(fits).max(1)
+pub fn segment_chunks(
+    chunk_bytes: u64,
+    total_chunks: u32,
+    binding: u64,
+    span: u32,
+    segs: u32,
+) -> Option<u32> {
+    let fits = binding_chunks(chunk_bytes, binding);
+    let most = spanned_segments(total_chunks, span, segs);
+    let least = total_chunks.div_ceil(fits);
+    (most > 0 && least <= most).then(|| total_chunks.div_ceil(most))
+}
+
+/// A pool's size: the room it is cut from, its chunks, the chunks of each
+/// segment, and the chunks the kernels index state in (a whole count of
+/// segments' worth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sized {
+    pub room: u64,
+    pub total: u32,
+    pub segment_chunks: u32,
+    pub words: u32,
+}
+
+/// The pool `left` bytes hold (or `kv_budget` of state beside the span,
+/// within `left`) in chunks of `chunk_bytes`: `least_chunks` of state (one
+/// working set) beside a top rung's `act` chunks, bound in at most `segs`
+/// segments of no more than `binding` bytes, with the span in the last.
+pub fn sized(
+    left: u64,
+    kv_budget: Option<u64>,
+    chunk_bytes: u64,
+    act: u32,
+    least_chunks: u32,
+    binding: u64,
+    segs: u32,
+) -> Result<Sized> {
+    let chunk = chunk_bytes;
+    let room = kv_budget.map_or(left, |budget| {
+        budget.saturating_add(u64::from(act) * chunk).min(left)
+    });
+    let total = engine::chunk::fit(room, chunk, act, least_chunks)
+        .map_err(|short| Fault::Residency(short.to_string()))?;
+    let binds =
+        u32::try_from((binding / chunk).saturating_mul(u64::from(segs))).unwrap_or(u32::MAX);
+    // Whole segments of an equal share of the pool, all within the
+    // bf16-element index the kernels address the pool by.
+    let words = u32::try_from(2 * u64::from(u32::MAX) / chunk).unwrap_or(u32::MAX) / segs * segs;
+    // State lies within that index; the span past it is the fire's
+    // alone (bound by offset, never indexed), at every rung.
+    let total = total.min(binds).min(words.saturating_add(act));
+    // As many segments as hold the span whole in the last, each within one
+    // binding: chunks past what those bind are not laid. A span near a
+    // binding cuts the pool into few segments, and a pool between whole
+    // counts of them binds only the lower count's.
+    let total = total
+        .min(spanned_segments(total, act, segs).saturating_mul(binding_chunks(chunk, binding)));
+    let span_short = || {
+        Fault::Residency(format!(
+            "one working set takes {least_chunks} chunks of {chunk} bytes beside a fire's \
+             {act}, and this device binds {} of {} MiB",
+            match segs {
+                1 if cfg!(target_arch = "wasm32") => {
+                    "one segment (the tab's pool is always one)".to_string()
+                }
+                1 => "one segment (its stage binds too few storage buffers for four)".to_string(),
+                4 => "four segments".to_string(),
+                n => format!("{n} segments"),
+            },
+            binding >> 20
+        ))
+    };
+    let segment_chunks = segment_chunks(chunk, total, binding, act, segs).ok_or_else(span_short)?;
+    if total < least_chunks + act {
+        return Err(span_short());
+    }
+    Ok(Sized {
+        room,
+        total,
+        segment_chunks,
+        words,
+    })
+}
+
+/// Why a rung is no rung of this device: one of its reservations (the span,
+/// an arm's readout seat, pixel plane or inputs store) passes one binding.
+pub const PAST_ONE_BINDING: &str = "past one binding";
+
+/// Why a rung is no rung of this device: its span and one working set at
+/// the context lie in no pool the device's room leaves, cut into segments
+/// with the span whole in the last.
+pub const PAST_THE_POOL: &str = "its span and one working set past the pool the room leaves";
+
+/// A top rung as the pool weighs it: its fires' `tokens`, its span's `act`
+/// chunks, the bytes the device leaves a pool of a load cut to it, and the
+/// widest reservation one of its fires binds whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rung {
+    pub tokens: u32,
+    pub act: u32,
+    pub left: u64,
+    pub widest: u64,
+}
+
+/// Why `rung` cannot be a load's top: a reservation past one `binding`
+/// ([`PAST_ONE_BINDING`]), or its span and one working set of
+/// `least_chunks` past the pool its room gives (or `kv_budget` of state
+/// beside the span), cut into segments of at most `binding` bytes with the
+/// span whole in the last ([`sized`], [`PAST_THE_POOL`]). `None`: it can.
+#[must_use]
+pub fn infeasible(
+    rung: &Rung,
+    kv_budget: Option<u64>,
+    chunk_bytes: u64,
+    least_chunks: u32,
+    binding: u64,
+    segs: u32,
+) -> Option<&'static str> {
+    if rung.widest > binding {
+        Some(PAST_ONE_BINDING)
+    } else if sized(
+        rung.left,
+        kv_budget,
+        chunk_bytes,
+        rung.act,
+        least_chunks,
+        binding,
+        segs,
+    )
+    .is_err()
+    {
+        Some(PAST_THE_POOL)
+    } else {
+        None
+    }
+}
+
+/// The widest of `rungs` that can be a load's top ([`infeasible`]).
+/// `None`: none can.
+#[must_use]
+pub fn widest_rung(
+    rungs: &[Rung],
+    kv_budget: Option<u64>,
+    chunk_bytes: u64,
+    least_chunks: u32,
+    binding: u64,
+    segs: u32,
+) -> Option<u32> {
+    rungs
+        .iter()
+        .filter(|rung| {
+            infeasible(rung, kv_budget, chunk_bytes, least_chunks, binding, segs).is_none()
+        })
+        .map(|rung| rung.tokens)
+        .max()
+}
+
+/// The u32 words of a segment of `segment_chunks` chunks of `chunk_bytes`,
+/// which every kernel reading the pool is told: a segment too long for the
+/// count is refused at the load, never stated short.
+fn segment_words(chunk_bytes: u64, segment_chunks: u32) -> Result<u32> {
+    let words = u64::from(segment_chunks) * chunk_bytes / 4;
+    u32::try_from(words).map_err(|_| Fault::Ceiling {
+        what: "words of one segment of the state pool (a kernel is told a segment in u32 words)",
+        need: words,
+        have: u64::from(u32::MAX),
+    })
 }
 
 impl<B: Backend> Pool<B> {
     /// A pool of `total_chunks` chunks of `chunk_bytes`, segments of
-    /// `segment_chunks`, nothing committed.
-    pub fn reserve(chunk_bytes: u64, total_chunks: u32, segment_chunks: u32) -> Result<Pool<B>> {
+    /// `segment_chunks`, the top `span` the activation's; nothing committed.
+    pub fn reserve(
+        chunk_bytes: u64,
+        total_chunks: u32,
+        segment_chunks: u32,
+        [lent, span]: [u32; 2],
+    ) -> Result<Pool<B>> {
         if chunk_bytes == 0 || total_chunks == 0 || segment_chunks == 0 {
             return Err(Fault::Ceiling {
                 what: "chunks of the state pool",
@@ -59,8 +272,10 @@ impl<B: Backend> Pool<B> {
                 have: SEGMENTS as u64,
             });
         }
-        // The kernels index the pool in u32 words, a bf16 at a time.
-        let bytes = chunk_bytes * u64::from(segments * segment_chunks);
+        // The kernels index state in u32 words, a bf16 at a time: every
+        // chunk under the smallest rung's activation (`lent` chunks); what
+        // lies past it is the fire's alone, bound by offset.
+        let bytes = chunk_bytes * u64::from(total_chunks.saturating_sub(lent));
         if bytes / 2 > u64::from(u32::MAX) {
             return Err(Fault::Ceiling {
                 what: "bytes of the state pool (a kernel indexes it a bf16 at a time)",
@@ -68,12 +283,29 @@ impl<B: Backend> Pool<B> {
                 have: 2 * u64::from(u32::MAX),
             });
         }
+        if span >= total_chunks
+            || (span > 0 && (total_chunks - span) / segment_chunks + 1 != segments)
+        {
+            return Err(Fault::Ceiling {
+                what: "chunks of the activation span in the pool's last segment",
+                need: u64::from(span),
+                have: u64::from(total_chunks - (segments - 1) * segment_chunks),
+            });
+        }
         Ok(Pool {
             segments: (0..segments).map(|_| None).collect(),
+            stand_ins: Vec::new(),
+            resizes: B::RESIZES_POOL,
             chunk_bytes,
             total_chunks,
             segment_chunks,
-            committed: 0,
+            segment_words: segment_words(chunk_bytes, segment_chunks)?,
+            span,
+            top: if span == 0 {
+                segments
+            } else {
+                (total_chunks - span) / segment_chunks
+            },
             table: ChunkTable::identity(total_chunks),
         })
     }
@@ -99,23 +331,48 @@ impl<B: Backend> Pool<B> {
         self.segments.len() as u32
     }
 
+    /// The buffers of the segments backed, in order.
     #[must_use]
-    pub fn committed_segments(&self) -> u32 {
-        self.committed
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.segments.iter().flatten().collect()
     }
 
-    /// The chunks with memory behind them: the first ones, a whole number
-    /// of segments (the last one short where the pool ends).
+    /// The segments backed from the first on, without a gap.
     #[must_use]
-    pub fn committed_chunks(&self) -> u32 {
-        self.committed
-            .saturating_mul(self.segment_chunks)
-            .min(self.total_chunks)
+    pub fn committed_segments(&self) -> u32 {
+        self.segments
+            .iter()
+            .take_while(|segment| segment.is_some())
+            .count() as u32
+    }
+
+    /// The activation span's chunks.
+    #[must_use]
+    pub fn span(&self) -> u32 {
+        self.span
+    }
+
+    /// The pool is laid whole and stands so: its device cannot rebind what a
+    /// recording binds of it ([`crate::backend::Context::resizes_pool`]).
+    pub fn lay_whole(&mut self) {
+        self.resizes = false;
+    }
+
+    /// Whether segments commit and release while serving.
+    #[must_use]
+    pub fn resizes(&self) -> bool {
+        self.resizes
     }
 
     #[must_use]
     pub fn growth(&self) -> Growth {
-        Growth::Bottom
+        if !self.resizes {
+            Growth::Fixed
+        } else if self.span > 0 {
+            Growth::TwoEnded
+        } else {
+            Growth::Bottom
+        }
     }
 
     /// The bytes one segment's buffer holds: its chunks (the last one
@@ -149,15 +406,39 @@ impl<B: Backend> Pool<B> {
 
     /// Refuses a physical chunk with no memory behind it.
     pub fn admit(&self, physical: u32) -> Result<()> {
-        let have = self.committed_chunks();
-        if physical >= have {
+        let segment = physical / self.segment_chunks;
+        let backed = physical < self.total_chunks
+            && self
+                .segments
+                .get(segment as usize)
+                .is_some_and(Option::is_some);
+        if !backed {
             return Err(Fault::Ceiling {
-                what: "committed chunks of the state pool",
-                need: u64::from(physical) + 1,
-                have: u64::from(have),
+                what: "committed segments of the state pool",
+                need: u64::from(segment) + 1,
+                have: u64::from(self.committed_segments()),
             });
         }
         Ok(())
+    }
+
+    /// The span's buffer, the pool's last segment, and the byte in it the
+    /// span (the pool) ends at; `None` until that segment is backed.
+    #[must_use]
+    pub fn span_place(&self) -> Option<(&B::Buffer, u64)> {
+        let last = self.segments() - 1;
+        self.segments[last as usize]
+            .as_ref()
+            .map(|buffer| (buffer, self.segment_bytes(last)))
+    }
+
+    /// The virtual byte the span's buffer (the last segment's,
+    /// [`Self::span_place`]) starts at.
+    #[must_use]
+    pub fn span_base(&self) -> u64 {
+        u64::from(self.segments().saturating_sub(1))
+            * u64::from(self.segment_chunks)
+            * self.chunk_bytes
     }
 
     /// The segment buffer virtual byte `at` lies in and its offset there;
@@ -172,30 +453,54 @@ impl<B: Backend> Pool<B> {
             .ok_or(Fault::Ceiling {
                 what: "committed segments of the state pool",
                 need: segment + 1,
-                have: u64::from(self.committed),
+                have: u64::from(self.committed_segments()),
             })?;
         Ok((buffer, at % span))
     }
 
+    /// Each segment's buffer where it is backed, beside its stand-in
+    /// ([`Pool::bind`]), for the segments below the span's (those commit
+    /// and release; the span's stand for good); empty before the load's
+    /// first commit.
+    #[must_use]
+    pub fn placed(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.segments
+            .iter()
+            .take(self.top as usize)
+            .zip(&self.stand_ins)
+            .map(|(backed, stand_in)| (backed.as_ref(), stand_in))
+            .collect()
+    }
+
     /// The pool as kernels bind it: every committed segment, the rest
-    /// absent.
-    pub fn bind(&self, handles: &Handles<B>) -> Result<Segments> {
+    /// their stand-ins (absent before the first commit). Where `below` is
+    /// stated (a fire's rung's carve start in the last segment, on a device
+    /// whose pool is one segment), the last segment is bound up to it: the
+    /// fire's activations lie past it, in their own bindings, and the
+    /// state below it, so no two views of the buffer overlap.
+    pub fn bind(&self, handles: &Handles<B>, below: Option<u64>) -> Result<Segments> {
         let mut bufs = [kernels_slang::ABSENT; SEGMENTS];
+        let last = self.segments.len().saturating_sub(1);
         for (at, segment) in self.segments.iter().enumerate() {
-            if let Some(buffer) = segment {
-                bufs[at] = handles.bind(buffer, 0, buffer.bytes())?;
+            if let Some(buffer) = segment.as_ref().or(self.stand_ins.get(at)) {
+                let bytes = match below {
+                    Some(below) if at == last && segment.is_some() => below.min(buffer.bytes()),
+                    _ => buffer.bytes(),
+                };
+                bufs[at] = handles.bind(buffer, 0, bytes)?;
             }
         }
-        let words = u64::from(self.segment_chunks) * self.chunk_bytes / 4;
         Ok(Segments {
             bufs,
-            words: u32::try_from(words).unwrap_or(u32::MAX),
+            words: self.segment_words,
         })
     }
 
-    /// Backs the first `segments` segments, each zeroed; what is backed
-    /// already stands, and fewer than are backed is no change.
+    /// Backs the first `segments` segments and every one holding the span,
+    /// each zeroed; what is backed already stands. The span's bytes are
+    /// entered as the fire's in the device's books.
     pub fn commit_segments(&mut self, device: &B::Context, segments: u32) -> Result<()> {
+        use crate::backend::Context as _;
         let max = self.segments();
         if segments > max {
             return Err(Fault::Ceiling {
@@ -204,34 +509,57 @@ impl<B: Backend> Pool<B> {
                 have: u64::from(max),
             });
         }
-        for segment in self.committed..segments {
-            let buffer = B::Buffer::zeroed(device, self.segment_bytes(segment))?;
+        if self.stand_ins.is_empty() {
+            self.stand_ins = (0..max)
+                .map(|_| B::Buffer::zeroed(device, 16, crate::books::owners::DUMMY))
+                .collect::<Result<Vec<_>>>()?;
+        }
+        for segment in (0..segments).chain(self.top..max) {
+            if self.segments[segment as usize].is_some() {
+                continue;
+            }
+            let buffer = B::Buffer::zeroed(
+                device,
+                self.segment_bytes(segment),
+                crate::books::owners::POOL,
+            )?;
             self.segments[segment as usize] = Some(buffer);
-            self.committed = segment + 1;
+            if segment == max - 1 && self.span > 0 {
+                device.books().relabel(
+                    crate::books::owners::POOL,
+                    crate::books::owners::SPAN,
+                    u64::from(self.span) * self.chunk_bytes,
+                );
+            }
         }
         Ok(())
     }
 
-    /// Gives back every segment at and past `segments`. The caller has
-    /// drained every frame, and the runtime evacuated their chunks first.
-    pub fn release_segments(&mut self, segments: u32) {
-        for segment in segments..self.committed {
-            self.segments[segment as usize] = None;
-        }
-        self.committed = self.committed.min(segments);
+    /// Gives back every segment at and past `segments` below the span's.
+    /// The caller has drained every frame, and the runtime evacuated their
+    /// chunks first.
+    ///
+    /// The buffers given back are answered, for the caller to drop once
+    /// nothing binds them (a recording is rebound to the stand-ins first).
+    #[must_use = "the buffers given back are dropped once nothing binds them"]
+    pub fn release_segments(&mut self, segments: u32) -> Vec<B::Buffer> {
+        (segments..self.top)
+            .filter_map(|segment| self.segments[segment as usize].take())
+            .collect()
     }
 
-    /// Copies each moved chunk onto its new physical chunk in `frame`, then
-    /// takes the moves into the table: the caller commits `frame` before any
-    /// later fire is encoded, so the copies land first.
-    /// Returns each move as `(from, to)` physical chunks, for what lies
-    /// beside the pool indexed by physical chunk.
+    /// Records each moved chunk's copy onto its new physical chunk in
+    /// `frame`, then takes the moves into the table and hands back the
+    /// table as it stood. Nothing is committed: the caller resolves what
+    /// the moves leave to repoint against the new table, then commits
+    /// `frame` before any later fire is encoded (the copies land first), or
+    /// puts the old table back ([`Pool::restore`]) and drops `frame`, its
+    /// copies unsubmitted. Refused with the table as it stood.
     pub fn evacuate(
         &mut self,
         frame: &mut B::Frame,
         evacuation: &Evacuation,
-    ) -> Result<Vec<(u32, u32)>> {
-        let mut moved = Vec::with_capacity(evacuation.moves.len());
+    ) -> Result<ChunkTable> {
         let mut table = self.table.clone();
         table.apply(evacuation).map_err(|why| Fault::Program {
             at: "store::pool::evacuate",
@@ -244,7 +572,6 @@ impl<B: Backend> Pool<B> {
             if from == physical {
                 continue;
             }
-            moved.push((from, physical));
             self.copy(
                 frame,
                 u64::from(from) * self.chunk_bytes,
@@ -252,8 +579,19 @@ impl<B: Backend> Pool<B> {
                 self.chunk_bytes,
             )?;
         }
+        Ok(std::mem::replace(&mut self.table, table))
+    }
+
+    /// Puts back the table an evacuation replaced ([`Pool::evacuate`]),
+    /// its copies dropped unsubmitted.
+    pub fn restore(&mut self, table: ChunkTable) {
         self.table = table;
-        Ok(moved)
+    }
+
+    /// The chunk table as it stands.
+    #[must_use]
+    pub fn table(&self) -> &ChunkTable {
+        &self.table
     }
 
     /// Writes `from` at virtual byte `at` through the queue, after every
@@ -261,6 +599,7 @@ impl<B: Backend> Pool<B> {
     pub fn write(&mut self, at: u64, from: &[u8]) -> Result<()> {
         let span = u64::from(self.segment_chunks) * self.chunk_bytes;
         let segment = usize::try_from(at / span).unwrap_or(usize::MAX);
+        let committed = self.committed_segments();
         let buffer = self
             .segments
             .get_mut(segment)
@@ -268,7 +607,7 @@ impl<B: Backend> Pool<B> {
             .ok_or(Fault::Ceiling {
                 what: "committed segments of the state pool",
                 need: segment as u64 + 1,
-                have: u64::from(self.committed),
+                have: u64::from(committed),
             })?;
         buffer.write(at % span, from)
     }
@@ -287,20 +626,88 @@ impl<B: Backend> Pool<B> {
         buffer.read(local, into)
     }
 
-    /// Zeroes `len` bytes at virtual byte `at`. The caller has drained every
-    /// frame that touches them.
-    pub fn zero(&mut self, at: u64, len: u64) -> Result<()> {
-        let span = u64::from(self.segment_chunks) * self.chunk_bytes;
-        let segment = usize::try_from(at / span).unwrap_or(usize::MAX);
-        let buffer = self
-            .segments
-            .get_mut(segment)
-            .and_then(Option::as_mut)
-            .ok_or(Fault::Ceiling {
-                what: "committed segments of the state pool",
-                need: segment as u64 + 1,
-                have: u64::from(self.committed),
-            })?;
-        buffer.zero_span(at % span, len)
+    /// Zeroes `len` bytes at virtual byte `at` in `frame`; the run crosses
+    /// no segment.
+    pub fn zero(&self, frame: &mut B::Frame, at: u64, len: u64) -> Result<()> {
+        let (buffer, local) = self.locate(at)?;
+        frame.fill_zero(buffer, local, len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segment_words;
+    use crate::error::Fault;
+
+    /// A segment's length in words is stated whole or the load is refused:
+    /// 16 GiB is one word past what a u32 counts.
+    #[test]
+    fn a_segment_past_u32_words_is_refused() {
+        let chunk = 4 << 20;
+        assert_eq!(segment_words(chunk, 1).ok(), Some(1 << 20));
+        assert_eq!(segment_words(chunk, 4095).ok(), Some(4095 << 20));
+        let refused = segment_words(chunk, 4096).expect_err("2^32 words");
+        assert!(
+            matches!(
+                refused,
+                Fault::Ceiling { need, have, .. } if need == 1 << 32 && have == u64::from(u32::MAX)
+            ),
+            "{refused}"
+        );
+    }
+
+    /// Qwen3-8B on a 32 GiB card binding 4095 MiB (14.5 GiB of weights):
+    /// its widest rungs' spans pass one binding, so the top is the widest
+    /// that lies in one, and the load boots; at the top asked it is refused.
+    #[test]
+    fn a_top_rung_past_one_binding_is_no_rung() {
+        const MIB: u64 = 1 << 20;
+        let chunk: u64 = 2_425_856;
+        let binding = 4095 * MIB;
+        // What the fit leaves the pool beside the weights, and one working
+        // set at the declared context.
+        let (left, least) = (18_390_605_824, 257);
+        // `(rung tokens, span bytes)` as the load lays them, asked 10240.
+        let spans: [(u32, u64); 15] = [
+            (1, 9_880_832),
+            (2, 19_728_384),
+            (4, 39_390_720),
+            (8, 78_715_392),
+            (16, 157_364_736),
+            (32, 314_663_424),
+            (64, 629_260_800),
+            (128, 1_258_455_552),
+            (256, 2_516_845_056),
+            (512, 5_033_624_064),
+            (1024, 5_235_343_872),
+            (2048, 5_638_783_488),
+            (4096, 5_978_915_328),
+            (8192, 6_348_014_080),
+            (10240, 6_532_563_456),
+        ];
+        let act = |top: u32| {
+            let bytes = spans.iter().find(|&&(tokens, _)| tokens == top).unwrap().1;
+            u32::try_from(bytes.div_ceil(chunk)).unwrap()
+        };
+        let top = crate::arena::bound_top(&spans, binding).expect("a rung lies in one binding");
+        assert_eq!(top, 256);
+        let pool = super::sized(left, None, chunk, act(top), least, binding, 4)
+            .expect("the bounded load boots");
+        assert!(u64::from(pool.segment_chunks) * chunk <= binding);
+        assert!(pool.total >= least + act(top));
+        // The top asked is refused as the load refused it.
+        let refused = super::sized(left, None, chunk, act(10240), least, binding, 4)
+            .expect_err("a span past one binding");
+        assert_eq!(
+            refused.to_string(),
+            Fault::Residency(
+                "one working set takes 257 chunks of 2425856 bytes beside a fire's 2693, and \
+                 this device binds four segments of 4095 MiB"
+                    .to_string()
+            )
+            .to_string()
+        );
+        // No rung at all lies in a binding narrower than the least span.
+        assert_eq!(crate::arena::bound_top(&spans, 8 * MIB), None);
     }
 }

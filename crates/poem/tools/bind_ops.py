@@ -72,6 +72,7 @@ PARAMS = {
 ROW_NAMED = {
     "attn::attend": "kv",
     "attn::attend_mla": "kv",
+    "attn::capture_scores": "kv",
     "attn::score_capture": "kv",
     "inputs::kv": "name",
     "inputs::state": "name",

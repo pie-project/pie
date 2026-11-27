@@ -153,7 +153,7 @@ impl ForwardHybrid for DoubleBlock {
             &indptr,
             HEAD_DIM,
             SM_SCALE,
-            RaggedMask::GroupBlockDiagonal,
+            RaggedMask::Stated,
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
@@ -609,6 +609,7 @@ impl Rig {
                 residency,
                 ordinal: 0,
                 frames_in_flight: 1,
+                steps: Default::default(),
             })
             .expect("the miniature loads");
         Rig {
@@ -688,6 +689,7 @@ impl Rig {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             },
         )
         .expect("the channel registers");
@@ -702,6 +704,11 @@ impl Rig {
                 seeds: Vec::new(),
                 geometry: GeometryClass::Host,
                 device_resolved: Default::default(),
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
+                scratch: engine::ScratchPlace::None,
+                pair: engine::ScratchPlace::None,
                 extents: engine::program::BindExtents {
                     row_count: rows,
                     token_count: rows,
@@ -709,6 +716,7 @@ impl Rig {
                     query_len: rows,
                     ..engine::program::BindExtents::default()
                 },
+                pair_generation: 0,
             })
             .expect("the instance binds")
             .id
@@ -780,6 +788,7 @@ impl Rig {
                 attachments,
                 media: Vec::new(),
                 voxels,
+                shape: None,
             }))
             .expect("the frame fires");
         self.engine
@@ -858,11 +867,18 @@ pub fn lanes_read(
 }
 
 pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
+    attach_over(lane, 1, instance)
+}
+
+/// `instance` attached over the fire's lanes `lane..lane + lanes`: the
+/// rows it may read are theirs.
+pub fn attach_over(lane: u32, lanes: u32, instance: InstanceId) -> Attachment {
     Attachment {
         lane,
-        lanes: 1,
+        lanes,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 

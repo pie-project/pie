@@ -5,19 +5,6 @@ use crate::linear::skeleton::{Epilogue, In, Paging};
 
 const GEMV: &str = "linear/gemv.cu";
 
-/// `out[n] = act . weight[n]` for one row: the gemv skeleton with the plain
-/// store filled in. The GEMM tuner's `Gemv` tactic.
-pub(crate) fn gemv_bf16(
-    ctx: &Ctx,
-    weight: u64,
-    act: u64,
-    out: u64,
-    n: i32,
-    k: i32,
-) -> Result<(), Error> {
-    gemv(ctx, Epilogue::store(), weight, act, &[], &[out], None, n, k)
-}
-
 /// The gemv skeleton's kernel for `epi` over `n` columns, and whether it splits
 /// each column's K over a block (`kernel.gemv.splitk_max_n` columns at
 /// most) and its warps a block. `kernel.gemv.bf16`: Blackwell profiles pick
@@ -27,8 +14,8 @@ pub(crate) fn gemv_kernel(
     n: i32,
     tuning: &crate::tuning::Tuning,
 ) -> (&'static Kernel, bool, u32) {
-    let narrow = tuning.gemv_narrow;
-    if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
+    let narrow = tuning.gemv_narrow();
+    if n.unsigned_abs() <= tuning.gemv_splitk_max_n() {
         let (class, warps) = if narrow { ("4, 2", 4) } else { ("8, 1", 8) };
         (epi.kernel("gemv_splitk_skeleton", class), true, warps)
     } else {
@@ -80,7 +67,8 @@ pub fn gemv(
     };
     ctx.fire(
         OP,
-        Fire::at(kernel).apply(Launch::grid([grid, 1, 1], [32, warps, 1]).programmatic(tuning.pdl)),
+        Fire::at(kernel)
+            .apply(Launch::grid([grid, 1, 1], [32, warps, 1]).programmatic(tuning.pdl())),
         &[
             ArgValue::Ptr(weight),
             ArgValue::Ptr(act),
@@ -95,13 +83,31 @@ pub fn gemv(
 /// A generated body holds no fields; C++ gives the empty struct one byte.
 const NO_FIELDS: u8 = 0;
 
-/// The warps a row of the few-rows kernel splits K over: eight where K
-/// divides so, the most blocks and the fewest dependent loads a lane.
+/// The warps a row of the few-rows kernel splits K over: the most (of
+/// eight) that divide K's eight-element vectors and still give each of a
+/// warp's 32 lanes one of its slice (a split past that leaves lanes idle);
+/// one where none does.
 fn rows_split(k: i32) -> i32 {
+    let vectors = k / 8;
     [8, 4, 2, 1]
         .into_iter()
-        .find(|s| (k / 8) % s == 0)
+        .find(|s| vectors % s == 0 && vectors / s >= 32)
         .unwrap_or(1)
+}
+
+/// The threads a block of the few-rows kernel runs.
+const ROWS_THREADS: u32 = 256;
+
+/// The weight rows a block of the few-rows kernel takes: its eight warps in
+/// groups of `split` over K, two weight rows a warp. A warp of four weight
+/// rows (each activation load reused over twice the rows) is no candidate:
+/// it runs the same flops over the same bytes in half the blocks, so under
+/// the device's wave rule (`engine::roofline::Constants::wave_ns`) it never
+/// costs less, and on the L40S it measured slower at every product of
+/// eight decode rows of Qwen3-0.6B (qkv 14.8 against 13.0 us, gate | up
+/// 21.4 / 19.2, o 9.0 / 8.1, down 12.7 / 11.9, the head 413 / 395).
+fn rows_per_block(k: i32) -> u32 {
+    (8 / rows_split(k)).unsigned_abs() * 2
 }
 
 /// The blocks a cluster of the few-rows kernel splits a row's K over besides:
@@ -113,7 +119,7 @@ pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
         return 1;
     }
     let split = rows_split(k);
-    let blocks = n.unsigned_abs().div_ceil(16 / split as u32);
+    let blocks = n.unsigned_abs().div_ceil(rows_per_block(k));
     if blocks <= 32 && (k / 8) % (split * 4) == 0 {
         4
     } else {
@@ -121,17 +127,33 @@ pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
     }
 }
 
+/// The blocks the few-rows kernel's grid takes over `n` columns of K `k`
+/// (each of its cluster's blocks besides).
+pub(crate) fn rows_blocks(n: i32, k: i32) -> u32 {
+    n.unsigned_abs().div_ceil(rows_per_block(k))
+}
+
 /// The few-rows skeleton's kernel for `epi` at `m x n x k`, its blocks and its
 /// cluster.
 pub(crate) fn rows_kernel(epi: &Epilogue, m: i32, n: i32, k: i32) -> (&'static Kernel, u32, u32) {
     let split = rows_split(k);
-    let rows = 16 / split;
     let cl = rows_cluster(n, k);
     (
         epi.kernel("rows_skeleton", &format!("{m}, {split}, {cl}")),
-        n.unsigned_abs().div_ceil(rows as u32),
+        rows_blocks(n, k),
         cl,
     )
+}
+
+/// The blocks of the few-rows kernel's plain product at `m x n x k` one
+/// multiprocessor of the current device holds at once, at its launch's
+/// [`ROWS_THREADS`] and no dynamic shared memory: the driver's occupancy
+/// calculator over the kernel's registers and shared memory
+/// ([`Kernel::resident_blocks`]).
+pub(crate) fn rows_resident_blocks(m: i32, n: i32, k: i32) -> Result<u32, Error> {
+    rows_kernel(Epilogue::store(), m, n, k)
+        .0
+        .resident_blocks(ROWS_THREADS, 0)
 }
 
 /// `out[m][n] = act[m] . weight[n]` for a few rows: the few-rows skeleton with
@@ -204,7 +226,7 @@ pub fn gemm_rows(
     ctx.fire(
         OP,
         Fire::at(kernel).apply(
-            Launch::grid([blocks * cl, 1, 1], [256, 1, 1])
+            Launch::grid([blocks * cl, 1, 1], [ROWS_THREADS, 1, 1])
                 .programmatic(pdl)
                 .cluster(cl),
         ),

@@ -137,8 +137,16 @@ pub struct Census {
 /// Reads every row `trace` remembers; with `state_f32`, a state row takes
 /// four bytes an element but an integer one (the backend widens it). With
 /// `rs_mamba2`, a Mamba-2 layer buffers its rows as a gated-delta one does
-/// ([`super::ChunkProfile::rs_mamba2`]).
-pub fn census(trace: &Trace, state_f32: bool, rs_mamba2: bool) -> Result<Census, ChunkError> {
+/// ([`super::ChunkProfile::rs_mamba2`]). With `rs_corrected`, a gated-delta
+/// layer's rows keep its corrected values and keys besides
+/// ([`super::ChunkProfile::rs_corrected`]).
+pub fn census(
+    trace: &Trace,
+    state_f32: bool,
+    rs_mamba2: bool,
+    rs_corrected: bool,
+    rs_scalars: bool,
+) -> Result<Census, ChunkError> {
     let readers = readers(trace);
     let mut out = Census::default();
     for (at, row) in trace.caches.iter().enumerate() {
@@ -191,7 +199,7 @@ pub fn census(trace: &Trace, state_f32: bool, rs_mamba2: bool) -> Result<Census,
             }
         }
     }
-    for (row, rs) in rs_rows(trace, &readers, rs_mamba2)? {
+    for (row, rs) in rs_rows(trace, &readers, rs_mamba2, rs_corrected, rs_scalars)? {
         out.rs.insert(row.id, rs);
         out.rs_rows.push(row);
     }
@@ -433,14 +441,19 @@ fn atom(slab: &[u64], bytes: u64, read: &Read, shard: &Shard) -> Atom {
 /// The rs buffer: a per-token row of `width` a chunked recurrence whose
 /// commit is deferred, `width` the planes it replays (as the engines'
 /// `store::rs::read` lay them): the conv's input, then the gate prep's
-/// `[b | a]` (gated delta) or the forget and beta projections (KDA); then a
-/// row an n-gram id window, its unfolded token ids (as Metal's rs layout
-/// buffers them, in their own dtype). `RowId::Rs(n)`: the recurrences in
-/// node order, then the windows in the order their first reader stands.
+/// `[b | a]` (gated delta) or the forget and beta projections (KDA); a
+/// buffered conv no recurrence reads (`rs::Feeds::Alone`, Qwen4's PLE
+/// conv), its input alone; then a row an n-gram id window, its unfolded
+/// token ids (as Metal's rs layout buffers them, in their own dtype).
+/// `RowId::Rs(n)`: the recurrences and lone convs in node order, then the
+/// windows in the order their first reader stands. Which convs are buffered
+/// is [`crate::rs::buffered_convs`], the rule every backend reads.
 fn rs_rows(
     trace: &Trace,
     readers: &[Read],
     rs_mamba2: bool,
+    rs_corrected: bool,
+    rs_scalars: bool,
 ) -> Result<Vec<(TokenRow, RsRow)>, ChunkError> {
     let mut defined: HashMap<u32, usize> = HashMap::new();
     let mut outs = Vec::new();
@@ -452,41 +465,109 @@ fn rs_rows(
         }
     }
     let op_of = |id: ValueId| defined.get(&id.0).map(|n| &trace.nodes[*n].op);
-    let conv_x = |id| match op_of(id) {
-        Some(Operation::Ssm(Ssm::CausalConv1dChunked { x, .. })) => Some(*x),
-        _ => None,
-    };
+    // The prompt convs the rs buffer covers (`crate::rs::buffered_convs`,
+    // the rule every backend's rs layout reads), by their output: a
+    // recurrence's planes start with its conv's input, and a conv no
+    // recurrence reads is a row of its own.
+    let buffered: Vec<crate::rs::BufferedConv> = crate::rs::buffered_convs(trace, rs_mamba2)
+        .filter(|conv| conv.chunked)
+        .collect();
+    let by_y: HashMap<u32, crate::rs::BufferedConv> =
+        buffered.iter().map(|conv| (conv.y.0, *conv)).collect();
+    let conv_x = |id: ValueId| by_y.get(&id.0).map(|conv| conv.x);
     let cache = |id: ValueId| match trace.values.get(id.0 as usize).map(|d| &d.def) {
         Some(Def::Cache(row)) => Some(*row),
         _ => None,
     };
     let mut recurrences = Vec::new();
     let mut windows: Vec<(u32, ValueId, Option<u32>)> = Vec::new();
-    for node in &trace.nodes {
+    for (at, node) in trace.nodes.iter().enumerate() {
+        if let Some(conv) = buffered
+            .iter()
+            .find(|conv| conv.node == at && conv.feeds == crate::rs::Feeds::Alone)
+        {
+            recurrences.push((vec![(conv.x, None)], conv.state, node.layer));
+            continue;
+        }
         match &node.op {
+            // With `rs_corrected` a row keeps its keys (the conv output's
+            // key heads, bf16) and its corrected values (`u`, the value
+            // its delta rule writes, f32): a decode step reads the buffered
+            // rows as a linear attention over them and never re-steps one.
+            // Then, with `rs_scalars`, its per-head scalars
+            // (`crate::rs::gdn_scalars_bytes`), keyed by the gate prep's
+            // output: the `[b | a]` plane stays for a reader that recomputes
+            // them.
             Operation::Ssm(Ssm::GatedDeltaChunked {
-                qkv, gates, state, ..
+                qkv,
+                gates,
+                state,
+                y,
+                k_heads,
+                k_dim,
+                v_heads,
+                v_dim,
+                ..
             }) => {
                 let ba = match op_of(*gates) {
                     Some(Operation::Ssm(Ssm::GdnGates { ba, .. })) => Some(*ba),
                     _ => None,
                 };
                 if let Some((x, ba)) = conv_x(*qkv).zip(ba) {
-                    recurrences.push((vec![x, ba], *state, node.layer));
+                    let mut planes = vec![(x, None), (ba, None)];
+                    if rs_corrected {
+                        planes.push((*qkv, Some(u64::from(k_heads * k_dim) * RS_ELEMENT)));
+                        planes.push((*y, Some(u64::from(v_heads * v_dim) * 4)));
+                        if rs_scalars {
+                            planes.push((*gates, Some(crate::rs::gdn_scalars_bytes(*v_heads))));
+                        }
+                    }
+                    recurrences.push((planes, *state, node.layer));
                 }
             }
+            // With `rs_corrected` a KDA row keeps its keys (the conv
+            // output's key plane, bf16) and its corrected values (f32), as
+            // a gated-delta row does.
             Operation::Ssm(Ssm::KdaChunked {
-                mixed, f, b, state, ..
+                mixed,
+                f,
+                b,
+                state,
+                y,
+                heads,
+                head_dim,
+                ..
             }) => {
                 if let Some(x) = conv_x(*mixed) {
-                    recurrences.push((vec![x, *f, *b], *state, node.layer));
+                    let mut planes = vec![(x, None), (*f, None), (*b, None)];
+                    if rs_corrected {
+                        let width = u64::from(heads * head_dim);
+                        planes.push((*mixed, Some(width * RS_ELEMENT)));
+                        planes.push((*y, Some(width * 4)));
+                    }
+                    recurrences.push((planes, *state, node.layer));
                 }
             }
             // A Mamba-2 layer replays its conv's input and its step sizes;
-            // its gate `z` reads only the rows a fire lands.
-            Operation::Ssm(Ssm::Mamba2Chunked { xbc, dt, state, .. }) if rs_mamba2 => {
+            // its gate `z` reads only the rows a fire lands. With
+            // `rs_corrected` a row keeps its convolved `x | B` (the conv
+            // output but its `C`), which its decode step reads it by.
+            Operation::Ssm(Ssm::Mamba2Chunked {
+                xbc,
+                dt,
+                state,
+                groups,
+                state_dim,
+                ..
+            }) => {
                 if let Some(x) = conv_x(*xbc) {
-                    recurrences.push((vec![x, *dt], *state, node.layer));
+                    let mut planes = vec![(x, None), (*dt, None)];
+                    if rs_corrected {
+                        let xbc_width = width_of(trace, *xbc).ok_or(ChunkError::UnsizedRs)?;
+                        let xb = xbc_width.saturating_sub(u64::from(groups * state_dim));
+                        planes.push((*xbc, Some(xb * RS_ELEMENT)));
+                    }
+                    recurrences.push((planes, *state, node.layer));
                 }
             }
             Operation::Gather(
@@ -523,13 +604,13 @@ fn rs_rows(
     for (values, state, layer) in recurrences {
         let mut planes = Vec::with_capacity(values.len());
         let mut width = 0u64;
-        for value in values {
-            let w = width_of(trace, value).ok_or(ChunkError::UnsizedRs)?;
-            width += w;
-            planes.push(RsPlane {
-                value,
-                bytes: w * RS_ELEMENT,
-            });
+        for (value, bytes) in values {
+            let bytes = match bytes {
+                Some(bytes) => bytes,
+                None => width_of(trace, value).ok_or(ChunkError::UnsizedRs)? * RS_ELEMENT,
+            };
+            width += bytes / RS_ELEMENT;
+            planes.push(RsPlane { value, bytes });
         }
         let row = cache(state);
         // The rs planes are cut as the recurrence's own state is: as many

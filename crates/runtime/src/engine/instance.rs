@@ -13,6 +13,12 @@ pub struct InstanceBindingPlan {
     pub engine_id: usize,
     pub pacing_wait_id: u64,
     pub binding: InstanceBinding,
+    /// The bind is a float pass's (a kv-less encoder's or embedding's): its
+    /// lanes read out every row they embed, which its extents do not state,
+    /// and land them through the engine's readout landing, not its fixed
+    /// readout store. A sequence pass's bind is held to the store by its
+    /// extents' `sampled_rows` (`SharedPool::readouts_refused`).
+    pub float: bool,
 }
 
 impl InstanceBindingPlan {
@@ -43,7 +49,14 @@ impl InstanceBindingPlan {
                 geometry,
                 extents,
                 device_resolved,
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
+                scratch: ::engine::ScratchPlace::None,
+                pair: ::engine::ScratchPlace::None,
+                pair_generation: 0,
             },
+            float: false,
         }
     }
 

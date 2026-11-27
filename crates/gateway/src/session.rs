@@ -31,12 +31,24 @@ pub struct TurnInput {
     pub message: ClientMessage,
     pub blobs: Vec<BlobRef>,
     pub priority: Priority,
+    /// How a launch goes on after output it has sent, if it can: then it
+    /// can be moved once running.
+    pub resume: Option<Resume>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Affinity {
-    Ephemeral,
-    Sticky,
+/// Given each `message` a launch emits, in order, the input that launches
+/// it again going on after them (`None` until it can). A turn that has one
+/// moves once it has sent output: launched again elsewhere under the same
+/// process, it sends the client only what follows.
+#[derive(Clone)]
+pub struct Resume(pub Arc<ResumeFn>);
+
+pub type ResumeFn = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+impl std::fmt::Debug for Resume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resume")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +60,8 @@ pub enum SessionError {
     Refused(String),
     /// The worker holding the session's handles is gone, and they with it.
     HandlesLost,
+    /// The cluster policy leaves off the worker holding them.
+    Excluded(WorkerId),
 }
 
 impl std::fmt::Display for SessionError {
@@ -61,6 +75,11 @@ impl std::fmt::Display for SessionError {
             SessionError::HandlesLost => {
                 f.write_str("dead: the worker holding this session's handles is gone")
             }
+            SessionError::Excluded(worker) => write!(
+                f,
+                "the policy excluded worker {}, which holds this launch's session",
+                worker.0
+            ),
         }
     }
 }
@@ -98,17 +117,31 @@ pub enum AdmitReject {
     Refused(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct DispatchFail;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchFail {
+    /// No worker took it.
+    NoWorker,
+    /// The policy's row leaves off the worker it is tied to.
+    Excluded(WorkerId),
+}
+
+/// What the gateway knows of a turn beyond what its client sent, for the
+/// cluster policies.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Facts {
+    /// The client connection it came on.
+    pub connection: Option<SessionId>,
+    /// The worker that holds its session's handles.
+    pub tied: Option<WorkerId>,
+}
 
 #[async_trait::async_trait]
 pub trait TurnRouter: Send + Sync + 'static {
-    async fn admit(&self, req: &Request) -> Result<(), AdmitReject>;
+    async fn admit(&self, req: &Request, facts: Facts) -> Result<(), AdmitReject>;
 
     async fn dispatch(
         &self,
         req: &Request,
-        affinity: Option<u64>,
         pinned: Option<WorkerId>,
     ) -> Result<WorkerId, DispatchFail>;
 
@@ -118,12 +151,18 @@ pub trait TurnRouter: Send + Sync + 'static {
 
     fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>>;
 
+    /// The workers a launch may run on.
+    fn eligible(&self) -> Vec<WorkerId>;
+
     fn launched(&self, _req: ReqId, _process: &str, _worker: WorkerId) {}
 
     fn ended(&self, _req: &Request, _outcome: Outcome, _by: By) {}
 
     /// A running turn moved to `worker`, or (`None`) could not.
     fn moved(&self, _req: &Request, _worker: Option<WorkerId>, _why: &str) {}
+
+    /// The worker started the turn's process.
+    fn started(&self, _req: &Request) {}
 }
 
 struct TurnState {
@@ -131,7 +170,6 @@ struct TurnState {
     /// Goes to this worker or nowhere: it holds what the turn names.
     pinned: Option<WorkerId>,
     request: Request,
-    affinity: Option<u64>,
     /// The client has been handed output: a process event (a message, a
     /// return, stdout, stderr, an error) or a file, not just the launch's
     /// answer. From then on the turn is not run again. It is marked as the
@@ -151,6 +189,9 @@ struct TurnState {
     answered: bool,
     process: Option<String>,
     lost: Arc<AtomicBool>,
+    resume: Option<Resume>,
+    /// The launch input that goes on after the output sent so far.
+    resumed: Option<String>,
 }
 
 struct Inner {
@@ -172,6 +213,35 @@ fn relaunch(turn: &mut TurnState, old: WorkerId) {
     turn.relaunched = turn.answered;
 }
 
+/// The upload a frame is of: its id, which chunk, and of how many.
+fn upload_of(message: &ClientMessage) -> Option<(u32, usize, usize)> {
+    match message {
+        ClientMessage::AddProgram {
+            corr_id,
+            chunk_index,
+            total_chunks,
+            ..
+        } => Some((*corr_id, *chunk_index, *total_chunks)),
+        _ => None,
+    }
+}
+
+/// What one worker said to a chunk: its answer, if it had one; or it was
+/// lost first.
+async fn answer_of(mut rx: mpsc::Receiver<Tokens>) -> Result<Option<(bool, String)>, ()> {
+    let mut answer = None;
+    while let Some(token) = rx.recv().await {
+        match token {
+            Tokens::Chunk(ServerMessage::Response { ok, result, .. }) => {
+                answer = Some((ok, result));
+            }
+            Tokens::Chunk(_) => {}
+            Tokens::Eos => return Ok(answer),
+        }
+    }
+    answer.map(Some).ok_or(())
+}
+
 fn is_launch_answer(turn: &TurnState, message: &ServerMessage) -> bool {
     matches!(
         (&turn.request.message, message),
@@ -191,7 +261,7 @@ impl Inner {
         tenant: &TenantId,
         user: &str,
         mut input: TurnInput,
-        affinity: Option<u64>,
+        connection: Option<SessionId>,
         pinned: Option<WorkerId>,
         open: &Arc<AtomicBool>,
     ) -> Result<(ReqId, TokenRx, WorkerId), SessionError> {
@@ -212,7 +282,17 @@ impl Inner {
             executors: Vec::new(),
         };
 
-        if let Err(refusal) = self.router.admit(&request).await {
+        if let Err(refusal) = self
+            .router
+            .admit(
+                &request,
+                Facts {
+                    connection,
+                    tied: pinned,
+                },
+            )
+            .await
+        {
             let r = match refusal {
                 AdmitReject::Refused(why) => return Err(SessionError::Refused(why)),
                 AdmitReject::Full(why) => why,
@@ -243,7 +323,6 @@ impl Inner {
                     worker: None,
                     pinned,
                     request: request.clone(),
-                    affinity,
                     emitted: false,
                     sink: tx,
                     open: open.clone(),
@@ -253,6 +332,8 @@ impl Inner {
                     answered: false,
                     process: None,
                     lost: lost.clone(),
+                    resume: input.resume,
+                    resumed: None,
                 },
             );
         }
@@ -261,9 +342,7 @@ impl Inner {
         // where the turn landed, and `dispatch` can cancel it there.
         let inner = self.clone();
         let open = open.clone();
-        match tokio::spawn(async move { inner.dispatch(req_id, &request, affinity, &open).await })
-            .await
-        {
+        match tokio::spawn(async move { inner.dispatch(req_id, &request, &open).await }).await {
             Ok(Ok(worker)) => Ok((req_id, TokenRx { rx, lost }, worker)),
             // Busy or draining is not gone: the handles are still there.
             _ if pinned
@@ -271,8 +350,136 @@ impl Inner {
             {
                 Err(SessionError::HandlesLost)
             }
+            Ok(Err(DispatchFail::Excluded(worker))) => Err(SessionError::Excluded(worker)),
             _ => Err(SessionError::NoWorker),
         }
+    }
+
+    /// A frame about a program (a chunk of its upload, or whether it is
+    /// installed), to every worker of `to`: a program is launched on
+    /// whichever worker a launch is placed on, so it is there when each of
+    /// them has it. The client is answered once, when each worker still
+    /// there has: one lost meanwhile is left out, one that refuses an upload
+    /// fails it, by name, and one without the program answers for all. `to`
+    /// is left with the workers that took the frame.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one turn's whole context, as its session has it"
+    )]
+    async fn everywhere(
+        self: &Arc<Self>,
+        session: SessionId,
+        tenant: &TenantId,
+        user: &str,
+        input: TurnInput,
+        corr_id: u32,
+        to: Arc<Mutex<Vec<WorkerId>>>,
+        open: &Arc<AtomicBool>,
+    ) -> Result<(Vec<ReqId>, TokenRx), SessionError> {
+        let workers = to.lock().unwrap().clone();
+        let mut sent = Vec::new();
+        for &worker in &workers {
+            let req_id = ReqId(self.next_req.fetch_add(1, Ordering::Relaxed));
+            let request = Request {
+                req_id,
+                session,
+                tenant: tenant.clone(),
+                user: user.to_string(),
+                priority: input.priority,
+                blobs: input.blobs.clone(),
+                message: input.message.clone(),
+                cluster_props: Default::default(),
+                executors: Vec::new(),
+            };
+            let (tx, rx) = mpsc::channel(self.pipe_cap);
+            self.turns.lock().unwrap().insert(
+                req_id,
+                TurnState {
+                    worker: None,
+                    pinned: Some(worker),
+                    request: request.clone(),
+                    emitted: false,
+                    sink: tx,
+                    open: open.clone(),
+                    outcome: None,
+                    left: None,
+                    relaunched: false,
+                    answered: false,
+                    process: None,
+                    lost: Arc::default(),
+                    resume: None,
+                    resumed: None,
+                },
+            );
+            let inner = self.clone();
+            let open = open.clone();
+            let dispatch =
+                tokio::spawn(async move { inner.dispatch(req_id, &request, &open).await });
+            sent.push((worker, req_id, rx, dispatch));
+        }
+        // Each worker has this chunk before the next is sent. One that does
+        // not take it (gone, or draining) is out.
+        let mut taken = Vec::new();
+        for (worker, req_id, rx, dispatch) in sent {
+            match dispatch.await {
+                Ok(Ok(_)) => taken.push((worker, req_id, rx)),
+                _ => to.lock().unwrap().retain(|w| *w != worker),
+            }
+        }
+        if taken.is_empty() {
+            return Err(SessionError::NoWorker);
+        }
+        let reqs = taken.iter().map(|(_, req_id, _)| *req_id).collect();
+        let (tx, rx) = mpsc::channel(self.pipe_cap);
+        let several = workers.len() > 1;
+        let upload = upload_of(&input.message).is_some();
+        tokio::spawn(async move {
+            let mut accepted = None;
+            let mut refused = None;
+            let mut kept = false;
+            for (worker, _, rx) in taken {
+                match answer_of(rx).await {
+                    Ok(Some((false, why))) if refused.is_none() => {
+                        refused = Some(if several && upload {
+                            format!("worker {} refused the program: {why}", worker.0)
+                        } else {
+                            why
+                        });
+                    }
+                    // One worker without it: not installed.
+                    Ok(Some((true, result))) if upload || result != "true" => {
+                        accepted = Some(result);
+                    }
+                    Ok(Some((true, result))) => accepted = accepted.or(Some(result)),
+                    Ok(_) => kept = true,
+                    Err(()) => to.lock().unwrap().retain(|w| *w != worker),
+                }
+            }
+            let answer = match (refused, accepted) {
+                (Some(why), _) => Some((false, why)),
+                (None, accepted) => accepted.map(|result| (true, result)),
+            };
+            let answered = answer.is_some();
+            if let Some((ok, result)) = answer {
+                let _ = tx
+                    .send(Tokens::Chunk(ServerMessage::Response {
+                        corr_id,
+                        ok,
+                        result,
+                    }))
+                    .await;
+            }
+            if answered || kept {
+                let _ = tx.send(Tokens::Eos).await;
+            }
+        });
+        Ok((
+            reqs,
+            TokenRx {
+                rx,
+                lost: Arc::default(),
+            },
+        ))
     }
 
     /// Dispatches a turn and binds it to the worker that took it. A turn
@@ -282,7 +489,6 @@ impl Inner {
         &self,
         req_id: ReqId,
         request: &Request,
-        affinity: Option<u64>,
         open: &AtomicBool,
     ) -> Result<WorkerId, DispatchFail> {
         let pinned = self
@@ -291,11 +497,11 @@ impl Inner {
             .unwrap()
             .get(&req_id)
             .and_then(|turn| turn.pinned);
-        let worker = match self.router.dispatch(request, affinity, pinned).await {
+        let worker = match self.router.dispatch(request, pinned).await {
             Ok(worker) => worker,
-            Err(DispatchFail) => {
+            Err(why) => {
                 self.end(req_id, Outcome::Failed, By::Host);
-                return Err(DispatchFail);
+                return Err(why);
             }
         };
         let bound = {
@@ -361,20 +567,34 @@ impl Sessions {
         Self { inner }
     }
 
+    /// A session of one request. [`Self::connect`] is a connection's.
     pub async fn create(
         &self,
         ident: Identity,
         first: TurnInput,
-        affinity: Affinity,
+    ) -> Result<(SessionHandle, TokenRx), SessionError> {
+        self.open(ident, first, false).await
+    }
+
+    /// A client connection's session: its turns are known as one client's.
+    pub async fn connect(
+        &self,
+        ident: Identity,
+        first: TurnInput,
+    ) -> Result<(SessionHandle, TokenRx), SessionError> {
+        self.open(ident, first, true).await
+    }
+
+    async fn open(
+        &self,
+        ident: Identity,
+        first: TurnInput,
+        connection: bool,
     ) -> Result<(SessionHandle, TokenRx), SessionError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionError::Draining);
         }
         let session = SessionId(self.inner.next_session.fetch_add(1, Ordering::Relaxed));
-        let affinity_key = match affinity {
-            Affinity::Ephemeral => None,
-            Affinity::Sticky => Some(session.0),
-        };
         self.inner.live.fetch_add(1, Ordering::Relaxed);
         // Made before the first turn so a create dropped mid-dispatch still
         // releases its count and ends the session.
@@ -383,10 +603,11 @@ impl Sessions {
             session,
             tenant: ident.tenant,
             user: ident.user,
-            affinity_key,
+            connection: connection.then_some(session),
             current: Mutex::new(Vec::new()),
             open: Arc::new(AtomicBool::new(true)),
             holds_handles: Mutex::new(None),
+            uploads: Mutex::default(),
         };
         match handle.turn(first).await {
             Ok(rx) => Ok((handle, rx)),
@@ -438,6 +659,12 @@ impl Sessions {
                 self.note(turn, req_id, message);
                 if relaunch && matches!(message, ServerMessage::Response { ok: true, .. }) {
                     return Control::Continue;
+                }
+                if let ServerMessage::ProcessEvent { event, value, .. } = message
+                    && event == "message"
+                    && let Some(resume) = &turn.resume
+                {
+                    turn.resumed = (resume.0)(value);
                 }
                 if let ServerMessage::ProcessEvent { process_id, .. }
                 | ServerMessage::File { process_id, .. } = message
@@ -515,13 +742,22 @@ impl Sessions {
             if old == target || turn.outcome.is_some() {
                 return false;
             }
-            // Run again, it would send what the client already has, or find
-            // the handles it names left behind.
-            if turn.emitted || turn.request.message.uses_handles() {
+            // Run again from its input, it would send what the client
+            // already has, or find the handles it names left behind: it
+            // moves after output only going on from it.
+            if turn.request.message.uses_handles() {
                 Err(turn.request.clone())
-            } else {
+            } else if !turn.emitted {
                 relaunch(turn, old);
-                Ok((old, turn.request.clone(), turn.affinity, turn.open.clone()))
+                Ok((old, turn.request.clone(), turn.open.clone()))
+            } else if let Some(resumed) = turn.resumed.clone()
+                && let ClientMessage::LaunchProcess { input, .. } = &mut turn.request.message
+            {
+                *input = resumed;
+                relaunch(turn, old);
+                Ok((old, turn.request.clone(), turn.open.clone()))
+            } else {
+                Err(turn.request.clone())
             }
         };
         let entry = match entry {
@@ -531,15 +767,15 @@ impl Sessions {
                 self.inner.router.moved(
                     &request,
                     None,
-                    "it has sent output or names handles, so it finishes where it runs",
+                    "it has sent output it cannot go on from, or names handles, so it finishes where it runs",
                 );
                 return false;
             }
         };
-        let (old, request, affinity, open) = entry;
+        let (old, request, open) = entry;
         tracing::info!(req = %req_id, from = %old, to = %target, "moving a turn");
         self.inner.router.cancel(old, req_id).await;
-        match self.inner.dispatch(req_id, &request, affinity, &open).await {
+        match self.inner.dispatch(req_id, &request, &open).await {
             Ok(worker) => {
                 self.inner.router.moved(&request, Some(worker), "");
                 true
@@ -559,6 +795,20 @@ impl Sessions {
         }
     }
 
+    /// The worker says the turn's process started.
+    pub fn started(&self, req_id: ReqId) {
+        let request = self
+            .inner
+            .turns
+            .lock()
+            .unwrap()
+            .get(&req_id)
+            .map(|turn| turn.request.clone());
+        if let Some(request) = request {
+            self.inner.router.started(&request);
+        }
+    }
+
     pub fn redirect(&self, req_id: ReqId) {
         let inner = self.inner.clone();
         let entry = {
@@ -566,16 +816,16 @@ impl Sessions {
             match turns.get_mut(&req_id) {
                 Some(turn) => {
                     turn.worker = None;
-                    Some((turn.request.clone(), turn.affinity, turn.open.clone()))
+                    Some((turn.request.clone(), turn.open.clone()))
                 }
                 None => None,
             }
         };
-        let Some((request, affinity, open)) = entry else {
+        let Some((request, open)) = entry else {
             return;
         };
         tokio::spawn(async move {
-            let _ = inner.dispatch(req_id, &request, affinity, &open).await;
+            let _ = inner.dispatch(req_id, &request, &open).await;
         });
     }
 
@@ -601,15 +851,40 @@ pub struct SessionHandle {
     session: SessionId,
     tenant: TenantId,
     user: String,
-    affinity_key: Option<u64>,
+    connection: Option<SessionId>,
     current: Mutex<Vec<ReqId>>,
     open: Arc<AtomicBool>,
     /// Where this session's handles are, from its first frame that names one.
     holds_handles: Mutex<Option<WorkerId>>,
+    /// Its uploads under way, by id, and the workers that have each whole
+    /// so far.
+    uploads: Mutex<HashMap<u32, Arc<Mutex<Vec<WorkerId>>>>>,
 }
 
 impl SessionHandle {
     pub async fn turn(&self, next: TurnInput) -> Result<TokenRx, SessionError> {
+        if let Some((corr_id, chunk, chunks)) = upload_of(&next.message) {
+            // The workers an upload goes to are those at its first chunk:
+            // one that joins later has not the chunks before.
+            let to = {
+                let mut uploads = self.uploads.lock().unwrap();
+                if chunk == 0 {
+                    let to = Arc::new(Mutex::new(self.inner.router.eligible()));
+                    uploads.insert(corr_id, to);
+                }
+                let to = uploads.get(&corr_id).cloned();
+                if chunk + 1 >= chunks {
+                    uploads.remove(&corr_id);
+                }
+                to
+            }
+            .unwrap_or_else(|| Arc::new(Mutex::new(self.inner.router.eligible())));
+            return self.everywhere(next, corr_id, to).await;
+        }
+        if let ClientMessage::CheckProgram { corr_id, .. } = next.message {
+            let to = Arc::new(Mutex::new(self.inner.router.eligible()));
+            return self.everywhere(next, corr_id, to).await;
+        }
         let handles = next.message.uses_handles();
         let pinned = if handles {
             *self.holds_handles.lock().unwrap()
@@ -623,7 +898,7 @@ impl SessionHandle {
                 &self.tenant,
                 &self.user,
                 next,
-                self.affinity_key,
+                self.connection,
                 pinned,
                 &self.open,
             )
@@ -632,6 +907,28 @@ impl SessionHandle {
             *self.holds_handles.lock().unwrap() = Some(worker);
         }
         self.current.lock().unwrap().push(req_id);
+        Ok(rx)
+    }
+
+    async fn everywhere(
+        &self,
+        input: TurnInput,
+        corr_id: u32,
+        to: Arc<Mutex<Vec<WorkerId>>>,
+    ) -> Result<TokenRx, SessionError> {
+        let (reqs, rx) = self
+            .inner
+            .everywhere(
+                self.session,
+                &self.tenant,
+                &self.user,
+                input,
+                corr_id,
+                to,
+                &self.open,
+            )
+            .await?;
+        self.current.lock().unwrap().extend(reqs);
         Ok(rx)
     }
 
@@ -688,14 +985,14 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                 turns
                     .iter()
                     .filter(|(_, t)| t.worker.is_some_and(|w| !live.contains(&w)))
-                    .map(|(id, t)| (*id, t.affinity, t.open.clone()))
+                    .map(|(id, t)| (*id, t.open.clone()))
                     .collect()
             };
 
             // A turn that has sent no output is launched again from its own
             // input; one that has is told why it ends, and ends: what it sent
             // cannot be unsent.
-            for (req_id, affinity, open) in affected {
+            for (req_id, open) in affected {
                 enum Next {
                     Again(Box<Request>),
                     Lost(mpsc::Sender<Tokens>, Option<String>),
@@ -709,7 +1006,9 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                     let Some(old) = turn.worker else {
                         continue;
                     };
-                    if turn.outcome.is_some() {
+                    if turn.outcome.is_some() || upload_of(&turn.request.message).is_some() {
+                        // An upload goes on with the workers that still
+                        // have it whole.
                         Next::End
                     } else if turn.emitted || turn.request.message.uses_handles() {
                         // Its handles went with the worker: run again, it
@@ -725,7 +1024,7 @@ fn spawn_drop_watcher(inner: Arc<Inner>) {
                 };
                 match next {
                     Next::Again(request) => {
-                        let _ = inner.dispatch(req_id, &request, affinity, &open).await;
+                        let _ = inner.dispatch(req_id, &request, &open).await;
                     }
                     Next::Lost(sink, process_id) => {
                         // Ended first, so nothing the lost worker still sends
@@ -764,7 +1063,8 @@ mod tests {
         admit_ok: AtomicBool,
         dispatch_worker: Mutex<Option<WorkerId>>,
         dispatched: Mutex<Vec<ReqId>>,
-        affinities: Mutex<Vec<Option<u64>>>,
+        /// Where uploads go; with any, a pinned turn goes to its worker.
+        eligible: Mutex<Vec<WorkerId>>,
         pins: Mutex<Vec<Option<WorkerId>>>,
         cancels: Mutex<Vec<(WorkerId, ReqId)>>,
         ended: Mutex<Vec<SessionId>>,
@@ -787,7 +1087,7 @@ mod tests {
                 admit_ok: AtomicBool::new(true),
                 dispatch_worker: Mutex::new(worker),
                 dispatched: Mutex::new(Vec::new()),
-                affinities: Mutex::new(Vec::new()),
+                eligible: Mutex::default(),
                 pins: Mutex::new(Vec::new()),
                 cancels: Mutex::new(Vec::new()),
                 ended: Mutex::new(Vec::new()),
@@ -806,7 +1106,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TurnRouter for MockRouter {
-        async fn admit(&self, _req: &Request) -> Result<(), AdmitReject> {
+        async fn admit(&self, _req: &Request, _facts: Facts) -> Result<(), AdmitReject> {
             if self.admit_ok.load(Ordering::Acquire) {
                 Ok(())
             } else {
@@ -816,20 +1116,21 @@ mod tests {
         async fn dispatch(
             &self,
             req: &Request,
-            affinity: Option<u64>,
             pinned: Option<WorkerId>,
         ) -> Result<WorkerId, DispatchFail> {
             self.pins.lock().unwrap().push(pinned);
             self.dispatched.lock().unwrap().push(req.req_id);
             self.messages.lock().unwrap().push(req.message.clone());
-            self.affinities.lock().unwrap().push(affinity);
             if self.held.load(Ordering::Acquire) {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
             match *self.dispatch_worker.lock().unwrap() {
+                Some(_) if !self.eligible.lock().unwrap().is_empty() => {
+                    pinned.ok_or(DispatchFail::NoWorker)
+                }
                 Some(w) => Ok(w),
-                None => Err(DispatchFail),
+                None => Err(DispatchFail::NoWorker),
             }
         }
         async fn cancel(&self, worker: WorkerId, req: ReqId) {
@@ -840,6 +1141,9 @@ mod tests {
         }
         fn connected(&self) -> watch::Receiver<Arc<HashSet<WorkerId>>> {
             self.connected_rx.clone()
+        }
+        fn eligible(&self) -> Vec<WorkerId> {
+            self.eligible.lock().unwrap().clone()
         }
         fn launched(&self, req: ReqId, process: &str, worker: WorkerId) {
             self.launches
@@ -872,6 +1176,7 @@ mod tests {
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: None,
         }
     }
 
@@ -883,6 +1188,7 @@ mod tests {
             },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: None,
         }
     }
 
@@ -890,10 +1196,7 @@ mod tests {
     async fn a_session_with_handles_goes_nowhere_but_where_they_are() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (handle, _rx) = sessions
-            .create(ident(), handles(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), handles()).await.unwrap();
         let _ = handle.turn(handles()).await.unwrap();
         let _ = handle.turn(launch()).await.unwrap();
         assert_eq!(
@@ -919,10 +1222,7 @@ mod tests {
     async fn a_turn_naming_handles_is_never_run_again() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (handle, _rx) = sessions
-            .create(ident(), handles(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), handles()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         assert!(!sessions.migrate(req, WorkerId(8)).await);
         assert_eq!(router.dispatched.lock().unwrap().len(), 1);
@@ -941,10 +1241,7 @@ mod tests {
     async fn the_router_hears_where_a_launch_started_and_how_each_turn_ended() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (handle, mut rx) = sessions
-            .create(ident(), launch(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (handle, mut rx) = sessions.create(ident(), launch()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         let started = Tokens::Chunk(ServerMessage::Response {
             corr_id: 4,
@@ -996,6 +1293,7 @@ mod tests {
             message: ClientMessage::Ping { corr_id: 1 },
             blobs: Vec::new(),
             priority: Priority::Normal,
+            resume: None,
         }
     }
 
@@ -1011,10 +1309,7 @@ mod tests {
     async fn create_then_stream_chunk_and_eos() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, mut rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (_h, mut rx) = sessions.create(ident(), input()).await.unwrap();
 
         let req_id = router.dispatched.lock().unwrap()[0];
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Continue);
@@ -1036,10 +1331,7 @@ mod tests {
     async fn dropped_consumer_aborts_feed() {
         let router = MockRouter::new(Some(WorkerId(1)));
         let sessions = Sessions::new(router.clone());
-        let (_h, rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (_h, rx) = sessions.create(ident(), input()).await.unwrap();
         let req_id = router.dispatched.lock().unwrap()[0];
         drop(rx);
         assert_eq!(sessions.feed(req_id, chunk()).await, Control::Abort);
@@ -1049,10 +1341,7 @@ mod tests {
     async fn closing_a_session_ends_it_on_the_worker() {
         let router = MockRouter::new(Some(WorkerId(3)));
         let sessions = Sessions::new(router.clone());
-        let (handle, _rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), input()).await.unwrap();
         let session = handle.id();
         handle.close().await;
         assert!(router.ended.lock().unwrap().contains(&session));
@@ -1062,7 +1351,7 @@ mod tests {
     async fn no_worker_surfaces() {
         let router = MockRouter::new(None);
         let sessions = Sessions::new(router);
-        let res = sessions.create(ident(), input(), Affinity::Sticky).await;
+        let res = sessions.create(ident(), input()).await;
         assert!(matches!(res, Err(SessionError::NoWorker)));
     }
 
@@ -1080,10 +1369,7 @@ mod tests {
         if let ClientMessage::LaunchProcess { input, .. } = &mut turn.message {
             *input = r#"{"prompt":"hi"}"#.into();
         }
-        let (_h, mut rx) = sessions
-            .create(ident(), turn, Affinity::Sticky)
-            .await
-            .unwrap();
+        let (_h, mut rx) = sessions.create(ident(), turn).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         let answer = || {
             Tokens::Chunk(ServerMessage::Response {
@@ -1142,10 +1428,7 @@ mod tests {
     async fn a_turn_that_sent_output_fails_with_its_worker_and_says_why() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, mut rx) = sessions
-            .create(ident(), launch(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (_h, mut rx) = sessions.create(ident(), launch()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         sessions
             .feed_from(req, event("message"), Some(WorkerId(7)))
@@ -1173,10 +1456,7 @@ mod tests {
     async fn a_turn_that_sent_output_is_not_moved() {
         let router = MockRouter::new(Some(WorkerId(7)));
         let sessions = Sessions::new(router.clone());
-        let (_h, _rx) = sessions
-            .create(ident(), launch(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (_h, _rx) = sessions.create(ident(), launch()).await.unwrap();
         let req = router.dispatched.lock().unwrap()[0];
         assert!(
             sessions.migrate(req, WorkerId(8)).await,
@@ -1193,6 +1473,168 @@ mod tests {
         assert_eq!(router.dispatched.lock().unwrap().len(), 2);
     }
 
+    fn upload(index: usize) -> TurnInput {
+        TurnInput {
+            message: ClientMessage::AddProgram {
+                corr_id: 9,
+                program_hash: "h".into(),
+                file: "p.py".into(),
+                chunk_index: index,
+                total_chunks: 2,
+                chunk_data: vec![0],
+            },
+            ..input()
+        }
+    }
+
+    /// An upload goes to every worker a launch may run on, each chunk to
+    /// the workers of the first, and answers once each has answered. A
+    /// worker lost meanwhile is left out; one that refuses fails it, by
+    /// name.
+    #[tokio::test]
+    async fn an_upload_goes_to_every_worker_and_answers_once_each_has_it() {
+        let said = |ok: bool, result: &str| {
+            Tokens::Chunk(ServerMessage::Response {
+                corr_id: 9,
+                ok,
+                result: result.into(),
+            })
+        };
+        // What the last of three workers does with the last chunk: refuses
+        // it, or is lost.
+        for refuses in [true, false] {
+            let router = MockRouter::new(Some(WorkerId(1)));
+            let ids = [WorkerId(1), WorkerId(2), WorkerId(3)];
+            router._connected_tx.send_replace(Arc::new(ids.into()));
+            *router.eligible.lock().unwrap() = ids.into();
+            let sessions = Sessions::new(router.clone());
+            let (handle, mut rx) = sessions.connect(ident(), upload(0)).await.unwrap();
+            let first = router.dispatched.lock().unwrap().clone();
+            assert_eq!(first.len(), 3);
+            for req in first {
+                sessions.feed(req, Tokens::Eos).await;
+            }
+            assert!(matches!(rx.recv().await, Some(Tokens::Eos)));
+
+            // One that joins has not the chunks before.
+            router.eligible.lock().unwrap().push(WorkerId(4));
+            let mut rx = handle.turn(upload(1)).await.unwrap();
+            let last = router.dispatched.lock().unwrap()[3..].to_vec();
+            let mut pins = router.pins.lock().unwrap()[3..].to_vec();
+            pins.sort();
+            assert_eq!(pins, ids.map(Some));
+            let req_of = |worker| {
+                let turns = sessions.inner.turns.lock().unwrap();
+                *last
+                    .iter()
+                    .find(|req| turns[req].worker == Some(worker))
+                    .unwrap()
+            };
+            let reqs = ids.map(req_of);
+            for req in &reqs[..2] {
+                sessions.feed(*req, said(true, "p@1")).await;
+                sessions.feed(*req, Tokens::Eos).await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                    .await
+                    .is_err(),
+                "the third has not answered"
+            );
+            if refuses {
+                sessions.feed(reqs[2], said(false, "bad bytes")).await;
+                sessions.feed(reqs[2], Tokens::Eos).await;
+            } else {
+                let left = HashSet::from([WorkerId(1), WorkerId(2)]);
+                router._connected_tx.send_replace(Arc::new(left));
+            }
+            let Some(Tokens::Chunk(ServerMessage::Response { ok, result, .. })) =
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+            else {
+                panic!("an answer");
+            };
+            if refuses {
+                assert!(!ok);
+                assert_eq!(result, "worker 3 refused the program: bad bytes");
+            } else {
+                assert!(ok);
+                assert_eq!(result, "p@1");
+            }
+            assert!(matches!(rx.recv().await, Some(Tokens::Eos)));
+            assert_eq!(router.dispatched.lock().unwrap().len(), 6, "run once each");
+        }
+    }
+
+    /// A program is installed when every worker a launch may run on has it.
+    #[tokio::test]
+    async fn a_program_one_worker_lacks_is_not_installed() {
+        for (answers, installed) in [
+            (["true", "false"], "false"),
+            (["false", "true"], "false"),
+            (["true", "true"], "true"),
+        ] {
+            let router = MockRouter::new(Some(WorkerId(1)));
+            *router.eligible.lock().unwrap() = vec![WorkerId(1), WorkerId(2)];
+            let sessions = Sessions::new(router.clone());
+            let check = TurnInput {
+                message: ClientMessage::CheckProgram {
+                    corr_id: 9,
+                    inferlet: "p".into(),
+                },
+                ..input()
+            };
+            let (_h, mut rx) = sessions.connect(ident(), check).await.unwrap();
+            let reqs = router.dispatched.lock().unwrap().clone();
+            assert_eq!(reqs.len(), 2);
+            for (req, result) in reqs.into_iter().zip(answers) {
+                let said = Tokens::Chunk(ServerMessage::Response {
+                    corr_id: 9,
+                    ok: true,
+                    result: result.into(),
+                });
+                sessions.feed(req, said).await;
+                sessions.feed(req, Tokens::Eos).await;
+            }
+            let Some(Tokens::Chunk(ServerMessage::Response { result, .. })) = rx.recv().await
+            else {
+                panic!("an answer");
+            };
+            assert_eq!(result, installed);
+            assert!(matches!(rx.recv().await, Some(Tokens::Eos)));
+        }
+    }
+
+    /// A turn that can go on (it has a `Resume`) moves after it sent
+    /// output: it is cancelled where it was and launched again elsewhere
+    /// from what the client was sent.
+    #[tokio::test]
+    async fn a_turn_that_can_go_on_moves_after_output_under_its_process() {
+        let router = MockRouter::new(Some(WorkerId(7)));
+        let sessions = Sessions::new(router.clone());
+        let mut input = launch();
+        input.resume = Some(Resume(Arc::new(|value: &str| {
+            Some(format!("after {value}"))
+        })));
+        let (_h, _rx) = sessions.create(ident(), input).await.unwrap();
+        let req = router.dispatched.lock().unwrap()[0];
+        let said = Tokens::Chunk(ServerMessage::ProcessEvent {
+            process_id: "p".into(),
+            event: "message".into(),
+            value: "one".into(),
+        });
+        sessions.feed_from(req, said, Some(WorkerId(7))).await;
+        *router.dispatch_worker.lock().unwrap() = Some(WorkerId(8));
+        assert!(sessions.migrate(req, WorkerId(8)).await);
+        assert_eq!(*router.cancels.lock().unwrap(), [(WorkerId(7), req)]);
+        let ClientMessage::LaunchProcess { input, .. } = router.messages.lock().unwrap()[1].clone()
+        else {
+            panic!("a launch");
+        };
+        assert_eq!(input, "after one", "it goes on after what was sent");
+    }
+
     #[tokio::test]
     async fn cancelled_dispatches_are_cancelled_where_they_land() {
         let router = MockRouter::new(Some(WorkerId(7)));
@@ -1201,7 +1643,7 @@ mod tests {
 
         let create = tokio::spawn({
             let sessions = sessions.clone();
-            async move { sessions.create(ident(), input(), Affinity::Sticky).await }
+            async move { sessions.create(ident(), input()).await }
         });
         router.entered.notified().await;
         create.abort();
@@ -1216,10 +1658,7 @@ mod tests {
         assert_eq!(sessions.live(), 0);
 
         router.held.store(false, Ordering::Release);
-        let (handle, _rx) = sessions
-            .create(ident(), input(), Affinity::Sticky)
-            .await
-            .unwrap();
+        let (handle, _rx) = sessions.create(ident(), input()).await.unwrap();
         router.held.store(true, Ordering::Release);
         {
             let mut turn = Box::pin(handle.turn(input()));

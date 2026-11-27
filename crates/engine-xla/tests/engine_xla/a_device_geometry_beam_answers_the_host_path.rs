@@ -9,9 +9,9 @@
 
 use crate::common_dit;
 
-use common_dit::{Rig, Weights, assert_close, attach};
+use common_dit::{Rig, Weights, assert_close, attach, attach_over};
 use engine::fire::{Lane, Readout};
-use engine::{Channels, Programs};
+use engine::{Channels, Engine, Programs};
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
@@ -80,7 +80,7 @@ impl ForwardHybrid for Tiny {
     }
 }
 
-fn plan() -> Trace {
+pub(crate) fn plan() -> Trace {
     trace_hybrid("tiny-paged", &Tiny, Platform::Xla)
 }
 
@@ -123,8 +123,8 @@ fn beam_program() -> TraceContainer {
             bound(Port::EmbedTokens, 0),
             const_port(Port::EmbedIndptr, &(0..=BEAMS).collect::<Vec<_>>()),
             bound(Port::Positions, 1),
-            bound(Port::Slots, 2),
             bound(Port::KvLen, 3),
+            bound(Port::Slots, 2),
         ],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
@@ -151,7 +151,26 @@ fn words(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-fn host_lane(slot: u32, tokens: Vec<u32>, pages: Vec<u32>, held: u32) -> Lane {
+/// What a device beam's lane may write, as the runtime states it: past the
+/// shared prompt page (its frozen prefix, `folded`) to the end of the one
+/// page the fire makes the set's own, `folded` and the fire's one row
+/// rounded up to the page (`KvDelta::writable`).
+fn device_writes() -> engine::fire::KvDelta {
+    engine::fire::KvDelta {
+        folded: PAGE,
+        write_end: (PAGE + 1).div_ceil(PAGE) * PAGE,
+        ..engine::fire::KvDelta::default()
+    }
+}
+
+/// A lane of `tokens` on `pages` of the kv list `kv` past `held` keys.
+pub(crate) fn host_lane(
+    kv: engine::chunk::ShapeId,
+    slot: u32,
+    tokens: Vec<u32>,
+    pages: Vec<u32>,
+    held: u32,
+) -> Lane {
     let mut lane = Lane {
         slot,
         word: 0,
@@ -159,7 +178,7 @@ fn host_lane(slot: u32, tokens: Vec<u32>, pages: Vec<u32>, held: u32) -> Lane {
         readout: Readout::Last,
         ..Lane::default()
     };
-    lane.kv.pages = pages;
+    lane.tables.push((kv, pages));
     lane.kv.held = held;
     lane
 }
@@ -189,7 +208,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
     let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
     let shared = refs.take(kv);
     rig.fire(
-        vec![host_lane(0, prompt, vec![shared], 0)],
+        vec![host_lane(kv, 0, prompt, vec![shared], 0)],
         Vec::new(),
         Vec::new(),
     );
@@ -216,6 +235,11 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             seeds: Vec::new(),
             geometry: GeometryClass::DeviceGeometry,
             device_resolved: Default::default(),
+            instance_slots: Vec::new(),
+            ring_slots: Vec::new(),
+            adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
             extents: engine::program::BindExtents {
                 row_count: BEAMS,
                 token_count: BEAMS,
@@ -223,6 +247,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                 query_len: 1,
                 ..engine::program::BindExtents::default()
             },
+            pair_generation: 0,
         })
         .expect("a device-geometry instance binds")
         .id;
@@ -234,6 +259,7 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
         let host: Vec<Lane> = (0..BEAMS as usize)
             .map(|b| {
                 host_lane(
+                    kv,
                     1 + b as u32,
                     vec![beam_tokens[b]],
                     vec![shared, host_own[b]],
@@ -266,11 +292,13 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
                     readout: Readout::Last,
                     ..Lane::default()
                 };
-                lane.kv.translation = vec![shared, device_own[b as usize]];
+                lane.tables.push((kv, vec![shared, device_own[b as usize]]));
+                lane.list = engine::fire::ListKind::Translation;
+                lane.kv = device_writes();
                 lane
             })
             .collect();
-        rig.fire(lanes, vec![attach(0, instance)], Vec::new());
+        rig.fire(lanes, vec![attach_over(0, BEAMS, instance)], Vec::new());
         let got = rig.take(instance, 4);
         assert_eq!(
             got.len(),
@@ -287,9 +315,225 @@ fn a_device_resolved_beam_answers_what_the_host_path_answers() {
             );
         }
     }
+
+    // Attached over its first lane alone, the program's ports, which state
+    // two beams, would set the next lane's geometry (its positions and the
+    // slots its rows land in, through that lane's own table): refused by
+    // name, the lane after it being another request's.
+    let held = PAGE + steps.len() as u32;
+    for (chan, cell) in [
+        (0u32, words(&[7, 8])),
+        (1, words(&[held, held])),
+        (2, words(&[held, held])),
+        (3, words(&[held + 1, held + 1])),
+    ] {
+        assert!(
+            engine::Channels::publish(&mut rig.engine, instance, chan, &cell)
+                .expect("the cell publishes"),
+            "the ring had room"
+        );
+    }
+    let lanes: Vec<Lane> = (0..BEAMS)
+        .map(|b| {
+            let mut lane = Lane {
+                slot: 3 + b,
+                word: 0,
+                tokens: vec![0],
+                readout: Readout::Last,
+                ..Lane::default()
+            };
+            lane.tables.push((kv, vec![shared, device_own[b as usize]]));
+            lane.list = engine::fire::ListKind::Translation;
+            lane.kv = device_writes();
+            lane
+        })
+        .collect();
+    let refused = rig
+        .engine
+        .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
+            lanes,
+            attachments: vec![attach(0, instance)],
+            media: Vec::new(),
+            voxels: Vec::new(),
+            shape: None,
+        }))
+        .expect_err("ports stating a lane past the attachment's are refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("attached over 1 lane(s) at lane 0 and its `embed_indptr` port describes 2"),
+        "refused by name: {refused}"
+    );
 }
 
 /// A rope's queries and the keys it was given.
 fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
     (q, k.expect("a rope given keys turns them"))
+}
+
+/// A lane decodes greedily on the device: each pass's epilogue takes the
+/// logits' argmax and puts it in the instance's own `embed_tokens` ring,
+/// which the pool keeps in its `Channel` slots, and the next fire (a decode
+/// envelope) gathers that token there, with no trip to the host. Each step
+/// answers what the host path answers, fed the host's argmax of the same
+/// logits.
+#[test]
+fn device_fed_tokens_reach_the_next_fire() {
+    let Some(_device) = common_dit::device() else {
+        return;
+    };
+    let plan = plan();
+    let weights = Weights::random(&plan, 17);
+    let mut rig = Rig::load(plan, &weights, 64, vec![1, 2, 16, 32, 64], None);
+    let mut refs = crate::common_llm::Refs::of_facts(rig.loaded.caps.chunks.clone());
+    let kv = refs.shapes(|s| s.role == engine::chunk::SlotRole::State)[0].id;
+    let prompt: Vec<u32> = (0..PAGE).map(|i| (i * 7 + 3) % VOCAB).collect();
+    let shared = refs.take(kv);
+    rig.fire(
+        vec![host_lane(kv, 0, prompt, vec![shared], 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let (host_own, device_own) = (refs.take(kv), refs.take(kv));
+
+    let mut tokens_ring = channel(Shape::vector(1), EtaDtype::I32, HostRole::None);
+    tokens_ring.seeded = true;
+    let program = rig.register(TraceContainer {
+        names: vec!["logits".to_string()],
+        channels: vec![
+            tokens_ring,
+            channel(Shape::matrix(1, VOCAB), EtaDtype::F32, HostRole::Reader),
+        ],
+        ports: vec![
+            PortBinding {
+                port: Port::EmbedTokens,
+                source: PortSource::Channel(0),
+            },
+            const_port(Port::EmbedIndptr, &[0, 1]),
+        ],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops: vec![
+                Op::ChanTake(0),
+                Op::Output {
+                    index: 0,
+                    lane: 0,
+                    shape: Shape::matrix(1, VOCAB),
+                    dtype: EtaDtype::F32,
+                },
+                Op::ChanPut { chan: 1, value: 1 },
+                Op::ReduceArgmax(1),
+                Op::ChanPut { chan: 0, value: 2 },
+            ],
+        }],
+        externs: Vec::new(),
+        inputs: Vec::new(),
+    });
+    // The rings the instance keeps itself: one contiguous run of Channel
+    // slots each, as the runtime takes them.
+    let facts = engine::Programs::facts(&rig.engine, program).expect("the program's facts");
+    assert!(
+        facts.rings.iter().any(|r| r.channel == 0),
+        "the fed ring is kept in the pool"
+    );
+    let ring_slots: Vec<engine::program::RingSlots> = facts
+        .rings
+        .iter()
+        .map(|r| {
+            let mut got: Vec<u32> = (0..r.footprint.slots)
+                .map(|_| refs.take(engine_xla::store::layout::CHANNEL))
+                .collect();
+            got.sort_unstable();
+            assert!(
+                got.windows(2).all(|w| w[1] == w[0] + 1),
+                "one contiguous run: {got:?}"
+            );
+            engine::program::RingSlots {
+                channel: r.channel,
+                slots: got,
+            }
+        })
+        .collect();
+    let channels = vec![
+        engine::channel::ChannelId(u64::MAX),
+        rig.channel_of(vec![1, VOCAB], EtaDtype::F32, HostRole::Reader),
+    ];
+    let first = 11u32;
+    let instance = engine::Programs::bind(
+        &mut rig.engine,
+        &engine::program::InstanceBinding {
+            program,
+            channels,
+            seeds: vec![engine::channel::ChannelSeed {
+                channel: 0,
+                bytes: words(&[first]),
+            }],
+            geometry: GeometryClass::DecodeEnvelope,
+            device_resolved: Default::default(),
+            instance_slots: Vec::new(),
+            ring_slots,
+            adapter_slots: Vec::new(),
+            scratch: engine::ScratchPlace::None,
+            pair: engine::ScratchPlace::None,
+            extents: engine::program::BindExtents {
+                row_count: 1,
+                token_count: 1,
+                sampled_rows: 1,
+                query_len: 1,
+                ..engine::program::BindExtents::default()
+            },
+            pair_generation: 0,
+        },
+    )
+    .expect("the instance binds")
+    .id;
+
+    let argmax = |row: &[f32]| -> u32 {
+        (0..row.len())
+            .max_by(|&a, &b| row[a].total_cmp(&row[b]).then(b.cmp(&a)))
+            .map_or(0, |i| i as u32)
+    };
+    let mut host_token = first;
+    let mut wants = Vec::new();
+    for step in 0..2u32 {
+        let want = rig.fire(
+            vec![host_lane(
+                kv,
+                1,
+                vec![host_token],
+                vec![shared, host_own],
+                PAGE + step,
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        host_token = argmax(&want[0].values);
+        wants.push(want);
+    }
+    // The device path: two frames submitted back to back, neither settled
+    // (their logits come back through the reader ring, not the frame's
+    // readouts), so the second's token is still the first pass's put on
+    // the device when it is resolved.
+    for step in 0..2u32 {
+        let _ = rig
+            .engine
+            .submit(&engine::fire::FrameSubmission::of(engine::fire::Step {
+                lanes: vec![host_lane(
+                    kv,
+                    3,
+                    vec![0],
+                    vec![shared, device_own],
+                    PAGE + step,
+                )],
+                attachments: vec![attach(0, instance)],
+                media: Vec::new(),
+                voxels: Vec::new(),
+                shape: None,
+            }))
+            .expect("the frame fires");
+    }
+    let got: Vec<Vec<f32>> = (0..2).map(|_| rig.take(instance, 1)).collect();
+    for (step, (want, got)) in wants.iter().zip(&got).enumerate() {
+        assert_close(got, &want[0].values, &format!("step {step} logits"));
+    }
 }

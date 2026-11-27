@@ -41,6 +41,23 @@ class Pipeline:
         Resource drop has exactly these semantics.
         """
         raise NotImplementedError
+    def retract(self, fires: int) -> None:
+        """
+        Take back what the last `fires` fires submitted on this closed
+        pipeline wrote: a program that ran ahead of its stop (EOS, a stop
+        string) hands back the rows past it. Returns once every fire
+        submitted on it has landed; each working set those fires wrote
+        then ends where the first of them began writing it, and its pages
+        past that are released. Their outputs stay take-able. Refused on
+        an open pipeline, or past the fires submitted. A set whose rows
+        cannot be taken back (a recurrent state folded them, the device
+        placed them, a fold sealed the page they end in) fails the
+        pipeline by that name: the set is refused wherever it is used
+        next.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
     def speculation_advised(self) -> bool:
         """
         The host's advice to a program that trades compute for latency
@@ -59,4 +76,6 @@ class Pipeline:
         Release this resource.
         """
         raise NotImplementedError
+
+
 

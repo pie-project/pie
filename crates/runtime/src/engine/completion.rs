@@ -143,7 +143,12 @@ fn classify_terminal_outcome(value: u32) -> TerminalOutcome {
 
 #[derive(Debug)]
 enum SubmissionCompletionMode {
-    Terminal { cell: OwnedTerminalCell },
+    Terminal {
+        cell: OwnedTerminalCell,
+    },
+    /// Settled once published: a copy's landing, which has no outcome of
+    /// its own to tell.
+    Landed,
 }
 
 #[derive(Debug)]
@@ -198,12 +203,14 @@ impl SubmissionCompletionState {
                     "engine operation published invalid terminal outcome {value}"
                 ))),
             },
+            SubmissionCompletionMode::Landed => Some(Ok(())),
         }
     }
 
     fn terminal_cell_ptr(&self) -> Option<CellPtr> {
         match &self.mode {
             SubmissionCompletionMode::Terminal { cell } => Some(cell.as_mut_ptr()),
+            SubmissionCompletionMode::Landed => None,
         }
     }
 
@@ -255,9 +262,44 @@ impl CompletionBroker {
         )
     }
 
+    /// A completion that settles once [`Self::notify`] publishes its wait
+    /// id at `target_epoch`: a copy the engine answered as still landing
+    /// ([`::engine::Tiers::copy_landing`]), its wait id the copy's
+    /// token.
+    pub fn landing_completion(&self, target_epoch: u64) -> SubmissionCompletion {
+        self.make_submission_completion(target_epoch, SubmissionCompletionMode::Landed)
+    }
+
     pub fn notify(&self, wait_id: u64, epoch: u64) {
         let _ = self.inner.table.publish(wait_id, epoch);
     }
+
+    /// A copy answered as still landing ended without landing
+    /// ([`::engine::Landing::Failed`]): its completion settles as
+    /// [`CopyLandingFailed`], never as landed. Its destination is not to be
+    /// trusted, and its sources hold what they held.
+    pub fn fail(&self, wait_id: u64, epoch: u64, why: String) {
+        failed_landings().lock().unwrap().insert(wait_id, why);
+        let _ = self.inner.table.publish(wait_id, epoch);
+    }
+}
+
+/// A copy that did not land, said by the engine
+/// ([`::engine::Landing::Failed`]): its destination is not to be trusted,
+/// its sources hold what they held before it.
+#[derive(Debug, thiserror::Error)]
+#[error("the copy did not land: {0}")]
+pub struct CopyLandingFailed(pub String);
+
+/// Forgets the boot's failed landings no one read.
+pub(crate) fn reset() {
+    failed_landings().lock().unwrap().clear();
+}
+
+/// The landing completions told failed, by wait id, until read.
+fn failed_landings() -> &'static Mutex<std::collections::HashMap<u64, String>> {
+    static FAILED: OnceLock<Mutex<std::collections::HashMap<u64, String>>> = OnceLock::new();
+    FAILED.get_or_init(Mutex::default)
 }
 
 #[derive(Clone)]
@@ -348,6 +390,8 @@ impl SubmissionCompletion {
                                     "engine callback published before terminal outcome settled"
                                 )))
                             })
+                        } else if let Some(why) = failed_landings().lock().unwrap().remove(&slot) {
+                            Some(Err(anyhow::Error::new(CopyLandingFailed(why))))
                         } else {
                             Some(Ok(()))
                         }
@@ -439,10 +483,22 @@ struct WorkItemCompletionState {
     guard: Option<Arc<dyn CompletionLease>>,
     /// Run once the completion resolves (or, never resolved, as the last
     /// handle on it goes): see [`WorkItemCompletion::on_settled`].
-    on_settled: Mutex<Vec<SettledHook>>,
+    on_settled: Mutex<Vec<LandedHook>>,
 }
 
 type SettledHook = Box<dyn FnOnce() + Send>;
+
+/// A hook told whether its completion landed, as it resolved.
+type LandedHook = Box<dyn FnOnce(bool) + Send>;
+
+/// `hooks`, each told `landed` now: they may run once no handle on the
+/// completion is left, past where it could still be asked.
+fn told(hooks: Vec<LandedHook>, landed: bool) -> Vec<SettledHook> {
+    hooks
+        .into_iter()
+        .map(|hook| Box::new(move || hook(landed)) as SettledHook)
+        .collect()
+}
 
 std::thread_local! {
     /// Hooks gathered by [`settle_batched`] on this thread, run together
@@ -521,7 +577,7 @@ impl WorkItemCompletionState {
 
     fn settled(&self) {
         let hooks = std::mem::take(&mut *self.on_settled.lock().unwrap());
-        run_settled(hooks);
+        run_settled(told(hooks, matches!(self.result(), Some(Ok(())))));
     }
 
     fn target_epoch(&self) -> u64 {
@@ -630,7 +686,10 @@ impl Drop for WorkItemCompletionState {
             self.terminal.mark_recyclable();
         }
         // No one holds the work item any more: nothing runs it now.
-        run_settled(std::mem::take(self.on_settled.get_mut().unwrap()));
+        run_settled(told(
+            std::mem::take(self.on_settled.get_mut().unwrap()),
+            false,
+        ));
     }
 }
 
@@ -738,13 +797,21 @@ impl WorkItemCompletion {
     /// this takes no waker and no task: a hook runs where the completion
     /// resolves, with nothing left to poll.
     pub fn on_settled(&self, hook: impl FnOnce() + Send + 'static) {
+        self.on_settled_landed(move |_| hook());
+    }
+
+    /// [`Self::on_settled`], told whether it landed, as it resolved: never
+    /// where it resolved otherwise, or no handle on it was left unresolved.
+    /// Its hooks run off the resolving stack, often once the last handle
+    /// is gone, so what it is told is fixed where it resolves.
+    pub fn on_settled_landed(&self, hook: impl FnOnce(bool) + Send + 'static) {
         let mut hooks = self.state.on_settled.lock().unwrap();
-        if self.state.result().is_none() {
+        let Some(result) = self.state.result() else {
             hooks.push(Box::new(hook));
             return;
-        }
+        };
         drop(hooks);
-        hook();
+        hook(result.is_ok());
     }
 
     pub fn same_request(&self, other: &Self) -> bool {
@@ -781,30 +848,127 @@ struct PendingFrame {
     /// and the waiters on what it puts; `None` once the step has settled
     /// and published them.
     steps: Vec<Option<LandingStep>>,
-    frame_cell: CellPtr,
-    wait_id: u64,
-    epoch: u64,
+    /// The submission's cell, its waiter and epoch, settled once every
+    /// step is in: `None` on an engine frame of a submission that took
+    /// more than one, all but its last (a refusal of lanes stopped the
+    /// one before short, `engine::FrameTicket::refused`).
+    frame: Option<(CellPtr, u64, u64)>,
+    /// The launch this frame is one of, and its place in it, where the
+    /// launch took more than one engine frame.
+    split: Option<(Arc<SplitLaunch>, usize)>,
+}
+
+/// A launch the runtime submitted as several engine frames (a refusal of
+/// lanes stopped one short and the rest went again,
+/// `engine::FrameTicket::refused`): its frames land in the order they were
+/// submitted, and one landing before an earlier one is in fails every fire
+/// of the launch still landing, by name, rather than settle a fire on
+/// another frame's tokens.
+pub struct SplitLaunch {
+    launch: u64,
+    frames: usize,
+    order: Mutex<SplitOrder>,
+}
+
+#[derive(Default)]
+struct SplitOrder {
+    /// The frame whose steps land next.
+    next: usize,
+    /// Why the launch's frames are refused, once one landed out of order.
+    broken: Option<String>,
+}
+
+impl SplitLaunch {
+    /// A launch of `frames` engine frames, numbered launch-wide.
+    #[must_use]
+    pub fn new(frames: usize) -> Arc<SplitLaunch> {
+        static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Arc::new(SplitLaunch {
+            launch: LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            frames,
+            order: Mutex::new(SplitOrder::default()),
+        })
+    }
+
+    /// Whether a step of the launch's frame `index` may land: every frame
+    /// before it in, and none out of order yet.
+    fn admit(&self, index: usize) -> Result<(), String> {
+        let mut order = self.order.lock().unwrap();
+        if let Some(why) = &order.broken {
+            return Err(why.clone());
+        }
+        if index != order.next {
+            let why = format!(
+                "launch {} settled its engine frame {index} of {} while frame {} was \
+                 expected: a launch's frames land in the order they were submitted, so \
+                 its fires fail rather than take another frame's tokens",
+                self.launch, self.frames, order.next
+            );
+            order.broken = Some(why.clone());
+            return Err(why);
+        }
+        Ok(())
+    }
+
+    /// The launch's frame `index` is in.
+    fn finish(&self, index: usize) {
+        let mut order = self.order.lock().unwrap();
+        if order.next == index {
+            order.next = index + 1;
+        }
+    }
+}
+
+/// How a step landed, as far as its fires are concerned: the lanes that
+/// faulted, the whole frame lost (the lane went down under it), or the
+/// whole frame refused for why.
+enum Landing {
+    Lanes(Vec<engine::LaneFault>),
+    Lost,
+    Refused(String),
 }
 
 impl PendingFrame {
-    /// Takes out what step `step` settles, landing as `failed` says: that
-    /// step, or on a fault every step not yet published, and the frame once
-    /// none is left. Published with [`Landed::publish`], off the book's lock.
-    fn land(&mut self, step: usize, failed: bool) -> Landed {
-        let range = if failed {
-            0..self.steps.len()
-        } else {
-            step.min(self.steps.len())..(step + 1).min(self.steps.len())
+    /// Takes out what step `step` settles: that step as `landing` says,
+    /// or, the frame lost, every step not yet published; and the frame
+    /// once none is left. Published with [`Landed::publish`], off the
+    /// book's lock.
+    fn land(&mut self, step: usize, landing: Landing) -> Landed {
+        let landing = match (&self.split, landing) {
+            (Some((split, index)), Landing::Lanes(faults)) => match split.admit(*index) {
+                Ok(()) => Landing::Lanes(faults),
+                Err(why) => Landing::Refused(why),
+            },
+            (_, landing) => landing,
+        };
+        let (range, faults, lost, refused) = match landing {
+            Landing::Lost => (0..self.steps.len(), Vec::new(), true, None),
+            Landing::Refused(why) => (0..self.steps.len(), Vec::new(), true, Some(why)),
+            Landing::Lanes(faults) => (
+                step.min(self.steps.len())..(step + 1).min(self.steps.len()),
+                faults,
+                false,
+                None,
+            ),
         };
         let steps = self.steps[range]
             .iter_mut()
             .filter_map(Option::take)
             .collect();
-        let frame = (failed || self.steps.iter().all(Option::is_none))
-            .then(|| (self.frame_cell.clone(), self.wait_id, self.epoch));
+        let done = lost || self.steps.iter().all(Option::is_none);
+        if done
+            && !lost
+            && let Some((split, index)) = &self.split
+        {
+            split.finish(*index);
+        }
+        let frame = self.frame.clone().filter(|_| done);
         Landed {
             steps,
-            failed,
+            faults,
+            lost,
+            refused,
+            done,
             frame,
         }
     }
@@ -814,31 +978,45 @@ impl PendingFrame {
 /// cell and waiter once its last step is in.
 struct Landed {
     steps: Vec<LandingStep>,
-    failed: bool,
+    /// The lanes of its one step that faulted.
+    faults: Vec<engine::LaneFault>,
+    lost: bool,
+    /// Why the frame's fires are refused, where they are.
+    refused: Option<String>,
+    /// Every step of the frame is in.
+    done: bool,
     frame: Option<(CellPtr, u64, u64)>,
 }
 
 impl Landed {
     fn publish(self, broker: &CompletionBroker) {
-        let code = if self.failed {
+        let code = if self.lost {
             TERMINAL_OUTCOME_FAILED
         } else {
             TERMINAL_OUTCOME_SUCCESS
         };
+        let faults = &self.faults;
         settle_batched(|| {
-            for LandingStep {
-                cells,
-                completions,
-                wakes,
-            } in self.steps
-            {
-                settle(&cells, code);
-                // Each fire resolves as its step lands, so what waits on it
-                // goes on a step later rather than once the frame retires.
-                for completion in &completions {
-                    completion.resolve_landed("step settle");
+            for step in self.steps {
+                if let Some(why) = &self.refused {
+                    settle(&step.cells, TERMINAL_OUTCOME_FAILED);
+                    tracing::warn!(%why, "a launch's frame landed out of order; its fires fail");
+                    for completion in &step.completions {
+                        completion.mark_native_retired();
+                        completion.reject(why.clone());
+                    }
+                } else if faults.is_empty() {
+                    settle(&step.cells, code);
+                    // Each fire resolves as its step lands, so what waits
+                    // on it goes on a step later rather than once the frame
+                    // retires.
+                    for completion in &step.completions {
+                        completion.resolve_landed("step settle");
+                    }
+                } else {
+                    step.settle_lanes(faults);
                 }
-                for wait_id in &wakes {
+                for wait_id in &step.wakes {
                     let outcome = waker::WakerTable::global().wake(*wait_id);
                     tracing::debug!(wait_id, ?outcome, "published to a waiter");
                 }
@@ -857,7 +1035,68 @@ impl Landed {
 pub struct LandingStep {
     pub cells: Vec<CellPtr>,
     pub completions: Vec<WorkItemCompletion>,
+    /// Which of the step's lanes are each fire's: fire `i` (its cell and
+    /// its completion) has lanes `member_lanes[i]..member_lanes[i + 1]`.
+    pub member_lanes: Vec<u32>,
     pub wakes: Vec<u64>,
+}
+
+impl LandingStep {
+    /// Settles the step's fires, some of its lanes faulted: a fire with a
+    /// faulted lane fails by that lane's reason, and every other fire
+    /// commits.
+    fn settle_lanes(&self, faults: &[engine::LaneFault]) {
+        settle_fires(
+            &self.cells,
+            &self.completions,
+            &self.member_lanes,
+            faults,
+            "step settle",
+        );
+    }
+}
+
+/// Settles fires `cells` (each the terminal cell of the completion at its
+/// index), whose lanes `member_lanes` says, as their lanes landed: a fire
+/// with a lane in `faults` fails by the first such lane's reason, which
+/// fails that fire's pipeline and nothing else; every other fire commits.
+pub(crate) fn settle_fires(
+    cells: &[CellPtr],
+    completions: &[WorkItemCompletion],
+    member_lanes: &[u32],
+    faults: &[engine::LaneFault],
+    at: &str,
+) {
+    for (member, cell) in cells.iter().enumerate() {
+        let lanes = match (member_lanes.get(member), member_lanes.get(member + 1)) {
+            (Some(&start), Some(&end)) => start..end,
+            _ => 0..0,
+        };
+        let fault = faults.iter().find(|fault| lanes.contains(&fault.lane));
+        match fault {
+            None => {
+                settle(std::slice::from_ref(cell), TERMINAL_OUTCOME_SUCCESS);
+                if let Some(completion) = completions.get(member) {
+                    completion.resolve_landed(at);
+                }
+            }
+            Some(fault) => {
+                settle(std::slice::from_ref(cell), TERMINAL_OUTCOME_FAILED);
+                let why = match fault.instance {
+                    Some(instance) => format!(
+                        "engine: lane {} (instance {instance}) faulted: {}",
+                        fault.lane, fault.reason
+                    ),
+                    None => format!("engine: lane {} faulted: {}", fault.lane, fault.reason),
+                };
+                tracing::warn!(lane = fault.lane, %why, "a lane faulted; its fire fails alone");
+                if let Some(completion) = completions.get(member) {
+                    completion.mark_native_retired();
+                    completion.reject(why);
+                }
+            }
+        }
+    }
 }
 
 /// The frames on a lane whose steps are still landing: each step publishes
@@ -871,9 +1110,9 @@ pub struct FrameSettlements {
 #[derive(Default)]
 struct Book {
     frames: std::collections::HashMap<engine::FrameId, PendingFrame>,
-    /// Steps that landed before their frame was booked, and whether each
-    /// faulted.
-    early: std::collections::HashMap<engine::FrameId, Vec<(usize, bool)>>,
+    /// Steps that landed before their frame was booked, and the lanes of
+    /// each that faulted.
+    early: std::collections::HashMap<engine::FrameId, Vec<(usize, Vec<engine::LaneFault>)>>,
 }
 
 impl FrameSettlements {
@@ -883,16 +1122,24 @@ impl FrameSettlements {
     }
 
     /// Books frame `frame`: each step's fires and the waiters on its puts,
-    /// step by step.
+    /// step by step, and `completion`'s cell once they are in, where the
+    /// frame is its submission's last (`None` on one before it).
     pub fn expect(
         &self,
         frame: engine::FrameId,
         steps: Vec<LandingStep>,
-        completion: &SubmissionCompletion,
+        completion: Option<&SubmissionCompletion>,
+        split: Option<(Arc<SplitLaunch>, usize)>,
         broker: &CompletionBroker,
     ) {
-        let Some(frame_cell) = completion.terminal_cell_ptr() else {
-            return;
+        let frame_completion = match completion {
+            Some(completion) => {
+                let Some(cell) = completion.terminal_cell_ptr() else {
+                    return;
+                };
+                Some((cell, completion.wait_id(), completion.target_epoch()))
+            }
+            None => None,
         };
         let mut steps: Vec<_> = steps.into_iter().map(Some).collect();
         if steps.is_empty() {
@@ -900,18 +1147,17 @@ impl FrameSettlements {
         }
         let mut pending = PendingFrame {
             steps,
-            frame_cell,
-            wait_id: completion.wait_id(),
-            epoch: completion.target_epoch(),
+            frame: frame_completion,
+            split,
         };
         let mut landed = Vec::new();
         {
             let mut book = self.inner.lock().unwrap();
             let early = book.early.remove(&frame).unwrap_or_default();
             let mut done = false;
-            for (step, failed) in early {
-                let landing = pending.land(step, failed);
-                done |= landing.frame.is_some();
+            for (step, faults) in early {
+                let landing = pending.land(step, Landing::Lanes(faults));
+                done |= landing.done;
                 landed.push(landing);
             }
             if !done {
@@ -923,7 +1169,9 @@ impl FrameSettlements {
         }
     }
 
-    /// Step `step` of frame `frame` landed, as `outcome` says.
+    /// Step `step` of frame `frame` landed, as `outcome` says: the fires
+    /// of its faulted lanes fail, each by its lane's reason, and the rest
+    /// commit.
     pub fn settled(
         &self,
         frame: engine::FrameId,
@@ -931,22 +1179,22 @@ impl FrameSettlements {
         outcome: &engine::StepOutcome,
         broker: &CompletionBroker,
     ) {
-        let failed = matches!(outcome, engine::StepOutcome::Faulted(_));
+        let faults = outcome.faulted.clone();
         let landed = {
             let mut book = self.inner.lock().unwrap();
             let Some(pending) = book.frames.get_mut(&frame) else {
-                book.early.entry(frame).or_default().push((step, failed));
                 tracing::debug!(
                     frame = frame.0,
                     step,
-                    failed,
+                    faulted = faults.len(),
                     "settled before its frame was booked"
                 );
+                book.early.entry(frame).or_default().push((step, faults));
                 return;
             };
-            let landed = pending.land(step, failed);
-            if landed.frame.is_some() {
-                tracing::debug!(frame = frame.0, failed, "frame settled");
+            let landed = pending.land(step, Landing::Lanes(faults));
+            if landed.done {
+                tracing::debug!(frame = frame.0, "frame settled");
                 book.frames.remove(&frame);
             }
             landed
@@ -961,7 +1209,7 @@ impl FrameSettlements {
             book.frames.drain().map(|(_, f)| f).collect()
         };
         for mut pending in frames {
-            pending.land(0, true).publish(broker);
+            pending.land(0, Landing::Lost).publish(broker);
         }
     }
 }

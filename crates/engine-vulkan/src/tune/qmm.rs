@@ -204,13 +204,14 @@ fn forcing(q: &Qmm) -> String {
 
 /// The kernel `kernels_slang::linear::qmm::ran` names for `q`.
 #[cfg(feature = "vulkan")]
-fn kernel(q: &Qmm) -> &'static str {
+fn kernel(q: &Qmm) -> kernels_slang::linear::qmm::Rung {
+    use kernels_slang::linear::qmm::Rung;
     match q {
-        Qmm::Coopmat => "coopmat",
-        Qmm::RegisterTiled { .. } => "register_tiled",
-        Qmm::Tiled { .. } => "tiled",
-        Qmm::OneRow { .. } => "one_row",
-        Qmm::Qmv { .. } => "qmv",
+        Qmm::Coopmat => Rung::Coopmat,
+        Qmm::RegisterTiled { .. } => Rung::RegisterTiled,
+        Qmm::Tiled { .. } => Rung::Tiled,
+        Qmm::OneRow { .. } => Rung::OneRow,
+        Qmm::Qmv { .. } => Rung::Qmv,
     }
 }
 
@@ -224,6 +225,9 @@ pub struct Point {
     pub times: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     pub baseline: Option<usize>,
+    /// The timed candidates' median errors pooled, relative
+    /// ([`profile::tune::Sample::spread`]).
+    pub spread: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -253,7 +257,7 @@ impl Measured {
                 .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {} {} {}",
+                "point {} {} {} {} {} {} {} {:e}",
                 p.rows,
                 p.n,
                 p.k,
@@ -261,7 +265,8 @@ impl Measured {
                 p.bank.group,
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                p.spread
             );
         }
         out
@@ -308,6 +313,9 @@ impl Measured {
                         .split(',')
                         .map(|t| t.parse().ok())
                         .collect(),
+                    spread: f.get(7).and_then(|v| v.parse().ok()).ok_or(format!(
+                        "`{line}` states no spread (measured by an older pie); measure again"
+                    ))?,
                 });
             }
         }
@@ -344,6 +352,7 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
             at: coords(p, cores),
             weight: weight(grid, p.rows, p.n, p.k, p.bank),
             times: p.times.clone(),
+            spread: p.spread,
         });
         baseline.push(p.baseline);
     }
@@ -360,7 +369,11 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
     }
     Ok((
         vec![(spec.id.to_string(), ladder)],
-        vec![Line { id: spec.id, text }],
+        vec![Line {
+            id: spec.id,
+            text,
+            measured: true,
+        }],
     ))
 }
 
@@ -368,7 +381,7 @@ pub fn fit(measured: &Measured, grid: &Grid, cores: u32) -> Result<(Entries, Vec
 pub use device::measure;
 
 #[cfg(feature = "vulkan")]
-mod device {
+pub(super) mod device {
     use std::cell::RefCell;
 
     use crate::tuning::Tuning;
@@ -404,23 +417,23 @@ mod device {
         }
     }
 
-    fn noise(at: u64) -> u8 {
+    pub(in crate::tune) fn noise(at: u64) -> u8 {
         let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
         x ^= x >> 33;
         x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
         (x >> 40) as u8
     }
 
-    fn bf16(v: f32) -> [u8; 2] {
+    pub(in crate::tune) fn bf16(v: f32) -> [u8; 2] {
         let bits = v.to_bits();
         [(bits >> 16) as u8, (bits >> 24) as u8]
     }
 
-    fn seen(v: f32) -> f64 {
+    pub(in crate::tune) fn seen(v: f32) -> f64 {
         f64::from(f32::from_bits(v.to_bits() & 0xFFFF_0000))
     }
 
-    fn to_f32(lo: u8, hi: u8) -> f32 {
+    pub(in crate::tune) fn to_f32(lo: u8, hi: u8) -> f32 {
         f32::from_bits((u32::from(hi) << 24) | (u32::from(lo) << 16))
     }
 
@@ -448,8 +461,8 @@ mod device {
     }
 
     /// More than any GPU's last-level cache.
-    const STREAM_BYTES: u64 = 256 << 20;
-    const SHAPE_BYTES: u64 = 1 << 30;
+    pub(in crate::tune) const STREAM_BYTES: u64 = 256 << 20;
+    pub(in crate::tune) const SHAPE_BYTES: u64 = 1 << 30;
 
     fn weights(
         device: &Context,
@@ -509,8 +522,12 @@ mod device {
         };
         for _ in 0..copies {
             for (bytes, into) in [(&packed, 0), (&sc, 1), (&bi, 2)] {
-                let mut b =
-                    Buffer::zeroed(device, bytes.len() as u64).map_err(|e| e.to_string())?;
+                let mut b = Buffer::zeroed(
+                    device,
+                    bytes.len() as u64,
+                    engine_gpu::books::owners::TUNING,
+                )
+                .map_err(|e| e.to_string())?;
                 b.write(0, bytes).map_err(|e| e.to_string())?;
                 let h = handles.bind(&b, 0, b.bytes()).map_err(|e| e.to_string())?;
                 match into {
@@ -569,7 +586,10 @@ mod device {
                 act_bytes[2 * i..2 * i + 2].copy_from_slice(&bf16(v));
                 act[i] = seen(v);
             }
-            let alloc = |bytes: u64| Buffer::zeroed(device, bytes).map_err(|e| e.to_string());
+            let alloc = |bytes: u64| {
+                Buffer::zeroed(device, bytes, engine_gpu::books::owners::TUNING)
+                    .map_err(|e| e.to_string())
+            };
             let mut act_b = alloc(act_bytes.len() as u64)?;
             act_b.write(0, &act_bytes).map_err(|e| e.to_string())?;
             let out_b = alloc(u64::from(cap) * u64::from(n) * 2)?;
@@ -661,9 +681,10 @@ mod device {
                         launch(sink, &forced[c], copy)
                     })?;
                     let mut row = vec![None; kept.len()];
-                    for (c, t) in live.iter().zip(times) {
-                        row[*c] = Some(t);
+                    for (c, (t, _)) in live.iter().zip(&times) {
+                        row[*c] = Some(*t);
                     }
+                    let spread = profile::tune::pooled(times.iter().map(|&(_, e)| e));
                     let at = today.qmm_at(m, n, k, bank.bits, bank.group);
                     let baseline = today
                         .qmm(&at)
@@ -677,6 +698,7 @@ mod device {
                         bank: *bank,
                         times: row,
                         baseline,
+                        spread,
                     });
                 }
                 say(&format!(
@@ -728,15 +750,20 @@ mod device {
     }
 
     /// Seconds per launch for each of `live`, timed round-robin so drift
-    /// lands on every candidate alike.
-    fn time(
+    /// lands on every candidate alike, each with its median's relative
+    /// error ([`profile::tune::median_and_error`]).
+    pub(in crate::tune) fn time(
         device: &Context,
         pipelines: &Pipelines,
         handles: &Handles<Api>,
         live: &[usize],
         launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-    ) -> Result<Vec<f64>, String> {
+    ) -> Result<Vec<(f64, f64)>, String> {
+        /// Timed frames a candidate takes; its median is kept (odd, so one
+        /// frame is the median).
         const ROUNDS: usize = 7;
+        /// A timed frame's span: launches enough that one launch's spread
+        /// averages out, short of a phone's 2 s submit bound by far.
         const FRAME_S: f64 = 0.002;
         /// A candidate this much slower than the fastest is timed once.
         const SLOWER: f64 = 3.0;
@@ -774,11 +801,8 @@ mod device {
             }
         }
         Ok(seen
-            .into_iter()
-            .map(|mut s| {
-                s.sort_by(f64::total_cmp);
-                s[s.len() / 2]
-            })
+            .iter()
+            .map(|s| profile::tune::median_and_error(s))
             .collect())
     }
 }
@@ -832,6 +856,7 @@ mod tests {
             bank: grid.banks[0],
             times,
             baseline: Some(1),
+            spread: 0.005,
         };
         let measured = Measured {
             candidates: candidates.clone(),

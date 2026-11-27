@@ -2,7 +2,8 @@
 //! run: RMS (`elemwise.rmsnorm` and its weight and axis forms, unscaled),
 //! gated RMS (`rmsnorm_gated`, `rmsnorm_gated_by`), layer norm with and
 //! without its affine, the residual blend (`res_blend`) and the per-column
-//! `standardize`.
+//! `standardize`. The normed rows are bound whole; a window's first row
+//! ([`RowSpan`]) is the fire's data.
 
 use dtype::Dtype;
 
@@ -10,6 +11,7 @@ use crate::encode::{
     Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
 };
 use crate::error::Error;
+use crate::ssm::RowSpan;
 use crate::tensor::Tensor;
 
 const NORM: &str = "elemwise/norm.slang";
@@ -19,6 +21,15 @@ const GROUP: u32 = 256;
 
 /// A weight read a column (`w_stride` 1).
 const DENSE: u32 = 1;
+
+/// The element the window's first row starts at in `x`'s rows, bound
+/// whole: what the kernels read from the fire block.
+fn first(op: &'static str, window: RowSpan, x: Tensor) -> Result<u32, Error> {
+    window
+        .row0
+        .checked_mul(x.width)
+        .ok_or_else(|| refuse(op, "the window's first row is past an element index"))
+}
 
 fn grid(op: &'static str, width: u32, axis: u32, rows: u32) -> Result<Grid, Error> {
     nonzero(op, "width", width)?;
@@ -55,11 +66,13 @@ fn rms(
     axis: u32,
     w_stride: u32,
     plus_one: bool,
+    window: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_rms_bf16" });
+    let rows = window.held(OP, x)?;
     ctx.fire(
-        Fire::at(NORM, entry).apply(grid(OP, x.width, axis, x.rows)?),
+        Fire::at(NORM, entry).apply(grid(OP, x.width, axis, rows)?),
         &[
             x.arg(),
             weight.arg(),
@@ -69,13 +82,21 @@ fn rms(
             w_stride.arg(),
             u32::from(plus_one).arg(),
             1.0f32.arg(),
+            first(OP, window, x)?.arg(),
         ],
     )
 }
 
 /// `y = x / rms(x) * weight` over the whole row.
-pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    rms(ctx, x, weight, y, eps, x.width, DENSE, false)
+pub fn rmsnorm(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    weight: Tensor,
+    eps: f32,
+    y: Tensor,
+    window: RowSpan,
+) -> Result<(), Error> {
+    rms(ctx, x, weight, y, eps, x.width, DENSE, false, window)
 }
 
 /// `y = x / rms(x) * (1 + weight)` over the whole row.
@@ -85,8 +106,9 @@ pub fn rmsnorm_plus_one(
     weight: Tensor,
     eps: f32,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
-    rms(ctx, x, weight, y, eps, x.width, DENSE, true)
+    rms(ctx, x, weight, y, eps, x.width, DENSE, true, window)
 }
 
 /// Each `head_dim`-wide head normed alone, one `head_dim`-wide weight for all.
@@ -97,8 +119,9 @@ pub fn rmsnorm_per_head(
     head_dim: u32,
     eps: f32,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
-    rms(ctx, x, weight, y, eps, head_dim, DENSE, false)
+    rms(ctx, x, weight, y, eps, head_dim, DENSE, false, window)
 }
 
 /// As [`rmsnorm_per_head`], times `1 + weight`.
@@ -109,8 +132,9 @@ pub fn rmsnorm_per_head_plus_one(
     head_dim: u32,
     eps: f32,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
-    rms(ctx, x, weight, y, eps, head_dim, DENSE, true)
+    rms(ctx, x, weight, y, eps, head_dim, DENSE, true, window)
 }
 
 /// Each `group`-wide run normed alone, times `1 + weight` from a bank as wide
@@ -122,6 +146,7 @@ pub fn rmsnorm_grouped_plus_one(
     group: u32,
     eps: f32,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
     let axis = nonzero(OP, "the group width", group)?;
@@ -146,8 +171,9 @@ pub fn rmsnorm_grouped_plus_one(
         ));
     }
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_rms_grouped_bf16" });
+    let rows = window.held(OP, x)?;
     ctx.fire(
-        Fire::at(NORM, entry).apply(grid(OP, x.width, axis, x.rows)?),
+        Fire::at(NORM, entry).apply(grid(OP, x.width, axis, rows)?),
         &[
             x.arg(),
             weight.arg(),
@@ -158,6 +184,7 @@ pub fn rmsnorm_grouped_plus_one(
             1u32.arg(),
             1.0f32.arg(),
             stated(OP, groups)?.arg(),
+            first(OP, window, x)?.arg(),
         ],
     )
 }
@@ -169,12 +196,20 @@ pub fn rmsnorm_no_scale(
     head_dim: u32,
     eps: f32,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_rms_unscaled_bf16" });
+    let rows = window.held(OP, x)?;
     ctx.fire(
-        Fire::at(NORM, entry).apply(grid(OP, x.width, head_dim, x.rows)?),
-        &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, head_dim)?.arg()],
+        Fire::at(NORM, entry).apply(grid(OP, x.width, head_dim, rows)?),
+        &[
+            x.arg(),
+            y.arg_mut(),
+            eps.arg(),
+            stated(OP, head_dim)?.arg(),
+            first(OP, window, x)?.arg(),
+        ],
     )
 }
 
@@ -189,6 +224,7 @@ fn gated(
     vd: u32,
     eps: f32,
     y: Tensor,
+    span: crate::ssm::RowSpan,
 ) -> Result<(), Error> {
     debug_assert_eq!(x.dtype, Dtype::F32, "`{op}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{op}` scales by an f32 weight");
@@ -208,10 +244,12 @@ fn gated(
             format!("a {vd}-wide head is odd; the landing is two values a word"),
         ));
     }
+    let rows = span.rows(op, &[x, gate, y])?;
     let groups = (x.width / vd)
-        .checked_mul(x.rows)
+        .checked_mul(rows)
         .and_then(|g| g.checked_mul(GROUP))
         .ok_or_else(|| refuse(op, "the grid will not launch"))?;
+    let first = first(op, span, x)?;
     ctx.fire(
         Fire::at(NORM, entry).apply(Grid::of([groups, 1, 1], [GROUP, 1, 1])),
         &[
@@ -221,6 +259,7 @@ fn gated(
             y.arg_mut(),
             eps.arg(),
             stated(op, vd)?.arg(),
+            first.arg(),
         ],
     )
 }
@@ -237,6 +276,7 @@ pub fn rmsnorm_gated(
     eps: f32,
     sigmoid_gate: bool,
     y: Tensor,
+    span: crate::ssm::RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated";
     let entry = if sigmoid_gate {
@@ -245,10 +285,11 @@ pub fn rmsnorm_gated(
         dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_bf16" })
     };
     let vd = nonzero(OP, "the stated value-head width", head_dim)?;
-    gated(ctx, OP, entry, x, gate, weight, vd, eps, y)
+    gated(ctx, OP, entry, x, gate, weight, vd, eps, y, span)
 }
 
 /// The row normed in `heads` equal heads, each gated by `sigmoid(z)`.
+#[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated_by(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -257,6 +298,7 @@ pub fn rmsnorm_gated_by(
     heads: u32,
     eps: f32,
     y: Tensor,
+    span: crate::ssm::RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.rmsnorm_gated_by";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "elemwise_norm_gated_rms_sigmoid_bf16" });
@@ -270,12 +312,23 @@ pub fn rmsnorm_gated_by(
             ),
         ));
     }
-    gated(ctx, OP, entry, x, gate, weight, x.width / heads, eps, y)
+    gated(
+        ctx,
+        OP,
+        entry,
+        x,
+        gate,
+        weight,
+        x.width / heads,
+        eps,
+        y,
+        span,
+    )
 }
 
-fn row_grid(op: &'static str, x: Tensor) -> Result<Grid, Error> {
+fn row_grid(op: &'static str, x: Tensor, window: RowSpan) -> Result<Grid, Error> {
     nonzero(op, "width", x.width)?;
-    let rows = nonzero(op, "rows", x.rows)?;
+    let rows = window.held(op, x)?;
     if x.dtype == Dtype::Bf16 && !x.width.is_multiple_of(2) {
         return Err(refuse(
             op,
@@ -299,11 +352,12 @@ pub fn layernorm(
     bias: Tensor,
     eps: f32,
     y: Tensor,
+    window: RowSpan,
 ) -> Result<(), Error> {
     const OP: &str = "elemwise.layernorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "elemwise_norm_layernorm_bf16" });
     ctx.fire(
-        Fire::at(NORM, entry).apply(row_grid(OP, x)?),
+        Fire::at(NORM, entry).apply(row_grid(OP, x, window)?),
         &[
             x.arg(),
             weight.arg(),
@@ -311,20 +365,33 @@ pub fn layernorm(
             y.arg_mut(),
             eps.arg(),
             stated(OP, x.width)?.arg(),
+            first(OP, window, x)?.arg(),
         ],
     )
 }
 
 /// Each row standardized, with no weight and no bias.
-pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
+pub fn layernorm_no_scale(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    eps: f32,
+    y: Tensor,
+    window: RowSpan,
+) -> Result<(), Error> {
     const OP: &str = "elemwise.layernorm";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "elemwise_norm_layernorm_unscaled_bf16",
         F32 => "elemwise_norm_layernorm_unscaled_f32",
     });
     ctx.fire(
-        Fire::at(NORM, entry).apply(row_grid(OP, x)?),
-        &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, x.width)?.arg()],
+        Fire::at(NORM, entry).apply(row_grid(OP, x, window)?),
+        &[
+            x.arg(),
+            y.arg_mut(),
+            eps.arg(),
+            stated(OP, x.width)?.arg(),
+            first(OP, window, x)?.arg(),
+        ],
     )
 }
 
@@ -366,12 +433,18 @@ pub fn res_blend(
     let lanes = rows
         .checked_mul(GROUP)
         .ok_or_else(|| refuse(OP, format!("the grid will not launch: {rows} rows")))?;
-    let stack = blocks.first().copied().unwrap_or(prefix);
+    // No blocks: the stack is never read; where two views of a buffer may
+    // not overlap it binds none rather than the prefix again.
+    let stack = match blocks.first() {
+        Some(stack) => stack.arg(),
+        None if !ctx.binds_overlap() => ctx.absent()?,
+        None => prefix.arg(),
+    };
     ctx.fire(
         Fire::at(NORM, entry).apply(Grid::of([lanes, 1, 1], [GROUP, 1, 1])),
         &[
             prefix.arg(),
-            stack.arg(),
+            stack,
             weight.arg(),
             proj.arg(),
             y.arg_mut(),

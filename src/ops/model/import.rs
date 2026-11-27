@@ -181,7 +181,7 @@ pub fn run(
             .iter()
             .all(|file| file.format == CheckpointFormat::Zt)
     }) {
-        return overlay_onto_artifact(&args, &source, metadata, overlay, json);
+        return overlay_onto_artifact(&args, &source, metadata, overlay, global, json);
     }
 
     let clobbered: Vec<&str> = metadata
@@ -212,7 +212,7 @@ pub fn run(
             source.name
         )));
     }
-    let platform = engine_or_refuse()?;
+    let platform = engine_or_refuse(global)?;
     if out_file.exists() && !args.force {
         if let Some(reason) = staleness(
             &out_file,
@@ -564,6 +564,7 @@ fn overlay_onto_artifact(
     source: &Source,
     mut metadata: Metadata,
     overlay: &Overlay,
+    global: &crate::args::GlobalArgs,
     json: bool,
 ) -> Result<crate::ui::Answer> {
     if args.out.is_some() {
@@ -576,7 +577,7 @@ fn overlay_onto_artifact(
     if args.delete_source || args.consume_source {
         bail!("an overlay onto an artifact keeps the artifact; nothing is deleted or consumed");
     }
-    let platform = engine_or_refuse()?;
+    let platform = engine_or_refuse(global)?;
     let base_file = source.path.clone();
     let before = checkpoint::file::serve::stamp_of(&base_file)
         .map_err(|err| anyhow!("cannot read {}: {err}", base_file.display()))?
@@ -1593,15 +1594,78 @@ fn refuse_a_source_no_deployment_in_this_build_claims(checkpoint: &Path) -> anyh
     )
 }
 
-fn engine_or_refuse() -> Result<Platform> {
-    runtime::engine::load::this_box().ok_or_else(|| {
-        anyhow!(
+/// The backend an artifact is written for: the engine the config names
+/// (`engine.type`), which is the one that boots it, else this build's own.
+fn engine_or_refuse(global: &crate::args::GlobalArgs) -> Result<Platform> {
+    let (path, origin) = crate::args::config_path(global);
+    let doc = match std::fs::read_to_string(&path) {
+        Ok(doc) => Some(doc),
+        Err(why)
+            if why.kind() == std::io::ErrorKind::NotFound
+                && origin == crate::args::Origin::Default =>
+        {
+            None
+        }
+        Err(why) => {
+            return Err(anyhow!(
+                "cannot read the config ({}) {}: {why}",
+                origin.describe(),
+                path.display()
+            ));
+        }
+    };
+    let platform = configured_platform(doc.as_deref())
+        .with_context(|| format!("the config at {}", path.display()))?;
+    let Some(platform) = platform.or_else(runtime::engine::load::this_box) else {
+        bail!(
             "this pie binary carries no engine, so it cannot say which setup to convert \
              for — and an artifact IS a setup: the backend is stamped in it and printed \
              in its name, and a boot refuses when it disagrees. Rebuild with --features \
              set to cuda or metal."
-        )
-    })
+        );
+    };
+    if !compiled_in(platform) {
+        bail!(
+            "the config at {} names the {} engine and this pie binary carries none; \
+             rebuild with --features {}",
+            path.display(),
+            platform.backend(),
+            platform.backend()
+        );
+    }
+    Ok(platform)
+}
+
+/// The platform the config document `doc` names in `engine.type`; `None`
+/// where there is no document or it names no engine.
+fn configured_platform(doc: Option<&str>) -> Result<Option<Platform>> {
+    use worker::config::EngineKind;
+    let Some(doc) = doc else {
+        return Ok(None);
+    };
+    let file: toml::Value = toml::from_str(doc).context("the config is not TOML")?;
+    let Some(kind) = worker::config::schema::lookup(&file, "engine.type") else {
+        return Ok(None);
+    };
+    let kind: EngineKind = kind
+        .clone()
+        .try_into()
+        .map_err(|why| anyhow!("`engine.type` names no engine: {why}"))?;
+    Ok(Some(match kind {
+        EngineKind::Cuda => Platform::Cuda,
+        EngineKind::Metal => Platform::Metal,
+        EngineKind::Vulkan => Platform::Vulkan,
+        EngineKind::Wgpu => Platform::Wgpu,
+        EngineKind::Xla => Platform::Xla,
+        EngineKind::Cerebras => Platform::Cerebras,
+    }))
+}
+
+/// Whether this build carries `platform`'s engine.
+fn compiled_in(platform: Platform) -> bool {
+    worker::backend::flavor::compiled_embedded()
+        .iter()
+        .any(|&(name, built)| built && name == platform.backend())
 }
 
 fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata, contract: &ModelContract) -> bool {
@@ -2267,6 +2331,31 @@ impl TensorSink for Handoff<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An artifact is for the engine the config boots, not this build's
+    /// first: a wgpu deployment in a build with Vulkan too imports for wgpu.
+    #[test]
+    fn the_config_engine_names_the_artifact_backend() {
+        for (kind, want) in [
+            ("vulkan", Platform::Vulkan),
+            ("wgpu", Platform::Wgpu),
+            ("cuda", Platform::Cuda),
+            ("metal", Platform::Metal),
+        ] {
+            let doc = format!("[engine]\ntype = \"{kind}\"\ndevice = [\"{kind}:0\"]\n");
+            assert_eq!(
+                configured_platform(Some(&doc)).unwrap(),
+                Some(want),
+                "{kind}"
+            );
+        }
+        assert_eq!(configured_platform(None).unwrap(), None);
+        assert_eq!(
+            configured_platform(Some("[server]\nlisten = \"127.0.0.1:1\"\n")).unwrap(),
+            None
+        );
+        assert!(configured_platform(Some("[engine]\ntype = \"abacus\"\n")).is_err());
+    }
 
     #[test]
     fn import_every_case() {

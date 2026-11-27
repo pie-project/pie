@@ -194,7 +194,7 @@ pub fn split_q_gate(
         ));
     }
     let heads = q.width / head_dim;
-    if ctx.tuning().rows_vec
+    if ctx.tuning().rows_vec()
         && head_dim.is_multiple_of(8)
         && [packed.ptr, q.ptr, gate.ptr]
             .iter()
@@ -272,7 +272,7 @@ pub fn split_rows(
                 [left.rows, (x.width / VEC_WIDTH).div_ceil(BLOCK), 1],
                 [BLOCK, 1, 1],
             )
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         )
     } else {
         (

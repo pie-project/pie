@@ -1,5 +1,5 @@
 //! Per-layer embedding n-gram ids (`gather.ngram_ids`,
-//! `gather.ngram_ids_chunked`) from `kernels/gather/ngram.slang`: tokens
+//! `gather.ngram_ids_chunked`, `gather.ngram_ids_committed`) from `kernels/gather/ngram.slang`: tokens
 //! hashed with the ids before them into table rows, each lane's window
 //! carried in a recurrent state of `ngram - 1` i32s a slot.
 #![allow(clippy::too_many_arguments)]
@@ -8,7 +8,7 @@ use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, nonzero, refuse, stated};
 use crate::error::Error;
-use crate::ssm::StatePool;
+use crate::ssm::{Committed, StatePool};
 use crate::tensor::Tensor;
 
 const NGRAM: &str = "gather/ngram.slang";
@@ -226,6 +226,67 @@ pub fn ngram_ids_chunked(
             ][..],
             &state.piece_args(true),
             &[
+                stated(OP, shape.ngram)?.arg(),
+                stated(OP, shape.heads)?.arg(),
+                stated(OP, shape.heads_per_ngram)?.arg(),
+                stated(OP, shape.eos)?.arg(),
+                stated(OP, lanes)?.arg(),
+            ],
+        ]
+        .concat(),
+    )
+}
+
+/// Each request's rows of a speculative window hashed in order, one request
+/// of the i32 CSR `indptr` a lane: `ids` is the extended rows (each
+/// request's `committed.replay` buffered rows, then its own), only its own
+/// rows land in `ngram_ids` (at the CSR's rows), and its window is kept as
+/// of row `committed.commit`, the state after commit `k` the last
+/// `ngram - 1` ids of (window ++ ids[0..k]).
+pub fn ngram_ids_committed(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    state: &StatePool,
+    hash: Tensor,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+    ngram_ids: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.ngram_ids_committed";
+    id_planes(OP, ids, ngram_ids)?;
+    let shape = shape(OP, eos, mults, primes, offsets, heads_per_ngram)?;
+    hash_plane(OP, hash, &shape)?;
+    debug_assert_eq!(
+        ngram_ids.width, shape.heads,
+        "one output column per hashed head"
+    );
+    debug_assert_eq!(
+        state.bank.width,
+        shape.ngram - 1,
+        "the window a lane keeps is the n-gram context, one i32 per trailing id"
+    );
+    nonzero(OP, "extended rows", ids.rows)?;
+    let lanes = lanes_of(OP, indptr)?;
+    ctx.fire(
+        Fire::at(NGRAM, "gather_ngram_committed").apply(Grid::of([lanes, 1, 1], [GROUP, 1, 1])),
+        &[
+            &[
+                ids.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                hash.arg(),
+                ngram_ids.arg_mut(),
+            ][..],
+            &state.piece_args(true),
+            &[
+                stated(OP, committed.lane0)?.arg(),
                 stated(OP, shape.ngram)?.arg(),
                 stated(OP, shape.heads)?.arg(),
                 stated(OP, shape.heads_per_ngram)?.arg(),

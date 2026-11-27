@@ -81,6 +81,8 @@ pub struct Context {
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
     cublas: *mut c_void,
     ctx: Ctx,
+    /// Where the ranks of a tensor-parallel group agree (`Comm::quiet`).
+    quiet: Option<&'static crate::ep::Quiet>,
     side: Vec<Side>,
     conditional: Option<Side>,
     events: Vec<crate::device::graph::Event>,
@@ -102,6 +104,19 @@ impl Context {
             // the prior calls produced. cudaSetDevice binds this thread.
             unsafe {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
+                // The units this process's queues run on, from its CU masks,
+                // stated before anything reads the device's count (the
+                // probe below, every grid and arena laid after).
+                #[cfg(feature = "rocm")]
+                {
+                    let at = ordinal.unsigned_abs();
+                    let all = kernels_cuda::hip::all_multiprocessors(at)
+                        .map_err(|error| Fault::Unsupported(error.to_string()))?;
+                    kernels_cuda::hip::hold_queue_units(
+                        at,
+                        crate::program::launch::masked_units(all, at),
+                    );
+                }
                 // What the process keeps idle (an earlier shell's dropped
                 // buffers) goes back first: the load measures the card from
                 // here, and fits as it would in a fresh process.
@@ -109,14 +124,9 @@ impl Context {
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
                 crate::device::held::adopt_stream(ordinal, stream.cast());
-                // The heaps' first chunks, while the load may wait.
+                // The pinned heap's first chunk, while the load may wait.
                 let reserved =
-                    crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned)
-                        .and_then(|()| {
-                            crate::device::held::heap::reserve(
-                                crate::device::held::heap::Kind::Device,
-                            )
-                        });
+                    crate::device::held::heap::reserve(crate::device::held::heap::Kind::Pinned);
                 if let Err(fault) = reserved {
                     destroy_stream(ordinal, stream.cast());
                     return Err(fault);
@@ -220,6 +230,7 @@ impl Context {
                     swap,
                     cublas,
                     ctx,
+                    quiet: comm.and_then(crate::comm::Comm::quiet),
                     slabs,
                     side: Vec::new(),
                     conditional: None,
@@ -246,6 +257,11 @@ impl Context {
     #[must_use]
     pub fn ctx(&self) -> &Ctx {
         &self.ctx
+    }
+
+    #[must_use]
+    pub fn quiet(&self) -> Option<&'static crate::ep::Quiet> {
+        self.quiet
     }
 
     #[must_use]
@@ -312,7 +328,7 @@ impl Context {
             };
             let stream: *mut c_void = stream.cast();
             self.slabs.attach(stream);
-            Ok(Side {
+            let mut side = Side {
                 stream,
                 cublas,
                 // a side stream's kernels launch plainly: a programmatic
@@ -333,7 +349,12 @@ impl Context {
                     .with_slabs(self.slabs)
                     .with_tuning(self.ctx.tuning())
                     .with_rank(self.ctx.rank()),
-            })
+            };
+            // The routes the main context holds, as `set_routes` keeps them.
+            if let Some(routes) = self.ctx.routes() {
+                side.ctx.set_routes(routes.clone());
+            }
+            Ok(side)
         }
     }
 
@@ -411,6 +432,18 @@ impl Context {
         self.ctx.set_tuning(tuning);
     }
 
+    /// Lay the device's measured product times on this context
+    /// (`kernels_cuda::linear::routes`).
+    /// The side streams' contexts take it too: a kernel the table picks (a
+    /// decode product's) launches on whichever stream its fire places it,
+    /// and reads the same choice there.
+    pub fn set_routes(&mut self, routes: std::sync::Arc<kernels_cuda::linear::routes::Routes>) {
+        for side in self.side.iter_mut().chain(self.conditional.as_mut()) {
+            side.ctx.set_routes(routes.clone());
+        }
+        self.ctx.set_routes(routes);
+    }
+
     #[must_use]
     pub fn capability(&self) -> (i32, i32) {
         self.capability
@@ -461,9 +494,7 @@ impl Drop for Context {
                     if !side.cublas.is_null() {
                         give_blas(self.ordinal, side.cublas);
                     }
-                    if !side.stream.is_null() {
-                        let _ = crate::device::rt::cudaStreamDestroy(side.stream.cast());
-                    }
+                    crate::device::held::destroy_unadopted_stream(side.stream);
                 }
                 if !self.cublas.is_null() {
                     give_blas(self.ordinal, self.cublas);
@@ -471,21 +502,45 @@ impl Drop for Context {
                 if !self.stream.is_null() {
                     destroy_stream(self.ordinal, self.stream);
                 }
-                if !self.notify.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.notify.cast());
-                }
-                if !self.tap.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.tap.cast());
-                }
-                if !self.swap.is_null() {
-                    let _ = crate::device::rt::cudaStreamDestroy(self.swap.cast());
-                }
+                crate::device::held::destroy_unadopted_stream(self.notify);
+                crate::device::held::destroy_unadopted_stream(self.tap);
+                crate::device::held::destroy_unadopted_stream(self.swap);
             }
         }
     }
 }
 
 /// `work` on the host once what `stream` has before it is done.
+/// Holds `stream` until the 32-bit word at device address `word` (mapped
+/// host memory a host thread writes) is at least `value`, compared as the
+/// driver does, wrapping: the stream waits on the device, no host function
+/// and no driver thread blocked for it.
+pub fn wait_value(stream: *mut c_void, word: u64, value: u32) -> Result<()> {
+    #[cfg(feature = "device")]
+    {
+        use crate::device::dr;
+        #[cfg(feature = "cuda")]
+        let geq = dr::CUstreamWaitValue_flags::CU_STREAM_WAIT_VALUE_GEQ as core::ffi::c_uint;
+        #[cfg(feature = "rocm")]
+        let geq = dr::CU_STREAM_WAIT_VALUE_GEQ;
+        // SAFETY: `word` is a live device-visible address of mapped host
+        // memory the caller holds while the stream may read it.
+        let code = unsafe { dr::cuStreamWaitValue32_v2(stream.cast(), word, value, geq) };
+        if code != dr::CUresult::CUDA_SUCCESS {
+            return Err(Fault::Device {
+                call: "cuStreamWaitValue32_v2",
+                code: code as i32,
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (stream, word, value);
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn host_fn_on(stream: *mut c_void, work: Box<dyn FnOnce() + Send + 'static>) -> Result<()> {
     #[cfg(feature = "device")]
     {

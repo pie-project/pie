@@ -3,8 +3,21 @@ use core::fmt;
 
 use super::op::Op;
 use crate::types::{
-    Dtype, MAX_RANK, Predicate, Shape, ValueId, ValueType, is_int, is_numeric, supports,
+    Dtype, MAX_RANK, Predicate, Shape, ValueId, ValueType, float_result, is_float, is_int,
+    is_numeric, supports,
 };
+
+/// What a reduction over a row of `dtype` returns: its accumulator's dtype,
+/// f32 for a `bf16` row (a `bf16` row accumulates in f32 and the result is
+/// the accumulator, never rounded; see `types`), the row's own otherwise.
+#[must_use]
+pub fn reduced_dtype(dtype: Dtype) -> Dtype {
+    if dtype == Dtype::Bf16 {
+        Dtype::F32
+    } else {
+        dtype
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyError {
@@ -204,7 +217,7 @@ fn infer(
         | Op::Sqrt(a)
         | Op::Rsqrt(a) => {
             let t = g(a)?;
-            if t.dtype != Dtype::F32 {
+            if !is_float(t.dtype) {
                 return Err(dtype_err());
             }
             push(&mut out, t);
@@ -228,34 +241,37 @@ fn infer(
         | Op::MinElem(a, b)
         | Op::Rem(a, b) => {
             let (ta, tb) = (g(a)?, g(b)?);
-            if !is_numeric(ta.dtype) || ta.dtype != tb.dtype {
+            let dtype = float_result(ta.dtype, tb.dtype).ok_or_else(dtype_err)?;
+            if !is_numeric(dtype) {
                 return Err(dtype_err());
             }
             push(
                 &mut out,
                 ValueType::new(
                     broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
-                    ta.dtype,
+                    dtype,
                 ),
             );
         }
         Op::Div(a, b) => {
             let (ta, tb) = (g(a)?, g(b)?);
-            if !is_numeric(ta.dtype) || ta.dtype != tb.dtype {
+            let dtype = float_result(ta.dtype, tb.dtype).ok_or_else(dtype_err)?;
+            if !is_numeric(dtype) {
                 return Err(dtype_err());
             }
             push(
                 &mut out,
                 ValueType::new(
                     broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?,
-                    ta.dtype,
+                    dtype,
                 ),
             );
         }
 
         Op::Gt(a, b) | Op::Ge(a, b) | Op::Eq(a, b) | Op::Ne(a, b) | Op::Lt(a, b) | Op::Le(a, b) => {
             let (ta, tb) = (g(a)?, g(b)?);
-            if !is_numeric(ta.dtype) || ta.dtype != tb.dtype {
+            let common = float_result(ta.dtype, tb.dtype).ok_or_else(dtype_err)?;
+            if !is_numeric(common) {
                 return Err(dtype_err());
             }
             push(
@@ -289,14 +305,15 @@ fn infer(
 
         Op::Select { cond, a, b } => {
             let (tc, ta, tb) = (g(cond)?, g(a)?, g(b)?);
-            if tc.dtype != Dtype::Bool || ta.dtype != tb.dtype {
+            if tc.dtype != Dtype::Bool {
                 return Err(dtype_err());
             }
+            let dtype = float_result(ta.dtype, tb.dtype).ok_or_else(dtype_err)?;
             let ab =
                 broadcast2(ta.shape, tb.shape).ok_or_else(|| shape_err2(ta.shape, tb.shape))?;
             push(
                 &mut out,
-                ValueType::new(broadcast2(ab, tc.shape).ok_or_else(shape_err)?, ta.dtype),
+                ValueType::new(broadcast2(ab, tc.shape).ok_or_else(shape_err)?, dtype),
             );
         }
 
@@ -307,7 +324,10 @@ fn infer(
             }
             push(
                 &mut out,
-                ValueType::new(t.shape.drop_last().ok_or_else(shape_err)?, t.dtype),
+                ValueType::new(
+                    t.shape.drop_last().ok_or_else(shape_err)?,
+                    reduced_dtype(t.dtype),
+                ),
             );
         }
         Op::ReduceArgmax(v) => {
@@ -318,6 +338,32 @@ fn infer(
             push(
                 &mut out,
                 ValueType::new(t.shape.drop_last().ok_or_else(shape_err)?, Dtype::I32),
+            );
+        }
+
+        Op::GumbelArgmax {
+            logits,
+            keep,
+            scale,
+            state,
+        } => {
+            let (tl, tk, td, ts) = (g(logits)?, g(keep)?, g(scale)?, g(state)?);
+            if !is_float(tl.dtype)
+                || tk.dtype != Dtype::Bool
+                || !is_float(td.dtype)
+                || ts.dtype != Dtype::U32
+            {
+                return Err(dtype_err());
+            }
+            if (!tk.shape.is_scalar() && tk.shape != tl.shape)
+                || !td.shape.is_scalar()
+                || *ts.shape.dims() != [2]
+            {
+                return Err(shape_err());
+            }
+            push(
+                &mut out,
+                ValueType::new(tl.shape.drop_last().ok_or_else(shape_err)?, Dtype::I32),
             );
         }
 
@@ -357,19 +403,19 @@ fn infer(
 
         Op::SortDesc(v) => {
             let t = g(v)?;
-            if t.dtype != Dtype::F32 {
+            if !is_float(t.dtype) {
                 return Err(dtype_err());
             }
             let n = match *t.shape.dims() {
                 [n] => n,
                 _ => return Err(shape_err()),
             };
-            push(&mut out, ValueType::vector(n, Dtype::F32));
+            push(&mut out, ValueType::vector(n, t.dtype));
             push(&mut out, ValueType::vector(n, Dtype::U32));
         }
         Op::TopK { input, k } => {
             let t = g(input)?;
-            if t.dtype != Dtype::F32 {
+            if !is_float(t.dtype) {
                 return Err(dtype_err());
             }
             let oshape = match *t.shape.dims() {
@@ -377,12 +423,12 @@ fn infer(
                 [m, n] if k >= 1 && k <= n => Shape::matrix(m, k),
                 _ => return Err(shape_err()),
             };
-            push(&mut out, ValueType::new(oshape, Dtype::F32));
+            push(&mut out, ValueType::new(oshape, t.dtype));
             push(&mut out, ValueType::new(oshape, Dtype::U32));
         }
         Op::MatMul(a, b) => {
             let (ta, tb) = (g(a)?, g(b)?);
-            if ta.dtype != Dtype::F32 || tb.dtype != Dtype::F32 {
+            if !is_float(ta.dtype) || !is_float(tb.dtype) {
                 return Err(dtype_err());
             }
             let (m, ka) = match *ta.shape.dims() {
@@ -400,7 +446,7 @@ fn infer(
         }
         Op::PivotThreshold { input, predicate } => {
             let t = g(input)?;
-            if t.dtype != Dtype::F32 {
+            if !is_float(t.dtype) {
                 return Err(dtype_err());
             }
             if t.shape.rank() != 1 && t.shape.rank() != 2 {
@@ -419,7 +465,7 @@ fn infer(
                 }
                 Predicate::CummassLe(thr) | Predicate::ProbGe(thr) => {
                     let tt = g(thr)?;
-                    if tt.dtype != Dtype::F32 {
+                    if !is_float(tt.dtype) {
                         return Err(dtype_err());
                     }
                     let per_row_ok = t.shape.rank() == 2 && tt.shape.dims() == &t.shape.dims()[..1];
@@ -467,7 +513,7 @@ fn infer(
             if !is_int(ti.dtype) {
                 return Err(dtype_err());
             }
-            if tv.dtype != tb.dtype {
+            if float_result(tb.dtype, tv.dtype).is_none() {
                 return Err(dtype_err());
             }
             let expect = axis0_result(ti.shape, tb.shape).ok_or_else(shape_err)?;
@@ -485,7 +531,7 @@ fn infer(
         Op::MaskApply { logits, mask } => {
             let (tl, tm) = (g(logits)?, g(mask)?);
             let n = tl.shape.last_len().ok_or_else(shape_err)?;
-            if tl.dtype != Dtype::F32 || tm.dtype != Dtype::U32 {
+            if !is_float(tl.dtype) || tm.dtype != Dtype::U32 {
                 return Err(dtype_err());
             }
             match *tm.shape.dims() {
@@ -559,13 +605,161 @@ fn infer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Literal;
+    use crate::types::{Literal, RngKind};
     use alloc::vec;
+    use alloc::vec::Vec;
+
+    impl ValueType {
+        fn matrix_of(m: u32, n: u32, dtype: Dtype) -> Self {
+            Self::new(Shape::matrix(m, n), dtype)
+        }
+    }
 
     fn ctx_with(channels: &[ValueType]) -> BodyCtx<'_> {
         BodyCtx {
             channel_types: channels,
             n_names: 1,
+        }
+    }
+
+    /// The bf16 rules (`types`): elementwise ops mix f32 and bf16 into
+    /// bf16, a reduction returns its f32 accumulator, a scan and an order
+    /// op keep bf16, and a cast converts in and out.
+    #[test]
+    fn bf16_types_by_the_rules() {
+        let chans = [
+            ValueType::vector(5, Dtype::F32),
+            ValueType::matrix_of(2, 5, Dtype::F32),
+        ];
+        let ops = vec![
+            Op::ChanTake(0), // 0 f32 [5]
+            Op::Cast {
+                value: 0,
+                dtype: Dtype::Bf16,
+            }, // 1 bf16 [5]
+            Op::Const(Literal::F32(0.5)), // 2 f32 []
+            Op::Mul(1, 2),   // 3 bf16
+            Op::Add(2, 1),   // 4 bf16
+            Op::Exp(3),      // 5 bf16
+            Op::ReduceSum(1), // 6 f32 []
+            Op::ReduceMax(1), // 7 f32 []
+            Op::ReduceArgmax(1), // 8 i32 []
+            Op::CumSum(1),   // 9 bf16 [5]
+            Op::TopK { input: 1, k: 2 }, // 10 bf16, 11 u32
+            Op::SortDesc(1), // 12 bf16, 13 u32
+            Op::Gt(1, 0),    // 14 bool
+            Op::Select {
+                cond: 14,
+                a: 1,
+                b: 0,
+            }, // 15 bf16
+            Op::Cast {
+                value: 1,
+                dtype: Dtype::I32,
+            }, // 16 i32
+            Op::Cast {
+                value: 1,
+                dtype: Dtype::F32,
+            }, // 17 f32
+            Op::PivotThreshold {
+                input: 1,
+                predicate: Predicate::CummassLe(2),
+            }, // 18 bool
+            Op::ChanTake(1), // 19 f32 [2, 5]
+            Op::Cast {
+                value: 19,
+                dtype: Dtype::Bf16,
+            }, // 20 bf16 [2, 5]
+            Op::Transpose(20), // 21 bf16 [5, 2]
+            Op::MatMul(20, 21), // 22 f32 [2, 2]
+            Op::Iota { len: 1 }, // 23 u32 [1]
+            Op::Gather { src: 1, idx: 23 }, // 24 bf16 [1]
+            Op::ScatterAdd {
+                base: 1,
+                idx: 23,
+                vals: 2,
+            }, // 25 bf16 [5]
+        ];
+        let types = body_types(&ops, &ctx_with(&chans)).expect("types");
+        let dtypes: Vec<Dtype> = types.iter().map(|t| t.dtype).collect();
+        use Dtype::*;
+        assert_eq!(
+            dtypes,
+            [
+                F32, Bf16, F32, Bf16, Bf16, Bf16, F32, F32, I32, Bf16, Bf16, U32, Bf16, U32, Bool,
+                Bf16, I32, F32, Bool, F32, Bf16, Bf16, F32, U32, Bf16, Bf16
+            ]
+        );
+        assert_eq!(types[6].shape, Shape::SCALAR);
+        assert_eq!(types[22].shape, Shape::matrix(2, 2));
+    }
+
+    #[test]
+    fn bf16_is_refused_where_a_value_is_an_index_or_a_mask() {
+        let chans = [
+            ValueType::vector(4, Dtype::Bf16),
+            ValueType::vector(1, Dtype::U32),
+        ];
+        for op in [
+            Op::Gather { src: 1, idx: 0 },
+            Op::And(0, 0),
+            Op::MaskApply { logits: 1, mask: 0 },
+            Op::RngKeyed {
+                state: 0,
+                shape: Shape::vector(2),
+                kind: RngKind::Uniform,
+            },
+        ] {
+            let ops = vec![Op::ChanTake(0), Op::ChanTake(1), op];
+            assert_eq!(
+                body_types(&ops, &ctx_with(&chans)).unwrap_err().kind,
+                BodyErrorKind::DTypeMismatch
+            );
+        }
+        // An int never mixes with bf16.
+        let ops = vec![Op::ChanTake(0), Op::ChanTake(1), Op::Add(0, 1)];
+        assert!(body_types(&ops, &ctx_with(&chans)).is_err());
+    }
+
+    /// `gumbel_argmax` takes a float row, a row-shaped or scalar bool, a
+    /// float scalar scale and a `[2]` u32 state, and returns each row's
+    /// index.
+    #[test]
+    fn gumbel_argmax_types() {
+        let chans = [
+            ValueType::new(Shape::matrix(3, 7), Dtype::Bf16),
+            ValueType::new(Shape::matrix(3, 7), Dtype::Bool),
+            ValueType::vector(2, Dtype::U32),
+        ];
+        let draw = |keep, scale| Op::GumbelArgmax {
+            logits: 0,
+            keep,
+            scale,
+            state: 2,
+        };
+        let base = || {
+            vec![
+                Op::ChanTake(0),
+                Op::ChanTake(1),
+                Op::ChanTake(2),
+                Op::Const(Literal::F32(0.7)),
+                Op::Const(Literal::Bool(true)),
+            ]
+        };
+        for keep in [1, 4] {
+            let mut ops = base();
+            ops.push(draw(keep, 3));
+            let types = body_types(&ops, &ctx_with(&chans)).expect("types");
+            assert_eq!(types[5], ValueType::vector(3, Dtype::I32));
+        }
+        // The scale is a float scalar; keep is a bool.
+        for (keep, scale) in [(1, 1), (3, 3), (1, 0)] {
+            let mut ops = base();
+            ops.push(draw(keep, scale));
+            assert!(
+                body_types(&ops, &ctx_with(&chans)).is_err(),
+                "{keep} {scale}"
+            );
         }
     }
 

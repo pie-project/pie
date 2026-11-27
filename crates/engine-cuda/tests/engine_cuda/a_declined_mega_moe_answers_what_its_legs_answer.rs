@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Platform, Request};
@@ -15,23 +16,12 @@ use poem_ir::{Fused, Operation, ParamSource, Trace};
 /// weighted sum.
 const ROWS: [&str; 1] = ["glm45-air-mini-bf16-kv-bf16"];
 const CEILING: u32 = 256;
-const PAGE: u32 = 16;
-
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// A plane's bf16 values, by its name.
@@ -89,32 +79,21 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
-    let chip = engine_cuda::chip::profile(&format!(
-        "[engine]\ngraphs = \"off\"\n[fuse]\nmoe_mega = {mega}\n"
-    ));
+    let chip = engine_cuda::chip::profile(&format!("[fuse]\nmoe_mega = {mega}\n"));
     let staged = Shell::stage(engine_cuda::Boot {
-        trace: trace.clone(),
-        contract: &contract,
-        checkpoint: container,
-        budget: Budget::new(1, CEILING),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CEILING,
-        slots: 1,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
+        ..crate::common::boot(
+            trace.clone(),
+            &contract,
+            container,
+            Budget::new(1, CEILING),
+            CEILING,
+            1,
+        )
     })
     .expect("the model loads");
     let mut shell = staged.finish().expect("the model arms");
@@ -134,6 +113,15 @@ fn logits(trace: &Trace, container: &Path, mega: bool, prompt: &[u32]) -> Vec<f3
 fn a_declined_mega_moe_answers_what_its_legs_answer() {
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    // A backend whose fusions hold no mega-MoE (ROCm) never forms one, so
+    // it has no declined one to answer for.
+    if !engine_cuda::FUSIONS
+        .iter()
+        .any(|rule| rule.kernel() == "fused.moe_mega")
+    {
+        eprintln!("skipping: this backend forms no `fused.moe_mega`");
         return;
     }
     for name in ROWS {

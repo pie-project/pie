@@ -4,11 +4,11 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 pub use crate::boot::{Embedded, Engine, Loaded, Summary};
-use crate::config::{ByteSize, Config, EngineKind};
+use crate::config::{ByteSize, Config, EngineKind, Runahead};
 
 /// The knobs an app sets (`PieServer.Configuration` in Swift and Kotlin, the
 /// browser's boot config), laid onto a worker [`Config`] sized for a phone or
@@ -19,44 +19,41 @@ pub struct Settings {
     /// False boots the runtime with no engine, for programs that never run a
     /// forward pass.
     pub engine: bool,
-    pub max_forward_tokens: u32,
-    pub max_forward_requests: u32,
-    #[serde(default)]
-    pub max_state_slots: crate::config::Removed<crate::config::removed::MaxStateSlots>,
-    pub max_model_len: u32,
-    /// Device bytes for the kv pages and state slots (`"1GiB"`); omitted,
-    /// the pool fills what `device_memory_share` leaves.
-    pub device_kv_budget: Option<ByteSize>,
-    pub device_memory_share: f64,
-    /// See [`crate::config::ModelConfig::memory_tolerance`].
-    pub memory_tolerance: runtime::governor::Tolerance,
+    /// See [`crate::config::EngineConfig::max_context`].
+    pub max_context: u32,
+    /// See [`crate::config::MemoryConfig::budget_device`]: on a phone, what
+    /// the app leaves the model of the memory it may wire.
+    pub budget_device: Option<ByteSize>,
+    /// See [`crate::config::MemoryConfig::yield_share`]: `yield`.
+    #[serde(rename = "yield")]
+    pub yield_share: Option<f64>,
     pub sandbox_memory_mb: u64,
     pub max_concurrent_processes: Option<usize>,
+    /// See [`crate::config::RuntimeConfig::frame_size`]. An app serves few
+    /// lanes, so it defaults to the most waves a frame takes
+    /// ([`Runahead::STEPS_MAX`]), the bound the worker config checks it by.
     pub frame_size: u32,
+    /// See [`crate::config::RuntimeConfig::frame_dispatch_depth`].
     pub frame_dispatch_depth: u32,
+    /// See [`crate::config::EngineConfig::measure`]: `false` times nothing
+    /// at load, each rate served by the estimate, named in the log.
+    pub measure: bool,
     pub verbose: bool,
-    pub max_voxels: Option<u32>,
-    pub max_clips: Option<u32>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             engine: true,
-            max_forward_tokens: 512,
-            max_forward_requests: 8,
-            max_state_slots: crate::config::Removed::default(),
-            max_model_len: 4096,
-            device_kv_budget: None,
-            device_memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-            memory_tolerance: runtime::governor::Tolerance::Dedicated,
+            max_context: 4096,
+            budget_device: None,
+            yield_share: None,
             sandbox_memory_mb: 512,
             max_concurrent_processes: None,
-            frame_size: 8,
+            frame_size: u32::from(Runahead::STEPS_MAX),
             frame_dispatch_depth: 2,
+            measure: true,
             verbose: false,
-            max_voxels: None,
-            max_clips: None,
         }
     }
 }
@@ -64,10 +61,12 @@ impl Default for Settings {
 impl Settings {
     /// TOML, or the same document as JSON.
     pub fn parse(text: &str) -> Result<Self> {
-        if text.trim_start().starts_with('{') {
-            return serde_json::from_str(text).context("parse the settings");
-        }
-        toml::from_str(text).context("parse the settings")
+        let parsed = if text.trim_start().starts_with('{') {
+            serde_json::from_str(text).map_err(|e| e.to_string())
+        } else {
+            toml::from_str(text).map_err(|e: toml::de::Error| e.message().to_string())
+        };
+        parsed.map_err(|e| anyhow!("parse the settings: {e}"))
     }
 
     /// The worker config that serves `artifact` from `home`: this build's
@@ -96,15 +95,11 @@ impl Settings {
         let mut config = Config::parse(&document.to_string())?;
 
         config.engine.options = self.engine_options(kind, home);
-        config.model.device_kv_budget = self.device_kv_budget;
-        config.model.memory_tolerance = self.memory_tolerance;
-        config.model.device_memory_share = self.device_memory_share;
-        if self.max_voxels.is_some() {
-            config.model.max_voxels = self.max_voxels;
-        }
-        if self.max_clips.is_some() {
-            config.model.max_clips = self.max_clips;
-        }
+        config.engine.max_context = Some(self.max_context);
+        config.engine.measure = self.measure;
+        config.engine.memory.budget_device = self.budget_device;
+        config.engine.memory.yield_share = self.yield_share;
+        config.engine.memory.yields()?;
         config.server.worker_threads = 2;
         config.server.verbose = self.verbose;
         config.server.max_upload = ByteSize::from_mib(256);
@@ -112,7 +107,7 @@ impl Settings {
         config.runtime.frame_dispatch_depth = Some(self.frame_dispatch_depth);
         config.runtime.max_concurrent_processes = self.max_concurrent_processes;
         let sandbox = &mut config.sandbox;
-        sandbox.max_instances = 16;
+        sandbox.max_instances = Some(16);
         sandbox.max_memory = ByteSize::from_mib(self.sandbox_memory_mb);
         sandbox.warm_memory = ByteSize::default();
         sandbox.warm_slots = 0;
@@ -120,6 +115,7 @@ impl Settings {
         sandbox.scratch_dir = home.join("scratch");
         sandbox.allow_network = false;
         sandbox.network_allowed_hosts.clear();
+        config.validate()?;
         Ok(config)
     }
 
@@ -128,25 +124,12 @@ impl Settings {
         let mut set = |key: &str, value: toml::Value| {
             options.insert(key.into(), value);
         };
-        set(
-            "max_forward_tokens",
-            i64::from(self.max_forward_tokens).into(),
-        );
-        set(
-            "max_forward_requests",
-            i64::from(self.max_forward_requests).into(),
-        );
-        set("max_model_len", i64::from(self.max_model_len).into());
-        match kind {
-            EngineKind::Metal => set("kv_page_size", 16.into()),
-            EngineKind::Vulkan => {
-                let cache = home.join("vulkan-pipelines.bin");
-                set(
-                    "pipeline_cache",
-                    cache.to_string_lossy().into_owned().into(),
-                );
-            }
-            _ => {}
+        if kind == EngineKind::Vulkan {
+            let cache = home.join("vulkan-pipelines.bin");
+            set(
+                "pipeline_cache",
+                cache.to_string_lossy().into_owned().into(),
+            );
         }
         options
     }
@@ -180,4 +163,19 @@ pub async fn recv_frames(session: u32, max_wait_ms: u64, max: usize) -> Result<V
         .iter()
         .map(|message| rmp_serde::to_vec_named(message).map_err(anyhow::Error::from))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What an app that states nothing boots with is a config the worker
+    /// takes: each default sits inside the bound `Config::validate` holds it to.
+    #[test]
+    fn the_default_settings_lay_a_valid_config() {
+        let config = Settings::default()
+            .config(Path::new("model.zt"), Path::new("home"))
+            .expect("the default settings validate");
+        assert_eq!(config.runtime.frame_size, u32::from(Runahead::STEPS_MAX));
+    }
 }

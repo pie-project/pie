@@ -1,9 +1,10 @@
 #include "prim/bf16.slang"
+#include "prim/ieee.slang"
 #include "prim/params.slang"
 
 // Each row's argmax, one workgroup a row (the grid's `y`), landed as an i32
 // at column `column` of a `depth`-wide plane: the first index of the
-// largest value, NaNs skipped (a row of NaNs lands 0). The reduction runs
+// largest value, NaNs skipped by their bits (a row of NaNs lands 0). The reduction runs
 // through workgroup memory, no subgroup operation. Rows are bf16 two a
 // word, or f32 with `PIE_F32`.
 
@@ -50,7 +51,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint bi = NONE;
     for (uint c = lid; c < width; c += uint(PIE_GROUP_X)) {
         float v = x_at(row * width + c);
-        if (v == v && beats(v, c, bv, bi)) {
+        if (!ieee_is_nan(v) && beats(v, c, bv, bi)) {
             bv = v;
             bi = c;
         }

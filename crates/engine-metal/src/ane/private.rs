@@ -87,16 +87,21 @@ pub struct Private {
     /// How many projections have.
     /// The fewest rows handed over (`kernel.ane.min_rows`).
     min_rows: u32,
-    _buffers: Vec<Buffer>,
+    buffers: banks::Keep,
 }
 
+/// A Neural Engine surface as the GPU binds it. The one memory outside the
+/// pool on Metal, by the OS: the Neural Engine reads IOSurfaces it maps
+/// itself, and a placement sparse buffer cannot be one, so the surfaces are
+/// laid at the load and entered in the ledger as model and fire class
+/// there (a stated exception, the user's ruling).
 fn view(
     device: &Context,
     handles: &Handles,
     surface: &Surface,
     rows: u32,
     width: u32,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
 ) -> Result<Tensor> {
     let at = std::ptr::NonNull::new(surface.base()).ok_or(Fault::Device {
         call: "IOSurfaceGetBaseAddress",
@@ -125,8 +130,9 @@ fn target(
     weights: &Surface,
     scale: &Surface,
     rows: u32,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
 ) -> Result<Target> {
+    keep.model += weights.bytes() + scale.bytes();
     Ok(Target {
         weights: view(device, handles, weights, rows, weights.stride(), keep)?,
         stride: weights.stride(),
@@ -167,7 +173,7 @@ fn mlp_site(
     common: &Common,
     mlps: &[Mlp],
     split: AneMlp,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<MlpSite>> {
     let (hidden, intermediate) = (mlps[0].gate_up.codes.width, mlps[0].intermediate);
@@ -190,7 +196,7 @@ fn mlp_site(
         view(device, handles, &memory.partial, hidden + 1, MAX_ROWS, keep)?,
         memory.partial.stride() / 2,
     );
-    let set = |w: &ffn::Weights, keep: &mut Vec<Buffer>| -> Result<Set> {
+    let set = |w: &ffn::Weights, keep: &mut banks::Keep| -> Result<Set> {
         Ok(Set {
             gate: w
                 .gate
@@ -243,7 +249,7 @@ fn mlp_site(
             },
         );
     }
-    eprintln!(
+    tracing::info!(
         "ane: {} MLP layers split, Neural Engine takes {} of {intermediate} columns",
         layers.len(),
         shape.ane
@@ -270,7 +276,7 @@ fn projection_site(
     (k, n): (u32, u32),
     projections: &[banks::Projection],
     percent: u32,
-    keep: &mut Vec<Buffer>,
+    keep: &mut banks::Keep,
     keys: &mut BTreeMap<u32, Key>,
 ) -> Result<Option<ProjectionSite>> {
     let Ok(shape) = linear::Shape::new(k, n, share(n / ffn::UNIT, percent)) else {
@@ -292,7 +298,7 @@ fn projection_site(
         view(device, handles, &memory.partial, shape.ane, MAX_ROWS, keep)?,
         memory.partial.stride() / 2,
     );
-    let set = |w: &linear::Weights, keep: &mut Vec<Buffer>| -> Result<Vec<Target>> {
+    let set = |w: &linear::Weights, keep: &mut banks::Keep| -> Result<Vec<Target>> {
         w.w.iter()
             .map(|s| target(device, handles, s, &w.scale, shape.ane, keep))
             .collect()
@@ -324,7 +330,7 @@ fn projection_site(
             },
         );
     }
-    eprintln!(
+    tracing::info!(
         "ane: {} projections of {k} -> {n} split, Neural Engine takes {} columns",
         layers.len(),
         shape.ane
@@ -362,7 +368,7 @@ fn tried<T>(
     loop {
         match compile() {
             Err(why) if attempt < COMPILE_TRIES => {
-                eprintln!(
+                tracing::warn!(
                     "ane: the Neural Engine {what} program did not compile ({why}); trying again"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
@@ -380,11 +386,11 @@ impl Job {
             Job::Mlp(slot, memory, shape) => {
                 let result = tried("MLP", || Ffn::compile(&shape, &memory, cache));
                 match &result {
-                    Ok(_) => eprintln!(
+                    Ok(_) => tracing::info!(
                         "ane: Neural Engine MLP program ready in {:.1}s",
                         started.elapsed().as_secs_f64()
                     ),
-                    Err(why) => eprintln!(
+                    Err(why) => tracing::warn!(
                         "ane: the Neural Engine MLP program did not compile ({why}); the load is refused"
                     ),
                 }
@@ -395,15 +401,16 @@ impl Job {
                     linear::Linear::compile(&shape, &memory, cache)
                 });
                 match &result {
-                    Ok(_) => eprintln!(
+                    Ok(_) => tracing::info!(
                         "ane: Neural Engine {} -> {} program ready in {:.1}s",
                         shape.k,
                         shape.n,
                         started.elapsed().as_secs_f64()
                     ),
-                    Err(why) => eprintln!(
+                    Err(why) => tracing::warn!(
                         "ane: the Neural Engine {} -> {} program did not compile ({why}); the load is refused",
-                        shape.k, shape.n
+                        shape.k,
+                        shape.n
                     ),
                 }
                 let _ = slot.set(result);
@@ -412,6 +419,7 @@ impl Job {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn load(
     device: &Context,
     handles: &Handles,
@@ -420,9 +428,10 @@ pub fn load(
     mlp_split: AneMlp,
     projection_split: AneProjections,
     min_rows: u32,
+    cache: Option<&std::path::Path>,
 ) -> Result<Option<Private>> {
     use objc2_metal::MTLDevice;
-    let mut keep = Vec::new();
+    let mut keep = banks::Keep::default();
     let signs = banks::staging(
         device,
         handles,
@@ -432,9 +441,9 @@ pub fn load(
         &mut keep,
     )?;
     let bytes: Vec<u8> = ffn::signs().iter().flat_map(|v| v.to_le_bytes()).collect();
-    banks::host(&keep[keep.len() - 1])?[..bytes.len()].copy_from_slice(&bytes);
+    banks::host(keep.last())?[..bytes.len()].copy_from_slice(&bytes);
     let status = banks::staging(device, handles, 1, 1, Dtype::U32, &mut keep)?;
-    let status_host = banks::host(&keep[keep.len() - 1])?.as_mut_ptr() as usize;
+    let status_host = banks::host(keep.last())?.as_mut_ptr() as usize;
     let common = Common { signs, status };
     let mut keys = BTreeMap::new();
 
@@ -505,10 +514,13 @@ pub fn load(
             site.shape.clone(),
         ));
     }
+    let cache = kernels_metal::ane::cache_directory(&cache.map_or_else(
+        || std::env::temp_dir().join("pie-cache"),
+        std::path::Path::to_path_buf,
+    ));
     std::thread::Builder::new()
         .name("pie-ane-compile".into())
         .spawn(move || {
-            let cache = kernels_metal::ane::cache_directory();
             for job in jobs {
                 job.run(&cache);
             }
@@ -522,11 +534,25 @@ pub fn load(
         keys,
         status: status_host,
         splits: AtomicU64::new(0),
-        _buffers: keep,
+        buffers: keep,
     }))
 }
 
 impl Private {
+    /// The device bytes this load holds, as (model, fire): the weight and
+    /// scale surfaces, and the activation surfaces, partials and staging.
+    #[must_use]
+    /// (model surfaces, a fire's surfaces, staging buffers).
+    pub fn bytes(&self) -> (u64, u64, u64) {
+        let model = self.buffers.model;
+        let staging = self.buffers.staging;
+        (
+            model,
+            self.buffers.bytes().saturating_sub(model + staging),
+            staging,
+        )
+    }
+
     /// The most rows the Neural Engine takes a share of in one fire; a fire
     /// past them runs on the GPU alone.
     #[must_use]
@@ -584,11 +610,27 @@ impl Private {
         (MIN_ROWS.max(self.min_rows)..=MAX_ROWS).contains(&rows) && !self.handoff.retired()
     }
 
+    /// The fire one procedure's rows and a GPU tail of `tail` rows make, where
+    /// the tail is one the GPU runs alone ([`Private::head_rows`]).
+    #[must_use]
+    pub fn with_tail(&self, tail: u32) -> Option<u32> {
+        (1..=GPU_TAIL)
+            .contains(&tail)
+            .then(|| MIN_ROWS.max(self.min_rows) + tail)
+    }
+
+    /// Whether a fire of `rows` rows can hand the Neural Engine any of them.
+    #[must_use]
+    pub fn shares(&self, rows: u32) -> bool {
+        self.rows_fit(self.head_rows(rows))
+    }
+
     /// A split for the MLP whose gate-up weight is `gate_up`, over `rows`,
     /// if the Neural Engine can take it: the rows fit a procedure, the
     /// program is compiled, the layer is one of the split ones, and nothing
-    /// has retired the hand-off.
-    pub fn plan(&self, gate_up: poem_ir::ValueId, rows: u32) -> Option<Plan> {
+    /// has retired the hand-off. A `dry` one is encoded for its pipelines
+    /// alone: it hands nothing over and marks nothing staged.
+    pub fn plan(&self, gate_up: poem_ir::ValueId, rows: u32, dry: bool) -> Option<Plan> {
         let Some(Key::Mlp(layer)) = self.keys.get(&gate_up.0).copied() else {
             return None;
         };
@@ -610,12 +652,13 @@ impl Private {
             layer,
             at: self.handoff.allot(),
             evaluation,
+            dry,
         })
     }
 
     /// A column split for the projection whose weight is `w`, over `rows`,
     /// on the same terms.
-    pub fn plan_columns(&self, w: poem_ir::ValueId, rows: u32) -> Option<Columns> {
+    pub fn plan_columns(&self, w: poem_ir::ValueId, rows: u32, dry: bool) -> Option<Columns> {
         let Some(Key::Projection(index, layer)) = self.keys.get(&w.0).copied() else {
             return None;
         };
@@ -633,6 +676,7 @@ impl Private {
             layer,
             at: self.handoff.allot(),
             evaluation,
+            dry,
         })
     }
 
@@ -641,13 +685,16 @@ impl Private {
         ctx: &Ctx<'_>,
         site: &MlpSite,
         layer: u32,
+        dry: bool,
     ) -> std::result::Result<(), Error> {
         let Some(source) = site.layers.get(&layer) else {
             return Ok(());
         };
         let set = &site.sets[(layer & 1) as usize];
         kernels::stage(ctx, &site.shape, &source.source, site.shared.signs, set)?;
-        site.staged.store(layer, Ordering::Release);
+        if !dry {
+            site.staged.store(layer, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -656,15 +703,15 @@ impl Private {
     /// behind the signal.
     pub fn before(&self, ctx: &Ctx<'_>, plan: &Plan, x: Tensor) -> std::result::Result<(), Error> {
         let site = self.mlp.as_ref().expect("a plan names a site");
-        if site.staged.load(Ordering::Acquire) != plan.layer {
-            self.stage_mlp(ctx, site, plan.layer)?;
+        if plan.dry || site.staged.load(Ordering::Acquire) != plan.layer {
+            self.stage_mlp(ctx, site, plan.layer, plan.dry)?;
         }
         let rotated = Tensor {
             rows: plan.rows,
             ..site.rotated
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
-        if let Some(Ok(ffn)) = site.ffn.get() {
+        if let Some(Ok(ffn)) = site.ffn.get().filter(|_| !plan.dry) {
             let binding = &ffn.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff.start(ctx, &ffn.program, binding, plan.at)?;
             self.splits.fetch_add(1, Ordering::AcqRel);
@@ -676,7 +723,7 @@ impl Private {
     /// the other set while the Neural Engine runs, then wait on it and join.
     pub fn after(&self, ctx: &Ctx<'_>, plan: &Plan, out: Tensor) -> std::result::Result<(), Error> {
         let site = self.mlp.as_ref().expect("a plan names a site");
-        self.stage_mlp(ctx, site, plan.layer + 1)?;
+        self.stage_mlp(ctx, site, plan.layer + 1, plan.dry)?;
         kernels::join(ctx, &site.shared, out, plan.at.done)
     }
 
@@ -685,13 +732,16 @@ impl Private {
         ctx: &Ctx<'_>,
         site: &ProjectionSite,
         layer: u32,
+        dry: bool,
     ) -> std::result::Result<(), Error> {
         let Some(source) = site.layers.get(&layer) else {
             return Ok(());
         };
         let set = &site.sets[(layer & 1) as usize];
         kernels::stage_projection(ctx, &source.projection, site.shared.signs, set)?;
-        site.staged.store(layer, Ordering::Release);
+        if !dry {
+            site.staged.store(layer, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -703,15 +753,15 @@ impl Private {
         x: Tensor,
     ) -> std::result::Result<(), Error> {
         let site = &self.projections[plan.site];
-        if site.staged.load(Ordering::Acquire) != plan.layer {
-            self.stage_projection(ctx, site, plan.layer)?;
+        if plan.dry || site.staged.load(Ordering::Acquire) != plan.layer {
+            self.stage_projection(ctx, site, plan.layer, plan.dry)?;
         }
         let rotated = Tensor {
             rows: plan.rows,
             ..site.rotated
         };
         kernels::prepare(ctx, &site.shared, x, rotated, plan.at.ready)?;
-        if let Some(Ok(program)) = site.program.get() {
+        if let Some(Ok(program)) = site.program.get().filter(|_| !plan.dry) {
             let binding = &program.evaluations[plan.evaluation].1[(plan.layer & 1) as usize];
             self.handoff
                 .start(ctx, &program.program, binding, plan.at)?;
@@ -728,7 +778,7 @@ impl Private {
         out: Tensor,
     ) -> std::result::Result<(), Error> {
         let site = &self.projections[plan.site];
-        self.stage_projection(ctx, site, plan.layer + 1)?;
+        self.stage_projection(ctx, site, plan.layer + 1, plan.dry)?;
         kernels::join_columns(ctx, &site.shared, out, plan.keep, plan.at.done)
     }
 

@@ -105,6 +105,9 @@ async fn pass(
             .collect(),
     );
     let fwd = ForwardPass::new();
+    // A verify's rejected draft rows are written again by the next round:
+    // the rows are taken back, so the pass is not final.
+    fwd.retractable()?;
     if drafting {
         fwd.switch(0, "block_draft", "on").context("draft block")?;
     }
@@ -170,6 +173,7 @@ struct Prices {
 }
 
 impl Prices {
+    /// An odd count, so the median is a fire's own price past one stall.
     const KEEP: usize = 5;
 
     fn keep(bucket: &mut Vec<u64>, ns: u64) {
@@ -216,6 +220,7 @@ struct Yield {
 }
 
 impl Yield {
+    /// A round's weight halves in about seven rounds (0.9^7 = 0.48).
     const DECAY: f64 = 0.9;
 
     /// A round verified `width - 1` proposals and kept the first `kept`.
@@ -274,7 +279,8 @@ pub async fn generate(
     // and the widest verify a block feeds: the anchor and every proposal.
     let from = draft.proposals_from.min(1) as usize;
     let widest = block + 1 - from as u32;
-    let ws = WorkingSet::new();
+    // Reused across requests within the tenant, as `generate`'s.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let pick = sampled.map(|(temperature, seed)| Pick {
         temperature,

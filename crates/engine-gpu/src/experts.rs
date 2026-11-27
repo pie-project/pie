@@ -11,11 +11,20 @@ use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use kernels_slang::Tensor;
 
+/// Staging slots a gather cycles through: one filled on the host while the
+/// other's copy is in flight; a third would wait on the same flush.
 const RING: usize = 2;
 
+/// Route entries one gather writes at most: an i32 table of 1 MiB, a
+/// 16384-token fire at top-16 routing.
 const MAX_ROUTES: u64 = 1 << 18;
 
-const COPY_THREADS: usize = 16;
+/// The host threads a gather's rows are copied by: the cores this process
+/// may run on.
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Mapping {
@@ -109,6 +118,8 @@ impl Mapping {
     /// a miss, from the page cache, so a load whose weights lie in the pool
     /// keeps no host copy of them resident.
     pub fn release(&self) {
+        // The advice is unix's; elsewhere the OS trims the mapping's pages.
+        #[cfg(unix)]
         // SAFETY: a read-only private file mapping; dropping its pages makes
         // the next read fault them back in from the file, unchanged.
         let _ = unsafe {
@@ -364,8 +375,14 @@ impl<B: Backend> HostTier<B> {
         map: Mapping,
         planes: Vec<HostPlane>,
     ) -> Result<(HostTier<B>, Vec<u32>)> {
-        const STRIDE: u64 = 256;
-        let phantom = B::Buffer::host(device, STRIDE * planes.len().max(1) as u64)?;
+        // Each plane's handle a view of its own on the phantom buffer, at the
+        // binding alignment every device accepts.
+        const STRIDE: u64 = crate::arena::ALIGN;
+        let phantom = B::Buffer::host(
+            device,
+            STRIDE * planes.len().max(1) as u64,
+            crate::books::owners::EXPERT_TIER,
+        )?;
         let mut minted = Vec::with_capacity(planes.len());
         let mut table = BTreeMap::new();
         let mut bytes = 0u64;
@@ -456,7 +473,7 @@ impl<B: Backend> Seats<B> {
                 continue;
             }
             let cap = per * u64::from(capacity);
-            let buffer = B::Buffer::zeroed(device, cap)?;
+            let buffer = B::Buffer::zeroed(device, cap, crate::books::owners::EXPERT_SEATS)?;
             let handle = handles.bind(&buffer, 0, cap)?;
             slabs.push((kind, buffer));
             seat[kind.at()] = Some((handle, per));
@@ -469,9 +486,10 @@ impl<B: Backend> Seats<B> {
                 device,
                 slot_bytes,
                 crate::backend::Memory::Staging,
+                crate::books::owners::EXPERT_SEATS,
             )?);
         }
-        let routes = B::Buffer::zeroed(device, MAX_ROUTES * 4)?;
+        let routes = B::Buffer::zeroed(device, MAX_ROUTES * 4, crate::books::owners::EXPERT_SEATS)?;
         let routes_handle = handles.bind(&routes, 0, MAX_ROUTES * 4)?;
         Ok(Some(Seats {
             slabs,
@@ -598,7 +616,6 @@ fn copy_row_at(map: &Mapping, plane: &HostPlane, seat: usize, row: i32, into: us
 
 #[cfg(target_arch = "wasm32")]
 fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> Result<()> {
-    let _ = COPY_THREADS;
     for (seat, &row) in unique.iter().enumerate() {
         copy_row_at(map, plane, seat, row, into)?;
     }
@@ -610,7 +627,7 @@ fn copy_rows(map: &Mapping, plane: &HostPlane, unique: &[i32], into: usize) -> R
     if unique.is_empty() {
         return Ok(());
     }
-    let threads = COPY_THREADS.min(unique.len());
+    let threads = copy_threads().min(unique.len());
     let chunk = unique.len().div_ceil(threads);
     let faults: Vec<Result<()>> = std::thread::scope(|scope| {
         unique
@@ -753,12 +770,12 @@ impl Plan {
         if dense > cap {
             return Err(Fault::Residency(format!(
                 "this deployment's dense weights take {dense} bytes, and the device holds {cap} \
-                 for them under `[model] device_memory_share` once the working set and one \
-                 sequence's kv pages and state slots are down. Dense weights always live in \
-                 device memory (only routed experts and token-id tables leave it, through the \
-                 weight cache), so serve a quantized deployment of this model, split it across \
-                 devices with tensor parallelism, or raise `[model] device_memory_share` or \
-                 shorten `max_model_len`."
+                 for them under the load's allowance once the working set and one sequence's \
+                 kv pages and state slots are down. Dense weights always live in device \
+                 memory (only routed experts and token-id tables leave it, through the weight \
+                 cache), so serve a quantized deployment of this model, split it across \
+                 devices with tensor parallelism, raise `[engine.memory] budget_device`, or \
+                 shorten `[engine] max_context`."
             )));
         }
         let mut device = dense;

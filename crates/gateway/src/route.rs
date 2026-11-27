@@ -1,17 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use controller_api::{Health, Role, RoutableWorker, RoutingTable};
+use controller_api::{Health, Role, RoutingTable};
 use ids::WorkerId;
 use tokio::sync::watch;
 use worker_api::{Accepted, Request};
 
-use crate::admission::{AdmissionConfig, AdmissionDecision, RejectReason, admit};
-
-pub type AffinityKey = u64;
-
-const MAX_DISPATCH_ATTEMPTS: usize = 8;
+use crate::admission::{AdmissionDecision, admit};
 
 pub trait WorkerDispatch {
     type Err: std::fmt::Display;
@@ -53,15 +48,13 @@ impl std::fmt::Display for RouteError {
 
 impl std::error::Error for RouteError {}
 
+/// The routing table as the controller last sent it, and the workers linked
+/// to this gateway. It places nothing by load: a launch goes where its
+/// placement row lists, else to the eligible workers in the table's order.
 #[derive(Clone)]
 pub struct RoutingHandle {
     routing: watch::Receiver<RoutingTable>,
     connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
-    admission: AdmissionConfig,
-    // Tokio's mutex hands out the lock in arrival order, so launches that
-    // find the pool full are seated first-come first-served.
-    queue: Arc<tokio::sync::Mutex<()>>,
-    queued: Arc<AtomicUsize>,
 }
 
 impl RoutingHandle {
@@ -69,33 +62,15 @@ impl RoutingHandle {
         routing: watch::Receiver<RoutingTable>,
         connected: watch::Receiver<Arc<HashSet<WorkerId>>>,
     ) -> Self {
-        Self {
-            routing,
-            connected,
-            admission: AdmissionConfig::default(),
-            queue: Arc::default(),
-            queued: Arc::default(),
-        }
-    }
-
-    pub fn with_admission(mut self, admission: AdmissionConfig) -> Self {
-        self.admission = admission;
-        self
-    }
-
-    pub fn max_queued_launches(&self) -> usize {
-        self.admission.max_queued_launches
+        Self { routing, connected }
     }
 
     pub fn table_watch(&self) -> watch::Receiver<RoutingTable> {
         self.routing.clone()
     }
 
-    // Admission sheds what takes a seat on a worker, and only a launch does:
-    // a ping, an upload, a query or a terminate holds no KV and no lane, and a
-    // client whose first frame is one of those (installing its program, or
-    // reaping the processes that saturated the pool) must not find its
-    // session refused and its socket closed for a pool another session fills.
+    // Only a launch takes a seat on a worker: a ping, an upload, a query or
+    // a terminate holds no KV and no lane, so it is never refused here.
     pub fn admit(&self, req: &Request) -> AdmissionDecision {
         if !matches!(
             &req.message,
@@ -103,68 +78,25 @@ impl RoutingHandle {
         ) {
             return AdmissionDecision::Admit;
         }
-        admit(&self.routing.borrow(), &self.admission)
+        admit(&self.routing.borrow())
     }
 
-    // A launch the pool cannot seat now waits for the routing table to show
-    // headroom again rather than being refused; dropping the future (the
-    // client went away) leaves the queue.
-    pub async fn admit_queued(&self, req: &Request) -> AdmissionDecision {
-        let decision = self.admit(req);
-        let is_launch = matches!(
-            &req.message,
-            client_api::ClientMessage::LaunchProcess { .. }
-        );
-        if !is_launch
-            || (decision != AdmissionDecision::Reject(RejectReason::ClusterSaturated)
-                && self.queued.load(Ordering::Acquire) == 0)
-        {
-            return decision;
-        }
-        struct Queued<'a>(&'a AtomicUsize);
-        impl Drop for Queued<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        if self.queued.fetch_add(1, Ordering::AcqRel) >= self.admission.max_queued_launches {
-            self.queued.fetch_sub(1, Ordering::AcqRel);
-            return AdmissionDecision::Reject(RejectReason::QueueFull);
-        }
-        let _queued = Queued(&self.queued);
-        let _turn = self.queue.lock().await;
-        let mut routing = self.routing.clone();
-        loop {
-            match admit(&routing.borrow_and_update(), &self.admission) {
-                AdmissionDecision::Reject(RejectReason::ClusterSaturated) => {}
-                decision => return decision,
-            }
-            if routing.changed().await.is_err() {
-                return AdmissionDecision::Reject(RejectReason::ClusterSaturated);
-            }
-        }
+    /// The eligible workers, in the table's order.
+    pub fn select_worker(&self) -> Vec<WorkerId> {
+        select_candidates(&self.routing.borrow(), &self.connected.borrow(), None)
     }
 
-    pub fn select_worker(&self, affinity: Option<AffinityKey>) -> Vec<WorkerId> {
-        let table = self.routing.borrow();
-        let connected = self.connected.borrow();
-        let mut rng = next_rand;
-        select_candidates(&table, &connected, None, affinity, &mut rng)
-    }
-
+    /// Tries the eligible workers in order, `preferred` first when it is
+    /// one, and only `pinned` when set, until one accepts.
     pub async fn dispatch_with_retry<W: WorkerDispatch>(
         &self,
         workers: &W,
         req: &Request,
-        affinity: Option<AffinityKey>,
         preferred: Option<WorkerId>,
         pinned: Option<WorkerId>,
     ) -> Result<Dispatched, RouteError> {
         let candidates = {
-            let table = self.routing.borrow();
-            let connected = self.connected.borrow();
-            let mut rng = next_rand;
-            let mut candidates = select_candidates(&table, &connected, None, affinity, &mut rng);
+            let mut candidates = self.select_worker();
             if let Some(at) = preferred.and_then(|p| candidates.iter().position(|&w| w == p)) {
                 let worker = candidates.remove(at);
                 candidates.insert(0, worker);
@@ -179,7 +111,7 @@ impl RoutingHandle {
         }
 
         let mut attempts = 0usize;
-        for id in candidates.into_iter().take(MAX_DISPATCH_ATTEMPTS) {
+        for id in candidates {
             attempts += 1;
             match workers.dispatch(id, req.clone()).await {
                 Ok(accepted @ Accepted::Ok { .. }) => {
@@ -200,98 +132,29 @@ impl RoutingHandle {
     }
 }
 
-fn load_key(w: &RoutableWorker) -> (u8, u32, u64) {
-    (
-        w.coarse_load.kv_pressure_bucket,
-        w.coarse_load.inflight,
-        w.id.0,
-    )
-}
-
-fn mix64(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-fn hrw_score(key: u64, worker: WorkerId) -> u64 {
-    mix64(key ^ mix64(worker.0))
-}
-
-fn next_rand() -> u64 {
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut s = STATE.load(Ordering::Relaxed);
-    if s == 0 {
-        use std::hash::{BuildHasher, Hasher};
-        let seed = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish()
-            | 1;
-        STATE.store(seed, Ordering::Relaxed);
-        s = seed;
-    }
-    let prev = STATE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
-    mix64(prev.wrapping_add(s))
-}
-
+/// The healthy, linked decode workers (of `want_model`, when named), in the
+/// table's order.
 fn select_candidates(
     table: &RoutingTable,
     connected: &HashSet<WorkerId>,
     want_model: Option<&str>,
-    affinity: Option<AffinityKey>,
-    rng: &mut dyn FnMut() -> u64,
 ) -> Vec<WorkerId> {
-    let mut eligible: Vec<&RoutableWorker> = table
+    table
         .workers
         .iter()
         .filter(|w| w.health == Health::Healthy)
         .filter(|w| w.role == Role::Decode)
         .filter(|w| connected.contains(&w.id))
         .filter(|w| want_model.is_none_or(|m| w.model == m))
-        .collect();
-
-    if eligible.is_empty() {
-        return Vec::new();
-    }
-
-    match affinity {
-        Some(key) => {
-            eligible.sort_by_key(|w| (std::cmp::Reverse(hrw_score(key, w.id)), w.id.0));
-            eligible.iter().map(|w| w.id).collect()
-        }
-        None => {
-            let primary_pos = p2c_pick(&eligible, rng);
-            let primary = eligible.remove(primary_pos);
-            eligible.sort_by_key(|w| load_key(w));
-            std::iter::once(primary.id)
-                .chain(eligible.iter().map(|w| w.id))
-                .collect()
-        }
-    }
-}
-
-fn p2c_pick(eligible: &[&RoutableWorker], rng: &mut dyn FnMut() -> u64) -> usize {
-    let n = eligible.len();
-    if n == 1 {
-        return 0;
-    }
-    let i = (rng() % n as u64) as usize;
-    let mut j = (rng() % (n as u64 - 1)) as usize;
-    if j >= i {
-        j += 1;
-    }
-    if load_key(eligible[i]) <= load_key(eligible[j]) {
-        i
-    } else {
-        j
-    }
+        .map(|w| w.id)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use client_api::ClientMessage;
-    use controller_api::{Role, WorkerStatus};
+    use controller_api::{RoutableWorker, WorkerStatus};
     use ids::{ReqId, SessionId, TenantId};
     use std::sync::Mutex;
     use worker_api::Priority;
@@ -316,7 +179,6 @@ mod tests {
         RoutingTable {
             epoch: 1,
             workers,
-            scales: false,
             author: None,
         }
     }
@@ -325,16 +187,12 @@ mod tests {
         ids.iter().map(|&i| WorkerId(i)).collect()
     }
 
-    fn scripted(seq: Vec<u64>) -> impl FnMut() -> u64 {
-        let mut it = seq.into_iter();
-        move || it.next().unwrap_or(0)
-    }
-
     #[test]
     fn route_every_case() {
         filters_unhealthy_disconnected_and_model();
         filters_executor_roles();
         empty_when_nothing_eligible();
+        the_table_order_holds_whatever_the_load();
     }
 
     fn filters_unhealthy_disconnected_and_model() {
@@ -345,11 +203,7 @@ mod tests {
             worker(4, "m", Health::Healthy, 0, 0),     // ✓ only eligible
         ]);
         let conn = connset(&[1, 3, 4]);
-        let mut rng = scripted(vec![]);
-        assert_eq!(
-            select_candidates(&t, &conn, Some("m"), Some(7), &mut rng),
-            vec![WorkerId(4)]
-        );
+        assert_eq!(select_candidates(&t, &conn, Some("m")), vec![WorkerId(4)]);
     }
 
     fn filters_executor_roles() {
@@ -360,19 +214,29 @@ mod tests {
         let decode = worker(3, "m", Health::Healthy, 0, 0);
         let t = table(vec![prefill, encode, decode]);
         let conn = connset(&[1, 2, 3]);
-        let mut rng = scripted(vec![]);
-        assert_eq!(
-            select_candidates(&t, &conn, Some("m"), None, &mut rng),
-            vec![WorkerId(3)]
-        );
+        assert_eq!(select_candidates(&t, &conn, Some("m")), vec![WorkerId(3)]);
     }
 
     fn empty_when_nothing_eligible() {
         let t = table(vec![worker(1, "m", Health::Unreachable, 0, 0)]);
         let conn = connset(&[1]);
-        let mut rng = scripted(vec![]);
-        assert!(select_candidates(&t, &conn, Some("m"), Some(1), &mut rng).is_empty());
-        assert!(select_candidates(&t, &conn, None, None, &mut rng).is_empty());
+        assert!(select_candidates(&t, &conn, Some("m")).is_empty());
+        assert!(select_candidates(&t, &conn, None).is_empty());
+    }
+
+    /// With no placement row, the eligible workers go in the table's order:
+    /// load orders nothing here, the cluster policy's rows do.
+    fn the_table_order_holds_whatever_the_load() {
+        let t = table(vec![
+            worker(3, "m", Health::Healthy, 255, 1000),
+            worker(1, "m", Health::Healthy, 0, 0),
+            worker(2, "m", Health::Healthy, 128, 10),
+        ]);
+        let conn = connset(&[1, 2, 3]);
+        assert_eq!(
+            select_candidates(&t, &conn, None),
+            vec![WorkerId(3), WorkerId(1), WorkerId(2)]
+        );
     }
 
     fn req() -> Request {
@@ -415,57 +279,9 @@ mod tests {
         RoutingHandle::new(rr, cr)
     }
 
-    #[test]
-    fn process_control_survives_resource_saturation_but_launches_do_not() {
-        for (kv, inflight) in [(255, 0), (0, 1024)] {
-            let h = handle_with(
-                table(vec![worker(1, "m", Health::Healthy, kv, inflight)]),
-                &[1],
-            );
-            let mut request = req();
-            for message in [
-                ClientMessage::ListProcesses { corr_id: 1 },
-                ClientMessage::TerminateProcess {
-                    corr_id: 1,
-                    process_id: "running".into(),
-                },
-                ClientMessage::Ping { corr_id: 1 },
-                ClientMessage::AttachProcess {
-                    corr_id: 1,
-                    process_id: "running".into(),
-                },
-                req().message,
-            ] {
-                request.message = message;
-                assert_eq!(h.admit(&request), AdmissionDecision::Admit);
-            }
-            request.message = ClientMessage::LaunchProcess {
-                corr_id: 1,
-                inferlet: "chat".into(),
-                input: String::new(),
-                capture_outputs: false,
-                props: Default::default(),
-                session: None,
-                files: Default::default(),
-                handles: Default::default(),
-                returns: Default::default(),
-                cluster_props: Default::default(),
-                executors: Vec::new(),
-            };
-            assert!(matches!(h.admit(&request), AdmissionDecision::Reject(_)));
-        }
-    }
-
-    #[tokio::test]
-    async fn saturated_launches_queue_in_order_until_the_pool_frees() {
-        let (routing, rr) = watch::channel(table(vec![worker(1, "m", Health::Healthy, 255, 0)]));
-        let (_ct, cr) = watch::channel(Arc::new(connset(&[1])));
-        let h = RoutingHandle::new(rr, cr).with_admission(AdmissionConfig {
-            max_queued_launches: 3,
-            ..AdmissionConfig::default()
-        });
-        let mut launch = req();
-        launch.message = ClientMessage::LaunchProcess {
+    fn launch() -> Request {
+        let mut request = req();
+        request.message = ClientMessage::LaunchProcess {
             corr_id: 1,
             inferlet: "chat".into(),
             input: String::new(),
@@ -478,34 +294,27 @@ mod tests {
             cluster_props: Default::default(),
             executors: Vec::new(),
         };
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let mut waiting = Vec::new();
-        for i in 0..3 {
-            let (h, launch, order) = (h.clone(), launch.clone(), order.clone());
-            waiting.push(tokio::spawn(async move {
-                let decision = h.admit_queued(&launch).await;
-                order.lock().unwrap().push(i);
-                decision
-            }));
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            h.admit_queued(&launch).await,
-            AdmissionDecision::Reject(RejectReason::QueueFull)
-        );
-        waiting.remove(1).abort();
-        tokio::task::yield_now().await;
-        routing.send_replace(table(vec![worker(1, "m", Health::Healthy, 0, 0)]));
-        for task in waiting {
-            assert_eq!(task.await.unwrap(), AdmissionDecision::Admit);
-        }
-        assert_eq!(*order.lock().unwrap(), vec![0, 2]);
+        request
+    }
 
-        routing.send_replace(table(vec![worker(1, "m", Health::Unreachable, 0, 0)]));
-        assert_eq!(
-            h.admit_queued(&launch).await,
-            AdmissionDecision::Reject(RejectReason::NoHealthyWorker)
+    /// The gateway holds no launch for load (the cluster policy does): a
+    /// launch is refused only when no worker is healthy, and nothing else
+    /// that takes no seat ever is.
+    #[test]
+    fn a_launch_is_refused_only_with_no_healthy_worker() {
+        let full = handle_with(
+            table(vec![worker(1, "m", Health::Healthy, 255, 4096)]),
+            &[1],
         );
+        assert_eq!(full.admit(&launch()), AdmissionDecision::Admit);
+        let gone = handle_with(table(vec![worker(1, "m", Health::Unreachable, 0, 0)]), &[1]);
+        assert_eq!(
+            gone.admit(&launch()),
+            AdmissionDecision::Reject(crate::admission::RejectReason::NoHealthyWorker)
+        );
+        let mut ping = req();
+        ping.message = ClientMessage::Ping { corr_id: 1 };
+        assert_eq!(gone.admit(&ping), AdmissionDecision::Admit);
     }
 
     #[tokio::test]
@@ -520,7 +329,7 @@ mod tests {
             request.message = ClientMessage::ListProcesses { corr_id: 1 };
             assert_eq!(h.admit(&request), AdmissionDecision::Admit);
             assert_eq!(
-                h.dispatch_with_retry(&reg, &request, None, None, None)
+                h.dispatch_with_retry(&reg, &request, None, None)
                     .await
                     .unwrap_err(),
                 RouteError::NoCandidate
@@ -544,7 +353,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let d = h
-            .dispatch_with_retry(&reg, &req(), Some(42), None, None)
+            .dispatch_with_retry(&reg, &req(), None, None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, WorkerId(1));
@@ -564,7 +373,7 @@ mod tests {
                 .collect(),
         );
         let h = handle_with(t, &[1, 2, 3]);
-        let order = h.select_worker(Some(99));
+        let order = h.select_worker();
         assert_eq!(order.len(), 3);
         let (first, second, accepting) = (order[0], order[1], order[2]);
         let reg = StubRegistry {
@@ -577,7 +386,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let d = h
-            .dispatch_with_retry(&reg, &req(), Some(99), None, None)
+            .dispatch_with_retry(&reg, &req(), None, None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, accepting);
@@ -592,7 +401,7 @@ mod tests {
                 .collect(),
         );
         let h = handle_with(t, &[1, 2, 3]);
-        let order = h.select_worker(Some(99));
+        let order = h.select_worker();
         let preferred = order[2];
         let accept_all = || StubRegistry {
             answers: (1..=3)
@@ -608,14 +417,14 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let d = h
-            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(preferred), None)
+            .dispatch_with_retry(&accept_all(), &req(), Some(preferred), None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, preferred);
 
         // One that is not connected is no candidate: the default order holds.
         let d = h
-            .dispatch_with_retry(&accept_all(), &req(), Some(99), Some(WorkerId(9)), None)
+            .dispatch_with_retry(&accept_all(), &req(), Some(WorkerId(9)), None)
             .await
             .unwrap();
         assert_eq!(d.worker_id, order[0]);
@@ -630,7 +439,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let err = h
-            .dispatch_with_retry(&reg, &req(), None, None, None)
+            .dispatch_with_retry(&reg, &req(), None, None)
             .await
             .unwrap_err();
         assert_eq!(err, RouteError::NoCandidate);
@@ -653,7 +462,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
         let err = h
-            .dispatch_with_retry(&reg, &req(), Some(5), None, None)
+            .dispatch_with_retry(&reg, &req(), None, None)
             .await
             .unwrap_err();
         assert_eq!(err, RouteError::Exhausted { attempts: 2 });

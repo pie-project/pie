@@ -6,11 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use engine_gpu::pread::pread_jobs;
 
 use crate::encode::Mark;
+use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core, note_reservation};
 use super::host::Signal;
 
+/// One `pread` a load's file read is cut into: far under the 2 GiB a Linux
+/// read moves at once, large enough that the calls cost nothing beside it.
 #[cfg(not(target_arch = "wasm32"))]
 const PREAD_CHUNK: u64 = 256 << 20;
 
@@ -25,32 +28,40 @@ pub(crate) struct Raw {
     pub(crate) kind: Memory,
     pub(crate) mappable: bool,
     pub(crate) id: u64,
+    /// Whose it is in the device's books; `None` for a buffer the host maps,
+    /// which lies in host memory.
+    owner: Option<Owner>,
 }
 
 pub(crate) type Slab = Arc<Raw>;
 
 impl Raw {
-    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory) -> Result<Slab> {
+    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
+        core.alive()?;
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
-        if size > core.limits.max_buffer_size {
+        if size > core.bound {
             return Err(Fault::Ceiling {
                 what: "bytes of one device reservation",
                 need: size,
-                have: core.limits.max_buffer_size,
+                have: core.bound,
             });
         }
-        let mappable =
-            kind == Memory::Readback || (kind != Memory::Device && core.enabled.mappable_primary);
-        let mut usage = if kind == Memory::Readback {
+        let mappable = kind == Memory::Readback;
+        let mut usage = if mappable {
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST
         } else {
             wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST
         };
-        if mappable && kind != Memory::Readback {
-            usage |= wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE;
+        // The pool's segments hold guest configs a stage binds as a uniform,
+        // and a guest stage's own buffers its steps' uniforms
+        // (`guest::session`), beside everything bound as storage.
+        if (owner == engine_gpu::books::owners::POOL || owner == engine_gpu::books::owners::GUEST)
+            && kind == Memory::Device
+        {
+            usage |= wgpu::BufferUsages::UNIFORM;
         }
         let buffer = core.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -63,14 +74,15 @@ impl Raw {
                 Fault::Wgpu { why, .. } if why.contains("emory") => Fault::Ceiling {
                     what: "device memory",
                     need: size,
-                    have: core
-                        .device_local
-                        .saturating_sub(core.allocated.load(Ordering::Relaxed)),
+                    have: core.budget.saturating_sub(core.books.device()),
                 },
                 other => other,
             });
         }
-        core.allocated.fetch_add(size, Ordering::Relaxed);
+        let owner = (!mappable).then_some(owner);
+        if let Some(owner) = owner {
+            core.books.take(owner, size);
+        }
 
         let mut encoder = core
             .device
@@ -78,7 +90,7 @@ impl Raw {
                 label: Some("pie clear"),
             });
         encoder.clear_buffer(&buffer, 0, None);
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.take_error("clear_buffer")?;
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
@@ -87,6 +99,7 @@ impl Raw {
             kind,
             mappable,
             id: IDS.fetch_add(1, Ordering::Relaxed),
+            owner,
         }))
     }
 
@@ -106,6 +119,7 @@ impl Raw {
         if bytes.is_empty() {
             return Ok(());
         }
+        self.core.alive()?;
         let len = bytes.len() as u64;
         if offset.is_multiple_of(4) && len.is_multiple_of(4) {
             self.core.queue.write_buffer(&self.buffer, offset, bytes);
@@ -145,7 +159,7 @@ impl Raw {
         len: u64,
         on_read: impl FnOnce(Result<Vec<u8>>) + Send + 'static,
     ) {
-        if let Err(fault) = self.span(offset, len) {
+        if let Err(fault) = self.span(offset, len).and_then(|()| self.core.alive()) {
             return on_read(Err(fault));
         }
         if len == 0 {
@@ -163,6 +177,7 @@ impl Raw {
             self.buffer
                 .slice(start..end)
                 .map_async(wgpu::MapMode::Read, move |result| {
+                    let _poke = crate::device::host::Poke;
                     let read = result
                         .map_err(|e| core.fault("map_async", e))
                         .and_then(|()| {
@@ -191,12 +206,13 @@ impl Raw {
                 label: Some("pie read"),
             });
         encoder.copy_buffer_to_buffer(&self.buffer, start, &staging, 0, Some(span));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         let mapped = staging.clone();
         let core = Arc::clone(core);
         staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
+                let _poke = crate::device::host::Poke;
                 let read = result
                     .map_err(|e| core.fault("map_async", e))
                     .and_then(|()| {
@@ -227,14 +243,16 @@ impl Raw {
                 label: Some("pie zero"),
             });
         encoder.clear_buffer(&self.buffer, start, Some(end - start));
-        core.queue.submit(std::iter::once(encoder.finish()));
+        core.submit(encoder.finish());
         core.take_error("clear_buffer")
     }
 }
 
 impl Drop for Raw {
     fn drop(&mut self) {
-        self.core.allocated.fetch_sub(self.size, Ordering::Relaxed);
+        if let Some(owner) = self.owner {
+            self.core.books.give(owner, self.size);
+        }
         // A browser frees the memory only when the JS wrapper is collected.
         self.buffer.destroy();
     }
@@ -256,16 +274,16 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Device)
+    pub fn zeroed(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Device, owner)
     }
 
-    pub fn host(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Host)
+    pub fn host(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Host, owner)
     }
 
-    pub fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        let slab = Raw::new(device.core(), bytes, kind)?;
+    pub fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        let slab = Raw::new(device.core(), bytes, kind, owner)?;
         Ok(Buffer { slab, bytes })
     }
 
@@ -364,8 +382,8 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {

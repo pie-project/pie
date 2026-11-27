@@ -4,7 +4,7 @@ use crate::api::{ContractFor, DeviceBoot, Xla};
 
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Xla, String> {
     let doc = parse(config_bytes)?;
-    Ok(Xla::new(device_boot(&doc), contract_for))
+    Ok(Xla::new(device_boot(&doc)?, contract_for))
 }
 
 fn parse(config_bytes: &[u8]) -> Result<toml::Table, String> {
@@ -18,9 +18,15 @@ fn table(doc: &toml::Table) -> Option<&toml::Table> {
     doc.get("xla").and_then(toml::Value::as_table)
 }
 
-fn device_boot(doc: &toml::Table) -> DeviceBoot {
+fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
     let t = table(doc);
-    DeviceBoot {
+    let measure = match t.and_then(|t| t.get("measure")) {
+        None => true,
+        Some(toml::Value::Boolean(measure)) => *measure,
+        Some(other) => return Err(format!("[xla] measure is true or false, not {other}")),
+    };
+    Ok(DeviceBoot {
+        measure,
         plugin: t
             .and_then(|t| t.get("plugin"))
             .and_then(toml::Value::as_str)
@@ -32,7 +38,9 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(toml::Value::as_integer)
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0),
-        window_pool: true,
+        stream_weights: false,
+        pool_extra_chunks: 0,
+        staging_slots: DeviceBoot::default().staging_slots,
         headroom: t
             .and_then(|t| t.get("headroom"))
             .and_then(toml::Value::as_integer)
@@ -41,15 +49,11 @@ fn device_boot(doc: &toml::Table) -> DeviceBoot {
             .and_then(|t| t.get("seat_tokens"))
             .and_then(toml::Value::as_integer)
             .and_then(|v| u32::try_from(v).ok()),
-        prewarm: t
-            .and_then(|t| t.get("prewarm"))
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false),
         profiles: t
             .and_then(|t| t.get("profiles"))
             .and_then(toml::Value::as_str)
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(std::path::PathBuf::from),
-    }
+    })
 }

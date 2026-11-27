@@ -91,6 +91,9 @@ pub struct DecodePlan {
 
     pub mask: Tensor,
 
+    /// One u32 a row: its enable flag (bits 0-1: 1 masked, 2 wide) and its
+    /// lane's committed boundary (bits 2-31), the key the plane's column 0
+    /// is (`pie_mask_admits`, `prim/kv_page.h`).
     pub mask_enabled: Tensor,
 
     pub mask_stride: u32,
@@ -107,6 +110,9 @@ pub struct PrefillPlan {
 
     pub mask: Tensor,
 
+    /// One u32 a row: its enable flag (bits 0-1: 1 masked, 2 wide) and its
+    /// lane's committed boundary (bits 2-31), the key the plane's column 0
+    /// is (`pie_mask_admits`, `prim/kv_page.h`).
     pub mask_enabled: Tensor,
 
     pub mask_stride: u32,
@@ -147,12 +153,12 @@ fn tables_agree(
             ),
         ));
     }
-    if mask_enabled.dtype != Dtype::U8 {
+    if mask_enabled.dtype != Dtype::U32 {
         return Err(refuse(
             op,
             format!(
-                "the fire's mask-enabled flags are {:?}, and this plan carries one u8 \
-                 per request",
+                "the fire's mask words are {:?}, and this plan carries one u32 per row \
+                 (its enable flag and its lane's committed boundary)",
                 mask_enabled.dtype
             ),
         ));
@@ -1149,7 +1155,7 @@ mod tests {
             positions: i32t(7, 2),
             request_of_token: i32t(8, 2),
             mask: Tensor::new(9, 2, 64, Dtype::U8),
-            mask_enabled: Tensor::new(10, 2, 1, Dtype::U8),
+            mask_enabled: Tensor::new(10, 2, 1, Dtype::U32),
             mask_stride: 64,
         }
     }
@@ -1163,9 +1169,8 @@ mod tests {
     }
 
     // `Fire::at` names an entry point by string and nothing resolves it until a
-    // real device does, where a typo is a nil pipeline. The Metal audit's
-    // `--table` mode, which used to hold the two sides together, is retired, so
-    // this holds its own: the shipped width is `d_256` and no test launches it.
+    // real device does, where a typo is a nil pipeline. This holds the two sides
+    // together: the shipped width is `d_256` and no test launches it.
     //
     // A shader stamps its entry points through an `instantiate_*` macro, so the
     // name never appears whole in the source; read the invocations and spell the

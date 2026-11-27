@@ -1,6 +1,6 @@
 use kernels_slang::attn::sdpa;
 use poem_exec::{DispatchAttn, KernelError};
-use poem_ir::{Attn, IndexScore, Operands, StructKind};
+use poem_ir::{Attn, Dim, IndexScore, Operands, StructKind, Ty};
 
 use crate::backend::{Backend, Tactics as _};
 use crate::run::{Run, StructSlot};
@@ -8,6 +8,37 @@ use crate::run::{Run, StructSlot};
 impl<B: Backend> DispatchAttn for Run<'_, B> {
     fn dispatch(&mut self, op: &Attn) -> Result<(), KernelError> {
         self.attention(op).map_err(crate::error::kernel)
+    }
+}
+
+impl<B: Backend> Run<'_, B> {
+    /// Every windowed layer's fold into its ring (CONTRACT-BC 19, 21), one
+    /// dispatch a fire, after its walk: every attention reading a ring (its
+    /// own layer's and a shared tail's, which reads its owner's) reads the
+    /// ring the fire found, its early rows' windows reaching rows the fold
+    /// drops. The rows each lane folds go into its ring, the fire's rows it
+    /// leaves unfolded into its buffer; the fold table opens with each
+    /// ring's geometry in the pools' row order (`Pools::ring_layers`), the
+    /// order the cache table binds them in.
+    pub fn fold_rings(&self) -> Result<(), kernels_slang::Error> {
+        let layers: Vec<&kernels_slang::KvPool> = self
+            .cache_pools()
+            .iter()
+            .filter_map(|pool| match pool {
+                crate::run::CachePool::Kv(pool) if pool.ring.is_some() => Some(pool),
+                _ => None,
+            })
+            .collect();
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let Some((jobs, most)) = self.bindings().ring_jobs else {
+            return Err(kernels_slang::Error::Backend {
+                op: "attn.ring_fold",
+                detail: "a fire reading a ring staged no fold table".to_string(),
+            });
+        };
+        kernels_slang::attn::ring::fold(self.ctx, &layers, jobs, most)
     }
 }
 
@@ -21,6 +52,68 @@ impl<B: Backend> Run<'_, B> {
         sdpa::Tables {
             mask: mask.unwrap_or(plan.mask),
             ..plan
+        }
+    }
+
+    /// A decode plan's tables reading `mask` (the fire's masks, per-row
+    /// data: each row's entry in the plan's words, a row stating none
+    /// reading no plane) where the op states it.
+    fn decode_tables(
+        &self,
+        op: &'static str,
+        plan: poem_ir::ValueId,
+        mask: Option<poem_ir::ValueId>,
+    ) -> Result<sdpa::Tables, kernels_slang::Error> {
+        let plan = *self.decode_plan(plan);
+        let mask = mask.map(|mask| self.tensor(mask));
+        Self::mask_is_bytes(op, mask)?;
+        Ok(sdpa::Tables {
+            mask: mask.unwrap_or(plan.mask),
+            ..plan
+        })
+    }
+
+    /// The plan's tables as a dispatch over `q` reads them. A query of the
+    /// fire's token rows reads them as the plan holds them: whole, from the
+    /// window's first row. A query of the fire's readouts (a head over each
+    /// lane's readout row, whose rows are not the window's tokens) reads the
+    /// window's own cut of them from its row 0, over its own rows.
+    fn tables_over(&self, q: poem_ir::ValueId, plan: sdpa::Tables) -> sdpa::Tables {
+        let readouts = matches!(
+            &self.values()[q.0 as usize].ty,
+            Ty::Tensor { shape, .. } if shape.first() == Some(&Dim::Readouts)
+        );
+        if !readouts {
+            return plan;
+        }
+        let rows = self.attended(q).rows;
+        if self.window().gathered.is_some() {
+            return sdpa::Tables { rows, ..plan };
+        }
+        // The tables whole, from the window's first token row: the same
+        // views whatever window a fire cuts.
+        sdpa::Tables {
+            row0: 0,
+            table0: self.window().span.row_offset,
+            rows,
+            ..plan
+        }
+    }
+
+    /// Refuses a mask the shader would read as something else.
+    fn mask_is_bytes(
+        op: &'static str,
+        mask: Option<kernels_slang::Tensor>,
+    ) -> Result<(), kernels_slang::Error> {
+        match mask {
+            Some(mask) if mask.dtype != poem_ir::Dtype::U8 => Err(kernels_slang::Error::Backend {
+                op,
+                detail: format!(
+                    "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
+                    mask.dtype
+                ),
+            }),
+            _ => Ok(()),
         }
     }
 
@@ -61,32 +154,39 @@ impl<B: Backend> Run<'_, B> {
         lse: Option<kernels_slang::Tensor>,
     ) -> Result<(), kernels_slang::Error> {
         const OP: &str = "attn.prefill";
-        let q = self.ragged(q).data;
+        let tables = self.tables_over(q, self.prefill_tables(plan, mask));
+        let q = self.attended(q);
         let pool = self.pool(cache);
         Self::kv_heads_agree(OP, pool, kv_heads)?;
-        if let Some(mask) = mask
-            && mask.dtype != poem_ir::Dtype::U8
-        {
-            return Err(kernels_slang::Error::Backend {
-                op: OP,
-                detail: format!(
-                    "the mask this op states is {:?}, and the shader reads packed u8 mask planes",
-                    mask.dtype
-                ),
-            });
-        }
+        Self::mask_is_bytes(OP, mask)?;
         let tactic = self.tuning().sdpa(self.tier(), head_dim);
-        let tables = self.prefill_tables(plan, mask);
         let (q, pool, o) = (q, *pool, o);
-        let tiles = q.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request();
-        if tiles {
+        let tiled = || {
             sdpa::prefill(
                 self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse,
             )
-        } else {
+        };
+        let walked = || {
             sdpa::decode(
                 self.ctx, tactic, q, &tables, &pool, window, head_dim, sm_scale, o, lse, None,
             )
+        };
+        // Which of the two a fire takes is its rows a request; a naming
+        // sink is told both.
+        if let Some(names) = self.ctx.naming() {
+            names.fork();
+            tiled()?;
+            names.or();
+            walked()?;
+            names.join();
+            return Ok(());
+        }
+        if tables.rows / self.requests().max(1) >= self.tuning().sdpa_tile_rows_per_request() {
+            self.pick(|| format!("prefill attention tiled: {tactic:?}"));
+            tiled()
+        } else {
+            self.pick(|| format!("prefill attention walked: {tactic:?}"));
+            walked()
         }
     }
 
@@ -96,6 +196,7 @@ impl<B: Backend> Run<'_, B> {
         &self,
         q: poem_ir::ValueId,
         plan: poem_ir::ValueId,
+        mask: Option<poem_ir::ValueId>,
         cache: poem_ir::ValueId,
         window: Option<u32>,
         head_dim: u32,
@@ -106,16 +207,16 @@ impl<B: Backend> Run<'_, B> {
         sdpa::decode(
             self.ctx,
             self.tuning().sdpa(self.tier(), head_dim),
-            self.tensor(q),
-            self.decode_plan(plan),
+            self.attended(q),
+            &self.tables_over(q, self.decode_tables("attn.decode", plan, mask)?),
             self.pool(cache),
             window,
             head_dim,
             sm_scale,
-            self.tensor(o),
-            lse.map(|l| self.tensor(l)),
+            self.attended(o),
+            lse.map(|l| self.attended(l)),
             self.split_scratch()
-                .filter(|_| self.tuning().binds_split(lse.is_some())),
+                .filter(|_| self.tuning().binds_split(head_dim, lse.is_some())),
         )
     }
 
@@ -151,9 +252,30 @@ impl<B: Backend> Run<'_, B> {
             head_dim,
             sm_scale,
             ratio,
-            self.tensor(selection),
-            self.tensor(o),
+            self.attended(selection),
+            self.attended(o),
         )
+    }
+
+    /// The fire's capture table and the normalisers' room.
+    fn capture_seats(
+        &self,
+        op: &'static str,
+    ) -> Result<(kernels_slang::Tensor, kernels_slang::Tensor), kernels_slang::Error> {
+        let missing = |what: &str| kernels_slang::Error::Backend {
+            op,
+            detail: format!(
+                "a capturing fire with no {what}, which the load lays where its trace captures"
+            ),
+        };
+        let table = self
+            .bindings()
+            .capture
+            .ok_or_else(|| missing("capture table"))?;
+        let stats = self
+            .score_stats()
+            .ok_or_else(|| missing("normalisers' room"))?;
+        Ok((table, stats))
     }
 
     fn requests(&self) -> u32 {
@@ -162,31 +284,81 @@ impl<B: Backend> Run<'_, B> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
+            // A fire's capturing lanes, compacted through its capture table:
+            // their rows lie in a pair's score room whatever the
+            // window, so a capture fires once a fire, in its region's first
+            // launch.
             Attn::ScoreCapture {
                 q,
-                plan,
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
+                into,
                 scores,
-            } => kernels_slang::attn::score::capture(
-                self.ctx,
-                self.ragged(*q),
-                self.prefill_plan(*plan).positions,
-                self.pool(*cache),
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                *observe,
-                // The rows are the window's lanes already.
-                0,
-                *kv_max,
-                self.requests(),
-                self.tensor(*scores),
-            ),
+                ..
+            } => {
+                if self.run_index() != 0 {
+                    return Ok(());
+                }
+                let capturing = self.scored().rows();
+                if capturing == 0 {
+                    return Ok(());
+                }
+                let (table, stats) = self.capture_seats("attn.score_capture")?;
+                let scores = self.tensor(*scores);
+                if let Some(into) = into {
+                    let held = self.tensor(*into);
+                    if held.buf != scores.buf {
+                        return Err(kernels_slang::Error::Backend {
+                            op: "attn.score_capture",
+                            detail: format!(
+                                "the row it adds into (value {}) is not the one it writes: a \
+                                 capturing lane holds one key row",
+                                into.0
+                            ),
+                        });
+                    }
+                }
+                kernels_slang::attn::score::capture(
+                    self.ctx,
+                    &kernels_slang::attn::score::Capture {
+                        q: self.uncut(*q),
+                        positions: self.bindings().positions,
+                        table,
+                        capturing,
+                        stats,
+                        scores,
+                    },
+                    self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *q_heads,
+                    *sm_scale,
+                    *observe,
+                    into.is_some(),
+                    self.tuning().workgroup_bytes(),
+                )
+            }
+            Attn::ScorePages { keys, pages } => {
+                if self.run_index() != 0 || self.scored().page_rows() == 0 {
+                    return Ok(());
+                }
+                let (table, _) = self.capture_seats("attn.score_pages")?;
+                let (keys, pages) = (self.tensor(*keys), self.tensor(*pages));
+                // The span lays the rows at a context of whole pages.
+                let page_size = keys.width / pages.width.max(1);
+                kernels_slang::attn::score::pages(
+                    self.ctx,
+                    table,
+                    self.scored().rows(),
+                    keys,
+                    pages,
+                    page_size,
+                )
+            }
             Attn::Voxel {
                 q,
                 k,
@@ -195,22 +367,36 @@ impl<B: Backend> Run<'_, B> {
                 segment,
                 sm_scale,
                 o,
-            } => kernels_slang::attn::voxel::attention(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                match segment {
-                    poem_ir::VoxelSegment::Clip => kernels_slang::attn::voxel::Segment::Clip,
-                    poem_ir::VoxelSegment::Frames(n) => {
-                        kernels_slang::attn::voxel::Segment::Frames(*n)
-                    }
-                },
-                *sm_scale,
-                self.tensor(*o),
-                self.grid_base(*grid, *q),
-            ),
+            } => {
+                // One value at several of the three is one tensor, so the
+                // kernel can read it through one binding where the host
+                // refuses overlapping views (`Encode::binds_overlap`).
+                let tq = self.tensor(*q);
+                let tk = if k == q { tq } else { self.tensor(*k) };
+                let tv = if v == q {
+                    tq
+                } else if v == k {
+                    tk
+                } else {
+                    self.tensor(*v)
+                };
+                kernels_slang::attn::voxel::attention(
+                    self.ctx,
+                    tq,
+                    tk,
+                    tv,
+                    self.tensor(*grid),
+                    match segment {
+                        poem_ir::VoxelSegment::Clip => kernels_slang::attn::voxel::Segment::Clip,
+                        poem_ir::VoxelSegment::Frames(n) => {
+                            kernels_slang::attn::voxel::Segment::Frames(*n)
+                        }
+                    },
+                    *sm_scale,
+                    self.tensor(*o),
+                    self.grid_base(*grid, *q),
+                )
+            }
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
@@ -234,11 +420,13 @@ impl<B: Backend> Run<'_, B> {
                 let built = sdpa::Tables::plan(
                     "attn.plan_decode",
                     sdpa::Tables {
-                        positions: self.cut_rows(positions),
-                        request_of_token: self.cut_rows(t.request_of_token),
-                        mask: self.cut_rows(t.mask),
-                        mask_enabled: self.cut_rows(t.mask_enabled),
-                        mask_stride: t.mask_stride,
+                        positions: self.attended_rows(positions),
+                        request_of_token: self.attended_rows(t.request_of_token),
+                        mask: t.mask,
+                        mask_words: self.attended_rows(t.mask_words),
+                        row0: self.row0(),
+                        table0: self.row0(),
+                        rows: self.window_rows(),
                     },
                 )?;
                 self.put(*plan, StructSlot::Decode(built));
@@ -268,17 +456,20 @@ impl<B: Backend> Run<'_, B> {
                 let built = sdpa::Tables::plan(
                     "attn.plan_prefill",
                     sdpa::Tables {
-                        positions: self.cut_rows(positions),
-                        request_of_token: self.cut_rows(t.request_of_token),
-                        mask: self.cut_rows(t.mask),
-                        mask_enabled: self.cut_rows(t.mask_enabled),
-                        mask_stride: t.mask_stride,
+                        positions: self.attended_rows(positions),
+                        request_of_token: self.attended_rows(t.request_of_token),
+                        mask: t.mask,
+                        mask_words: self.attended_rows(t.mask_words),
+                        row0: self.row0(),
+                        table0: self.row0(),
+                        rows: self.window_rows(),
                     },
                 )?;
                 self.put(*plan, StructSlot::Prefill(built));
                 Ok(())
             }
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -291,7 +482,9 @@ impl<B: Backend> Run<'_, B> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => self.decode_attention(*q, *plan, *cache, *window, *head_dim, *sm_scale, *o, None),
+            } => self.decode_attention(
+                *q, *plan, *mask, *cache, *window, *head_dim, *sm_scale, *o, None,
+            ),
 
             Attn::Prefill {
                 q,
@@ -302,10 +495,13 @@ impl<B: Backend> Run<'_, B> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // The fire's masks, per-row data: a row stating none reads
+                // every key its bounds give.
+                mask,
                 selection: None,
                 bias: None,
-                floor: None,
+                // This backend splits no prompt's rows, so a replay floor stays 0.
+                floor: _,
                 causal: true,
                 selected: None,
                 rel: None,
@@ -313,13 +509,13 @@ impl<B: Backend> Run<'_, B> {
             } => self.prefill_attention(
                 *q,
                 *plan,
-                None,
+                mask.map(|mask| self.tensor(mask)),
                 *cache,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
-                self.tensor(*o),
+                self.attended(*o),
                 None,
             ),
 
@@ -331,7 +527,6 @@ impl<B: Backend> Run<'_, B> {
                 ..
             }
             | Attn::Prefill {
-                mask: None,
                 selection: Some(_),
                 bias: None,
                 selected: Some(poem_ir::Blocks { per_head: true, .. }),
@@ -351,6 +546,7 @@ impl<B: Backend> Run<'_, B> {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 selection: Some(selection),
@@ -369,8 +565,8 @@ impl<B: Backend> Run<'_, B> {
                 lse: None,
             } => self.selected_attention(
                 "attn.decode",
-                self.tensor(*q),
-                self.decode_plan(*plan),
+                self.attended(*q),
+                &self.tables_over(*q, self.decode_tables("attn.decode", *plan, *mask)?),
                 *selection,
                 *cache,
                 *window,
@@ -389,9 +585,10 @@ impl<B: Backend> Run<'_, B> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                mask,
                 bias: None,
-                floor: None,
+                // This backend splits no prompt's rows, so a replay floor stays 0.
+                floor: _,
                 causal: true,
                 selected:
                     Some(poem_ir::Blocks {
@@ -403,10 +600,12 @@ impl<B: Backend> Run<'_, B> {
             } => {
                 const OP: &str = "attn.prefill";
                 Self::kv_heads_agree(OP, self.pool(*cache), *kv_heads)?;
+                let mask = mask.map(|mask| self.tensor(mask));
+                Self::mask_is_bytes(OP, mask)?;
                 self.selected_attention(
                     OP,
-                    self.ragged(*q).data,
-                    &self.prefill_tables(*plan, None),
+                    self.attended(*q),
+                    &self.tables_over(*q, self.prefill_tables(*plan, mask)),
                     *selection,
                     *cache,
                     *window,
@@ -449,16 +648,35 @@ impl<B: Backend> Run<'_, B> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                match mask {
-                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {}
-                    _ => return Err(kernels_slang::Error::Unsupported { op: op.name() }),
-                }
-                let stated = self.group_mask(*q_indptr, *kv_indptr).map(|stated| {
-                    kernels_slang::attn::dense::CustomMask {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
+                let stated = match (mask, self.group_mask(*q_indptr, *kv_indptr)) {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        Some(kernels_slang::attn::dense::CustomMask {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        })
                     }
-                });
+                    (
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => None,
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(_),
+                    ) => {
+                        return Err(kernels_slang::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention its model \
+                                     states none on: only an attention the model text spells \
+                                     `stated_group_mask()` reads a lane's mask"
+                                .to_string(),
+                        });
+                    }
+                    (poem_ir::RaggedMask::RelativeBias { .. }, _) => {
+                        return Err(kernels_slang::Error::Unsupported { op: op.name() });
+                    }
+                };
                 kernels_slang::attn::dense::ragged(
                     self.ctx,
                     self.uncut(*q),
@@ -496,71 +714,13 @@ impl<B: Backend> Run<'_, B> {
                 ..
             }
             | Attn::Prefill {
-                mask: None,
                 selection: None,
                 bias: Some(_),
                 lse: None,
                 ..
             } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
-            Attn::Prefill {
-                q,
-                plan,
-                mask: Some(mask),
-                cache,
-                window,
-                head_dim,
-                kv_heads,
-                causal: _,
-                sm_scale,
-                o,
-                selection: None,
-                bias: None,
-                floor: None,
-                selected: None,
-                rel: None,
-                lse: None,
-            } => self.prefill_attention(
-                *q,
-                *plan,
-                Some(self.cut_rows(self.tensor(*mask))),
-                *cache,
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                self.tensor(*o),
-                None,
-            ),
-            Attn::Prefill {
-                q,
-                plan,
-                mask: Some(mask),
-                cache,
-                window,
-                head_dim,
-                kv_heads,
-                causal: _,
-                sm_scale,
-                o,
-                lse: Some(lse),
-                selection: None,
-                bias: None,
-                floor: None,
-                selected: None,
-                rel: None,
-            } => self.prefill_attention(
-                *q,
-                *plan,
-                Some(self.cut_rows(self.tensor(*mask))),
-                *cache,
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                self.tensor(*o),
-                Some(self.tensor(*lse)),
-            ),
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -576,6 +736,7 @@ impl<B: Backend> Run<'_, B> {
             } => self.decode_attention(
                 *q,
                 *plan,
+                *mask,
                 *cache,
                 *window,
                 *head_dim,
@@ -595,7 +756,7 @@ impl<B: Backend> Run<'_, B> {
                 lse: Some(lse),
                 // This backend splits no prompt's rows, so a replay floor stays 0.
                 floor: _,
-                mask: None,
+                mask,
                 selection: None,
                 bias: None,
                 causal: true,
@@ -604,14 +765,14 @@ impl<B: Backend> Run<'_, B> {
             } => self.prefill_attention(
                 *q,
                 *plan,
-                None,
+                mask.map(|mask| self.tensor(mask)),
                 *cache,
                 *window,
                 *head_dim,
                 *kv_heads,
                 *sm_scale,
-                self.tensor(*o),
-                Some(self.tensor(*lse)),
+                self.attended(*o),
+                Some(self.attended(*lse)),
             ),
             Attn::Sink {
                 o,
@@ -652,27 +813,45 @@ impl<B: Backend> Run<'_, B> {
                 cache,
                 write_page,
                 write_offset,
-            } => kernels_slang::attn::kv_append::kv_append(
-                self.ctx,
-                self.tensor(*k),
-                self.tensor(*v),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let ([k, v], window) = self.windowed([*k, *v]);
+                let ([write_page, write_offset], tables) =
+                    self.windowed([*write_page, *write_offset]);
+                kernels_slang::attn::kv_append::kv_append(
+                    self.ctx,
+                    k,
+                    v,
+                    self.pool(*cache),
+                    write_page,
+                    write_offset,
+                    kernels_slang::attn::kv_append::Rows {
+                        window,
+                        tables: tables.row0,
+                    },
+                )
+            }
             Attn::KvAppend {
                 k: plane,
                 v: None,
                 cache,
                 write_page,
                 write_offset,
-            } => kernels_slang::attn::kv_append::kv_append_shared(
-                self.ctx,
-                self.tensor(*plane),
-                self.pool(*cache),
-                self.tensor(*write_page),
-                self.tensor(*write_offset),
-            ),
+            } => {
+                let ([plane], window) = self.windowed([*plane]);
+                let ([write_page, write_offset], tables) =
+                    self.windowed([*write_page, *write_offset]);
+                kernels_slang::attn::kv_append::kv_append_shared(
+                    self.ctx,
+                    plane,
+                    self.pool(*cache),
+                    write_page,
+                    write_offset,
+                    kernels_slang::attn::kv_append::Rows {
+                        window,
+                        tables: tables.row0,
+                    },
+                )
+            }
 
             Attn::MlaPlan {
                 kv_indptr,
@@ -1109,8 +1288,7 @@ impl<B: Backend> Run<'_, B> {
                     self.pool(*pages),
                     *head_dim,
                     *ratio,
-                    state.state_kv,
-                    state.state_score,
+                    state,
                     ape.map(|id| self.tensor(id)),
                     self.tensor(*entries),
                 )
@@ -1139,8 +1317,7 @@ impl<B: Backend> Run<'_, B> {
                     self.tensor(*write_offset),
                     *head_dim,
                     *ratio,
-                    state.state_kv,
-                    state.state_score,
+                    state,
                 )
             }
             Attn::PoolKvAppend {

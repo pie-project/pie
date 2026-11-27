@@ -15,7 +15,12 @@ const MMA_LSE_ENTRY: &str = "sdpa_paged_mma_lse_bfloat16_d_64";
 
 /// The wide heads' simdgroup-matrix kernels, a 128-wide slice of the head a
 /// simdgroup and four row groups: as many threads as the head is wide.
-const MMA_WIDE: [(u32, &str, &str); 2] = [
+const MMA_WIDE: [(u32, &str, &str); 3] = [
+    (
+        128,
+        "sdpa_paged_mma_wide_bfloat16_d_128",
+        "sdpa_paged_mma_wide_lse_bfloat16_d_128",
+    ),
     (
         256,
         "sdpa_paged_mma_wide_bfloat16_d_256",
@@ -30,6 +35,40 @@ const MMA_WIDE: [(u32, &str, &str); 2] = [
 
 const MMA_FILE: &str = "attn/sdpa_paged_mma.metal";
 
+/// The kv page sizes the MPP prompt kernel serves over a bf16 pool: a
+/// 32-key tile is one page of 32, or two of 16 read by their own addresses.
+pub const MPP_PAGE_SIZES: [i32; 2] = [16, 32];
+
+/// The kernel family a prompt (tiled rows, causal, no lse) of a
+/// `head_dim`-wide head attends through over a pool of `page_size`-token
+/// pages: what [`arbitrate`] picks past the q8 and the vector cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillForm {
+    /// The MPP tensor-op kernel (`sdpa.prefill = "mpp"`).
+    Mpp,
+    /// The simdgroup-matrix kernel ([`should_mma`]).
+    Mma,
+    /// The scalar tiled kernel.
+    Tiled,
+}
+
+/// [`PrefillForm`] for a head width and a pool's page size under `tuning`,
+/// by the arbiter's own tests, so a load can say once which form its
+/// prompts take, and why a profile's `sdpa.prefill = "mpp"` is not it:
+/// the MPP kernel serves 64-, 128- and 256-wide heads over 16- and
+/// 32-token pages ([`MPP_PAGE_SIZES`]), and a pool of other pages falls
+/// through to the next form.
+#[must_use]
+pub fn prefill_form(head_dim: u32, page_size: i32, tuning: &Tuning) -> PrefillForm {
+    if tuning.sdpa_mpp() && super::q8::mpp_serves(head_dim, page_size) {
+        PrefillForm::Mpp
+    } else if should_mma(head_dim, tuning) {
+        PrefillForm::Mma
+    } else {
+        PrefillForm::Tiled
+    }
+}
+
 #[must_use]
 pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
     rows / requests.max(1) >= tuning.sdpa_tile_rows_per_request()
@@ -37,7 +76,7 @@ pub fn should_tile(rows: u32, requests: u32, tuning: &Tuning) -> bool {
 
 #[must_use]
 pub fn should_mma(head_dim: u32, tuning: &Tuning) -> bool {
-    // The plain and the lse kernels are stamped at 64, 256 and 512.
+    // The plain and the lse kernels are stamped at 64, 128, 256 and 512.
     tuning.sdpa_mma() && (head_dim == MMA_HEAD_DIM || MMA_WIDE.iter().any(|w| w.0 == head_dim))
 }
 

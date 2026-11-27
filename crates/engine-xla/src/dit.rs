@@ -148,6 +148,17 @@ pub fn cell_bytes(
 }
 
 impl Dit {
+    /// Every guest input a fire may stage: the id, whether a lane's row or
+    /// a row a token, and the bytes a row takes.
+    #[must_use]
+    pub fn input_seats(&self) -> Vec<(u32, bool, usize)> {
+        self.feeds
+            .seats()
+            .into_iter()
+            .map(|seat| (seat.id, seat.per_lane(), seat.row_bytes() as usize))
+            .collect()
+    }
+
     pub fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Dit> {
         let mut dit = Dit {
             feeds: Feeds::of(trace, compiled),
@@ -450,6 +461,11 @@ impl Dit {
             key.push_str(&format!("pk{};", self.feeds.selections.len()));
             for (q, kv, mask) in self.group_masks_of(lanes, &groups, &packings, feeds)? {
                 let len = u32::try_from(mask.bits.len().max(1)).unwrap_or(u32::MAX);
+                // A byte offset a segment, as the packings' tables are laid: the
+                // padding lanes' segments are empty, from the mask's end.
+                let mut mask_indptr = mask.indptr.clone();
+                let end = i32::try_from(mask.bits.len()).unwrap_or(i32::MAX);
+                mask_indptr.resize((lane_count as usize + 1).max(mask_indptr.len()), end);
                 let mut bits = mask.bits;
                 bits.resize(len as usize, 0);
                 key.push_str(&format!("gm{len};"));
@@ -457,7 +473,7 @@ impl Dit {
                     q,
                     kv,
                     bits: inputs.raw(handles, Dtype::U8, len, 1, bits),
-                    indptr: inputs.i32s(handles, &mask.indptr, 1),
+                    indptr: inputs.i32s(handles, &mask_indptr, 1),
                 });
             }
         } else if feeds.iter().any(|feed| feed.mask.is_some()) {
@@ -504,7 +520,14 @@ impl Dit {
             return Ok(Vec::new());
         }
         let patch = self.voxel.as_ref().and_then(|seat| seat.token_patch);
-        let mut guests = vec![poem_exec::fire::GuestRows::default(); feeds.len()];
+        // A guest row a lane the fire seats, its padding lanes too: a group's
+        // mask walks every lane of it (`group_mask`), not only the fed ones.
+        let seats = (lanes.iter())
+            .map(|row| row.source as usize + 1)
+            .max()
+            .unwrap_or(0)
+            .max(feeds.len());
+        let mut guests = vec![poem_exec::fire::GuestRows::default(); seats];
         for row in lanes {
             let Some(guest) = guests.get_mut(row.source as usize) else {
                 continue;

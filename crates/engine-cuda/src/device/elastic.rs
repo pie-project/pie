@@ -1,4 +1,6 @@
 #![allow(unsafe_code)]
+use engine::SAFETY_FLOOR_BYTES;
+
 use crate::error::{Fault, Result};
 
 pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
@@ -6,8 +8,6 @@ pub const LOGICAL_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAP_UNIT_BYTES: u64 = 32 * 1024 * 1024;
 
 const HANDLES_PER_ARENA: u64 = 256;
-
-const SAFETY_FLOOR_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The handle a flat arena's units carry: they are backed by the arena's
 /// one allocation, and own nothing to release.
@@ -24,35 +24,54 @@ pub const fn mapped_on_demand() -> bool {
     !cfg!(feature = "rocm")
 }
 
+/// What the pool holds back from the card for the driver: on a mapped pool,
+/// what the driver allocates beside it on its own while serving. A flat
+/// range holds back nothing: it is one allocation made once the load has
+/// taken what it takes beside it (side streams, library handles), and what
+/// arming allocates after is the bodies record's hold, which the fit leaves
+/// out of the range by name; once arming ends nothing allocates on the
+/// device.
 #[must_use]
-pub const fn safety_floor_bytes(total: u64) -> u64 {
-    let tenth = total / 10;
-    if SAFETY_FLOOR_BYTES < tenth {
+pub const fn safety_floor_bytes() -> u64 {
+    if mapped_on_demand() {
         SAFETY_FLOOR_BYTES
     } else {
-        tenth
+        0
     }
 }
 
+/// What a load may still take of a card with `free` of `total` bytes free
+/// under `allowance`, past the driver's safety floor.
 #[must_use]
-pub fn budget_bytes(free: u64, total: u64, utilization: f64) -> u64 {
-    let fraction = if utilization.is_finite() {
-        utilization.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a byte count of a GPU card is far inside f64's exact integer \
-                  range, and the product is floored back into u64 deliberately"
-    )]
-    let ceiling = (total as f64 * fraction) as u64;
-    let already = total.saturating_sub(free);
+pub fn budget_bytes(free: u64, total: u64, allowance: engine::Allowance) -> u64 {
+    allowance
+        .room(total, total.saturating_sub(free))
+        .saturating_sub(safety_floor_bytes())
+}
+
+/// What a card of `total` bytes may hold in all while a load under
+/// `allowance` runs, resolved once against the `held` bytes it had when the
+/// load began: the card itself, and no more than a stated budget past what
+/// was held then. A later reading's room is this less what the card then
+/// holds ([`room_under`]), so a stated budget counts everything the load
+/// has taken since, its weights and what the driver holds for its graph
+/// bodies among it. No share of the card is left aside for those: the
+/// load's last fit reads the card once they are on it.
+#[must_use]
+pub fn ceiling_of(total: u64, held: u64, allowance: engine::Allowance) -> u64 {
+    allowance
+        .budget
+        .map_or(total, |budget| total.min(held.saturating_add(budget)))
+}
+
+/// What may still be taken under `ceiling` of a card with `free` of
+/// `total` bytes free, past the driver's safety floor.
+#[must_use]
+pub fn room_under(ceiling: u64, free: u64, total: u64) -> u64 {
     ceiling
-        .saturating_sub(already)
-        .saturating_sub(safety_floor_bytes(total))
+        .min(total)
+        .saturating_sub(total.saturating_sub(free))
+        .saturating_sub(safety_floor_bytes())
 }
 
 #[must_use]
@@ -78,22 +97,70 @@ pub struct PhysicalPool {
     pledged_pages: u64,
     held_pages: u64,
     committed_pages: u64,
+    /// What the card may hold in all under the load's allowance, resolved
+    /// when the load began ([`ceiling_of`]).
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
-    utilization: f64,
+    ceiling: u64,
+    /// What the driver holds on the card beside the pool that the device's
+    /// free figure does not count: on a flat range, the wave save areas of
+    /// this process's compute queues, read when the pool opens (every queue
+    /// a load makes is made before: `kernels_rocm::hip::open`, the fan).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    beside: Beside,
+}
+
+/// What the driver holds beside a pool: the device's free figure already
+/// leaves it out (engine-cuda's `cudaMemGetInfo` on ROCm); the pool states
+/// it, for the load's line and a refusal.
+#[derive(Debug, Clone)]
+pub struct Beside {
+    pub said: String,
+}
+
+impl Beside {
+    const NONE: Beside = Beside {
+        said: String::new(),
+    };
+
+    /// On a flat range, the save areas of this process's compute queues;
+    /// a mapped pool holds back its safety floor instead.
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    fn read() -> Result<Beside> {
+        if mapped_on_demand() {
+            return Ok(Beside::NONE);
+        }
+        #[cfg(feature = "rocm")]
+        {
+            // A load opens its fan's side streams before its pools, past the
+            // hardware queues HIP makes a device: KFD's list counts them all,
+            // or HIP's rule, at least as many, where the list is not ours.
+            let areas = kernels_cuda::hip::kfd::held().map_err(|why| {
+                Fault::Card(format!(
+                    "the flat range cannot be sized: the driver's wave save areas for this \
+                     process's queues are not readable ({why})"
+                ))
+            })?;
+            Ok(Beside {
+                said: format!("the driver holds {areas}"),
+            })
+        }
+        #[cfg(not(feature = "rocm"))]
+        Ok(Beside::NONE)
+    }
 }
 
 impl PhysicalPool {
-    pub fn open(device: i32, utilization: f64) -> Result<PhysicalPool> {
+    /// A pool of what `ceiling` ([`ceiling_of`]) leaves of the card now.
+    pub fn open(device: i32, ceiling: u64) -> Result<PhysicalPool> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
             let granularity = allocation_granularity(device)?;
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let budget = budget_bytes(free as u64, total as u64, utilization);
+            let (free, total) = crate::device::card::memory()?;
+            let beside = Beside::read()?;
+            if !beside.said.is_empty() {
+                tracing::info!("outside the pool, {}", beside.said);
+            }
+            let budget = room_under(ceiling, free, total);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -105,12 +172,13 @@ impl PhysicalPool {
                 pledged_pages: 0,
                 held_pages: 0,
                 committed_pages: 0,
-                utilization,
+                ceiling,
+                beside,
             })
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = (device, utilization);
+            let _ = (device, ceiling);
             Err(Fault::Runtimeless)
         }
     }
@@ -127,7 +195,8 @@ impl PhysicalPool {
             pledged_pages: 0,
             held_pages: 0,
             committed_pages: 0,
-            utilization: 1.0,
+            ceiling: u64::MAX,
+            beside: Beside::NONE,
         }
     }
 
@@ -159,13 +228,8 @@ impl PhysicalPool {
     pub fn spare_bytes(&self, reserve: u64) -> Result<u64> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            Ok(budget_bytes(free as u64, total as u64, self.utilization).saturating_sub(reserve))
+            let (free, total) = crate::device::card::memory()?;
+            Ok(room_under(self.ceiling, free, total).saturating_sub(reserve))
         }
         #[cfg(not(feature = "device"))]
         {
@@ -227,14 +291,8 @@ impl PhysicalPool {
     pub fn recalibrate(&mut self) -> Result<()> {
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
-            let (mut free, mut total) = (0usize, 0usize);
-            // SAFETY: two live locals; the call only writes them.
-            let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-            crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let available =
-                budget_bytes(free as u64, total as u64, self.utilization) / LOGICAL_PAGE_BYTES;
+            let (free, total) = crate::device::card::memory()?;
+            let available = room_under(self.ceiling, free, total) / LOGICAL_PAGE_BYTES;
             self.recalibrate_to(available);
         }
         Ok(())
@@ -500,10 +558,13 @@ impl Arena {
     }
 
     /// A flat arena's one allocation, backing every unit.
-    fn grow_flat(&mut self) -> Result<()> {
+    fn grow_flat(&mut self, pool: &PhysicalPool) -> Result<()> {
         if self.base != 0 {
             return Ok(());
         }
+        // Read only where a device allocates (its refusal names the pool).
+        #[cfg(not(feature = "device"))]
+        let _ = pool;
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
@@ -517,8 +578,23 @@ impl Arena {
             if made != rt::cudaError::cudaSuccess && crate::device::held::release_idle() > 0 {
                 made = allocate(&mut base);
             }
-            crate::device::ctx::check("cudaMalloc", made)?;
+            crate::device::ctx::check("cudaMalloc", made).map_err(|why| {
+                Fault::Card(format!(
+                    "the flat range of {} bytes was sized to what the card had free less what \
+                     the driver holds beside it ({}), and the device refused it: {why}",
+                    self.virtual_bytes,
+                    if pool.beside.said.is_empty() {
+                        "nothing"
+                    } else {
+                        &pool.beside.said
+                    },
+                ))
+            })?;
             self.base = base as u64;
+            // `unwritten-nan`: nothing has written any of it yet.
+            if crate::serve::diag::on().unwritten_nan {
+                crate::device::fill_span(self.base, self.virtual_bytes as usize, 0xFF)?;
+            }
             self.units.fill(Some(FLAT));
             self.mapped = self.units.len() as u64;
             self.high_water = self.high_water.max(self.committed_bytes());
@@ -533,7 +609,7 @@ impl Arena {
     fn grow(&mut self, pool: &PhysicalPool, units: &[usize]) -> Result<()> {
         if self.flat {
             return if units.iter().any(|&u| self.unbacked(u)) {
-                self.grow_flat()
+                self.grow_flat(pool)
             } else {
                 Ok(())
             };
@@ -696,6 +772,11 @@ impl Arena {
                 || ((offset / self.map_unit)..=((end - 1) / self.map_unit))
                     .all(|u| !self.unbacked(u as usize)));
         if !backed {
+            // A size-only walk names unbacked spans by a stand-in base:
+            // nothing reads or writes through it (`crate::sizing`).
+            if crate::sizing::active() && end <= self.virtual_bytes {
+                return Ok(crate::sizing::STAND_IN + offset);
+            }
             return Err(Fault::Ceiling {
                 what: self.label,
                 need: end,
@@ -855,6 +936,23 @@ pub struct Range {
     /// The most bytes the committed segments have backed, the held spans
     /// apart.
     segment_high: u64,
+    /// Where the segments part, and by how many bytes ([`Range::part`]):
+    /// those from the first lie that many bytes further up the range.
+    parted: (u64, u64),
+    /// A flat range before its fit: its holds are noted, not backed, so the
+    /// one allocation is made at the size the fit gives it
+    /// ([`Range::undefer`]), not at the estimate it was reserved with.
+    deferred: bool,
+}
+
+/// The spans the first `bottom` bytes of a range's segments lie in, parted
+/// at `parted.0` by `parted.1` bytes.
+fn laid(bottom: u64, parted: (u64, u64)) -> [(u64, u64); 2] {
+    let (from, by) = parted;
+    if bottom <= from {
+        return [(0, bottom), (0, 0)];
+    }
+    [(0, from), (from + by, bottom - from)]
 }
 
 impl Range {
@@ -873,11 +971,27 @@ impl Range {
             held: Vec::new(),
             limit: u64::MAX,
             segment_high: 0,
+            parted: (u64::MAX, 0),
+            deferred: !mapped_on_demand(),
         })
     }
 
+    /// Ends a flat range's deferral: its holds are backed, so it is
+    /// allocated at its first.
+    pub fn undefer(&mut self) {
+        self.deferred = false;
+    }
+
+    /// Where the range lies. A flat range is allocated at its first
+    /// commit, so before the fit it lies nowhere; a size-only walk over it
+    /// then sees it at the stand-in base, so every address it derives from
+    /// the range is a stand-in and nothing the walk writes reaches memory
+    /// (`crate::sizing`).
     #[must_use]
-    pub const fn base(&self) -> u64 {
+    pub fn base(&self) -> u64 {
+        if self.arena.base == 0 && crate::sizing::active() {
+            return crate::sizing::STAND_IN;
+        }
         self.arena.base
     }
 
@@ -918,6 +1032,25 @@ impl Range {
             .map_or(0, |span| span.1)
     }
 
+    /// The bytes the spans held backed that start at or past `from` cover:
+    /// a byte two of them hold is counted once.
+    #[must_use]
+    pub fn held_past(&self, from: u64) -> u64 {
+        let mut spans: Vec<(u64, u64)> = self
+            .held
+            .iter()
+            .filter(|span| span.0 >= from)
+            .map(|span| (span.0, span.0.saturating_add(span.1)))
+            .collect();
+        spans.sort_unstable();
+        let (mut covered, mut reached) = (0, from);
+        for (start, end) in spans {
+            covered += end.saturating_sub(start.max(reached));
+            reached = reached.max(end);
+        }
+        covered
+    }
+
     /// Every byte backed: the committed segments' and the held span's.
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
@@ -930,7 +1063,10 @@ impl Range {
         let bottom = (u64::from(self.committed) * self.segment_bytes)
             .min(self.arena.max_bytes)
             .min(self.limit);
-        self.arena.units_of(&Want::Prefix(bottom)).len() as u64 * self.arena.map_unit
+        self.arena
+            .units_of(&Want::Ranges(laid(bottom, self.parted).to_vec()))
+            .len() as u64
+            * self.arena.map_unit
     }
 
     #[must_use]
@@ -955,10 +1091,54 @@ impl Range {
         let bytes = self.arena.max_bytes.min(self.limit);
         let bottom = (u64::from(segments) * self.segment_bytes).min(bytes);
         Want::Ranges(
-            core::iter::once((0, bottom))
+            laid(bottom, self.parted)
+                .into_iter()
                 .chain(held.iter().copied())
                 .collect(),
         )
+    }
+
+    /// The pages backing the first `segments` segments under `limit` bytes
+    /// would take beyond what is backed now, were the segments parted at
+    /// `parted.0` by `parted.1` bytes ([`Range::part`]), the held spans
+    /// standing: what a commit of them would ask the pool for. Counted,
+    /// nothing backed.
+    pub fn growth_of(&self, segments: u32, limit: u64, parted: (u64, u64)) -> Result<u64> {
+        let bytes = self.arena.max_bytes.min(limit);
+        let bottom = (u64::from(segments.min(self.segments())) * self.segment_bytes).min(bytes);
+        let want = Want::Ranges(
+            laid(bottom, parted)
+                .into_iter()
+                .chain(self.held.iter().copied())
+                .collect(),
+        );
+        let units = self.arena.target_units(&want)?;
+        Ok(self.arena.growth_pages(&units))
+    }
+
+    /// Where the segments part ([`Range::part`]).
+    #[must_use]
+    pub const fn parted(&self) -> (u64, u64) {
+        self.parted
+    }
+
+    /// Parts the segments at `from` bytes, a whole number of segments none
+    /// past which is committed: those from there on lie `by` bytes further
+    /// up the range, and the `by` bytes between are never backed. A range
+    /// reserved for more than it comes to hold keeps both its ends where
+    /// they lie this way: its first segments at its base, its last ones
+    /// under what lies above them.
+    pub fn part(&mut self, from: u64, by: u64) -> Result<()> {
+        if !from.is_multiple_of(self.segment_bytes)
+            || u64::from(self.committed) * self.segment_bytes > from
+        {
+            return Err(Fault::program(
+                "device::elastic",
+                "a range parted inside a segment, or under committed ones",
+            ));
+        }
+        self.parted = (from, by);
+        Ok(())
     }
 
     /// Holds the segments to the first `bytes` of the range: a segment that
@@ -980,10 +1160,25 @@ impl Range {
         bytes: u64,
         beside: bool,
     ) -> Result<Commit> {
+        // A size-only walk backs nothing and holds nothing (`crate::sizing`).
+        if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
+        // A span held from `from` already covering `bytes` leaves what is
+        // held as it is, and what is held is backed: nothing to commit. A
+        // bind holds the same span again on every program it lays, and the
+        // walk below spells out every unit of the range to find that out.
+        if self.held(from) >= bytes {
+            return Ok(Commit::Committed);
+        }
         let mut held = self.held.clone();
         match held.iter_mut().find(|span| span.0 == from) {
             Some(span) => span.1 = span.1.max(bytes),
             None => held.push((from, bytes)),
+        }
+        if self.deferred && !self.flat_allocated() {
+            self.held = held;
+            return Ok(Commit::Committed);
         }
         let want = self.wanted(self.committed, &held);
         let mut targets = [Target {
@@ -1003,6 +1198,10 @@ impl Range {
 
     /// Backs the first `segments` segments; those already backed stay.
     pub fn commit_segments(&mut self, pool: &mut PhysicalPool, segments: u32) -> Result<Commit> {
+        // A size-only walk backs nothing (`crate::sizing`).
+        if crate::sizing::active() {
+            return Ok(Commit::Committed);
+        }
         let segments = segments.min(self.segments());
         if segments <= self.committed {
             return Ok(Commit::Committed);
@@ -1014,8 +1213,32 @@ impl Range {
         }];
         let outcome = commit_atomically(pool, &mut targets)?;
         if outcome == Commit::Committed {
+            let bottom = |segments: u32| {
+                (u64::from(segments) * self.segment_bytes)
+                    .min(self.arena.max_bytes)
+                    .min(self.limit)
+            };
+            let before = bottom(self.committed);
+            let after = bottom(segments);
             self.committed = segments;
             self.segment_high = self.segment_high.max(self.segment_bytes_committed());
+            // `unwritten-nan`: what the segments back anew holds NaN until a
+            // kernel writes it.
+            // (A flat range's one allocation is filled whole as it is made.)
+            if crate::serve::diag::on().unwritten_nan && mapped_on_demand() {
+                let [low, high] = laid(after, self.parted);
+                let [was_low, was_high] = laid(before, self.parted);
+                // Each piece grows at its end, from what it held.
+                for ((at, len), (_, was)) in [(low, was_low), (high, was_high)] {
+                    if len > was {
+                        crate::device::fill_span(
+                            self.span(at + was, len - was)?,
+                            usize::try_from(len - was).unwrap_or(0),
+                            0xFF,
+                        )?;
+                    }
+                }
+            }
         }
         Ok(outcome)
     }
@@ -1040,6 +1263,23 @@ impl Range {
     /// dropped for another, so the pool's count of what is backed stands.
     pub fn release_all(&mut self, pool: &mut PhysicalPool) {
         self.arena.shrink_to(pool, &[]);
+        self.committed = 0;
+        self.held.clear();
+    }
+
+    /// Whether this is a flat range already allocated: its one allocation
+    /// stands for the range's life ([`Range::unhold`]).
+    #[must_use]
+    pub fn flat_allocated(&self) -> bool {
+        self.arena.flat && self.arena.base != 0
+    }
+
+    /// Forgets what is committed and held on a flat range already
+    /// allocated, keeping the allocation: the range is laid out anew inside
+    /// it. Allocating a flat range costs the driver clearing it (about five
+    /// seconds for 150 GiB on gfx942), so a load allocates it once.
+    pub fn unhold(&mut self) {
+        debug_assert!(self.flat_allocated());
         self.committed = 0;
         self.held.clear();
     }
@@ -1141,10 +1381,11 @@ fn allocation_granularity(device: i32) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LOGICAL_PAGE_BYTES, PhysicalPool, pages_for_bytes};
+    use super::{Arena, LOGICAL_PAGE_BYTES, PhysicalPool, Range, pages_for_bytes};
 
     #[test]
     fn elastic_every_case() {
+        a_parted_range_backs_the_chunks_it_states();
         a_promise_charges_the_budget_before_it_is_a_mapping();
         a_pledge_outlives_what_the_device_reports_free();
         a_partial_page_is_a_whole_page();
@@ -1207,6 +1448,106 @@ mod tests {
         pool.mark_committed(10);
         assert_eq!(pool.committed_pages(), 10);
         assert!(!pool.try_reserve(1));
+    }
+
+    /// A range of `bytes` in segments of `segment`, mapped in `unit`s, as
+    /// reserved: nothing backed, no device asked.
+    fn reserved(bytes: u64, segment: u64, unit: u64) -> Range {
+        let virtual_bytes = bytes.div_ceil(unit) * unit;
+        Range {
+            arena: Arena {
+                label: "a test's range",
+                base: 0,
+                max_bytes: bytes,
+                virtual_bytes,
+                map_unit: unit,
+                units: vec![None; (virtual_bytes / unit) as usize],
+                mapped: 0,
+                cached: Vec::new(),
+                high_water: 0,
+                flat: false,
+            },
+            segment_bytes: segment,
+            committed: 0,
+            held: Vec::new(),
+            limit: u64::MAX,
+            segment_high: 0,
+            parted: (u64::MAX, 0),
+            deferred: false,
+        }
+    }
+
+    /// The range stated is the range backed: a range reserved for more
+    /// chunks than the card comes to back, stated as the chunks it does
+    /// (parted, limited to them), backs with every segment committed those
+    /// chunks and no byte of the ones skipped, its first chunks at its base
+    /// and its last ending where the span above them starts, whatever the
+    /// fit came to.
+    fn a_parted_range_backs_the_chunks_it_states() {
+        // A chunk that is no whole number of map units, as a served one.
+        const CHUNK: u64 = 19 << 20;
+        const UNIT: u64 = 1 << 20;
+        const SEGMENT: u64 = 8;
+        const RESERVED: u64 = 100;
+        const ABOVE: u64 = 30;
+        let units = |from: u64, bytes: u64| from / UNIT..(from + bytes).div_ceil(UNIT);
+        for fitted in [8, 9, 16, 37, 64, 99] {
+            for parting in [8, 16] {
+                // A pool that fits under where it would part is not parted.
+                if parting >= fitted {
+                    continue;
+                }
+                let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
+                let skipped = RESERVED - fitted;
+                range.part(parting * CHUNK, skipped * CHUNK).unwrap();
+                range.limit(fitted * CHUNK);
+                let want = range.wanted(range.segments(), &[]);
+                let backed = range.arena.target_units(&want).unwrap();
+                let stated: Vec<usize> = units(0, parting * CHUNK)
+                    .chain(units(
+                        (parting + skipped) * CHUNK,
+                        (fitted - parting) * CHUNK,
+                    ))
+                    .map(|unit| unit as usize)
+                    .collect();
+                assert_eq!(
+                    backed, stated,
+                    "{fitted} chunks stated of {RESERVED}, parted at {parting}"
+                );
+                assert_eq!(backed.len() as u64 * UNIT, fitted * CHUNK);
+                assert_eq!(
+                    backed.last().map(|&unit| (unit as u64 + 1) * UNIT),
+                    Some(RESERVED * CHUNK),
+                    "the last chunk stated ends where the span above starts"
+                );
+                // What a commit of them all would ask is those chunks.
+                assert_eq!(
+                    range
+                        .growth_of(range.segments(), fitted * CHUNK, range.parted())
+                        .unwrap(),
+                    pages_for_bytes(fitted * CHUNK)
+                );
+            }
+        }
+        // Spans held over one another are counted once.
+        let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
+        let above = RESERVED * CHUNK;
+        range.held = vec![
+            (above, 4 * CHUNK),
+            (above + CHUNK, CHUNK),
+            (above + 3 * CHUNK, 2 * CHUNK),
+            (above + 9 * CHUNK, CHUNK),
+            (CHUNK, CHUNK),
+        ];
+        assert_eq!(range.held_past(above), 6 * CHUNK);
+        assert_eq!(range.held(above), 4 * CHUNK);
+        // Parted under a committed segment, or inside one, it is refused:
+        // what is backed never moves.
+        let mut range = reserved((RESERVED + ABOVE) * CHUNK, SEGMENT * CHUNK, UNIT);
+        assert!(range.part(3 * CHUNK, CHUNK).is_err());
+        range.committed = 2;
+        assert!(range.part(SEGMENT * CHUNK, CHUNK).is_err());
+        assert!(range.part(2 * SEGMENT * CHUNK, CHUNK).is_ok());
     }
 
     fn a_partial_page_is_a_whole_page() {

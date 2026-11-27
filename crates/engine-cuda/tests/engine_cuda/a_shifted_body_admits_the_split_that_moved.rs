@@ -5,7 +5,7 @@ use poem_exec::fire::{Composition, Lane, compose};
 use poem_ir::ops::Elemwise;
 
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096, false)
 }
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
@@ -97,6 +97,7 @@ fn subject() -> Trace {
         value: y,
         layer: None,
         grid: None,
+        planes: Vec::new(),
     });
     b.trace
 }
@@ -284,7 +285,7 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
         "and therefore a lattice point",
     );
     assert_eq!(
-        BodyKey::of_axes(
+        BodyKey::of(
             first.classes(),
             first.bucket(),
             &no_decode_class(),
@@ -292,7 +293,7 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
             &plain(),
             None
         ),
-        BodyKey::of_axes(
+        BodyKey::of(
             second.classes(),
             second.bucket(),
             &no_decode_class(),

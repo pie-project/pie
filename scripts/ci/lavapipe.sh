@@ -32,6 +32,11 @@ echo "== inferlets (wasm32-wasip3)"
 echo "== import"
 "$pie" model import "$work/snapshot" --deployment qwen35-tiny-u4g64-kv-bf16 --keep-source
 
+# llvmpipe is too slow to time the roofline rates on (a measuring boot ran
+# past seven minutes and its fences timed out): the load measures nothing
+# (`[engine] measure = false`, each rate served by the estimate, named in the
+# log), so the budget holds only the model and its pools, as main's did.
+
 case "$engine" in
   wgpu)   engine_toml=$'type = "wgpu"\nbackends = "vulkan"\ndevice = ["wgpu:0"]' ;;
   vulkan) engine_toml=$'type = "vulkan"\ndevice = ["vulkan:0"]' ;;
@@ -43,11 +48,11 @@ listen = "127.0.0.1:$port"
 [model]
 name = "default"
 source = "snapshot"
-device_kv_budget = "256MiB"
 [engine]
 $engine_toml
-max_forward_tokens = 1024
-max_forward_requests = 8
+measure = false
+[engine.memory]
+budget_device = "1GiB"
 [sandbox]
 allow_fs = false
 allow_network = true

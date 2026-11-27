@@ -44,6 +44,20 @@ pub(super) struct View {
     pub order: Option<Order>,
 }
 
+/// Where a bank view's experts lie: expert `e`'s `[n, k]` bf16 weights at
+/// pool row `table[e] + offset`, as `k / 128` column panels of `n / 2` pool
+/// rows each (`crate::linear::moe_gmm::Pooled`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankAt {
+    pub pool: Val,
+    /// i32 `[experts]`: each expert's pool row.
+    pub table: Val,
+    pub offset: i64,
+    pub experts: i64,
+    pub n: i64,
+    pub k: i64,
+}
+
 /// A permuted row order of a view's pool rows: in each block of `tokens ·
 /// rpt` pool rows (`tokens` view rows of `rpt` pool rows each, a kv page),
 /// the pool row `j · tokens + t` holds part `j` of view row `t` (row-pair
@@ -157,6 +171,183 @@ impl Func {
         let v = self.fresh(format!("%view{id}"), ty);
         self.views.insert(v.0, View { pool, elem, order });
         Ok(v)
+    }
+
+    /// A bf16 bank `[experts·n, k]` whose experts lie in `pool` where
+    /// `table` puts them ([`BankAt`]): a value with no text. The grouped
+    /// matmul reads it in place ([`Func::bank_parts`]); an expert's slice
+    /// reads that expert's rows ([`Func::bank_expert`]); anything else
+    /// materializes it ([`Func::bank_solid`], logged).
+    pub fn bank_view(&mut self, at: BankAt) -> Built<Val> {
+        let pool = match self.views.get(&at.pool.0) {
+            Some(v) => v.pool,
+            None => at.pool,
+        };
+        let pt = self.ty(pool).clone();
+        if pt.elem != Elem::U32 || pt.rank() != 2 || pt.dims[1] != LANES {
+            return malformed("bank_view", format!("a bank in {pt}"));
+        }
+        if at.k % LANES != 0 || at.n % 16 != 0 || self.dims(at.table) != [at.experts] {
+            return malformed("bank_view", format!("{at:?}"));
+        }
+        let id = self.next;
+        self.next += 1;
+        let v = self.fresh(
+            format!("%bank{id}"),
+            Ty::new(Elem::Bf16, &[at.experts * at.n, at.k]),
+        );
+        self.banks.insert(v.0, BankAt { pool, ..at });
+        Ok(v)
+    }
+
+    /// Where a bank view's experts lie (`None`: not a bank view).
+    #[must_use]
+    pub fn bank_parts(&self, v: Val) -> Option<BankAt> {
+        self.banks.get(&v.0).copied()
+    }
+
+    /// Expert `e`'s (i32 scalar) `[n, k]` weights of a bank view, read from
+    /// its panels.
+    pub fn bank_expert(&mut self, v: Val, e: Val) -> Built<Val> {
+        let Some(at) = self.bank_parts(v) else {
+            return malformed("bank_expert", "not a bank view".to_string());
+        };
+        let e0 = self.reshape(e, &[])?;
+        let row = self.dynamic_slice(at.table, &[e0], &[1])?;
+        let row = self.reshape(row, &[])?;
+        let off = self.const_i(Elem::I32, at.offset, &[]);
+        let row = self.add(row, off)?;
+        let half = at.n / 2;
+        let zero = self.const_i(Elem::I32, 0, &[]);
+        let mut panels = Vec::with_capacity((at.k / LANES) as usize);
+        for j in 0..at.k / LANES {
+            let step = self.const_i(Elem::I32, j * half, &[]);
+            let r = self.add(row, step)?;
+            let rows = self.dynamic_slice(at.pool, &[r, zero], &[half, LANES])?;
+            let x = self.unpack(rows, Elem::Bf16)?;
+            panels.push(self.reshape(x, &[at.n, LANES])?);
+        }
+        if panels.len() == 1 {
+            return Ok(panels[0]);
+        }
+        self.concat(&panels, 1)
+    }
+
+    /// Lands the routed experts of a bank in no slot before a select reads
+    /// it: each expert `routes` names (any i32 shape; ids outside
+    /// `0..experts` name none) whose `table` row is negative is copied, its
+    /// plane's `rows` pool rows, from `host` (u32 `[experts · rows, 128]`
+    /// in pinned host memory, each expert's plane as the pool lays it) into
+    /// the next of the `staging` rows (i32 `[S]`), in expert order. Answers
+    /// the pool and the table with those experts at their staging rows. No
+    /// expert missing: no copy (the loop takes no step). More missing than
+    /// `S`: the extra ones read the last staging row (the caller sizes `S`
+    /// to the most a fire routes to).
+    pub fn stage_misses(
+        &mut self,
+        pool: Val,
+        table: Val,
+        routes: Val,
+        host: Val,
+        rows: i64,
+        staging: Val,
+    ) -> Built<(Val, Val)> {
+        use super::Fold;
+        let e = self.dims(table)[0];
+        let s = self.dims(staging)[0];
+        let p: i64 = self.dims(routes).iter().product();
+        let r = self.reshape(routes, &[p, 1])?;
+        let r = self.broadcast(r, &[p, e], &[0, 1])?;
+        let ids = self.iota(Elem::I32, &[p, e], 1);
+        let named = self.compare(Cmp::Eq, r, ids)?;
+        let named = self.reduce(named, &[0], Fold::Or)?;
+        let zero = self.const_i(Elem::I32, 0, &[e]);
+        let none = self.compare(Cmp::Lt, table, zero)?;
+        let miss = self.and(named, none)?;
+        let one = self.const_i(Elem::I32, 1, &[e]);
+        let missed = self.select(miss, one, zero)?;
+        let upto = self.scan(missed, 0, Fold::Sum)?;
+        let rank = self.sub(upto, missed)?;
+        let top = self.const_i(Elem::I32, s - 1, &[e]);
+        let at = self.min(rank, top)?;
+        let at = self.reshape(at, &[e, 1])?;
+        let row = self.gather_rows_i32(staging, at)?;
+        let table = self.select(miss, row, table)?;
+        let count = self.reduce(missed, &[0], Fold::Sum)?;
+        // Each staging row's expert: the missing one ranked there.
+        let ks = self.iota(Elem::I32, &[s, e], 0);
+        let rk = self.broadcast(rank, &[s, e], &[1])?;
+        let here = self.compare(Cmp::Eq, rk, ks)?;
+        let mb = self.broadcast(miss, &[s, e], &[1])?;
+        let here = self.and(here, mb)?;
+        let es = self.iota(Elem::I32, &[s, e], 1);
+        let zs = self.const_i(Elem::I32, 0, &[s, e]);
+        let pick = self.select(here, es, zs)?;
+        let list = self.reduce(pick, &[1], Fold::Sum)?;
+        let pool = self.copy_from_host(pool, host, list, staging, count, rows)?;
+        Ok((pool, table))
+    }
+
+    /// Copies `count` (i32 scalar) planes of `rows` pool rows from `host`
+    /// (u32 `[n · rows, 128]` in pinned host memory) into the pool: the
+    /// `k`-th takes plane `from[k]` (i32 `[F]`) to pool row `to[k]`
+    /// (i32 `[F]`). Entries past `count` copy nothing. Answers the pool.
+    pub fn copy_from_host(
+        &mut self,
+        pool: Val,
+        host: Val,
+        from: Val,
+        to: Val,
+        count: Val,
+        rows: i64,
+    ) -> Built<Val> {
+        let out = crate::lanes::loop_upto(
+            self,
+            count,
+            &[pool],
+            &[from, to, host],
+            |f, k, carried, inv| {
+                let (pool, from, to, host) = (carried[0], inv[0], inv[1], inv[2]);
+                let ex = f.dynamic_slice(from, &[k], &[1])?;
+                let ex = f.reshape(ex, &[])?;
+                let rv = f.const_i(Elem::I32, rows, &[]);
+                let at = f.mul(ex, rv)?;
+                let z = f.const_i(Elem::I32, 0, &[]);
+                let block = f.dynamic_slice(host, &[at, z], &[rows, LANES])?;
+                let block = f.to_device(block);
+                let dst = f.dynamic_slice(to, &[k], &[1])?;
+                let dst = f.reshape(dst, &[])?;
+                Ok(vec![f.dynamic_update_slice(pool, block, &[dst, z])?])
+            },
+        )?;
+        Ok(out[0])
+    }
+
+    /// `table[at]` (i32 `[n]`) for i32 `at` `[m, 1]`: `[m]`.
+    fn gather_rows_i32(&mut self, table: Val, at: Val) -> Built<Val> {
+        let m = self.dims(at)[0];
+        let t = self.reshape(table, &[self.dims(table)[0], 1])?;
+        let g = self.take_rows(t, at)?;
+        self.reshape(g, &[m])
+    }
+
+    /// A bank view as a value: every expert read (a copy of the bank,
+    /// logged in [`Func::materialized`]).
+    pub fn bank_solid(&mut self, v: Val, why: &str) -> Built<Val> {
+        let Some(at) = self.bank_parts(v) else {
+            return Ok(v);
+        };
+        self.materialized
+            .push(format!("{why}: bank [{}, {}]", at.experts * at.n, at.k));
+        let mut experts = Vec::with_capacity(at.experts as usize);
+        for e in 0..at.experts {
+            let ev = self.const_i(Elem::I32, e, &[]);
+            experts.push(self.bank_expert(v, ev)?);
+        }
+        if experts.len() == 1 {
+            return Ok(experts[0]);
+        }
+        self.concat(&experts, 0)
     }
 
     /// A view's row order (`None`: the packed rows order, or not a view).
@@ -520,7 +711,7 @@ impl Func {
             && g % len == 0
             && self.blocked(rows_total, nr)
             && batch * nr * LANES * 4 <= SMALL_BY_XLA;
-        if aligned && g % len == 0 && k > 1 && crate::blocks::on() && !self.xla_reads && !small {
+        if aligned && g % len == 0 && k > 1 && !self.xla_reads && !small {
             // Whole blocks by DMA, any number of rows: no element
             // reinterpreted (`crate::blocks`).
             let at = self.block_of(row, nr)?;
@@ -533,34 +724,6 @@ impl Func {
                 }
                 None => self.reshape(got, &[batch, nr * e])?,
             };
-            let check = std::env::var("PIE_XLA_POOL_DMA_CHECK").ok();
-            if let Some(mode @ ("1" | "2")) = check.as_deref() {
-                // Debugging: the same rows by XLA's gather, bit for bit;
-                // any difference turns the whole read into NaN (`2`: against
-                // the next rows, which must differ: the check's own test).
-                let start = if mode == "2" {
-                    let one = self.like_i(row, 1);
-                    let r = self.add(row, one)?;
-                    let top = self.like_i(r, rows_total - nr);
-                    self.min(r, top)?
-                } else {
-                    row
-                };
-                let ids = self.rows_of(start, batch, nr)?;
-                let x = self.take_rows(view.pool, ids)?;
-                let x = self.reshape(x, &[batch, nr, LANES])?;
-                let x = self.unpack(x, view.elem)?;
-                let ub = uint(view.elem.bits());
-                let (a, b) = (self.bitcast(got, ub)?, self.bitcast(x, ub)?);
-                let ne = self.compare(Cmp::Ne, a, b)?;
-                let ne = self.convert(ne, Elem::I32);
-                let any = self.reduce(ne, &[0, 1], super::Fold::Max)?;
-                let zero = self.like_i(any, 0);
-                let same = self.compare(Cmp::Eq, any, zero)?;
-                let same = self.broadcast(same, &[batch, nr * e], &[])?;
-                let nan = self.const_f(view.elem, f64::NAN, &[batch, nr * e]);
-                return Ok(Some(self.select(same, got, nan)?));
-            }
             return Ok(Some(got));
         }
         let got = if aligned && g % len == 0 && self.blocked(rows_total, nr) {
@@ -914,7 +1077,7 @@ impl Func {
         rows_total: i64,
         unique: bool,
     ) -> Built<Option<Val>> {
-        if g % len == 0 && k > 1 && crate::blocks::on() {
+        if g % len == 0 && k > 1 {
             // whole blocks by DMA (`crate::blocks`), any number of rows:
             // a row scatter pays for every pool row it is handed
             let at = self.block_of(row, nr)?;
@@ -1058,14 +1221,88 @@ impl Func {
             let s = self.clamp_to(s, od[a] - sizes[a])?;
             starts.push((a, s));
         }
-        let Some(pool) = self.write_block(view, &od, &starts, valid, ups, batch, len, unique)?
-        else {
+        if let Some(pool) = self.write_block(view, &od, &starts, valid, ups, batch, len, unique)? {
+            return Ok(Some(
+                self.pool_view_ordered(pool, view.elem, &od, view.order)?,
+            ));
+        }
+        // One update that lies in part of a view's rows (a 128-wide bf16
+        // row of a 256-wide view): the whole rows it lies in read, the
+        // update spliced into them, and the rows written back, each an
+        // aligned block of the view. Else a copy of the pool a write (v6e
+        // GLM-5 next miniature: 20 GiB of views a fire).
+        // Several updates land one after another, a loop over them (one
+        // splice in the program whatever their count; a scatter's repeated
+        // index is unordered, so in order is one of its answers).
+        if od.len() < 2 {
             return Ok(None);
-        };
-        let dims = od;
-        Ok(Some(
-            self.pool_view_ordered(pool, view.elem, &dims, view.order)?,
-        ))
+        }
+        let last = od.len() - 1;
+        let mut whole = sizes.clone();
+        whole[last] = od[last];
+        // each axis's start a vector over the updates (0 where it is not
+        // scattered)
+        let mut axis_starts = Vec::with_capacity(od.len());
+        for a in 0..od.len() {
+            axis_starts.push(starts.iter().find(|(axis, _)| *axis == a).map(|&(_, s)| s));
+        }
+        let n = self.const_i(Elem::I32, batch, &[]);
+        let i0 = self.const_i(Elem::I32, 0, &[]);
+        let declined = std::cell::Cell::new(false);
+        let out = self.while_loop(
+            &[i0, operand],
+            |f, a| f.compare(Cmp::Lt, a[0], n),
+            |f, a| {
+                let (i, cur) = (a[0], a[1]);
+                let zero = f.const_i(Elem::I32, 0, &[]);
+                let pick = |f: &mut Self, v: Val| -> Built<Val> {
+                    let one = f.dynamic_slice(v, &[i], &[1])?;
+                    f.reshape(one, &[])
+                };
+                let mut rows_at = Vec::with_capacity(od.len());
+                let mut col = zero;
+                for (ax, s) in axis_starts.iter().enumerate() {
+                    let s = match s {
+                        Some(s) => pick(f, *s)?,
+                        None => zero,
+                    };
+                    if ax == last {
+                        col = s;
+                        rows_at.push(zero);
+                    } else {
+                        rows_at.push(s);
+                    }
+                }
+                let one = f.const_i(Elem::I32, 1, &[]);
+                let next_i = f.add(i, one)?;
+                let Some(rows) = f.view_slice_at(cur, &rows_at, &whole)? else {
+                    declined.set(true);
+                    return Ok(vec![next_i, cur]);
+                };
+                let block = f.dynamic_slice(ups, &[i, zero], &[1, len])?;
+                let block = f.reshape(block, &sizes)?;
+                let mut splice_at = vec![zero; od.len()];
+                splice_at[last] = col;
+                let spliced = f.dynamic_update_slice(rows, block, &splice_at)?;
+                let spliced = match valid {
+                    Some(ok) => {
+                        let ok = pick(f, ok)?;
+                        let ok = f.broadcast(ok, &whole, &[])?;
+                        f.select(ok, spliced, rows)?
+                    }
+                    None => spliced,
+                };
+                let Some(next) = f.view_update_at(cur, spliced, &rows_at)? else {
+                    declined.set(true);
+                    return Ok(vec![next_i, cur]);
+                };
+                Ok(vec![next_i, next])
+            },
+        )?;
+        if declined.get() {
+            return Ok(None);
+        }
+        Ok(Some(out[1]))
     }
 
     /// `dynamic_update_slice` onto a view. `None` where it has no rewrite.

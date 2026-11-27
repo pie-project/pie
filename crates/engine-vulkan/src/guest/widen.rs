@@ -1,5 +1,4 @@
 #![allow(unsafe_code)]
-use std::cell::Cell;
 use std::sync::Arc;
 
 use ash::vk;
@@ -7,12 +6,10 @@ use ash::vk;
 use crate::device::Context;
 use crate::device::alloc::{Buffer, Memory};
 use crate::device::ctx::{Core, Frame};
-use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes};
+use engine_gpu::guest::widen::{Cfg, STORAGE_SOURCE, WG, config_bytes, word};
 
 use engine_gpu::error::Result;
 
-/// Config slots, one per widen still on the queue: a frame that runs ahead
-/// keeps its own offsets while the next frame records.
 /// What the widen's pipeline layout binds: source, destination, config.
 const LAYOUT: [(u32, super::Slot); 3] = [
     (0, super::Slot::Storage),
@@ -20,20 +17,15 @@ const LAYOUT: [(u32, super::Slot); 3] = [
     (2, super::Slot::Storage),
 ];
 
-const SLOTS: u64 = 16;
-
-/// Apart by any device's storage-buffer offset alignment.
-const SLOT_BYTES: u64 = 256;
-
 pub struct Widen {
     core: Arc<Core>,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// The config of the widen the queue runs next: each widen records its
+    /// own into the command stream just before its dispatch, so any number
+    /// of them, in one frame or in frames in flight, read their own.
     cfg: Buffer,
-    next: Cell<u64>,
-
-    armed: Cell<bool>,
 }
 
 impl std::fmt::Debug for Widen {
@@ -51,7 +43,12 @@ impl Widen {
             }
         })?;
         let core = device.core().clone();
-        let cfg = Buffer::with(device, SLOTS * SLOT_BYTES, Memory::Host)?;
+        let cfg = Buffer::with(
+            device,
+            size_of::<Cfg>() as u64,
+            Memory::Host,
+            engine_gpu::books::owners::GUEST,
+        )?;
 
         let bindings = LAYOUT.map(|(at, slot)| binding(at, super::descriptor_type(slot)));
         let d = &core.device;
@@ -95,8 +92,6 @@ impl Widen {
                 layout,
                 pipeline,
                 cfg,
-                next: Cell::new(0),
-                armed: Cell::new(false),
             })
         }
     }
@@ -110,14 +105,6 @@ impl Widen {
         dst_at: u64,
         lanes: u32,
     ) -> Result<()> {
-        if self.armed.get() {
-            return Err(engine_gpu::error::Fault::Program {
-                at: "guest::widen",
-                why: "a second readout widen was recorded into one frame; there is one config \
-                      slot and the first would run with the second's offsets"
-                    .into(),
-            });
-        }
         if !src_at.is_multiple_of(4) || !dst_at.is_multiple_of(4) {
             return Err(engine_gpu::error::Fault::Program {
                 at: "guest::widen",
@@ -127,25 +114,20 @@ impl Widen {
                 ),
             });
         }
-        let slot = self.next.get();
-        self.next.set((slot + 1) % SLOTS);
-        self.cfg.write_shared(
-            slot * SLOT_BYTES,
-            &config_bytes(Cfg {
-                src_word: u32::try_from(src_at / 4).unwrap_or(u32::MAX),
-                dst_word: u32::try_from(dst_at / 4).unwrap_or(u32::MAX),
-                lanes,
-                pad: 0,
-            }),
-        )?;
-        self.armed.set(true);
+        let cfg = Cfg {
+            src_word: word(src_at)?,
+            dst_word: word(dst_at)?,
+            lanes,
+            pad: 0,
+        };
+        let config = config_bytes(cfg);
 
         let set = frame.descriptor_set(self.set_layout)?;
         frame.retain(self.cfg.slab());
         let d = &self.core.device;
         // SAFETY: `set` was handed to this widen alone by `descriptor_set` and
         // no command uses it yet; its writes name live buffers with ranges
-        // inside them (the config slot is `SLOT_BYTES` wide), and `infos`
+        // inside them (the config is one `Cfg`), and `infos`
         // outlives the update. `cmd` is the open frame's buffer, recorded only
         // on this thread (`Frame` is not `Sync`), and the pipeline and layout
         // are this widen's own.
@@ -155,7 +137,7 @@ impl Widen {
                 [buffer_info(dst)],
                 [vk::DescriptorBufferInfo::default()
                     .buffer(self.cfg.slab().buffer)
-                    .offset(slot * SLOT_BYTES)
+                    .offset(0)
                     .range(size_of::<Cfg>() as u64)],
             ];
             let writes: Vec<vk::WriteDescriptorSet> = (0..3)
@@ -170,6 +152,22 @@ impl Widen {
             d.update_descriptor_sets(&writes, &[]);
 
             let cmd = frame.cmd();
+
+            // The config is this widen's once the widen before it on the
+            // queue has read its own: written in the stream, in order.
+            let read = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[read],
+                &[],
+                &[],
+            );
+            d.cmd_update_buffer(cmd, self.cfg.slab().buffer, 0, &config);
 
             // The readout may still be landing: a forward submitted ahead of
             // this frame on the queue writes it from its shaders.
@@ -216,10 +214,6 @@ impl Widen {
             );
         }
         Ok(())
-    }
-
-    pub fn disarm(&self) {
-        self.armed.set(false);
     }
 }
 

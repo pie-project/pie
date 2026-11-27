@@ -19,8 +19,22 @@ fn backend(op: &'static str, detail: impl ToString) -> Error {
 }
 
 impl Run<'_> {
+    /// Whether `id` is a capturing lane's row (`Dim::Capturing`), which no
+    /// arena value holds.
+    fn capture_row(&self, id: poem_ir::ValueId) -> bool {
+        matches!(
+            &self.values()[id.0 as usize].ty,
+            poem_ir::Ty::Tensor { shape, .. } if shape.first() == Some(&poem_ir::Dim::Capturing)
+        )
+    }
+
     fn collective(&mut self, op: &Collective) -> Result<(), Error> {
         match op {
+            Collective::AllReduce { buf, .. } if self.capture_row(*buf) => Err(backend(
+                "collective.all_reduce",
+                "the ranks' score rows lie in each capturing lane's reader, not in the arena, \
+                 and this backend has no sum through the row tables yet",
+            )),
             Collective::AllReduce { buf, buf_out: _ } => {
                 collective::all_reduce(self.ctx(), &mut self.tensor(*buf))
             }
@@ -44,6 +58,12 @@ impl Run<'_> {
                 ..
             } => {
                 const OP: &str = "collective.dispatch";
+                // A size-only walk (`crate::sizing`) moves nothing, and a
+                // dispatch takes no slab: its landing is the group's seats,
+                // which a rank staged ahead of its group has yet to join.
+                if crate::sizing::active() {
+                    return Ok(());
+                }
                 let ep = self
                     .ep_rank()
                     .ok_or_else(|| backend(OP, "this rank is in no expert-parallel group"))?;
@@ -98,6 +118,11 @@ impl Run<'_> {
                 ..
             } => {
                 const OP: &str = "collective.combine";
+                // As a dispatch: a size-only walk moves nothing, and the
+                // combine's buffers are the group's seats.
+                if crate::sizing::active() {
+                    return Ok(());
+                }
                 let ep = self
                     .ep_rank()
                     .ok_or_else(|| backend(OP, "this rank is in no expert-parallel group"))?;

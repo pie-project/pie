@@ -132,6 +132,39 @@ pub struct KvPool {
 
     /// u32 words from the pool's origin to page 0's keys, then its values.
     pub origin: [u32; 2],
+
+    /// A windowed layer served as state + buffer (CONTRACT-BC 19, 21): the
+    /// keys below each lane's buffer base lie in its record's ring, and the
+    /// page table holds its buffer slots, then the fire's slots of its own
+    /// rows. `None`: every key through the page table.
+    pub ring: Option<Ring>,
+}
+
+/// Where a windowed layer's rows lie beside its page table ([`KvPool::ring`]).
+/// The ring holds `rows` rows of the layer's keys and as many of its values
+/// (each row `seq_stride` elements), row `r` at place `r % rows`, at u32
+/// word `keys` of piece `piece` (`values` of piece `values_piece`) of each
+/// lane's record, a record's piece its unit in [`Ring::lanes`], units of
+/// `slot_stride` words into the pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Ring {
+    /// `6 + pieces` i32 a lane: its folded index (keys below it lie in the
+    /// ring), its buffer base (a page's first row: entry `i` of its table
+    /// holds rows `[base + i * page, base + (i + 1) * page)`), its first row
+    /// in the fire (keys from it on lie in the fire's own slots, the page
+    /// table's after the lane's buffer slots of the rows below it), its
+    /// folded index after the fire (the fold's), the buffered rows it does
+    /// not read and the first slot of its one run of those it reads (a
+    /// row's window counts along its lineage), then its record's units.
+    pub lanes: Tensor,
+    pub rows: u32,
+    /// The record's pieces the keys and the values lie in.
+    pub piece: u32,
+    pub values_piece: u32,
+    pub pieces: u32,
+    pub keys: u32,
+    pub values: u32,
+    pub slot_stride: u32,
 }
 
 impl KvPool {
@@ -175,7 +208,44 @@ impl KvPool {
                 stride(values, u64::from(values.width)),
             ],
             origin: [0, if shared { 0 } else { words }],
+            ring: None,
         }
+    }
+
+    /// [`KvPool::planes`] laid in one buffer, as a pool of one segment
+    /// holds them: `keys` (bound over both planes, from the keys' first
+    /// word) and `values` the plane's shape, its first word `values_at`
+    /// words past the keys'.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "`planes`' seven and where the values start"
+    )]
+    pub fn packed(
+        keys: Tensor,
+        values: Tensor,
+        values_at: u32,
+        page_indices: Tensor,
+        page_indptr: Tensor,
+        page_size: i32,
+        seq_stride: u64,
+        head_stride: u64,
+    ) -> Self {
+        let mut pool = Self::planes(
+            keys,
+            Tensor {
+                buf: keys.buf,
+                ..values
+            },
+            page_indices,
+            page_indptr,
+            page_size,
+            seq_stride,
+            head_stride,
+        );
+        pool.origin[1] = values_at;
+        pool.pool = Segments::one(keys.buf, values_at.saturating_add(words_of(values)).max(1));
+        pool
     }
 }
 

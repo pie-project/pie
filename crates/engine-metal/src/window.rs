@@ -26,6 +26,8 @@ pub struct Gathered {
     pub rows: Tensor,
     pub positions_host: Vec<i32>,
     pub positions: Tensor,
+    pub rotations_host: Vec<i32>,
+    pub rotations: Tensor,
     pub request_of_token_host: Vec<i32>,
     pub request_of_token: Tensor,
     pub page_tables: Vec<GatheredTable>,
@@ -43,12 +45,21 @@ pub struct GatheredTable {
     pub kv_len: Tensor,
 }
 
+/// What a copied window carries beside its bf16 and f32 token rows
+/// (`dispatch::copy`): each gathered row's mask word and mask row, and the
+/// integer token rows a region only reads (its row gather moves i32).
+pub const CARRIES: fallback::Carries = fallback::Carries {
+    masks: true,
+    read_ints: true,
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Copies<'a> {
     pub bucket: u32,
     pub enabled: bool,
     pub page_tables: &'a [Geometry],
     pub positions: &'a [i32],
+    pub rotations: &'a [i32],
     pub request_of_token: &'a [i32],
 }
 
@@ -60,6 +71,7 @@ impl Copies<'_> {
             enabled: false,
             page_tables: &[],
             positions: &[],
+            rotations: &[],
             request_of_token: &[],
         }
     }
@@ -113,6 +125,7 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             .collect()
     };
     let positions_host = relay(copies.positions);
+    let rotations_host = relay(copies.rotations);
     let request_of_token_host = relay(copies.request_of_token);
 
     let page_tables = copies
@@ -160,6 +173,8 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             rows_host,
             positions: Tensor::new(NIL, 0, 1, Dtype::I32),
             positions_host,
+            rotations: Tensor::new(NIL, 0, 1, Dtype::I32),
+            rotations_host,
             request_of_token: Tensor::new(NIL, 0, 1, Dtype::I32),
             request_of_token_host,
             page_tables,
@@ -230,7 +245,7 @@ impl Windows {
             if spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && fallback::copyable_mask(trace, compiled, &region.mask)
+                && fallback::copyable_mask(trace, compiled, &region.mask, CARRIES)
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies);
                 gathered.patch = patch;
@@ -283,6 +298,7 @@ impl Windows {
             };
             out.extend_from_slice(&gathered.rows_host);
             out.extend_from_slice(&gathered.positions_host);
+            out.extend_from_slice(&gathered.rotations_host);
             out.extend_from_slice(&gathered.request_of_token_host);
             for table in &gathered.page_tables {
                 out.extend_from_slice(&table.page_indptr_host);
@@ -310,6 +326,7 @@ impl Windows {
             };
             gathered.rows = take(&gathered.rows_host)?;
             gathered.positions = take(&gathered.positions_host)?;
+            gathered.rotations = take(&gathered.rotations_host)?;
             gathered.request_of_token = take(&gathered.request_of_token_host)?;
             for table in &mut gathered.page_tables {
                 table.page_indptr = take(&table.page_indptr_host)?;
@@ -354,21 +371,21 @@ impl Windows {
             .max(1)
     }
 
+    /// Run `run` of region `region`'s window; `None` past the runs this
+    /// fire cut the region into ([`Self::runs`]).
     #[must_use]
-    pub fn at(&self, region: u32, run: u32) -> &Window {
+    pub fn at(&self, region: u32, run: u32) -> Option<&Window> {
         self.of_region
             .get(region as usize)
             .filter(|&&(_, runs)| run < runs)
             .and_then(|&(start, _)| self.runs.get((start + run) as usize))
             .and_then(|index| self.windows.get(*index as usize))
-            .unwrap_or_else(|| {
-                panic!(
-                    "region {region} has no run {run}; this fire cut it into {} \
-                     over a template of {}",
-                    self.runs(region),
-                    self.of_region.len()
-                )
-            })
+    }
+
+    /// The regions this fire's windows are cut over.
+    #[must_use]
+    pub fn regions(&self) -> usize {
+        self.of_region.len()
     }
 }
 

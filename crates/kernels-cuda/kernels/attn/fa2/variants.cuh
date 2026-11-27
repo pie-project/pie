@@ -27,6 +27,7 @@
 namespace pie::attn::fa2 {
 
 DEFINE_HAS_MEMBER(maybe_mask_indptr)
+DEFINE_HAS_MEMBER(maybe_mask_origin)
 
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
 struct DefaultAttention : AttentionVariantBase {
@@ -35,6 +36,11 @@ struct DefaultAttention : AttentionVariantBase {
   static constexpr bool skips_decode_window = use_sliding_window && !use_custom_mask;
 
   uint8_t* custom_mask_ptr;
+  // PIE: the request's committed boundary: keys below it are read under the
+  // model's own bounds and no mask bit; the plane's column `c` is key
+  // `mask_origin + c`. `mask_wide`: its rows read both ways (no causal term).
+  uint32_t mask_origin;
+  bool mask_wide;
   uint32_t qo_len, kv_len;
   uint32_t window_left;
   float sm_scale_log2;
@@ -55,9 +61,24 @@ struct DefaultAttention : AttentionVariantBase {
         sm_scale_log2 = params.sm_scale * math::log2e;
       }
     }
+    mask_origin = 0;
+    mask_wide = true;
     if constexpr (use_custom_mask) {
+      if constexpr (has_maybe_mask_origin_v<Params>) {
+        if (params.maybe_mask_origin != nullptr) {
+          const uint32_t word = params.maybe_mask_origin[batch_idx];
+          mask_origin = word & 0x7fffffffu;
+          mask_wide = (word >> 31) != 0;
+        }
+      }
       if constexpr (has_maybe_mask_indptr_v<Params>) {
-        custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
+        // PIE: a negative offset states no mask (a group none of whose
+        // rows states one): its boundary is past every key.
+        const int64_t at = params.maybe_mask_indptr[batch_idx];
+        custom_mask_ptr = params.maybe_custom_mask + (at < 0 ? 0 : at);
+        if (at < 0) {
+          mask_origin = 0x7fffffffu;
+        }
       } else {
         custom_mask_ptr = params.maybe_custom_mask;
       }
@@ -81,8 +102,14 @@ struct DefaultAttention : AttentionVariantBase {
     if constexpr (use_custom_mask) {
       if (qo_idx >= qo_len || kv_idx >= kv_len) {
         mask = false;
-      } else {
-        const uint64_t offset = static_cast<uint64_t>(qo_idx) * kv_len + kv_idx;
+      } else if (!mask_wide && kv_idx + qo_len > kv_len + qo_idx) {
+        // PIE: a row reads no key after its own (the cache row), whatever its bits.
+        mask = false;
+      } else if (kv_idx >= mask_origin) {
+        // PIE: past the committed boundary the plane speaks, a row of
+        // `kv_len - mask_origin` bits; below it every key is read.
+        const uint64_t width = kv_len - mask_origin;
+        const uint64_t offset = static_cast<uint64_t>(qo_idx) * width + (kv_idx - mask_origin);
         mask &= ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
       }
     }

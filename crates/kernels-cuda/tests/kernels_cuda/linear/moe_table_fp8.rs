@@ -81,30 +81,23 @@ fn the_bf16_selects_land_the_same_bits_through_any_table() {
     let mut g = Gpu::open();
     let mut lcg = Lcg::seeded(0x0bf1_67ab);
     // (experts, tokens, top, n, k, by_token, glu, arm tuning): the
-    // register-held select, the 64-route tiled GEMM (256 routes), the wide
-    // tile (128 routes an expert), the grouped mma.sync select, cuBLAS's
-    // grouped leg (`matmul_select`).
-    let held = Tuning::DEFAULT;
-    let mma = Tuning {
-        bf16_mma_from: 1,
-        bf16_mma_until: 65_536,
-        moe_grouped: false,
-        ..Tuning::DEFAULT
-    };
-    let grouped = Tuning {
-        moe_grouped: true,
-        moe_group_at: 4,
-        ..Tuning::DEFAULT
+    // tiled GEMM at a few routes an expert and at 64 (with and without its
+    // GLU), its wide tile (128 routes an expert), the grouped mma.sync
+    // select, and the leg `matmul_select` prices cheapest.
+    let d = Tuning::DEFAULT;
+    let priced = Tuning {
+        roof: crate::common::roof(),
+        ..d
     };
     #[rustfmt::skip]
     let cases: [BfCase; 7] = [
-        (8, 4, 2, 128, 256, true, None, held, "held"),
-        (8, 6, 2, 96, 512, false, Some(Glu::Swiglu), held, "held glu"),
-        (8, 160, 2, 256, 256, true, None, held, "tiled"),
-        (4, 288, 2, 128, 256, true, Some(Glu::Swiglu), held, "wide glu"),
-        (8, 24, 4, 128, 256, true, None, mma, "mma"),
-        (8, 20, 2, 136, 512, false, None, mma, "mma tail"),
-        (8, 40, 2, 128, 256, true, None, grouped, "cublas grouped"),
+        (8, 4, 2, 128, 256, true, None, d, "tiled few"),
+        (8, 6, 2, 96, 512, false, Some(Glu::Swiglu), d, "tiled glu"),
+        (8, 160, 2, 256, 256, true, None, d, "tiled"),
+        (4, 288, 2, 128, 256, true, Some(Glu::Swiglu), d, "wide glu"),
+        (8, 24, 4, 128, 256, true, None, d, "mma"),
+        (8, 20, 2, 136, 512, false, None, d, "mma tail"),
+        (8, 40, 2, 128, 256, true, None, priced, "priced"),
     ];
     for (ex, tokens, top, n, k, by_token, glu, tuning, arm) in cases {
         let rows = if glu.is_some() { 2 * n } else { n };
@@ -124,15 +117,18 @@ fn the_bf16_selects_land_the_same_bits_through_any_table() {
             |table| {
                 let (x, r) = (t(f.x, xr, k, Bf16), t(f.r, tokens, top, I32));
                 let mut y = t(f.y, tokens * top, n, Bf16);
-                if arm.starts_with("held") || arm.starts_with("tiled") || arm.starts_with("wide") {
-                    let took = moe::select_bf16_held(
+                let plane = t(bank, ex, n * k, Bf16);
+                if arm.starts_with("tiled") || arm.starts_with("wide") {
+                    let took = moe::select_bf16_tiled(
                         &ctx, "test", x, bank, ex as u32, r, &mut y, glu, table,
                     )
                     .expect("the select fires");
-                    assert!(took, "{arm}: the held select takes the fire");
-                } else {
-                    moe::matmul_select(&ctx, x, t(bank, ex, n * k, Bf16), r, &mut y, table)
+                    assert!(took, "{arm}: the tiled select takes the fire");
+                } else if arm.starts_with("mma") {
+                    moe::matmul_select_on(&ctx, moe::Leg::Mma, x, plane, r, &mut y, table)
                         .expect("the select fires");
+                } else {
+                    moe::matmul_select(&ctx, x, plane, r, &mut y, table).expect("the select fires");
                 }
             },
         );
@@ -321,19 +317,21 @@ fn an_expert_table_costs_a_select_next_to_nothing() {
     let fire = |table: ExpertTable| {
         let (x, r) = (t(f.x, tokens, k, Bf16), t(f.r, tokens, top, I32));
         let mut y = t(f.y, tokens * top, n, Bf16);
-        moe::select_fp8_w8a16(
-            &ctx,
-            "test",
-            x,
-            planes[0].base,
-            planes[1].base,
-            ex as u32,
-            128,
-            r,
-            &mut y,
-            None,
-            table,
-        )
+        g.laid(&ctx, |ctx| {
+            moe::select_fp8_w8a16(
+                ctx,
+                "test",
+                x,
+                planes[0].base,
+                planes[1].base,
+                ex as u32,
+                128,
+                r,
+                &mut y,
+                None,
+                table,
+            )
+        })
         .expect("the W8A16 select fires");
     };
     let time = |g: &Gpu, table: ExpertTable| {

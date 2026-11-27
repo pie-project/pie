@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::bf16_bits;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
 use poem::{Dtype, ForwardHybrid, Input, Platform, StateRows, Weight, ops, trace_hybrid};
@@ -73,12 +74,6 @@ impl Lcg {
     fn unit(&mut self) -> f32 {
         ((self.next() >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, k: usize, seed: u64) {
@@ -197,12 +192,13 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         page_size: PAGE,
         context: ceiling,
         slots: 1,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         // Eager: the fold is read off the walk, not a recorded body.
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            pin: Some((Graphs::Off, None)),
             ..knobs
         },
         cache_dir: None,
@@ -211,6 +207,7 @@ fn fire(fixture: &Fixture, knobs: Knobs) -> engine_cuda::Result<Vec<f32>> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })?;
     shell.open(0).expect("slot 0 opens");
     let prompt: Vec<u32> = (0..TOKENS).map(|t| (t * 7 + 11) % VOCAB).collect();

@@ -14,91 +14,9 @@ pub fn no_lane(dtype: Dtype) -> ! {
     panic!("{dtype:?} is not a dtype ETA computes in; this plane has no lane for it")
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    F32(Vec<f32>),
-
-    I32(Vec<i32>),
-
-    U32(Vec<u32>),
-
-    Bool(Vec<u8>),
-}
-
-impl Value {
-    #[must_use]
-    pub fn dtype(&self) -> Dtype {
-        match self {
-            Value::F32(_) => Dtype::F32,
-            Value::I32(_) => Dtype::I32,
-            Value::U32(_) => Dtype::U32,
-            Value::Bool(_) => Dtype::Bool,
-        }
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Value::F32(v) => v.len(),
-            Value::I32(v) => v.len(),
-            Value::U32(v) => v.len(),
-            Value::Bool(v) => v.len(),
-        }
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[must_use]
-    pub fn zeros(dtype: Dtype, numel: usize) -> Value {
-        let n = numel.max(1);
-        match dtype {
-            Dtype::I32 => Value::I32(vec![0; n]),
-            Dtype::U32 => Value::U32(vec![0; n]),
-            Dtype::Bool => Value::Bool(vec![0; n]),
-            Dtype::F32 => Value::F32(vec![0.0; n]),
-            _ => no_lane(dtype),
-        }
-    }
-
-    #[must_use]
-    pub fn lanes_f32(&self) -> Vec<f32> {
-        match self {
-            Value::F32(v) => v.clone(),
-            Value::I32(v) => v.iter().map(|&x| x as f32).collect(),
-            Value::U32(v) => v.iter().map(|&x| x as f32).collect(),
-            Value::Bool(v) => v.iter().map(|&x| if x != 0 { 1.0 } else { 0.0 }).collect(),
-        }
-    }
-
-    #[must_use]
-    pub fn lanes_i64(&self) -> Vec<i64> {
-        match self {
-            Value::I32(v) => v.iter().map(|&x| i64::from(x)).collect(),
-            Value::U32(v) => v.iter().map(|&x| i64::from(x)).collect(),
-            Value::Bool(v) => v.iter().map(|&x| i64::from(x != 0)).collect(),
-            Value::F32(v) => v.iter().map(|&x| x as i64).collect(),
-        }
-    }
-
-    #[must_use]
-    pub fn from_i64(dtype: Dtype, x: &[i64]) -> Value {
-        match dtype {
-            Dtype::U32 => Value::U32(x.iter().map(|&v| v as u32).collect()),
-            Dtype::Bool => Value::Bool(x.iter().map(|&v| u8::from(v != 0)).collect()),
-            Dtype::F32 => Value::F32(x.iter().map(|&v| v as f32).collect()),
-            Dtype::I32 => Value::I32(x.iter().map(|&v| v as i32).collect()),
-            _ => no_lane(dtype),
-        }
-    }
-}
-
-#[must_use]
-pub fn pick(len: usize, i: usize) -> usize {
-    if len == 1 { 0 } else { i }
-}
+/// A value as the interpreter holds it: eta-compiler's, whose `eval_op`
+/// evaluates every op here.
+pub use eta_compiler::eval::interp::Value;
 
 #[must_use]
 pub fn value_matches(v: &Value, dtype: ChanDType, dims: &[u32]) -> bool {
@@ -107,10 +25,10 @@ pub fn value_matches(v: &Value, dtype: ChanDType, dims: &[u32]) -> bool {
 
 #[must_use]
 pub fn wire_cell_bytes(dtype: Dtype, numel: usize) -> usize {
-    if dtype == Dtype::Bool {
-        numel.div_ceil(8)
-    } else {
-        numel * 4
+    match dtype {
+        Dtype::Bool => numel.div_ceil(8),
+        Dtype::Bf16 => numel * 2,
+        _ => numel * 4,
     }
 }
 
@@ -120,13 +38,11 @@ pub fn decode_wire(bytes: &[u8], dtype: Dtype, numel: usize) -> Option<Value> {
         return None;
     }
     Some(match dtype {
-        Dtype::Bool => {
-            let mut out = vec![0u8; numel];
-            for (j, lane) in out.iter_mut().enumerate() {
-                *lane = (bytes[j / 8] >> (j % 8)) & 1;
-            }
-            Value::Bool(out)
-        }
+        Dtype::Bool => Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => Value::I32(
             bytes
                 .as_chunks::<4>()
@@ -151,6 +67,14 @@ pub fn decode_wire(bytes: &[u8], dtype: Dtype, numel: usize) -> Option<Value> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
+        Dtype::Bf16 => Value::Bf16(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
         _ => return None,
     })
 }
@@ -163,7 +87,7 @@ pub fn encode_wire(v: &Value, dst: &mut [u8]) {
                 *byte = 0;
             }
             for (j, &lane) in b.iter().enumerate() {
-                if lane != 0 {
+                if lane {
                     dst[j / 8] |= 1u8 << (j % 8);
                 }
             }
@@ -171,6 +95,7 @@ pub fn encode_wire(v: &Value, dst: &mut [u8]) {
         Value::I32(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
         Value::U32(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
         Value::F32(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
+        Value::Bf16(v) => copy_le(v.iter().flat_map(|x| x.to_le_bytes()), dst),
     }
 }
 

@@ -154,10 +154,13 @@ impl Instruct for Atem {
 /// The Muse Spark release's system turn around `msg` (its chat template's
 /// defaults: the 2026-01-04 cutoff, today's UTC date, strength 512).
 fn open_system(msg: &str) -> String {
-    let days = std::time::SystemTime::now()
+    #[cfg(not(target_arch = "wasm32"))]
+    let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() / 86_400)
-        .cast_signed();
+        .unwrap_or_default();
+    #[cfg(target_arch = "wasm32")]
+    let since = web_std::time::since_epoch();
+    let days = (since.as_secs() / 86_400).cast_signed();
     // Days since 1970-01-01 as a civil date (Hinnant's algorithm).
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

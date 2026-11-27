@@ -15,6 +15,7 @@ pub mod pack;
 mod pq;
 pub mod prefetch;
 mod region;
+pub mod rs;
 pub mod shard;
 pub mod spatial;
 pub mod stream;
@@ -275,10 +276,6 @@ pub fn arena_ladder(
     ladder.sort_by_key(|(_, map)| map.bytes);
     Ok(ladder)
 }
-
-/// The activation rungs a pool may drop to (SPEC decision 6): fires of at
-/// most these many tokens, beside the largest.
-pub const ACTIVATION_RUNGS: [u32; 3] = [256, 1024, 4096];
 
 /// The carve of `compiled`'s arena for fires of at most `tokens` tokens
 /// (and as many lanes), every other ceiling as `budgets` states it: what

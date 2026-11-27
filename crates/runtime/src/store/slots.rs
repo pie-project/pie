@@ -40,25 +40,108 @@
 //! total_chunks, segment_chunks, committed segments, the reserved chunk
 //! count, shapes, act_chunks), and [`Evacuation`] carries E1's
 //! `moves: Vec<(logical, new_physical)>` plus the old position.
+//!
+//! Placement by class: a chunk holds one class while it is open, set as it
+//! opens ([`ChunkMeta::class`]). Single slots ([`SlotPool::acquire`]) lie
+//! only in single-slot chunks; a run of `n` adjacent slots
+//! ([`SlotPool::acquire_run`]) only among runs of exactly `n`, its class the
+//! run's own length, with no table of classes; a chunk taken whole
+//! ([`SlotPool::acquire_chunk_runs`]) holds nothing else. A run's hole is
+//! then one the next run of its length takes exactly, no single slot ever
+//! breaks a run's room, and a chunk whose items all leave is free whole
+//! again for any class. Its cost is at most one partly filled chunk per
+//! class in use.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use state::key::Hash256;
 
 pub use super::segments::{ChunkMove, Evacuation, SegmentError, SegmentState, Segments};
 
+mod acquire;
+mod census;
+mod chunks;
+mod claims;
+mod compaction;
+mod holdings;
+mod release;
+mod rung;
+mod sizes;
+mod span;
+mod walk;
+
 /// A slot shape's id: its index in [`SlotPoolFacts::shapes`].
 pub type ShapeId = u16;
+
+/// A piece of a parked guest state its restore retakes, as
+/// [`SlotPool::chunk_runs_beside`] places it on its view: `pieces` runs of
+/// `run` whole chunks, or one run of `slots` slots of `shape` in a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnPiece {
+    Chunks {
+        run: u32,
+        pieces: u32,
+    },
+    Slots {
+        shape: ShapeId,
+        slots: u32,
+    },
+    /// `slots` single slots of `shape`, as [`SlotPool::acquire`] takes them:
+    /// the shape's partly filled chunks first, then free chunks opened
+    /// lowest first ([`SlotPool::opens_for`]).
+    Take {
+        shape: ShapeId,
+        slots: u64,
+    },
+}
+
+/// Who holds what [`SlotPool::place`] takes on its scratch copy.
+const PLACING: Holder = Holder::WorkingSet(u64::MAX - 1);
+
+/// Where [`SlotPool::place`] put a list of pieces, on a scratch copy of
+/// the pool the takes themselves ran on.
+#[derive(Clone, Debug)]
+pub struct Placement {
+    /// The free physical chunks the placed pieces opened.
+    pub opened: std::collections::BTreeSet<u32>,
+    /// The budget's headroom left once they were placed.
+    pub room: u32,
+    /// The pieces placed, in order, before the first the takes refused.
+    pub placed: usize,
+    asked: usize,
+    scratch: SlotPool,
+}
+
+impl Placement {
+    /// Whether every piece was placed.
+    #[must_use]
+    pub fn stands(&self) -> bool {
+        self.placed == self.asked
+    }
+
+    /// The free runs of `run` adjacent chunks the pool holds once the
+    /// placed pieces are taken ([`SlotPool::free_chunk_runs`] on the copy).
+    #[must_use]
+    pub fn free_runs(&self, run: u32) -> u32 {
+        self.scratch.free_chunk_runs(run)
+    }
+
+    /// Whether `runs` (`(run, pieces)` of whole chunks) are placed by the
+    /// takes themselves once the placed pieces are taken, within the
+    /// budget's headroom: the one reading a restore's reservation
+    /// ([`super::roles::Roles::reserve_restore`]) holds its bind's runs by.
+    #[must_use]
+    pub fn places_runs(&self, runs: &[(u32, u32)]) -> bool {
+        let mut scratch = self.scratch.scratch();
+        runs.iter()
+            .all(|&(run, pieces)| scratch.acquire_chunk_runs(PLACING, 0, run, pieces).is_ok())
+    }
+}
 
 /// Fixed sets each working set holds: the one its fires read. Derived, not
 /// configured.
 pub const FIXED_SETS_PER_WORKING_SET: u32 = 1;
-
-/// Copy-on-write fixed sets each running lane holds while it fires: the one
-/// the fire writes before the working set's set is let go. Charged per lane
-/// a fire carries, not per working set.
-pub const COW_SETS_PER_LANE: u32 = 1;
 
 const NONE: u32 = u32::MAX;
 const NO_SHAPE: ShapeId = ShapeId::MAX;
@@ -68,8 +151,8 @@ const WORD: u32 = u64::BITS;
 pub enum ShapeKind {
     /// Whole-sequence state (recurrent, conv, rs buffer, snapshot ids).
     Fixed,
-    /// Per-token state, in token order: the kv list, a window list (its
-    /// slots behind the window trimmed), the rs list.
+    /// Per-token state, in token order: the kv list, the rs list, the
+    /// window buffer.
     List,
 }
 
@@ -81,8 +164,8 @@ pub struct SlotShape {
 }
 
 impl SlotShape {
-    /// Slot sets each working set holds of this shape; a running lane holds
-    /// [`COW_SETS_PER_LANE`] more of a fixed one.
+    /// Slot sets each working set holds of this shape; a fork's write takes
+    /// one more of a fixed one from the pool while a sibling still reads it.
     pub fn sets_per_working_set(&self) -> u32 {
         match self.kind {
             ShapeKind::Fixed => FIXED_SETS_PER_WORKING_SET,
@@ -104,6 +187,16 @@ pub struct SlotPoolFacts {
     pub shapes: Vec<SlotShape>,
     /// `(rung tokens, activation chunks)`, ascending.
     pub act_chunks: Vec<(u32, u32)>,
+    /// The span under the largest rung's activation is backed on demand
+    /// (`ChunkFacts::span_backed_on_demand`): not committed at load; the
+    /// engine backs its own activation carve, and a span segment is
+    /// committed here ([`SlotPool::commit_span`]) before state opens a
+    /// chunk in it.
+    pub span_on_demand: bool,
+    /// The chunks a rung's activation may take as the engine stands
+    /// (`ChunkFacts::act_span_chunks`); `None`: nothing of the engine's
+    /// own bounds it.
+    pub act_span: Option<u32>,
 }
 
 /// One slot: a logical chunk and the slot's index in it.
@@ -178,9 +271,43 @@ pub enum SlotError {
     NoRoom { rung: u32, chunks: u32 },
     #[error("a rung evacuation no longer matches the pool")]
     StaleRung,
+    #[error("a compaction no longer matches the pool")]
+    StaleCompaction,
+    /// Moves that would leave a run of chunks split: one of its chunks
+    /// moved without the rest, or not to the next physical chunk after its
+    /// first's destination. Refused whoever planned them.
+    #[error("a run of {run} chunk(s) from physical chunk {first} would lie across a segment's end")]
+    RunAcrossSegment { first: u32, run: u32 },
+    #[error(
+        "chunk moves would split the run of {run} chunk(s) from logical chunk {head} at its chunk {at}"
+    )]
+    SplitsRun { head: u32, run: u32, at: u32 },
     /// A claim named a chunk that cannot be taken whole as it stands.
     #[error("chunk {chunk} cannot be claimed: {why}")]
     Unclaimable { chunk: u32, why: &'static str },
+    /// A run of adjacent slots longer than a chunk holds.
+    #[error("a run of {slots} slots of shape {shape} is past a chunk's {per_chunk}")]
+    RunPastChunk {
+        shape: ShapeId,
+        slots: u64,
+        per_chunk: u32,
+    },
+    /// A run of adjacent chunks longer than a segment holds: chunks lie at
+    /// adjacent addresses only inside one segment.
+    #[error("a run of {run} adjacent chunks is past a segment's {segment}")]
+    RunPastSegment { run: u32, segment: u32 },
+    /// Fewer free runs of `run` adjacent chunks inside one segment than
+    /// `pieces`: what was free, as runs of that length and as chunks.
+    #[error(
+        "{pieces} runs of {run} adjacent chunks inside one segment asked, and {free_runs} \
+         such runs are free ({free_chunks} free chunks)"
+    )]
+    NoChunkRun {
+        run: u32,
+        pieces: u32,
+        free_runs: u32,
+        free_chunks: u32,
+    },
 }
 
 /// The state chunks in the way of a rung's activation, each moved to a free
@@ -189,6 +316,8 @@ pub enum SlotError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RungEvacuation {
     pub rung: u32,
+    /// The rung the activation was set aside for when it was planned.
+    pub from: u32,
     /// The activation chunks the rung takes.
     pub act: u32,
     pub moves: Vec<ChunkMove>,
@@ -294,12 +423,35 @@ struct ChunkMeta {
     frame: u32,
     /// Slots held or waiting on an epoch.
     used: u32,
+    /// What the chunk holds while open ([`SINGLE`], a run length, or
+    /// [`WHOLE`]): set as it opens, fixed until it is free again.
+    class: u32,
 }
+
+/// A chunk of a shape's single slots, as [`SlotPool::single_chunks`] reads
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SingleChunk {
+    pub logical: u32,
+    /// The slots it holds or keeps for an epoch.
+    pub used: u32,
+    /// No chunk move or residency copy holds it.
+    pub settled: bool,
+}
+
+/// The class of a chunk of single slots ([`SlotPool::acquire`]): a run of
+/// one is a single slot too.
+pub const SINGLE: u32 = 1;
+
+/// The class of a chunk taken whole ([`SlotPool::acquire_chunk_runs`]):
+/// no single slot or run is placed in it.
+pub const WHOLE: u32 = u32::MAX;
 
 const FREE_CHUNK: ChunkMeta = ChunkMeta {
     shape: NO_SHAPE,
     frame: NONE,
     used: 0,
+    class: SINGLE,
 };
 
 /// One shape's slot arena: each open chunk owns a frame of
@@ -314,10 +466,12 @@ struct ShapeState {
     refs: Vec<SlotRefs>,
     spare: Vec<u32>,
     frames: u32,
-    /// Partly filled chunks, fullest first, then lowest physical address:
+    /// Partly filled chunks by class ([`ChunkMeta::class`]), each class's
+    /// fullest first, then lowest physical address:
     /// `(Reverse(used), physical, logical)`.
-    partial: BTreeSet<(Reverse<u32>, u32, u32)>,
-    /// Free slots in `partial`.
+    partial: BTreeMap<u32, BTreeSet<(Reverse<u32>, u32, u32)>>,
+    /// Free slots in single-slot chunks' `partial`: what a take of single
+    /// slots finds without opening a chunk.
     partial_free: u64,
     /// Slots some working set or snapshot holds.
     live: u64,
@@ -336,7 +490,7 @@ impl ShapeState {
             refs: Vec::new(),
             spare: Vec::new(),
             frames: 0,
-            partial: BTreeSet::new(),
+            partial: BTreeMap::new(),
             partial_free: 0,
             live: 0,
             cached: 0,
@@ -366,23 +520,72 @@ impl ShapeState {
         frame
     }
 
+    /// The lowest slot of frame `frame` that starts `n` free slots in a
+    /// row, if one does.
+    /// The slots `held` reads as held count as taken too: a view of what
+    /// runs placed on it would leave ([`SlotPool::chunk_runs_beside`]).
+    fn free_run_beside(&self, frame: u32, n: u32, held: impl Fn(u32) -> bool) -> Option<u32> {
+        let base = frame as usize * self.words;
+        let free = |index: u32| {
+            let (word, bit) = Bits::locate(index);
+            self.free[base + word] & bit != 0 && !held(index)
+        };
+        let mut start = 0;
+        let mut length = 0;
+        for index in 0..self.spc() {
+            if free(index) {
+                if length == 0 {
+                    start = index;
+                }
+                length += 1;
+                if length == n {
+                    return Some(start);
+                }
+            } else {
+                length = 0;
+            }
+        }
+        None
+    }
+
     fn ref_at(&mut self, frame: u32, index: u32) -> &mut SlotRefs {
         let at = (frame * self.spc() + index) as usize;
         &mut self.refs[at]
     }
 
-    /// Moves a chunk's place among the partly filled as its count goes from
-    /// `was` to `now`.
-    fn reposition(&mut self, physical: u32, logical: u32, was: u32, now: u32) {
+    /// Moves a chunk's place among its class's partly filled as its count
+    /// goes from `was` to `now`.
+    fn reposition(&mut self, physical: u32, logical: u32, class: u32, was: u32, now: u32) {
         let spc = self.spc();
         if was > 0 && was < spc {
-            self.partial.remove(&(Reverse(was), physical, logical));
-            self.partial_free -= u64::from(spc - was);
+            let emptied = self.partial.get_mut(&class).is_some_and(|chunks| {
+                chunks.remove(&(Reverse(was), physical, logical));
+                chunks.is_empty()
+            });
+            if emptied {
+                self.partial.remove(&class);
+            }
+            if class == SINGLE {
+                self.partial_free -= u64::from(spc - was);
+            }
         }
         if now > 0 && now < spc {
-            self.partial.insert((Reverse(now), physical, logical));
-            self.partial_free += u64::from(spc - now);
+            self.partial
+                .entry(class)
+                .or_default()
+                .insert((Reverse(now), physical, logical));
+            if class == SINGLE {
+                self.partial_free += u64::from(spc - now);
+            }
         }
+    }
+
+    /// The fullest partly filled chunk of `class`, its logical id.
+    fn fullest(&self, class: u32) -> Option<u32> {
+        self.partial
+            .get(&class)
+            .and_then(|chunks| chunks.first())
+            .map(|&(_, _, logical)| logical)
     }
 
     /// Counts a slot's move between live, cached-only and unheld.
@@ -395,20 +598,86 @@ impl ShapeState {
     }
 }
 
+/// Test builds: the queue a pool's given-back slots go to
+/// ([`SlotPool::poison_into`]). A clone of the pool (a planner's or a test's
+/// copy to try a placement on) taps nothing: what it gives back it gives
+/// back in its copy alone, and the slots are still the live pool's.
+#[cfg(feature = "test-slot-fill")]
+#[derive(Default)]
+struct PoisonTap(Option<::engine::chunk::PoisonQueue>);
+
+#[cfg(feature = "test-slot-fill")]
+impl Clone for PoisonTap {
+    fn clone(&self) -> Self {
+        PoisonTap(None)
+    }
+}
+
+#[cfg(feature = "test-slot-fill")]
+impl std::fmt::Debug for PoisonTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "PoisonTap(tapped)"
+        } else {
+            "PoisonTap(none)"
+        })
+    }
+}
+
 /// See the module docs.
 #[derive(Clone, Debug)]
 pub struct SlotPool {
+    /// Test builds: where a slot given back goes to be poisoned
+    /// ([`PoisonTap`]).
+    #[cfg(feature = "test-slot-fill")]
+    poison: PoisonTap,
     chunk_bytes: u64,
     total: u32,
     reserved: u32,
     shapes: Vec<ShapeState>,
     act_chunks: Vec<(u32, u32)>,
     act: u32,
+    /// The activation chunks the engine may still back for fires: where
+    /// the span is backed on demand, the widest activation set aside since
+    /// the engine last narrowed its carve ([`Self::engine_narrowed`]). No
+    /// state opens there: a lower the engine was not told (the rung
+    /// standing, a guest term given back) leaves its carve as wide as
+    /// before, and state lent into it would be refused at its first copy
+    /// (an eviction's copy inside the engine's carve, failing the
+    /// process). Elsewhere it
+    /// is the activation itself.
+    carved: u32,
+    /// Physical chunks a residency move's copy (an eviction, parked state
+    /// moving down) reads from while it is in flight, each with how many
+    /// such moves read it: a raise does not take them back for its
+    /// activation until the copy has landed ([`Self::plan_rung`]).
+    moving_out: BTreeMap<u32, u32>,
+    /// What a fire takes for the guest programs it carries, on top of
+    /// every rung's activation ([`Self::act_chunks`]): the term of the
+    /// pairs that can be in a fire ([`::engine::GuestTerm`]).
+    fire: ::engine::GuestTerm,
+    /// The engine's standing guest bytes, beside the fire term below every
+    /// rung's carve ([`Self::set_standing`]).
+    standing: u64,
+    /// The readout term ([`Self::set_readouts`]): the bytes a row a fire
+    /// reads out takes beside the model's activation (0: inside the span),
+    /// and the most rows one fire reads out.
+    readout_row_bytes: u64,
+    readout_rows: u32,
+    /// The most lanes a fire carries (the engine's `FireLimits::max_lanes`):
+    /// a rung of `r` tokens allows `min(r, max_lanes)`.
+    max_lanes: u32,
     /// The largest rung's activation chunks, the top of the range.
     act_max: u32,
     /// The first segment under the largest rung's activation: it and those
-    /// above are committed from the load and never evacuated or released.
+    /// above are committed from the load and never evacuated or released,
+    /// unless the span is backed on demand ([`SlotPoolFacts::span_on_demand`]).
     top_segment: u32,
+    /// See [`SlotPoolFacts::span_on_demand`].
+    span_on_demand: bool,
+    /// What the engine states its activation span covers as it stands
+    /// ([`Self::set_act_span`]): the statement itself, nothing derived.
+    act_span: Option<u32>,
     chunks: Vec<ChunkMeta>,
     /// A permutation of `0..total`, as the engine's chunk table.
     logical_to_physical: Vec<u32>,
@@ -422,6 +691,9 @@ pub struct SlotPool {
     /// the fire that carries the copy retires, by that fire's epoch.
     fences: BTreeMap<u64, Vec<u32>>,
     fenced: Bits,
+    /// No chunk at or past this physical id is opened: the engine binds
+    /// none there yet ([`Self::set_ceiling`]).
+    ceiling: u32,
     segments: Segments,
     /// Chunks opened for a shape.
     held: u32,
@@ -429,6 +701,101 @@ pub struct SlotPool {
     retired: u64,
     holders: HashMap<Holder, u64>,
     waiters: HashMap<u64, (ShapeId, u64)>,
+    /// Runs of adjacent chunks taken whole ([`Self::acquire_chunk_runs`])
+    /// and longer than one: each run's first logical chunk and its length.
+    /// The chunks after the first lie at the next physical chunks, and an
+    /// evacuation moves the run whole.
+    runs: HashMap<u32, u32>,
+    /// The chunks the last compaction moved off ([`Self::apply_compaction`]),
+    /// fenced until its copy's fire retires.
+    compacted: Vec<u32>,
+    /// Told each time a chunk comes free for state ([`Self::room_watch`]).
+    given: std::sync::Arc<RoomGiven>,
+    /// Slots taken and given back since the pool was made: moved, the
+    /// placement of what is held has changed ([`Self::room_changes`]).
+    changes: u64,
+    /// Free physical chunks held for a served restore by its ticket
+    /// ([`Self::reserve_chunks`]): closed to every take but its own
+    /// ([`Self::with_claim`]) until its unpark and bind land.
+    held_for: BTreeMap<u64, BTreeSet<u32>>,
+    next_ticket: u64,
+}
+
+/// Room given back: a chunk opened for state, by a slot's release, a fence
+/// retired, a lower or a commit. A count of the gives, and their event.
+#[derive(Debug, Default)]
+pub struct RoomGiven {
+    gives: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+    /// Told each time slots come free, of any shape, in an open chunk or
+    /// not (a release, a fire's epoch retiring), with the pool's counts
+    /// after: the one place every return of room passes, so the waiter it
+    /// can serve is woken whichever path gave it back
+    /// ([`SlotPool::set_room_signal`]). Its tier, and the shape whose free
+    /// slots it counts.
+    signal: std::sync::OnceLock<(RoomSignal, RoomTier, Option<ShapeId>)>,
+}
+
+/// Which tier a [`RoomCount`] is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomTier {
+    Device,
+    /// The host or the disk tier: where a victim's move goes.
+    Swap,
+    /// No slots: pages a reader held are idle cache again.
+    Reader,
+}
+
+/// A pool's room as slots came free: its free chunks and the free slots of
+/// the shape it counts (the kv list's), read under its own lock and handed
+/// to the signal, which takes none.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomCount {
+    pub tier: RoomTier,
+    pub chunks: u64,
+    pub slots: u64,
+}
+
+/// What [`RoomGiven::signal`] calls: lock-free, for a release may run under
+/// the pool's lock and its caller's.
+#[derive(Clone)]
+pub struct RoomSignal(pub std::sync::Arc<dyn Fn(RoomCount) + Send + Sync>);
+
+impl std::fmt::Debug for RoomSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RoomSignal")
+    }
+}
+
+impl RoomGiven {
+    fn give(&self) {
+        self.gives.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+/// A watch on room given back from when it was taken ([`SlotPool::room_watch`]).
+#[derive(Debug, Clone)]
+pub struct RoomWatch {
+    given: std::sync::Arc<RoomGiven>,
+    seen: u64,
+}
+
+impl RoomWatch {
+    /// Ends once a chunk has come free since the watch was taken: at once
+    /// where one already has.
+    pub async fn given(self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let notified = self.given.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.given.gives.load(Ordering::Acquire) != self.seen {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl SlotPool {
@@ -444,14 +811,23 @@ impl SlotPool {
             "the reserved chunks and the largest rung's activation outgrow the pool"
         );
         let mut segments = Segments::new(total, facts.segment_chunks, facts.committed_segments);
-        // The largest rung's activation is backed from the load.
-        let top_segment = if act_max == 0 {
+        // The largest rung's activation is backed from the load, unless the
+        // span is backed on demand.
+        // The span starts where the engine pins it: the segment its widest
+        // carve with its guests' terms starts in (`act_span_chunks`), when
+        // that is wider than the largest rung's activation. Read from the
+        // rungs alone, a segment inside the span would count as a bottom
+        // segment: the runtime would open its chunks for state that Metal
+        // backs as span, and restores wanting them be refused ("the load
+        // reserved ...").
+        let span = act_max.max(facts.act_span.unwrap_or(0)).min(total);
+        let top_segment = if span == 0 {
             segments.count()
         } else {
-            segments.of(total - act_max)
+            segments.of(total - span)
         };
         for segment in top_segment..segments.count() {
-            if segments.state(segment) == SegmentState::Uncommitted {
+            if !facts.span_on_demand && segments.state(segment) == SegmentState::Uncommitted {
                 segments.set_state(segment, SegmentState::Committed);
             }
         }
@@ -467,21 +843,39 @@ impl SlotPool {
             shapes: facts.shapes.into_iter().map(ShapeState::new).collect(),
             act_chunks,
             act: 0,
+            carved: 0,
+            moving_out: BTreeMap::new(),
+            fire: ::engine::GuestTerm::default(),
+            standing: 0,
+            readout_row_bytes: 0,
+            readout_rows: u32::MAX,
+            max_lanes: u32::MAX,
             act_max,
             top_segment,
+            span_on_demand: facts.span_on_demand,
+            act_span: facts.act_span,
             chunks: vec![FREE_CHUNK; total as usize],
             logical_to_physical: (0..total).collect(),
             physical_to_logical: (0..total).collect(),
             free,
             open: Bits::new(total, false),
             fences: BTreeMap::new(),
+            compacted: Vec::new(),
             fenced: Bits::new(total, false),
+            ceiling: total,
             segments,
             held: 0,
             pending: BTreeMap::new(),
             retired: 0,
             holders: HashMap::new(),
             waiters: HashMap::new(),
+            runs: HashMap::new(),
+            given: std::sync::Arc::default(),
+            changes: 0,
+            held_for: BTreeMap::new(),
+            next_ticket: 0,
+            #[cfg(feature = "test-slot-fill")]
+            poison: PoisonTap::default(),
         };
         pool.act = pool.act_chunks(0);
         assert!(
@@ -493,1369 +887,7 @@ impl SlotPool {
         }
         pool
     }
-
-    /// Whether physical chunk `chunk` may be opened: free, in a committed
-    /// segment, below the activation and not fenced.
-    fn openable(&self, chunk: u32) -> bool {
-        self.free.get(chunk)
-            && !self.fenced.get(chunk)
-            && chunk < self.state_limit()
-            && self.segments.state(self.segments.of(chunk)) == SegmentState::Committed
-    }
-
-    /// Brings `chunk`'s place in [`Self::open`] up to date.
-    fn reopen(&mut self, chunk: u32) {
-        if self.openable(chunk) {
-            self.open.set(chunk);
-        } else {
-            self.open.clear(chunk);
-        }
-    }
-
-    // ---- accounting ----
-
-    pub fn chunk_bytes(&self) -> u64 {
-        self.chunk_bytes
-    }
-
-    pub fn total_chunks(&self) -> u32 {
-        self.total
-    }
-
-    pub fn reserved_chunks(&self) -> u32 {
-        self.reserved
-    }
-
-    /// Chunks opened for a slot shape, waiting slots included.
-    pub fn state_chunks(&self) -> u32 {
-        self.held
-    }
-
-    pub fn committed_chunks(&self) -> u32 {
-        self.segments.committed_chunks()
-    }
-
-    /// Activation chunks a fire at `rung` tokens takes: the smallest rung at
-    /// or above it, else the largest.
-    pub fn act_chunks(&self, rung: u32) -> u32 {
-        self.act_chunks
-            .iter()
-            .find(|(tokens, _)| *tokens >= rung)
-            .or(self.act_chunks.last())
-            .map_or(0, |(_, chunks)| *chunks)
-    }
-
-    /// The activation chunks set aside now.
-    pub fn act_reserved(&self) -> u32 {
-        self.act
-    }
-
-    /// Every rung's tokens, ascending.
-    pub fn rungs(&self) -> Vec<u32> {
-        self.act_chunks.iter().map(|&(tokens, _)| tokens).collect()
-    }
-
-    /// The rung the activation is set aside for now: the largest whose
-    /// chunks it holds (0 where no rung is stated).
-    pub fn rung(&self) -> u32 {
-        self.act_chunks
-            .iter()
-            .filter(|&&(_, chunks)| chunks <= self.act)
-            .map(|&(tokens, _)| tokens)
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// The largest rung's activation chunks: the top span, committed from
-    /// the load.
-    pub fn act_max(&self) -> u32 {
-        self.act_max
-    }
-
-    /// The first segment under the largest rung's activation (the segment
-    /// count where activation lives apart).
-    pub fn top_segment(&self) -> u32 {
-        self.top_segment
-    }
-
-    /// State chunks lie at physical ids below this: the activation of the
-    /// current rung takes the rest.
-    pub fn state_limit(&self) -> u32 {
-        self.total - self.act
-    }
-
-    /// Committed segments below the top span: what `commit_segments(n)`
-    /// backs as a prefix, `0..n`.
-    pub fn prefix_segments(&self) -> u32 {
-        (0..self.top_segment)
-            .take_while(|&segment| self.segments.state(segment) != SegmentState::Uncommitted)
-            .count() as u32
-    }
-
-    fn rung_budget(&self, act: u32) -> Result<(), SlotError> {
-        let needed = self.reserved + self.held + act;
-        if needed > self.committed_chunks() {
-            return Err(SlotError::Budget {
-                needed,
-                committed: self.committed_chunks(),
-            });
-        }
-        Ok(())
-    }
-
-    /// State chunks at physical ids `from..to`.
-    fn held_in(&self, from: u32, to: u32) -> Vec<u32> {
-        (from..to)
-            .filter(|&chunk| !self.free.get(chunk) && chunk >= self.reserved)
-            .collect()
-    }
-
-    /// Sets the activation aside for fires up to `rung` tokens; refused when
-    /// the state already held leaves too little, or when state sits in the
-    /// span the rung's activation takes (raise it with [`Self::plan_rung`]
-    /// and [`Self::apply_rung`] then).
-    pub fn set_rung(&mut self, rung: u32) -> Result<(), SlotError> {
-        let act = self.act_chunks(rung);
-        self.rung_budget(act)?;
-        let in_way = self.held_in(self.total - act, self.state_limit()).len() as u32;
-        if in_way > 0 {
-            return Err(SlotError::Occupied {
-                rung,
-                chunks: in_way,
-            });
-        }
-        self.set_act(act);
-        Ok(())
-    }
-
-    fn set_act(&mut self, act: u32) {
-        let (was, now) = (self.state_limit(), self.total - act);
-        self.act = act;
-        for chunk in was.min(now)..was.max(now) {
-            self.reopen(chunk);
-        }
-    }
-
-    /// The moves that clear rung `rung`'s activation span of state: each
-    /// state chunk in it to the lowest free chunk below it. Empty when
-    /// nothing is in the way (or the rung takes no more than now).
-    pub fn plan_rung(&self, rung: u32) -> Result<RungEvacuation, SlotError> {
-        let act = self.act_chunks(rung);
-        self.rung_budget(act)?;
-        let limit = self.total - act;
-        let sources = self.held_in(limit, self.state_limit());
-        let moves: Vec<ChunkMove> = sources
-            .iter()
-            .zip(self.open.iter_in(0, limit))
-            .map(|(&from, to)| ChunkMove {
-                logical: self.physical_to_logical[from as usize],
-                from,
-                to,
-            })
-            .collect();
-        if moves.len() < sources.len() {
-            return Err(SlotError::NoRoom {
-                rung,
-                chunks: sources.len() as u32,
-            });
-        }
-        Ok(RungEvacuation { rung, act, moves })
-    }
-
-    /// The chunks raising the activation to `rung` lacks now: past what is
-    /// committed, and in free chunks below its span for the state in it.
-    /// 0 when the raise fits.
-    pub fn rung_short(&self, rung: u32) -> u32 {
-        let act = self.act_chunks(rung);
-        let budget = (self.reserved + self.held + act).saturating_sub(self.committed_chunks());
-        let limit = self.total - act;
-        let sources = self.held_in(limit, self.state_limit()).len() as u32;
-        let targets = self.open.iter_in(0, limit).take(sources as usize).count() as u32;
-        budget.max(sources - targets)
-    }
-
-    /// Carries out `evacuation` and takes its rung; the fire at `epoch`
-    /// carries the copy, and the chunks moved off stay closed until it
-    /// retires. All or nothing.
-    pub fn apply_rung(&mut self, evacuation: &RungEvacuation, epoch: u64) -> Result<(), SlotError> {
-        let act = self.act_chunks(evacuation.rung);
-        self.rung_budget(act)?;
-        let limit = self.total - act;
-        if act != evacuation.act
-            || evacuation.moves.len() != self.held_in(limit, self.state_limit()).len()
-        {
-            return Err(SlotError::StaleRung);
-        }
-        let mut targets = BTreeSet::new();
-        for step in &evacuation.moves {
-            let fits = (step.logical as usize) < self.logical_to_physical.len()
-                && self.chunks[step.logical as usize].shape != NO_SHAPE
-                && self.logical_to_physical[step.logical as usize] == step.from
-                && step.from >= limit
-                && step.to < limit
-                && self.open.get(step.to)
-                && targets.insert(step.to);
-            if !fits {
-                return Err(SlotError::StaleRung);
-            }
-        }
-        for step in &evacuation.moves {
-            self.move_chunk(*step);
-            self.fenced.set(step.from);
-        }
-        if !evacuation.moves.is_empty() {
-            self.fences
-                .entry(epoch)
-                .or_default()
-                .extend(evacuation.moves.iter().map(|step| step.from));
-        }
-        self.set_act(act);
-        Ok(())
-    }
-
-    /// Moves a held chunk onto free physical chunk `step.to`, as the
-    /// engine's `ChunkTable::apply` does: the free logical id there takes the
-    /// moved one's old place.
-    fn move_chunk(&mut self, step: ChunkMove) {
-        let meta = self.chunks[step.logical as usize];
-        let displaced = self.physical_to_logical[step.to as usize];
-        self.open.clear(step.to);
-        self.free.clear(step.to);
-        self.free.set(step.from);
-        self.logical_to_physical[step.logical as usize] = step.to;
-        self.logical_to_physical[displaced as usize] = step.from;
-        self.physical_to_logical[step.to as usize] = step.logical;
-        self.physical_to_logical[step.from as usize] = displaced;
-        self.segments.let_go(step.from);
-        self.segments.hold(step.to);
-        let state = &mut self.shapes[meta.shape as usize];
-        let spc = state.spc();
-        if meta.used > 0 && meta.used < spc {
-            state
-                .partial
-                .remove(&(Reverse(meta.used), step.from, step.logical));
-            state
-                .partial
-                .insert((Reverse(meta.used), step.to, step.logical));
-        }
-        self.reopen(step.from);
-    }
-
-    /// Committed chunks neither held nor set aside for activation.
-    pub fn headroom(&self) -> u32 {
-        self.committed_chunks()
-            .saturating_sub(self.reserved + self.held + self.act)
-    }
-
-    pub fn shape(&self, shape: ShapeId) -> Option<&SlotShape> {
-        self.shapes.get(shape as usize).map(|state| &state.shape)
-    }
-
-    /// The engine's slot reference: `chunk * slots_per_chunk + index`.
-    pub fn slot_ref(&self, slot: Slot) -> u32 {
-        let shape = self.chunks[slot.chunk as usize].shape;
-        slot.chunk * self.shapes[shape as usize].spc() + slot.index
-    }
-
-    /// Where logical chunk `chunk` lies now, when it is reserved or open.
-    pub fn physical(&self, chunk: u32) -> Option<u32> {
-        (chunk < self.reserved || self.chunks[chunk as usize].shape != NO_SHAPE)
-            .then(|| self.logical_to_physical[chunk as usize])
-    }
-
-    /// The logical -> physical table the engine keeps: a permutation, free
-    /// logical ids included.
-    pub fn chunk_table(&self) -> &[u32] {
-        &self.logical_to_physical
-    }
-
-    /// The shape logical chunk `chunk` is open for.
-    pub fn chunk_shape(&self, chunk: u32) -> Option<ShapeId> {
-        Some(self.chunks[chunk as usize].shape).filter(|&shape| shape != NO_SHAPE)
-    }
-
-    /// Slots `holder` holds references on.
-    pub fn held_by(&self, holder: &Holder) -> u64 {
-        self.holders.get(holder).copied().unwrap_or(0)
-    }
-
-    /// References on `slot`: `(working sets and snapshots, cache entries)`.
-    pub fn refs(&self, slot: Slot) -> (u32, u32) {
-        let meta = self.chunks[slot.chunk as usize];
-        if meta.shape == NO_SHAPE {
-            return (0, 0);
-        }
-        let shape = &self.shapes[meta.shape as usize];
-        let refs = shape.refs[(meta.frame * shape.spc() + slot.index) as usize];
-        (refs.live, refs.cache)
-    }
-
-    /// Free chunks a shape could open now without breaking the budget.
-    pub fn free_chunks(&self) -> u32 {
-        self.open.count.min(self.headroom())
-    }
-
-    /// Free slots `shape` could take now without breaking the budget.
-    pub fn available(&self, shape: ShapeId) -> u64 {
-        let Some(state) = self.shapes.get(shape as usize) else {
-            return 0;
-        };
-        let chunks = self.free_chunks();
-        state.partial_free + u64::from(chunks) * u64::from(state.spc())
-    }
-
-    /// Whether every `(shape, slots)` of `needs` could be taken at once:
-    /// each shape's partly filled chunks first, then free chunks, which the
-    /// shapes share.
-    pub fn fits(&self, needs: &[(ShapeId, u64)]) -> bool {
-        let room = u64::from(self.free_chunks());
-        let mut chunks = 0u64;
-        for &(shape, slots) in needs {
-            let Some(state) = self.shapes.get(shape as usize) else {
-                return slots == 0;
-            };
-            chunks += slots
-                .saturating_sub(state.partial_free)
-                .div_ceil(u64::from(state.spc()));
-        }
-        chunks <= room
-    }
-
-    /// Free chunks a shape could open once every segment below the
-    /// activation the facts allow were committed: what the pool can grow
-    /// to, short of the reserved chunks, the activation and what is held.
-    pub fn growable_chunks(&self) -> u32 {
-        let free = (0..self.state_limit())
-            .filter(|&chunk| {
-                self.free.get(chunk)
-                    && !self.fenced.get(chunk)
-                    && !matches!(
-                        self.segments.state(self.segments.of(chunk)),
-                        SegmentState::Draining { .. }
-                    )
-            })
-            .count() as u32;
-        free.min(
-            self.total
-                .saturating_sub(self.reserved + self.held + self.act),
-        )
-    }
-
-    /// [`Self::fits`] against what the pool can grow to
-    /// ([`Self::growable_chunks`]), committed or not.
-    pub fn fits_grown(&self, needs: &[(ShapeId, u64)]) -> bool {
-        self.chunks_for(needs)
-            .is_some_and(|chunks| chunks <= u64::from(self.growable_chunks()))
-    }
-
-    fn chunks_for(&self, needs: &[(ShapeId, u64)]) -> Option<u64> {
-        let mut chunks = 0u64;
-        for &(shape, slots) in needs {
-            let Some(state) = self.shapes.get(shape as usize) else {
-                if slots == 0 {
-                    continue;
-                }
-                return None;
-            };
-            chunks += slots
-                .saturating_sub(state.partial_free)
-                .div_ceil(u64::from(state.spc()));
-        }
-        Some(chunks)
-    }
-
-    /// Commits the lowest uncommitted segments below the activation, a
-    /// prefix, until `needs` fit the committed chunks and every chunk below
-    /// physical chunk `through` lies in a committed segment. The segments
-    /// committed, lowest first: the engine backs them (`commit_segments`
-    /// of the prefix they end) before anything lands in them. Stops short
-    /// where no segment is left; the take that follows says so.
-    pub fn commit_for(&mut self, needs: &[(ShapeId, u64)], through: u32) -> Vec<u32> {
-        let mut committed = Vec::new();
-        loop {
-            let covered = (0..through.min(self.total)).all(|chunk| {
-                self.segments.state(self.segments.of(chunk)) != SegmentState::Uncommitted
-            });
-            if covered && self.fits(needs) {
-                return committed;
-            }
-            let Some(segment) = self
-                .segments
-                .uncommitted()
-                .find(|&segment| segment < self.top_segment)
-            else {
-                return committed;
-            };
-            self.commit_segment(segment)
-                .expect("an uncommitted segment commits");
-            committed.push(segment);
-        }
-    }
-
-    pub fn shape_demand(&self, shape: ShapeId) -> ShapeDemand {
-        self.shapes
-            .get(shape as usize)
-            .map_or_else(ShapeDemand::default, |state| ShapeDemand {
-                live: state.live,
-                cached: state.cached,
-                waiting: state.waiting,
-            })
-    }
-
-    /// Demand counted slot by slot: what is live, and what is wanted.
-    pub fn demand(&self) -> Demand {
-        self.shapes.iter().fold(Demand::default(), |demand, state| {
-            let bytes = state.shape.slot_bytes;
-            Demand {
-                live: demand.live + state.live * bytes,
-                wanted: demand.wanted + (state.live + state.cached + state.waiting) * bytes,
-            }
-        })
-    }
-
-    /// Records that `waiter` is parked short `slots` of `shape`, replacing
-    /// what it was short before.
-    pub fn wait(&mut self, waiter: u64, shape: ShapeId, slots: u64) {
-        self.unwait(waiter);
-        if let Some(state) = self.shapes.get_mut(shape as usize) {
-            state.waiting += slots;
-            self.waiters.insert(waiter, (shape, slots));
-        }
-    }
-
-    pub fn unwait(&mut self, waiter: u64) {
-        if let Some((shape, slots)) = self.waiters.remove(&waiter) {
-            self.shapes[shape as usize].waiting -= slots;
-        }
-    }
-
-    // ---- slots ----
-
-    /// `n` fresh slots of `shape` for `holder`, from the fullest partly
-    /// filled chunks first, then from chunks opened lowest address first.
-    /// All or nothing.
-    pub fn acquire(
-        &mut self,
-        holder: Holder,
-        shape: ShapeId,
-        n: u64,
-    ) -> Result<Vec<Slot>, SlotError> {
-        let state = self
-            .shapes
-            .get(shape as usize)
-            .ok_or(SlotError::UnknownShape(shape))?;
-        let spc = u64::from(state.spc());
-        let fresh = n.saturating_sub(state.partial_free).div_ceil(spc);
-        let room = u64::from(self.free_chunks());
-        if fresh > room {
-            let short = fresh - room;
-            return Err(SlotError::Short {
-                shape,
-                slots: n - state.partial_free - room * spc,
-                chunks: short as u32,
-            });
-        }
-        let mut taken = Vec::with_capacity(n as usize);
-        while (taken.len() as u64) < n {
-            let chunk = match self.shapes[shape as usize].partial.first() {
-                Some(&(_, _, logical)) => logical,
-                None => self.open_chunk(shape),
-            };
-            self.fill(chunk, holder.is_live(), n - taken.len() as u64, &mut taken);
-        }
-        if n > 0 {
-            *self.holders.entry(holder).or_default() += n;
-        }
-        Ok(taken)
-    }
-
-    /// Exactly slot refs `first .. first + n` of `shape` for `holder`, in
-    /// ref order: the chunks they lie in, `first` its chunk's slot 0, each
-    /// opened for the shape where it is named rather than lowest first (a
-    /// last chunk's slots past `n` stay free for the shape). What a load's
-    /// own placement is adopted by. A segment of theirs not yet committed
-    /// is counted committed: the backend backed it. All or nothing.
-    ///
-    /// # Errors
-    ///
-    /// [`SlotError::Unclaimable`] where `first` is not a slot 0 or a chunk
-    /// is past the pool, reserved, open already, not free, in the
-    /// activation span or draining; [`SlotError::Budget`] where the chunks
-    /// outgrow what is committed.
-    pub fn claim(
-        &mut self,
-        holder: Holder,
-        shape: ShapeId,
-        first: u32,
-        n: u64,
-    ) -> Result<Vec<Slot>, SlotError> {
-        let range = self.claimable(shape, first, n)?;
-        let count = range.end - range.start;
-        let uncommitted: BTreeSet<u32> = range
-            .clone()
-            .map(|chunk| self.segments.of(self.logical_to_physical[chunk as usize]))
-            .filter(|&segment| self.segments.state(segment) == SegmentState::Uncommitted)
-            .collect();
-        let added: u32 = uncommitted
-            .iter()
-            .map(|&segment| self.segments.len(segment))
-            .sum();
-        let needed = self.reserved + self.held + self.act + count;
-        let committed = self.committed_chunks() + added;
-        if needed > committed {
-            return Err(SlotError::Budget { needed, committed });
-        }
-        for segment in uncommitted {
-            self.segments.set_state(segment, SegmentState::Committed);
-            for chunk in self.segments.range(segment) {
-                self.reopen(chunk);
-            }
-        }
-        let mut taken = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
-        for chunk in range {
-            let physical = self.logical_to_physical[chunk as usize];
-            let opened = self.open_at(physical, shape);
-            debug_assert_eq!(opened, chunk);
-            self.fill(chunk, holder.is_live(), n - taken.len() as u64, &mut taken);
-        }
-        if n > 0 {
-            *self.holders.entry(holder).or_default() += n;
-        }
-        Ok(taken)
-    }
-
-    /// Whether [`Self::claim`] of the same slots could take their chunks as
-    /// the pool stands, budget aside: the logical chunks they lie in.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::claim`]'s [`SlotError::Unclaimable`].
-    pub fn claimable(
-        &self,
-        shape: ShapeId,
-        first: u32,
-        n: u64,
-    ) -> Result<std::ops::Range<u32>, SlotError> {
-        let spc = self
-            .shapes
-            .get(shape as usize)
-            .ok_or(SlotError::UnknownShape(shape))?
-            .spc();
-        let start = first / spc;
-        if !first.is_multiple_of(spc) {
-            return Err(SlotError::Unclaimable {
-                chunk: start,
-                why: "the first slot is not its chunk's slot 0",
-            });
-        }
-        let count = u32::try_from(n.div_ceil(u64::from(spc))).unwrap_or(u32::MAX);
-        let range = start..start.saturating_add(count);
-        for chunk in range.clone() {
-            if let Some(why) = self.unclaimable(chunk) {
-                return Err(SlotError::Unclaimable { chunk, why });
-            }
-        }
-        Ok(range)
-    }
-
-    /// Why logical chunk `chunk` cannot be claimed now, if it cannot.
-    fn unclaimable(&self, chunk: u32) -> Option<&'static str> {
-        if chunk >= self.total {
-            return Some("past the pool");
-        }
-        if chunk < self.reserved {
-            return Some("reserved");
-        }
-        if self.chunks[chunk as usize].shape != NO_SHAPE {
-            return Some("open for a shape already");
-        }
-        let physical = self.logical_to_physical[chunk as usize];
-        if !self.free.get(physical) || self.fenced.get(physical) {
-            Some("not free")
-        } else if physical >= self.state_limit() {
-            Some("in the activation span")
-        } else if matches!(
-            self.segments.state(self.segments.of(physical)),
-            SegmentState::Draining { .. }
-        ) {
-            Some("its segment is draining")
-        } else {
-            None
-        }
-    }
-
-    /// Adds `holder`'s reference to slots someone already holds.
-    pub fn share(&mut self, holder: Holder, slots: &[Slot]) {
-        let live = holder.is_live();
-        for &slot in slots {
-            let (state, at) = self.locate(slot);
-            let was = state.refs[at];
-            assert!(was.live + was.cache > 0, "{slot:?} is not held");
-            let mut now = was;
-            if live {
-                now.live += 1;
-            } else {
-                now.cache += 1;
-            }
-            state.refs[at] = now;
-            state.reclassify(was, now);
-        }
-        if !slots.is_empty() {
-            *self.holders.entry(holder).or_default() += slots.len() as u64;
-        }
-    }
-
-    /// Notes that a fire at `epoch` touches `slots`: once let go, they wait
-    /// for it.
-    pub fn touch(&mut self, slots: &[Slot], epoch: u64) {
-        for &slot in slots {
-            let (state, at) = self.locate(slot);
-            let refs = &mut state.refs[at];
-            refs.touched = refs.touched.max(epoch);
-        }
-    }
-
-    /// Drops `holder`'s reference on each of `slots`. A slot no one holds
-    /// any more is handed out again once the later of `epoch` and the last
-    /// fire that touched it retires.
-    pub fn release(&mut self, holder: Holder, slots: &[Slot], epoch: u64) {
-        let live = holder.is_live();
-        let mut immediate = Vec::new();
-        // Let go slots by the epoch they wait on; few epochs per call.
-        let mut waiting: Vec<(u64, Vec<Slot>)> = Vec::new();
-        for &slot in slots {
-            let (state, at) = self.locate(slot);
-            let was = state.refs[at];
-            let mut now = was;
-            if live {
-                assert!(now.live > 0, "{slot:?} has no live reference to drop");
-                now.live -= 1;
-            } else {
-                assert!(now.cache > 0, "{slot:?} has no cache reference to drop");
-                now.cache -= 1;
-            }
-            state.refs[at] = now;
-            state.reclassify(was, now);
-            if now.live + now.cache == 0 {
-                let after = now.touched.max(epoch);
-                if after <= self.retired {
-                    immediate.push(slot);
-                } else if let Some((_, batch)) = waiting.iter_mut().find(|(at, _)| *at == after) {
-                    batch.push(slot);
-                } else {
-                    waiting.push((after, vec![slot]));
-                }
-            }
-        }
-        if !slots.is_empty() {
-            let count = self
-                .holders
-                .get_mut(&holder)
-                .expect("a holder releases only what it holds");
-            *count -= slots.len() as u64;
-            if *count == 0 {
-                self.holders.remove(&holder);
-            }
-        }
-        for (after, batch) in waiting {
-            match self.pending.entry(after) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(batch);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().extend(batch);
-                }
-            }
-        }
-        for slot in immediate {
-            self.give_back(slot);
-        }
-    }
-
-    /// Every fire through `epoch` has retired: what waited on them is free.
-    pub fn retire_through(&mut self, epoch: u64) {
-        self.retired = self.retired.max(epoch);
-        let later = self.fences.split_off(&(epoch.saturating_add(1)));
-        let mut due = std::mem::replace(&mut self.fences, later);
-        if epoch == u64::MAX {
-            due.append(&mut self.fences);
-        }
-        for chunk in due.into_values().flatten() {
-            self.fenced.clear(chunk);
-            self.reopen(chunk);
-        }
-        let later = self.pending.split_off(&(epoch.saturating_add(1)));
-        let due = std::mem::replace(&mut self.pending, later);
-        if epoch == u64::MAX {
-            // split_off(MAX) leaves MAX itself behind.
-            let rest = std::mem::take(&mut self.pending);
-            for slot in rest.into_values().flatten() {
-                self.give_back(slot);
-            }
-        }
-        for slot in due.into_values().flatten() {
-            self.give_back(slot);
-        }
-    }
-
-    /// Slots let go and waiting on a fire.
-    pub fn pending_slots(&self) -> usize {
-        self.pending.values().map(Vec::len).sum()
-    }
-
-    fn locate(&mut self, slot: Slot) -> (&mut ShapeState, usize) {
-        let meta = self.chunks[slot.chunk as usize];
-        assert!(meta.shape != NO_SHAPE, "{slot:?} lies in a free chunk");
-        let state = &mut self.shapes[meta.shape as usize];
-        assert!(slot.index < state.spc(), "{slot:?} is past its chunk");
-        let at = (meta.frame * state.spc() + slot.index) as usize;
-        (state, at)
-    }
-
-    /// Opens the lowest free committed chunk for `shape`. The caller has
-    /// checked the room.
-    fn open_chunk(&mut self, shape: ShapeId) -> u32 {
-        let physical = self.open.first().expect("room was checked");
-        self.open_at(physical, shape)
-    }
-
-    /// Opens free physical chunk `physical` for `shape`; its logical id.
-    fn open_at(&mut self, physical: u32, shape: ShapeId) -> u32 {
-        self.open.clear(physical);
-        self.free.clear(physical);
-        let logical = self.physical_to_logical[physical as usize];
-        debug_assert_eq!(self.chunks[logical as usize].shape, NO_SHAPE);
-        self.segments.hold(physical);
-        self.held += 1;
-        let frame = self.shapes[shape as usize].open_frame();
-        self.chunks[logical as usize] = ChunkMeta {
-            shape,
-            frame,
-            used: 0,
-        };
-        logical
-    }
-
-    /// Takes up to `want` of `chunk`'s lowest free slots.
-    fn fill(&mut self, chunk: u32, live: bool, want: u64, taken: &mut Vec<Slot>) {
-        let meta = self.chunks[chunk as usize];
-        let physical = self.logical_to_physical[chunk as usize];
-        let state = &mut self.shapes[meta.shape as usize];
-        let base = meta.frame as usize * state.words;
-        let mut got = 0u32;
-        for word in 0..state.words {
-            while state.free[base + word] != 0 && u64::from(got) < want {
-                let bits = &mut state.free[base + word];
-                let index = word as u32 * WORD + bits.trailing_zeros();
-                *bits &= *bits - 1;
-                let refs = state.ref_at(meta.frame, index);
-                let was = *refs;
-                *refs = SlotRefs {
-                    live: u32::from(live),
-                    cache: u32::from(!live),
-                    touched: 0,
-                };
-                let now = *refs;
-                state.reclassify(was, now);
-                taken.push(Slot { chunk, index });
-                got += 1;
-            }
-            if u64::from(got) == want {
-                break;
-            }
-        }
-        let now = meta.used + got;
-        state.reposition(physical, chunk, meta.used, now);
-        self.chunks[chunk as usize].used = now;
-    }
-
-    fn give_back(&mut self, slot: Slot) {
-        let meta = self.chunks[slot.chunk as usize];
-        let physical = self.logical_to_physical[slot.chunk as usize];
-        let state = &mut self.shapes[meta.shape as usize];
-        let (word, bit) = Bits::locate(slot.index);
-        let at = meta.frame as usize * state.words + word;
-        debug_assert_eq!(state.free[at] & bit, 0, "{slot:?} freed twice");
-        state.free[at] |= bit;
-        let now = meta.used - 1;
-        state.reposition(physical, slot.chunk, meta.used, now);
-        self.chunks[slot.chunk as usize].used = now;
-        if now == 0 {
-            state.spare.push(meta.frame);
-            self.close_chunk(slot.chunk, physical);
-        }
-    }
-
-    fn close_chunk(&mut self, logical: u32, physical: u32) {
-        self.chunks[logical as usize] = FREE_CHUNK;
-        self.free.set(physical);
-        self.segments.let_go(physical);
-        self.held -= 1;
-        self.reopen(physical);
-    }
-
-    // ---- segments ----
-
-    pub fn segments(&self) -> &Segments {
-        &self.segments
-    }
-
-    /// The committed segment below the top span holding the fewest chunks,
-    /// the highest among equals.
-    pub fn emptiest_segment(&self) -> Option<u32> {
-        (0..self.top_segment)
-            .rev()
-            .filter(|&segment| self.segments.state(segment) == SegmentState::Committed)
-            .min_by_key(|&segment| self.segments.used(segment))
-    }
-
-    /// Moves every held chunk of `segment` into free committed chunks of
-    /// lower segments, lowest first; none when they do not fit there, when
-    /// the segment holds reserved chunks, or when the budget would not
-    /// survive losing the segment.
-    pub fn plan_evacuation(&self, segment: u32) -> Option<Evacuation> {
-        if segment >= self.top_segment || self.segments.state(segment) != SegmentState::Committed {
-            return None;
-        }
-        let range = self.segments.range(segment);
-        if range.start < self.reserved {
-            return None;
-        }
-        let needed = self.reserved + self.held + self.act;
-        if needed > self.committed_chunks() - self.segments.len(segment) {
-            return None;
-        }
-        let sources: Vec<u32> = (range.start..range.end)
-            .filter(|&chunk| !self.free.get(chunk))
-            .collect();
-        let moves: Vec<ChunkMove> = sources
-            .iter()
-            .zip(self.open.iter_in(0, range.start))
-            .map(|(&from, to)| ChunkMove {
-                logical: self.physical_to_logical[from as usize],
-                from,
-                to,
-            })
-            .collect();
-        (moves.len() == sources.len()).then_some(Evacuation { segment, moves })
-    }
-
-    /// Carries out `evacuation`, which the fire at `epoch` copies: the
-    /// segment then drains, handing nothing out, until that fire retires.
-    pub fn apply_evacuation(
-        &mut self,
-        evacuation: &Evacuation,
-        epoch: u64,
-    ) -> Result<(), SegmentError> {
-        let segment = evacuation.segment;
-        self.segments.check(segment)?;
-        let stale = SegmentError::Stale(segment);
-        if segment >= self.top_segment || self.segments.state(segment) != SegmentState::Committed {
-            return Err(stale);
-        }
-        let range = self.segments.range(segment);
-        let needed = self.reserved + self.held + self.act;
-        let committed = self.committed_chunks() - self.segments.len(segment);
-        if needed > committed {
-            return Err(SegmentError::Budget {
-                segment,
-                committed,
-                needed,
-            });
-        }
-        if evacuation.moves.len() != self.segments.used(segment) as usize {
-            return Err(stale);
-        }
-        let mut targets = BTreeSet::new();
-        for step in &evacuation.moves {
-            let fits = (step.logical as usize) < self.logical_to_physical.len()
-                && self.chunks[step.logical as usize].shape != NO_SHAPE
-                && self.logical_to_physical[step.logical as usize] == step.from
-                && range.contains(&step.from)
-                && step.to < range.start
-                && self.open.get(step.to)
-                && targets.insert(step.to);
-            if !fits {
-                return Err(stale);
-            }
-        }
-        self.segments
-            .set_state(segment, SegmentState::Draining { until: epoch });
-        for chunk in range {
-            self.open.clear(chunk);
-        }
-        for step in &evacuation.moves {
-            self.move_chunk(*step);
-        }
-        Ok(())
-    }
-
-    /// Every draining segment waits on the fire at `epoch` too, where it
-    /// waited on an earlier one: the fire known, once the engine took the
-    /// evacuation, to come after its copy.
-    pub fn fence_drains(&mut self, epoch: u64) {
-        for segment in 0..self.segments.count() {
-            if let SegmentState::Draining { until } = self.segments.state(segment)
-                && until < epoch
-            {
-                self.segments
-                    .set_state(segment, SegmentState::Draining { until: epoch });
-            }
-        }
-    }
-
-    /// Gives `segment` back: a drained one once its evacuation's fire has
-    /// retired, or a committed one holding nothing.
-    pub fn release_segment(&mut self, segment: u32) -> Result<(), SegmentError> {
-        self.segments.check(segment)?;
-        if segment >= self.top_segment {
-            return Err(SegmentError::State {
-                segment,
-                state: self.segments.state(segment),
-                wanted: "below the activation committed from the load",
-            });
-        }
-        let held = self.segments.used(segment);
-        if held > 0 {
-            return Err(SegmentError::Held { segment, held });
-        }
-        match self.segments.state(segment) {
-            SegmentState::Draining { until } if until > self.retired => {
-                Err(SegmentError::Draining {
-                    segment,
-                    until,
-                    retired: self.retired,
-                })
-            }
-            SegmentState::Draining { .. } => {
-                self.segments.set_state(segment, SegmentState::Uncommitted);
-                Ok(())
-            }
-            SegmentState::Committed => {
-                let needed = self.reserved + self.held + self.act;
-                let committed = self.committed_chunks() - self.segments.len(segment);
-                if needed > committed {
-                    return Err(SegmentError::Budget {
-                        segment,
-                        committed,
-                        needed,
-                    });
-                }
-                self.segments.set_state(segment, SegmentState::Uncommitted);
-                for chunk in self.segments.range(segment) {
-                    self.reopen(chunk);
-                }
-                Ok(())
-            }
-            state => Err(SegmentError::State {
-                segment,
-                state,
-                wanted: "drained or empty",
-            }),
-        }
-    }
-
-    /// Marks `segment` committed once the backend has mapped it.
-    pub fn commit_segment(&mut self, segment: u32) -> Result<(), SegmentError> {
-        self.segments.check(segment)?;
-        match self.segments.state(segment) {
-            SegmentState::Uncommitted => {
-                self.segments.set_state(segment, SegmentState::Committed);
-                for chunk in self.segments.range(segment) {
-                    debug_assert!(self.free.get(chunk));
-                    self.reopen(chunk);
-                }
-                Ok(())
-            }
-            state => Err(SegmentError::State {
-                segment,
-                state,
-                wanted: "uncommitted",
-            }),
-        }
-    }
-
-    /// The lowest uncommitted segments to commit so `bytes` of headroom
-    /// stand ready, off the fire path; empty when they already do. Never
-    /// more than there are.
-    pub fn commit_ahead(&self, bytes: u64) -> Vec<u32> {
-        let want = bytes.div_ceil(self.chunk_bytes.max(1));
-        let mut room = u64::from(self.headroom());
-        let mut segments = Vec::new();
-        for segment in self.segments.uncommitted() {
-            if room >= want {
-                break;
-            }
-            room += u64::from(self.segments.len(segment));
-            segments.push(segment);
-        }
-        segments
-    }
-
-    /// Checks every internal invariant; for tests.
-    #[cfg(test)]
-    fn check(&self) {
-        let mut held = 0;
-        let mut seg_used = vec![0u32; self.segments.count() as usize];
-        for logical in 0..self.total {
-            let physical = self.logical_to_physical[logical as usize];
-            let meta = self.chunks[logical as usize];
-            assert_eq!(self.physical_to_logical[physical as usize], logical);
-            if meta.shape == NO_SHAPE && logical >= self.reserved {
-                assert!(self.free.get(physical), "a free logical id on a held chunk");
-                continue;
-            }
-            assert!(!self.free.get(physical));
-            assert!(!self.open.get(physical));
-            seg_used[self.segments.of(physical) as usize] += 1;
-            if logical < self.reserved {
-                assert_eq!(physical, logical);
-                continue;
-            }
-            held += 1;
-            assert!(meta.used > 0, "an open chunk with nothing out");
-            let state = &self.shapes[meta.shape as usize];
-            let base = meta.frame as usize * state.words;
-            let free: u32 = state.free[base..base + state.words]
-                .iter()
-                .map(|word| word.count_ones())
-                .sum();
-            assert_eq!(free + meta.used, state.spc());
-            let partial = meta.used < state.spc();
-            assert_eq!(
-                state
-                    .partial
-                    .contains(&(Reverse(meta.used), physical, logical)),
-                partial
-            );
-            assert!(
-                matches!(
-                    self.segments.state(self.segments.of(physical)),
-                    SegmentState::Committed
-                ),
-                "a held chunk outside a committed segment"
-            );
-        }
-        assert_eq!(held, self.held);
-        for segment in 0..self.segments.count() {
-            assert_eq!(seg_used[segment as usize], self.segments.used(segment));
-            if segment >= self.top_segment {
-                assert_eq!(self.segments.state(segment), SegmentState::Committed);
-            }
-            for chunk in self.segments.range(segment) {
-                assert_eq!(self.open.get(chunk), self.openable(chunk), "chunk {chunk}");
-                if !self.free.get(chunk) && chunk >= self.reserved {
-                    assert!(chunk < self.state_limit(), "state in the activation span");
-                }
-            }
-        }
-        for state in &self.shapes {
-            let mut live = 0;
-            let mut cached = 0;
-            let mut partial_free = 0;
-            for &(Reverse(used), physical, logical) in &state.partial {
-                assert_eq!(self.logical_to_physical[logical as usize], physical);
-                assert_eq!(self.chunks[logical as usize].used, used);
-                partial_free += u64::from(state.spc() - used);
-            }
-            assert_eq!(partial_free, state.partial_free);
-            for logical in 0..self.total {
-                let meta = self.chunks[logical as usize];
-                if meta.shape == NO_SHAPE || !std::ptr::eq(&self.shapes[meta.shape as usize], state)
-                {
-                    continue;
-                }
-                for index in 0..state.spc() {
-                    let refs = state.refs[(meta.frame * state.spc() + index) as usize];
-                    live += u64::from(refs.live > 0);
-                    cached += u64::from(refs.live == 0 && refs.cache > 0);
-                }
-            }
-            assert_eq!(live, state.live);
-            assert_eq!(cached, state.cached);
-        }
-        assert!(self.reserved + self.held + self.act <= self.committed_chunks());
-        assert!(self.committed_chunks() <= self.total);
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-
-    /// splitmix64: a seeded stream, so a failing case replays.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            if n == 0 { 0 } else { self.next() % n }
-        }
-    }
-
-    fn facts(
-        total: u32,
-        segment: u32,
-        committed: u32,
-        shapes: &[(ShapeKind, u32)],
-    ) -> SlotPoolFacts {
-        facts_with(
-            total,
-            segment,
-            committed,
-            shapes,
-            &[(16, 1), (256, 3), (4096, 6)],
-        )
-    }
-
-    fn facts_with(
-        total: u32,
-        segment: u32,
-        committed: u32,
-        shapes: &[(ShapeKind, u32)],
-        act_chunks: &[(u32, u32)],
-    ) -> SlotPoolFacts {
-        SlotPoolFacts {
-            chunk_bytes: 1 << 20,
-            total_chunks: total,
-            segment_chunks: segment,
-            committed_segments: committed,
-            reserved_chunks: 1,
-            shapes: shapes
-                .iter()
-                .map(|&(kind, slots_per_chunk)| SlotShape {
-                    kind,
-                    slot_bytes: (1 << 20) / u64::from(slots_per_chunk),
-                    slots_per_chunk,
-                })
-                .collect(),
-            act_chunks: act_chunks.to_vec(),
-        }
-    }
-
-    fn cache(key: u8) -> Holder {
-        Holder::CacheEntry([key; 32])
-    }
-
-    /// What the test believes each holder holds.
-    #[derive(Default)]
-    struct Model {
-        held: HashMap<Holder, Vec<Slot>>,
-        /// Let go, and the epoch it waits on.
-        pending: HashMap<Slot, u64>,
-        retired: u64,
-        touched: HashMap<Slot, u64>,
-    }
-
-    impl Model {
-        fn refs(&self, slot: Slot) -> (u32, u32) {
-            let mut refs = (0, 0);
-            for (holder, slots) in &self.held {
-                let count = slots.iter().filter(|&&s| s == slot).count() as u32;
-                if holder.is_live() {
-                    refs.0 += count;
-                } else {
-                    refs.1 += count;
-                }
-            }
-            refs
-        }
-    }
-
-    fn property_run(seed: u64, shapes: &[(ShapeKind, u32)]) {
-        let mut rng = Rng(seed);
-        let mut pool = SlotPool::new(facts(96, 16, 3, shapes));
-        let mut model = Model::default();
-        let mut epoch = 1u64;
-        let holders = |rng: &mut Rng| match rng.below(3) {
-            0 => Holder::WorkingSet(rng.below(6)),
-            1 => Holder::Snapshot(rng.below(3)),
-            _ => cache(rng.below(4) as u8),
-        };
-        for step in 0..3000 {
-            match rng.below(12) {
-                0..=3 => {
-                    let holder = holders(&mut rng);
-                    let shape = rng.below(shapes.len() as u64) as ShapeId;
-                    let n = rng.below(12);
-                    let available = pool.available(shape);
-                    match pool.acquire(holder, shape, n) {
-                        Ok(slots) => {
-                            assert!(n <= available);
-                            assert_eq!(slots.len() as u64, n);
-                            let unique: HashSet<_> = slots.iter().collect();
-                            assert_eq!(unique.len(), slots.len(), "a slot handed out twice");
-                            for &slot in &slots {
-                                assert_eq!(
-                                    model.refs(slot),
-                                    (0, 0),
-                                    "{slot:?} handed out while held"
-                                );
-                                if let Some(&after) = model.pending.get(&slot) {
-                                    assert!(
-                                        after <= model.retired,
-                                        "{slot:?} reused before epoch {after}"
-                                    );
-                                    model.pending.remove(&slot);
-                                }
-                                model.touched.remove(&slot);
-                            }
-                            model.held.entry(holder).or_default().extend(slots);
-                        }
-                        Err(SlotError::Short { .. }) => assert!(n > available),
-                        Err(other) => panic!("{other}"),
-                    }
-                }
-                4 => {
-                    // A holder takes a reference on another's slots.
-                    let from = holders(&mut rng);
-                    let to = holders(&mut rng);
-                    let mut slots: Vec<Slot> = model.held.get(&from).cloned().unwrap_or_default();
-                    slots.retain(|slot| {
-                        !model.held.get(&to).is_some_and(|held| held.contains(slot))
-                    });
-                    slots.sort();
-                    slots.dedup();
-                    slots.truncate(rng.below(6) as usize);
-                    pool.share(to, &slots);
-                    model.held.entry(to).or_default().extend(slots);
-                }
-                5..=7 => {
-                    let holder = holders(&mut rng);
-                    let Some(held) = model.held.get_mut(&holder) else {
-                        continue;
-                    };
-                    let count = rng.below(held.len() as u64 + 1) as usize;
-                    let gone: Vec<Slot> = held.drain(..count).collect();
-                    let at = epoch.saturating_sub(rng.below(3));
-                    pool.release(holder, &gone, at);
-                    for slot in gone {
-                        if model.refs(slot) == (0, 0) {
-                            let after = at.max(model.touched.get(&slot).copied().unwrap_or(0));
-                            model.pending.insert(slot, after);
-                        }
-                    }
-                }
-                8 => {
-                    // A fire touches some held slots.
-                    let mut slots: Vec<Slot> = model.held.values().flatten().copied().collect();
-                    slots.sort();
-                    slots.dedup();
-                    slots.retain(|_| rng.below(3) == 0);
-                    pool.touch(&slots, epoch);
-                    for slot in slots {
-                        model.touched.insert(slot, epoch);
-                    }
-                    epoch += 1;
-                }
-                9 => {
-                    let through = epoch.saturating_sub(rng.below(4));
-                    pool.retire_through(through);
-                    model.retired = model.retired.max(through);
-                }
-                10 => {
-                    let rung = [0, 200, 1000, 5000][rng.below(4) as usize];
-                    if pool.set_rung(rung).is_err()
-                        && let Ok(evacuation) = pool.plan_rung(rung)
-                    {
-                        let refs: Vec<(Slot, u32)> = model
-                            .held
-                            .values()
-                            .flatten()
-                            .map(|&slot| (slot, pool.slot_ref(slot)))
-                            .collect();
-                        pool.apply_rung(&evacuation, epoch).unwrap();
-                        for (slot, engine) in refs {
-                            assert_eq!(pool.slot_ref(slot), engine);
-                            assert!(pool.physical(slot.chunk).unwrap() < pool.state_limit());
-                        }
-                        epoch += 1;
-                    }
-                }
-                _ => {
-                    // Shrink or grow the pool.
-                    if rng.below(2) == 0 {
-                        if let Some(segment) = pool.emptiest_segment()
-                            && let Some(evacuation) = pool.plan_evacuation(segment)
-                        {
-                            let refs: Vec<(Slot, (u32, u32), u32)> = model
-                                .held
-                                .values()
-                                .flatten()
-                                .map(|&slot| (slot, pool.refs(slot), pool.slot_ref(slot)))
-                                .collect();
-                            pool.apply_evacuation(&evacuation, epoch).unwrap();
-                            assert_eq!(pool.segments().used(segment), 0);
-                            for (slot, refs, engine) in refs {
-                                assert_eq!(pool.refs(slot), refs);
-                                assert_eq!(pool.slot_ref(slot), engine);
-                                let physical = pool.physical(slot.chunk).unwrap();
-                                assert_ne!(pool.segments().of(physical), segment);
-                            }
-                            epoch += 1;
-                        }
-                        for segment in 0..pool.segments().count() {
-                            let _ = pool.release_segment(segment);
-                        }
-                    } else if let Some(&segment) = pool.commit_ahead(8 << 20).first() {
-                        pool.commit_segment(segment).unwrap();
-                    }
-                }
-            }
-            if step % 7 == 0 {
-                pool.check();
-            }
-            // Refcount conservation, holder by holder and slot by slot.
-            let mut total = 0;
-            for (holder, slots) in &model.held {
-                assert_eq!(pool.held_by(holder), slots.len() as u64, "{holder:?}");
-                total += slots.len() as u64;
-            }
-            let pool_total: u64 = pool.holders.values().sum();
-            assert_eq!(pool_total, total);
-            if step % 50 == 0 {
-                let mut all: Vec<Slot> = model.held.values().flatten().copied().collect();
-                all.sort();
-                all.dedup();
-                for slot in all {
-                    assert_eq!(pool.refs(slot), model.refs(slot));
-                }
-            }
-            assert!(
-                pool.reserved_chunks() + pool.state_chunks() + pool.act_reserved()
-                    <= pool.committed_chunks()
-            );
-            assert!(pool.committed_chunks() <= pool.total_chunks());
-        }
-        // Let everything go: the pool comes back whole.
-        for (holder, slots) in std::mem::take(&mut model.held) {
-            pool.release(holder, &slots, epoch);
-        }
-        pool.retire_through(u64::MAX);
-        assert_eq!(pool.state_chunks(), 0);
-        assert_eq!(pool.demand(), Demand::default());
-        pool.check();
-    }
-
-    #[test]
-    fn random_runs_keep_every_invariant() {
-        for seed in 0..24 {
-            property_run(
-                seed,
-                &[
-                    (ShapeKind::List, 4),
-                    (ShapeKind::Fixed, 1),
-                    (ShapeKind::List, 70),
-                ],
-            );
-        }
-    }
-}
+mod tests;

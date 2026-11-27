@@ -15,29 +15,13 @@ use poem_compiler::{Budgets, DeviceProfile};
 use crate::serve::Shell;
 
 impl Shell {
-    /// The pool's counts as the pre-chunk facts state them: the kv list's
-    /// slots as kv pages, a record's bytes as a state slot's.
+    /// What the load states beside its chunk facts.
     #[must_use]
     pub fn pool_facts(&self) -> PoolFacts {
-        let pools = self.pools();
-        let paging = self.paging();
-        let facts = pools.facts();
-        let slots = |id: Option<engine::chunk::ShapeId>| {
-            id.and_then(|id| facts.shape(id))
-                .map_or(0, |shape| shape.device_slots(&facts))
-        };
+        // (no window list: windowed layers are served as ring + buffer,
+        // `Shell::serves_windowed_state`)
         PoolFacts {
-            kv_pages: u32::try_from(slots(pools.kv_shape())).unwrap_or(u32::MAX),
-            kv_page_size: paging.page_size,
-            state_slots: 0,
-            buffer_pages: 0,
-            state_slot_bytes: pools.state_slot_bytes(),
-            adapter_banks: u32::try_from(self.banks().len()).unwrap_or(u32::MAX),
-            window_tokens: paging.window.map_or(0, |window| window.tokens),
-            seated_first: self.seats()[0],
-            seat_to_end: self.seats()[1],
-            seat_spread: self.seats()[2],
-            ..PoolFacts::default()
+            adapter_banks: u32::try_from(self.bank_seats().len()).unwrap_or(u32::MAX),
         }
     }
 

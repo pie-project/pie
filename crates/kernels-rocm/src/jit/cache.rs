@@ -7,8 +7,8 @@ use crate::hip::sys;
 use crate::jit::{Fault, Root, hiprtc};
 
 pub struct Resolved {
-    #[allow(dead_code)]
-    module: sys::Module,
+    /// The module `function` lives in, held beside it and never unloaded.
+    _module: sys::Module,
     pub function: sys::Function,
 }
 
@@ -97,7 +97,10 @@ pub(crate) fn load(root: &Root, instantiation: &str, ordinal: i32) -> Result<Res
         ms = started.elapsed().as_secs_f64() * 1e3,
         "resolved a device instantiation"
     );
-    Ok(Resolved { module, function })
+    Ok(Resolved {
+        _module: module,
+        function,
+    })
 }
 
 fn api(call: &'static str) -> Result<&'static sys::Api, Fault> {
@@ -111,6 +114,10 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<sys::Module, Fault> {
             log: "the compile produced an empty image, so there is nothing to load".into(),
         });
     }
+    // A kernel that asks HIP for a buffer at its first launch would
+    // allocate on the device after the load: refused by name.
+    crate::hip::code_object::refuse_late_buffers(image)
+        .map_err(|log| Fault::Compile { unit: root, log })?;
     let api = api("hipModuleLoadData")?;
     let mut module: sys::Module = std::ptr::null_mut();
 

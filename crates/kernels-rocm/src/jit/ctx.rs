@@ -23,6 +23,31 @@ impl Launch {
         }
     }
 
+    /// The most blocks a grid's x axis holds on HIP.
+    pub const GRID_X: u32 = i32::MAX as u32;
+
+    /// A grid-stride sweep over `n` elements, one a thread: a thread an
+    /// element up to the x axis's most blocks, the kernel's loop past it.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn strided(n: u64, block: u32) -> Self {
+        let blocks = if block == 0 {
+            0
+        } else {
+            n.div_ceil(block as u64)
+        };
+        let grid = if blocks > Self::GRID_X as u64 {
+            Self::GRID_X
+        } else {
+            blocks as u32
+        };
+        Self {
+            grid: [grid, 1, 1],
+            block: [block, 1, 1],
+            smem: 0,
+        }
+    }
+
     #[must_use]
     pub const fn per_row(rows: u32, block: u32) -> Self {
         Self {
@@ -84,18 +109,69 @@ impl Fire {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Slabs(u32);
 
+/// What names a slab: the arena it is one of ([`Slabs::id`]), its name, the
+/// region that takes it (or `NO_REGION`), and the stream it is scoped to (0
+/// where it is a region's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SlabKey {
+    pub arena: u32,
+    pub name: &'static str,
+    pub region: u32,
+    pub scope: usize,
+}
+
+/// What a placed slab is aligned to.
+pub const PLACED_ALIGN: usize = 256;
+
 impl Slabs {
     pub const PROCESS: Slabs = Slabs(0);
 
+    /// The arena a [`SlabKey`] names these slabs by.
     #[must_use]
-    pub fn census() -> Vec<(&'static str, usize)> {
+    pub const fn id(self) -> u32 {
+        self.0
+    }
+
+    /// The bytes `slabs` take laid one after another, each of `(key,
+    /// bytes)` at [`PLACED_ALIGN`].
+    #[must_use]
+    pub fn placed_bytes(slabs: &[(SlabKey, usize)]) -> usize {
+        slabs.iter().fold(0usize, |at, (_, bytes)| {
+            at.saturating_add(bytes.next_multiple_of(PLACED_ALIGN))
+        })
+    }
+
+    /// Lays `slabs` one after another from `base`: a take of one answers
+    /// its place there, and nothing is allocated for it. A slab laid before
+    /// is laid anew.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be device memory of [`Slabs::placed_bytes`] bytes, zeroed,
+    /// that the caller keeps backed for as long as the slabs' arenas live.
+    pub unsafe fn place(base: *mut c_void, slabs: &[(SlabKey, usize)]) {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::census()
+            crate::jit::device::place(base, slabs);
         }
         #[cfg(not(feature = "rocm"))]
         {
-            Vec::new()
+            let _ = (base, slabs);
+        }
+    }
+
+    /// The bytes takes asked past what was placed for them (a slab not
+    /// placed, or placed smaller) since the process began: each one a
+    /// launch refused.
+    #[must_use]
+    pub fn unplaced_bytes() -> usize {
+        #[cfg(feature = "rocm")]
+        {
+            crate::jit::device::unplaced_bytes()
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            0
         }
     }
 
@@ -120,13 +196,15 @@ impl Slabs {
         }
     }
 
-    /// Frees every slab these arenas hold.
+    /// Forgets the slabs laid for these arenas; their memory is the placing
+    /// caller's to free.
     ///
     /// # Safety
     ///
-    /// Nothing reads the slabs again: no `Ctx` carrying them fires after
-    /// this, and no graph captured on their stream is replayed. A `Slabs` is
-    /// `Copy`, so that is the caller's to keep across every copy.
+    /// Nothing reads the slabs again through these arenas: no `Ctx` carrying
+    /// them fires after this, and no graph captured on their stream is
+    /// replayed. A `Slabs` is `Copy`, so that is the caller's to keep across
+    /// every copy.
     pub unsafe fn release(self) {
         #[cfg(feature = "rocm")]
         {
@@ -156,8 +234,11 @@ impl Pad {
 
 pub const NO_REGION: u32 = u32::MAX;
 
+/// The slab rocBLAS's calls run on ([`Ctx::blas_workspace`]).
+const BLAS_WORKSPACE: &str = "linear.rocblas_workspace";
+
 /// The tickets a stream holds ([`Ctx::tickets`]): every launch that draws
-/// them asks for this many, so the slab never grows past its warm size.
+/// them asks for this many, so one laid slab serves every one.
 pub const TICKETS: u32 = 1 << 16;
 
 #[cfg(feature = "rocm")]
@@ -183,6 +264,9 @@ pub struct Ctx {
     lane: core::cell::Cell<u32>,
 
     tuning: crate::tuning::Tuning,
+    /// The device's measured product times (`crate::linear::routes`);
+    /// `None` until a load states them, every choice then the skinny kernel.
+    routes: Option<std::sync::Arc<crate::linear::routes::Routes>>,
 }
 
 impl Ctx {
@@ -204,12 +288,13 @@ impl Ctx {
             region: core::cell::Cell::new(NO_REGION),
             lane: core::cell::Cell::new(0),
             tuning: crate::tuning::Tuning::DEFAULT,
+            routes: None,
         }
     }
 
     /// Launches that run in `owner`'s order — a conditional body, captured
     /// on its own stream and replayed inside `owner`'s graph — share
-    /// `owner`'s per-stream slabs, so what a load warmed there serves them.
+    /// `owner`'s per-stream slabs, so what a load laid there serves them.
     #[must_use]
     pub const fn in_order_of(mut self, owner: *mut c_void) -> Self {
         self.owner = owner;
@@ -229,6 +314,22 @@ impl Ctx {
     #[must_use]
     pub const fn tuning(&self) -> crate::tuning::Tuning {
         self.tuning
+    }
+
+    #[must_use]
+    pub fn with_routes(mut self, routes: std::sync::Arc<crate::linear::routes::Routes>) -> Self {
+        self.routes = Some(routes);
+        self
+    }
+
+    pub fn set_routes(&mut self, routes: std::sync::Arc<crate::linear::routes::Routes>) {
+        self.routes = Some(routes);
+    }
+
+    /// The measured product times a load stated (`with_routes`).
+    #[must_use]
+    pub fn routes(&self) -> Option<&std::sync::Arc<crate::linear::routes::Routes>> {
+        self.routes.as_ref()
     }
 
     #[must_use]
@@ -293,6 +394,16 @@ impl Ctx {
         Ok(self.blas)
     }
 
+    /// Where this context's rocBLAS calls take their workspace: one slab a
+    /// stream, at the most any call on it asks (`hip::blas::Workspace`), so
+    /// rocBLAS allocates none of its own.
+    pub fn blas_workspace(&self, op: &'static str) -> impl FnMut(usize) -> Result<u64, Error> + '_ {
+        move |bytes| {
+            self.scratch_stream(op, BLAS_WORKSPACE, bytes)
+                .map(|at| at as usize as u64)
+        }
+    }
+
     pub fn comm(&self, op: &'static str) -> Result<*mut c_void, Error> {
         if self.comm.is_null() {
             return Err(refuse(op, "this context carries no communicator"));
@@ -308,15 +419,8 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::take(
-                self.slabs.0,
-                self.stream,
-                self.stream,
-                name,
-                self.region.get(),
-                bytes,
-            )
-            .map_err(|fault| fault.at(op))
+            crate::jit::device::take(self.slabs.0, self.stream, name, self.region.get(), bytes)
+                .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "rocm"))]
         {
@@ -328,8 +432,7 @@ impl Ctx {
     /// A slab one per stream, whatever region asks: for a tile a launch
     /// fills and the next launch on the same stream consumes, so a model
     /// with hundreds of such regions holds one tile a stream, not one a
-    /// region. A capture sees the slab as it was warmed, so arming fires
-    /// the widest plane eagerly first.
+    /// region.
     pub fn scratch_stream(
         &self,
         op: &'static str,
@@ -338,15 +441,8 @@ impl Ctx {
     ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::take(
-                self.slabs.0,
-                self.stream,
-                self.owner,
-                name,
-                NO_REGION,
-                bytes,
-            )
-            .map_err(|fault| fault.at(op))
+            crate::jit::device::take(self.slabs.0, self.owner, name, NO_REGION, bytes)
+                .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "rocm"))]
         {
@@ -355,21 +451,14 @@ impl Ctx {
         }
     }
 
-    /// [`Ctx::tickets`] taken now, at the size every launch draws, so no
-    /// capture has to grow them: a load arms bodies before any eager fire.
-    pub fn warm_tickets(&self) -> Result<(), Error> {
-        self.tickets("pie.tickets", TICKETS).map(|_| ())
-    }
-
-    /// `count` i32 tickets, zero when first handed out, one slab a stream:
+    /// `count` i32 tickets, zero as laid, one slab a stream:
     /// a launch that draws them puts every one back to zero before it ends
     /// (its last block), so the next launch on the stream finds them zero.
     pub fn tickets(&self, op: &'static str, count: u32) -> Result<u64, Error> {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::take_zeroed(
+            crate::jit::device::take(
                 self.slabs.0,
-                self.stream,
                 self.owner,
                 "pie.tickets",
                 NO_REGION,
@@ -394,7 +483,7 @@ impl Ctx {
         #[cfg(feature = "rocm")]
         {
             let region = SHARED_REGION.saturating_sub(self.lane.get().min(1 << 8));
-            crate::jit::device::take(self.slabs.0, self.stream, self.stream, name, region, bytes)
+            crate::jit::device::take(self.slabs.0, self.stream, name, region, bytes)
                 .map_err(|fault| fault.at(op))
         }
         #[cfg(not(feature = "rocm"))]
@@ -457,15 +546,22 @@ impl Ctx {
     }
 
     #[allow(clippy::unused_self)]
-    #[must_use]
-    pub fn multiprocessors(&self) -> Option<u32> {
+    /// The device's compute units, which the launchers shape their grids
+    /// by: a device that does not answer is refused by name.
+    pub fn multiprocessors(&self, op: &'static str) -> Result<u32, Error> {
         #[cfg(feature = "rocm")]
         {
-            crate::jit::device::multiprocessors()
+            crate::jit::device::multiprocessors().ok_or_else(|| {
+                refuse(
+                    op,
+                    "the device did not answer its compute-unit count, which the launchers \
+                     shape their grids by",
+                )
+            })
         }
         #[cfg(not(feature = "rocm"))]
         {
-            None
+            Err(crate::jit::runtimeless(op))
         }
     }
 
@@ -492,7 +588,7 @@ impl Ctx {
     ) -> Result<(), Error> {
         let resolved = match kernel.resolve() {
             Ok(resolved) => resolved,
-            Err(why) => return Err(said(kernel, why).at(op)),
+            Err(why) => return Err(unfireable(op, kernel, &why)),
         };
 
         let mut bound = crate::jit::abi::Bound::new(args);
@@ -507,7 +603,7 @@ impl Ctx {
         };
         match fired {
             Ok(()) => Ok(()),
-            Err(why) => Err(said(kernel, why).at(op)),
+            Err(why) => Err(unfireable(op, kernel, &why)),
         }
     }
 
@@ -524,47 +620,15 @@ impl Ctx {
     }
 }
 
-/// Whether a device instantiation that will not fire (it does not compile,
-/// or its module does not load) panics rather than falling back: on under
-/// `PIE_STRICT_KERNELS=1` or [`strict_kernels`], as the test harnesses run.
-/// Off, the fallback serves (another chip's toolchain may lack what one
-/// unit asks) and the fault is said once.
-#[must_use]
-pub fn kernels_strict() -> bool {
-    STRICT.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var_os("PIE_STRICT_KERNELS").is_some_and(|v| v == "1")
-}
-
-/// Turns [`kernels_strict`] on for this process.
-pub fn strict_kernels() {
-    STRICT.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+/// A device instantiation that will not fire (it does not compile, its
+/// module does not load, or its launch is refused): a fault naming the op,
+/// the unit and the instantiation, never a fallback that serves in its place.
 #[cfg(feature = "rocm")]
-fn said(kernel: &Kernel, why: crate::jit::Fault) -> crate::jit::Fault {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-
-    let (root, instantiation) = (kernel.file, kernel.name);
-    assert!(
-        !kernels_strict(),
-        "strict kernels: `{root}` {instantiation} will not fire: {why}"
-    );
-    static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut said) = said.lock()
-        && said.insert(instantiation.to_owned())
-    {
-        tracing::error!(
-            root,
-            instantiation,
-            why = %why,
-            "a device instantiation will not fire"
-        );
+fn unfireable(op: &'static str, kernel: &Kernel, why: &crate::jit::Fault) -> Error {
+    Error::Backend {
+        op,
+        detail: format!("`{}` {} will not fire: {why}", kernel.file, kernel.name),
     }
-    why
 }
 
 #[cfg(test)]

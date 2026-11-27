@@ -5,8 +5,9 @@ pub mod layout;
 pub mod pool;
 mod pools;
 pub mod streamed;
+pub mod windowed;
 
-pub use pools::{Pools, Rows, RsRows, TablePaging, WindowRows};
+pub use pools::{GuestPiece, Pools, RingRows, Rows, RsRows, TablePaging, WindowRows};
 
 use kernels_metal::{StateMap, Tensor};
 use poem_ir::{Attn, Def, Dtype, Operation, Trace};
@@ -66,43 +67,106 @@ pub struct Seats {
     pub row_bands: Vec<Tensor>,
 }
 
-/// Bytes of one state row's segment table: its head and one segment.
-const STATE_MAP_BYTES: u64 = ((StateMap::HEAD + 1) * 8) as u64;
+/// Bytes of one state row's segment table where the range spans `parts`
+/// buffers: the head and a base a buffer.
+const fn state_map_bytes(parts: usize) -> u64 {
+    ((StateMap::HEAD + parts) * 8) as u64
+}
 
 #[derive(Debug)]
 struct Spill {
     file: engine::disk::SlotFile,
+    /// A slot's cover: its bytes widened to the direct I/O boundary.
     stage: engine::disk::Aligned,
+    /// One aligned block, for the bytes of a cover outside its slot.
+    edge: engine::disk::Aligned,
+}
+
+/// The aligned span of the slot file the bytes `[at, at + len)` lie in:
+/// its first byte, its length, and the byte `at` falls on within it.
+fn cover(at: u64, len: u64) -> (u64, usize, usize) {
+    let align = engine::disk::ALIGN as u64;
+    let start = at / align * align;
+    let end = (at + len).next_multiple_of(align);
+    (
+        start,
+        usize::try_from(end - start).unwrap_or(usize::MAX),
+        usize::try_from(at - start).unwrap_or(usize::MAX),
+    )
+}
+
+/// The bytes a cover of a slot of `slot_bytes` takes at most.
+fn cover_room(slot_bytes: u64) -> usize {
+    let align = engine::disk::ALIGN as u64;
+    usize::try_from(slot_bytes.next_multiple_of(align) + align).unwrap_or(usize::MAX)
 }
 
 impl Spill {
+    /// The slot file of `budget` bytes in chunks of `chunk_bytes`, a slot's
+    /// cover `room` bytes at most.
     fn open(
         dir: &std::path::Path,
         name: &str,
-        slot_bytes: u64,
+        chunk_bytes: u64,
+        room: usize,
         budget: u64,
     ) -> Result<Option<Spill>> {
         let file =
-            engine::disk::SlotFile::open(dir, name, slot_bytes, budget).map_err(slot_file)?;
+            engine::disk::SlotFile::open(dir, name, chunk_bytes, budget).map_err(slot_file)?;
         Ok(file.map(|file| Spill {
-            stage: engine::disk::Aligned::zeroed(file.stride()),
+            stage: engine::disk::Aligned::zeroed(room),
+            edge: engine::disk::Aligned::zeroed(engine::disk::ALIGN),
             file,
         }))
     }
 
+    /// The disk chunks the file holds.
     fn slots(spill: Option<&Spill>) -> u32 {
         spill.map_or(0, |spill| spill.file.slots())
     }
 
-    fn room(spill: Option<&Spill>, what: &'static str, slots: &[u32]) -> Result<()> {
-        let have = Spill::slots(spill);
-        match slots.iter().find(|&&slot| slot >= have) {
-            Some(&slot) => Err(Fault::Ceiling {
-                what,
-                need: u64::from(slot) + 1,
-                have: u64::from(have),
-            }),
-            None => Ok(()),
+    /// Copies the slot of `bytes` at byte `at` of the file through
+    /// `place(slot, out)`, which reads the slot's bytes from its place into
+    /// `slot` (`out`, the copy going to disk) or writes `slot` to its place.
+    /// A slot off the direct I/O boundary goes through its cover, its
+    /// neighbours' bytes read back first so a write leaves them as they are.
+    fn copy(
+        &mut self,
+        at: u64,
+        bytes: u64,
+        to_disk: bool,
+        mut place: impl FnMut(&mut [u8], bool) -> Result<()>,
+    ) -> Result<()> {
+        let (start, span, lead) = cover(at, bytes);
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        if span > self.stage.as_slice().len() {
+            return Err(Fault::Ceiling {
+                what: "bytes of the slot file's stage",
+                need: span as u64,
+                have: self.stage.as_slice().len() as u64,
+            });
+        }
+        let staged = &mut self.stage.as_mut_slice()[..span];
+        if to_disk {
+            place(&mut staged[lead..lead + len], true)?;
+            let align = engine::disk::ALIGN;
+            let block = self.edge.as_mut_slice();
+            if lead > 0 {
+                self.file.read_span(start, block).map_err(slot_file)?;
+                staged[..lead].copy_from_slice(&block[..lead]);
+            }
+            let end = lead + len;
+            if end < span {
+                let last = span - align;
+                self.file
+                    .read_span(start + last as u64, block)
+                    .map_err(slot_file)?;
+                staged[end..].copy_from_slice(&block[end - last..]);
+            }
+            self.file.write_span(start, staged).map_err(slot_file)
+        } else {
+            self.file.read_span(start, staged).map_err(slot_file)?;
+            place(&mut staged[lead..lead + len], false)
         }
     }
 }
@@ -171,8 +235,8 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
 }
 
 /// The bytes a load's pool takes at `paging`: the kv and state rows and the
-/// recurrent-state buffers beside them, what `[model] device_kv_budget`
-/// states for it.
+/// recurrent-state buffers beside them, what a test's
+/// `Residency::device_kv_budget` states for it.
 pub fn pool_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
     let rs = crate::rs::Layout::read(trace)?;
     Ok(PoolDemand::of(trace, paging, rs.as_ref())?.bytes(paging.pages()))
@@ -207,7 +271,12 @@ fn split(name: &str, planes: &[u64]) -> Result<Widths> {
     }
 }
 
+/// A slot-file write failing for want of room on its file system is the
+/// tier below full ([`Fault::TierFull`]): nothing on the device changed.
 fn slot_file(error: std::io::Error) -> Fault {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return Fault::TierFull(error.to_string());
+    }
     Fault::Device {
         call: "slot file",
         why: error.to_string(),

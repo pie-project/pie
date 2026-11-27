@@ -7,7 +7,7 @@ use checkpoint::executor::{Execution, sink::TensorSink};
 use checkpoint::file::read::parse_metadata;
 use checkpoint::file::serve;
 use checkpoint::file::zt;
-use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
+use checkpoint::plan::{LoadPlan, StorageInstr, StorageTarget, compile, compile_streaming};
 use checkpoint::serving::Stamp;
 use checkpoint::types::{ScaleForm, TensorId};
 use engine::load::Tiers;
@@ -102,6 +102,86 @@ pub struct Weights<B: Backend> {
     /// The host bytes of the tables and routed banks the weight cache
     /// streams (the runtime's to place, not this load's own tier).
     cached_bytes: u64,
+
+    hashes: NgramHashes<B>,
+}
+
+/// The hash constants of every n-gram id gather (`gather.ngram_ids`), one
+/// run of u64 a distinct key, written at load: model bytes, kept apart
+/// from any fire's buffer, which a re-carve may lay anew.
+#[derive(Debug)]
+pub struct NgramHashes<B: Backend> {
+    plane: Option<B::Buffer>,
+    held: Vec<(Box<[u64]>, u64)>,
+}
+
+impl<B: Backend> NgramHashes<B> {
+    pub fn write(device: &B::Context, trace: &Trace) -> Result<NgramHashes<B>> {
+        use kernels_slang::gather::ngram;
+        use poem_ir::{Gather, Operation};
+        let mut held: Vec<(Box<[u64]>, u64)> = Vec::new();
+        let mut at = 0u64;
+        for node in &trace.nodes {
+            let Operation::Gather(
+                Gather::NgramIds {
+                    mults,
+                    primes,
+                    offsets,
+                    ..
+                }
+                | Gather::NgramIdsChunked {
+                    mults,
+                    primes,
+                    offsets,
+                    ..
+                },
+            ) = &node.op
+            else {
+                continue;
+            };
+            let key: Box<[u64]> = ngram::hash_constants(mults, primes, offsets).into();
+            if key.is_empty() || held.iter().any(|(seen, _)| *seen == key) {
+                continue;
+            }
+            let start = at.next_multiple_of(ALIGN);
+            at = start + 8 * key.len() as u64;
+            held.push((key, start));
+        }
+        if held.is_empty() {
+            return Ok(NgramHashes { plane: None, held });
+        }
+        let mut plane = B::Buffer::zeroed(device, at, crate::books::owners::NGRAM_HASHES)?;
+        for (key, start) in &held {
+            let bytes: Vec<u8> = key.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            plane.write(*start, &bytes)?;
+        }
+        Ok(NgramHashes {
+            plane: Some(plane),
+            held,
+        })
+    }
+
+    /// The constants of the gather stating `mults`, `primes`, `offsets`.
+    pub fn bind(
+        &self,
+        handles: &Handles<B>,
+        mults: &[u64],
+        primes: &[u64],
+        offsets: &[u64],
+    ) -> Option<Result<Tensor>> {
+        let want = kernels_slang::gather::ngram::hash_constants(mults, primes, offsets);
+        let (key, start) = self.held.iter().find(|(key, _)| **key == *want)?;
+        let plane = self.plane.as_ref()?;
+        let bytes = 8 * key.len() as u64;
+        Some(handles.bind(plane, *start, bytes).map(|buf| {
+            Tensor::new(
+                buf,
+                1,
+                u32::try_from(key.len()).unwrap_or(u32::MAX),
+                Dtype::U64,
+            )
+        }))
+    }
 }
 
 impl<B: Backend> Weights<B> {
@@ -204,18 +284,26 @@ impl<B: Backend> Weights<B> {
             }
         }
 
-        let mut sink = Landing {
-            store: &mut store,
-            host: host_map.as_ref().map(|map| (map, &host_planes)),
-            places: &places,
-            index: &index,
-            landed: vec![false; places.len()],
+        let landed = if B::LANDS {
+            let mut sink = Landing {
+                store: &mut store,
+                device,
+                host: host_map.as_ref().map(|map| (map, &host_planes)),
+                places: &places,
+                index: &index,
+                landed: vec![false; places.len()],
+            };
+            Execution::new(&streaming, snapshot)
+                .streaming()
+                .sink(&mut sink)
+                .run()?;
+            // Each plane's host copy was freed as it landed; the pages go
+            // back before the pool and its spans are reserved beside them.
+            engine::memory::return_freed_heap();
+            sink.landed
+        } else {
+            published(&streaming, &index, places.len())?
         };
-        Execution::new(&streaming, snapshot)
-            .streaming()
-            .sink(&mut sink)
-            .run()?;
-        let landed = sink.landed;
 
         let mut phantom: BTreeMap<usize, u32> = BTreeMap::new();
         let host = match host_map {
@@ -307,7 +395,13 @@ impl<B: Backend> Weights<B> {
             banks: banks(trace, &places),
             decoded: Vec::new(),
             cached_bytes: streamed.iter().map(|&at| reserved[at]).sum(),
+            hashes: NgramHashes::write(device, trace)?,
         })
+    }
+
+    #[must_use]
+    pub fn hashes(&self) -> &NgramHashes<B> {
+        &self.hashes
     }
 
     #[must_use]
@@ -447,7 +541,8 @@ impl<B: Backend> Weights<B> {
                 call: "decode_absorbed",
                 why: format!("{}: {why}", param.name),
             })?;
-            let mut buffer = B::Buffer::zeroed(device, plane.len() as u64)?;
+            let mut buffer =
+                B::Buffer::zeroed(device, plane.len() as u64, crate::books::owners::DERIVED)?;
             buffer.write(0, &plane)?;
             let handle = handles.bind(&buffer, 0, plane.len() as u64)?;
             self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
@@ -503,7 +598,11 @@ impl<B: Backend> Weights<B> {
                     }
                 }
             }
-            let mut buffer = B::Buffer::zeroed(device, relabelled.len() as u64)?;
+            let mut buffer = B::Buffer::zeroed(
+                device,
+                relabelled.len() as u64,
+                crate::books::owners::DERIVED,
+            )?;
             buffer.write(0, &relabelled)?;
             let handle = handles.bind(&buffer, 0, relabelled.len() as u64)?;
             self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
@@ -714,6 +813,45 @@ struct Place {
     dtype: Dtype,
 }
 
+/// The bytes of the planes a load derives on the device once its weights
+/// land, past sizing: each quantized plane [`Weights::decode_absorbed`]
+/// decodes to bf16 (an absorbed one, or one an f32 activation multiplies),
+/// and each convolution weight [`Weights::relabel_conv_weights`] lays again
+/// taps-major in bf16. The room a load sizes its pool from leaves them out.
+#[must_use]
+pub fn derived_bytes(trace: &Trace) -> u64 {
+    let mut decoded = crate::decoded::absorbed_weights(trace);
+    decoded.extend(crate::decoded::lane_axis_weights(trace));
+    let bf16 = |param: &poem_ir::Param| {
+        let (rows, width) = rectangle(&param.shape);
+        rows.saturating_mul(width).saturating_mul(2)
+    };
+    let decodes: u64 = decoded
+        .into_iter()
+        .filter_map(|at| trace.params.get(at))
+        .filter(|param| {
+            matches!(
+                param.dtype,
+                Dtype::U4g64
+                    | Dtype::U4g32
+                    | Dtype::U4g64tiled
+                    | Dtype::U2g32
+                    | Dtype::U2g64
+                    | Dtype::U2g128
+                    | Dtype::U8g64
+            )
+        })
+        .map(bf16)
+        .sum();
+    let relabels: u64 = trace
+        .params
+        .iter()
+        .filter(|param| matches!(param.layout, poem_ir::ParamLayout::ConvTapsMajor { .. }))
+        .map(bf16)
+        .sum();
+    decodes.saturating_add(relabels)
+}
+
 pub fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
     trace
         .params
@@ -852,11 +990,39 @@ fn places(trace: &Trace, layout: &Layout) -> Result<Vec<Place>> {
 
 struct Landing<'a, B: Backend> {
     store: &'a mut Store<B>,
+    /// Where each landing's write is settled before the next: a queue that
+    /// stages a write until a submission carries it holds the whole model
+    /// staged otherwise, beside the planes it lands in (wgpu).
+    device: &'a B::Context,
 
     host: Option<(&'a Mapping, &'a BTreeMap<usize, HostPlane>)>,
     places: &'a [Place],
     index: &'a BTreeMap<&'a str, usize>,
     landed: Vec<bool>,
+}
+
+/// The planes `plan` publishes, each the one its scheduled `Finalize` names,
+/// as an execution of it lands them; a name the plan does not hold is
+/// refused in the words a landing refuses it.
+fn published(plan: &LoadPlan, index: &BTreeMap<&str, usize>, planes: usize) -> Result<Vec<bool>> {
+    let mut landed = vec![false; planes];
+    let scheduled: std::collections::HashSet<_> = plan.schedule.iter().collect();
+    for instr in &plan.instrs {
+        let StorageInstr::Finalize { id, name, .. } = instr else {
+            continue;
+        };
+        if !scheduled.contains(id) {
+            continue;
+        }
+        let at = *index.get(name.as_str()).ok_or_else(|| {
+            Fault::Load(LoadError::Contract(format!(
+                "the load contract publishes `{name}`, which this plan does not \
+                 name — the two were not written from each other"
+            )))
+        })?;
+        landed[at] = true;
+    }
+    Ok(landed)
 }
 
 impl<B: Backend> TensorSink for Landing<'_, B> {
@@ -877,10 +1043,17 @@ impl<B: Backend> TensorSink for Landing<'_, B> {
             )));
         }
         match place.tier {
-            Tier::Device => self
-                .store
-                .write(place.offset, bytes)
-                .map_err(|fault| LoadError::Internal(fault.to_string()))?,
+            Tier::Device => {
+                self.store
+                    .write(place.offset, bytes)
+                    .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+                // The write lands and its staging goes before the next plane
+                // stages: the load holds one plane staged at most.
+                self.device
+                    .frame()
+                    .and_then(crate::backend::Frame::commit)
+                    .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+            }
             Tier::Host => {
                 let (map, planes) = self.host.ok_or_else(|| {
                     LoadError::Internal(format!(

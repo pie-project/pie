@@ -10,7 +10,8 @@ moe.mxfp4_select_lean = true  # 1.9% faster end to end
 qmm.gemm_from = 12  # 2.1% faster end to end
 qmm.split_thin_max = 16  # 1.2% faster end to end
 qmm.split_warps_per_sm = 80  # 2.3% faster end to end
-ssm.gdn_scan_until = 48  # 1.9% faster end to end
+# ssm.gdn_scan_until = 48 reset to its default: the tune timed it 1.9% faster on gpt-oss-20b,
+# which never reads it here (a recurrent (SSM) path; it has none): the win was noise.
 sdpa.index_mma = true
 sdpa.index_radix = true
 # a paged decode of a group of at most eight query heads on the tensor-core kernel, as the B200:
@@ -54,17 +55,10 @@ moe.nvfp4_wide_from = 128
 [engine]
 prefill_lattice_from = 192  # 2.0% faster end to end
 working_set_percent = 70
-# fires of 16384 rows, not 8192, as the B200: Qwen3.6-35B-A3B pf32-512 54.5k -> 57.6k, Qwen3-0.6B pf128-512
-# 406k -> 419k, gemma-4-26B-A4B pf64-512 52.5k -> 54.1k, MiniMax mini60 pf32-512 10.2k -> 10.4k tok/s;
-# Qwen3.6 c512 12.6k -> 12.8k, gemma-4-26B-A4B c1024 14.1k -> 14.6k
-forward_tokens = 16384
 # two recurrent-state slots a lane, so a hybrid trunk seats past the fixed 256, as on the RTX PRO 6000:
 # Qwen3.8-Flash-Next mini c512 54.4k -> 65.8k tok/s, single-stream greedy tokens unchanged
-# a Gemma-4 process starts only while the pools hold the started ones to the end, a decoding lane's pages
-# before a waiting prompt's, the windowed ring a page a lane past its kv pages, as on the RTX PRO 6000:
+# the windowed ring a page a lane past its kv pages:
 # gemma-4-26b-a4b c1024 10.7k -> 12.7k tok/s, single-request decode 264 -> 279 tok/s
-seated_first = true
-seat_to_end = true
 window_spare = true
 
 [compiler]
@@ -75,12 +69,9 @@ dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 26.2 -> 26.2 ms, 1-lane step 3.06 -> 2.87 ms, 4-lane step 5.16 -> 4.85 ms, 8-lane step 6.21 -> 6.12 ms, readout cosine 1.0000"
+# `measured` names only what gpt-oss-20b, the tune's model, reads on this device: the tune once listed
+# every decision, since a load counted each as read; those it cannot read are dropped (and reset where set).
 measured = [
-  "kernel.attn.qkv_rows_from",
-  "kernel.attn_res.fused_norm",
-  "kernel.elemwise.hc_mma",
-  "kernel.elemwise.hc_tile",
-  "kernel.elemwise.norm_emit",
   "kernel.elemwise.rows_vec",
   "kernel.gemm.affine_mma",
   "kernel.gemm.fp8_gemv_until",
@@ -90,19 +81,9 @@ measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.rows_m",
   "kernel.gemm.split_rows_from",
-  "kernel.gemm.tc5_raster",
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
   "kernel.gemv.splitk_max_n",
-  "kernel.mla.expanded_from",
-  "kernel.mla.path",
-  "kernel.moe.affine_grouped",
-  "kernel.moe.affine_grouped_from",
-  "kernel.moe.affine_wmma",
-  "kernel.moe.bf16_mma_from",
-  "kernel.moe.bf16_mma_until",
-  "kernel.moe.group_at",
-  "kernel.moe.grouped",
   "kernel.moe.mxfp4_cvt",
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
@@ -110,13 +91,6 @@ measured = [
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
   "kernel.moe.mxfp4_wmma",
-  "kernel.moe.nvfp4_mma_from",
-  "kernel.moe.nvfp4_mma_until",
-  "kernel.moe.routes_sized",
-  "kernel.moe.tc5",
-  "kernel.moe.tc5_from",
-  "kernel.moe.w4a4_fused_from",
-  "kernel.moe.w4a4_fused_layout",
   "kernel.moe.w4a8_fused_from",
   "kernel.pdl",
   "kernel.qmm.gemm_from",
@@ -126,45 +100,20 @@ measured = [
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
   "kernel.sdpa.compressed_decode_until",
-  "kernel.sdpa.decode.chunk_floor_128",
   "kernel.sdpa.decode.gqa",
   "kernel.sdpa.decode.gqa_cluster",
   "kernel.sdpa.decode.gqa_deep_64",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
-  "kernel.sdpa.index_fp4_tc5",
-  "kernel.sdpa.index_mma",
-  "kernel.sdpa.index_radix",
-  "kernel.sdpa.index_split_until",
-  "kernel.sdpa.index_tc5",
   "kernel.sdpa.merge_warp",
-  "kernel.sdpa.mla_dense_short",
-  "kernel.sdpa.mla_sparse",
-  "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
-  "kernel.sdpa.prefill.tc5",
   "kernel.sdpa.prefill.wide_sliding",
-  "kernel.sdpa.selected_mma",
-  "kernel.ssm.conv_vec4",
-  "kernel.ssm.gdn_fused_scan",
-  "kernel.ssm.gdn_out_bf16",
-  "kernel.ssm.gdn_scan_until",
-  "kernel.ssm.gdn_step_blocks",
-  "kernel.ssm.gdn_tc5",
-  "kernel.ssm.kda_chunked",
-  "kernel.ssm.kda_step_fused",
   "engine.copies",
-  "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
-  "engine.recording",
-  "engine.seated_first",
   "engine.working_set_percent",
   "compiler.branches",
   "compiler.cond_fixed_us",

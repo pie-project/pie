@@ -108,6 +108,11 @@ pub struct Fire {
     /// constants 0 and 1 (`kernels/prim/kv_page.h`): fixed for a loaded
     /// model, so the pipeline is specialized once and the kernel folds them.
     pub page_strides: Option<[u64; 2]>,
+
+    /// The bytes of the kernel's `[[threadgroup(0)]]` block, set at
+    /// dispatch (0: the kernel declares none): a kernel whose threadgroup
+    /// arrays are sized by what it runs, not by a constant.
+    pub threadgroup_bytes: u32,
 }
 
 /// Three u32 threadgroup counts at `offset` bytes into the buffer `buf` binds.
@@ -128,7 +133,16 @@ impl Fire {
             group: [0, 0, 0],
             indirect: None,
             page_strides: None,
+            threadgroup_bytes: 0,
         }
+    }
+
+    /// Sets the kernel's `[[threadgroup(0)]]` block to `bytes` at dispatch
+    /// ([`Fire::threadgroup_bytes`]).
+    #[must_use]
+    pub const fn threadgroup_bytes(mut self, bytes: u32) -> Self {
+        self.threadgroup_bytes = bytes;
+        self
     }
 
     /// Specializes the pipeline on the kv planes' page strides

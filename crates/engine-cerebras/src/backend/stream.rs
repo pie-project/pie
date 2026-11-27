@@ -400,6 +400,11 @@ impl CerebrasEngine {
                         Value::F32(v) => v,
                         Value::I32(v) => v.into_iter().map(|x| x as f32).collect(),
                         Value::U32(v) => v.into_iter().map(|x| x as f32).collect(),
+                        // bf16 widens exactly: its bits are an f32's high half
+                        Value::Bf16(v) => v
+                            .into_iter()
+                            .map(|x| f32::from_bits(u32::from(x) << 16))
+                            .collect(),
                         Value::Bool(_) => {
                             return Err(invalid(format!("input {}: a boolean cell", feed.id)));
                         }
@@ -684,10 +689,10 @@ impl CerebrasEngine {
         checkpoint: &std::path::Path,
         contract: &checkpoint::contract::ModelContract,
         budgets: &engine::load::Budgets,
+        steps: &engine::StepRules,
         programs: &[(std::path::PathBuf, std::path::PathBuf)],
     ) -> EngineResult<engine::load::Loaded> {
         use engine::caps::{Capabilities, FireLimits, PoolFacts};
-        use engine::chunk::{ChunkFacts, DegenerateBytes};
         use eta_ir::registry::{GeometryClass, PortMask};
         let load = |e: String| Error::Load(e);
         let t0 = std::time::Instant::now();
@@ -797,21 +802,23 @@ impl CerebrasEngine {
             poem_compiler::state_slots(budgets.slots, &trace, super::default_state_slots(budgets));
         let facts = crate::facts::Facts::of(trace.clone(), budgets, slots).map_err(load)?;
         let paging = facts.paging();
-        let pools = PoolFacts {
-            kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-            kv_page_size: paging.page_size,
-            ..PoolFacts::default()
-        };
-        let chunks = ChunkFacts::degenerate(
-            &pools,
-            &DegenerateBytes {
-                kv_page: u64::from(paging.page_size) * 4,
-                buffer_page: 0,
-            },
-        );
+        // One shared pool on the host, kv pages of tokens alone: a stream step holds no cache.
+        let chunks = super::pool::Pool {
+            page_size: paging.page_size,
+            kv_pages: paging.pages(),
+            records: 0,
+            state_bytes: 0,
+            windowed: Vec::new(),
+            buffer_pages: 0,
+            wafer: None,
+        }
+        .facts();
+        chunks
+            .validate()
+            .map_err(|e| load(format!("the stream load's pool: {e}")))?;
         let caps = Capabilities {
             device: super::device_facts(),
-            pools,
+            pools: PoolFacts::default(),
             chunks,
             limits: FireLimits {
                 max_lanes,
@@ -819,7 +826,9 @@ impl CerebrasEngine {
                 max_page_refs: paging.pages_per_slot,
                 max_context: paging.context(),
                 prefill_rows: 0,
+                prefill_lanes: 0,
                 max_readouts: max_tokens,
+                replayed_rows: 0,
                 dispatch_depth: 0,
             },
             has_lora: false,
@@ -831,8 +840,8 @@ impl CerebrasEngine {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: false,
+            windowed_state: false,
             rs_snapshots: 0,
             // a stream step's lanes attend each other's rows
             bidirectional_attention: true,
@@ -840,7 +849,22 @@ impl CerebrasEngine {
             facts: facts.trace().facts.clone(),
             inputs: facts.input_decls(),
             classes: facts.classes(),
+            // Cerebras states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
+            host_ops: engine::HostOps::NONE,
+            mixed_lanes: engine::MixedLanes::Any,
+            // one frame at a time: no run-ahead
+            frames_in_flight: 1,
+            steps: engine::StatedSteps::default(),
         };
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24), as a decode load states them: a stream
+        // load records no bodies either.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
         for s in &readings {
             tracing::info!(
                 program = %s.reading.dir.display(),

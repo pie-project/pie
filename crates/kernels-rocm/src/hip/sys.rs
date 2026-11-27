@@ -85,10 +85,13 @@ table!(Hip from "libamdhip64.so" {
     fn hipSetDevice(device: c_int) -> HipError;
     fn hipGetDevice(device: *mut c_int) -> HipError;
     fn hipGetDevicePropertiesR0600(props: *mut c_void, device: c_int) -> HipError;
+    fn hipDriverGetVersion(version: *mut c_int) -> HipError;
+    fn hipRuntimeGetVersion(version: *mut c_int) -> HipError;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError;
     fn hipMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int, stream: Stream) -> HipError;
     fn hipStreamIsCapturing(stream: Stream, status: *mut c_int) -> HipError;
     fn hipDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> HipError;
+    fn hipDeviceGetPCIBusId(bus: *mut c_char, len: c_int, device: c_int) -> HipError;
     fn hipMalloc(ptr: *mut *mut c_void, bytes: usize) -> HipError;
     fn hipFree(ptr: *mut c_void) -> HipError;
     fn hipMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int) -> HipError;
@@ -123,6 +126,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipStreamCreateWithFlags(stream: *mut Stream, flags: c_uint) -> HipError;
     fn hipStreamWaitEvent(stream: Stream, event: Event, flags: c_uint) -> HipError;
     fn hipLaunchHostFunc(stream: Stream, func: HostFn, data: *mut c_void) -> HipError;
+    fn hipStreamWaitValue32(stream: Stream, ptr: *mut c_void, value: u32, flags: c_uint, mask: u32) -> HipError;
     fn hipStreamBeginCapture(stream: Stream, mode: c_int) -> HipError;
     fn hipStreamEndCapture(stream: Stream, graph: *mut Graph) -> HipError;
     fn hipEventCreate(event: *mut Event) -> HipError;
@@ -149,6 +153,7 @@ table!(Hip from "libamdhip64.so" {
     fn hipMemSetAccess(ptr: *mut c_void, bytes: usize, desc: *const MemAccessDesc, count: usize) -> HipError;
     fn hipMemGetAllocationGranularity(granularity: *mut usize, prop: *const MemAllocationProp, option: c_int) -> HipError;
     fn hipFuncGetAttribute(value: *mut c_int, attr: c_int, function: Function) -> HipError;
+    fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(blocks: *mut c_int, function: Function, block: c_int, shared_bytes: usize) -> HipError;
 });
 
 table!(Hiprtc from "libhiprtc.so" {
@@ -224,6 +229,12 @@ pub type BlasOp = c_int;
 pub type BlasType = c_int;
 
 pub const BLAS_SUCCESS: BlasStatus = 0;
+/// `rocblas_status_size_increased`: a call made in a device-memory size
+/// query asked for more than the query had collected.
+pub const BLAS_SIZE_INCREASED: BlasStatus = 9;
+/// `rocblas_status_size_unchanged`: a call made in a size query asked for no
+/// more than the query had collected.
+pub const BLAS_SIZE_UNCHANGED: BlasStatus = 10;
 pub const BLAS_OP_N: BlasOp = 111;
 pub const BLAS_OP_T: BlasOp = 112;
 pub const BLAS_F16: BlasType = 150;
@@ -237,6 +248,10 @@ table!(Rocblas from "librocblas.so" {
     fn rocblas_destroy_handle(handle: Blas) -> BlasStatus;
     fn rocblas_set_stream(handle: Blas, stream: Stream) -> BlasStatus;
     fn rocblas_status_to_string(status: BlasStatus) -> *const c_char;
+    fn rocblas_start_device_memory_size_query(handle: Blas) -> BlasStatus;
+    fn rocblas_stop_device_memory_size_query(handle: Blas, size: *mut usize) -> BlasStatus;
+    fn rocblas_set_workspace(handle: Blas, addr: *mut c_void, size: usize) -> BlasStatus;
+    fn rocblas_get_device_memory_size(handle: Blas, size: *mut usize) -> BlasStatus;
     fn rocblas_gemm_ex(
         handle: Blas, trans_a: BlasOp, trans_b: BlasOp, m: c_int, n: c_int, k: c_int,
         alpha: *const c_void,
@@ -349,7 +364,8 @@ table!(Hipblaslt from "libhipblaslt.so" {
     ) -> LtStatus;
 });
 
-/// hipBLASLt, opened on first use; a box without it falls back to rocBLAS.
+/// hipBLASLt, opened on first use; a box without it is refused by name
+/// (`lt::open`, at the load).
 pub fn hipblaslt() -> Result<&'static Hipblaslt, String> {
     static LT: OnceLock<Result<Hipblaslt, String>> = OnceLock::new();
     LT.get_or_init(Hipblaslt::open)
@@ -359,7 +375,7 @@ pub fn hipblaslt() -> Result<&'static Hipblaslt, String> {
 
 /// Where to look for a ROCm library: the loader's own search first, then
 /// `$ROCM_PATH/lib`, then the default install root.
-fn open_library(name: &str) -> Result<libloading::Library, String> {
+pub(crate) fn open_library(name: &str) -> Result<libloading::Library, String> {
     let mut tried = Vec::new();
     let mut candidates = vec![PathBuf::from(name)];
     if let Some(root) = std::env::var_os("ROCM_PATH") {
@@ -383,6 +399,29 @@ fn open_library(name: &str) -> Result<libloading::Library, String> {
 pub struct Api {
     pub hip: Hip,
     pub rtc: Hiprtc,
+}
+
+/// Whether this process copies through the device's copy (SDMA) queues:
+/// HIP's default (on) unless the operator's `HSA_ENABLE_SDMA` states
+/// otherwise. Each copy queue holds a save area of device memory
+/// ([`super::kfd`]), made at a stream's first copy past HIP's blit
+/// threshold; a load makes the queues it copies on before its pools
+/// ([`super::warm_copies`]). Off, every copy runs as a blit kernel on the
+/// compute queues, which on gfx942 slows the decode bodies a load captures
+/// about 2.6 times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyQueues {
+    On,
+    Off,
+}
+
+/// [`CopyQueues`] for this process.
+pub fn copy_queues() -> CopyQueues {
+    static CHOSEN: OnceLock<CopyQueues> = OnceLock::new();
+    *CHOSEN.get_or_init(|| match std::env::var("HSA_ENABLE_SDMA") {
+        Ok(stated) if stated.trim() == "0" => CopyQueues::Off,
+        _ => CopyQueues::On,
+    })
 }
 
 /// The loaded runtime, opened once per process. `Err` carries why the ROCm

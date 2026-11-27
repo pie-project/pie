@@ -41,6 +41,11 @@ impl RowExpr {
             Dim::VoxelsScaled(n, d) => RowExpr::Voxels(n, d),
             Dim::Clips => RowExpr::Clips,
             Dim::ClipsPlus(k) => RowExpr::ClipsPlus(k),
+            // Some of the fire's lanes: at most its lanes.
+            Dim::Capturing => RowExpr::Lanes,
+            // A width, never a row count; a row of it is refused where a
+            // shape is read as rows.
+            Dim::ContextTimes(_) | Dim::ContextPages => RowExpr::Const(1),
         }
     }
 
@@ -336,6 +341,15 @@ pub enum Placement {
     },
     Alias(ValueId),
     Struct(StructKind),
+    /// A value of one row a capturing lane ([`Dim::Capturing`]), `width`
+    /// wide (a run of the load's context, [`Dim::ContextTimes`], or its
+    /// pages, [`Dim::ContextPages`]) of `dtype`: no arena bytes. Each
+    /// capturing lane's row lies in its reading program's guest region, a
+    /// term of that program's members.
+    Capture {
+        width: Dim,
+        dtype: Dtype,
+    },
 }
 
 impl Placement {
@@ -347,7 +361,8 @@ impl Placement {
             | Placement::Param(_)
             | Placement::Cache(_)
             | Placement::Alias(_)
-            | Placement::Struct(_) => 0,
+            | Placement::Struct(_)
+            | Placement::Capture { .. } => 0,
         }
     }
 
@@ -391,23 +406,6 @@ impl ArenaMap {
     #[must_use]
     pub fn root(&self, value: ValueId) -> ValueId {
         root(&self.placements, value)
-    }
-
-    /// Where the `attn.scores` planes start: every other slot lies under it.
-    #[must_use]
-    pub fn scores_from(&self, trace: &Trace) -> u64 {
-        trace
-            .outputs
-            .iter()
-            .filter(|output| output.name == SCORES)
-            .filter_map(
-                |output| match self.placements.get(self.root(output.value).0 as usize) {
-                    Some(Placement::Arena { offset, .. }) => Some(*offset),
-                    _ => None,
-                },
-            )
-            .min()
-            .unwrap_or(self.bytes)
     }
 
     #[must_use]
@@ -632,7 +630,6 @@ pub(crate) fn carve(
     flatten(&mut placements);
     let (mut spans, live_in) = lives(trace, &placements, classes);
     outlive_the_region(trace, conc, &mut spans);
-    let held = hold_out_scores(trace, &mut placements);
 
     let stacks = stacks(trace, &placements);
     let mut conservative = placements.clone();
@@ -652,15 +649,11 @@ pub(crate) fn carve(
         conc,
         Columns::Shared,
     );
-    let (mut placements, bytes) = if shared < blind {
+    let (placements, bytes) = if shared < blind {
         (placements, shared)
     } else {
         (conservative, blind)
     };
-    for (id, slot) in held {
-        placements[id] = slot;
-    }
-    let bytes = lift_scores(trace, &mut placements, bytes);
 
     Ok(ArenaMap {
         placements,
@@ -688,6 +681,20 @@ fn rectangles(
                 Def::Cache(i) => Ok(Placement::Cache(*i)),
                 Def::Op(_) | Def::Merge(_) => match &decl.ty {
                     Ty::Struct(kind) => Ok(Placement::Struct(*kind)),
+                    Ty::Tensor { shape, dtype } if shape.first() == Some(&Dim::Capturing) => {
+                        match shape[1..] {
+                            [width @ (Dim::ContextTimes(_) | Dim::ContextPages)] => {
+                                Ok(Placement::Capture {
+                                    width,
+                                    dtype: *dtype,
+                                })
+                            }
+                            _ => Err(Error::Unrectangled {
+                                value,
+                                why: Unrectangled::SymbolicWidth,
+                            }),
+                        }
+                    }
                     Ty::Tensor { shape, dtype } => {
                         let (rows, width) =
                             rect(shape).map_err(|why| Error::Unrectangled { value, why })?;
@@ -743,7 +750,10 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
             | Dim::VoxelsScaled(..)
             | Dim::Clips
             | Dim::ClipsPlus(_)
-            | Dim::Readouts => {
+            | Dim::Readouts
+            | Dim::Capturing
+            | Dim::ContextTimes(_)
+            | Dim::ContextPages => {
                 return Err(Unrectangled::SymbolicWidth);
             }
         }
@@ -916,6 +926,27 @@ fn share(
     let (Some(a), Some(b)) = (placements.get(h.0 as usize), placements.get(s.0 as usize)) else {
         return Err(Error::AliasOutside { holds, shares });
     };
+    // A capturing lane's row written in place (a tensor-parallel group's
+    // sum of the score row each rank holds a term of) stays that row: the
+    // two are one row exactly when they are the same grain (`width`) of the
+    // same dtype. Any other write in place through a value outside the
+    // arena is refused below.
+    if kind == Share::InPlace
+        && let (
+            Placement::Capture {
+                width: aw,
+                dtype: ad,
+            },
+            Placement::Capture {
+                width: bw,
+                dtype: bd,
+            },
+        ) = (a, b)
+        && (aw, ad) == (bw, bd)
+    {
+        placements[s.0 as usize] = Placement::Alias(h);
+        return Ok(());
+    }
     if !a.is_arena() || !b.is_arena() {
         return match kind {
             Share::InPlace => Err(Error::AliasOutside { holds, shares }),
@@ -1119,59 +1150,6 @@ fn widen(set: &mut ClassSet, by: &ClassSet) {
 }
 
 const BIND_ALIGN: u64 = 256;
-
-/// The `attn.scores` planes taken out of the placement, to be put back on
-/// top of every other slot (`lift_scores`): placed among the rest, their
-/// layer-long lives held the bottom of the arena, every later slot went over
-/// them, and lifted they left that room under the rest unused (gpt-oss-20b
-/// at 1024 lanes: 6 GiB of 8.6 the arena backed without scores).
-fn hold_out_scores(trace: &Trace, placements: &mut [Placement]) -> Vec<(usize, Placement)> {
-    let mut held: Vec<(usize, Placement)> = Vec::new();
-    for output in trace.outputs.iter().filter(|output| output.name == SCORES) {
-        let id = root(placements, output.value).0 as usize;
-        if placements.get(id).is_some_and(Placement::is_arena) {
-            held.push((
-                id,
-                core::mem::replace(&mut placements[id], Placement::Param(u32::MAX)),
-            ));
-        }
-    }
-    held
-}
-
-/// Each layer's `attn.scores` plane on top of every other slot, so a load no
-/// program reads scores from backs the arena only up to [`ArenaMap::scores_from`].
-fn lift_scores(trace: &Trace, placements: &mut [Placement], bytes: u64) -> u64 {
-    let mut lifted: Vec<usize> = Vec::new();
-    for output in trace.outputs.iter().filter(|output| output.name == SCORES) {
-        let id = root(placements, output.value).0 as usize;
-        if placements.get(id).is_some_and(Placement::is_arena) && !lifted.contains(&id) {
-            lifted.push(id);
-        }
-    }
-    if lifted.is_empty() {
-        return bytes;
-    }
-    let mut at = placements
-        .iter()
-        .enumerate()
-        .filter(|(id, _)| !lifted.contains(id))
-        .filter_map(|(_, slot)| match slot {
-            Placement::Arena { offset, bytes, .. } => Some(offset + align(*bytes)),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0);
-    for id in lifted {
-        if let Placement::Arena { offset, bytes, .. } = &mut placements[id] {
-            *offset = at;
-            at += align(*bytes);
-        }
-    }
-    at
-}
-
-const SCORES: &str = "attn.scores";
 
 fn align(bytes: u64) -> u64 {
     bytes.div_ceil(BIND_ALIGN) * BIND_ALIGN
@@ -1395,6 +1373,70 @@ mod tests {
         the_row_algebra_sizes_every_dim_at_its_ceiling();
         a_symbolic_width_is_refused_and_names_the_value();
         a_merge_of_two_sizes_is_refused_rather_than_carved();
+        a_capture_row_is_written_in_place_only_through_itself();
+    }
+
+    /// A write in place through a capturing lane's row is that row (an
+    /// all-reduce of the score row the ranks each hold a term of), and only
+    /// that: through the other grain's row, through an arena rectangle or
+    /// from one, or through any other value outside the arena, it is
+    /// refused as before.
+    fn a_capture_row_is_written_in_place_only_through_itself() {
+        let keys = Placement::Capture {
+            width: Dim::ContextTimes(1),
+            dtype: Dtype::F32,
+        };
+        let pages = Placement::Capture {
+            width: Dim::ContextPages,
+            dtype: Dtype::F32,
+        };
+        let rect = Placement::Arena {
+            offset: 0,
+            bytes: 64,
+            rows: RowExpr::of(Dim::Lanes),
+            width: 4,
+            dtype: Dtype::F32,
+        };
+        let (v0, v1) = (ValueId(0), ValueId(1));
+
+        let mut same = vec![keys.clone(), keys.clone()];
+        assert_eq!(share(&mut same, Share::InPlace, v0, v1), Ok(()));
+        assert_eq!(same[1], Placement::Alias(v0), "the reduced row is the row");
+
+        let refused = |holds: Placement, shares: Placement| {
+            let mut placements = vec![holds, shares];
+            assert_eq!(
+                share(&mut placements, Share::InPlace, v0, v1),
+                Err(Error::AliasOutside {
+                    holds: v0,
+                    shares: v1
+                }),
+                "{placements:?}"
+            );
+        };
+        refused(keys.clone(), pages.clone());
+        refused(pages, keys.clone());
+        refused(keys.clone(), rect.clone());
+        refused(rect.clone(), keys);
+        refused(rect, Placement::Runtime(poem_ir::RuntimeInput::Tokens));
+        let mut other = vec![
+            Placement::Capture {
+                width: Dim::ContextTimes(1),
+                dtype: Dtype::F32,
+            },
+            Placement::Capture {
+                width: Dim::ContextTimes(1),
+                dtype: Dtype::Bf16,
+            },
+        ];
+        assert_eq!(
+            share(&mut other, Share::InPlace, v0, v1),
+            Err(Error::AliasOutside {
+                holds: v0,
+                shares: v1
+            }),
+            "a row of another dtype is another row"
+        );
     }
 
     fn the_row_algebra_sizes_every_dim_at_its_ceiling() {

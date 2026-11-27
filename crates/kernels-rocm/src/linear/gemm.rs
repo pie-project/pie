@@ -5,8 +5,56 @@ use crate::tensor::Tensor;
 
 #[cfg(feature = "rocm")]
 use super::dense;
-#[cfg(feature = "rocm")]
 use dtype::Dtype;
+
+/// The workgroups (blocks) of the skinny kernel, ROCm's few-rows kernel,
+/// walking a plain bf16 product of `m x n x k` (`m` up to its 8 rows) one
+/// compute unit of the current device holds at once, at its launch's
+/// threads and LDS: HIP's occupancy calculator
+/// (`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`) over the kernel's
+/// registers and LDS against the compute unit's.
+pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32, Error> {
+    const OP: &str = "linear.few_rows_occupancy";
+    let (m, n, k) = (
+        count(OP, "the rows", m)?,
+        count(OP, "the columns", n)?,
+        count(OP, "the contraction", k)?,
+    );
+    #[cfg(feature = "rocm")]
+    {
+        super::gemv::skinny_resident_blocks(ctx, m, n, k)
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, m, n, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// The waves hipBLASLt's first heuristic algorithm for a dense bf16 product
+/// of `m x n x k` fills on the current device, as its library states the
+/// algorithm's kernel (`hip::lt::waves`). `None` where it offers no
+/// algorithm or states no waves; where its solution could not be read, the
+/// reason is kept for `hip::lt_kernel::pricing`.
+#[cfg(feature = "rocm")]
+#[must_use]
+pub fn waves(m: u32, n: u32, k: u32) -> Option<f64> {
+    crate::hip::lt::waves(crate::hip::lt::Shape {
+        m,
+        n,
+        k,
+        bias: false,
+        groups: 1,
+        f32_out: false,
+    })
+    .unwrap_or_else(|why| {
+        crate::hip::lt_kernel::unread(why);
+        None
+    })
+}
+
+/// The most rows ROCm's few-rows kernel (the skinny kernel) walks.
+pub const FEW_ROWS: u32 = 8;
 
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, None, y)
@@ -100,7 +148,7 @@ pub fn lm_head_live(
     const OP: &str = "linear.matmul";
     #[cfg(feature = "rocm")]
     {
-        let from = ctx.tuning().gemm_live_from;
+        let from = ctx.tuning().gemm_live_from();
         if live != 0
             && from > 0
             && y.rows >= from
@@ -120,6 +168,142 @@ pub fn lm_head_live(
     }
     let _ = live;
     act_x_wt(ctx, OP, act, w, None, y)
+}
+
+/// `z = rmsnorm(x + y) · wᵀ` in one launch where that pays
+/// (`ResidualAddRmsnormMatmul`): `x + y` lands in `y_out` and the normed
+/// rows in `out`, each block norming its own copy where it stages them for
+/// the product. `Ok(false)`, landing nothing, where the product would not take
+/// the skinny kernel or the blocks' redundant norms cost more than the
+/// launch they save; the caller then runs the norm and the product apart.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rmsnorm_matmul(
+    ctx: &Ctx,
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    w: Tensor,
+    y_out: &mut Tensor,
+    out: &mut Tensor,
+    z: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.residual_add_rmsnorm_matmul";
+    if [x.dtype, y.dtype, weight.dtype, w.dtype, y_out.dtype, out.dtype, z.dtype]
+        .iter()
+        .any(|&d| d != Dtype::Bf16)
+        || x.rows != y.rows
+        || x.rows != z.rows
+        || x.width != y.width
+        // The norm's weight as a load lays it (k rows of one) or one row.
+        || u64::from(weight.rows) * u64::from(weight.width) != u64::from(x.width)
+        || w.width != x.width
+        || w.rows != z.width
+        || z.rows == 0
+    {
+        return Ok(false);
+    }
+    let n = count(OP, "the columns this projection lands", z.width)?;
+    let k = count(OP, "the contraction this projection walks", x.width)?;
+    let m = ctx.opaque_rows(stated(OP, z.rows)?);
+    #[cfg(feature = "rocm")]
+    {
+        dense::act_x_wt_normed(
+            ctx,
+            w.ptr,
+            z.ptr,
+            m,
+            n,
+            k,
+            super::gemv::SkinnyNorm {
+                x: x.ptr,
+                y: y.ptr,
+                w: weight.ptr,
+                y_out: y_out.ptr,
+                out: out.ptr,
+                eps,
+                plus_one: i32::from(plus_one),
+            },
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, plus_one, eps, y_out, out, m, n, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// `h = swiglu(rmsnorm(x + y) · gate_upᵀ)` in one launch where that pays
+/// (`ResidualAddRmsnormMatmulSwigluMatmul`'s first half): `x + y` lands in
+/// `y_out` and the normed rows in `out`, each block norming its own copy
+/// where it stages them for the packed `[gate | up]` product. `Ok(false)`,
+/// landing nothing, where the gated product would not take the skinny
+/// kernel or the blocks' redundant norms cost more than the launch they
+/// save; the caller then runs the norm and the MLP apart.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_add_rmsnorm_matmul_swiglu(
+    ctx: &Ctx,
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    gate_up: Tensor,
+    y_out: &mut Tensor,
+    out: &mut Tensor,
+    h: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "fused.residual_add_rmsnorm_matmul_swiglu_matmul";
+    if [
+        x.dtype,
+        y.dtype,
+        weight.dtype,
+        gate_up.dtype,
+        y_out.dtype,
+        out.dtype,
+        h.dtype,
+    ]
+    .iter()
+    .any(|&d| d != Dtype::Bf16)
+        || x.rows != y.rows
+        || x.rows != h.rows
+        || x.width != y.width
+        || u64::from(weight.rows) * u64::from(weight.width) != u64::from(x.width)
+        || gate_up.width != x.width
+        || gate_up.rows != 2 * h.width
+        || h.rows == 0
+    {
+        return Ok(false);
+    }
+    let i = count(OP, "the intermediate width", h.width)?;
+    let k = count(OP, "the contraction this projection walks", x.width)?;
+    let m = ctx.opaque_rows(stated(OP, h.rows)?);
+    #[cfg(feature = "rocm")]
+    {
+        dense::act_x_wt_swiglu_normed(
+            ctx,
+            gate_up.ptr,
+            h.ptr,
+            m,
+            i,
+            k,
+            super::gemv::SkinnyNorm {
+                x: x.ptr,
+                y: y.ptr,
+                w: weight.ptr,
+                y_out: y_out.ptr,
+                out: out.ptr,
+                eps,
+                plus_one: i32::from(plus_one),
+            },
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        let _ = (ctx, plus_one, eps, y_out, out, m, i, k);
+        Err(crate::jit::runtimeless(OP))
+    }
 }
 
 pub fn act_x_wt(

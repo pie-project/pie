@@ -1,6 +1,6 @@
 //! Sizing the cache pool: the kv pages and recurrent-state slots a load
-//! keeps on the device. `[model] device_kv_budget` states the pool's bytes;
-//! omitted, the pool takes what `[model] device_memory_share` leaves once
+//! keeps on the device. A load (a test's, a bench's) may state the pool's
+//! bytes; unstated, the pool takes what the device allowance leaves once
 //! the weights and working set are down. Either way the page count follows
 //! from bytes, so it means the same on every engine and model.
 
@@ -10,11 +10,11 @@ use core::fmt;
 /// what one sequence needs, worded the same on every engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Short {
-    /// A stated `device_kv_budget` past the room the share leaves.
+    /// A stated pool budget past the room the allowance leaves.
     Budget { budget: u64, room: u64 },
-    /// A stated `device_kv_budget` under one sequence at the declared context.
+    /// A stated pool budget under one sequence at the declared context.
     Sequence { budget: u64, least: u64 },
-    /// No budget stated, and the room the share leaves holds no sequence.
+    /// No budget stated, and the room the allowance leaves holds no sequence.
     Room { room: u64, least: u64 },
 }
 
@@ -24,26 +24,27 @@ impl fmt::Display for Short {
         match *self {
             Short::Budget { budget, room } => write!(
                 f,
-                "`[model] device_kv_budget` states {} MiB for the kv pages and state slots, \
-                 and the device has {} MiB under `[model] device_memory_share` once the \
-                 weights and working set are down; state a smaller budget or a larger share",
+                "the load states {} MiB for the kv pages and state slots, and the device has \
+                 {} MiB under `[engine.memory] budget_device` once the weights and working \
+                 set are down; state a smaller pool or a larger budget",
                 mib(budget),
                 mib(room),
             ),
             Short::Sequence { budget, least } => write!(
                 f,
-                "`[model] device_kv_budget` states {} MiB, and one sequence at the declared \
-                 context beside the state slots takes {} MiB; state a larger budget or a \
-                 shorter `max_model_len`",
+                "the load states {} MiB for the kv pages and state slots, and one sequence \
+                 at the declared context beside the state slots takes {} MiB; state a larger \
+                 pool or a shorter `[engine] max_context`",
                 mib(budget),
                 mib(least),
             ),
             Short::Room { room, least } => write!(
                 f,
-                "the device has {} MiB for the kv pages and state slots under `[model] \
-                 device_memory_share`, and one sequence at the declared context beside the \
-                 state slots takes {} MiB; raise the share, state a shorter \
-                 `max_model_len`, or serve a quantized deployment of the model",
+                "the device has {} MiB for the kv pages and state slots under its allowance \
+                 (`[engine.memory] budget_device`, or the whole device), and one sequence at \
+                 the declared context beside the state slots takes {} MiB; state a shorter \
+                 `[engine] max_context`, a larger budget, or serve a quantized deployment of \
+                 the model",
                 mib(room),
                 mib(least),
             ),

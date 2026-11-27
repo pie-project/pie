@@ -101,7 +101,7 @@ pub fn topk_softmax(
     let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
-    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl) {
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl()) {
         return ctx.fire(
             OP,
             fire,
@@ -159,7 +159,7 @@ pub fn topk_softmax_scaled(
     );
     ranked_planes(OP, logits, top_k, routes, weights);
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
-    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl) {
+    if let Some(fire) = topk_lane(t, experts, top_k, logits.rows, ctx.tuning().pdl()) {
         return ctx.fire(
             OP,
             fire,
@@ -223,7 +223,7 @@ pub(super) fn ranked_router(
         ))
         .apply(
             Launch::grid([logits.rows.div_ceil(ROWS), 1, 1], [WARP * ROWS, 1, 1])
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
         ),
         &[
             logits.arg(),
@@ -501,7 +501,7 @@ pub(super) fn route_order_sliced(
         .apply(
             Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1])
                 .smem(2 * (experts + 1) * 4)
-                .programmatic(ctx.tuning().pdl && scan),
+                .programmatic(ctx.tuning().pdl() && scan),
         ),
         &[
             routes.arg(),
@@ -832,7 +832,7 @@ fn gate_tc5(
     };
     let takes = supported()
         && rows > 0
-        && rows <= ctx.tuning().gate_tc5_until
+        && rows <= ctx.tuning().gate_tc5_until()
         && x.dtype == Dtype::Bf16
         && router.dtype == Dtype::Bf16
         && matches!(logits, Dtype::Bf16 | Dtype::F32)
@@ -913,7 +913,7 @@ fn gate_tc5(
             Launch::grid([blocks * split, 1, 1], [GATE_THREADS, 1, 1])
                 .smem(gate_smem(groups, bn, split, stages))
                 .cluster(split)
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
         ),
         &[
             ArgValue::of(&map_w),

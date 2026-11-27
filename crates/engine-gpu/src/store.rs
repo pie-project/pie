@@ -3,12 +3,13 @@
 //! hands out translated to the physical slots kernels address, and the
 //! copies, spills and evacuations that move slots.
 pub mod experts;
+pub mod frozen;
 pub mod kv;
 pub mod layout;
 pub mod pool;
 pub mod rows;
 
-use engine::chunk::{ChunkFacts, Evacuation, ShapeId, SlotCopy};
+use engine::chunk::{ChunkFacts, ChunkTable, Evacuation, ShapeId, SlotCopy};
 use engine::transfer::{KvRun, MemoryDomain};
 use kernels_slang::{KvPool, Segments, Tensor};
 use poem_compiler::chunk::{ChunkRecipe, RowId, SlotLayout};
@@ -19,7 +20,7 @@ use crate::error::{Fault, Result};
 use crate::handles::Handles;
 use crate::run::{CachePool, CacheTable};
 use crate::store::kv::{Facts, Paging};
-use crate::store::layout::{FIXED, LIST, Layout, RS, Slots, WINDOWS, gcd, window_shape};
+use crate::store::layout::{FIXED, LIST, Layout, RS, Slots, WINDOW, gcd};
 use crate::store::pool::Pool;
 
 /// A layer's recurrent cache as kernels bind it: `state` carries the row's
@@ -80,43 +81,87 @@ pub struct Seats {
     pub slot_ids: Tensor,
 
     pub slot_of_row: Tensor,
+
+    /// `4 + pieces` ints a lane where the fire reads windowed rows: its
+    /// folded index, buffer base, first row of the fire, folded index after
+    /// it, and its record's units (`kernels_slang::Ring::lanes`).
+    pub ring_lanes: Tensor,
 }
 
-/// The list a kv row's pages lie in: the kv list, or window list `k`
-/// (CONTRACT-BC 21).
+/// The list a kv row's pages lie in: the kv list, or the window buffer of
+/// a windowed row (CONTRACT-BC 19, 21), whose keys below a lane's folded
+/// index lie in its ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Paged {
     List,
-    Window(usize),
+    Buffer,
 }
 
 impl Paged {
-    /// The window list this is, if one.
-    #[must_use]
-    pub fn window(self) -> Option<usize> {
-        match self {
-            Paged::List => None,
-            Paged::Window(k) => Some(k),
-        }
-    }
-
     /// The slot shape of this list.
     #[must_use]
     pub fn shape(self) -> ShapeId {
         match self {
             Paged::List => LIST,
-            Paged::Window(k) => window_shape(k),
+            Paged::Buffer => WINDOW,
         }
     }
 }
 
-/// A window list as a load lays it: its slot's bytes, the rows its window
-/// retains, the tokens (`T_w`) a slot holds.
+/// The window buffer as a load lays it: its slot's bytes and the tokens
+/// (`T`, the kv page's) a slot holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowRows {
+pub struct BufferRows {
     pub bytes: u64,
-    pub window: u32,
     pub tokens: u32,
+}
+
+/// A windowed kv row's ring in a lane's record ([`crate::chunks::Rings`]):
+/// `rows` (W) rows of its keys at byte `keys` of record piece `piece`, as
+/// many of its values at byte `values` of piece `values_piece`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingAt {
+    pub rows: u32,
+    pub piece: u32,
+    pub keys: u64,
+    pub values_piece: u32,
+    pub values: u64,
+}
+
+/// Where a windowed layer's ring lies in the recipe's ring run: its bytes
+/// from `at` of the region, cut into pieces between `atom`s as `run` cuts
+/// them.
+#[derive(Debug, Clone)]
+struct RingRun {
+    rows: u32,
+    at: u64,
+    atom: u64,
+    run: poem_compiler::chunk::FixedRun,
+}
+
+impl RingRun {
+    /// The record piece and byte there the region's bytes `[from, from +
+    /// len)` lie at, refused where a piece cut divides them.
+    fn place(&self, from: u64, len: u64, what: &str) -> Result<(u32, u64)> {
+        let per = self.run.atoms_per_piece.max(1);
+        let from = self.at + from;
+        let (first, last) = (from / self.atom, (from + len.max(1) - 1) / self.atom);
+        if first / per != last / per {
+            return Err(disagree(format!("cuts {what} across record pieces")));
+        }
+        let piece = *self
+            .run
+            .slots
+            .get(usize::try_from(first / per).unwrap_or(usize::MAX))
+            .ok_or_else(|| disagree(format!("lays {what} past the record's pieces")))?;
+        let byte = self.run.offset + (first % per) * self.atom + from % self.atom;
+        if !byte.is_multiple_of(4) {
+            return Err(disagree(format!(
+                "lays {what} at byte {byte}, inside a word"
+            )));
+        }
+        Ok((piece, byte))
+    }
 }
 
 /// One cache row's place in a slot.
@@ -135,6 +180,8 @@ enum Row {
         values_width: u64,
         keys_cell: u64,
         values_cell: u64,
+        /// A windowed row's ring (its pages then the window buffer's).
+        ring: Option<RingAt>,
     },
     /// A state row: `stride` elements at `offset` in the record's slots
     /// `first ..`: whole in slot `first`, or cut `piece_atoms` atoms
@@ -147,6 +194,19 @@ enum Row {
         piece_atoms: u32,
         piece_bytes: u64,
     },
+}
+
+/// A compressor's state beside kv row `row` (the row a pool gather keys
+/// by its pages), in that row's slots: the recipe's `RowId::Pool` run, a
+/// projection plane at `kv` and a score plane at `score` of the slot,
+/// `width` bf16 a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Compressed {
+    row: u32,
+    paged: Paged,
+    width: u64,
+    kv: u64,
+    score: u64,
 }
 
 /// The rs list's slot as this shell reads it: `tokens` rows of each rs
@@ -162,22 +222,25 @@ pub struct RsRows {
 #[derive(Debug, Clone)]
 pub struct Rows {
     rows: Vec<Row>,
+    compressed: Vec<Compressed>,
     pub chunk_bytes: u64,
     pub list_bytes: u64,
     /// The list slot's tokens: the kv page size.
     pub tokens: u32,
     pub fixed_bytes: u64,
     pub pieces: u32,
-    /// The window lists, narrowest window first.
-    pub windows: Vec<WindowRows>,
+    /// The window buffer, where the load has windowed rows.
+    pub buffer: Option<BufferRows>,
     /// The page tables a fire stages, by the list each pages: the kv
-    /// list's first (the All axis reads it), then each window list's.
+    /// list's first (the All axis reads it), then the window buffer's.
     pub tables: Vec<Paged>,
     pub rs: Option<RsRows>,
     pub kv_rows: Vec<u32>,
-    /// The kv rows each window list lays out, in order.
-    pub window_rows: Vec<Vec<u32>>,
+    /// The kv rows the window buffer lays out, in order.
+    pub buffer_rows: Vec<u32>,
     pub state_rows: Vec<u32>,
+    /// The windowed layers' rings as the facts state them.
+    pub windowed: Vec<engine::chunk::WindowedLayer>,
 }
 
 fn disagree(what: String) -> Fault {
@@ -197,31 +260,29 @@ impl Rows {
         facts: &Facts,
         rs: Option<&crate::rs::Layout>,
     ) -> Result<Rows> {
-        let mut windows = Vec::new();
-        let mut window_runs = Vec::new();
-        for layout in recipe.windows() {
-            if let SlotLayout::List {
-                tokens,
-                bytes,
-                rows,
-                window: Some(window),
-            } = layout
-            {
-                windows.push(WindowRows {
-                    bytes: *bytes,
-                    window: *window,
-                    tokens: *tokens,
-                });
-                window_runs.push(rows.as_slice());
-            }
-        }
-        if windows.len() > WINDOWS {
+        if recipe.windows().next().is_some() {
             return Err(disagree(format!(
-                "keeps {} window lists ({}), where a load holds at most {WINDOWS}",
-                windows.len(),
+                "keeps window lists ({}), where this shell serves windowed rows as ring + \
+                 buffer",
                 recipe.shapes()
             )));
         }
+        let (buffer, buffer_runs) = match recipe.window_buffer() {
+            Some(SlotLayout::List {
+                tokens,
+                bytes,
+                rows,
+                ..
+            }) => (
+                Some(BufferRows {
+                    bytes: *bytes,
+                    tokens: *tokens,
+                }),
+                rows.as_slice(),
+            ),
+            _ => (None, &[][..]),
+        };
+        let rings = rings_of(recipe)?;
         let (tokens, list_bytes, runs) = match recipe.list() {
             Some(SlotLayout::List {
                 tokens,
@@ -240,26 +301,23 @@ impl Rows {
             }) => (*bytes, *pieces_per_ws, rows.as_slice()),
             _ => (0, 0, &[][..]),
         };
-        // Without a kv list the narrowest window list's slot is the kv page.
+        // Without a kv list the window buffer's slot is the kv page.
         let tokens = if list_bytes == 0 {
-            windows.first().map_or(0, |w| w.tokens)
+            buffer.map_or(0, |b| b.tokens)
         } else {
             tokens
         };
-        if let Some(window) = windows
-            .iter()
-            .find(|w| w.tokens == 0 || w.tokens > tokens || tokens % w.tokens != 0)
-        {
+        if let Some(held) = buffer.filter(|b| b.tokens != tokens) {
             return Err(disagree(format!(
-                "pages windowed rows {} tokens a window slot beside {tokens}-token kv pages, \
-                 where a window list's slot divides a kv page",
-                window.tokens
+                "buffers windowed rows {} tokens a slot beside {tokens}-token kv pages, \
+                 where this shell's ring kernels read both as one page",
+                held.tokens
             )));
         }
         let mut tables: Vec<Paged> = Vec::new();
         let mut rows = Vec::with_capacity(trace.caches.len());
         let mut kv_rows = Vec::new();
-        let mut window_rows = vec![Vec::new(); windows.len()];
+        let mut window_rows = Vec::new();
         let mut state_rows = Vec::new();
         for (index, row) in trace.caches.iter().enumerate() {
             let id = RowId::Cache(u32::try_from(index).unwrap_or(u32::MAX));
@@ -296,17 +354,13 @@ impl Rows {
                     let keys_cell = width * element;
                     let values_cell = planes.values * element;
                     let per_token = keys_cell + if own_values { values_cell } else { 0 };
-                    // Where the row lies: a kv list slot or a window list's,
-                    // and the tokens a run there holds.
+                    // Where the row lies: a kv list slot or the window
+                    // buffer's, and the tokens a run there holds.
                     let (paged, run, run_tokens) =
                         if let Some(run) = runs.iter().find(|run| run.row == id) {
                             (Paged::List, run, tokens)
-                        } else if let Some((k, run)) =
-                            window_runs.iter().enumerate().find_map(|(k, runs)| {
-                                runs.iter().find(|run| run.row == id).map(|run| (k, run))
-                            })
-                        {
-                            (Paged::Window(k), run, windows[k].tokens)
+                        } else if let Some(run) = buffer_runs.iter().find(|run| run.row == id) {
+                            (Paged::Buffer, run, tokens)
                         } else {
                             return Err(disagree(format!("lays kv row `{name}` in no slot")));
                         };
@@ -332,10 +386,40 @@ impl Rows {
                         tables.push(paged);
                     }
                     let at = u32::try_from(index).unwrap_or(u32::MAX);
-                    match paged {
-                        Paged::List => kv_rows.push(at),
-                        Paged::Window(k) => window_rows[k].push(at),
-                    }
+                    let ring = match paged {
+                        Paged::List => {
+                            kv_rows.push(at);
+                            None
+                        }
+                        Paged::Buffer => {
+                            window_rows.push(at);
+                            let Some((_, at)) = rings.iter().find(|(row, _)| *row == id) else {
+                                return Err(disagree(format!(
+                                    "buffers windowed kv row `{name}` and gives it no ring"
+                                )));
+                            };
+                            // Keys, then values: a shared plane reads its keys twice.
+                            let half = u64::from(at.rows) * keys_cell;
+                            let (piece, keys) =
+                                at.place(0, half, &format!("kv row `{name}`'s ring keys"))?;
+                            let (values_piece, values) = if own_values {
+                                at.place(
+                                    half,
+                                    u64::from(at.rows) * values_cell,
+                                    &format!("kv row `{name}`'s ring values"),
+                                )?
+                            } else {
+                                (piece, keys)
+                            };
+                            Some(RingAt {
+                                rows: at.rows,
+                                piece,
+                                keys,
+                                values_piece,
+                                values,
+                            })
+                        }
+                    };
                     rows.push(Row::Kv {
                         paged,
                         head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
@@ -350,6 +434,7 @@ impl Rows {
                         } else {
                             values_cell
                         },
+                        ring,
                     });
                 }
                 CacheRow::State {
@@ -411,33 +496,124 @@ impl Rows {
                 }
             }
         }
+        let mut compressed = Vec::new();
+        for (row, width) in poem_compiler::chunk::census::pooled(trace) {
+            let id = RowId::Pool(row);
+            let (paged, run, run_tokens) = if let Some(run) = runs.iter().find(|run| run.row == id)
+            {
+                (Paged::List, run, tokens)
+            } else {
+                return Err(disagree(format!(
+                    "keeps no compressor state beside kv row {row}, which a pool gather \
+                         keys by"
+                )));
+            };
+            let plane = width * Dtype::Bf16.bytes_ceil();
+            if run.per_token != 2 * plane || run.offset % 4 != 0 {
+                return Err(disagree(format!(
+                    "keeps kv row {row}'s compressor state at byte {} and {} bytes a token, \
+                     where this shell keeps two word-aligned {plane}-byte planes",
+                    run.offset, run.per_token
+                )));
+            }
+            compressed.push(Compressed {
+                row,
+                paged,
+                width,
+                kv: run.offset,
+                score: run.offset + u64::from(run_tokens) * plane,
+            });
+        }
         let rs = match rs {
             None => None,
             Some(layout) => Some(rs_rows(recipe, layout)?),
         };
         Ok(Rows {
             rows,
+            compressed,
             chunk_bytes: recipe.chunk_bytes,
             list_bytes,
             tokens,
             fixed_bytes,
             pieces: pieces.max(1),
-            windows,
+            buffer,
             // The kv list's table first: the All axis reads it (or the
-            // narrowest window list's, where no row is in the kv list).
+            // window buffer's, where no row is in the kv list).
             tables: {
                 tables.sort_by_key(|paged| match paged {
                     Paged::List => 0,
-                    Paged::Window(k) => 1 + *k,
+                    Paged::Buffer => 1,
                 });
                 tables
             },
             rs,
             kv_rows,
-            window_rows,
+            buffer_rows: window_rows,
             state_rows,
+            windowed: windowed_of(recipe),
         })
     }
+}
+
+/// The windowed layers' rings as the facts state them: each layer's share
+/// of the ring region ([`crate::chunks::Rings`]).
+fn windowed_of(recipe: &ChunkRecipe) -> Vec<engine::chunk::WindowedLayer> {
+    let Some(windowed) = &recipe.windowed else {
+        return Vec::new();
+    };
+    windowed
+        .layers
+        .iter()
+        .zip(&windowed.region.layer_bytes)
+        .map(|(layer, &bytes)| engine::chunk::WindowedLayer {
+            layer: layer.layer.unwrap_or(u32::MAX),
+            window: layer.window,
+            bytes,
+        })
+        .collect()
+}
+
+/// Each windowed kv row's ring: the plain per-layer rings
+/// ([`crate::chunks::Rings`]) where the recipe's ring run lays the region.
+fn rings_of(recipe: &ChunkRecipe) -> Result<Vec<(RowId, RingRun)>> {
+    let Some(windowed) = &recipe.windowed else {
+        return Ok(Vec::new());
+    };
+    let plain = poem_compiler::chunk::plain_rings(&windowed.layers, crate::chunks::RING_ALIGN);
+    if plain.region != windowed.region {
+        return Err(disagree(
+            "lays a ring region other than this shell's plain per-layer rings".to_string(),
+        ));
+    }
+    if windowed.ring_shape.is_some() {
+        return Err(disagree(
+            "lays the rings at chunk starts, where this shell reads them inside the record"
+                .to_string(),
+        ));
+    }
+    let run = windowed
+        .ring_run(recipe)
+        .ok_or_else(|| disagree("states windowed layers and no ring run".to_string()))?;
+    let mut out = Vec::new();
+    for (at, layer) in windowed.layers.iter().enumerate() {
+        let [row] = layer.rows.as_slice() else {
+            return Err(disagree(format!(
+                "rings layer {:?} of {} kv rows, where this shell reads a ring a row",
+                layer.layer,
+                layer.rows.len()
+            )));
+        };
+        out.push((
+            *row,
+            RingRun {
+                rows: layer.window,
+                at: plain.offsets[at],
+                atom: windowed.region.atom.max(1),
+                run: run.clone(),
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// The rs planes' places in an rs-list slot, read off the recipe's
@@ -504,11 +680,14 @@ fn rs_rows(recipe: &ChunkRecipe, layout: &crate::rs::Layout) -> Result<RsRows> {
 pub struct Pools<B: Backend> {
     paging: Paging,
     rows: Vec<Row>,
+    compressed: Vec<Compressed>,
     pool: Pool<B>,
     layout: Layout,
     /// The cache rows each shape lays out: the kv list's, the record's,
-    /// then each window list's.
+    /// then the window buffer's.
     shape_rows: Vec<Vec<u32>>,
+    /// The windowed layers' rings, as the facts state them.
+    windowed: Vec<engine::chunk::WindowedLayer>,
     /// The page tables a fire stages, by the list each pages.
     tables: Vec<Paged>,
     rs: Option<RsRows>,
@@ -516,22 +695,62 @@ pub struct Pools<B: Backend> {
     host_chunks: u32,
     disk: Option<Spill<B>>,
     watermark: engine::frame::Demand,
+    /// `(rung tokens, chunks)` of each activation rung, ascending: the top
+    /// chunks a fire of the rung takes ([`crate::arena`]).
+    act_chunks: Vec<(u32, u32)>,
+    /// Where each record's own folds left it ([`frozen`]), carried by
+    /// every whole-slot copy of the fixed shape this pool makes.
+    frozen: frozen::Frozen,
+}
+
+/// A record's unit as a slot table's entry. Kernels read the entries as i32,
+/// a negative one as no record, so a unit past `i32::MAX` is refused: staged,
+/// it would read as a lane with no record.
+pub fn slot_entry(unit: u32) -> Result<i32> {
+    i32::try_from(unit).map_err(|_| Fault::Ceiling {
+        what: "record units (a slot table's entry is an i32)",
+        need: u64::from(unit),
+        have: i32::MAX as u64,
+    })
+}
+
+/// A record's units as a slot table's entries ([`slot_entry`]).
+pub fn slot_entries(units: &[u32]) -> Result<Vec<i32>> {
+    units.iter().map(|&unit| slot_entry(unit)).collect()
 }
 
 impl<B: Backend> Pools<B> {
+    /// The bytes of one chunk of the pool.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u64 {
+        self.pool.chunk_bytes()
+    }
+
+    /// The buffers of the pool's backed segments, in order.
+    #[must_use]
+    pub fn segment_buffers(&self) -> Vec<&B::Buffer> {
+        self.pool.segment_buffers()
+    }
+
     /// The pool `layout` sizes over `rows`, kv pages of `paging`'s size,
-    /// and `host_chunks` host chunks beside it; nothing committed yet.
+    /// and `host_chunks` host chunks beside it, its top chunks the
+    /// activation span of `act_chunks`' rungs; nothing committed yet.
     pub fn reserve(
         device: &B::Context,
         rows: Rows,
         layout: Layout,
         paging: Paging,
         host_chunks: u32,
+        act_chunks: Vec<(u32, u32)>,
     ) -> Result<Pools<B>> {
         let pool = Pool::reserve(
             layout.chunk_bytes,
             layout.total_chunks,
             layout.segment_chunks,
+            [
+                act_chunks.first().map_or(0, |&(_, chunks)| chunks),
+                act_chunks.last().map_or(0, |&(_, chunks)| chunks),
+            ],
         )?;
         let list_slots = layout.list.map_or(0, |list| {
             u64::from(list.per_chunk) * u64::from(layout.total_chunks)
@@ -539,7 +758,13 @@ impl<B: Backend> Pools<B> {
         let host = if B::MAPS_HOST {
             HostChunks::Mapped(
                 (host_chunks > 0)
-                    .then(|| B::Buffer::host(device, u64::from(host_chunks) * layout.chunk_bytes))
+                    .then(|| {
+                        B::Buffer::host(
+                            device,
+                            u64::from(host_chunks) * layout.chunk_bytes,
+                            crate::books::owners::HOST_POOL,
+                        )
+                    })
                     .transpose()?,
             )
         } else {
@@ -556,25 +781,36 @@ impl<B: Backend> Pools<B> {
                 pages: list_slots.max(1),
                 ..paging
             },
-            shape_rows: [rows.kv_rows.clone(), rows.state_rows.clone()]
-                .into_iter()
-                .chain(rows.window_rows.iter().cloned())
-                .collect(),
+            shape_rows: vec![
+                rows.kv_rows.clone(),
+                rows.state_rows.clone(),
+                rows.buffer_rows.clone(),
+            ],
+            windowed: rows.windowed.clone(),
             tables: rows.tables.clone(),
             rs: rows.rs,
             rows: rows.rows,
+            compressed: rows.compressed,
             pool,
             layout,
             host,
             host_chunks,
             disk: None,
             watermark: engine::frame::Demand::ZERO,
+            act_chunks,
+            frozen: frozen::Frozen::default(),
         })
     }
 
     #[must_use]
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// The bytes of the host tier's chunks.
+    #[must_use]
+    pub fn host_tier_bytes(&self) -> u64 {
+        u64::from(self.host_chunks) * self.chunk_bytes()
     }
 
     /// The pool as the runtime counts it.
@@ -584,8 +820,23 @@ impl<B: Backend> Pools<B> {
             self.pool.growth(),
             self.pool.committed_segments(),
             &self.shape_rows,
-            [self.host_chunks, self.disk_pages()],
+            [self.host_chunks, self.disk_chunks()],
+            &self.act_chunks,
         )
+    }
+
+    /// The activation span's buffer (the pool's last segment) and the byte
+    /// in it the span ends at; `None` until the load backs it.
+    #[must_use]
+    pub fn span_place(&self) -> Option<(&B::Buffer, u64)> {
+        self.pool.span_place()
+    }
+
+    /// The activation span's chunks: the pool's top ones, state's only where
+    /// the runtime lowers the rung.
+    #[must_use]
+    pub fn span_chunks(&self) -> u32 {
+        self.pool.span()
     }
 
     fn shape(&self, id: ShapeId) -> Result<&Slots> {
@@ -616,6 +867,59 @@ impl<B: Backend> Pools<B> {
         Ok(u64::from(chunk) * self.layout.chunk_bytes + u64::from(index) * shape.slot_bytes)
     }
 
+    /// Slot ref `slot` of shape `id`'s first u32 word in the pool, as a
+    /// kernel binding the segments addresses it.
+    pub fn slot_word(&self, id: ShapeId, slot: u32) -> Result<u32> {
+        let at = self.slot_offset(id, slot)?;
+        u32::try_from(at / 4).map_err(|_| Fault::Ceiling {
+            what: "pool words a kernel indexes",
+            need: at / 4,
+            have: u64::from(u32::MAX),
+        })
+    }
+
+    /// The pool words a kv page id counts, and each kv plane a page holds:
+    /// its first word in the page and the words a slot holds there.
+    /// Refused by name where a plane does not lie in whole words.
+    pub fn kv_planes(&self) -> Result<(u32, Vec<[u32; 2]>)> {
+        let unit = self.unit(LIST)?;
+        let word = |bytes: u64, what: &'static str| {
+            if !bytes.is_multiple_of(4) {
+                return Err(Fault::Program {
+                    at: "store::kv_planes",
+                    why: format!(
+                        "{what} of {bytes} bytes, not whole words: a beam copy moves a page's \
+                         slots a word at a time"
+                    ),
+                });
+            }
+            u32::try_from(bytes / 4).map_err(|_| Fault::Ceiling {
+                what: "pool words a kv page plane holds",
+                need: bytes / 4,
+                have: u64::from(u32::MAX),
+            })
+        };
+        let planes = self
+            .kv_runs()
+            .into_iter()
+            .map(|(offset, cell)| {
+                Ok([
+                    word(offset, "a kv plane's offset")?,
+                    word(cell, "a kv slot's cell")?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((word(unit, "a kv page id's unit")?, planes))
+    }
+
+    /// Whether a list page holds anything but kv rows (a compressed
+    /// attention's state), which a page copy of its kv planes alone would
+    /// leave behind.
+    #[must_use]
+    pub fn pages_hold_more_than_kv(&self) -> bool {
+        !self.compressed.is_empty()
+    }
+
     /// The virtual byte weight slot ref `slot` (of a shape `per_chunk`
     /// slots of `slot_bytes` a chunk) starts at, its chunk committed.
     pub fn weight_slot(&self, per_chunk: u32, slot_bytes: u64, slot: u32) -> Result<u64> {
@@ -636,6 +940,63 @@ impl<B: Backend> Pools<B> {
     /// The segment buffer virtual byte `at` lies in, and its offset there.
     pub fn locate(&self, at: u64) -> Result<(&B::Buffer, u64)> {
         self.pool.locate(at)
+    }
+
+    /// Logical chunk `chunk`'s first byte as a guest's state lies there
+    /// (`guest::state`): the segment buffer its physical chunk sits in now
+    /// and its offset there, its segment committed. A run of chunks from it
+    /// lies at the next physical chunks of the same segment.
+    pub fn chunk_place(&self, chunk: u32) -> Result<(&B::Buffer, u64)> {
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a guest's state may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let physical = self.pool.physical(chunk)?;
+        self.pool.admit(physical)?;
+        self.pool
+            .locate(u64::from(physical) * self.layout.chunk_bytes)
+    }
+
+    /// Logical chunk `chunk`'s first u32 word in the pool, as a kernel
+    /// binding the segments addresses it ([`Pools::chunk_place`]'s byte;
+    /// a run of chunks from it lies at the next physical chunks of the
+    /// same segment, its words one span).
+    pub fn chunk_word(&self, chunk: u32) -> Result<u32> {
+        if chunk == 0 || chunk >= self.layout.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks a guest's state may name (past the null chunk)",
+                need: u64::from(chunk) + 1,
+                have: u64::from(self.layout.total_chunks),
+            });
+        }
+        let physical = self.pool.physical(chunk)?;
+        self.pool.admit(physical)?;
+        let at = u64::from(physical) * self.layout.chunk_bytes;
+        u32::try_from(at / 4).map_err(|_| Fault::Ceiling {
+            what: "pool words a kernel indexes",
+            need: at / 4,
+            have: u64::from(u32::MAX),
+        })
+    }
+
+    /// The bytes one slot of shape `id` holds.
+    pub fn slot_bytes(&self, id: ShapeId) -> Result<u64> {
+        Ok(self.shape(id)?.slot_bytes)
+    }
+
+    /// The slots of shape `id` one chunk holds.
+    pub fn slots_per_chunk(&self, id: ShapeId) -> Result<u32> {
+        Ok(self.shape(id)?.per_chunk)
+    }
+
+    /// Slot ref `slot` of shape `id` as a guest's table or cell lies
+    /// (`guest::held`): the segment buffer its chunk sits in now and its
+    /// first byte there.
+    pub fn slot_place(&self, id: ShapeId, slot: u32) -> Result<(&B::Buffer, u64)> {
+        self.pool.locate(self.slot_offset(id, slot)?)
     }
 
     /// What one id of shape `id` counts as kernels address it: the slot
@@ -676,6 +1037,37 @@ impl<B: Backend> Pools<B> {
         refs.iter().map(|&r| self.units(LIST, r)).collect()
     }
 
+    /// What a lane of a bind-only fire names by ref: `pages` slot refs of
+    /// the list shape and a record (a slot ref of the fixed shape a piece),
+    /// each in the first chunk past the null chunk. The fire reads and writes
+    /// none of them; the pool takes them as any lane's (none of a shape the
+    /// pool holds not).
+    pub fn walk_refs(&self, pages: u32) -> Result<(Vec<u32>, Vec<u32>)> {
+        let first = |id: ShapeId, count: u32| -> Result<Vec<u32>> {
+            let per_chunk = self.shape(id)?.per_chunk.max(1);
+            Ok((0..count).map(|at| per_chunk + at % per_chunk).collect())
+        };
+        let pages = if self.layout.list.is_some() {
+            first(LIST, pages)?
+        } else {
+            Vec::new()
+        };
+        let record = if self.has_state() {
+            first(FIXED, self.pieces())?
+        } else {
+            vec![0; self.pieces() as usize]
+        };
+        Ok((pages, record))
+    }
+
+    /// `pages` rs-list slot refs any lane may take, as
+    /// [`Pools::walk_refs`] names the kv list's: a bind-only fire reads and
+    /// writes none of them.
+    pub fn walk_rs_refs(&self, pages: u32) -> Result<Vec<u32>> {
+        let per_chunk = self.shape(RS)?.per_chunk.max(1);
+        Ok((0..pages).map(|at| per_chunk + at % per_chunk).collect())
+    }
+
     /// The physical page explicit write descriptor page `page` names.
     pub fn kv_page(&self, page: u32) -> Result<u32> {
         self.units(LIST, page)
@@ -697,69 +1089,128 @@ impl<B: Backend> Pools<B> {
             .unwrap_or(0)
     }
 
-    /// The page table each window list's write descriptors read, by its
-    /// window; a window the recipe kept whole reads the kv list's (table 0).
+    /// The page table each windowed row's write descriptors read, by its
+    /// window: the window buffer's.
     #[must_use]
     pub fn window_tables(&self) -> Vec<(u32, usize)> {
-        (0..WINDOWS)
-            .filter_map(|k| {
-                let list = self.layout.window(k)?;
-                Some((list.window, self.table_of(Paged::Window(k))))
-            })
-            .collect()
+        let mut out: Vec<(u32, usize)> = Vec::new();
+        for row in &self.rows {
+            if let Row::Kv {
+                ring: Some(ring), ..
+            } = row
+                && !out.iter().any(|&(w, _)| w == ring.rows)
+            {
+                out.push((ring.rows, self.table_of(Paged::Buffer)));
+            }
+        }
+        out
     }
 
-    /// The paging of `paged`'s list: the kv page, or window list `k`'s `T_w`
-    /// tokens a page (CONTRACT-BC 21), as many pages a seat as its context
-    /// fills.
+    /// The distinct windows the windowed rows read through.
     #[must_use]
-    pub fn paging_of(&self, paged: Paged) -> Paging {
-        match paged.window().and_then(|k| self.layout.window(k)) {
-            Some(list) => {
-                let tokens = list.tokens.max(1);
-                Paging {
-                    page_size: tokens,
-                    pages_per_slot: self.paging.context().div_ceil(tokens).max(1),
-                    ..self.paging
-                }
-            }
-            None => self.paging,
-        }
+    pub fn windows(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.window_tables().into_iter().map(|(w, _)| w).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The windowed layers' rings, as the facts state them.
+    #[must_use]
+    pub fn windowed(&self) -> &[engine::chunk::WindowedLayer] {
+        &self.windowed
+    }
+
+    /// The widest ring a windowed row holds and the narrowest window, where
+    /// the load has windowed rows: every ring holds at least its window.
+    #[must_use]
+    pub fn rings(&self) -> Option<(u32, u32)> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Kv {
+                    ring: Some(ring), ..
+                } => Some(ring.rows),
+                _ => None,
+            })
+            .fold(None, |held: Option<(u32, u32)>, w| {
+                Some(held.map_or((w, w), |(a, b)| (a.max(w), b.min(w))))
+            })
+    }
+
+    /// The paging of `paged`'s list: the kv page (the window buffer's slot
+    /// holds as many rows), as many pages a seat as its context fills.
+    #[must_use]
+    pub fn paging_of(&self, _paged: Paged) -> Paging {
+        self.paging
     }
 
     /// A lane's pages of `paged`'s list as kernels address them, in token
-    /// order: `refs` (its slot refs; in a window list 0 is a slot trimmed
-    /// behind the window, the null chunk) as units of [`Pools::unit`], or,
-    /// seat-addressed, seat `seat`'s run, `pages` of them.
+    /// order: `refs` (its slot refs) as units of [`Pools::unit`], or,
+    /// seat-addressed, seat `seat`'s run from its page `first`, `pages` of
+    /// them.
     pub fn list_pages(
         &self,
         paged: Paged,
         refs: &[u32],
-        seat: Option<(u32, u32)>,
+        seat: Option<(u32, u32, u32)>,
     ) -> Result<Vec<u32>> {
-        let Paged::Window(k) = paged else {
-            return self.kv_pages(refs, seat);
+        let Paged::Buffer = paged else {
+            return self.kv_pages(refs, seat.map(|(slot, _, pages)| (slot, pages)));
         };
-        let id = window_shape(k);
-        let window = *self.shape(id)?;
-        let unit = |slot: u32| -> Result<u32> {
-            if slot == 0 {
-                return Ok(0);
-            }
-            self.units(id, slot)
-        };
-        if let Some((slot, pages)) = seat
+        let buffer = *self.shape(WINDOW)?;
+        if let Some((slot, first, pages)) = seat
             && refs.is_empty()
         {
-            let first = u64::from(slot) * u64::from(self.paging_of(paged).pages_per_slot);
+            let base = u64::from(slot) * u64::from(self.paging.pages_per_slot) + u64::from(first);
             return (0..pages)
                 .map(|page| {
-                    let at = u32::try_from(first + u64::from(page)).unwrap_or(u32::MAX);
-                    unit(window.seat_ref(at)?)
+                    let at = u32::try_from(base + u64::from(page)).unwrap_or(u32::MAX);
+                    self.units(WINDOW, buffer.seat_ref(at)?)
                 })
                 .collect();
         }
-        refs.iter().map(|&r| unit(r)).collect()
+        refs.iter().map(|&r| self.units(WINDOW, r)).collect()
+    }
+
+    /// The window buffer's slot bytes and its unit (what one of its page ids
+    /// counts), where the load has one.
+    #[must_use]
+    pub fn buffer_slot(&self) -> Option<(u64, u64)> {
+        let shape = self.layout.shape(WINDOW)?;
+        Some((shape.slot_bytes, self.unit(WINDOW).ok()?))
+    }
+
+    /// The fire's own window-buffer-shaped slots, `count` from byte `at`
+    /// of the span's buffer (the first on the next unit), as kernel units.
+    pub fn fire_units(&self, at: u64, count: u32) -> Result<Vec<u32>> {
+        let (_, unit) = self.buffer_slot().ok_or_else(|| Fault::Unbound {
+            what: "the window buffer, which this load holds none of".to_string(),
+        })?;
+        self.units_at((self.pool.span_base() + at).next_multiple_of(unit), count)
+    }
+
+    /// Window-buffer-shaped slots laid at virtual byte `at` of the pool (the
+    /// fire's own, in its activation span), `count` of them, as kernel
+    /// units; `at` a multiple of the unit.
+    pub fn units_at(&self, at: u64, count: u32) -> Result<Vec<u32>> {
+        let (slot, unit) = self.buffer_slot().ok_or_else(|| Fault::Unbound {
+            what: "the window buffer, which this load holds none of".to_string(),
+        })?;
+        if !at.is_multiple_of(unit) || !slot.is_multiple_of(unit) {
+            return Err(Fault::Unbound {
+                what: format!("fire slots at byte {at}, off the window buffer's {unit}-byte units"),
+            });
+        }
+        (0..u64::from(count))
+            .map(|k| {
+                let byte = at + k * slot;
+                u32::try_from(byte / unit).map_err(|_| Fault::Ceiling {
+                    what: "slot units a kernel indexes",
+                    need: byte,
+                    have: u64::from(u32::MAX),
+                })
+            })
+            .collect()
     }
 
     /// The slots a record takes.
@@ -828,7 +1279,25 @@ impl<B: Backend> Pools<B> {
 
     /// The pool as kernels bind it.
     pub fn segments(&self, handles: &Handles<B>) -> Result<Segments> {
-        self.pool.bind(handles)
+        self.pool.bind(handles, None)
+    }
+
+    /// The pool as a fire's kernels bind it, below its rung's carve where
+    /// `below` states it ([`pool::Pool::bind`]).
+    pub fn segments_below(&self, handles: &Handles<B>, below: Option<u64>) -> Result<Segments> {
+        self.pool.bind(handles, below)
+    }
+
+    /// The pool is laid whole: its device cannot rebind what a recording
+    /// binds of it.
+    pub fn lay_whole(&mut self) {
+        self.pool.lay_whole();
+    }
+
+    /// Each pool segment's buffer where it is backed, beside its stand-in.
+    #[must_use]
+    pub fn placed_segments(&self) -> Vec<(Option<&B::Buffer>, &B::Buffer)> {
+        self.pool.placed()
     }
 
     #[must_use]
@@ -879,8 +1348,18 @@ impl<B: Backend> Pools<B> {
         Ok(out)
     }
 
+    /// Whether a lane holds a record: recurrent state, or the windowed
+    /// layers' rings.
     #[must_use]
     pub fn has_state(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| matches!(row, Row::State { .. } | Row::Kv { ring: Some(_), .. }))
+    }
+
+    /// Whether the load holds recurrent state rows.
+    #[must_use]
+    pub fn has_recurrent(&self) -> bool {
         self.rows.iter().any(|row| matches!(row, Row::State { .. }))
     }
 
@@ -905,9 +1384,54 @@ impl<B: Backend> Pools<B> {
         self.pool.committed_bytes()
     }
 
+    /// Each ring's geometry as the fold reads it (`attn/ring.slang`'s
+    /// layer entries), its rows in order: its keys' and values' origins,
+    /// its slot unit and row words, the pieces and the words its ring's keys
+    /// and values lie at, and its ring rows, every word a u32 of the pool.
+    /// [`Self::table`] binds the same rows in the same order.
+    pub fn ring_layers(&self) -> Result<Vec<i32>> {
+        let mut out = Vec::new();
+        for row in &self.rows {
+            let Row::Kv {
+                paged,
+                head_dim,
+                kv_heads,
+                keys,
+                values,
+                ring: Some(ring),
+                ..
+            } = *row
+            else {
+                continue;
+            };
+            let word = |v: u64| {
+                i32::try_from(v).map_err(|_| Fault::Unbound {
+                    what: format!("ring word {v}, which passes the fold's int"),
+                })
+            };
+            out.extend([
+                word(keys / 4)?,
+                word(values / 4)?,
+                word(self.unit(paged.shape())? / 4)?,
+                word(u64::from(kv_heads) * u64::from(head_dim) / 2)?,
+                word(u64::from(ring.piece))?,
+                word(u64::from(ring.values_piece))?,
+                word(ring.keys / 4)?,
+                word(ring.values / 4)?,
+                word(u64::from(ring.rows))?,
+            ]);
+        }
+        Ok(out)
+    }
+
     /// The cache table one fire binds.
-    pub fn table(&self, handles: &Handles<B>, seats: &Seats) -> Result<CacheTable> {
-        let segments = self.pool.bind(handles)?;
+    pub fn table(
+        &self,
+        handles: &Handles<B>,
+        seats: &Seats,
+        below: Option<u64>,
+    ) -> Result<CacheTable> {
+        let segments = self.pool.bind(handles, below)?;
         let cells = u32::try_from(self.paging.pages() * u64::from(self.paging.page_size))
             .unwrap_or(u32::MAX);
         let fixed_unit = self.unit(FIXED).unwrap_or(4);
@@ -922,6 +1446,7 @@ impl<B: Backend> Pools<B> {
                     keys,
                     values,
                     values_width,
+                    ring,
                     ..
                 } => {
                     let table = self.table_of(paged);
@@ -954,6 +1479,16 @@ impl<B: Backend> Pools<B> {
                             u32::try_from(keys / 4).unwrap_or(u32::MAX),
                             u32::try_from(values / 4).unwrap_or(u32::MAX),
                         ],
+                        ring: ring.map(|ring| kernels_slang::Ring {
+                            lanes: seats.ring_lanes,
+                            rows: ring.rows,
+                            piece: ring.piece,
+                            values_piece: ring.values_piece,
+                            pieces: self.pieces(),
+                            keys: u32::try_from(ring.keys / 4).unwrap_or(u32::MAX),
+                            values: u32::try_from(ring.values / 4).unwrap_or(u32::MAX),
+                            slot_stride: u32::try_from(fixed_unit / 4).unwrap_or(u32::MAX),
+                        }),
                     })
                 }
                 Row::State {
@@ -980,19 +1515,39 @@ impl<B: Backend> Pools<B> {
                 }),
             });
         }
-        Ok(CacheTable(rows))
+        let states = self
+            .compressed
+            .iter()
+            .map(|state| {
+                let stride = u32::try_from(self.unit(state.paged.shape())? / 4).unwrap_or(u32::MAX);
+                Ok((
+                    state.row,
+                    kernels_slang::attn::pool::PoolState {
+                        pool: segments,
+                        origin: [
+                            u32::try_from(state.kv / 4).unwrap_or(u32::MAX),
+                            u32::try_from(state.score / 4).unwrap_or(u32::MAX),
+                        ],
+                        page_stride: stride,
+                        pitch: u32::try_from(state.width).unwrap_or(u32::MAX),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CacheTable(rows, states))
     }
 
-    /// Zeroes the record at `units` (a piece each): a fresh lane's state.
-    /// The caller has drained every frame.
-    pub fn clear(&mut self, units: &[u32]) -> Result<()> {
+    /// Zeroes the record at `units` (a piece each) in `frame`: a fresh
+    /// lane's state, written in queue order, after every frame submitted
+    /// before and before every one submitted after.
+    pub fn clear(&self, frame: &mut B::Frame, units: &[u32]) -> Result<()> {
         if !self.has_state() {
             return Ok(());
         }
         let bytes = self.shape(FIXED)?.slot_bytes;
         let unit = self.unit(FIXED)?;
         for &id in units {
-            self.pool.zero(u64::from(id) * unit, bytes)?;
+            self.pool.zero(frame, u64::from(id) * unit, bytes)?;
         }
         Ok(())
     }
@@ -1052,15 +1607,48 @@ impl<B: Backend> Pools<B> {
         Ok(())
     }
 
+    /// The slot refs of the fixed shape a lane's record stands in, a piece
+    /// each ([`Self::record`]); `None` where the pool holds no state.
+    pub fn record_refs(&self, refs: Option<&[u32]>, seat: u32) -> Result<Option<Vec<u32>>> {
+        if !self.has_state() {
+            return Ok(None);
+        }
+        match refs {
+            Some(refs) => Ok(Some(refs.to_vec())),
+            None => {
+                let pieces = self.pieces();
+                let fixed = *self.shape(FIXED)?;
+                (0..pieces)
+                    .map(|p| fixed.seat_ref(seat * pieces + p))
+                    .collect::<Result<Vec<u32>>>()
+                    .map(Some)
+            }
+        }
+    }
+
+    /// The slot the last fold of the record in `pieces` left it at, where
+    /// the record keeps its own position ([`frozen`]).
+    #[must_use]
+    pub fn frozen_at(&self, pieces: &[u32]) -> Option<u32> {
+        self.frozen.held(pieces)
+    }
+
+    /// A fire left the record in `pieces` at `at`; `None` hands its
+    /// position back to the verb that states it.
+    pub fn leave_frozen(&mut self, pieces: &[u32], at: Option<u32>) {
+        self.frozen.leave(pieces, at);
+    }
+
     /// A kv page's bytes, as the slot file holds one: a list slot.
     #[must_use]
     pub fn page_bytes(&self) -> u64 {
         self.layout.list.map_or(0, |list| list.slot_bytes)
     }
 
-    /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device.
+    /// Copies whole slots of `id` (slot refs) `(src, dst)` on the device;
+    /// a record's own frozen position goes with it ([`frozen`]).
     pub fn copy_shape(
-        &self,
+        &mut self,
         frame: &mut B::Frame,
         id: ShapeId,
         moves: &[(u32, u32)],
@@ -1072,6 +1660,10 @@ impl<B: Backend> Pools<B> {
             if from != to {
                 self.pool.copy(frame, from, to, bytes)?;
             }
+        }
+        if id == FIXED {
+            self.frozen
+                .copied(frozen::Tier::Device, frozen::Tier::Device, moves);
         }
         Ok(())
     }
@@ -1093,9 +1685,30 @@ impl<B: Backend> Pools<B> {
 
     /// Slots of one shape copied as [`engine::Tiers::copy`] states
     /// them: on the device (whole slots, and token runs of the list),
-    /// between the device and the host chunks, or between the device and
-    /// the slot file. A host or disk copy waits out its frame.
+    /// between the device and the host chunks, or between the device (or
+    /// the host chunks) and the slot file. A host or disk copy waits out its
+    /// frame. A record's
+    /// own frozen position goes where its slot does ([`frozen`]).
     pub fn copy_slots(
+        &mut self,
+        device: &B::Context,
+        frame: &mut B::Frame,
+        copy: &SlotCopy,
+    ) -> Result<()> {
+        self.copy_slot_bytes(device, frame, copy)?;
+        let (src, dst) = (B::is_device(copy.src), B::is_device(copy.dst));
+        // Within the device `copy_shape` carried it.
+        if copy.shape == FIXED && !(src && dst) {
+            self.frozen.copied(
+                frozen::Tier::of(copy.src, src),
+                frozen::Tier::of(copy.dst, dst),
+                &copy.slots,
+            );
+        }
+        Ok(())
+    }
+
+    fn copy_slot_bytes(
         &mut self,
         device: &B::Context,
         frame: &mut B::Frame,
@@ -1206,10 +1819,18 @@ impl<B: Backend> Pools<B> {
                 let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
                 self.spill(device, copy.shape, false, &ids, &slots)
             }
+            (MemoryDomain::HostPinned, MemoryDomain::LocalDisk) => {
+                let (ids, slots): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, true, &ids, &slots)
+            }
+            (MemoryDomain::LocalDisk, MemoryDomain::HostPinned) => {
+                let (slots, ids): (Vec<u32>, Vec<u32>) = copy.slots.iter().copied().unzip();
+                self.spill_host(copy.shape, false, &ids, &slots)
+            }
             (src, dst) => Err(Fault::Unbound {
                 what: format!(
                     "a slot copy from {src:?} to {dst:?}: this pool moves slots within the \
-                     device, to its host chunks and to its slot file"
+                     device, to its host chunks, and from either to its disk chunks"
                 ),
             }),
         }
@@ -1281,6 +1902,13 @@ impl<B: Backend> Pools<B> {
                 have: bytes.len() as u64,
             });
         }
+        // Bytes from outside the pool carry no position of a record's own:
+        // what they hold stands where its verb states.
+        for (shape, refs) in slots {
+            if *shape == FIXED {
+                self.frozen.written(frozen::Tier::Host, refs);
+            }
+        }
         let host = match &mut self.host {
             HostChunks::Mapped(host) => host.as_mut().ok_or(Fault::Ceiling {
                 what: "host chunks of the state pool",
@@ -1317,8 +1945,45 @@ impl<B: Backend> Pools<B> {
         Ok(())
     }
 
-    /// Copies whole kv list slots (slot refs `ids`) and the slot file's
-    /// `slots` the way `to_disk` says. The caller has drained every frame.
+    /// The bytes one disk chunk takes: a pool chunk, on a direct I/O
+    /// boundary. A disk chunk is laid out as the device's (and the host
+    /// tier's), any shape's slots in any chunk.
+    #[must_use]
+    pub fn disk_chunk_bytes(&self) -> u64 {
+        self.layout
+            .chunk_bytes
+            .next_multiple_of(engine::disk::ALIGN as u64)
+    }
+
+    /// How the slot file divides the disk tier: each shape's id, its slots
+    /// a disk chunk and the bytes of each, packed as on the device.
+    #[must_use]
+    pub fn disk_division(&self) -> Vec<(ShapeId, u32, u64)> {
+        self.layout
+            .shapes()
+            .map(|shape| (shape.id, shape.per_chunk, shape.slot_bytes))
+            .collect()
+    }
+
+    /// The byte of the slot file disk ref `slot` of shape `id` starts at:
+    /// slot `index` of disk chunk `chunk`, as on the device.
+    fn disk_place(&self, id: ShapeId, slot: u32) -> Result<u64> {
+        let shape = *self.shape(id)?;
+        let (chunk, index) = shape.split(slot);
+        let have = self.disk_chunks();
+        if chunk >= have {
+            return Err(Fault::Ceiling {
+                what: "chunks of the disk tier",
+                need: u64::from(chunk) + 1,
+                have: u64::from(have),
+            });
+        }
+        Ok(u64::from(chunk) * self.disk_chunk_bytes() + u64::from(index) * shape.slot_bytes)
+    }
+
+    /// Copies whole slots of shape `id` between the device (slot refs
+    /// `ids`) and the slot file (disk refs `slots`) the way `to_disk` says.
+    /// The caller has drained every frame.
     fn spill(
         &mut self,
         device: &B::Context,
@@ -1327,55 +1992,157 @@ impl<B: Backend> Pools<B> {
         ids: &[u32],
         slots: &[u32],
     ) -> Result<()> {
-        if id != LIST {
-            return Err(Fault::Unbound {
-                what: format!("slot shape {id} to the slot file, which holds kv list slots"),
-            });
-        }
-        Spill::room(self.disk.as_ref(), "disk kv pages", slots)?;
-        let bytes = self.page_bytes();
-        let places = ids
+        let bytes = self.shape(id)?.slot_bytes;
+        let places = slots
             .iter()
-            .map(|&slot| self.slot_offset(LIST, slot))
+            .map(|&slot| self.disk_place(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let offsets = ids
+            .iter()
+            .map(|&slot| self.slot_offset(id, slot))
             .collect::<Result<Vec<_>>>()?;
         let Some(mut disk) = self.disk.take() else {
             return Ok(());
         };
-        let copied = places.into_iter().zip(slots).try_for_each(|(at, &slot)| {
-            let (buffer, local) = self.pool.locate(at)?;
-            disk.copy(device, buffer, local, bytes, to_disk, slot)
-        });
+        let copied = offsets
+            .into_iter()
+            .map(|at| self.pool.locate(at))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|rows| disk.copy(device, &rows, &places, bytes, to_disk));
         self.disk = Some(disk);
         copied
     }
 
-    /// Opens the kv slot file under `dir` within `budget` bytes; the kv
-    /// pages it holds.
+    /// Copies whole slots of shape `id` between the host chunks (host slot
+    /// refs `ids`) and the slot file (disk refs `slots`) the way `to_disk`
+    /// says: the host tier's idle state going on down to disk, and back.
+    /// The bytes pass through the host alone. The caller has drained every
+    /// frame.
+    fn spill_host(&mut self, id: ShapeId, to_disk: bool, ids: &[u32], slots: &[u32]) -> Result<()> {
+        let bytes = self.shape(id)?.slot_bytes;
+        let places = slots
+            .iter()
+            .map(|&slot| self.disk_place(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let hosts = ids
+            .iter()
+            .map(|&slot| self.host_offset(id, slot))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(file) = self.disk.as_ref().map(Spill::file) else {
+            return Ok(());
+        };
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let mut stage = engine::disk::Aligned::zeroed(cover_room(bytes));
+        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        for (at, disk_at) in hosts.into_iter().zip(places) {
+            let (start, span, lead) = cover(disk_at, bytes);
+            let staged = &mut stage.as_mut_slice()[..span];
+            let span = |host_len: usize| {
+                let from = usize::try_from(at).unwrap_or(usize::MAX);
+                from.checked_add(len)
+                    .filter(|&end| end <= host_len)
+                    .map(|end| from..end)
+                    .ok_or(Fault::Ceiling {
+                        what: "bytes of the host chunks",
+                        need: at + bytes,
+                        have: host_len as u64,
+                    })
+            };
+            if to_disk {
+                let slot = &mut staged[lead..lead + len];
+                match &self.host {
+                    HostChunks::Mapped(host) => host
+                        .as_ref()
+                        .ok_or(Fault::Ceiling {
+                            what: "host chunks of the state pool",
+                            need: 1,
+                            have: 0,
+                        })?
+                        .read(at, slot)?,
+                    HostChunks::Heap(host) => {
+                        slot.copy_from_slice(&host[span(host.len())?]);
+                    }
+                }
+                keep_edges(file, start, staged, lead, len, &mut edge)?;
+                file.write_span(start, staged).map_err(slot_file)?;
+            } else {
+                file.read_span(start, staged).map_err(slot_file)?;
+                let slot = &staged[lead..lead + len];
+                match &mut self.host {
+                    HostChunks::Mapped(host) => host
+                        .as_mut()
+                        .ok_or(Fault::Ceiling {
+                            what: "host chunks of the state pool",
+                            need: 1,
+                            have: 0,
+                        })?
+                        .write(at, slot)?,
+                    HostChunks::Heap(host) => {
+                        let span = span(host.len())?;
+                        host[span].copy_from_slice(slot);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the slot file under `dir` within `budget` bytes: chunks of
+    /// [`Self::disk_chunk_bytes`], any shape's slots in any chunk, laid out
+    /// as on the device. The disk chunks it holds.
     pub fn seat_disk(
         &mut self,
         device: &B::Context,
         dir: &std::path::Path,
         budget: u64,
     ) -> Result<u32> {
-        let page = self.page_bytes();
-        if page > 0 {
-            self.disk = Spill::open(device, dir, "r0.kv", page, budget)?;
+        let chunk = self.disk_chunk_bytes();
+        let widest = self.layout.shapes().map(|shape| shape.slot_bytes).max();
+        if let (true, Some(widest)) = (chunk > 0, widest) {
+            self.disk = Spill::open(
+                device,
+                dir,
+                "r0.state",
+                chunk,
+                cover_room(widest) as u64,
+                budget,
+            )?;
         }
-        Ok(self.disk_pages())
+        Ok(self.disk_chunks())
+    }
+
+    /// Whether the host chunks are device-mapped memory a frame copies
+    /// to and from (else a heap the host copies through, in the call).
+    #[must_use]
+    pub fn host_mapped(&self) -> bool {
+        matches!(self.host, HostChunks::Mapped(_))
+    }
+
+    /// Waits out a slot file read's copy onto the device still in flight.
+    pub fn settle_spill(&mut self) -> Result<()> {
+        match &mut self.disk {
+            Some(Spill::Mapped { landing, .. }) => {
+                landing.take().map_or(Ok(()), |landing| landing.wait())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn unseat_disk(&mut self) {
         self.disk = None;
     }
 
+    /// The disk tier's chunks.
     #[must_use]
-    pub fn disk_pages(&self) -> u32 {
+    pub fn disk_chunks(&self) -> u32 {
         Spill::slots(self.disk.as_ref())
     }
 
     /// Checks what a fire touches is committed: `demand`'s kv pages and
     /// state slots are one past the highest physical page and record unit
-    /// it names; lifts the watermark over it.
+    /// it names, each counted in its shape's unit ([`Pools::unit`]: the
+    /// slot where a chunk holds whole ones, else `gcd(chunk, slot)` bytes,
+    /// as [`Pools::kv_pages`] names a page); lifts the watermark over it.
     pub fn admit(&mut self, demand: engine::frame::Demand) -> Result<()> {
         if demand.workspace > 0 {
             return Err(Fault::Ceiling {
@@ -1385,10 +2152,8 @@ impl<B: Backend> Pools<B> {
             });
         }
         let chunk = self.layout.chunk_bytes;
-        if demand.kv_pages > 0
-            && let Some(list) = self.layout.list
-        {
-            let at = u64::from(demand.kv_pages - 1) * list.slot_bytes;
+        if demand.kv_pages > 0 && self.layout.list.is_some() {
+            let at = u64::from(demand.kv_pages - 1) * self.unit(LIST)?;
             self.pool
                 .admit(u32::try_from(at / chunk).unwrap_or(u32::MAX))?;
         }
@@ -1414,6 +2179,18 @@ impl<B: Backend> Pools<B> {
         self.pool.commit_segments(device, segments)
     }
 
+    /// The segments a load backs: the null chunk's and the span's where
+    /// the pool resizes, every one where it is laid whole
+    /// ([`Backend::RESIZES_POOL`]).
+    #[must_use]
+    pub fn load_segments(&self) -> u32 {
+        if self.pool.resizes() {
+            1
+        } else {
+            self.pool.segments()
+        }
+    }
+
     /// The segments the seat runs lie in: what a caller firing directly
     /// backs.
     #[must_use]
@@ -1426,28 +2203,33 @@ impl<B: Backend> Pools<B> {
 
     /// Gives back every segment at and past `segments`. The caller drained
     /// every frame, and the runtime evacuated what they held.
-    pub fn release_segments(&mut self, segments: u32) {
-        self.pool.release_segments(segments);
+    #[must_use = "the buffers given back are dropped once nothing binds them"]
+    pub fn release_segments(&mut self, segments: u32) -> Vec<B::Buffer> {
+        self.pool.release_segments(segments)
     }
 
-    /// Moves each evacuated chunk onto its new physical chunk in `frame`
-    /// and takes the moves into the chunk table.
-    /// Returns each move as `(from, to)` physical list pages: the first
-    /// page of each chunk moved and the pages a chunk holds.
+    /// Records each evacuated chunk's copy onto its new physical chunk in
+    /// `frame` and takes the moves into the chunk table, handing back the
+    /// table as it stood ([`pool::Pool::evacuate`]): nothing is committed
+    /// until the caller commits `frame`, and [`Pools::restore_table`] puts
+    /// the old table back where it drops `frame` instead.
     pub fn evacuate(
         &mut self,
         frame: &mut B::Frame,
         evacuation: &Evacuation,
-    ) -> Result<(Vec<(u64, u64)>, u64)> {
-        let moved = self.pool.evacuate(frame, evacuation)?;
-        let per = u64::from(self.layout.list.map_or(0, |list| list.per_chunk));
-        Ok((
-            moved
-                .into_iter()
-                .map(|(from, to)| (u64::from(from) * per, u64::from(to) * per))
-                .collect(),
-            per,
-        ))
+    ) -> Result<ChunkTable> {
+        self.pool.evacuate(frame, evacuation)
+    }
+
+    /// Puts back the table an uncommitted evacuation replaced.
+    pub fn restore_table(&mut self, table: ChunkTable) {
+        self.pool.restore(table);
+    }
+
+    /// The chunk table as it stands (`Engine::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &ChunkTable {
+        self.pool.table()
     }
 }
 
@@ -1461,10 +2243,59 @@ enum HostChunks<B: Backend> {
     Heap(Vec<u8>),
 }
 
-/// The bytes a batched spill stages at once.
+/// The bytes a batched spill stages at once: rows enough that a spill of
+/// thousands is a handful of copies, in one staging buffer every device
+/// allocates (its smallest `maxMemoryAllocationSize` is 1 GiB).
 const STAGE_BYTES: usize = 32 << 20;
 
-/// The kv slot file and how slots reach it: through one mapped stage that
+/// The aligned span of the slot file the bytes `[at, at + len)` lie in:
+/// its first byte, its length, and the byte `at` falls on within it.
+fn cover(at: u64, len: u64) -> (u64, usize, usize) {
+    let align = engine::disk::ALIGN as u64;
+    let start = at / align * align;
+    let end = (at + len).next_multiple_of(align);
+    (
+        start,
+        usize::try_from(end - start).unwrap_or(usize::MAX),
+        usize::try_from(at - start).unwrap_or(usize::MAX),
+    )
+}
+
+/// The bytes a cover of a slot of `slot_bytes` takes at most.
+fn cover_room(slot_bytes: u64) -> usize {
+    let align = engine::disk::ALIGN as u64;
+    usize::try_from(slot_bytes.next_multiple_of(align) + align).unwrap_or(usize::MAX)
+}
+
+/// Fills `span` (the cover from `start`) outside the slot's `[lead, lead +
+/// len)` from the file, so writing the whole span leaves the slots beside
+/// it as they are; `edge` is one aligned block of scratch. Run right before
+/// the write, after any earlier write of the same blocks.
+fn keep_edges(
+    file: &engine::disk::SlotFile,
+    start: u64,
+    span: &mut [u8],
+    lead: usize,
+    len: usize,
+    edge: &mut engine::disk::Aligned,
+) -> Result<()> {
+    let align = engine::disk::ALIGN;
+    let block = edge.as_mut_slice();
+    if lead > 0 {
+        file.read_span(start, block).map_err(slot_file)?;
+        span[..lead].copy_from_slice(&block[..lead]);
+    }
+    let end = lead + len;
+    if end < span.len() {
+        let last = span.len() - align;
+        file.read_span(start + last as u64, block)
+            .map_err(slot_file)?;
+        span[end..].copy_from_slice(&block[end - last..]);
+    }
+    Ok(())
+}
+
+/// The slot file and how slots reach it: through one mapped stage that
 /// stands for the file's life where the API maps host memory, else through
 /// stages that live for one copy, so an idle tier holds no memory.
 #[derive(Debug)]
@@ -1474,6 +2305,8 @@ enum Spill<B: Backend> {
         stage: B::Buffer,
         /// The mapping need not start on the boundary direct I/O asks for.
         at: usize,
+        /// The bytes the stage holds past `at`: the widest slot's cover.
+        room: usize,
         /// A copy out of the stage may still be in flight.
         landing: Option<B::Pending>,
     },
@@ -1483,27 +2316,36 @@ enum Spill<B: Backend> {
 }
 
 impl<B: Backend> Spill<B> {
+    /// The file of `budget` bytes in chunks of `chunk_bytes`, a slot's
+    /// cover `stride` bytes at most.
     fn open(
         device: &B::Context,
         dir: &std::path::Path,
         name: &str,
-        slot_bytes: u64,
+        chunk_bytes: u64,
+        stride: u64,
         budget: u64,
     ) -> Result<Option<Spill<B>>> {
         let Some(file) =
-            engine::disk::SlotFile::open(dir, name, slot_bytes, budget).map_err(slot_file)?
+            engine::disk::SlotFile::open(dir, name, chunk_bytes, budget).map_err(slot_file)?
         else {
             return Ok(None);
         };
         if !B::MAPS_HOST {
             return Ok(Some(Spill::Batched { file }));
         }
-        let stage = B::Buffer::host(device, (file.stride() + engine::disk::ALIGN) as u64)?;
+        let room = usize::try_from(stride).unwrap_or(usize::MAX);
+        let stage = B::Buffer::host(
+            device,
+            stride + engine::disk::ALIGN as u64,
+            crate::books::owners::SPILL,
+        )?;
         let mapped = stage.mapped_ptr().ok_or(Fault::Deviceless)?;
         Ok(Some(Spill::Mapped {
             file,
             stage,
             at: mapped.next_multiple_of(engine::disk::ALIGN) - mapped,
+            room,
             landing: None,
         }))
     }
@@ -1518,60 +2360,62 @@ impl<B: Backend> Spill<B> {
         spill.map_or(0, |spill| spill.file().slots())
     }
 
-    fn room(spill: Option<&Spill<B>>, what: &'static str, slots: &[u32]) -> Result<()> {
-        let have = u64::from(Spill::slots(spill));
-        match slots.iter().find(|&&slot| u64::from(slot) >= have) {
-            Some(&slot) => Err(Fault::Ceiling {
-                what,
-                need: u64::from(slot) + 1,
-                have,
-            }),
-            None => Ok(()),
-        }
-    }
-
-    /// One slot's `bytes` at `local` of `buffer` and file slot `slot`: a
-    /// write returns once on disk; a read once its copy onto the device is
-    /// submitted (mapped) or has landed (batched).
+    /// Slots of `bytes` each at `rows` (a buffer and the byte in it) and at
+    /// bytes `places` of the file: a write returns once on disk; a read
+    /// once its copy onto the device is submitted (mapped) or has landed
+    /// (batched).
     #[allow(unsafe_code)]
     fn copy(
         &mut self,
         device: &B::Context,
-        buffer: &B::Buffer,
-        local: u64,
+        rows: &[(&B::Buffer, u64)],
+        places: &[u64],
         bytes: u64,
         to_disk: bool,
-        slot: u32,
     ) -> Result<()> {
         let Spill::Mapped {
             file,
             stage,
             at,
+            room,
             landing,
         } = self
         else {
-            return self.copy_batched(device, &[(buffer, local, bytes)], to_disk, &[0], &[slot]);
+            return self.copy_batched(device, rows, places, bytes, to_disk);
         };
-        let stride = file.stride();
         let base = stage.mapped_ptr().ok_or(Fault::Deviceless)? + *at;
-        if let Some(landing) = landing.take() {
-            landing.wait()?;
-        }
-        // SAFETY: the stage stays mapped while `self` lives, and no copy in
-        // flight touches it now (waited above, or committed below).
-        let staged = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, stride) };
-        if !to_disk {
-            file.read(slot, staged).map_err(slot_file)?;
-        }
-        let mut frame = device.frame()?;
-        let offset = *at as u64;
-        if to_disk {
-            frame.copy(buffer, local, stage, offset, bytes)?;
-            frame.commit()?;
-            file.write(slot, staged).map_err(slot_file)?;
-        } else {
-            frame.copy(stage, offset, buffer, local, bytes)?;
-            *landing = Some(frame.commit_async(None)?);
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        for (&(buffer, local), &disk_at) in rows.iter().zip(places) {
+            let (start, span, lead) = cover(disk_at, bytes);
+            if span > *room {
+                return Err(Fault::Ceiling {
+                    what: "bytes of the slot file's stage",
+                    need: span as u64,
+                    have: *room as u64,
+                });
+            }
+            if let Some(landing) = landing.take() {
+                landing.wait()?;
+            }
+            // SAFETY: the stage stays mapped while `self` lives, holds
+            // `room` bytes past `at`, and no copy in flight touches it now
+            // (waited above, or committed below).
+            let staged = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, span) };
+            if !to_disk {
+                file.read_span(start, staged).map_err(slot_file)?;
+            }
+            let mut frame = device.frame()?;
+            let offset = (*at + lead) as u64;
+            if to_disk {
+                frame.copy(buffer, local, stage, offset, bytes)?;
+                frame.commit()?;
+                keep_edges(file, start, staged, lead, len, &mut edge)?;
+                file.write_span(start, staged).map_err(slot_file)?;
+            } else {
+                frame.copy(stage, offset, buffer, local, bytes)?;
+                *landing = Some(frame.commit_async(None)?);
+            }
         }
         Ok(())
     }
@@ -1584,52 +2428,60 @@ impl<B: Backend> Spill<B> {
     fn copy_batched(
         &self,
         device: &B::Context,
-        planes: &[(&B::Buffer, u64, u64)],
+        rows: &[(&B::Buffer, u64)],
+        places: &[u64],
+        bytes: u64,
         to_disk: bool,
-        ids: &[u32],
-        slots: &[u32],
     ) -> Result<()> {
         let file = self.file();
-        let stride = file.stride();
-        let batch = (STAGE_BYTES / stride).max(1).min(ids.len());
-        if batch == 0 {
+        if rows.is_empty() {
             return Ok(());
         }
+        // Each row's cover in a stride of its own, from an `ALIGN` boundary.
+        let stride = cover_room(bytes);
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let batch = (STAGE_BYTES / stride).max(1).min(rows.len());
         let kind = if to_disk {
             Memory::Readback
         } else {
             Memory::Staging
         };
-        let mut stage = B::Buffer::with(device, (batch * stride) as u64, kind)?;
-        // A multiple of the stride from an `ALIGN` boundary, so each slot in
-        // it is one aligned stage.
+        let mut stage = B::Buffer::with(
+            device,
+            (batch * stride) as u64,
+            kind,
+            crate::books::owners::SPILL,
+        )?;
         let mut host = engine::disk::Aligned::zeroed(batch * stride);
-        for (ids, slots) in ids.chunks(batch).zip(slots.chunks(batch)) {
-            let staged = &mut host.as_mut_slice()[..ids.len() * stride];
+        let mut edge = engine::disk::Aligned::zeroed(engine::disk::ALIGN);
+        for (rows, places) in rows.chunks(batch).zip(places.chunks(batch)) {
+            let staged = &mut host.as_mut_slice()[..rows.len() * stride];
             if !to_disk {
-                for (&slot, row) in slots.iter().zip(staged.chunks_exact_mut(stride)) {
-                    file.read(slot, row).map_err(slot_file)?;
+                for (&at, row) in places.iter().zip(staged.chunks_exact_mut(stride)) {
+                    let (start, span, _) = cover(at, bytes);
+                    file.read_span(start, &mut row[..span]).map_err(slot_file)?;
                 }
                 stage.write(0, staged)?;
             }
             let mut frame = device.frame()?;
-            for (row, &id) in ids.iter().enumerate() {
-                let mut offset = (row * stride) as u64;
-                for &(slab, plane, bytes) in planes {
-                    let on_device = plane + u64::from(id) * bytes;
-                    if to_disk {
-                        frame.copy(slab, on_device, &stage, offset, bytes)?;
-                    } else {
-                        frame.copy(&stage, offset, slab, on_device, bytes)?;
-                    }
-                    offset += bytes;
+            for (row, (&(slab, on_device), &at)) in rows.iter().zip(places).enumerate() {
+                let offset = (row * stride + cover(at, bytes).2) as u64;
+                if to_disk {
+                    frame.copy(slab, on_device, &stage, offset, bytes)?;
+                } else {
+                    frame.copy(&stage, offset, slab, on_device, bytes)?;
                 }
             }
             frame.commit()?;
             if to_disk {
                 stage.read(0, staged)?;
-                for (&slot, row) in slots.iter().zip(staged.chunks_exact(stride)) {
-                    file.write(slot, row).map_err(slot_file)?;
+                // One row after another, each keeping what the rows before
+                // it wrote beside it.
+                for (&at, row) in places.iter().zip(staged.chunks_exact_mut(stride)) {
+                    let (start, span, lead) = cover(at, bytes);
+                    let row = &mut row[..span];
+                    keep_edges(file, start, row, lead, len, &mut edge)?;
+                    file.write_span(start, row).map_err(slot_file)?;
                 }
             }
         }
@@ -1637,7 +2489,12 @@ impl<B: Backend> Spill<B> {
     }
 }
 
+/// A slot-file write failing for want of room on its file system is the
+/// tier below full ([`Fault::TierFull`]): nothing on the device changed.
 fn slot_file(error: std::io::Error) -> Fault {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return Fault::TierFull(error.to_string());
+    }
     Fault::Device {
         call: "slot file",
         why: error.to_string(),
@@ -1685,4 +2542,31 @@ fn elem_size(dtype: Dtype) -> u32 {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{slot_entries, slot_entry};
+    use crate::error::Fault;
+
+    /// A unit a slot table's i32 cannot state is refused by name, where a
+    /// cast would stage a negative entry: no record.
+    #[test]
+    fn a_record_unit_past_i32_is_refused() {
+        assert_eq!(slot_entry(0).ok(), Some(0));
+        assert_eq!(slot_entry(i32::MAX as u32).ok(), Some(i32::MAX));
+        for unit in [1 << 31, u32::MAX] {
+            let refused = slot_entry(unit).expect_err("past i32");
+            assert!(
+                matches!(
+                    refused,
+                    Fault::Ceiling { need, have, .. }
+                        if need == u64::from(unit) && have == i32::MAX as u64
+                ),
+                "{refused}"
+            );
+        }
+        assert_eq!(slot_entries(&[3, 7]).ok(), Some(vec![3, 7]));
+        assert!(slot_entries(&[3, 1 << 31]).is_err());
+    }
 }

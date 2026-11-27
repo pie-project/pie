@@ -33,13 +33,16 @@ class InferletError(Exception):
     """A host-side refusal (`pie:inferlet` declares `type error = string`)."""
 
 
-def _wit(fn: Callable, *args, what: str = ""):
+def _wit(fn: Callable, *args, what: str = "", hint: str = ""):
     """Call a WIT binding, turning its `Err` into an `InferletError` that
-    says where it came from."""
+    says where it came from (and, with `hint`, what the program states
+    instead)."""
     try:
         return fn(*args)
     except _WitErr as e:
         msg = e.value if isinstance(e.value, str) else repr(e.value)
+        if hint:
+            msg = f"{msg} {hint}"
         raise InferletError(f"{what}: {msg}" if what else msg) from None
 
 
@@ -317,8 +320,24 @@ class WorkingSet:
         return self.ws.folded()
 
     def fork(self, on: "Pipeline") -> "WorkingSet":
-        """A child sharing the frozen part, with a copy of the buffer."""
+        """A child sharing the frozen part, with a copy of the buffer; it shares as this set does."""
         return WorkingSet._wrap(_wit(self.ws.fork, on.wit, what="fork"))
+
+    def share(self, scope: Literal["session", "tenant", "group"], group: str | None = None) -> None:
+        """Publishes this set's frozen slots within `scope` (a `group` names its group), and
+        lets its passes reuse what that scope holds. Unasked, a set is private. Ask before its
+        first pass."""
+        if (scope == "group") != (group is not None):
+            raise ValueError("share: a group is named with scope 'group', and only with it")
+        if scope == "session":
+            wire = _wit_ws.ShareScope_Session()
+        elif scope == "tenant":
+            wire = _wit_ws.ShareScope_Tenant()
+        elif scope == "group":
+            wire = _wit_ws.ShareScope_Group(group)
+        else:
+            raise ValueError(f"share: no scope {scope!r}; 'session', 'tenant' or 'group'")
+        _wit(self.ws.share, wire, what="share")
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +355,12 @@ class Pipeline:
     def close(self) -> None:
         """End the stream; already-submitted fires still drain."""
         self.wit.close()
+
+    def retract(self, fires: int) -> None:
+        """Take back what the last `fires` fires submitted on this closed
+        pipeline wrote, once every fire on it has landed: the rows a program
+        ran ahead past its stop."""
+        _wit(self.wit.retract, fires, what="retract")
 
     def park(self) -> None:
         """Leave the frame wait-set until this pipeline submits again."""
@@ -368,7 +393,8 @@ class Pipeline:
     ) -> int:
         """Keep the runtime's run-ahead window full while `on_token` consumes
         results, until `budget` fires submit or `on_token` returns False.
-        Returns the run count."""
+        Returns the run count. A break takes back the fires past the one read
+        when `fwd` is retractable; a final pass's stay in its sets."""
         if budget == 0:
             return 0
         # Every slot of a frame is its own fire: the runtime advances the
@@ -407,7 +433,13 @@ class Pipeline:
             if cont is False:
                 if not ended:
                     self.close()
-                return consumed + 1
+                # The fire whose output broke the loop read a token the
+                # program took, so its rows stay; those past it are taken
+                # back, unless the pass is final: then they stay in its sets.
+                kept = consumed + 1
+                if submitted > kept and not fwd.is_final():
+                    self.retract(submitted - kept)
+                return kept
             consumed += 1
             if submitted < budget and submitted - consumed <= (window_frames - 1) * r:
                 submit_one_frame()
@@ -454,11 +486,6 @@ class StateGeometry:
 def frame_size() -> int:
     """Waves per frame (k) for this deployment (cached)."""
     return max(_wit_model.frame_size(), 1)
-
-
-@functools.cache
-def submit_deadline_us() -> int:
-    return _wit_model.submit_deadline_us()
 
 
 def channel_capacity() -> int:
@@ -541,6 +568,7 @@ class ForwardPass:
         self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
         self._switches: list[tuple[int, str, str]] = []
+        self._retractable = False
 
     # -- ports ----------------------------------------------------------------
 
@@ -607,7 +635,12 @@ class ForwardPass:
             self.wit.state,
             [lane.ws for lane in lanes],
             _wit_forward.StateGeometry(
-                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3]
+                positions=wits[0],
+                slots=wits[1],
+                kv_len=wits[2],
+                fold=wits[3],
+                parents=None,
+                parents_end=None,
             ),
             what="state",
         )
@@ -618,6 +651,23 @@ class ForwardPass:
     def checkpoints(self, slots: Sequence[int]) -> None:
         """Slots to keep a recurrent state at, so a later pass over these tokens resumes there."""
         _wit(self.wit.checkpoints, [int(s) for s in slots], what="checkpoints")
+
+    def retractable(self) -> None:
+        """State that this pass may take back rows it sampled: the program
+        retracts, truncates, rolls back or rewinds its sets below a sampled
+        row (a stop string cut in a set it continues, a draft or speculative
+        verify, a beam, a rollback). Without it a pass is final:
+        the SDK states its rows final when the program is
+        attached, its lanes fold every row at fire, a retract over one of its
+        fires is refused by name, and `run_ahead` leaves its rows past a
+        break in place. Before the program."""
+        if self._program_attached:
+            raise InferletError("forward pass program is already attached")
+        self._retractable = True
+
+    def is_final(self) -> bool:
+        """Whether this pass's rows are final: `retractable()` was not stated."""
+        return not self._retractable
 
     # -- switches and inputs ---------------------------------------------------
 
@@ -653,7 +703,8 @@ class ForwardPass:
         _wit(self.wit.group, int(lane), int(id), what="group")
 
     def mask(self, rows: Channel) -> None:
-        """Per row, the kv slots it attends, or its attention group's rows without kv."""
+        """Per row, what it attends past the frozen part (column c is slot folded() + c:
+        the buffer, then the pass's rows), or its attention group's rows without kv."""
         self._ensure_ports_available([Port.ATTN_MASK])
         _wit(self.wit.mask, rows._wit(), what="mask")
         self._ports.append((Port.ATTN_MASK, rows))
@@ -754,6 +805,16 @@ class ForwardPass:
     def attach_program(self) -> None:
         if self._program_attached:
             return
+        # A pass is final unless the program said it may take rows back: the
+        # program's own statement, made here since the runtime takes it
+        # before the program.
+        if not self._retractable:
+            _wit(
+                self.wit.final_rows,
+                what="final-rows",
+                hint="(a pass that binds `parents`, or otherwise takes rows back, "
+                "states `ForwardPass.retractable()`)",
+            )
         builder = Builder(self._vocab, self._page_size)
         lanes = max(
             [1, len(self._lanes)]

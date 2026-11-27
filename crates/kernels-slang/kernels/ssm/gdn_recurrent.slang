@@ -18,6 +18,12 @@
 // state in `work` (a lane's), and the slot takes the state as of row
 // `commit[lane0 + r]`.
 //
+// The committed form also lands each lane's own rows' keys (raw, the key
+// head's) and corrected values `u = beta (v - g S^T k)` (the delta each row
+// writes) in its rs buffer pages, through the fire's staged rs table
+// (`prim/carry.slang`): a later decode step reads them as a linear attention
+// (`ssm/gdn_carried.slang`). A lane landing none states it there.
+//
 // `PIE_SNAPS` (with either of the last two): a request's lane also lands
 // the state as of up to `PIE_RS_SNAPSHOTS` rows inside it in records of
 // their own (`prim/pool.slang`, CONTRACT-BC 16).
@@ -37,11 +43,12 @@
 [[vk::binding(5)]] StructuredBuffer<float> gates;
 [[vk::binding(6)]] RWStructuredBuffer<float> work;
 [[vk::binding(7)]] RWStructuredBuffer<float> y;
+[[vk::binding(8)]] StructuredBuffer<int> carry;
 #if defined(PIE_SNAPS)
-[[vk::binding(8)]] StructuredBuffer<int> pie_snaps;
-#define SEGMENTS_AT 9
+[[vk::binding(9)]] StructuredBuffer<int> pie_snaps;
+#define SEGMENTS_AT 10
 #else
-#define SEGMENTS_AT 8
+#define SEGMENTS_AT 9
 #endif
 #define STATE work
 #elif defined(PIE_CHUNKED)
@@ -65,8 +72,16 @@
 #define SEGMENTS_AT 4
 #define STATE rstate
 #endif
-// The state bank, in the chunk pool's segments (`prim/pool.slang`).
-PIE_POOL_SEGMENTS(RWStructuredBuffer, float, SEGMENTS_AT)
+// The state bank (and the rs list), in the chunk pool's segments
+// (`prim/pool.slang`), as words: f32 state and bf16 keys alike.
+// The register forms read a state row as vectors of four words (the pool's
+// segments, the state's origin and its slot stride whole vectors: the host
+// refuses another pool); the others as words.
+#if defined(PIE_DK_REG)
+PIE_POOL_SEGMENTS(RWStructuredBuffer, uint4, SEGMENTS_AT)
+#else
+PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, SEGMENTS_AT)
+#endif
 #define PARAMS_AT (SEGMENTS_AT + 4)
 
 struct Params {
@@ -83,16 +98,75 @@ struct Params {
     int v_heads;
     int k_dim;
     int v_dim;
+    // The fire row a window's row 0 is: `qkv`, `gates`, `y` and the slots
+    // table are the fire's whole, bound once whatever window a fire cuts
+    // (0 for the committed form, whose extended planes are the window's).
+    uint row0;
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    // The window's CSR lies at int `indptr_at` of the fire's packed windows
+    // table, which is bound whole: one view whatever window a fire cuts.
+    int indptr_at;
+#endif
 #if defined(PIE_SNAPS)
     int snap_lane0;
 #endif
+#if defined(PIE_COMMITTED)
+    // The rs list's pages, and where a row's keys and `u` lie in one.
+    uint page_tokens;
+    uint stride_words;
+    uint k_at;
+    uint k_row;
+    uint u_at;
+    uint u_row;
+#endif
 };
-PIE_PARAMS(PARAMS_AT, Params, params);
-PIE_POOL_READ(float, params.seg_words)
-PIE_POOL_WRITE(float, params.seg_words)
-PIE_POOL_VIEW(rstate, float, params.state_origin)
+PIE_PARAMS_FIRED(PARAMS_AT, Params, params);
+
+// The window's fields, read from the fire block once at the top of `main`,
+// ahead of the address math they feed.
+static uint fired_row0;
+static uint fired_indptr_at;
+static uint fired_lane0;
+
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+// The window's CSR boundary `i`.
+int csr(uint i) {
+    return indptr[fired_indptr_at + i];
+}
+#endif
+#if defined(PIE_DK_REG)
+PIE_POOL_READ(uint4, params.seg_words / 4u)
+// Virtual word `v` of the pool, set.
+void pie_pool_set(uint v, uint x) {
+    uint seg, at;
+    pie_pool_find(v >> 2, seg, at);
+#define GDN_WORD_SET(buf_) buf_[at][v & 3u] = x;
+    PIE_POOL_BRANCH(seg, GDN_WORD_SET)
+}
+#else
+PIE_POOL_READ(uint, params.seg_words)
+PIE_POOL_WRITE(uint, params.seg_words)
+// The state from its origin on, as f32.
+struct rstate_pool_view {
+    __subscript(uint i)->float {
+        get { return asfloat(pie_pool_get(params.state_origin + i)); }
+        set { pie_pool_set(params.state_origin + i, asuint(newValue)); }
+    }
+};
+static rstate_pool_view rstate;
+#endif
 
 PIE_STATE_PIECES
+#if defined(PIE_COMMITTED)
+#if defined(PIE_DK_REG)
+#define PIE_CARRY_POOL_WORD(v) (pie_pool_get((v) >> 2)[(v) & 3u])
+#endif
+#include "prim/carry.slang"
+// The virtual word the token's `u` lands at (its head's), `CARRY_NONE`
+// where it lands none.
+#define CARRY_NONE 0xffffffffu
+static uint u_into = CARRY_NONE;
+#endif
 #if defined(PIE_SNAPS)
 PIE_STATE_SNAPSHOTS
 #endif
@@ -113,7 +187,8 @@ static float st[PIE_DK_REG];
 #endif
 
 // Token `t` of value head `hv` (key head `hk`), its state at `state_base`.
-void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
+void token(uint tid, uint window_t, uint hv, uint hk, uint state_base) {
+    uint t = fired_row0 + window_t;
     uint dk = uint(params.k_dim);
     uint dv = uint(params.v_dim);
     uint keys = uint(params.k_heads) * dk;
@@ -156,6 +231,11 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
             kv_mem += st[i] * sk[i];
         }
         float delta = (bf16_at(qkv, vbase + tid) - kv_mem) * beta;
+#if defined(PIE_COMMITTED)
+        if (u_into != CARRY_NONE) {
+            pie_pool_set(u_into + tid, asuint(delta));
+        }
+#endif
         float acc = 0.0;
         [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) {
             st[i] += sk[i] * delta;
@@ -173,6 +253,11 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
             kv_mem += s * sk[i];
         }
         float delta = (bf16_at(qkv, vbase + c) - kv_mem) * beta;
+#if defined(PIE_COMMITTED)
+        if (u_into != CARRY_NONE) {
+            pie_pool_set(u_into + c, asuint(delta));
+        }
+#endif
         float acc = 0.0;
         for (uint i = 0; i < dk; i++) {
             float s = STATE[cell + i] + sk[i] * delta;
@@ -185,8 +270,34 @@ void token(uint tid, uint t, uint hv, uint hk, uint state_base) {
     GroupMemoryBarrierWithGroupSync();
 }
 
+#if defined(PIE_COMMITTED)
+// Where run position `t` of a lane (its `replay` replayed rows, then its
+// own, fire row `row`) lands its `u` (`u_into`, read by `token`), and its
+// keys, landed here by its key head's first value head.
+void land_at(CarryLane cl, int replay, int t, uint tid, uint row, uint hv, uint hk) {
+    u_into = CARRY_NONE;
+    int e = t - replay;
+    if (cl.at < 0 || e < 0) {
+        return;
+    }
+    uint tok = uint(cl.at + e);
+    u_into = carry_word(cl, tok, params.u_at, params.u_row) + hv * uint(params.v_dim);
+    if (hv % (uint(params.v_heads) / uint(params.k_heads)) == 0u) {
+        uint dk = uint(params.k_dim);
+        uint keys = uint(params.k_heads) * dk;
+        uint pitch = 2u * keys + uint(params.v_heads) * uint(params.v_dim);
+        uint from = (row * pitch + keys + hk * dk) / 2u;
+        uint into = carry_word(cl, tok, params.k_at, params.k_row) + hk * (dk / 2u);
+        for (uint w = tid; w < dk / 2u; w += uint(PIE_GROUP_X)) {
+            pie_pool_set(into + w, qkv[from + w]);
+        }
+    }
+}
+#endif
+
 #if defined(PIE_DK_REG)
-// A lane's state row lies in one slot, so in one segment: found once.
+// A lane's state row lies in one slot, so in one segment: found once, and
+// read and written four words a vector.
 void reg_load(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid >= uint(params.v_dim)) {
@@ -196,10 +307,14 @@ void reg_load(uint tid, uint base) {
         return;
     }
     uint seg, at;
-    pie_pool_find(params.state_origin + base + tid * dk, seg, at);
+    pie_pool_find((params.state_origin + base + tid * dk) / 4u, seg, at);
 #define GDN_REG_LOAD(buf_) \
-    [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
-        st[i] = buf_[at + i]; \
+    [ForceUnroll] for (uint m = 0; m < uint(PIE_DK_REG) / 4u; m++) { \
+        uint4 v = buf_[at + m]; \
+        st[4u * m] = asfloat(v.x); \
+        st[4u * m + 1u] = asfloat(v.y); \
+        st[4u * m + 2u] = asfloat(v.z); \
+        st[4u * m + 3u] = asfloat(v.w); \
     }
     PIE_POOL_BRANCH(seg, GDN_REG_LOAD)
 }
@@ -208,10 +323,11 @@ void reg_store(uint tid, uint base) {
     uint dk = uint(params.k_dim);
     if (tid < uint(params.v_dim)) {
         uint seg, at;
-        pie_pool_find(params.state_origin + base + tid * dk, seg, at);
+        pie_pool_find((params.state_origin + base + tid * dk) / 4u, seg, at);
 #define GDN_REG_STORE(buf_) \
-        [ForceUnroll] for (uint i = 0; i < uint(PIE_DK_REG); i++) { \
-            buf_[at + i] = st[i]; \
+        [ForceUnroll] for (uint m = 0; m < uint(PIE_DK_REG) / 4u; m++) { \
+            buf_[at + m] = uint4(asuint(st[4u * m]), asuint(st[4u * m + 1u]), \
+                                 asuint(st[4u * m + 2u]), asuint(st[4u * m + 3u])); \
         }
         PIE_POOL_BRANCH(seg, GDN_REG_STORE)
     }
@@ -244,6 +360,13 @@ void snap_cells(uint tid, uint from, int snap, uint n, uint hv, uint head) {
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    fired_row0 = uint(PIE_FIRE(row0));
+#if defined(PIE_CHUNKED) || defined(PIE_COMMITTED)
+    fired_indptr_at = uint(PIE_FIRE(indptr_at));
+#endif
+#if defined(PIE_COMMITTED)
+    fired_lane0 = uint(PIE_FIRE(lane0));
+#endif
     uint tid = local.x;
     uint hv = group.y;
     uint hk = hv / (uint(params.v_heads) / uint(params.k_heads));
@@ -257,13 +380,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     uint r = group.z;
 #if defined(PIE_COMMITTED)
-    uint lane = uint(params.lane0) + r;
+    uint lane = fired_lane0 + r;
     if (tid == 0u) {
-        int begin = indptr[r];
+        int begin = csr(r);
         for (uint j = 0; j < r; j++) {
-            begin += replay[uint(params.lane0) + j];
+            begin += replay[fired_lane0 + j];
         }
-        int span = (indptr[r + 1] - indptr[r]) + replay[lane];
+        int span = (csr(r + 1) - csr(r)) + replay[lane];
         gdn_lo = begin;
         gdn_hi = pie_state_none(lane) ? begin : begin + span;
         gdn_keep = min(commit[lane], span);
@@ -278,6 +401,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         return;
     }
     uint bank = state_at(lane, hv, head);
+    CarryLane cl = carry_lane(lane);
+    int rep = replay[lane];
 #if defined(PIE_SNAPS)
     int snap = pie_snap_lane(r);
     uint snapped = 0u;
@@ -286,6 +411,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #if defined(PIE_DK_REG)
     reg_load(tid, bank);
     for (int t = 0; t < span; t++) {
+        land_at(cl, rep, t, tid, fired_row0 + uint(begin + t), hv, hk);
         token(tid, uint(begin + t), hv, hk, 0u);
         if (t + 1 == keep) {
             reg_store(tid, bank);
@@ -299,19 +425,22 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
     }
 #else
-    uint state_base = (lane * uint(params.v_heads) + hv) * head;
+    // The work plane holds the dispatch's lanes, the lane's at its own `r`:
+    // a fire's lanes take as many dispatches as the plane holds lanes.
+    uint state_base = (r * uint(params.v_heads) + hv) * head;
     // A row of the head's state lies in one segment: found once a row.
     for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
         uint seg, at;
         pie_pool_find(params.state_origin + bank + c * dk, seg, at);
 #define GDN_BANK_LOAD(buf_) \
         for (uint i = 0; i < dk; i++) { \
-            work[state_base + c * dk + i] = buf_[at + i]; \
+            work[state_base + c * dk + i] = asfloat(buf_[at + i]); \
         }
         PIE_POOL_BRANCH(seg, GDN_BANK_LOAD)
     }
     GroupMemoryBarrierWithGroupSync();
     for (int t = 0; t < span; t++) {
+        land_at(cl, rep, t, tid, fired_row0 + uint(begin + t), hv, hk);
         token(tid, uint(begin + t), hv, hk, state_base);
         if (t + 1 == keep) {
             for (uint c = tid; c < dv; c += uint(PIE_GROUP_X)) {
@@ -319,7 +448,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                 pie_pool_find(params.state_origin + bank + c * dk, seg, at);
 #define GDN_BANK_STORE(buf_) \
                 for (uint i = 0; i < dk; i++) { \
-                    buf_[at + i] = work[state_base + c * dk + i]; \
+                    buf_[at + i] = asuint(work[state_base + c * dk + i]); \
                 }
                 PIE_POOL_BRANCH(seg, GDN_BANK_STORE)
             }
@@ -335,8 +464,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 #endif
 #elif defined(PIE_CHUNKED)
     if (tid == 0u) {
-        gdn_lo = indptr[r];
-        gdn_hi = indptr[r + 1];
+        gdn_lo = csr(r);
+        gdn_hi = csr(r + 1);
     }
     GroupMemoryBarrierWithGroupSync();
     // Read uniformly: they bound the token loop.
@@ -345,7 +474,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (end <= begin) {
         return;
     }
-    uint state_base = state_at(uint(begin), hv, head);
+    uint state_base = state_at(fired_row0 + uint(begin), hv, head);
 #if defined(PIE_SNAPS)
     int snap = pie_snap_lane(r);
     uint snapped = 0u;
@@ -372,7 +501,17 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     reg_store(tid, state_base);
 #endif
 #else
-    uint state_base = state_at(r, hv, head);
+    // A padding row holds no record (its slot -1): it folds nothing. Read
+    // uniformly: `token` holds barriers, which WGSL lets follow only
+    // workgroup-uniform control flow.
+    if (tid == 0u) {
+        gdn_keep = pie_state_none(fired_row0 + r) ? 1 : 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (workgroupUniformLoad(gdn_keep) != 0) {
+        return;
+    }
+    uint state_base = state_at(fired_row0 + r, hv, head);
 #if defined(PIE_DK_REG)
     reg_load(tid, state_base);
 #endif

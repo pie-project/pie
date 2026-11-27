@@ -8,7 +8,8 @@
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, nonzero, refuse, stated,
+    Arg, ArgValue, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, nonzero, refuse,
+    stated,
 };
 use crate::error::Error;
 use crate::tensor::Tensor;
@@ -35,8 +36,17 @@ fn grid(op: &'static str, words: u32, rows: u32) -> Result<Grid, Error> {
     Ok(Grid::of(elementwise_rows(op, words, rows)?, [GROUP, 1, 1]))
 }
 
-/// `bytes` copied from `src` to `dst`, whole words.
-pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result<(), Error> {
+/// `bytes` copied from word `src_at` of `src` to word `dst_at` of `dst`,
+/// whole words. Both are bound whole, so a copy binds one group a pair of
+/// buffers wherever its run lies; a run past either is refused.
+pub fn copy_words(
+    ctx: &Ctx<'_>,
+    src: Tensor,
+    src_at: u32,
+    dst: Tensor,
+    dst_at: u32,
+    bytes: u64,
+) -> Result<(), Error> {
     const OP: &str = "gather.rs_copy";
     if bytes == 0 {
         return Ok(());
@@ -53,10 +63,151 @@ pub fn copy_words(ctx: &Ctx<'_>, src: Tensor, dst: Tensor, bytes: u64) -> Result
             format!("{bytes} bytes is more than one launch addresses"),
         )
     })?;
+    for (what, t, at) in [("source", src, src_at), ("destination", dst, dst_at)] {
+        let held = u64::from(t.rows) * u64::from(t.width);
+        if u64::from(at) + u64::from(words) > held {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the run's words {at}..{} pass the {held} words of its {what}",
+                    u64::from(at) + u64::from(words)
+                ),
+            ));
+        }
+    }
     ctx.fire(
         Fire::at(ROWS, "gather_rows_copy_words").threads([words, 1, 1], [GROUP, 1, 1]),
-        &[src.arg(), dst.arg_mut(), stated(OP, words)?.arg()],
+        &[
+            src.arg(),
+            dst.arg_mut(),
+            stated(OP, words)?.arg(),
+            src_at.arg(),
+            dst_at.arg(),
+        ],
     )
+}
+
+/// The tables of runs a [`copy_runs`] dispatch takes, by their runs
+/// (`PIE_RUNS`, `kernels/gather/rows.slang`), each its own kernel: a fire
+/// lays the smallest that holds what its rung can move, so a decode's copy
+/// stages a few hundred bytes, not a prompt's table.
+pub const COPY_RUNS: [(usize, &str); 3] = [
+    (16, "gather_rows_copy_runs_16_words"),
+    (128, "gather_rows_copy_runs_128_words"),
+    (1024, "gather_rows_copy_runs_1024_words"),
+];
+
+/// The table (its runs and its kernel) and the dispatches a copy of at most
+/// `most` runs takes: the smallest table that holds them, else the largest
+/// as many times as they take.
+#[must_use]
+pub fn copy_runs_plan(most: usize) -> (usize, &'static str, usize) {
+    let (runs, entry) = COPY_RUNS
+        .iter()
+        .copied()
+        .find(|&(runs, _)| runs >= most)
+        .unwrap_or(COPY_RUNS[COPY_RUNS.len() - 1]);
+    (runs, entry, most.div_ceil(runs).max(1))
+}
+
+/// Where a run of [`copy_runs`] reads or writes: a segment of the state
+/// pool, or one of the two arena buffers the dispatch binds whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Space {
+    Segment(u32),
+    ArenaA,
+    ArenaB,
+}
+
+impl Space {
+    fn code(self) -> u32 {
+        match self {
+            Space::Segment(segment) => segment,
+            Space::ArenaA => 4,
+            Space::ArenaB => 5,
+        }
+    }
+}
+
+/// One run of [`copy_runs`]: `words` words from word `from` of one space to
+/// word `to` of another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyRun {
+    pub from: (Space, u32),
+    pub to: (Space, u32),
+    pub words: u32,
+}
+
+/// `runs` moved between the state pool's segments (`pool`) and two arena
+/// buffers bound whole (`arena_a`, `arena_b`), in the dispatches a copy of
+/// at most `most` runs takes ([`copy_runs_plan`]; a dispatch past the runs
+/// moves none): the runs and their count are the dispatches' fired scalars,
+/// so the commands are the same however many runs a fire moves and wherever
+/// they lie. More runs than `most` is refused by name.
+pub fn copy_runs(
+    ctx: &Ctx<'_>,
+    arena_a: Tensor,
+    arena_b: Tensor,
+    pool: crate::Segments,
+    runs: &[CopyRun],
+    most: usize,
+) -> Result<(), Error> {
+    const OP: &str = "gather.rs_copy_runs";
+    let (table, entry, dispatches) = copy_runs_plan(most);
+    // A naming walk names every table width a fire's plan may take, so the
+    // load builds them all: a fire of another rung or lane count picks
+    // another, after ready.
+    if let Some(names) = ctx.naming() {
+        let widths: Vec<Fire> = COPY_RUNS
+            .iter()
+            .map(|&(_, entry)| Fire::at(ROWS, entry))
+            .collect();
+        for _ in 0..dispatches {
+            names.either(&widths)?;
+        }
+        return Ok(());
+    }
+    if runs.len() > dispatches.saturating_mul(table) {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} runs, past the {most} the fire's rung states for its recurrent copy",
+                runs.len()
+            ),
+        ));
+    }
+    for at in 0..dispatches {
+        let chunk = runs
+            .get(at * table..)
+            .map_or(&[][..], |rest| &rest[..rest.len().min(table)]);
+        let longest = chunk.iter().map(|run| run.words).max().unwrap_or(0).max(1);
+        let count = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
+        let mut args = vec![arena_a.arg_mut(), arena_b.arg_mut()];
+        args.extend(pool.args(true));
+        args.extend([count.arg(), 0u32.arg(), 0u32.arg(), 0u32.arg()]);
+        for run in chunk {
+            args.extend([
+                (run.from.0.code() << 16 | run.to.0.code()).arg(),
+                run.from.1.arg(),
+                run.to.1.arg(),
+                run.words.arg(),
+            ]);
+        }
+        // The table's rows past the fire's runs, zero, as one argument.
+        let unused = u32::try_from((table - chunk.len()) * 4).unwrap_or(u32::MAX);
+        if unused > 0 {
+            args.push(ArgValue::Zeros(unused));
+        }
+        ctx.fire(
+            Fire::at(ROWS, entry).threads([longest, count.max(1), 1], [GROUP, 1, 1]),
+            &args,
+        )
+        .map_err(|why| match why {
+            Error::Backend { detail, .. } => Error::Backend { op: OP, detail },
+            other => other,
+        })?;
+    }
+    Ok(())
 }
 
 /// Rows moved between the fire-wide rectangle and a compacted one by an i32
@@ -278,7 +429,13 @@ pub fn merge_rows(ctx: &Ctx<'_>, x: Tensor, side: u32, y: Tensor) -> Result<(), 
         .ok_or_else(|| refuse(OP, format!("{out} rows of {pitch} words will not launch")))?;
     ctx.fire(
         Fire::at(ROWS, "gather_rows_copy_words").threads([total, 1, 1], [GROUP, 1, 1]),
-        &[x.arg(), y.arg_mut(), stated(OP, total)?.arg()],
+        &[
+            x.arg(),
+            y.arg_mut(),
+            stated(OP, total)?.arg(),
+            0u32.arg(),
+            0u32.arg(),
+        ],
     )
 }
 

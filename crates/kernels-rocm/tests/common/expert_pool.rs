@@ -9,7 +9,6 @@
 use crate::common::Gpu;
 use dtype::Dtype;
 use kernels_rocm::hip::{self, Direction};
-use kernels_rocm::linear::moe::contiguous_entries;
 
 /// One plane of a contiguous bank: expert `e`'s `bytes` at `base + e *
 /// stride` (`base` 0: a plane the bank lacks, its entries null).
@@ -212,4 +211,13 @@ pub fn fill(g: &Gpu, at: u64, byte: u8, bytes: usize) {
         bytes as u64,
         Direction::HostToDevice,
     );
+}
+
+/// The contiguous bank's table: `planes` given as `(base, stride)` in bytes,
+/// expert `e`'s entry `p` at `base_p + e * stride_p` (a plane the bank lacks
+/// as `(0, 0)`). Uploaded, it lands what no table does.
+fn contiguous_entries(experts: u32, planes: &[(u64, u64)]) -> Vec<u64> {
+    (0..u64::from(experts))
+        .flat_map(|e| planes.iter().map(move |&(base, stride)| base + e * stride))
+        .collect()
 }

@@ -66,7 +66,7 @@ pub fn project(
     // rows alone would leave the SMs idle (a decode fire). The kernel below
     // read a row once a mix column and walked it alone (DeepSeek-V4-Flash:
     // 8.3 s of a 32x4096 prefill, 3.3 ms a decode8 step).
-    if ctx.tuning().hc_tile
+    if ctx.tuning().hc_tile()
         && fan.is_multiple_of(TILE_K)
         && rows >= TILE_FROM
         && mix_hc <= TILE_COLS
@@ -168,7 +168,7 @@ pub(crate) fn prenorm_launch(
     } else {
         256
     };
-    if wide && ctx.tuning().hc_mma {
+    if wide && ctx.tuning().hc_mma() {
         return prenorm_launch_mma(ctx, op, streams, eps, hc_fn, mixes);
     }
     let (br, kt) = (if wide { TILE_ROWS } else { 32 }, TILE_K);
@@ -206,7 +206,7 @@ pub(crate) fn prenorm_launch(
                 smem,
                 ..Launch::grid([row_blocks, slices, 1], [threads, 1, 1])
             }
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[
             streams.arg(),
@@ -324,7 +324,7 @@ pub fn prenorm_project(
         let (rows, mix_hc) = (mixes.rows, hc_fn.rows);
         // A few slices over many rows (the tensor-core form's) fold a
         // thread a row; a decode's many slices a warp a mix.
-        let fold = if ctx.tuning().hc_mma && landed.slices <= 8 && rows >= 1024 {
+        let fold = if ctx.tuning().hc_mma() && landed.slices <= 8 && rows >= 1024 {
             Fire::at(kernel(
                 HC_PROJECT,
                 "::pie::elemwise::hc_prenorm_project_fold_rows",

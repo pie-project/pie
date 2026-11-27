@@ -29,17 +29,12 @@ sdpa.selected_mma = true
 # DeepSeek-V4.1 bounded replay, as vLLM prefills it (its decoder layers
 # route a quarter of a 2048-token batch): pf16-512 prefill 19.8k to ~29.8k tok/s.
 sdpa.compressed_replay = true
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 # MXFP4 experts averaging 4 to 16 routes on the 512-code-run select, past
 # them the staged one (gpt-oss-120b's miniature at c128: 2490 to 2645 tok/s).
 moe.mxfp4_mma_per_from = 4
 
 [engine]
-seated_first = true
-recording = { use = "bodies", mem_mb = 1024 }
-forward_tokens = 2304
 prefill_lattice_steps = 8
 
 # Independent chains on side streams, as the RTX 4090, H100, sm100 and the RTX PRO 6000 run them:
@@ -49,6 +44,30 @@ prefill_lattice_steps = 8
 [compiler]
 dag_streams = true
 dag_streams_until = 256
+
+[rates]
+# `pie tune cuda --rates` on this L40S, the median of 5 bursts of each kernel
+# back to back, its launches taken off. The matmul by rows at n = k of 1024,
+# 2048 and 4096, at half octaves of rows (each point the median of 5 such
+# steps, 2026-11-18); the attention, one sequence attending itself, d 128, by
+# keys (at 8192 keys d 64 323.7, d 256 297.3); the per-row ops an rmsnorm and a
+# swiglu at 2048 x 4096.
+launch_ns = 904
+gemm_tflops_by_rows = [
+  [1024, [[256, 53.3], [362, 74.3], [512, 92.6], [724, 96.0], [1024, 146.6], [1448, 127.4], [2048, 164.9], [2896, 125.1], [4096, 175.8], [5793, 173.1], [8192, 207.3]]],
+  [2048, [[256, 125.8], [362, 153.3], [512, 172.3], [724, 152.4], [1024, 209.1], [1448, 175.1], [2048, 227.4], [2896, 176.5], [4096, 224.6], [5793, 209.3], [8192, 219.8]]],
+  [4096, [[256, 140.3], [362, 165.1], [512, 203.2], [724, 165.6], [1024, 222.5], [1448, 151.6], [2048, 226.2], [2896, 215.9], [4096, 224.6], [5793, 201.4], [8192, 201.6]]],
+]
+attn_tflops_by_keys = [[512, 95.1], [1024, 167.7], [2048, 235.3], [4096, 297.4], [8192, 359.8]]
+hbm_gbps = 651.4
+elementwise_gbps = 648.0
+scan_gelems = 2723.6
+# The few-rows kernel (the rows skeleton) at 16 x 4096 x 4096 over one
+# cached plane, the median of 5 `pie tune cuda --rates` steps (11.2 to
+# 12.4); the blocks of it a multiprocessor holds, by the occupancy
+# calculator (derived, not timed).
+few_row_tflops = 12.0
+workgroups_per_core = 2.0
 
 [provenance]
 measured = [
@@ -63,8 +82,6 @@ measured = [
   "kernel.moe.affine_grouped",
   "kernel.moe.affine_grouped_from",
   "kernel.moe.affine_wmma",
-  "kernel.moe.group_at",
-  "kernel.moe.grouped",
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
   "kernel.moe.mxfp4_wmma",
@@ -75,22 +92,15 @@ measured = [
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
-  "kernel.sdpa.decode.chunk_floor_128",
   "kernel.sdpa.decode.grouped_prefill_from",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.pool_mma",
   "kernel.sdpa.index_mma",
   "kernel.sdpa.index_radix",
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.prefill_lattice_steps",
-  "engine.graphs",
   "engine.lattice_steps",
-  "engine.recording",
   "engine.working_set_percent",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
   "compiler.cond_fixed_us",
@@ -107,3 +117,4 @@ measured = [
   "compiler.launch_us",
   "compiler.side_streams",
 ]
+rates = "pie tune cuda --rates on 2026-11-17 (pie 0.6.0): NVIDIA L40S; the matmul through cuBLASLt's first heuristic algorithm, each rate a 20 ms burst on the stream timed by events, the median of 5 (the launch of 15); operands: engine::rates' pattern; at commit 9bc8af76e-wip; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 512, 1024, 2048, 4096, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

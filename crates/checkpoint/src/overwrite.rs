@@ -8,7 +8,7 @@ use crate::executor::arena::ArenaBacking;
 use crate::executor::sink::TensorSink;
 use crate::file::read::parse_metadata;
 use crate::file::zt;
-use crate::plan::{LoadPlan, StorageTarget, compile};
+use crate::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use crate::types::{DType, Encoding, encoding_nbytes};
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +25,9 @@ pub struct Overwrite {
     held: usize,
     verbatim: Vec<Verbatim>,
     rest: Option<LoadPlan>,
+    /// The rest is walked streaming: each plane published as it lands, no
+    /// arena of the whole ([`Overwrite::streaming`]).
+    streaming: bool,
 }
 
 #[derive(Debug)]
@@ -35,11 +38,36 @@ struct Verbatim {
 }
 
 impl Overwrite {
+    /// The overwrite of `held` by the checkpoint at `path`, its transforms
+    /// in one arena of [`Overwrite::arena_bytes`] the run is handed.
     pub fn plan(
         path: &Path,
         contract: &ModelContract,
         target: StorageTarget,
         held: &[Option<Held<'_>>],
+    ) -> Result<Overwrite, Error> {
+        Self::plan_with(path, contract, target, held, false)
+    }
+
+    /// As [`Overwrite::plan`], its transforms walked as a streaming load
+    /// walks them: each plane published as it lands and dropped after its
+    /// last use, so no host image of the whole is held and the run takes
+    /// no arena.
+    pub fn streaming(
+        path: &Path,
+        contract: &ModelContract,
+        target: StorageTarget,
+        held: &[Option<Held<'_>>],
+    ) -> Result<Overwrite, Error> {
+        Self::plan_with(path, contract, target, held, true)
+    }
+
+    fn plan_with(
+        path: &Path,
+        contract: &ModelContract,
+        target: StorageTarget,
+        held: &[Option<Held<'_>>],
+        streaming: bool,
     ) -> Result<Overwrite, Error> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -102,10 +130,12 @@ impl Overwrite {
             )));
         }
         let (verbatim, rest) = split(&metadata, contract, &plan, snapshot);
-        let rest = if verbatim.is_empty() {
-            Some(plan)
-        } else if rest.tensors.is_empty() {
+        let rest = if rest.tensors.is_empty() {
             None
+        } else if streaming {
+            Some(compile_streaming(&metadata, &rest, plan.target)?)
+        } else if verbatim.is_empty() {
+            Some(plan)
         } else {
             Some(compile(&metadata, &rest, plan.target)?)
         };
@@ -115,11 +145,16 @@ impl Overwrite {
             held: held.len(),
             verbatim,
             rest,
+            streaming,
         })
     }
 
+    /// The arena the run is handed: none where it streams.
     #[must_use]
     pub fn arena_bytes(&self) -> u64 {
+        if self.streaming {
+            return 0;
+        }
         self.rest
             .as_ref()
             .map_or(0, |rest| rest.memory.arena_bytes())
@@ -158,6 +193,7 @@ impl Overwrite {
         if let Some(rest) = &self.rest {
             let execution = Execution::new(rest, &self.snapshot);
             match arena {
+                _ if self.streaming => execution.streaming(),
                 Some(arena) => execution.arena(arena),
                 None => execution,
             }

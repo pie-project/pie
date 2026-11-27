@@ -17,5 +17,8 @@ tokenizer = { path = "../tokenizer" }
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-std = { path = "../web-std" }
+
 [lints]
 workspace = true

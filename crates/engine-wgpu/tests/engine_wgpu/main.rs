@@ -17,6 +17,14 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
+    /// wgpu times no frame apart from its own fires here: nothing to watch.
+    pub fn watch_frames(_on: bool) {}
+
+    /// `None`: wgpu keeps no longest frame span.
+    pub fn longest_frame_ns() -> Option<u64> {
+        None
+    }
+
     pub const NAME: &str = "wgpu";
     pub const PLATFORM: poem::Platform = poem::Platform::Wgpu;
     /// Kernels compile to WGSL: no register-tiled or cooperative-matrix
@@ -28,6 +36,12 @@ mod backend {
     pub const LOGITS: &str = "PIE_WGPU_LOGITS";
     pub const FIXTURES: &str = "PIE_WGPU_FIXTURES";
     pub const CHUNK: &str = "PIE_WGPU_CHUNK";
+
+    /// What a test's load takes: `[engine.memory] budget_device` is
+    /// stated, so a test takes no more than this of a device it shares.
+    pub const ALLOWANCE: engine::Allowance = engine::Allowance {
+        budget: Some(8 << 30),
+    };
 
     /// The narrowest subgroup the adapter runs (0 without subgroups).
     pub fn subgroup(device: &Context) -> u32 {
@@ -43,8 +57,7 @@ mod backend {
     pub fn moe_rows(device: &Context, pairs: u32, experts: u32) -> (u32, u32, u32) {
         use engine_gpu::backend::Tactics as _;
         let (profile, _) = engine_wgpu::chip::resolve(&device.chip(), None);
-        let tuning =
-            engine_wgpu::tuning::Tuning::new(profile, device.cores(), device.storage_buffers());
+        let tuning = engine_wgpu::tuning::Tuning::new(profile);
         (
             tuning.moe_tile_rows(pairs, experts),
             tuning.moe_sorted_rows(pairs, experts),
@@ -63,6 +76,7 @@ macro_rules! spirv_only {
 
 #[path = "../../../engine-gpu/suite/attn/mod.rs"]
 mod attn;
+mod built_at_load;
 #[path = "../../../engine-gpu/suite/collective/mod.rs"]
 mod collective;
 #[path = "../../../engine-gpu/suite/conv/mod.rs"]

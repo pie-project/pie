@@ -43,9 +43,9 @@ impl Room {
         u64::from(self.rows) * u64::from(self.width) * self.dtype.bytes_ceil()
     }
 
-    fn bind(&self, handles: &Handles, plane: &Buffer) -> Result<Tensor> {
+    fn bind(&self, handles: &Handles, plane: &Plane) -> Result<Tensor> {
         Ok(Tensor::new(
-            handles.bind(plane, self.at, self.bytes())?,
+            handles.bind(&plane.buffer, plane.base + self.at, self.bytes())?,
             self.rows,
             self.width,
             self.dtype,
@@ -89,9 +89,25 @@ struct Register {
     grids: Room,
 }
 
+/// Where the plane lies: the pool's buffer, from `base` (the top of the
+/// activation span), once [`Scratch::seat`] places it.
+#[derive(Debug)]
+struct Plane {
+    buffer: Buffer,
+    base: u64,
+}
+
 #[derive(Debug)]
 pub struct Scratch {
-    plane: Buffer,
+    plane: Plane,
+    /// The plane's bytes.
+    plane_bytes: u64,
+    /// The n-gram hash constants (`ple`'s rooms), model bytes.
+    /// The model's constants (the n-gram hash tables), laid in the pool's
+    /// tables run once the pool is ([`Scratch::lay_constants`]), and what
+    /// is written there.
+    constants: crate::inputs::Region,
+    constant_image: Vec<u8>,
 
     precast: Option<Room>,
     partials: Option<Room>,
@@ -343,13 +359,22 @@ impl Scratch {
             .max(register.map_or(0, |r| r.grids.at + r.grids.bytes()))
             .max(index.map_or(0, |r| r.at + r.bytes()))
             .max(spatial.map_or(0, |r| r.at + r.bytes()));
-        let copy = copy_ceiling(trace, compiled, budget).map(|bytes| CopyRoom {
+        // A copy carries each gathered row's mask word and mask row where a
+        // fire can stage masks (`dispatch::copy`): a row of every key, a
+        // whole number of words (`mask::stage`).
+        let mask_row = stages_masks(trace).then(|| {
+            (u64::from(paging.pages_per_slot) * u64::from(paging.page_size)).next_multiple_of(4)
+        });
+        let copy = copy_ceiling(trace, compiled, budget, mask_row).map(|bytes| CopyRoom {
             at: union.next_multiple_of(ALIGN),
             bytes,
         });
 
-        let mut at = copy.map_or(union, |room| room.at + room.bytes);
+        let at = copy.map_or(union, |room| room.at + room.bytes);
 
+        // The n-gram hash constants are the model's, not a fire's: they lie
+        // in a buffer of their own, which no carve of the plane overwrites.
+        let mut constant_at = 0u64;
         let mut ple: Vec<PleHash> = Vec::new();
         for node in &trace.nodes {
             let Operation::Gather(
@@ -373,18 +398,27 @@ impl Scratch {
             if key.is_empty() || ple.iter().any(|held| held.key == key) {
                 continue;
             }
-            let room = Room::lay(&mut at, 1, key.len() as u64, Dtype::U64);
+            let room = Room::lay(&mut constant_at, 1, key.len() as u64, Dtype::U64);
             ple.push(PleHash { key, room });
         }
 
-        let mut plane = Buffer::zeroed(device, at)?;
+        let plane = Plane {
+            buffer: Buffer::zeroed(device, 0)?,
+            base: 0,
+        };
+        let mut constant_image = vec![0u8; usize::try_from(constant_at).unwrap_or(usize::MAX)];
         for hashing in &ple {
             let bytes: Vec<u8> = hashing.key.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            plane.write(hashing.room.at, &bytes)?;
+            let at = usize::try_from(hashing.room.at).unwrap_or(usize::MAX);
+            constant_image[at..at + bytes.len()].copy_from_slice(&bytes);
         }
+        let constants = crate::inputs::Region::unplaced(constant_at, Buffer::zeroed(device, 0)?);
 
         Ok(Scratch {
             plane,
+            plane_bytes: at,
+            constants,
+            constant_image,
             precast,
             partials,
             routed,
@@ -400,7 +434,27 @@ impl Scratch {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.plane.bytes()
+        self.plane_bytes
+    }
+
+    /// Lays the plane at `base` of `buffer`, the pool's: the top of the
+    /// activation span, zeroed from the load and taken by no carve.
+    pub fn seat(&mut self, buffer: Buffer, base: u64) {
+        self.plane = Plane { buffer, base };
+    }
+
+    /// The model's constants' bytes: what the tables run lays for them.
+    #[must_use]
+    pub fn constant_bytes(&self) -> u64 {
+        self.constants.bytes()
+    }
+
+    /// Lays the constants in `region` of the pool's tables run and writes
+    /// them there.
+    pub fn lay_constants(&mut self, mut region: crate::inputs::Region) -> Result<()> {
+        region.write(0, &self.constant_image)?;
+        self.constants = region;
+        Ok(())
     }
 
     #[must_use]
@@ -497,7 +551,11 @@ impl Scratch {
         if offset.saturating_add(bytes) > room.bytes {
             return None;
         }
-        Some(handles.bind(&self.plane, room.at + offset, bytes))
+        Some(handles.bind(
+            &self.plane.buffer,
+            self.plane.base + room.at + offset,
+            bytes,
+        ))
     }
 
     pub fn routed(&self, handles: &Handles) -> Option<Result<RoutedScratch>> {
@@ -548,11 +606,42 @@ impl Scratch {
     ) -> Option<Result<Tensor>> {
         let want = ngram::hash_constants(mults, primes, offsets);
         let held = self.ple.iter().find(|h| *h.key == *want)?;
-        Some(held.room.bind(handles, &self.plane))
+        let room = held.room;
+        Some(
+            handles
+                .bind(
+                    self.constants.view(),
+                    self.constants.at(room.at),
+                    room.bytes(),
+                )
+                .map(|buf| Tensor::new(buf, room.rows, room.width, room.dtype)),
+        )
     }
 }
 
-fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Option<u64> {
+/// Whether a fire on `trace` can stage masks (`mask::stage`): an attention
+/// reads the fire's masks, or attends both ways.
+fn stages_masks(trace: &Trace) -> bool {
+    trace.nodes.iter().any(|node| {
+        matches!(
+            &node.op,
+            Operation::Attn(
+                poem_ir::Attn::Prefill { mask: Some(_), .. }
+                    | poem_ir::Attn::Prefill { causal: false, .. }
+                    | poem_ir::Attn::Decode { mask: Some(_), .. }
+            )
+        )
+    })
+}
+
+/// The copy role's bytes: the largest copied region's token rows, and, where
+/// `mask_row` is stated, each row's mask row of that many bytes and its word.
+fn copy_ceiling(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    budget: &Budget,
+    mask_row: Option<u64>,
+) -> Option<u64> {
     let lanes = u64::from(budget.max_lanes);
     let mut most = 0u64;
     for region in compiled.template() {
@@ -573,7 +662,7 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
                     .then_some(budget.max_tokens)
             });
         let Some(rows) = rows else { continue };
-        if !fallback::copyable_mask(trace, compiled, &region.mask) {
+        if !fallback::copyable_mask(trace, compiled, &region.mask, crate::window::CARRIES) {
             continue;
         }
         let Some((ins, outs)) = fallback::operands(&trace.nodes, region) else {
@@ -604,6 +693,10 @@ fn copy_ceiling(trace: &Trace, compiled: &CompiledModel, budget: &Budget) -> Opt
             seen.push(rect.offset);
             let row = u64::from(rect.width) * rect.dtype.bytes_ceil();
             at = at.next_multiple_of(COPY_ALIGN) + u64::from(rows) * row;
+        }
+        if let Some(mask_row) = mask_row {
+            at = at.next_multiple_of(COPY_ALIGN) + u64::from(rows) * mask_row;
+            at = at.next_multiple_of(COPY_ALIGN) + u64::from(rows) * 4;
         }
         most = most.max(at);
     }

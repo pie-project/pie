@@ -9,6 +9,7 @@
 //! layers) pairs `(i, i + head_dim/2)` at `pos * theta^(-2i/head_dim)` for the
 //! first `rotary_dim/2` pairs instead, as HF's `proportional` rope type does.
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -24,28 +25,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
-fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-        .collect()
 }
 
 /// The reference: the first `rotary_dim/2` pairs, `span` apart, turned by
@@ -148,6 +127,7 @@ fn check(
 
 #[test]
 fn the_partial_rope_turns_only_the_rotary_pairs() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

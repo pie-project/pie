@@ -153,7 +153,7 @@ pub fn try_tables(
         || mask.dtype != Dtype::U8
         || plan.positions.dtype != Dtype::I32
         || plan.request_of_token.dtype != Dtype::I32
-        || plan.mask_enabled.dtype != Dtype::U8
+        || plan.mask_enabled.dtype != Dtype::U32
     {
         return Ok(false);
     }

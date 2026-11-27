@@ -21,6 +21,7 @@ pub struct Enabled {
     pub memory_model: bool,
     pub subgroup_size_control: bool,
     pub memory_budget: bool,
+    pub coopmat: bool,
 }
 
 #[derive(Debug)]
@@ -29,7 +30,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot, _share: f64) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _allowance: engine::Allowance) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 
@@ -39,7 +40,22 @@ impl Context {
     }
 
     #[must_use]
-    pub fn working_set(&self) -> u64 {
+    pub fn capacity(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn outside(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn whose_memory(&self) -> engine::DeviceMemory {
         match self.never {}
     }
 
@@ -54,7 +70,25 @@ impl Context {
     }
 
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn books(&self) -> &engine_gpu::Books {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn cores(&self) -> Option<u32> {
+        match self.never {}
+    }
+
+    pub fn resident(&self) -> Option<u32> {
+        match self.never {}
+    }
+
+    pub(crate) fn hold_resident(&self, _workgroups: u32) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn table_align(&self) -> u64 {
         match self.never {}
     }
 
@@ -94,6 +128,11 @@ impl Context {
     }
 
     #[must_use]
+    pub fn measured_on(&self) -> String {
+        match self.never {}
+    }
+
+    #[must_use]
     pub fn chip(&self) -> crate::chip::Device {
         match self.never {}
     }
@@ -107,11 +146,99 @@ impl Context {
         match self.never {}
     }
 
+    pub fn lay_staging(&self) -> Result<()> {
+        match self.never {}
+    }
+
+    pub fn seal_descriptor_pools(&self, _frames: usize) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn frame(&self) -> Result<Frame> {
         match self.never {}
     }
 
+    pub fn landed(&self, _on_done: Option<engine_gpu::backend::OnDone>) -> Result<Pending> {
+        match self.never {}
+    }
+
+    pub fn frame_lay(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn spanned_kept(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn writes_timestamps(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn stamps(&self) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps, _keep: bool) -> Result<Frame> {
+        match self.never {}
+    }
+
     pub fn frame_kept(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn name_descriptor_sets(&self) {}
+
+    pub fn frame_dry(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn room_next(&self, _room: Option<(&Buffer, u64)>) {
+        match self.never {}
+    }
+
+    pub fn rebind_segments(&self, _segments: &[(Option<&Buffer>, &Buffer)]) -> Result<u64> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn verifies_fills(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn rebinds_segments(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn indirect_next(&self, _at: Option<std::sync::Arc<Vec<bool>>>) {
+        match self.never {}
+    }
+
+    pub fn arm_next(&self, _arm: Option<std::sync::Arc<ArmBlock>>) {
+        match self.never {}
+    }
+
+    pub fn fixed_next(&self, _fixed: bool) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fire_alignments(&self) -> (u64, u64) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copier_scalars(&self) -> u32 {
         match self.never {}
     }
 }
@@ -120,12 +247,47 @@ pub struct Frame {
     never: std::convert::Infallible,
 }
 
+#[derive(Clone, Debug)]
+pub enum Stamps {}
+
+/// What a fill walk laid: none, with no device.
+#[derive(Debug)]
+pub struct Fill {
+    pub baked: u64,
+    pub groups: Vec<[u32; 3]>,
+    pub copies: Vec<[u32; 3]>,
+    pub image: Image,
+    pub cuts: usize,
+    pub picks: u64,
+    pub room_pasts: Vec<u64>,
+}
+
 impl Frame {
+    pub fn is_dry(&self) -> bool {
+        false
+    }
+}
+
+impl Frame {
+    #[must_use]
+    pub fn room_pasts(&self) -> Vec<u64> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn into_fill(self) -> Fill {
+        match self.never {}
+    }
+
     pub fn flush_settled(&self) -> Result<()> {
         self.flush()
     }
 
     pub fn flush(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
+    pub fn submit_segment(&self) -> Result<()> {
         Err(Fault::Deviceless)
     }
 
@@ -144,6 +306,10 @@ impl Frame {
     }
 
     pub fn commit_timed(self) -> Result<f64> {
+        match self.never {}
+    }
+
+    pub fn commit_spanned(self) -> Result<Option<u64>> {
         match self.never {}
     }
 
@@ -171,11 +337,25 @@ impl Frame {
         match self.never {}
     }
 
+    pub fn copy_rows(
+        &mut self,
+        _source: &Buffer,
+        _into: &Buffer,
+        _regions: &[(u64, u64, u64)],
+        _most: usize,
+    ) -> Result<()> {
+        match self.never {}
+    }
+
     pub fn fill_zero(&mut self, _into: &Buffer, _at: u64, _len: u64) -> Result<()> {
         match self.never {}
     }
 
     pub fn into_kept(self) -> Result<Kept> {
+        match self.never {}
+    }
+
+    pub fn into_kept_spanned(self) -> Result<Kept> {
         match self.never {}
     }
 }
@@ -185,9 +365,98 @@ pub struct Kept {
     never: std::convert::Infallible,
 }
 
+/// What a walk laid in a fire block: none, with no device.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Image;
+
+impl Image {
+    #[must_use]
+    pub fn sealed(&self) -> Image {
+        Image
+    }
+
+    #[must_use]
+    pub fn same(&self, _other: &Image) -> bool {
+        true
+    }
+
+    #[must_use]
+    pub fn layout(&self) -> Vec<usize> {
+        Vec::new()
+    }
+}
+
+/// An arm's fire block: none, with no device.
+pub struct ArmBlock {
+    never: std::convert::Infallible,
+}
+
+impl ArmBlock {
+    pub fn new(device: &Context, _bytes: u64) -> Result<std::sync::Arc<ArmBlock>> {
+        match device.never {}
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        match self.never {}
+    }
+}
+
 impl Kept {
+    pub fn bind_room(&self, _room: Option<(&Buffer, u64)>, _pasts: &[u64]) -> Result<bool> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn pinned(&self) -> Option<String> {
+        match self.never {}
+    }
+
     #[must_use]
     pub fn cuts(&self) -> usize {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn baked(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn image(&self) -> &Image {
+        match self.never {}
+    }
+
+    pub fn stage(&self, _image: &Image) -> Result<()> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn groups(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn copies(&self) -> &[[u32; 3]] {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn picks(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn fixed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn indirect(&self, _at: usize) -> bool {
+        match self.never {}
+    }
+
+    pub fn replay_spanned(&self) -> Result<Option<u64>> {
         match self.never {}
     }
 
@@ -217,6 +486,10 @@ impl Pending {
     pub fn wait(&self) -> Result<()> {
         match self.never {}
     }
+
+    pub fn span_ns(&self) -> Result<Option<u64>> {
+        match self.never {}
+    }
 }
 
 pub use engine_gpu::Memory;
@@ -227,15 +500,20 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(_device: &Context, _bytes: u64) -> Result<Buffer> {
+    pub fn zeroed(_device: &Context, _bytes: u64, _owner: engine_gpu::Owner) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
-    pub fn host(_device: &Context, _bytes: u64) -> Result<Buffer> {
+    pub fn host(_device: &Context, _bytes: u64, _owner: engine_gpu::Owner) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
-    pub fn with(_device: &Context, _bytes: u64, _kind: Memory) -> Result<Buffer> {
+    pub fn with(
+        _device: &Context,
+        _bytes: u64,
+        _kind: Memory,
+        _owner: engine_gpu::Owner,
+    ) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
@@ -293,8 +571,13 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(
+        device: &Context,
+        bytes: u64,
+        kind: Memory,
+        owner: engine_gpu::Owner,
+    ) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {
@@ -381,15 +664,38 @@ impl Pipelines {
         self.compiles.get()
     }
 
-    pub fn warm(&self, _device: &Context, _fire: kernels_slang::Fire) -> Result<()> {
-        Err(Fault::Deviceless)
+    #[must_use]
+    pub fn most_scalars(&self) -> u32 {
+        0
+    }
+
+    /// The kernels built after `from`: none, since a device-less build
+    /// builds no pipeline.
+    #[must_use]
+    pub fn built_since(&self, _from: u64) -> Vec<&'static str> {
+        Vec::new()
     }
 
     pub fn get(
         &self,
         _device: &Context,
-        _fire: kernels_slang::Fire,
+        _file: &'static str,
+        _key: &'static str,
     ) -> Result<std::sync::Arc<Pipeline>> {
         Err(Fault::Deviceless)
     }
+
+    pub fn hold(_device: &Context, _file: &'static str, _key: &'static str) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+}
+
+#[must_use]
+pub fn held_counts() -> (i64, i64, u64, u64, u64) {
+    (0, 0, 0, 0, 0)
+}
+
+#[must_use]
+pub fn take_spent() -> bool {
+    false
 }

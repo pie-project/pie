@@ -33,8 +33,10 @@ fn tests_every_case() {
     run_ahead_successor_after_fork_cows_exactly_once();
     publish_batch_rejects_an_aliased_working_set();
     a_fold_drops_the_buffer_pages_behind_it();
+    a_truncate_takes_back_the_buffer_past_its_cut();
     a_state_others_read_is_folded_into_a_copy();
     a_checkpoint_is_cache_and_goes_when_idle();
+    new_weights_drop_every_checkpoint();
     idle_snapshots_go_in_retention_order();
     a_checkpoint_past_a_step_goes_first();
     a_checkpoint_resumes_a_fresh_working_set();
@@ -43,11 +45,6 @@ fn tests_every_case() {
 
 // A checkpoint's rows are held by its cache entry: they count as cache only
 // once no working set holds them too, and the hold goes with the checkpoint.
-
-// A windowed model's state is a window list: a fire takes the slots it
-// writes, the slots behind the committed position's window retire, a write
-// moves the head back without touching a slot, a fork shares the list and
-// copies only the slot it overwrites.
 
 fn idle_snapshots_go_in_retention_order() {
     use crate::inferlet::process::ProcessId;
@@ -66,14 +63,33 @@ fn idle_snapshots_go_in_retention_order() {
         "the lower-ranked, though newer"
     );
     assert!(s.has_checkpoint(&[1; 32]), "the higher-ranked stays");
-    assert_eq!(
-        s.reclaim_droppable(rank),
-        0,
-        "the runtime leaves what a policy keyed above 0"
-    );
-    assert!(s.has_checkpoint(&[1; 32]));
-    assert_eq!(s.discard_cache(high), 1);
+    // No lower tier for a checkpoint: cached state yields to the next
+    // demand, whatever its key.
+    assert_eq!(s.reclaim_cache(rank), 1);
+    assert!(!s.has_checkpoint(&[1; 32]));
     assert_eq!(s.reclaim_cache(rank), 0);
+}
+
+/// A reload in place drops every checkpoint, whatever its key: none of
+/// them may be resumed under the new weights.
+fn new_weights_drop_every_checkpoint() {
+    use crate::inferlet::process::ProcessId;
+    let mut s = store();
+    for (key, owner) in [([6; 32], 6), ([7; 32], 7)] {
+        let ws = s.create_working_set(geom());
+        write_state(&mut s, ws);
+        assert!(
+            s.checkpoint(ws, key, Some(ProcessId::from_u128(owner)))
+                .unwrap()
+        );
+        s.release_working_set(ws);
+    }
+    assert!(s.cache_only() != RsUnits::default());
+    assert_eq!(s.drop_cache(), 2);
+    assert!(!s.holds_checkpoints());
+    assert!(!s.has_checkpoint(&[6; 32]) && !s.has_checkpoint(&[7; 32]));
+    assert_eq!(s.cache_only(), RsUnits::default());
+    assert_eq!(s.drop_cache(), 0);
 }
 
 fn a_checkpoint_past_a_step_goes_first() {
@@ -126,14 +142,8 @@ fn a_checkpoint_is_cache_and_goes_when_idle() {
     write_state(&mut s, other);
     assert!(s.checkpoint(other, o, None).unwrap());
     assert_eq!(s.group_demand(other, true, false, None), Ok(slots(1)));
-    let kept = |_: Option<crate::inferlet::process::ProcessId>| 1;
-    assert_eq!(
-        s.reclaim_sharing(&[other], kept),
-        0,
-        "a checkpoint a policy keeps is not the runtime's to drop"
-    );
-    assert!(s.has_checkpoint(&o));
-    assert_eq!(s.reclaim_sharing(&[other], |_| 0), 1);
+    // Cached state yields to running work, whatever its key.
+    assert_eq!(s.reclaim_sharing(&[other]), 1);
     assert_eq!(
         s.group_demand(other, true, false, None),
         Ok(slots(0)),
@@ -267,6 +277,42 @@ fn a_fold_drops_the_buffer_pages_behind_it() {
     );
 }
 
+// A stop's take-back on a set with a recurrent state: the buffer pages
+// wholly past the cut go back, the page the cut falls in stays; a cut below
+// what the state holds is refused, the buffer untouched.
+fn a_truncate_takes_back_the_buffer_past_its_cut() {
+    let mut s = store();
+    let ws = store_with_state(&mut s);
+    let prepared = s
+        .prepare_group(ws, false, false, None, Some(0..12), None)
+        .unwrap();
+    settled(&mut s, prepared);
+    s.fold(ws, 2);
+    let held = s.held([ws]);
+    assert_eq!(s.buffer_size(ws), Ok(3));
+    s.truncate(ws, 5).unwrap();
+    assert_eq!(
+        s.buffer_size(ws),
+        Ok(2),
+        "slots 8..12 went, 4..8 holds row 4"
+    );
+    assert_eq!(s.held([ws]).pages + 1, held.pages, "and its page went back");
+    assert_eq!(
+        s.truncate(ws, 1),
+        Err(RsError::FoldedPastCut {
+            committed: 2,
+            cut: 1
+        })
+    );
+    assert_eq!(s.buffer_size(ws), Ok(2));
+    s.truncate(ws, 2).unwrap();
+    assert_eq!(s.buffer_size(ws), Ok(1), "the page the state ends in stays");
+    // A state that buffers no row (no rs list) is refused by name.
+    let mut bare = RsStore::new(4, 0);
+    let ws = bare.create_working_set(geom());
+    assert_eq!(bare.truncate(ws, 0), Err(RsError::Unbuffered));
+}
+
 fn a_state_others_read_is_folded_into_a_copy() {
     let mut s = store();
     let ws = store_with_state(&mut s);
@@ -288,8 +334,9 @@ fn a_checkpoint_resumes_a_fresh_working_set() {
     let ws = s.create_working_set(geom());
     let prepared = s.prepare_group(ws, true, false, None, None, None).unwrap();
     let published = s.publish_prepared(prepared).unwrap();
-    assert!(
-        !s.checkpoint(ws, key, None).unwrap(),
+    assert_eq!(
+        s.checkpoint(ws, key, None),
+        Err(RsError::CheckpointUnsettled),
         "a fire still writes it"
     );
     s.settle(published);
@@ -349,4 +396,97 @@ fn a_snapshot_resumes_at_its_row() {
         free - 1,
         "the checkpoint holds its slot"
     );
+}
+
+// A fold the device counts: from its fire's submit until it settles the
+// record stands ahead of the frozen length, and only the engine, and only
+// where the record stands, knows by how much.
+
+#[test]
+fn device_fold_gate_every_case() {
+    a_device_counted_fold_gates_every_copy_until_it_settles();
+    two_device_counted_folds_gate_until_the_last_settles();
+    a_device_counted_fold_that_failed_refuses_by_its_failure();
+    a_released_set_has_nothing_left_to_wait_for();
+}
+
+fn folded_at(s: &mut RsStore, frozen: u32) -> RsWorkingSetId {
+    let ws = s.create_working_set(geom());
+    write_state(s, ws);
+    s.fold(ws, frozen);
+    ws
+}
+
+fn a_device_counted_fold_gates_every_copy_until_it_settles() {
+    let mut s = store();
+    let ws = folded_at(&mut s, 4);
+    s.begin_device_fold(ws);
+    let unsettled = || RsError::DeviceFoldUnsettled;
+    assert_eq!(s.fork(ws), Err(unsettled()));
+    assert_eq!(s.export(ws).map(|set| set.frozen), Err(unsettled()));
+    assert_eq!(s.checkpoint(ws, [1; 32], None), Err(unsettled()));
+    assert!(!s.has_checkpoint(&[1; 32]));
+
+    s.end_device_fold(ws, Some(3), None);
+    let child = s.fork(ws).expect("the fold settled");
+    assert_eq!(s.frozen(child), Ok(7), "the child takes what the fold left");
+    assert_eq!(s.export(ws).map(|set| set.frozen), Ok(7));
+    assert_eq!(s.checkpoint(ws, [1; 32], None), Ok(true));
+    let resumed = s.create_working_set(geom());
+    assert!(s.adopt_checkpoint(resumed, &[1; 32]).unwrap());
+    assert_eq!(s.frozen(resumed), Ok(7));
+}
+
+fn two_device_counted_folds_gate_until_the_last_settles() {
+    let mut s = store();
+    let ws = folded_at(&mut s, 4);
+    s.begin_device_fold(ws);
+    s.begin_device_fold(ws);
+    s.end_device_fold(ws, Some(1), None);
+    assert_eq!(
+        s.fork(ws),
+        Err(RsError::DeviceFoldUnsettled),
+        "another is on its way"
+    );
+    s.end_device_fold(ws, Some(2), None);
+    let child = s.fork(ws).unwrap();
+    assert_eq!(s.frozen(child), Ok(7));
+}
+
+fn a_device_counted_fold_that_failed_refuses_by_its_failure() {
+    let mut s = store();
+    let ws = folded_at(&mut s, 4);
+    s.begin_device_fold(ws);
+    s.end_device_fold(ws, None, Some("pipeline: forward failed: device lost"));
+    let failed = || RsError::DeviceFoldFailed("pipeline: forward failed: device lost".to_string());
+    assert_eq!(s.fork(ws), Err(failed()));
+    assert_eq!(s.export(ws).map(|set| set.frozen), Err(failed()));
+    assert_eq!(s.checkpoint(ws, [2; 32], None), Err(failed()));
+    assert!(
+        failed().to_string().contains("forward failed: device lost"),
+        "by the fire's own failure: {}",
+        failed()
+    );
+    assert_eq!(s.frozen(ws), Ok(4), "nothing was counted");
+
+    // A fold that settles after it does not make the length known again.
+    s.begin_device_fold(ws);
+    s.end_device_fold(ws, Some(1), None);
+    assert_eq!(s.fork(ws), Err(failed()));
+
+    // With the record gone there is nothing to be behind.
+    s.forget_state(ws).unwrap();
+    assert!(s.fork(ws).is_ok());
+}
+
+fn a_released_set_has_nothing_left_to_wait_for() {
+    use futures::FutureExt;
+    let store = std::sync::Mutex::new(store());
+    let ws = folded_at(&mut store.lock().unwrap(), 4);
+    store.lock().unwrap().begin_device_fold(ws);
+    let sets = [ws];
+    let mut waiting = Box::pin(super::device_folds_settled(&store, &sets));
+    assert!(waiting.as_mut().now_or_never().is_none());
+    store.lock().unwrap().release_working_set(ws);
+    assert!(waiting.as_mut().now_or_never().is_some());
 }

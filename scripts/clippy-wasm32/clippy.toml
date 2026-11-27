@@ -1,0 +1,31 @@
+# The tab's lint (scripts/browser-check.sh points CLIPPY_CONF_DIR here for its
+# wasm32 runs): the workspace's clippy.toml, plus std's clocks, which panic
+# in a browser ("time not implemented on this platform"), and std's thread
+# spawns, which fail there ("operation not supported on this platform"). Code the tab
+# compiles reads the crate's web-safe Instant (engine_gpu::Instant,
+# engine-wgpu's device::host::Instant, runtime's rt::Instant / rt::wall) or
+# web_std::time. Keep the first entry as the workspace file has it.
+disallowed-methods = [
+    { path = "std::sync::PoisonError::into_inner", reason = "a poisoned lock's state is not to be trusted; `.expect(\"… poisoned\")` instead" },
+    { path = "std::time::Instant::now", reason = "panics in the tab; the crate's web-safe Instant instead" },
+    { path = "std::time::Instant::elapsed", reason = "panics in the tab; the crate's web-safe Instant instead" },
+    { path = "std::time::SystemTime::now", reason = "panics in the tab; web_std's clock, or cfg the path off wasm32" },
+    { path = "std::time::SystemTime::elapsed", reason = "panics in the tab; web_std's clock, or cfg the path off wasm32" },
+    { path = "std::thread::spawn", reason = "the tab spawns no thread (\"operation not supported\"); run the work serially on wasm32" },
+    { path = "std::thread::scope", reason = "the tab spawns no thread (\"operation not supported\"); run the work serially on wasm32" },
+    { path = "std::thread::Builder::spawn", reason = "the tab spawns no thread (\"operation not supported\"); run the work serially on wasm32" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "the tab spawns no thread (\"operation not supported\"); run the work serially on wasm32" },
+    { path = "std::thread::Scope::spawn", reason = "the tab spawns no thread (\"operation not supported\"); run the work serially on wasm32" },
+    { path = "std::sync::mpsc::Receiver::recv", reason = "spin-waits on the tab's only thread; web_std's channel (crate::rt::channel) parks a green thread" },
+    { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "spin-waits on the tab's only thread; web_std's channel (crate::rt::channel) parks a green thread" },
+    { path = "std::sync::mpsc::Receiver::iter", reason = "spin-waits on the tab's only thread; web_std's channel (crate::rt::channel) parks a green thread" },
+    { path = "std::sync::mpsc::SyncSender::send", reason = "spin-waits on the tab's only thread when full; web_std's channel instead" },
+    { path = "std::sync::Condvar::wait", reason = "cannot block on the tab's only thread; park on a waker (web_std) or refuse by name" },
+    { path = "std::sync::Condvar::wait_while", reason = "cannot block on the tab's only thread; park on a waker (web_std) or refuse by name" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "cannot block on the tab's only thread; park on a waker (web_std) or refuse by name" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "cannot block on the tab's only thread; park on a waker (web_std) or refuse by name" },
+    { path = "std::sync::Barrier::wait", reason = "cannot block on the tab's only thread" },
+    { path = "std::thread::sleep", reason = "cannot block on the tab's only thread; web_std's sleep instead" },
+    { path = "std::thread::park", reason = "cannot block on the tab's only thread; park on a waker (web_std)" },
+    { path = "std::thread::park_timeout", reason = "cannot block on the tab's only thread; park on a waker (web_std)" },
+]

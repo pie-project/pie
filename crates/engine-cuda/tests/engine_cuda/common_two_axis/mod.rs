@@ -348,6 +348,7 @@ pub struct Rig {
     /// The plan's guest inputs by name, in id order.
     pub inputs: Vec<String>,
     next_channel: u64,
+    guest: crate::guest::Guest,
     _dir: tempfile::TempDir,
 }
 
@@ -382,12 +383,17 @@ impl Rig {
                     max_voxels: Some(max_voxels),
                     max_clips: Some(2),
                 },
-                residency: Residency::default(),
+                residency: Residency {
+                    device_kv_budget: Some(crate::POOL),
+                    ..Residency::default()
+                },
                 ordinal: 0,
                 frames_in_flight: 1,
+                steps: Default::default(),
             })
             .expect("the two-axis miniature loads");
         Rig {
+            guest: crate::guest::Guest::on(&mut engine, &loaded.caps.chunks),
             engine,
             loaded,
             facts,
@@ -497,43 +503,62 @@ impl Rig {
             .expect("the program registers")
     }
 
+    fn registration(id: ChannelId, shape: Vec<u32>, host_role: HostRole) -> ChannelRegistration {
+        ChannelRegistration {
+            id,
+            shape,
+            dtype: ChanDType::Concrete(EtaDtype::F32),
+            host_role,
+            seeded: false,
+            extern_dir: None,
+            capacity: 2,
+            extern_name: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+
     pub fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> ChannelId {
         let id = ChannelId(self.next_channel);
         self.next_channel += 1;
-        Channels::open(
-            &mut self.engine,
-            &ChannelRegistration {
-                id,
-                shape,
-                dtype: ChanDType::Concrete(EtaDtype::F32),
-                host_role,
-                seeded: false,
-                extern_dir: None,
-                capacity: 2,
-                extern_name: Vec::new(),
-            },
-        )
-        .expect("the channel registers");
+        self.guest
+            .register(&mut self.engine, Self::registration(id, shape, host_role));
         id
     }
 
+    /// Fresh `Channel` slots for the ring of a channel of `shape` and
+    /// `host_role`: where a restore copies a parked ring back to.
+    pub fn fresh_ring(&mut self, shape: Vec<u32>, host_role: HostRole) -> Vec<u32> {
+        self.guest.ring(
+            &mut self.engine,
+            &Self::registration(ChannelId(0), shape, host_role),
+        )
+    }
+
     pub fn bind(&mut self, program: ProgramId, channels: Vec<ChannelId>, rows: u32) -> InstanceId {
-        self.engine
-            .bind(&InstanceBinding {
-                program,
-                channels,
-                seeds: Vec::new(),
-                geometry: GeometryClass::Host,
-                device_resolved: Default::default(),
-                extents: engine::program::BindExtents {
-                    row_count: rows,
-                    token_count: rows,
-                    sampled_rows: rows,
-                    query_len: rows,
-                    ..engine::program::BindExtents::default()
+        self.guest
+            .bind(
+                &mut self.engine,
+                InstanceBinding {
+                    program,
+                    channels,
+                    seeds: Vec::new(),
+                    geometry: GeometryClass::Host,
+                    device_resolved: Default::default(),
+                    extents: engine::program::BindExtents {
+                        row_count: rows,
+                        token_count: rows,
+                        sampled_rows: rows,
+                        query_len: rows,
+                        ..engine::program::BindExtents::default()
+                    },
+                    instance_slots: Vec::new(),
+                    ring_slots: Vec::new(),
+                    adapter_slots: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
-            })
-            .expect("the instance binds")
+            )
             .id
     }
 
@@ -568,6 +593,7 @@ pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
         lanes: 1,
         instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 
@@ -582,6 +608,7 @@ pub fn frame(
         attachments,
         media: Vec::new(),
         voxels,
+        shape: None,
     })
 }
 

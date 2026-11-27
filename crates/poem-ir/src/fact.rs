@@ -4,6 +4,10 @@ use crate::{Guard, Request};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Builtin {
+    /// The lane states an attention mask. A model reads it only where its
+    /// own rows differ for such a lane; attention never parts lanes by it
+    /// (`attn.attend` reads each lane's mask as data, [`crate::RuntimeInput::Mask`]),
+    /// so a trace that does not read it gives it no bit and no class.
     Masked,
     Adapted,
     Media,
@@ -73,6 +77,12 @@ pub struct Facts {
     pub table: Vec<Fact>,
     #[serde(default)]
     pub switches: Vec<SwitchDecl>,
+    /// The tokens the model's own draft head proposes in one pass, each fed
+    /// the one before it: the leading entries of `mtp.drafts` that are a
+    /// chain, however many copies the output carries. `None` when the text
+    /// states no head.
+    #[serde(default)]
+    pub draft_depth: Option<u32>,
 }
 
 impl Facts {
@@ -236,6 +246,21 @@ impl Facts {
             .iter()
             .position(|fact| *fact == Fact::Builtin(builtin))
             .is_some_and(|bit| word & (1 << bit) != 0)
+    }
+
+    /// `word` with `builtin`'s bit set to `on`, where the trace gives it a
+    /// bit; as it was where it gives none.
+    #[must_use]
+    pub fn with(&self, word: u64, builtin: Builtin, on: bool) -> u64 {
+        match self
+            .table
+            .iter()
+            .position(|fact| *fact == Fact::Builtin(builtin))
+        {
+            Some(bit) if on => word | (1 << bit),
+            Some(bit) => word & !(1 << bit),
+            None => word,
+        }
     }
 
     /// A request per reachable word, plainest first; each switch also at one value never read.

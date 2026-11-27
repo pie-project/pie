@@ -5,12 +5,13 @@
 mod fire;
 mod kv;
 mod launch;
+mod pool;
 mod posted;
 mod stream;
+mod window;
 
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, PoolFacts};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::chunk::{ChunkFacts, DegenerateBytes};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout};
 use engine::load::{Checkpoint, LoadFacts, LoadRequest, Loaded};
@@ -20,6 +21,7 @@ use engine::{Channels, Completion, Engine, Programs, Tiers};
 use eta_ir::registry::{GeometryClass, PortMask};
 
 use kv::Kv;
+use window::Windows;
 
 use crate::config::{Config, Debug, Target};
 use crate::facts::Facts;
@@ -40,6 +42,8 @@ pub struct CerebrasEngine {
     readout: Option<(String, u32)>,
     model: Option<wafer::Wafer>,
     kv: Kv,
+    /// Windowed layers' rings and window buffer.
+    windows: Windows,
     /// Fires run (the model-time log's count).
     fires: u64,
     /// Rows of history replayed into the model's cache.
@@ -49,6 +53,9 @@ pub struct CerebrasEngine {
     ahead_runs: u64,
     /// The posted token loop on the wafer: the token it was fed and its position.
     loop_posted: Option<(u32, usize)>,
+    /// The most steps a greedy lane's token loop runs past its row, as the
+    /// load decided ([`fire::lookahead_of`]).
+    lookahead: usize,
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
@@ -57,6 +64,8 @@ pub struct CerebrasEngine {
     posted: std::collections::VecDeque<posted::Posted>,
     /// A stream reading's program (a diffusion transformer's denoise), when the load is one.
     stream: Option<stream::Streams>,
+    /// A unit program's pages, as its lanes' kv refs name them.
+    wafer_pages: Option<pool::WaferPages>,
 }
 
 impl CerebrasEngine {
@@ -72,17 +81,20 @@ impl CerebrasEngine {
             readout: None,
             model: None,
             kv: Kv::default(),
+            windows: Windows::default(),
             fires: 0,
             replayed: 0,
             ahead_hits: 0,
             ahead_runs: 0,
             loop_posted: None,
+            lookahead: 0,
             next_fire: 0,
             next_frame: 0,
             sink: None,
             pending: None,
             posted: std::collections::VecDeque::new(),
             stream: None,
+            wafer_pages: None,
         }
     }
 
@@ -131,6 +143,8 @@ fn device_facts() -> DeviceFacts {
         storage_alignment: 256,
         storage_max_tile_bytes: u64::MAX,
         codegen_backend: None,
+        // what it planned with before forms were stated: every form
+        library_forms: engine::LibraryForms::ALL,
     }
 }
 
@@ -140,8 +154,39 @@ fn default_state_slots(budgets: &engine::load::Budgets) -> u32 {
 }
 
 impl Engine for CerebrasEngine {
+    /// Unsupported on Cerebras, by name: it keys no host cover (no committed
+    /// covers) and has no keyed load-time measurements to skip (out of scope
+    /// for this work), so it never skips.
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Cerebras times nothing at load: none.
+    fn measured_at_load(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> &'static str {
         "cerebras-spatial"
+    }
+
+    /// The fire the wafer program is built for; a stated context is its
+    /// positions, built into the program.
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(engine::load::FireCeiling {
+            lanes: 4,
+            tokens: 64,
+            page_size: None,
+            context_binds: true,
+        })
+    }
+
+    fn live(&self) -> engine::live::Live {
+        self.programs.live()
     }
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
@@ -166,6 +211,7 @@ impl Engine for CerebrasEngine {
             residency,
             ordinal: _,
             frames_in_flight: _,
+            steps,
         } = request;
         // The program's cache is replayed from host tokens: there is no device pool to back with a
         // slot file or map out to another worker.
@@ -188,6 +234,30 @@ impl Engine for CerebrasEngine {
                 "the cerebras engine loads a checkpoint path".into(),
             ));
         };
+        // What the trace and budgets alone decide, before anything is compiled: the float output
+        // a trace reads at its readout rows bounds the wafer's vocabulary, wherever it has one. A
+        // decode model (no stream reading declared, which is what routes a load to its stream
+        // readings) without one could serve no fire.
+        let slots =
+            poem_compiler::state_slots(budgets.slots, &trace, default_state_slots(&budgets));
+        let decode = trace.facts.declared("reading").is_none() && self.debug.program.is_none();
+        let readout = if decode {
+            Facts::of(trace.clone(), &budgets, slots)
+                .map_err(Error::Load)?
+                .readout()
+        } else {
+            Facts::of(trace.clone(), &budgets, slots)
+                .ok()
+                .and_then(|facts| facts.readout())
+        };
+        if decode && readout.is_none() {
+            return Err(Error::Load(
+                "the trace reads no float output at its readout rows (`logits`, else its one \
+                 float readout): the cerebras engine serves none"
+                    .into(),
+            ));
+        }
+        let width = readout.map(|(_, width)| width);
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
         // a stream reading's program (its host.json), or a directory of them, one a reading
         if let Some(programs) = self
@@ -196,20 +266,14 @@ impl Engine for CerebrasEngine {
             .as_deref()
             .and_then(|d| stream::programs_in(d, self.debug.link.as_deref()))
         {
-            return self.load_stream(trace, &path, &contract, &budgets, &programs);
+            return self.load_stream(trace, &path, &contract, &budgets, &steps, &programs);
         }
         // the program serves the context the config states (else as many positions as it holds)
         let positions = budgets.context_declared.then_some(budgets.max_context);
-        let slots =
-            poem_compiler::state_slots(budgets.slots, &trace, default_state_slots(&budgets));
         let platform = self.platform()?;
         let w = match prepare::prepare(&self.cfg, &trace, &contract, &path, positions) {
             Ok(prepared) => {
-                let facts = Facts::of(trace.clone(), &budgets, slots).map_err(Error::Load)?;
-                let vocab = facts
-                    .readout()
-                    .as_ref()
-                    .map_or(usize::MAX, |(_, w)| *w as usize);
+                let vocab = width.map_or(usize::MAX, |w| w as usize);
                 let w = wafer::Wafer::open(
                     prepared.program.clone(),
                     platform,
@@ -218,20 +282,11 @@ impl Engine for CerebrasEngine {
                     self.cfg.toolchain.sdk_lib(),
                 )
                 .map_err(|e| Error::Load(format!("the wafer model: {e}")))?;
-                // a program without the token loop serves only with the lookahead off: refused here
-                if !w.token_loop
-                    && self
-                        .cfg
-                        .lookahead
-                        .unwrap_or(fire::default_lookahead(w.posted_loop))
-                        > 0
-                {
-                    return Err(Error::Load(format!(
-                        "{}: built without the token loop (a WL build), and the lookahead is on \
-                         ([cerebras] lookahead = 0 serves it without one)",
-                        prepared.program.display()
-                    )));
-                }
+                // Whether greedy lanes run the program's token loop, and how far: a lookahead
+                // stated for a program without one is refused here.
+                self.lookahead =
+                    fire::lookahead_of(self.cfg.lookahead, w.token_loop, w.posted_loop)
+                        .map_err(|e| Error::Load(format!("{}: {e}", prepared.program.display())))?;
                 tracing::info!(
                     program = %prepared.program.display(),
                     vocab = w.vocab,
@@ -274,6 +329,9 @@ impl Engine for CerebrasEngine {
                     )
                     .map_err(|e| Error::Load(format!("the unit decode program: {e}")))?;
                     tracing::info!(program = %program.display(), vocab = w.vocab, positions = w.positions, "spatial unit decode model loaded");
+                    self.lookahead =
+                        fire::lookahead_of(self.cfg.lookahead, w.token_loop, w.posted_loop)
+                            .map_err(Error::Load)?;
                     w
                 } else {
                     // a model the decode program does not run: its stream readings, compiled here
@@ -288,7 +346,8 @@ impl Engine for CerebrasEngine {
                             decode = %e,
                             "cerebras: no decode program; the model's stream readings are served"
                         );
-                        return self.load_stream(trace, &path, &contract, &budgets, &programs);
+                        return self
+                            .load_stream(trace, &path, &contract, &budgets, &steps, &programs);
                     }
                     return Err(Error::Load(format!("the wafer program: {e}")));
                 }
@@ -317,34 +376,53 @@ impl Engine for CerebrasEngine {
         let trace_name = facts.trace().name.clone();
         let paging = facts.paging();
         self.kv.page_size = paging.page_size;
-        let state_rows = facts.has_state();
-        let pools = PoolFacts {
-            // The pages hold tokens here (the program's cache is replayed from them).
-            kv_pages: wafer_pages.map_or(
-                u32::try_from(paging.pages()).unwrap_or(u32::MAX),
-                |(_, pages, _)| pages,
-            ),
-            kv_page_size: wafer_pages.map_or(paging.page_size, |(_, _, size)| size),
-            state_slots: match (state_rows, wafer_lanes) {
-                (false, _) => 0,
-                (true, Some(b)) => u32::try_from(b).unwrap_or(u32::MAX),
-                (true, None) => paging.slots,
+        // One shared pool on the host: a kv page is its tokens (a 32-bit token a position),
+        // never a device span the runtime could place, evict or stream. A unit program's pages
+        // are Pie's (its K / V columns' own, a lane's ids its pages).
+        let windowed = facts.windowed_layers().map_err(Error::Load)?;
+        let lanes = budgets.max_lanes.max(1);
+        let page_size = wafer_pages.map_or(paging.page_size, |(_, _, size)| size);
+        self.kv.page_size = page_size;
+        let pool = pool::Pool {
+            page_size,
+            kv_pages: wafer_pages.map_or(paging.pages(), |(_, pages, _)| u64::from(pages)),
+            // each seat's record and a snapshot's, and a copy-on-write one a lane a fire runs
+            records: paging.slots.saturating_mul(2).saturating_add(lanes),
+            state_bytes: if facts.has_state() {
+                facts.state_slot_bytes()
+            } else {
+                0
             },
-            // recurrent state replays from tokens: no buffered verbs
-            buffer_pages: 0,
-            state_slot_bytes: facts.state_slot_bytes(),
-            adapter_banks: 0,
-            ..PoolFacts::default()
+            buffer_pages: u64::from(paging.slots)
+                * u64::from(budgets.max_tokens.div_ceil(paging.page_size.max(1)) + 2),
+            windowed,
+            // a unit program's pages and state slots are its own on the wafer
+            wafer: wafer_pages
+                .zip(wafer_lanes)
+                .map(|((_, pages, _), lanes)| pool::WaferIds {
+                    pages,
+                    state_slots: u32::try_from(lanes).unwrap_or(u32::MAX),
+                }),
         };
-        // Pinned chunks, one slot a chunk, device tier only: a kv page is its tokens on the host,
-        // never a device span the runtime could place, evict or stream.
-        let chunks = ChunkFacts::degenerate(
-            &pools,
-            &DegenerateBytes {
-                kv_page: u64::from(pools.kv_page_size) * 4,
-                buffer_page: 0,
-            },
+        self.wafer_pages = pool.wafer_pages();
+        let chunks = pool.facts();
+        chunks
+            .validate()
+            .map_err(|e| Error::Load(format!("the spatial engine's pool: {e}")))?;
+        if let Some(ids) = pool.wafer
+            && chunks.total_chunks <= 1
+        {
+            return Err(Error::Load(format!(
+                "the unit program's {} pages and {} state slots hold no chunk of {} bytes \
+                 (its widest slot): the pool would name ids the wafer does not hold",
+                ids.pages, ids.state_slots, chunks.chunk_bytes
+            )));
+        }
+        self.windows = Windows::new(
+            pool.windowed.iter().map(|&(_, window)| window).collect(),
+            page_size,
         );
+        let pools = PoolFacts::default();
         let caps = Capabilities {
             device: device_facts(),
             pools,
@@ -357,7 +435,10 @@ impl Engine for CerebrasEngine {
                 max_context: wafer_pages
                     .map_or(paging.context().min(model_context), |(_, p, s)| p * s),
                 prefill_rows: 0,
+                prefill_lanes: 0,
                 max_readouts: budgets.max_tokens,
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
                 dispatch_depth,
             },
             has_lora: false,
@@ -370,15 +451,38 @@ impl Engine for CerebrasEngine {
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: false,
+            windowed_state: !self.windows.is_empty(),
             rs_snapshots: 0,
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: facts.trace().facts.clone(),
             inputs: facts.input_decls(),
             classes: facts.classes(),
+            // Cerebras states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
+            // No `beam_list`: a beam group's bind is refused by name.
+            host_ops: engine::HostOps::NONE,
+            mixed_lanes: engine::MixedLanes::Any,
+            // one frame at a time: no run-ahead
+            frames_in_flight: 1,
+            steps: engine::StatedSteps::default(),
         };
+
+        // The step compositions the runtime's builder forms over this load's
+        // facts (CONTRACT-BC 24). Interim: computed once the caps are; Cerebras records
+        // no bodies (out of scope for this set).
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        tracing::info!(
+            "engine-cerebras: step set: {}; its arm walk does not key on the set yet, so none \
+             of the {} is checked against what it records",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
         self.facts = Some(facts);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -397,59 +501,13 @@ impl Engine for CerebrasEngine {
         })
     }
 
+    /// A frame's submit, its refusal counted ([`engine::live::Tally::Refused`]).
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        refuse_adapters(frame)?;
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
-        )?;
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
-            tracing::debug!(target: "spatial_trace",
-                "spatial-trace frame: {} step(s), attachments {:?}",
-                frame.steps.len(),
-                frame.steps.first().map(|s| s.attachments.len())
-            );
+        let submitted = self.submit_frame(frame);
+        if submitted.is_err() {
+            self.programs.live().tally(engine::live::Tally::Refused, 1);
         }
-        if self.settling() {
-            posted::post(&mut self.posted, id, &frame.steps);
-            self.pump();
-            // Readouts come on the lanes' channels: a step lands when its epilogue has run.
-            return Ok(FrameTicket {
-                id,
-                steps: frame
-                    .steps
-                    .iter()
-                    .map(|_| FireTicket {
-                        id: FireId(self.next_fire),
-                        readouts: Vec::new(),
-                    })
-                    .collect(),
-            });
-        }
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        let mut readouts = Vec::with_capacity(frame.steps.len());
-        for (index, step) in frame.steps.iter().enumerate() {
-            let read = self.fire_step(step)?;
-            if let Some(sink) = &self.sink {
-                sink(
-                    engine::StepDone {
-                        frame: id,
-                        step: index as u32,
-                    },
-                    engine::StepOutcome::Committed,
-                );
-            }
-            steps.push(FireTicket {
-                id: FireId(self.next_fire),
-                readouts: read.clone(),
-            });
-            readouts.push(read);
-        }
-        self.pending = Some((id, readouts));
-        Ok(FrameTicket { id, steps })
+        submitted
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -463,19 +521,25 @@ impl Engine for CerebrasEngine {
         Ok(())
     }
 
+    /// Every load: a synchronous one still tells the sink, inside
+    /// `submit`, of each step whose lanes faulted ([`Completion::asynchronous`]).
     fn completion(&mut self) -> Option<&mut dyn Completion> {
-        if self.asynchronous() {
-            Some(self)
-        } else {
-            None
-        }
+        Some(self)
     }
 
     fn programs(&mut self) -> Option<&mut dyn Programs> {
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn Programs> {
+        Some(self)
+    }
+
     fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn Channels> {
         Some(self)
     }
 
@@ -495,13 +559,22 @@ impl Tiers for CerebrasEngine {
         })
     }
 
-    /// The load states its pools pinned (`ChunkFacts::degenerate`), so the
-    /// runtime moves its kv through `copy_kv`; there is no shared pool and
-    /// no host or disk tier to move slots between.
+    /// The wafer program copies no slot between tiers: nothing to wait for.
+    fn settle(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
+    /// Refused as [`Tiers::copy`] is: the wafer program moves no slot
+    /// between tiers.
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, _token: u64) -> EngineResult<bool> {
+        self.copy(copy)?;
+        Ok(true)
+    }
+
     fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         let _ = copy;
         Err(Error::Unsupported {
-            verb: "`copy_slots` on the wafer program (its pools are pinned, device tier only: \
+            verb: "`copy_slots` on the wafer program (its pool has no host or disk tier: \
                    kv moves through `copy_kv`)",
             engine: "cerebras-spatial",
         })
@@ -578,6 +651,35 @@ impl Programs for CerebrasEngine {
         self.programs.register(registration).map_err(refusal)
     }
 
+    /// The program adopted in the returned compile, off the engine's
+    /// thread.
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registration = registration.clone();
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(crate::guest::Plane::adopt(&registration)))
+        }))
+    }
+
+    /// The adopted program's id; a compile that refused refuses here.
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(adopted) = prepared
+            .0
+            .downcast::<Result<eta_exec::ExecPlan, crate::guest::Refusal>>()
+        else {
+            return Err(engine::Error::Program(
+                "a prepared program Cerebras did not prepare".to_string(),
+            ));
+        };
+        self.programs.finish(*adopted).map_err(refusal)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
     fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         let caps = self
             .caps
@@ -592,9 +694,10 @@ impl Programs for CerebrasEngine {
         self.programs.bind(binding).map_err(refusal)
     }
 
-    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.drain();
-        self.programs.close_instance(id).map_err(refusal)
+        self.programs.close_instance(id).map_err(refusal)?;
+        Ok(0)
     }
 
     fn adapter(&mut self, registration: &engine::adapter::AdapterRegistration) -> EngineResult<()> {
@@ -633,6 +736,73 @@ impl Completion for CerebrasEngine {
     fn publish_landed(&mut self) -> EngineResult<()> {
         self.pump();
         Ok(())
+    }
+
+    /// Whether a step lands after `submit` returns ([`Self::on_complete`]
+    /// told each), as the config says.
+    fn asynchronous(&self) -> bool {
+        CerebrasEngine::asynchronous(self)
+    }
+}
+
+impl CerebrasEngine {
+    /// The frame `submit` runs: posted on an asynchronous engine, else run
+    /// whole here.
+    fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        refuse_adapters(frame)?;
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
+        )?;
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        if tracing::enabled!(target: "spatial_trace", tracing::Level::DEBUG) {
+            tracing::debug!(target: "spatial_trace",
+                "spatial-trace frame: {} step(s), attachments {:?}",
+                frame.steps.len(),
+                frame.steps.first().map(|s| s.attachments.len())
+            );
+        }
+        if self.settling() {
+            posted::post(&mut self.posted, id, &frame.steps);
+            self.pump();
+            // Readouts come on the lanes' channels: a step lands when its
+            // epilogue has run.
+            return Ok(FrameTicket {
+                id,
+                steps: frame
+                    .steps
+                    .iter()
+                    .map(|_| FireTicket {
+                        id: FireId(self.next_fire),
+                        readouts: Vec::new(),
+                    })
+                    .collect(),
+                refused: Vec::new(),
+            });
+        }
+        let mut steps = Vec::with_capacity(frame.steps.len());
+        let mut readouts = Vec::with_capacity(frame.steps.len());
+        for (index, step) in frame.steps.iter().enumerate() {
+            let (read, outcome) = self.fire_step(step)?;
+            if let Some(sink) = &self.sink {
+                sink(
+                    engine::StepDone {
+                        frame: id,
+                        step: index as u32,
+                    },
+                    outcome,
+                );
+            }
+            steps.push(FireTicket {
+                id: FireId(self.next_fire),
+                readouts: read.clone(),
+            });
+            readouts.push(read);
+        }
+        self.pending = Some((id, readouts));
+        Ok(FrameTicket::of(id, steps, None))
     }
 }
 

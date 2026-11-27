@@ -1,4 +1,5 @@
 pub mod alloc;
+pub mod card;
 pub mod conditional;
 pub mod ctx;
 pub mod elastic;
@@ -39,13 +40,21 @@ pub mod held {
         0
     }
 
+    pub fn heap_mark() {}
+
     #[must_use]
-    pub fn kept_bytes() -> usize {
+    pub fn malloced_since() -> Option<u64> {
+        None
+    }
+
+    #[must_use]
+    pub fn blas_library_since() -> u64 {
         0
     }
 }
 #[cfg(feature = "rocm")]
 pub mod hip;
+pub mod own;
 
 /// The runtime, driver, NCCL and cuBLAS bindings the engine calls: CUDA's,
 /// or on ROCm HIP's, RCCL's and rocBLAS's under the same names.
@@ -56,7 +65,7 @@ pub use hip::{blas, dr, nccl, rt};
 
 pub use alloc::{
     Buffer, Pinned, Pinning, copy_any, copy_batch, copy_batch_d2d, copy_d2d, copy_d2h, copy_d2h_on,
-    free_bytes, stage_raw, zero_span, zero_span_on,
+    fill_span, free_bytes, stage_raw, zero_span, zero_span_on,
 };
 pub use ctx::{Context, count, present};
 pub use elastic::{Arena, PhysicalPool};

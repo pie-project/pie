@@ -89,7 +89,6 @@ async fn main(input: Input) -> Result<String> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
-    let stop_tokens = chat::stop_tokens();
     let delta = input.delta;
     let gamma = input.gamma;
     let last_prompt = *prompt.last().unwrap_or(&0);
@@ -116,11 +115,11 @@ async fn main(input: Input) -> Result<String> {
     let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
+    if !chat::is_stop(first) {
         generated.push(first);
     }
 
-    if generated.len() < input.max_tokens && !stop_tokens.contains(&first) {
+    if generated.len() < input.max_tokens && !chat::is_stop(first) {
         let token_in = Channel::from([first as i32]);
         let rng = Channel::from([0x9e37_u32, 0]);
         let embed_indptr = Channel::from([0u32, 1]);
@@ -154,7 +153,7 @@ async fn main(input: Input) -> Result<String> {
             decode.submit(&pipeline).context("watermark decode")?;
             submitted += 1;
             let token = token_out.take_host::<i32>().await? as u32;
-            if stop_tokens.contains(&token) {
+            if chat::is_stop(token) {
                 break;
             }
             generated.push(token);

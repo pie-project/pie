@@ -1,5 +1,9 @@
 //! The eta program plane: guest programs run in the host interpreter over the
 //! rows a fire read out.
+//!
+//! The interpreter ([`eta_exec::Interpreted`]) is this engine's one
+//! execution path for a guest stage: it lowers no stage to a device form, so
+//! an interpreted pass is how every guest pass runs here, not a fallback.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -80,24 +84,70 @@ pub struct Plane {
     instances: BTreeMap<InstanceId, Instance>,
     next_program: u64,
     next_instance: u64,
+
+    /// What the engine counts while it serves: each guest pass the host
+    /// interprets is a [`engine::live::Tally::Fallback`].
+    live: engine::live::Live,
 }
 
 impl Plane {
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
-        let plan = eta_exec::adopt_launch_package(registration.launch.clone())
-            .map_err(|error| Refusal::Program(error.to_string()))?;
+        self.finish(Plane::adopt(registration))
+    }
+
+    /// A registration's compile, on any thread: the program adopted, or
+    /// why it is refused, by its hash.
+    pub fn adopt(registration: &ProgramRegistration) -> Result<ExecPlan, Refusal> {
+        let hash = registration.program_hash;
+        let plan =
+            eta_exec::adopt_launch_package(registration.launch.clone()).map_err(|error| {
+                Refusal::Program(format!("program 0x{hash:016x} does not adopt: {error}"))
+            })?;
         if !plan.executable {
             return Err(Refusal::Program(format!(
-                "program 0x{:016x} does not interpret: {}",
-                registration.program_hash,
+                "program 0x{hash:016x} calls a semantic boundary this backend does not implement: {}",
                 plan.reject_reason.as_deref().unwrap_or("no reason given")
             )));
         }
+        Ok(plan)
+    }
+
+    /// A registration's last step, on the engine's thread: the adopted
+    /// program's id, or its compile's refusal.
+    pub fn finish(&mut self, adopted: Result<ExecPlan, Refusal>) -> Result<ProgramId, Refusal> {
+        let plan = adopted?;
         self.next_program += 1;
         let id = ProgramId(self.next_program);
         tracing::debug!(program = id.0, "guest program registered");
         self.programs.insert(id, Arc::new(plan));
         Ok(id)
+    }
+
+    /// Releases `id`, which no instance binds (`Programs::close_program`):
+    /// its id answers nothing after.
+    pub fn close_program(&mut self, id: ProgramId) -> Result<(), Refusal> {
+        if self
+            .instances
+            .values()
+            .any(|instance| instance.program == id)
+        {
+            return Err(Refusal::Program(format!(
+                "program {id} still has an instance bound"
+            )));
+        }
+        self.programs.remove(&id).ok_or(Refusal::Closed {
+            what: "program",
+            id: id.0,
+        })?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn package(
+        &self,
+        program: ProgramId,
+    ) -> Option<&eta_compiler::codegen::launch::LaunchPackage> {
+        self.programs.get(&program).map(|plan| &plan.package)
     }
 
     pub fn register_channel(
@@ -209,6 +259,7 @@ impl Plane {
             id,
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes: 0,
         })
     }
 
@@ -483,6 +534,7 @@ impl Plane {
         let inputs = PassInputs { outputs };
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
+        self.live.tally(engine::live::Tally::Fallback, 1);
         let program = seat.program;
         match outcome {
             StepOutcome::Committed => Ok(()),
@@ -497,6 +549,21 @@ impl Plane {
 
     /// Nothing is ever in flight on this backend.
     fn settle_ring(&self, _ring: &Arc<ChannelState>) {}
+
+    /// Nothing is ever in flight on this backend.
+    pub fn settle(&self) {}
+
+    #[must_use]
+    pub fn airborne(&self) -> bool {
+        false
+    }
+
+    /// What the plane counts while it serves (the engine's
+    /// [`engine::Engine::live`]).
+    #[must_use]
+    pub fn live(&self) -> engine::live::Live {
+        self.live.clone()
+    }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
         self.instances.get_mut(&id).ok_or(Refusal::Closed {
@@ -525,7 +592,11 @@ fn decode(bytes: &[u8], dtype: eta_ir::container::ChanDType, shape: &[u32]) -> O
             .map(|c| [c[0], c[1], c[2], c[3]])
     };
     Some(match dtype {
-        Dtype::Bool => Value::Bool((0..numel).map(|j| (bytes[j / 8] >> (j % 8)) & 1).collect()),
+        Dtype::Bool => Value::Bool(
+            (0..numel)
+                .map(|j| (bytes[j / 8] >> (j % 8)) & 1 != 0)
+                .collect(),
+        ),
         Dtype::I32 => Value::I32(words().map(i32::from_le_bytes).collect()),
         Dtype::U32 => Value::U32(words().map(u32::from_le_bytes).collect()),
         Dtype::F32 => Value::F32(words().map(f32::from_le_bytes).collect()),
@@ -606,7 +677,7 @@ impl Plane {
                         value.dtype()
                     )));
                 };
-                out.mask = Some(cells.into_iter().map(|cell| cell != 0).collect());
+                out.mask = Some(cells);
                 continue;
             }
             let slot = match binding.port {

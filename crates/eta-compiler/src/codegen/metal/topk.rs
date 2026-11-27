@@ -29,7 +29,7 @@ pub const SIGNATURE: &str = r#"(
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
     const device M1OpParams* params [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
+    const device ulong* lane_scratch [[buffer(4)]],
     const device M3GroupLayout* layout [[buffer(5)]],
     const device uint* channel_bindings [[buffer(6)]],
     device uchar* pending_flags [[buffer(7)]],
@@ -61,7 +61,7 @@ pub const SIGNATURE: &str = r#"(
   const device M1OpParams* lane_params =
       params + dispatch_lane * layout->reserved2;
   device uchar* scratch =
-      all_scratch + dispatch_lane * layout->scratch_stride;
+      reinterpret_cast<device uchar*>(lane_scratch[dispatch_lane]);
   device uchar* temporary = scratch + layout->temporary_offset;
 "#;
 
@@ -69,11 +69,13 @@ const BODY: &str = r#"
   const M1ValueDesc input_desc = descriptors[kInput];
   if (row >= input_desc.rows) return;
   const uint len = input_desc.last;
-  const device float* input =
-      reinterpret_cast<const device float*>(scratch + offsets[kInput]) +
-      ulong(row) * len;
-  device float* top_values =
-      reinterpret_cast<device float*>(scratch + offsets[kValues]);
+  // The row is read at its dtype and the values stored at theirs: a bf16
+  // element widens exactly and stores back exactly.
+  const device uchar* input = scratch + offsets[kInput];
+  const uint in_row = row * len;
+  const uint in_dtype = input_desc.dtype;
+  device uchar* top_values = scratch + offsets[kValues];
+  const uint top_dtype = descriptors[kValues].dtype;
   device uint* top_indices =
       reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
   device uint* order_a =
@@ -100,7 +102,7 @@ const BODY: &str = r#"
     }
     for (uint position = chunk_begin; position < chunk_end; ++position) {
       const uint index = input_order[position];
-      ++digit_counts[m3_topk_order_digit(input[index], pass)];
+      ++digit_counts[m3_topk_order_digit(m1_load_f(input, in_row + index, in_dtype), pass)];
     }
     for (uint digit = 0u; digit < 16u; ++digit)
       digit_offsets[thread_index * 16u + digit] = digit_counts[digit];
@@ -121,7 +123,7 @@ const BODY: &str = r#"
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint position = chunk_begin; position < chunk_end; ++position) {
       const uint index = input_order[position];
-      const uint digit = m3_topk_order_digit(input[index], pass);
+      const uint digit = m3_topk_order_digit(m1_load_f(input, in_row + index, in_dtype), pass);
       output_order[
           digit_offsets[thread_index * 16u + digit] +
           digit_written[digit]++] = index;
@@ -135,7 +137,7 @@ const BODY: &str = r#"
     const uint count = min(k, len);
     for (uint position = 0u; position < count; ++position) {
       const uint index = input_order[position];
-      top_values[ulong(row) * k + position] = input[index];
+      m1_store_fd(top_values, row * k + position, m1_load_f(input, in_row + index, in_dtype), top_dtype);
       top_indices[ulong(row) * k + position] = index;
     }
   }
@@ -159,11 +161,13 @@ const SELECT_BODY: &str = r#"
   const M1ValueDesc input_desc = descriptors[kInput];
   if (row >= input_desc.rows) return;
   const uint len = input_desc.last;
-  const device float* input =
-      reinterpret_cast<const device float*>(scratch + offsets[kInput]) +
-      ulong(row) * len;
-  device float* top_values =
-      reinterpret_cast<device float*>(scratch + offsets[kValues]);
+  // The row is read at its dtype and the values stored at theirs: a bf16
+  // element widens exactly and stores back exactly.
+  const device uchar* input = scratch + offsets[kInput];
+  const uint in_row = row * len;
+  const uint in_dtype = input_desc.dtype;
+  device uchar* top_values = scratch + offsets[kValues];
+  const uint top_dtype = descriptors[kValues].dtype;
   device uint* top_indices =
       reinterpret_cast<device uint*>(scratch + offsets[kIndices]);
   const uint count = min(k, len);
@@ -187,7 +191,7 @@ const SELECT_BODY: &str = r#"
       float held[8];
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * threads;
-        held[u] = i < len ? input[i] : 0.0f;
+        held[u] = i < len ? m1_load_f(input, in_row + i, in_dtype) : 0.0f;
       }
       for (uint u = 0u; u < 8u; ++u) {
         const uint i = i0 + u * threads;
@@ -248,7 +252,7 @@ const SELECT_BODY: &str = r#"
     float held[8];
     for (uint u = 0u; u < 8u; ++u) {
       const uint i = i0 + u * threads;
-      held[u] = i < len ? input[i] : 0.0f;
+      held[u] = i < len ? m1_load_f(input, in_row + i, in_dtype) : 0.0f;
     }
     for (uint u = 0u; u < 8u; ++u) {
       const uint i = i0 + u * threads;
@@ -278,7 +282,7 @@ const SELECT_BODY: &str = r#"
     uint n_mine = 0u;
     for (uint i = chunk_begin; i < chunk_end; ++i) {
       uint flag;
-      const uint key = m3_topk_key(input[i], flag);
+      const uint key = m3_topk_key(m1_load_f(input, in_row + i, in_dtype), flag);
       n_mine += (((ulong(flag) << 32) | ulong(key)) == pivot) ? 1u : 0u;
     }
     tg_scan_eq[thread_index] = n_mine;
@@ -295,7 +299,7 @@ const SELECT_BODY: &str = r#"
     uint at = tg_scan_eq[thread_index];
     for (uint i = chunk_begin; i < chunk_end; ++i) {
       uint flag;
-      const uint key = m3_topk_key(input[i], flag);
+      const uint key = m3_topk_key(m1_load_f(input, in_row + i, in_dtype), flag);
       if ((((ulong(flag) << 32) | ulong(key)) == pivot)) {
         if (at < remaining) {
           tg_key[total_lt + at] = pivot;
@@ -335,7 +339,7 @@ const SELECT_BODY: &str = r#"
   }
   for (uint p = thread_index; p < count; p += threads) {
     const uint index = tg_idx[p];
-    top_values[ulong(row) * k + p] = input[index];
+    m1_store_fd(top_values, row * k + p, m1_load_f(input, in_row + index, in_dtype), top_dtype);
     top_indices[ulong(row) * k + p] = index;
   }
   threadgroup_barrier(mem_flags::mem_device);

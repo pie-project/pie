@@ -1,5 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -15,28 +16,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
-fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-        .collect()
 }
 
 const Q_LENS: [i32; 3] = [40, 9, 20];
@@ -182,7 +161,6 @@ fn compare(what: &str, want: &[f32], got: &[f32], bar: f32) {
             at = i;
         }
     }
-    eprintln!("{what}: worst absolute {worst:.3e} at {at}");
     assert!(
         worst <= bar,
         "{what}: parts from the reference by {worst:.3e} at {at} (want {}, got {})",
@@ -284,6 +262,7 @@ fn run_case(rig: &Rig, head_dim: usize, mask_kind: &str) {
 
 #[test]
 fn the_ragged_attention_answers_its_host_reference_every_case() {
+    let _device = crate::device_alone();
     both_arms_answer_the_reference_under_every_mask();
     a_head_width_the_matrix_unit_cannot_tile_still_answers();
 }
@@ -293,7 +272,6 @@ fn both_arms_answer_the_reference_under_every_mask() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
     for head_dim in [64usize, 128] {
         for mask in ["segments", "bias"] {
             run_case(&rig, head_dim, mask);

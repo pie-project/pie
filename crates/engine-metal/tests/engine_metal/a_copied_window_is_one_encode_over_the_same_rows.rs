@@ -106,6 +106,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
             enabled,
             page_tables: &page_tables,
             positions: &positions,
+            rotations: &positions,
             request_of_token: &request_of_token,
         },
     )
@@ -129,6 +130,7 @@ fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
 
 #[test]
 fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
+    let _device = crate::device_alone();
     the_bake_writes_a_copy_row_below_the_crossover();
     a_withdrawn_window_splits_when_the_shell_does_not_copy();
     the_same_window_is_one_encode_when_it_does();
@@ -136,7 +138,7 @@ fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
     the_boundaries_are_rebased_over_the_union_and_not_over_one_run();
     the_ambient_row_tables_are_permuted_and_not_sliced();
     the_page_tables_are_re_cut_lane_by_lane_and_not_sliced();
-    the_masked_window_is_refused_by_name_however_the_switch_is_set();
+    a_window_reading_what_no_copy_carries_splits_however_the_switch_is_set();
     only_a_withdrawn_mask_is_ever_in_pieces();
     the_builder_inherits_its_readers_answer();
     the_packed_blob_and_the_bind_walk_it_in_one_order();
@@ -221,11 +223,16 @@ fn the_gathered_window_names_the_rows_the_split_ran_over() {
 
     let mut expected: Vec<i32> = Vec::new();
     for run in 0..split.runs(at) {
-        let span = split.at(at, run).span;
+        let span = split
+            .at(at, run)
+            .expect("the fire cut this region into this run")
+            .span;
         expected.extend((span.row_offset..span.row_offset + span.rows).map(|row| row as i32));
     }
 
-    let window = copy.at(at, 0);
+    let window = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run");
     let gathered = window
         .gathered
         .as_ref()
@@ -254,7 +261,9 @@ fn the_boundaries_are_rebased_over_the_union_and_not_over_one_run() {
         .find(|&at| copy.runs(at) == 1 && split.runs(at) > 1)
         .expect("some region is copied");
 
-    let window = copy.at(at, 0);
+    let window = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run");
     assert_eq!(
         window.indptr_host.first().copied(),
         Some(0),
@@ -289,7 +298,12 @@ fn the_ambient_row_tables_are_permuted_and_not_sliced() {
     let lanes = compiled.classes.classes.len();
     let (positions, request_of_token) = ambient(lanes);
 
-    let gathered = copy.at(at, 0).gathered.as_ref().expect("a row map");
+    let gathered = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run")
+        .gathered
+        .as_ref()
+        .expect("a row map");
     let want_positions: Vec<i32> = gathered
         .rows_host
         .iter()
@@ -336,7 +350,9 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
     let lanes = compiled.classes.classes.len();
     let fire = geometry(lanes);
 
-    let window = copy.at(at, 0);
+    let window = copy
+        .at(at, 0)
+        .expect("the fire cut this region into this run");
     let gathered = window.gathered.as_ref().expect("a row map");
     assert_eq!(
         gathered.page_tables.len(),
@@ -391,7 +407,10 @@ fn the_page_tables_are_re_cut_lane_by_lane_and_not_sliced() {
     );
 }
 
-fn the_masked_window_is_refused_by_name_however_the_switch_is_set() {
+/// A copy carries token rows, each row's mask and the integer rows a region
+/// only reads (`window::CARRIES`); a region reading what it does not (the
+/// readout rows) is split whatever the switch says.
+fn a_window_reading_what_no_copy_carries_splits_however_the_switch_is_set() {
     let (trace, compiled) = baked();
     let copy = windows(&trace, &compiled, true);
     let split = windows(&trace, &compiled, false);
@@ -403,9 +422,9 @@ fn the_masked_window_is_refused_by_name_however_the_switch_is_set() {
         .collect();
     assert!(
         !refused.is_empty(),
-        "every withdrawn window on this catalog was gathered; the masked \
-         window names `RuntimeInput::Mask` and `fallback::copyable` must decline \
-         it — a copy that permuted the activations and sliced the mask plane \
+        "every withdrawn window on this catalog was gathered; the readout \
+         window reads rows no copy carries and `fallback::copyable` must decline \
+         it — a copy that permuted the activations and sliced the readouts \
          would compute the wrong bytes with nothing to fault on"
     );
     for at in refused {
@@ -415,7 +434,10 @@ fn the_masked_window_is_refused_by_name_however_the_switch_is_set() {
             "a region the copy path declined takes the split it always took"
         );
         assert!(
-            copy.at(at, 0).gathered.is_none(),
+            copy.at(at, 0)
+                .expect("the fire cut this region into this run")
+                .gathered
+                .is_none(),
             "and its window carries no row map, which is what `Serve::copies` \
              reads"
         );
@@ -436,7 +458,10 @@ fn only_a_withdrawn_mask_is_ever_in_pieces() {
                 "region {at} was seated and gathered anyway"
             );
             assert!(
-                copy.at(at, 0).gathered.is_none(),
+                copy.at(at, 0)
+                    .expect("the fire cut this region into this run")
+                    .gathered
+                    .is_none(),
                 "region {at} was seated and carries a row map"
             );
             continue;
@@ -457,14 +482,13 @@ fn the_builder_inherits_its_readers_answer() {
     let copy = windows(&trace, &compiled, true);
 
     let owed: Vec<u32> = withdrawn(&compiled).into_iter().map(|(at, _)| at).collect();
+    // Every region that splits without a `Copy` row of its own answers as the
+    // regions over its mask do. Since the masks are per-row data, a copy
+    // carries them and this catalog may leave none in pieces: the rule is
+    // checked over whatever does split.
     let inherited: Vec<u32> = (0..compiled.template().len() as u32)
         .filter(|at| !owed.contains(at) && split.runs(*at) > 1)
         .collect();
-    assert!(
-        !inherited.is_empty(),
-        "no region without a `Copy` row of its own came back in pieces; the \
-         inheritance this test is about has nothing to inherit"
-    );
     for at in inherited {
         let mask = &compiled.template()[at as usize].mask;
         let readers_gather = (0..compiled.template().len() as u32).any(|other| {
@@ -487,7 +511,9 @@ fn the_packed_blob_and_the_bind_walk_it_in_one_order() {
     let mut seen: Vec<usize> = Vec::new();
     for at in 0..compiled.template().len() as u32 {
         for run in 0..copy.runs(at) {
-            let window = copy.at(at, run);
+            let window = copy
+                .at(at, run)
+                .expect("the fire cut this region into this run");
             let here = window.indptr_host.as_ptr() as usize;
             if seen.contains(&here) {
                 continue;
@@ -499,6 +525,7 @@ fn the_packed_blob_and_the_bind_walk_it_in_one_order() {
             };
             want += gathered.rows_host.len()
                 + gathered.positions_host.len()
+                + gathered.rotations_host.len()
                 + gathered.request_of_token_host.len();
             for table in &gathered.page_tables {
                 want += table.page_indptr_host.len()

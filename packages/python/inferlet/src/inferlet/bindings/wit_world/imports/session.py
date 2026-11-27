@@ -9,8 +9,8 @@ import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import frames
-from ..imports import working_set
 from ..imports import grammar
+from ..imports import working_set
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
@@ -104,7 +104,7 @@ def give(name: str, h: Handle) -> None:
     once its last fire has settled; frames and pcm never cross linear
     memory. Refused if the launch expects no such return, or has one
     already; `h` is dropped either way it fails.
-
+    
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError

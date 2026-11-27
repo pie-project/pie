@@ -1,0 +1,76 @@
+package plex:placement@1.1.0;
+
+/// Where a process runs. One row per process.
+
+/// The workers a process may run on, best first. Default: every worker,
+/// in the router's own order.
+///
+/// The router sends a pending process to the first worker of the list
+/// that will take it. The empty list is nowhere: the process stays at the
+/// gateway. A process already at a worker stays there while the list
+/// names that worker, in any position; a list that leaves it out moves
+/// the process, where the host can move one.
+/// The gate applies while a loaded cluster policy imports placement/workers or terminate; with none, the gate bound is zero.
+@since(version = 1.1.0)
+interface workers {
+    use plex:core/types@1.1.0.{process-id, worker-id, error-code};
+
+    @since(version = 1.1.0)
+    get: func(process: process-id) -> option<list<worker-id>>;
+
+    @since(version = 1.1.0)
+    set: func(process: process-id, value: list<worker-id>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    set-list: func(entries: list<tuple<process-id, list<worker-id>>>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(process: process-id);
+
+    @since(version = 1.1.0)
+    set-default: func(value: list<worker-id>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    clear: func();
+
+    @since(version = 1.1.0)
+    get-refused: func() -> list<tuple<process-id, error-code>>;
+}
+
+/// Workers that may compute for a process that lives elsewhere, best
+/// first. What a host can hand to a helper is the host's to say. Default:
+/// none, so everything runs on the process's own worker.
+@unstable(feature = placement-helpers)
+interface helpers {
+    @unstable(feature = placement-helpers)
+    use plex:core/types@1.1.0.{process-id, worker-id, error-code};
+
+    @unstable(feature = placement-helpers)
+    get: func(process: process-id) -> option<list<worker-id>>;
+
+    @unstable(feature = placement-helpers)
+    set: func(process: process-id, value: list<worker-id>) -> result<_, error-code>;
+
+    @unstable(feature = placement-helpers)
+    set-list: func(entries: list<tuple<process-id, list<worker-id>>>) -> result<_, error-code>;
+
+    @unstable(feature = placement-helpers)
+    delete: func(process: process-id);
+
+    @unstable(feature = placement-helpers)
+    set-default: func(value: list<worker-id>) -> result<_, error-code>;
+
+    @unstable(feature = placement-helpers)
+    clear: func();
+
+    @unstable(feature = placement-helpers)
+    get-refused: func() -> list<tuple<process-id, error-code>>;
+}
+
+@since(version = 1.1.0)
+world imports {
+    @since(version = 1.1.0)
+    import workers;
+    @unstable(feature = placement-helpers)
+    import helpers;
+}

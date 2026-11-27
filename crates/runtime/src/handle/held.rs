@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use super::{FORK_WAIT, MOVE_WAIT, RS_MOVE_POLL};
 use crate::inferlet::ProcessId;
 use crate::inferlet::host::working_set::Cursor;
 use crate::inferlet::process::ProcessResidency;
@@ -94,13 +93,8 @@ impl Held {
             return Ok(());
         };
         planner.claim_holder(self.holder);
-        let deadline = crate::rt::time::Instant::now() + MOVE_WAIT;
-        while planner.holder_moving(self.holder) {
-            if crate::rt::time::Instant::now() >= deadline {
-                return Err("its pages are still moving".to_string());
-            }
-            let _ = crate::rt::time::timeout(RS_MOVE_POLL, std::future::pending::<()>()).await;
-        }
+        // Its eviction ending is the event: no clock, no deadline.
+        planner.wait_not_moving(self.holder).await;
         Ok(())
     }
 
@@ -117,6 +111,11 @@ impl Held {
         let Parts { kv, rs, cursor } = self.parts();
         let rs_child = match rs {
             Some(rs) => {
+                // A fold the device counts settles first: the child takes
+                // the frozen length it leaves, or the fork is refused as the
+                // fire's failure.
+                let stores = store_registry::get(rs.model, rs.engine);
+                crate::store::rs::device_folds_settled(&stores.rs, &[rs.id]).await;
                 let id = rs_settled(rs, |store| store.fork(rs.id))
                     .await?
                     .map_err(|error| error.to_string())?;
@@ -124,6 +123,9 @@ impl Held {
             }
             None => None,
         };
+        // Parked, the set has no fire on its way: a frozen length a fold
+        // left unknown stays so, and the KV store refuses the fork rather
+        // than have the child state the bound.
         let child = settled(kv, "handle-fork", |store| store.fork(kv.id)).await;
         match child {
             Ok(child) => Ok(Held::park(
@@ -167,18 +169,19 @@ impl Held {
     }
 
     /// Its tokens, what of them are folded, and its recurrent slots.
-    pub(super) fn measure(&self) -> (u64, u64, u32) {
-        let Parts { rs, cursor, .. } = self.parts();
-        let slots = rs.as_ref().map_or(0, |rs| {
-            let stores = store_registry::get(rs.model, rs.engine);
-            let held = stores.rs.lock().unwrap().held([rs.id]);
-            held.slots
-        });
-        (
-            u64::from(cursor.tail.unwrap_or(cursor.folded)),
-            u64::from(cursor.folded),
-            slots,
-        )
+    pub(super) fn measure(&self) -> (u64, u64) {
+        let Parts { cursor, .. } = self.parts();
+        let folded = self.folded();
+        (cursor.tail.map_or(folded, u64::from), folded)
+    }
+
+    /// What it has folded: its KV working set's folded length.
+    fn folded(&self) -> u64 {
+        let kv = &self.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        store_registry::with_kv_lock(&stores.kv, "handle-stat", |store| {
+            store.folded(kv.id).unwrap_or(0)
+        })
     }
 
     pub(super) fn stat(&self) -> Value {
@@ -189,10 +192,11 @@ impl Held {
                 .swapped_page_count(&HashSet::from([kv.id]))
                 .unwrap_or(0)
         });
+        let folded = self.folded();
         json!({
             "state": "parked",
-            "tokens": cursor.tail.unwrap_or(cursor.folded),
-            "folded": cursor.folded,
+            "tokens": cursor.tail.map_or(folded, u64::from),
+            "folded": folded,
             "engine": kv.engine,
             "resident": swapped == 0,
             "swapped_pages": swapped,
@@ -213,7 +217,10 @@ impl Drop for Held {
 }
 
 /// Runs `f` on the store once no move holds a page `kv` maps: what a set names
-/// under a move is not where its map says.
+/// under a move is not where its map says. It waits for the move to end with
+/// no deadline: every move ends, landed or aborted, and each end wakes it
+/// ([`KvStore::moves_ended`]). A store that refuses the set, then or after,
+/// refuses it by name.
 async fn settled<T>(
     kv: &KvWorkingSet,
     label: &'static str,
@@ -221,7 +228,6 @@ async fn settled<T>(
 ) -> Result<T, String> {
     let stores = store_registry::get(kv.model, kv.engine);
     let set = HashSet::from([kv.id]);
-    let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
         let ended = store_registry::with_kv_lock(&stores.kv, label, |store| store.moves_ended());
         let notified = ended.notified();
@@ -237,32 +243,29 @@ async fn settled<T>(
         if let Some(done) = done {
             return Ok(done);
         }
-        let now = crate::rt::time::Instant::now();
-        if now >= deadline {
-            return Err("its pages are still moving".to_string());
-        }
-        let _ = crate::rt::time::timeout(deadline - now, notified).await;
+        notified.await;
     }
 }
 
-/// [`settled`] for recurrent state, whose moves end with no signal.
+/// [`settled`] for recurrent state: woken when a move lets slots go
+/// ([`RsStore::moves_ended`]), landed or aborted.
 async fn rs_settled<T>(
     rs: &RsWorkingSet,
     mut f: impl FnMut(&mut RsStore) -> T,
 ) -> Result<T, String> {
     let stores = store_registry::get(rs.model, rs.engine);
-    let deadline = crate::rt::time::Instant::now() + FORK_WAIT;
     loop {
+        let ended = stores.rs.lock().unwrap().moves_ended();
+        let notified = ended.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
         {
             let mut store = stores.rs.lock().unwrap();
             if !store.in_move(rs.id) {
                 return Ok(f(&mut store));
             }
         }
-        if crate::rt::time::Instant::now() >= deadline {
-            return Err("its state is still moving".to_string());
-        }
-        let _ = crate::rt::time::timeout(RS_MOVE_POLL, std::future::pending::<()>()).await;
+        notified.await;
     }
 }
 
@@ -283,4 +286,106 @@ fn demand(kv_pages: u32, rs: Option<&RsWorkingSet>) -> Option<Demand> {
         rs: rs.map(rs_units).unwrap_or_default(),
     };
     (!demand.is_zero()).then_some(demand)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::store::rs::{RsGeometry, RsWorkingSetId};
+
+    pub(in crate::handle) const DEVICE_LOST: &str = "pipeline: forward failed: device lost";
+
+    /// A parked set whose recurrent state is frozen at 4, a fire that folds
+    /// it by a count the device computes still on its way.
+    pub(in crate::handle) fn folding() -> (Held, store_registry::Stores, RsWorkingSetId) {
+        let model = store_registry::register_model(4, &[8], &[2]);
+        let stores = store_registry::get(model, 0);
+        let kv = stores.kv.lock().create_working_set();
+        let geom = RsGeometry {
+            state_size: 8,
+            buffer_page_tokens: 4,
+        };
+        let rs = {
+            let mut store = stores.rs.lock().unwrap();
+            let ws = store.create_working_set(geom);
+            let written = store
+                .prepare_group(ws, true, false, None, None, None)
+                .unwrap();
+            let published = store.publish_prepared(written).unwrap();
+            store.settle(published);
+            store.fold(ws, 4);
+            store.begin_device_fold(ws);
+            ws
+        };
+        let held = Held::park(
+            ProcessId::new_v4(),
+            KvWorkingSet::new(model, 0, kv, 4),
+            Some(RsWorkingSet::new(model, 0, rs, geom)),
+            Cursor::default(),
+        );
+        (held, stores, rs)
+    }
+
+    /// A parked set that keeps no recurrent state, its cursor as `cursor`.
+    pub(in crate::handle) fn parked(cursor: Cursor) -> Held {
+        let model = store_registry::register_model(4, &[8], &[2]);
+        let stores = store_registry::get(model, 0);
+        let kv = stores.kv.lock().create_working_set();
+        Held::park(
+            ProcessId::new_v4(),
+            KvWorkingSet::new(model, 0, kv, 4),
+            None,
+            cursor,
+        )
+    }
+
+    /// A parked set whose frozen length a fold left unknown: the fire that
+    /// was to place it settled and never told its count.
+    pub(in crate::handle) fn unplaced() -> Held {
+        let held = parked(Cursor::default());
+        let kv = &held.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        let mut store = stores.kv.lock();
+        store.unsettle(kv.id).unwrap();
+        store.fold_settled(kv.id, false).unwrap();
+        drop(store);
+        held
+    }
+
+    /// A parked set has no fire on its way, so a frozen length a fold left
+    /// unknown stays unknown: its fork is refused by name, never handed the
+    /// bound. One at rest forks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_of_a_set_whose_frozen_length_is_not_known_is_refused_by_name() {
+        let bound = unplaced();
+        let refused = bound
+            .fork(ProcessId::new_v4())
+            .now_or_never()
+            .expect("there is nothing to wait for")
+            .expect_err("the child would state a bound");
+        assert_eq!(refused, crate::store::kv::page_table::UNPLACED);
+        let child = parked(Cursor::default()).fork(ProcessId::new_v4()).await;
+        let child = child.expect("its frozen length is known");
+        let kv = &child.parts().kv;
+        let stores = store_registry::get(kv.model, kv.engine);
+        assert!(stores.kv.lock().folded_exact(kv.id).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fork_is_refused_by_the_failure_of_the_fold_it_waited_for() {
+        let (held, stores, rs) = folding();
+        let mut fork = Box::pin(held.fork(ProcessId::new_v4()));
+        assert!(fork.as_mut().now_or_never().is_none());
+        stores
+            .rs
+            .lock()
+            .unwrap()
+            .end_device_fold(rs, None, Some(DEVICE_LOST));
+        let refused = fork
+            .await
+            .expect_err("how far its record is folded is not known");
+        assert!(refused.contains(DEVICE_LOST), "{refused}");
+    }
 }

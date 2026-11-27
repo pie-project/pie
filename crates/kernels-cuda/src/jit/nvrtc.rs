@@ -152,12 +152,6 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     let log = program.log();
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         let log = log.unwrap_or_else(|| "NVRTC rejected the source and offered no log".into());
-        if let Some(diagnosis) = tile_header_mismatch(&log) {
-            return Err(Fault::Compile {
-                unit,
-                log: format!("{log}\n\n{diagnosis}"),
-            });
-        }
         return Err(Fault::Compile { unit, log });
     }
     let log = log.unwrap_or_default();
@@ -211,64 +205,11 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
         });
     }
 
-    let wants_function = job.wanted.iter().any(|w| !w.trim_start().starts_with('&'));
-    unassembled_tile_ir(unit, &cubin, wants_function)?;
-
     Ok(Built {
         cubin,
         lowered,
         log,
     })
-}
-
-fn unassembled_tile_ir(
-    unit: &'static str,
-    cubin: &[u8],
-    wants_function: bool,
-) -> Result<(), Fault> {
-    let has = |needle: &[u8]| cubin.windows(needle.len()).any(|w| w == needle);
-    if wants_function && has(b".note.nv.tkinfo") && !has(b".text.") {
-        return Err(Fault::Compile {
-            unit,
-            log: format!(
-                "`{unit}` compiled to Tile IR, not SASS: the image carries \
-                 `.note.nv.tkinfo` and no `.text`, so it would load and then answer \
-                 `cuModuleGetFunction` with NOT_FOUND at the first launch. A tile \
-                 unit needs its Tile IR assembled -- `tileiras` over \
-                 `nvrtcGetTileIR`, with CUDA_ROOT set, or a driver new enough to \
-                 assemble at load. See new-horizon.md 23.18"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn tile_header_mismatch(log: &str) -> Option<String> {
-    let ice = log.contains("Unexpected element type in tile!");
-    let tile_codegen = log.contains("tile codegen");
-    if !(ice || (tile_codegen && log.contains("Internal Compiler Error"))) {
-        return None;
-    }
-
-    Some(
-        "This is almost certainly NOT a compiler bug. It is a version skew \
-         between the tile frontend and the CUDA RUNTIME headers.\n\n\
-         A 16-bit type only becomes a tile element because CUDA 13.3's \
-         `cuda_bf16.h` / `cuda_fp16.h` mark it `__NV_TL_BUILTIN__`, which the \
-         frontend expands to `__tile_builtin__`. Under 13.0 headers that \
-         marker site does not exist, the 2-byte struct lowers as `tile<2 x \
-         i8>`, and tile codegen aborts with the message above -- which names \
-         neither headers nor bf16.\n\n\
-         Check the runtime headers on the include path, not NVRTC's version:\n\
-         \n\
-         \x20   ls  <include>/cuda_tf32.h          # ships only in 13.3+\n\
-         \x20   grep -c __NV_TL_BUILTIN__ <include>/cuda_bf16.h   # 0 is the bug\n\
-         \n\
-         The four wheels version independently and nothing cross-checks them: \
-         nvidia-cuda-nvcc, -nvrtc, -tileiras and -cuda-runtime. Only the last \
-         carries the marker. See new-horizon.md on the 16-bit header trap."
-            .to_string(),
-    )
 }
 
 /// `sm_XY`, its arch-specific `sm_XYa` or its family `sm_XYf`: each makes
@@ -557,7 +498,9 @@ mod tests {
     /// the generic units, sm_80 (the oldest a unit is compiled for) and
     /// sm_100 (the B200's plain target, past whose `__CUDA_ARCH__` gates).
     fn tiers(file: &str) -> &'static [&'static str] {
-        if file.contains("_sm100") {
+        if file.contains("_sm120") {
+            &["sm_120"]
+        } else if file.contains("_sm100") {
             &["sm_100"]
         } else if file.contains("_sm90") {
             &["sm_90"]

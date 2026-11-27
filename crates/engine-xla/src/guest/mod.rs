@@ -1,7 +1,7 @@
 //! Device forms of eta guest programs: every stage of a program lowered to
 //! StableHLO (`lower`), compiled per batch shape and run on the device
-//! (`run`). A program any of whose stages does not lower is refused a device
-//! form and runs in the host interpreter.
+//! (`run`). A program any of whose stages does not lower is refused at its
+//! registration, by name: there is no other path for its passes.
 
 pub mod lower;
 pub mod run;
@@ -23,12 +23,126 @@ pub struct Compiled {
     pub stages: usize,
     /// Channels whose cell can stay on the device between passes.
     pub carried: Vec<u32>,
+    /// Each carried channel's cell in u32 words, a lane (an instance) one
+    /// cell: what its `Channel` slots hold.
+    pub carried_words: Vec<(u32, u32)>,
+    /// Channels the next fire reads off the device (`embed_tokens`): each
+    /// with its cell's u32 words and its ring's capacity. A pass's put
+    /// lands in the ring's `Channel` slots too, where the fire gathers it.
+    pub fed: Vec<(u32, u32, u32)>,
+}
+
+impl Compiled {
+    /// The channels a pass keeps in the pool: the carried ones (read and
+    /// written there) and the fed ones (written there): its stages' key.
+    #[must_use]
+    pub fn pooled(&self) -> Vec<u32> {
+        let mut out = self.carried.clone();
+        out.extend(self.fed.iter().map(|&(c, _, _)| c));
+        out
+    }
+}
+
+/// The channels the next fire reads off the device: a non-constant
+/// `embed_tokens` port's that a stage puts to, with its cell's u32 words
+/// and ring capacity.
+#[must_use]
+pub fn fed_channels(package: &LaunchPackage) -> Vec<(u32, u32, u32)> {
+    package
+        .ports
+        .iter()
+        .filter(|p| !p.is_const && p.port == eta_ir::registry::Port::EmbedTokens)
+        // A stage puts its cells: the device produces them.
+        .filter(|p| {
+            package
+                .stages
+                .iter()
+                .any(|s| s.puts.iter().any(|put| put.channel == p.channel))
+        })
+        .filter_map(|p| {
+            let decl = package.channels.get(p.channel as usize)?;
+            let dtype = eta_exec::concrete_dtype(decl.dtype);
+            let n = decl
+                .shape
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>()
+                .max(1);
+            Some((
+                p.channel,
+                u32::try_from(lower::words(dtype, n)).unwrap_or(u32::MAX),
+                decl.capacity,
+            ))
+        })
+        .collect()
+}
+
+/// The u32 words of each carried channel's cell (`carried_channels`): the
+/// value its one put lands, packed as the stages pack it.
+#[must_use]
+pub fn carried_words(package: &LaunchPackage) -> Vec<(u32, u32)> {
+    carried_channels(package)
+        .into_iter()
+        .filter_map(|c| {
+            let put = package
+                .stages
+                .iter()
+                .flat_map(|s| s.puts.iter())
+                .find(|p| p.channel == c)?;
+            let value = &package.values[put.value as usize];
+            let n = value
+                .shape
+                .iter()
+                .map(|&d| d as usize)
+                .product::<usize>()
+                .max(1);
+            Some((
+                c,
+                u32::try_from(lower::words(value.dtype, n)).unwrap_or(u32::MAX),
+            ))
+        })
+        .collect()
+}
+
+/// A `Channel` slot's bytes (`SlotRole::Channel`, the pool's
+/// [`crate::store::layout::CHANNEL`] shape).
+pub const CHANNEL_SLOT: u64 = 1 << 10;
+
+impl Compiled {
+    /// The rings an instance keeps in the pool's `Channel` slots: each
+    /// carried channel, one cell of its words, one contiguous run.
+    #[must_use]
+    pub fn rings(&self) -> Vec<engine::program::RingFacts> {
+        let ring = |channel: u32, words: u32, capacity: u32| {
+            let bytes = u64::from(words) * 4;
+            // Each cell whole slots, back to back.
+            let slots = bytes.div_ceil(CHANNEL_SLOT) * u64::from(capacity.max(1));
+            engine::program::RingFacts {
+                channel,
+                cell_bytes: bytes,
+                capacity,
+                footprint: engine::program::Footprint {
+                    bytes: slots * CHANNEL_SLOT,
+                    slots: u32::try_from(slots).unwrap_or(u32::MAX),
+                    contiguous: true,
+                },
+            }
+        };
+        self.carried_words
+            .iter()
+            .map(|&(c, w)| ring(c, w, 1))
+            .chain(self.fed.iter().map(|&(c, w, cap)| ring(c, w, cap)))
+            .collect()
+    }
 }
 
 /// The channels a pass carries to the next one and nobody else sees: a
 /// one-cell ring the host neither reads nor writes, bound to no port, input
 /// or extern, taken and put by one stage and touched by no other. Their
 /// cells can stay on the device between passes (`Plane::fire_guests`).
+/// So does a beam group's parents (`Port::Parents`, BEAM-PAGE-LISTS §2): a
+/// one-cell ring the host never sees, put by one stage, read by the group's
+/// next head from its cell on the device and by nothing else.
 #[must_use]
 pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
     let mut out = Vec::new();
@@ -37,7 +151,10 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
         if decl.capacity != 1
             || decl.host_role != eta_ir::container::HostRole::None
             || decl.extern_dir.is_some()
-            || package.ports.iter().any(|p| !p.is_const && p.channel == c)
+            || package
+                .ports
+                .iter()
+                .any(|p| !p.is_const && p.channel == c && p.port != eta_ir::registry::Port::Parents)
             || package.inputs.contains(&c)
         {
             continue;
@@ -56,7 +173,11 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
         };
         let takes = stage.takes.iter().filter(|&&t| t == c).count();
         let puts = stage.puts.iter().filter(|p| p.channel == c).count();
-        if takes == 1 && puts == 1 && !stage.reads.contains(&c) {
+        let parents = package
+            .ports
+            .iter()
+            .any(|p| !p.is_const && p.channel == c && p.port == eta_ir::registry::Port::Parents);
+        if (takes == 1 || parents && takes == 0) && puts == 1 && !stage.reads.contains(&c) {
             out.push(c);
         }
     }
@@ -71,11 +192,6 @@ pub struct Forms {
 
 /// Whether every stage of `package` lowers.
 pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
-    if std::env::var_os("PIE_XLA_GUESTS_ON_HOST").is_some_and(|v| v != "0") {
-        return Err(Refused(
-            "PIE_XLA_GUESTS_ON_HOST asks for the host interpreter".into(),
-        ));
-    }
     for at in 0..package.stages.len() {
         lower::lower(
             package,
@@ -85,24 +201,36 @@ pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
                 reads: Vec::new(),
             },
             &carried_channels(package),
+            1,
         )?;
     }
     Ok(())
 }
 
+/// `package`'s form where every stage lowers, else why not; touches no
+/// plane, so a registration's prepare holds nothing its finish must undo.
+pub fn form_of(package: &LaunchPackage) -> Result<Arc<Compiled>, Refused> {
+    admits(package)?;
+    let key = *blake3::hash(format!("{package:?}").as_bytes()).as_bytes();
+    Ok(Arc::new(Compiled {
+        key,
+        stages: package.stages.len(),
+        carried: carried_channels(package),
+        carried_words: carried_words(package),
+        fed: fed_channels(package),
+    }))
+}
+
 impl Forms {
     pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
-        match admits(package) {
-            Ok(()) => {
-                let key = *blake3::hash(format!("{package:?}").as_bytes()).as_bytes();
-                self.compiled.insert(
-                    program,
-                    Arc::new(Compiled {
-                        key,
-                        stages: package.stages.len(),
-                        carried: carried_channels(package),
-                    }),
-                );
+        self.hold(program, form_of(package))
+    }
+
+    /// Holds `program`'s form ([`form_of`]), or why it has none.
+    pub fn hold(&mut self, program: ProgramId, form: Result<Arc<Compiled>, Refused>) -> bool {
+        match form {
+            Ok(compiled) => {
+                self.compiled.insert(program, compiled);
                 true
             }
             Err(why) => {

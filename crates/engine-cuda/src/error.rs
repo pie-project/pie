@@ -8,6 +8,9 @@ pub type Result<T> = std::result::Result<T, Fault>;
 pub enum Fault {
     Runtimeless,
 
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Device {
         call: &'static str,
         code: i32,
@@ -35,6 +38,9 @@ pub enum Fault {
     },
 
     Residency(String),
+    /// The card cannot hold what the load sized for it: the driver's own
+    /// holdings beside the pool, or a range it refused.
+    Card(String),
 
     Recipe(String),
 
@@ -54,6 +60,15 @@ pub enum Fault {
         have: u64,
     },
 
+    /// A fire's carve that asks a value more bytes than the arena map laid
+    /// its slot: the value's rows would land in a neighbour's.
+    Overcarved {
+        value: u32,
+        rows: u32,
+        need: u64,
+        laid: u64,
+    },
+
     Mask {
         lane: u32,
         stated: u64,
@@ -70,14 +85,30 @@ pub enum Fault {
         lane: u32,
     },
 
-    MaskWord {
+    MaskUnread {
         lane: u32,
         word: u64,
-        runs_masked_arm: bool,
     },
 
     Adapterless {
         lane: u32,
+    },
+
+    /// A row the lane's program places lands outside the slots the lane may
+    /// write (`engine::fire::misplaced_write`): refused before any of it runs.
+    KvWrite {
+        lane: u32,
+        why: String,
+    },
+
+    /// A device-geometry program's `embed_indptr` port describes more lanes
+    /// than its attachment spans: its ports would state the next lanes'
+    /// positions and slots. Every lane of the attachment is refused, before
+    /// any of it is written.
+    Overreach {
+        instance: engine::InstanceId,
+        lanes: std::ops::Range<u32>,
+        carried: usize,
     },
 
     AdapterWord {
@@ -114,6 +145,11 @@ pub enum Fault {
 
     Compile(eta_exec::Failure),
 
+    /// Two live guest holders' state would overlap, or a member alone would
+    /// move its group's pair: a bind or a rebind refused before it wrote
+    /// there ([`engine::guest_claims`]).
+    Claimed(engine::guest_claims::Refusal),
+
     Program {
         at: &'static str,
         why: String,
@@ -149,6 +185,40 @@ pub enum Fault {
     },
 }
 
+impl Fault {
+    /// The lane of its step a fault refuses for its own sake, where one
+    /// does: what the lane states (its word, mask, positions, adapter,
+    /// payload) is what this load cannot serve, and every other lane of
+    /// the step could be ([`engine::Error::Lanes`]).
+    #[must_use]
+    pub fn lane(&self) -> Option<u32> {
+        match self {
+            Self::PatchPayload { lane, .. }
+            | Self::Mask { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::Maskless { lane, .. }
+            | Self::MaskUnread { lane, .. }
+            | Self::Adapterless { lane, .. }
+            | Self::KvWrite { lane, .. }
+            | Self::AdapterWord { lane, .. } => Some(*lane),
+            Self::Fire(error) => error.lane(),
+            _ => None,
+        }
+    }
+
+    /// A mask staging's fault, its lane counted in `rows`' order, named by
+    /// the step's lane that row is of.
+    #[must_use]
+    pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
+        if let Self::Mask { lane, .. } | Self::MaskRows { lane, .. } = &mut self
+            && let Some(row) = rows.get(*lane as usize)
+        {
+            *lane = row.source;
+        }
+        self
+    }
+}
+
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -163,6 +233,7 @@ impl fmt::Display for Fault {
             Self::Unsupported(why) => write!(f, "this device is not served: {why}"),
             Self::Bake(refusal) => write!(f, "this plan does not bake: {refusal:?}"),
             Self::Residency(why) => write!(f, "weight residency: {why}"),
+            Self::Card(why) => write!(f, "the card: {why}"),
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Load(error) => write!(f, "this checkpoint does not land: {error}"),
             Self::Fire(error) => write!(f, "{error}"),
@@ -202,6 +273,17 @@ impl fmt::Display for Fault {
                 f,
                 "this fire wants {need} {what} and the shell reserved {have}"
             ),
+            Self::Overcarved {
+                value,
+                rows,
+                need,
+                laid,
+            } => write!(
+                f,
+                "this fire carves value {value} at {rows} rows, {need} bytes, and the arena \
+                 laid its slot for {laid}: its rows past the slot would land in another \
+                 value's"
+            ),
             Self::Mask {
                 lane,
                 stated,
@@ -224,30 +306,27 @@ impl fmt::Display for Fault {
                 "lane {lane} carries an explicit attention mask and this load's \
                  artifact bakes no masked class: `masked` is a fact the MODEL declares \
                  and this plan has no `attention.masked` arm for the bits \
-                 to reach"
+                 to reach, nor a ragged attention whose text states a lane's mask \
+                 (`stated_group_mask()`)"
             ),
-            Self::MaskWord {
-                lane,
-                word,
-                runs_masked_arm,
-            } => {
-                if *runs_masked_arm {
-                    write!(
-                        f,
-                        "lane {lane}'s word {word:#x} puts it in a class that runs \
-                         `attention.masked`, and it carries no mask for that arm to \
-                         read; a fire-wide mask on a per-lane axis is design \u{00A7}0's \
-                         collapse, and this is where it stops"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "lane {lane} carries an explicit attention mask and its word \
-                         {word:#x} puts it in a class that runs the causal arm, so the \
-                         mask would be staged and never read"
-                    )
-                }
-            }
+            Self::MaskUnread { lane, word } => write!(
+                f,
+                "lane {lane} states an attention mask and its word {word:#x} reads it in no \
+                 arm this engine applies a mask in, so the mask would be staged and never \
+                 read: here `attn.decode`, a selection's and a bias's arms read no per-lane mask"
+            ),
+            Self::KvWrite { lane, why } => write!(f, "lane {lane} refused: {why}"),
+            Self::Overreach {
+                instance,
+                lanes,
+                carried,
+            } => write!(
+                f,
+                "instance {instance} is attached over lanes {}..{} and its `embed_indptr` port \
+                 describes {carried} lane(s): a program's ports state its own lanes' geometry, \
+                 never the next request's",
+                lanes.start, lanes.end
+            ),
             Self::Adapterless { lane } => write!(
                 f,
                 "lane {lane} routes to an adapter bank and this load's artifact bakes \
@@ -321,7 +400,9 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "{at}: {why}"),
+            Self::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
             Self::Integrity { at, why } => write!(f, "{at}: {why} (a fault in this engine)"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Interpret(error) => write!(f, "{error}"),
             Self::Unlowered { region, lowering } => write!(
                 f,
@@ -422,5 +503,17 @@ pub fn kernel(error: kernels_cuda::Error) -> KernelError {
             KernelError::DtypeUnsupported { op, dtype }
         }
         kernels_cuda::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+    }
+}
+
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
     }
 }

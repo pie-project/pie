@@ -26,6 +26,21 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
+    /// Where a capturing lane's rows lie: its reader's, through the fire's
+    /// tables (`crate::scores`).
+    fn capture_rows(
+        &self,
+        op: &'static str,
+    ) -> Result<kernels_cuda::attn::score::CaptureRows, kernels_cuda::Error> {
+        self.bindings()
+            .score_rows
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: "this load captures no attention scores, so it laid no row tables"
+                    .to_string(),
+            })
+    }
+
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
             Attn::ScoreCapture {
@@ -34,10 +49,11 @@ impl Run<'_> {
                 cache,
                 head_dim,
                 kv_heads,
+                q_heads,
                 sm_scale,
                 observe,
-                kv_max,
-                scores,
+                into,
+                ..
             } => {
                 let mut q_rows = self.ragged(*q);
                 q_rows.data = self.windowed(q_rows.data);
@@ -48,11 +64,21 @@ impl Run<'_> {
                     &self.pool(*cache),
                     *head_dim,
                     *kv_heads,
+                    *q_heads,
                     *sm_scale,
                     *observe,
                     self.window().span().lane_offset,
-                    *kv_max,
-                    &mut self.tensor(*scores),
+                    self.capture_rows("attn.score_capture")?,
+                    into.is_none(),
+                )
+            }
+            Attn::ScorePages { .. } => {
+                let span = self.window().span();
+                kernels_cuda::attn::score::pages(
+                    self.ctx(),
+                    self.capture_rows("attn.score_pages")?,
+                    span.lane_offset,
+                    span.lanes,
                 )
             }
             Attn::Voxel {
@@ -87,7 +113,7 @@ impl Run<'_> {
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     #[cfg(not(feature = "rocm"))]
                     let max_grid = fa2::decode_max_grid_size(
                         seat.shape.head_dim,
@@ -112,7 +138,7 @@ impl Run<'_> {
                     )?
                 };
                 if crate::serve::diag::on().plan_trace.is_some() {
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     eprintln!(
                         "[plan-trace] decode capture={} rows={} live={:?} window={:?} grant={:?} info={:?}",
                         self.bindings().capture,
@@ -123,6 +149,13 @@ impl Run<'_> {
                         built.info
                     );
                 }
+                // The fire's mask offsets and words, where it staged them: a
+                // decode reading the masks finds each request's here.
+                let built = plan::DecodePlan {
+                    mask_indptr: self.mask_indptr(),
+                    mask_origin: self.mask_origin(),
+                    ..built
+                };
                 built.stage(self.ctx())?;
                 self.put(*plan, StructSlot::Decode(built));
                 Ok(())
@@ -140,12 +173,12 @@ impl Run<'_> {
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     let spans = self.mask_indptr();
                     debug_assert_eq!(seat.live.rows, self.total_tokens());
                     match self.declared(*plan) {
                         StructKind::AttnPrefillPlan => {
-                            let built = plan::plan_prefill(
+                            let mut built = plan::plan_prefill(
                                 self.qo_indptr_host(),
                                 seat.kv_indptr,
                                 seat.kv_len,
@@ -160,6 +193,7 @@ impl Run<'_> {
                                 fire.toggles,
                                 seat.workspace,
                             )?;
+                            built.mask_origin = self.mask_origin();
                             if let Some(wanted) = crate::serve::diag::on().plan_trace.as_deref()
                                 && (wanted == "all" || wanted == seat.rows.to_string())
                             {
@@ -197,6 +231,7 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -218,8 +253,11 @@ impl Run<'_> {
                 *head_dim,
                 *sm_scale,
                 &mut self.tensor(*o),
+                self.applied_masks(*mask),
             ),
             Attn::Decode {
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
+                mask: _,
                 q,
                 plan: _,
                 selection: Some(selection),
@@ -254,7 +292,8 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
+                mask: _,
                 bias: None,
                 floor: None,
                 causal: true,
@@ -301,6 +340,8 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -344,7 +385,8 @@ impl Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-                mask: None,
+                // A lane stating a mask never reaches this arm (`exports::masked_classes`).
+                mask: _,
                 selection: None,
                 floor: None,
                 causal: true,
@@ -403,7 +445,7 @@ impl Run<'_> {
             ),
             // `causal: false` marks a wide class: its staged mask bits are unclipped.
             Attn::Prefill {
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 q,
                 plan,
@@ -419,19 +461,32 @@ impl Run<'_> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => attn::masked(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*mask),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *sm_scale,
-                &mut self.tensor(*o),
-            ),
+            } => match self.applied_masks(Some(*mask)) {
+                Some(bits) => attn::masked(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    bits,
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                ),
+                None => attn::prefill(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                ),
+            },
             Attn::Prefill {
-                kv_heads: _,
+                kv_heads,
                 causal: _,
                 q,
                 plan,
@@ -447,18 +502,32 @@ impl Run<'_> {
                 floor: None,
                 selected: None,
                 rel: None,
-            } => attn::masked_lse(
-                self.ctx(),
-                self.ragged_q(*q),
-                self.prefill_plan(*plan),
-                self.tensor(*mask),
-                &self.pool_absolute(*cache),
-                *window,
-                *head_dim,
-                *sm_scale,
-                &mut self.tensor(*o),
-                &mut self.tensor(*lse),
-            ),
+            } => match self.applied_masks(Some(*mask)) {
+                Some(bits) => attn::masked_lse(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    bits,
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                    &mut self.tensor(*lse),
+                ),
+                None => attn::prefill_lse(
+                    self.ctx(),
+                    self.ragged_q(*q),
+                    self.prefill_plan(*plan),
+                    &self.pool_absolute(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                    &mut self.tensor(*lse),
+                ),
+            },
             Attn::Prefill {
                 kv_heads: _,
                 causal: false,
@@ -535,6 +604,7 @@ impl Run<'_> {
                 &mut self.tensor(*o),
             ),
             Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -557,6 +627,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
+                self.applied_masks(*mask),
             ),
             Attn::Prefill {
                 q,
@@ -578,7 +649,7 @@ impl Run<'_> {
             } => {
                 // A floor stays 0 unless the profile turns bounded replay on;
                 // then only the fused kernels read it.
-                if floor.is_some() && self.ctx().tuning().compressed_replay {
+                if floor.is_some() && self.ctx().tuning().compressed_replay() {
                     return Err(kernels_cuda::Error::Backend {
                         op: "attn.prefill",
                         detail: "the window is held above a replay floor, which only the fused \
@@ -692,7 +763,7 @@ impl Run<'_> {
             } => {
                 let built = {
                     let fire = self.bindings();
-                    let seat = self.planning(*kv_indptr, *plan);
+                    let seat = self.planning(*kv_indptr, *plan)?;
                     plan::plan_mla(
                         self.qo_indptr_host(),
                         seat.kv_indptr,
@@ -1350,15 +1421,26 @@ impl Run<'_> {
                     .zip(packing(*kv_indptr))
                     .and_then(|(q, kv)| self.group_mask(q, kv));
                 let mask = match (mask, stated) {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        kernels_cuda::attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        }
+                    }
+                    (
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => kernels_cuda::attn::ragged::RaggedMask::None,
                     (
                         poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
-                        Some(stated),
-                    ) => kernels_cuda::attn::ragged::RaggedMask::Custom {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
-                    },
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
-                        kernels_cuda::attn::ragged::RaggedMask::None
+                        Some(_),
+                    ) => {
+                        return Err(kernels_cuda::Error::Backend {
+                            op: "attn.ragged",
+                            detail: STATED_ONLY.to_string(),
+                        });
                     }
                     (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_cuda::Error::Backend {
@@ -1403,6 +1485,15 @@ impl Run<'_> {
 }
 
 impl Run<'_> {
+    /// The fire's mask bits an attention applies, where its op reads them
+    /// (the plan binds each request's offset and word).
+    pub(crate) fn applied_masks(
+        &self,
+        mask: Option<poem_ir::ValueId>,
+    ) -> Option<kernels_cuda::Tensor> {
+        mask.map(|mask| self.tensor(mask))
+    }
+
     pub(crate) fn dense_or_decoded(
         &self,
         op: &'static str,
@@ -1461,3 +1552,9 @@ impl Run<'_> {
         }
     }
 }
+
+/// Why a lane's mask over an attention its model does not state one on
+/// (`RaggedMask::Stated`) is refused.
+const STATED_ONLY: &str = "a lane states an attention mask over an attention its model states \
+                           none on: only an attention the model text spells \
+                           `stated_group_mask()` reads a lane's mask";

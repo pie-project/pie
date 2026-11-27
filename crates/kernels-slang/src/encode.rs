@@ -44,6 +44,9 @@ pub enum ArgValue {
     I32(i32),
     U32(u32),
     F32(f32),
+    /// That many zero u32 scalars: a fired table's rows past those a fire
+    /// fills (`gather.rs_copy_runs`'s runs), laid without one argument each.
+    Zeros(u32),
 }
 
 impl ArgValue {
@@ -55,6 +58,7 @@ impl ArgValue {
             Self::I32(_) => "an i32",
             Self::U32(_) => "a u32",
             Self::F32(_) => "an f32",
+            Self::Zeros(_) => "zero scalars",
         }
     }
 }
@@ -91,6 +95,12 @@ pub enum Target {
 }
 
 pub trait Encode {
+    /// Dispatches `fire`: `fire.groups` workgroups of `fire.group`
+    /// invocations each, as `vkCmdDispatch` and `dispatch_workgroups` take
+    /// them. `groups` is a count of workgroups, never tiles times threads: a
+    /// kernel that picks its tile from `SV_GroupID` fires a group a tile,
+    /// and one that reads `SV_DispatchThreadID` states its invocations
+    /// through [`Fire::threads`].
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error>;
 
     fn absent(&self) -> Result<ArgValue, Error>;
@@ -108,6 +118,77 @@ pub trait Encode {
     /// Every rank's writes so far made visible to every rank.
     fn rendezvous(&self, _op: &'static str) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// Whether the fire's row counts are constants of its commands: a host
+    /// that keeps recordings of fires whose rows vary within one body reads
+    /// them from per-fire data where this is false. True for a sink that
+    /// keeps nothing.
+    fn fixed_rows(&self) -> bool {
+        true
+    }
+
+    /// Whether two arguments of one fire may bind overlapping views of a
+    /// buffer: false where the host's API refuses them (a browser's
+    /// WebGPU), where a kernel reading one value at two arguments takes
+    /// its form that reads it through one binding.
+    fn binds_overlap(&self) -> bool {
+        true
+    }
+
+    /// The sink's naming side, where it names kernels and fires none: a
+    /// host that picks its kernel by the rows of a fire then states every
+    /// kernel its widths allow ([`Naming::either`]) and fires nothing.
+    fn naming(&self) -> Option<&dyn Naming> {
+        None
+    }
+}
+
+/// A sink that takes the kernels a load can fire, before any fire states
+/// its rows.
+pub trait Naming {
+    /// One dispatch a host makes with whichever of `alternatives` its rows
+    /// pick.
+    fn either(&self, alternatives: &[Fire]) -> Result<(), Error>;
+
+    /// Opens the ways a host goes by a fire's rows, each a run of
+    /// dispatches: what is named until [`Naming::or`] or [`Naming::join`]
+    /// is the first way.
+    fn fork(&self);
+
+    /// Ends one way and opens the next.
+    fn or(&self);
+
+    /// Ends the last way: a fire makes the dispatches of one of them, so
+    /// the host counts as the longest and names the kernels of all.
+    fn join(&self);
+
+    /// The most rows a fire of the load may bring: a host whose dispatches
+    /// grow with a fire's rows counts at these, not at the naming fire's.
+    fn most_rows(&self) -> u32;
+}
+
+/// Every kernel `pick` answers over `breaks`, the row counts its answer
+/// changes at: each once, in the order first met.
+pub fn every(
+    breaks: &[u32],
+    pick: impl Fn(u32) -> Result<Fire, Error>,
+) -> Result<Vec<Fire>, Error> {
+    let mut all: Vec<Fire> = Vec::with_capacity(breaks.len());
+    for &rows in breaks {
+        distinct(&mut all, pick(rows)?);
+    }
+    Ok(all)
+}
+
+/// `fire` joins `all` unless its kernel is already there: a kernel is its
+/// entry at its tier, whatever grid it launches.
+pub(crate) fn distinct(all: &mut Vec<Fire>, fire: Fire) {
+    if !all
+        .iter()
+        .any(|held| held.entrypoint == fire.entrypoint && held.tier == fire.tier)
+    {
+        all.push(fire);
     }
 }
 
@@ -265,12 +346,10 @@ pub(crate) fn instantiated(op: &'static str, name: String) -> Result<&'static st
         .ok_or_else(|| refuse(op, format!("no kernel is instantiated as `{name}`")))
 }
 
-#[allow(dead_code)]
 pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the shader's int")))
 }
 
-#[allow(unused_macros)]
 macro_rules! dtype_dispatch {
     ($op:expr, $dtype:expr, { $($stamped:ident => $arm:expr),+ $(,)? }) => {
         match $dtype {
@@ -285,5 +364,4 @@ macro_rules! dtype_dispatch {
     };
 }
 
-#[allow(unused_imports)]
 pub(crate) use dtype_dispatch;

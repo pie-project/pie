@@ -242,6 +242,9 @@ constexpr int kMfmaThreads = 256;
 // distinct banks, and a row stays 16-byte aligned for the staging stores.
 constexpr int kMfmaLd = kMfmaBK + 8;
 
+// Eight bf16 of one row, moved to LDS as one 16-byte vector.
+typedef u32 Stage8 __attribute__((ext_vector_type(4)));
+
 // A 64x64 output tile a block of four wavefronts, 32x32 (2x2 MFMA tiles) a
 // wavefront; K staged 32 at a time through LDS as bf16. Needs C_in % 8 == 0
 // and 16-byte planes: an 8-channel chunk is then wholly in or out of range.
@@ -292,19 +295,22 @@ __global__ __launch_bounds__(kMfmaThreads) void conv3d_mfma(const bf16* __restri
         }
         const int c = c0 + s_k;
         const bool k_live = c < g.c_in;
-        b128 a{{0u, 0u, 0u, 0u}};
-        b128 b{{0u, 0u, 0u, 0u}};
+        // Staged as vectors: a struct of an array, assigned under a branch,
+        // was kept on the stack (48 bytes of scratch a lane on gfx942),
+        // which a captured body cannot have.
+        Stage8 a = {0u, 0u, 0u, 0u};
+        Stage8 b = {0u, 0u, 0u, 0u};
         if (k_live && r.live && src_row >= 0) {
-            a = *reinterpret_cast<const b128*>((from_cache ? cache : x) +
+            a = *reinterpret_cast<const Stage8*>((from_cache ? cache : x) +
                                                static_cast<long long>(src_row) * g.c_in + c);
         }
         if (k_live && n_live) {
-            b = *reinterpret_cast<const b128*>(wrow + static_cast<long long>(tap) * g.c_in + c);
+            b = *reinterpret_cast<const Stage8*>(wrow + static_cast<long long>(tap) * g.c_in + c);
         }
 
         __syncthreads();
-        *reinterpret_cast<b128*>(As + s_row * kMfmaLd + s_k) = a;
-        *reinterpret_cast<b128*>(Bs + s_row * kMfmaLd + s_k) = b;
+        *reinterpret_cast<Stage8*>(As + s_row * kMfmaLd + s_k) = a;
+        *reinterpret_cast<Stage8*>(Bs + s_row * kMfmaLd + s_k) = b;
         __syncthreads();
 
 #pragma unroll

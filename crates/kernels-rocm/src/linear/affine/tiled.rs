@@ -127,7 +127,7 @@ pub fn matmul(
     biases: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows());
     tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
@@ -139,10 +139,12 @@ pub fn lm_head(
     biases: Tensor,
     y: &mut Tensor,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows());
     tiled_launch(ctx, "linear.matmul", act, codes, scales, biases, y, tuple)
 }
 
+/// [`matmul`] at a stated tile tuple, whatever the tuning picks.
+#[cfg(feature = "test-support")]
 pub fn matmul_with(
     ctx: &Ctx,
     act: Tensor,
@@ -202,7 +204,7 @@ fn tiled_launch(
             ),
         ));
     }
-    let cus = ctx.multiprocessors().unwrap_or(304).max(1);
+    let cus = ctx.multiprocessors(op)?;
     let blocks = y.rows.div_ceil(m) * n.div_ceil(tile_n);
     let split = GemmSplit::plan(ctx, op, y.rows, n, k, blocks, cus)?;
     ctx.fire(
@@ -249,8 +251,11 @@ impl Carve {
 /// Wavefronts a block at most.
 const MAX_SPLIT: u32 = 16;
 
+/// Wavefronts a block at least: a chosen bound, not a measured one.
 pub const MIN_SPLIT: u32 = 8;
 
+/// The rows up to which a product takes the thin split-K maximum
+/// (`qmm_split_thin_max`): a chosen bound, not a measured one.
 pub const THIN_ROWS: u32 = 8;
 
 /// The most activation rows the GEMV lands (one 16-row tile of the core).
@@ -258,17 +263,15 @@ pub const GEMV_ROWS: u32 = 16;
 
 /// Split-K depth for `rows` x `n`: aims for `kernel.qmm.split_warps_per_sm`
 /// warps on every SM, capped by the thin (8 rows or fewer) or wide maximum.
-fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
+fn carve_for(n: u32, rows: u32, ctx: &Ctx, sms: u32) -> Carve {
     let tuning = ctx.tuning();
-    // A context that cannot say its SM count aims as an L40S would.
-    let sms = ctx.multiprocessors().unwrap_or(142);
     // The knob counts 32-lane warps; a 64-lane wavefront is two.
-    let warps = (sms.saturating_mul(tuning.qmm_split_warps_per_sm) / 2).max(1);
+    let warps = (sms.saturating_mul(tuning.qmm_split_warps_per_sm()) / 2).max(1);
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS {
-        tuning.qmm_split_thin_max
+        tuning.qmm_split_thin_max()
     } else {
-        tuning.qmm_split_wide_max
+        tuning.qmm_split_wide_max()
     };
     #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {
@@ -305,7 +308,7 @@ pub fn matmul_gemv(
         scales,
         biases,
         y,
-        carve_for(y.width, y.rows, ctx),
+        carve_for(y.width, y.rows, ctx, ctx.multiprocessors("linear.matmul")?),
     )
 }
 
@@ -325,7 +328,7 @@ pub fn lm_head_gemv(
         scales,
         biases,
         y,
-        carve_for(y.width, y.rows, ctx),
+        carve_for(y.width, y.rows, ctx, ctx.multiprocessors("linear.matmul")?),
     )
 }
 

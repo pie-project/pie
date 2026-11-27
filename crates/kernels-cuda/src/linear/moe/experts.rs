@@ -373,7 +373,7 @@ pub fn experts(
         let mxfp4 = |o: gemm_sm100::Operand| {
             o.elem == gemm_sm100::Elem::E2m1 && o.scales.is_some_and(|s| s.gran == 32)
         };
-        let f16 = ctx.tuning().moe_mxfp4_f16 && mxfp4(u.0) && mxfp4(d.0);
+        let f16 = ctx.tuning().moe_mxfp4_f16() && mxfp4(u.0) && mxfp4(d.0);
         let act = if f16 {
             gemm_sm100::Elem::F16
         } else {
@@ -481,15 +481,15 @@ pub(super) fn experts_w4a4(
     // the four apart would.
     if count == 0
         || norm.is_some_and(|(s, _)| s.dtype != Dtype::Bf16 || s.rows * s.width != y.width)
-        || tokens < ctx.tuning().moe_w4a4_fused_from
+        || tokens < ctx.tuning().moe_w4a4_fused_from()
         || !matches!(
             glu,
             gemm_sm100::Glu::Swiglu
                 | gemm_sm100::Glu::Relu2
                 | gemm_sm100::Glu::SwigluClampAlpha { .. }
         )
-        || !ctx.tuning().moe_tc5
         || !gemm_sm100::supported()
+        || !ctx.tuning().moe_tc5()
         || x.dtype != Dtype::Bf16
         || x.rows != tokens
         || down_codes.rows != experts
@@ -538,7 +538,7 @@ pub(super) fn experts_w4a4(
         let align = gemm_sm100::GROUP_ALIGN;
         // A narrow fire lays its routes out and quantizes their rows in one
         // launch where the profile says (`kernel.moe.w4a4_fused_layout`).
-        let fused = ctx.tuning().moe_w4a4_fused_layout
+        let fused = ctx.tuning().moe_w4a4_fused_layout()
             && count <= act_quant::FUSED_ROUTES
             && experts <= act_quant::FUSED_EXPERTS;
         let rows = act_quant::contiguous_rows(count, experts, align) as usize;
@@ -768,10 +768,10 @@ pub(super) fn experts_w4a8_as(
         && count <= act_quant::MASKED_FIRE
         && glu == gemm_sm100::Glu::Swiglu
         && matches!(sum, W4a8Sum::Weighted(_));
-    if (count <= act_quant::MASKED_FIRE || tokens < ctx.tuning().moe_w4a8_fused_from) && !masked
+    if (count <= act_quant::MASKED_FIRE || tokens < ctx.tuning().moe_w4a8_fused_from()) && !masked
         || !glu_taken
-        || !ctx.tuning().moe_tc5
         || !gemm_sm100::supported()
+        || !ctx.tuning().moe_tc5()
         || x.dtype != Dtype::Bf16
         || x.rows != tokens
         || down_codes.rows != experts

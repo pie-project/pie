@@ -80,16 +80,50 @@ fn the_ropes_answer_the_reference() {
         let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
         let (hd, rd, sp) = (head_dim as u32, rotary as u32, span as u32);
         match rotary == head_dim {
-            true => gpu
-                .run(|c| kernels_slang::elemwise::rope::full(c, t(q), t(k), pt, hd, theta, false)),
+            true => gpu.run(|c| {
+                kernels_slang::elemwise::rope::full(
+                    c,
+                    t(q),
+                    t(k),
+                    pt,
+                    kernels_slang::ssm::RowSpan::whole(pt),
+                    0,
+                    hd,
+                    theta,
+                    false,
+                )
+            }),
             false => gpu.run(|c| {
-                kernels_slang::elemwise::rope::partial(c, t(q), t(k), pt, rd, hd, theta, sp)
+                kernels_slang::elemwise::rope::partial(
+                    c,
+                    t(q),
+                    t(k),
+                    pt,
+                    kernels_slang::ssm::RowSpan::whole(pt),
+                    0,
+                    rd,
+                    hd,
+                    theta,
+                    sp,
+                )
             }),
         }
         close(&gpu.down(q, n), &wq, &format!("rope q {shape}"));
         close(&gpu.down(k, n), &wk, &format!("rope k {shape}"));
         let (q, _) = gpu.up(&qv);
-        gpu.run(|c| kernels_slang::elemwise::rope::partial_q(c, t(q), pt, rd, hd, theta, sp));
+        gpu.run(|c| {
+            kernels_slang::elemwise::rope::partial_q(
+                c,
+                t(q),
+                pt,
+                kernels_slang::ssm::RowSpan::whole(pt),
+                0,
+                rd,
+                hd,
+                theta,
+                sp,
+            )
+        });
 
         close(&gpu.down(q, n), &wq, &format!("rope q alone {shape}"));
     }
@@ -151,6 +185,8 @@ fn the_ropes_answer_the_reference() {
                         c,
                         t(q),
                         pt,
+                        kernels_slang::ssm::RowSpan::whole(pt),
+                        0,
                         rd,
                         hd,
                         theta,
@@ -202,6 +238,8 @@ fn the_ropes_answer_the_reference() {
                 t(q),
                 t(k),
                 pt,
+                kernels_slang::ssm::RowSpan::whole(pt),
+                0,
                 hd,
                 theta,
                 4.0,
@@ -359,15 +397,42 @@ fn the_mropes_answer_the_reference() {
         let (qt, kt) = (t(q, q_heads), t(k, k_heads));
         let (qt, kt, pt) = (qt, kt, pt);
         gpu.run(|c| match form {
-            Mrope::Interleaved => {
-                kernels_slang::elemwise::rope::mrope_interleaved(c, qt, kt, pt, s3, rd, hd, theta)
-            }
-            Mrope::Blocked => {
-                kernels_slang::elemwise::rope::mrope_blocked(c, qt, kt, pt, s3, rd, hd, theta)
-            }
-            Mrope::Split => {
-                kernels_slang::elemwise::rope::mrope_split(c, qt, kt, pt, s3, rd, hd, theta)
-            }
+            Mrope::Interleaved => kernels_slang::elemwise::rope::mrope_interleaved(
+                c,
+                qt,
+                kt,
+                pt,
+                kernels_slang::ssm::RowSpan::whole(pt),
+                0,
+                s3,
+                rd,
+                hd,
+                theta,
+            ),
+            Mrope::Blocked => kernels_slang::elemwise::rope::mrope_blocked(
+                c,
+                qt,
+                kt,
+                pt,
+                kernels_slang::ssm::RowSpan::whole(pt),
+                0,
+                s3,
+                rd,
+                hd,
+                theta,
+            ),
+            Mrope::Split => kernels_slang::elemwise::rope::mrope_split(
+                c,
+                qt,
+                kt,
+                pt,
+                kernels_slang::ssm::RowSpan::whole(pt),
+                0,
+                s3,
+                rd,
+                hd,
+                theta,
+            ),
         });
 
         close(&gpu.down(q, qn), &wq, &format!("mrope q {shape}"));
@@ -495,11 +560,37 @@ fn the_axis_ropes_answer_the_reference() {
             _ => kernels_slang::elemwise::rope::RopeForm::SplitLadder,
         };
         let (y, _) = gpu.up(&xv);
-        gpu.run(|c| kernels_slang::elemwise::rope::axes(c, t(y), pt, dims, thetas, sf, rd, hd));
+        gpu.run(|c| {
+            kernels_slang::elemwise::rope::axes(
+                c,
+                t(y),
+                pt,
+                kernels_slang::ssm::RowSpan::whole(t(y)),
+                0,
+                dims,
+                thetas,
+                sf,
+                rd,
+                hd,
+            )
+        });
         close(&gpu.down(y, n), &want, &format!("rope axes {shape}"));
         let y = gpu.up_f32(&xv);
         let ft = Tensor::new(y, ROWS as u32, width as u32, Dtype::F32);
-        gpu.run(|c| kernels_slang::elemwise::rope::axes(c, ft, pt, dims, thetas, sf, rd, hd));
+        gpu.run(|c| {
+            kernels_slang::elemwise::rope::axes(
+                c,
+                ft,
+                pt,
+                kernels_slang::ssm::RowSpan::whole(ft),
+                0,
+                dims,
+                thetas,
+                sf,
+                rd,
+                hd,
+            )
+        });
         let want = axes_reference(&xv, heads, head_dim, &dims_u, &th64, form, rotary, &posv);
         close(
             &gpu.down_f32(y, n),

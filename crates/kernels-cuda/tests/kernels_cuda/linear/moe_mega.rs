@@ -368,6 +368,7 @@ fn the_bf16_mega_moe_answers_the_composition_apart() {
     // Every width the kernel takes, B200's floor for bf16 banks aside.
     let ctx = b.ctx().with_tuning(kernels_cuda::tuning::Tuning {
         moe_mega_bf16_from: 0,
+        roof: crate::common::roof(),
         ..SM100
     });
     for first in [false, true] {

@@ -16,6 +16,7 @@ path = "src/lib.rs"
 state = { path = "../state" }
 memmap2 = "0.9"
 toml = "1.1"
+tracing = "0.1"
 libc = "0.2"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda", optional = true }
@@ -61,16 +62,33 @@ rocm = ["device", "dep:kernels-rocm", "kernels-rocm/rocm"]
 # A device runtime, either one; enable `cuda` or `rocm`.
 device = []
 
+# Fills memory nothing should read before a launch (a guest lane's dummy
+# bytes), so a kernel that does read it answers wrongly where a golden
+# sees it. Off, no build writes those bytes.
+test-slot-fill = []
+
+# A test build's pins (`Knobs::pin`, `Knobs::weights`): fires launched
+# eagerly, or a load with no weight shape. No profile or config reaches them;
+# serving captures every fire. The crate's own tests turn it on below.
+test-pins = []
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
 
 [dev-dependencies]
+engine-cuda = { path = ".", features = ["test-pins"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 tempfile = "3"
+engine-cpu = { path = "../engine-cpu" }
 
 [lints]
 workspace = true

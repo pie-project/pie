@@ -24,6 +24,69 @@ impl<B: Backend> Run<'_, B> {
                 heads_per_ngram,
                 map,
                 ngram_ids,
+            }
+            | Gather::NgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
+            } if self
+                .rs_seat()
+                .is_some_and(|seat| seat.layout.in_of.contains_key(&ids.0)) =>
+            {
+                // The id window the rs buffer covers: its ids extend by the
+                // lane's buffered ones, its own rows hash, and the window is
+                // kept as of the fold, as a committed conv's history is.
+                const OP: &str = "gather.ngram_ids_committed";
+                if map.is_some() {
+                    return Err(kernels_slang::Error::Unsupported { op: op.name() });
+                }
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_slang::Error::Unsupported { op: op.name() });
+                };
+                let seat = self.rs_seat().expect("guarded");
+                let ext_ids = self.rs_extend(OP, &seat, *ids)?;
+                let pool = self.recurrent(*state);
+                kernels_slang::gather::ngram::ngram_ids_committed(
+                    self.ctx,
+                    ext_ids,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    &kernels_slang::ssm::StatePool {
+                        bank: pool.state,
+                        slots: pool.slots,
+                        pool: pool.pool,
+                        origin: pool.origin,
+                        slot_stride: pool.slot_stride,
+                        pieces: pool.pieces,
+                        piece_first: pool.piece_first,
+                        piece_atoms: pool.piece_atoms,
+                        snapshots: None,
+                    },
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    self.tensor(*ngram_ids),
+                )
+            }
+            Gather::NgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                map,
+                ngram_ids,
             } => {
                 if map.is_some() {
                     // Engram's id map is not carried by this backend's hasher yet.

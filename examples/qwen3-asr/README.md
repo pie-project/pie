@@ -18,5 +18,5 @@ has no filesystem. A shell passes one argument of at most 128 KiB, about
 three seconds of 16-bit audio; a longer clip goes through a client. It
 answers the transcript and the language Qwen3-ASR names.
 
-The engine's voxel ceiling (`max_voxels`) must hold a convolution pass's
-clip: two chunks of 100 frames by 128 bands. It runs on Metal, CUDA and Vulkan.
+The engine's voxel rung, derived from the device, must hold a convolution
+pass's clip: two chunks of 100 frames by 128 bands. It runs on Metal, CUDA and Vulkan.

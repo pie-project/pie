@@ -93,7 +93,7 @@ inline void sdpa_paged_decode_body(
     const float scale,
     const device uchar* attention_mask,
     const uint attention_mask_stride,
-    const device uchar* attention_mask_enabled,
+    const device uint* attention_mask_enabled,
     const int window,
     const device T* sinks,
     device float* lse,
@@ -149,7 +149,7 @@ inline void sdpa_paged_decode_body(
   const int r          = req_of_token[row];
   const int q_pos      = position_ids[row];
 
-  const int mask_word  = FAST_FULL ? 0 : int(attention_mask_enabled[row]);
+  const int mask_word  = FAST_FULL ? 0 : int((attention_mask_enabled[row] & 3u));
   const bool wide      = window < 0 || mask_word == 2;
   const int  extent    = window < 0 ? (-window - 1) : window;
   const int kv_start   =
@@ -169,8 +169,8 @@ inline void sdpa_paged_decode_body(
   const bool masked = mask_word != 0;
 
   auto absorb = [&](uint page, uint off) {
-    const size_t kcell = size_t(page) * k_page + (off * k_row);
-    const size_t vcell = size_t(page) * v_page + (off * v_row);
+    const size_t kcell = pie_page_at(page, k_page, kv_unit) + (off * k_row);
+    const size_t vcell = pie_page_at(page, v_page, kv_unit) + (off * v_row);
     if constexpr (PACKED) {
       // Byte-index the lane's slice of the packed 130-byte block: read the K and
       // V per-block fp16 scales once, then dequantize this lane's own elements
@@ -210,8 +210,8 @@ inline void sdpa_paged_decode_body(
       return true;
     } else {
       return !masked ||
-          (uint(kp) < attention_mask_stride &&
-           attention_mask[size_t(row) * attention_mask_stride + uint(kp)] != 0);
+          pie_mask_admits(attention_mask, attention_mask_stride,
+                          attention_mask_enabled[row] >> 2, uint(row), uint(kp));
     }
   };
 
@@ -377,7 +377,7 @@ template <
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant ulong& k_page_stride [[buffer(17)]],
@@ -417,7 +417,7 @@ template <typename T, int D, int V = D>
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const device int* selection                [[buffer(17)]],
@@ -474,7 +474,7 @@ template <typename T, int D, int V = D>
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant ulong& k_page_stride [[buffer(17)]],
@@ -515,7 +515,7 @@ template <typename T, int D, int V = D>
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     device float* lse                          [[buffer(17)]],
@@ -574,7 +574,7 @@ inline void sdpa_paged_tiled_body(
     const float scale,
     const device uchar* attention_mask,
     const uint attention_mask_stride,
-    const device uchar* attention_mask_enabled,
+    const device uint* attention_mask_enabled,
     const int window,
     const device T* sinks,
     device float* lse,
@@ -649,7 +649,7 @@ inline void sdpa_paged_tiled_body(
 
   const int q_pos     = live ? position_ids[row] : 0;
 
-  const int mask_word = live ? int(attention_mask_enabled[row]) : 0;
+  const int mask_word = live ? int((attention_mask_enabled[row] & 3u)) : 0;
   const bool wide     = window < 0 || mask_word == 2;
   const int  extent   = window < 0 ? (-window - 1) : window;
   const int my_start  = (extent > 0 && q_pos >= extent) ? (q_pos - extent + 1) : 0;
@@ -672,7 +672,7 @@ inline void sdpa_paged_tiled_body(
       const int p = position_ids[row_lo + i];
       kp_hi = max(kp_hi, p);
       kp_lo = min(kp_lo, (extent_here > 0 && p >= extent_here) ? (p - extent_here + 1) : 0);
-      wide_here = wide_here || attention_mask_enabled[row_lo + i] == 2;
+      wide_here = wide_here || (attention_mask_enabled[row_lo + i] & 3u) == 2;
     }
     const int page_base = int(kv_page_indptr[r]);
     if (wide_here) {
@@ -690,10 +690,12 @@ inline void sdpa_paged_tiled_body(
       // out of the element loop.
       if (int(lid) < cnt) {
         const int kp = base + int(lid);
-        const ulong page = ulong(kv_page_indices[page_base + kp / page_size]);
+        const uint page = uint(kv_page_indices[page_base + kp / page_size]);
         const ulong off = ulong(kp % page_size);
-        cells[lid] = page * k_page + off * k_row + ulong(kv_head) * kv_head_width;
-        cells[KT + lid] = page * v_page + off * v_row + ulong(kv_head) * kv_head_width;
+        cells[lid] = pie_page_at(page, k_page, kv_unit) + off * k_row +
+                     ulong(kv_head) * kv_head_width;
+        cells[KT + lid] = pie_page_at(page, v_page, kv_unit) + off * v_row +
+                          ulong(kv_head) * kv_head_width;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (int e = int(lid); e < cnt * D; e += 1024) {
@@ -733,9 +735,9 @@ inline void sdpa_paged_tiled_body(
 
       const auto keeps = [&](int kp) {
         if ((!wide && kp > q_pos) || kp < my_start) return false;
-        return !(masked && (uint(kp) >= attention_mask_stride ||
-                            attention_mask[size_t(row) * attention_mask_stride +
-                                           uint(kp)] == 0));
+        return !masked ||
+            pie_mask_admits(attention_mask, attention_mask_stride,
+                            attention_mask_enabled[row] >> 2, uint(row), uint(kp));
       };
 
       if (KEY_PER_LANE) {
@@ -849,7 +851,7 @@ template <typename T, int D, int V = D, bool WITH_SINK = false, bool KEY_PER_LAN
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
@@ -891,7 +893,7 @@ template <typename T, int D, int V = D, bool KEY_PER_LANE = false>
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
@@ -941,7 +943,7 @@ template <typename T, int D, int V = D>
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
@@ -988,7 +990,7 @@ template <typename T, int D, int V = D>
     const constant float& scale             [[buffer(11)]],
     const device uchar* attention_mask      [[buffer(12)]],
     const device uint& attention_mask_stride[[buffer(13)]],
-    const device uchar* attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int& window                 [[buffer(15)]],
     const device T* sinks                      [[buffer(16)]],
     const constant int& n_rows                 [[buffer(17)]],
@@ -1023,7 +1025,7 @@ template <typename T, int D, int V = D>
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
-      const device uchar*, const device uint&, const device uchar*,        \
+      const device uchar*, const device uint&, const device uint*,        \
       const constant int&, const device itype*, const constant int&,       \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -1040,7 +1042,7 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 512, 512, fals
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
-      const device uchar*, const device uint&, const device uchar*,        \
+      const device uchar*, const device uint&, const device uint*,        \
       const constant int&, const device itype*, const constant int&,       \
       device float*, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -1058,7 +1060,7 @@ instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 512, 512, f
       device itype*, const constant int&, const device int*,                \
       const device int*, const device uint*, const device uint*,            \
       const constant int&, const constant int&, const constant float&,      \
-      const device uchar*, const device uint&, const device uchar*,         \
+      const device uchar*, const device uint&, const device uint*,         \
       const constant int&, const device itype*, const constant int&,        \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -1069,7 +1071,7 @@ instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 512, 512, f
       device itype*, const constant int&, const device int*,                \
       const device int*, const device uint*, const device uint*,            \
       const constant int&, const constant int&, const constant float&,      \
-      const device uchar*, const device uint&, const device uchar*,         \
+      const device uchar*, const device uint&, const device uint*,         \
       const constant int&, const device itype*, const constant int&,        \
       device float*, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -1085,7 +1087,7 @@ instantiate_sdpa_tiled_lse_kv_u4(bfloat16, bfloat, 256, 256)
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
-      const device uchar*, const device uint&, const device uchar*,        \
+      const device uchar*, const device uint&, const device uint*,        \
       const constant int&, const device itype*,                            \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -1104,7 +1106,7 @@ instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
-      const device uchar*, const device uint&, const device uchar*,        \
+      const device uchar*, const device uint&, const device uint*,        \
       const constant int&, const device itype*, const device int*,         \
       const constant int&, const constant int&, const constant int&,       \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
@@ -1122,7 +1124,7 @@ instantiate_sdpa_paged_selected(bfloat16, bfloat, 64, 64)
       device itype*, const constant int&, const device int*,                \
       const device int*, const device uint*, const device uint*,            \
       const constant int&, const constant int&, const constant float&,      \
-      const device uchar*, const device uint&, const device uchar*,         \
+      const device uchar*, const device uint&, const device uint*,         \
       const constant int&, const device itype*,                             \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
@@ -1136,7 +1138,7 @@ instantiate_sdpa_paged_kv_u4(bfloat16, bfloat, 256, 256)
       device itype*, const constant int&, const device int*,               \
       const device int*, const device uint*, const device uint*,           \
       const constant int&, const constant int&, const constant float&,     \
-      const device uchar*, const device uint&, const device uchar*,        \
+      const device uchar*, const device uint&, const device uint*,        \
       const constant int&, const device itype*, device float*,             \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 

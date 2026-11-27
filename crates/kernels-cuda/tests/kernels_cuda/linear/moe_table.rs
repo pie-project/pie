@@ -25,6 +25,9 @@ pub fn same_bits(
 ) {
     let mut run = |g: &mut Gpu, table: ExpertTable| -> Vec<u8> {
         g.fill(y, 0x7f, y_bytes);
+        // The fire's slabs laid first, as the engine lays them: it is walked
+        // on the context it carries.
+        g.lay(&g.ctx(), |_| fire(table));
         fire(table);
         g.sync();
         g.down::<u8>(y, y_bytes)
@@ -81,8 +84,14 @@ fn bf16_bank(g: &mut Gpu, lcg: &mut Lcg, experts: usize, n: usize, k: usize) -> 
     g.up(&raw)
 }
 
+/// `g`'s context, priced on the tests' roofline.
 fn ctx_of(g: &Gpu) -> Ctx {
-    g.ctx()
+    let ctx = g.ctx();
+    let tuning = ctx.tuning();
+    ctx.with_tuning(kernels_cuda::tuning::Tuning {
+        roof: crate::common::roof(),
+        ..tuning
+    })
 }
 
 #[test]
@@ -146,8 +155,10 @@ fn a_streamed_bf16_select_reads_its_host_experts_through_the_table() {
         let run = |g: &mut Gpu, table: ExpertTable| -> Vec<u8> {
             g.fill(y, 0x7f, y_bytes);
             let mut yt = t(y, tokens * top, n, Bf16);
-            moe::matmul_select(&ctx, x, t(bank, experts, n * k, Bf16), r, &mut yt, table)
-                .expect("the select fires");
+            g.laid(&ctx, |ctx| {
+                moe::matmul_select(ctx, x, t(bank, experts, n * k, Bf16), r, &mut yt, table)
+            })
+            .expect("the select fires");
             g.sync();
             g.down::<u8>(y, y_bytes)
         };

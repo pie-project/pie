@@ -22,6 +22,20 @@ pub(crate) fn can_block() -> bool {
 
 static PARKED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
+/// Held by every callback WebGPU resolves for the engine (a submission's
+/// work done, a buffer mapped): in the tab, its drop asks the page for a
+/// tick (`web_std::executor::poke`), so a waiter reading what the callback
+/// changed polls again after it, woken or not. Natively nothing: waiters
+/// poll the device there.
+pub(crate) struct Poke;
+
+impl Drop for Poke {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        web_std::executor::poke();
+    }
+}
+
 pub fn parked() -> Vec<&'static str> {
     PARKED.lock().expect("parked lock poisoned").clone()
 }
@@ -142,12 +156,12 @@ pub(crate) mod thread {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod channel {
-    pub(crate) use std::sync::mpsc::{SendError, Sender, channel as unbounded};
+    pub(crate) use std::sync::mpsc::{Receiver, SendError, Sender, channel as unbounded};
 }
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod channel {
-    pub(crate) use web_std::channel::{SendError, Sender, unbounded};
+    pub(crate) use web_std::channel::{Receiver, SendError, Sender, unbounded};
 }
 
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]

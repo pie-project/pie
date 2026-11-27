@@ -117,6 +117,9 @@ def layout(id, deploy):
         fail("{} ships no drafter and no parts".format(id))
     table = dtype.bf16 if proj in RELEASED else proj
     d = DIMS[id]
+    # The first layers and experts of the whole model, at full width.
+    if deploy.layers or deploy.experts:
+        d = dims(d.hidden, deploy.layers or d.layers, d.q_heads, d.kv_heads, deploy.experts or d.experts, d.inter, d.theta)
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
 

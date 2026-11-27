@@ -3,8 +3,8 @@
 #include "prim/shuffle.slang"
 
 // y = x * w^T on bf16 for WGSL: every store lands a pair of columns, one
-// word. `PIE_GEMV`: a few rows, a 32-lane strip a column walking the
-// contraction (four words a step where it is even), the strip folded
+// word. `PIE_GEMV`: a few rows (`PIE_VROWS` a workgroup over one read of
+// its columns' weights), a 32-lane strip a column walking the contraction (four words a step where it is even), the strip folded
 // through workgroup memory or, at the subgroup tier, by shuffles; column
 // pairs land from the even strip. Otherwise a `PIE_BM` x 64 tile a
 // workgroup of 16 x 16, k-major float4 tiles in workgroup memory so an
@@ -20,11 +20,19 @@ struct Params {
     int m;
     int n;
     int k;
+    // The window's first row in the bound rows of x and the landing (both
+    // the fire's whole): the fire's data.
+    uint row0;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
+
+// A window row's row in the bound rows.
+uint bound_row(uint row) {
+    return PIE_FIRE(row0) + row;
+}
 
 float load_x(uint row, uint kk) {
-    return bf16_at(x, row * uint(params.k) + kk);
+    return bf16_at(x, bound_row(row) * uint(params.k) + kk);
 }
 
 float load_w(uint col, uint kk) {
@@ -35,7 +43,7 @@ void write_pair(uint row, uint col, float lo, float hi) {
     if (row >= uint(params.m) || col >= uint(params.n)) {
         return;
     }
-    out_[(row * uint(params.n) + col) >> 1] = pack_bf16(lo, hi);
+    out_[(bound_row(row) * uint(params.n) + col) >> 1] = pack_bf16(lo, hi);
 }
 
 #if defined(PIE_GEMV)
@@ -44,8 +52,17 @@ void write_pair(uint row, uint col, float lo, float hi) {
 #define PIE_NLANES 8u
 #define PIE_WORDS 4u
 #define PIE_WIDE (PIE_KLANES * PIE_WORDS)
+// The rows a workgroup carries over one read of its columns' weights: a
+// row of workgroups (group.z) a block of them.
+#ifndef PIE_VROWS
+#define PIE_VROWS 4u
+#endif
 
-groupshared float partial[PIE_KLANES * PIE_NLANES];
+#if defined(PIE_SUBGROUP)
+groupshared float partial[PIE_NLANES * PIE_VROWS];
+#else
+groupshared float partial[PIE_VROWS * PIE_NLANES * PIE_KLANES];
+#endif
 
 float pair_dot(uint xw, uint ww) {
     return bf16_to_f32(xw & 0xffffu) * bf16_to_f32(ww & 0xffffu)
@@ -53,57 +70,84 @@ float pair_dot(uint xw, uint ww) {
 }
 
 [numthreads(32, 8, 1)]
-void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
+void main(uint3 gid : SV_DispatchThreadID, uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint klane = local.x;
     uint clane = local.y;
     uint col = gid.y;
-    uint row = gid.z;
-    float acc = 0.0;
-    if (col < uint(params.n) && row < uint(params.m)) {
+    uint row0 = group.z * PIE_VROWS;
+    uint rows = min(uint(params.m) - min(row0, uint(params.m)), PIE_VROWS);
+    float acc[PIE_VROWS];
+    [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) acc[r] = 0.0;
+    if (col < uint(params.n)) {
         uint k = uint(params.k);
         uint words = k >> 1;
         uint wide = 0u;
         if ((k & 1u) == 0u) {
             wide = (words / PIE_WIDE) * PIE_WIDE;
         }
-        uint xbase = row * words;
         uint wbase = col * words;
         for (uint wi = klane * PIE_WORDS; wi < wide; wi += PIE_WIDE) {
-            uint xa = xbase + wi;
             uint wa = wbase + wi;
-            acc += pair_dot(x[xa], w[wa]);
-            acc += pair_dot(x[xa + 1u], w[wa + 1u]);
-            acc += pair_dot(x[xa + 2u], w[wa + 2u]);
-            acc += pair_dot(x[xa + 3u], w[wa + 3u]);
+            uint w0 = w[wa];
+            uint w1 = w[wa + 1u];
+            uint w2 = w[wa + 2u];
+            uint w3 = w[wa + 3u];
+            [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+                if (r < rows) {
+                    uint xa = bound_row(row0 + r) * words + wi;
+                    acc[r] += pair_dot(x[xa], w0);
+                    acc[r] += pair_dot(x[xa + 1u], w1);
+                    acc[r] += pair_dot(x[xa + 2u], w2);
+                    acc[r] += pair_dot(x[xa + 3u], w3);
+                }
+            }
         }
         for (uint kk = wide * 2u + klane; kk < k; kk += PIE_KLANES) {
-            acc += load_x(row, kk) * load_w(col, kk);
+            float wv = load_w(col, kk);
+            [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+                if (r < rows) acc[r] += load_x(row0 + r, kk) * wv;
+            }
         }
     }
 #if defined(PIE_SUBGROUP)
     // A subgroup of at least 32 lanes holds a strip: fold it by shuffles.
-    [ForceUnroll] for (uint off = 16u; off > 0u; off >>= 1u) {
-        acc += pie_shuffle_xor(acc, off);
-    }
-    if (klane == 0u) {
-        partial[clane] = acc;
+    [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+        [ForceUnroll] for (uint off = 16u; off > 0u; off >>= 1u) {
+            acc[r] += pie_shuffle_xor(acc[r], off);
+        }
+        if (klane == 0u) {
+            partial[r * PIE_NLANES + clane] = acc[r];
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     if (klane == 0u && (clane & 1u) == 0u) {
-        write_pair(row, col, partial[clane], partial[clane + 1u]);
+        [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+            if (r < rows) {
+                write_pair(row0 + r, col, partial[r * PIE_NLANES + clane], partial[r * PIE_NLANES + clane + 1u]);
+            }
+        }
     }
 #else
-    uint slot = clane * PIE_KLANES + klane;
-    partial[slot] = acc;
+    [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+        partial[(r * PIE_NLANES + clane) * PIE_KLANES + klane] = acc[r];
+    }
     GroupMemoryBarrierWithGroupSync();
     for (uint step = PIE_KLANES / 2u; step > 0u; step >>= 1u) {
         if (klane < step) {
-            partial[slot] += partial[slot + step];
+            [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+                uint slot = (r * PIE_NLANES + clane) * PIE_KLANES + klane;
+                partial[slot] += partial[slot + step];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
     }
     if (klane == 0u && (clane & 1u) == 0u) {
-        write_pair(row, col, partial[clane * PIE_KLANES], partial[(clane + 1u) * PIE_KLANES]);
+        [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
+            if (r < rows) {
+                write_pair(row0 + r, col, partial[(r * PIE_NLANES + clane) * PIE_KLANES],
+                    partial[(r * PIE_NLANES + clane + 1u) * PIE_KLANES]);
+            }
+        }
     }
 #endif
 }
@@ -157,7 +201,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             [ForceUnroll] for (uint j = 0u; j < 4u; j++) {
                 uint row = tile_row + rq * 4u + j;
                 if (row < m) {
-                    float2 pair = pair_of(x, row, kb + kk, k, k_even);
+                    float2 pair = pair_of(x, bound_row(row), kb + kk, k, k_even);
                     lo[j] = pair.x;
                     hi[j] = pair.y;
                 }
@@ -208,5 +252,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 // pie:instantiate linear_gemm_pairs_gemv_bf16 PIE_GEMV=1 PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_gemv_bf16 PIE_GEMV=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v1_bf16 PIE_GEMV=1 PIE_VROWS=1u PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v1_bf16 PIE_GEMV=1 PIE_VROWS=1u PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v8_bf16 PIE_GEMV=1 PIE_VROWS=8u PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v8_bf16 PIE_GEMV=1 PIE_VROWS=8u PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v16_bf16 PIE_GEMV=1 PIE_VROWS=16u PIE_TARGET=wgsl
+// pie:instantiate linear_gemm_pairs_gemv_v16_bf16 PIE_GEMV=1 PIE_VROWS=16u PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_tiled_bf16 PIE_BM=64 PIE_TARGET=wgsl
 // pie:instantiate linear_gemm_pairs_tiled_bm_16_bf16 PIE_BM=16 PIE_TARGET=wgsl

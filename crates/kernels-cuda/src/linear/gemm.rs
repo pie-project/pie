@@ -1,5 +1,6 @@
-//! Host-only: the dense products on the vendor's libraries. `cublas` times
-//! cuBLAS and cuBLASLt tactics for a bf16 product; `cublas_lt_fp8` is
+//! Host-only: the dense products on the vendor's libraries. `cublas` runs a
+//! bf16 product on a streaming skeleton where one covers its few rows, else
+//! on cuBLASLt's first heuristic algorithm for its shape; `cublas_lt_fp8` is
 //! cuBLASLt's fp8 product over `act_quant`'s scales.
 
 use crate::error::Error;
@@ -13,7 +14,93 @@ use dtype::Dtype;
 #[cfg(feature = "cuda")]
 pub(crate) mod cublas;
 #[cfg(feature = "cuda")]
+pub use cublas::{Tile, skinny_rows, tile, tile_rows};
+#[cfg(feature = "cuda")]
 pub mod cublas_lt_fp8;
+
+/// The workgroups (blocks) of the few-rows kernel serving runs a plain bf16
+/// product of `m x n x k` on (the rows skeleton, `m` up to its
+/// [`crate::linear::skeleton::ROWS_M`]) one multiprocessor of the current
+/// device holds at once, at its launch's threads: the driver's occupancy
+/// calculator (`cuOccupancyMaxActiveBlocksPerMultiprocessor`) over the
+/// kernel's registers and shared memory against the multiprocessor's.
+pub fn few_rows_resident_blocks(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<u32, Error> {
+    const OP: &str = "linear.few_rows_occupancy";
+    let _ = ctx;
+    if !(1..=FEW_ROWS).contains(&m) {
+        return Err(crate::jit::refuse(
+            OP,
+            format!("the few-rows kernel takes 1..={FEW_ROWS} rows, not {m}"),
+        ));
+    }
+    #[cfg(feature = "cuda")]
+    {
+        crate::linear::gemv::rows_resident_blocks(
+            count(OP, "the rows", m)?,
+            count(OP, "the columns", n)?,
+            count(OP, "the contraction", k)?,
+        )
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (n, k);
+        Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// The blocks (each cluster's blocks counted) of the few-rows kernel a
+/// dense bf16 product of `m x n x k` runs on, where it does: the rows
+/// skeleton's grid from 2 to [`FEW_ROWS`] rows (one row runs the gemv,
+/// more cuBLASLt's algorithm). `None` elsewhere.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn few_rows_grid(m: u32, n: u32, k: u32) -> Option<u32> {
+    let (n, k) = (i32::try_from(n).ok()?, i32::try_from(k).ok()?);
+    ((2..=FEW_ROWS).contains(&m) && n > 0 && k > 0 && k % 8 == 0)
+        .then(|| crate::linear::gemv::rows_blocks(n, k) * crate::linear::gemv::rows_cluster(n, k))
+}
+
+/// The waves cuBLASLt's first heuristic algorithm fills on the current
+/// device for a dense bf16 product of `m x n x k` serving runs on it (past
+/// the few-rows kernel's rows, and short of `kernel.gemm.bf16_split_from`,
+/// where cuBLAS's own algorithm runs): its `wavesCount`, its tiles (and
+/// split-K slices) over the blocks of its kernel the device holds at once.
+/// Short of one such wave, the waves its tiles fill of the multiprocessors
+/// (at most one): a block alone on a multiprocessor runs it near its rate
+/// (L40S, width 2048 at 724 rows: 96 tiles of a kernel two a
+/// multiprocessor, 0.34 of `wavesCount`'s wave, ran 152 TFLOP/s against
+/// 227 at 2048 rows), so the device is short only the multiprocessors it
+/// leaves idle. `None` where serving runs another kernel or cuBLASLt states
+/// none.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn waves(tuning: &crate::tuning::Tuning, m: u32, n: u32, k: u32) -> Option<f64> {
+    if m <= FEW_ROWS || (tuning.gemm_bf16_split_from > 0 && m >= tuning.gemm_bf16_split_from) {
+        return None;
+    }
+    let t = tile(tuning, m, n, k)?;
+    let stated = f64::from(t.waves);
+    if !(stated.is_finite() && stated > 0.0) {
+        return None;
+    }
+    if stated >= 1.0 {
+        return Some(stated);
+    }
+    let tiles =
+        f64::from(m.div_ceil(t.rows)) * f64::from(n.div_ceil(t.cols)) * f64::from(t.split_k);
+    let sms = f64::from(multiprocessors()?);
+    Some((tiles / sms).min(1.0))
+}
+
+/// The current device's multiprocessors, where it answers.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn multiprocessors() -> Option<u32> {
+    crate::jit::device::multiprocessors()
+}
+
+/// The most rows CUDA's few-rows kernel (the rows skeleton) takes.
+pub const FEW_ROWS: u32 = crate::linear::skeleton::ROWS_M;
 
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, y)
@@ -187,11 +274,11 @@ pub fn epilogue(
 }
 
 /// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone (a bias, a ReLU,
-/// or a bias then a ReLU: [`Epilogue::lt`]), at the first
-/// heuristic that takes it: one of the candidates [`anchored`] times, as it
-/// runs. `ins` is the bias, where the epilogue reads one. False, landing
-/// nothing, where no cuBLASLt epilogue lands `epi`'s or no algorithm takes
-/// it.
+/// or a bias then a ReLU: [`Epilogue::lt`]), at cuBLASLt's first heuristic
+/// algorithm for the product with it, as [`anchored`] runs a region no
+/// streaming skeleton covers. `ins` is the bias, where the epilogue reads
+/// one. False, landing nothing, where no cuBLASLt epilogue lands `epi`'s or
+/// cuBLASLt offers no algorithm for it.
 pub fn anchored_on_lt(
     ctx: &Ctx,
     op: &'static str,

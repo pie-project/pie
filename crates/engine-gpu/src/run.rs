@@ -8,7 +8,7 @@ use poem_ir::{Def, Dim, Dtype, GeomKind, Node, RuntimeInput, StructKind, Ty, Val
 use crate::backend::Backend;
 use crate::dispatch::copy::CopyPlan;
 use crate::handles::Handles;
-use crate::scratch::Scratch;
+use crate::scratch::FireScratch;
 use crate::window::{Window, Windows};
 
 use crate::store::RecurrentPool;
@@ -26,8 +26,100 @@ pub enum WeightRow {
 #[derive(Clone, Debug, Default)]
 pub struct WeightTable(pub Vec<Option<WeightRow>>, pub Vec<Vec<(u32, Bank)>>);
 
+/// A fire's carve: each value's rectangle, and its capturing lanes.
 #[derive(Clone, Debug, Default, Hash)]
-pub struct SlotTable(pub Vec<Option<Tensor>>);
+pub struct SlotTable(pub Vec<Option<Tensor>>, pub Scored);
+
+/// A fire's capturing lanes (`poem_ir::Dim::Capturing`), compacted: each
+/// takes a key row in lane order, and those whose program reads pages a
+/// page row too, in lane order among themselves. The fire's other lanes
+/// take none.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct Scored {
+    /// For each capturing lane in lane order: the fire lane, and its page
+    /// row where it reads pages.
+    capturing: Vec<(u32, Option<u32>)>,
+    /// For each lane of the fire, its key row where it captures.
+    rows: Vec<Option<u32>>,
+    pages: u32,
+}
+
+impl Scored {
+    /// The fire's lanes in order, each as `(captures, reads pages)`.
+    #[must_use]
+    pub fn of(lanes: impl IntoIterator<Item = (bool, bool)>) -> Scored {
+        let mut scored = Scored::default();
+        for (lane, (captures, pages)) in lanes.into_iter().enumerate() {
+            if !captures {
+                scored.rows.push(None);
+                continue;
+            }
+            let row = u32::try_from(scored.capturing.len()).unwrap_or(u32::MAX);
+            let page = pages.then(|| {
+                scored.pages += 1;
+                scored.pages - 1
+            });
+            scored.rows.push(Some(row));
+            scored
+                .capturing
+                .push((u32::try_from(lane).unwrap_or(u32::MAX), page));
+        }
+        if scored.capturing.is_empty() {
+            return Scored::default();
+        }
+        scored
+    }
+
+    /// The key rows: the fire's capturing lanes.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        u32::try_from(self.capturing.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The page rows: the capturing lanes whose program reads pages.
+    #[must_use]
+    pub fn page_rows(&self) -> u32 {
+        self.pages
+    }
+
+    /// The key row lane `lane` writes, where it captures.
+    #[must_use]
+    pub fn row(&self, lane: u32) -> Option<u32> {
+        self.rows.get(lane as usize).copied().flatten()
+    }
+
+    /// The page row lane `lane` writes, where it captures and reads pages.
+    #[must_use]
+    pub fn page_row(&self, lane: u32) -> Option<u32> {
+        let row = self.row(lane)?;
+        self.capturing.get(row as usize)?.1
+    }
+
+    /// The capture table a fire stages for its kernels
+    /// (`kernels_slang::attn::score::TABLE_INTS` a capturing lane): each
+    /// capturing lane's fire lane, its first and end query row by `indptr`
+    /// (the fire's), and the base of its key row and of its page row (or
+    /// -1), in f32s from the start of the rows the fire binds: `keys` and
+    /// `pages` f32s a row, its row among them.
+    #[must_use]
+    pub fn table(&self, indptr: &[i32], keys: u32, pages: u32) -> Vec<i32> {
+        let at = |lane: u32| indptr.get(lane as usize).copied().unwrap_or(0);
+        let int = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
+        self.capturing
+            .iter()
+            .enumerate()
+            .flat_map(|(row, &(lane, page))| {
+                [
+                    int(u64::from(lane)),
+                    at(lane),
+                    at(lane + 1),
+                    int(row as u64 * u64::from(keys)),
+                    page.map_or(-1, |page| int(u64::from(page) * u64::from(pages))),
+                ]
+            })
+            .collect()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Hash)]
 pub enum CachePool {
@@ -37,7 +129,11 @@ pub enum CachePool {
 }
 
 #[derive(Clone, Debug, Default, Hash)]
-pub struct CacheTable(pub Vec<CachePool>);
+pub struct CacheTable(
+    pub Vec<CachePool>,
+    /// Each compressor's state, by the kv row its gather keys by.
+    pub Vec<(u32, kernels_slang::attn::pool::PoolState)>,
+);
 
 #[derive(Clone, Copy, Debug, Default, Hash)]
 pub struct CacheGeometry {
@@ -64,18 +160,12 @@ pub struct CacheGeometry {
 pub struct FireTables {
     pub request_of_token: Tensor,
 
+    /// The fire's mask plane, whole: no window cuts it.
     pub mask: Tensor,
 
-    pub mask_enabled: Tensor,
-
-    pub mask_stride: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PoolSlabs {
-    pub state_kv: Tensor,
-
-    pub state_score: Tensor,
+    /// Two words a row: its boundary (`mask::NONE` stating no mask) and its
+    /// offset in the plane; a window cuts them by its rows.
+    pub mask_words: Tensor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -91,7 +181,12 @@ pub enum StructSlot {
 pub struct FireBindings {
     pub tokens: Tensor,
 
+    /// Each row's cache row: attention's causal bound.
     pub positions: Tensor,
+
+    /// Each row's stated position: the rotation `RuntimeInput::Positions`
+    /// reads.
+    pub rotations: Tensor,
 
     pub readout_rows: Tensor,
 
@@ -115,6 +210,11 @@ pub struct FireBindings {
     /// a geometry input states (CONTRACT-BC 21); any other reads table 0.
     pub window_tables: Vec<(u32, usize)>,
 
+    /// The fold's job table of the fire's windowed rows and the most jobs
+    /// its grid takes (`kernels_slang::attn::ring::fold`), where the load
+    /// has them.
+    pub ring_jobs: Option<(Tensor, u32)>,
+
     pub tables: FireTables,
 
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
@@ -137,6 +237,20 @@ pub struct FireBindings {
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<crate::inputs::VoxelHandles>,
+    /// The fire's capture table, where a lane of it captures scores.
+    pub capture: Option<Tensor>,
+}
+
+/// A step submitted a layer at a time: the layer whose work the frame holds
+/// unsubmitted, the step it is (for the per-layer line), and when the last
+/// layer's submission returned.
+struct Split {
+    layer: Option<u32>,
+    step: Option<engine::StepDone>,
+    since: crate::Instant,
+    /// The layers a submission takes, and the layers begun since the last.
+    each: u32,
+    begun: u32,
 }
 
 pub struct Run<'c, B: Backend> {
@@ -180,17 +294,27 @@ pub struct Run<'c, B: Backend> {
 
     copy: CopyPlan,
 
-    scratch: &'c Scratch<B>,
+    scratch: FireScratch<'c, B>,
+
+    hashes: &'c crate::weights::NgramHashes<B>,
 
     tuning: &'c B::Tuning,
 
     /// The layer whose work the frame holds unsubmitted, when the step is
     /// submitted a layer at a time.
-    split: Option<Option<u32>>,
+    split: Option<Split>,
+
+    /// The kernels the walk picked, by class (a dense matmul at its rows,
+    /// attention, its tile or its walk), each once: what a step's line says
+    /// it ran ([`Run::take_picks`]).
+    picks: std::cell::RefCell<std::collections::BTreeSet<String>>,
 
     /// The highest kernels-slang tier the adapter runs, where the backend's
     /// tactics read it.
     tier: kernels_slang::Tier,
+
+    /// The dense matmul's tactic at each rung.
+    dense: &'c crate::dense::Dense,
 }
 
 impl<'c, B: Backend> Run<'c, B> {
@@ -211,9 +335,11 @@ impl<'c, B: Backend> Run<'c, B> {
         fire: FireBindings,
         windows: &'c Windows,
         place: &'c At,
-        scratch: &'c Scratch<B>,
+        scratch: FireScratch<'c, B>,
+        hashes: &'c crate::weights::NgramHashes<B>,
         tuning: &'c B::Tuning,
         tier: kernels_slang::Tier,
+        dense: &'c crate::dense::Dense,
         rows: Option<&'c crate::experts::Gathered<B>>,
         host: Option<&'c crate::experts::HostTier<B>>,
     ) -> Self {
@@ -240,9 +366,12 @@ impl<'c, B: Backend> Run<'c, B> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            hashes,
             tuning,
             split: None,
+            picks: std::cell::RefCell::new(std::collections::BTreeSet::new()),
             tier,
+            dense,
         }
     }
 
@@ -250,15 +379,27 @@ impl<'c, B: Backend> Run<'c, B> {
         self.tier
     }
 
-    /// Submits the frame each time a node of a new layer has run.
-    pub fn flush_between_layers(&mut self) {
-        self.split = Some(None);
+    /// The dense matmul's tactic at each rung.
+    pub fn dense(&self) -> &'c crate::dense::Dense {
+        self.dense
+    }
+
+    /// Submits the frame each time a node of a new layer has run past
+    /// every `each` layers (`crate::submit::pack_layers`).
+    pub fn flush_between_layers(&mut self, step: Option<engine::StepDone>, each: u32) {
+        self.split = Some(Split {
+            layer: None,
+            step,
+            since: crate::Instant::now(),
+            each: each.max(1),
+            begun: 0,
+        });
     }
 
     /// After `node` runs: submits what the frame holds once a new layer
     /// starts. A failed submit faults the frame, which its commit reports.
     pub fn split_at(&mut self, node: &Node) {
-        let Some(held) = self.split.as_mut() else {
+        let Some(split) = self.split.as_mut() else {
             return;
         };
         let Some(layer) = node.layer else {
@@ -271,12 +412,36 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             return;
         };
-        if held.is_some_and(|held| held != layer)
-            && let Err(fault) = B::flush_recording()
+        if let Some(held) = split.layer.filter(|&held| held != layer)
+            && {
+                split.begun += 1;
+                split.begun % split.each == 0
+            }
         {
-            tracing::warn!(%fault, "submitting a layer of a split step");
+            let at = crate::Instant::now();
+            let flushed = B::submit_recording();
+            let done = crate::Instant::now();
+            // Each layer's submission said where the platform's bound is
+            // held (`crate::submit`): the wall from the last submission's
+            // return to this one's (the host's encoding of the layer, or
+            // the queue's backpressure), and the submit alone. A layer's
+            // submission is queued unawaited: the bound wants each short,
+            // not waited on.
+            tracing::debug!(
+                target: "engine_gpu::api",
+                frame = split.step.map(|s| s.frame.0),
+                step = split.step.map(|s| s.step),
+                layer = held,
+                wall_ms = done.duration_since(split.since).as_secs_f64() * 1e3,
+                submit_ms = done.duration_since(at).as_secs_f64() * 1e3,
+                "submit bound: a layer's submission landed"
+            );
+            split.since = done;
+            if let Err(fault) = flushed {
+                tracing::warn!(%fault, "submitting a layer of a split step");
+            }
         }
-        *held = Some(layer);
+        split.layer = Some(layer);
     }
 
     pub fn window(&self) -> &'c Window {
@@ -292,6 +457,18 @@ impl<'c, B: Backend> Run<'c, B> {
         self.window().indptr
     }
 
+    /// The window's query CSR as the scans bind it: the fire's packed
+    /// windows table whole (one view whatever window a fire cuts), the
+    /// window's boundaries from their int in it.
+    pub fn csr(&self) -> kernels_slang::ssm::Csr {
+        let window = self.window();
+        kernels_slang::ssm::Csr {
+            table: self.windows.table(),
+            at: window.indptr_at,
+            lanes: u32::try_from(window.indptr_host.len().saturating_sub(1)).unwrap_or(u32::MAX),
+        }
+    }
+
     pub fn qo_indptr_host(&self) -> &'c [i32] {
         &self.window().indptr_host
     }
@@ -301,12 +478,66 @@ impl<'c, B: Backend> Run<'c, B> {
             if handle.buf == self.fire.positions.buf {
                 return gathered.positions;
             }
+            if handle.buf == self.fire.rotations.buf {
+                return gathered.rotations;
+            }
             if handle.buf == self.fire.tables.request_of_token.buf {
                 return gathered.request_of_token;
+            }
+            if handle.buf == self.fire.tables.mask_words.buf {
+                return gathered.mask_words;
             }
         }
         let span = self.window().span;
         self.slice(handle, span.row_offset, span.rows)
+    }
+
+    /// A row-shaped value as attention binds it: in a window of the fire's
+    /// own rows, the fire's whole value, the window's rows from
+    /// [`Self::row0`] on (so its views are the ones the load bound, whatever
+    /// window a fire cuts); in a gathered window, its compacted column.
+    pub fn attended(&self, id: ValueId) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.tensor(id)
+        } else {
+            self.uncut(id)
+        }
+    }
+
+    /// A fire table as attention binds it, as [`Self::attended`]: whole, or
+    /// a gathered window's own.
+    pub fn attended_rows(&self, handle: Tensor) -> Tensor {
+        if self.window().gathered.is_some() {
+            self.cut_rows(handle)
+        } else {
+            handle
+        }
+    }
+
+    /// The row of what [`Self::attended`] binds the window's first row is.
+    pub fn row0(&self) -> u32 {
+        if self.window().gathered.is_some() {
+            0
+        } else {
+            self.window().span.row_offset
+        }
+    }
+
+    /// The window's rows of what [`Self::attended`] binds, from
+    /// [`Self::row0`].
+    pub fn row_span(&self) -> kernels_slang::ssm::RowSpan {
+        kernels_slang::ssm::RowSpan {
+            row0: self.row0(),
+            rows: self.window_rows(),
+        }
+    }
+
+    /// The window's rows.
+    pub fn window_rows(&self) -> u32 {
+        match &self.window().gathered {
+            Some(gathered) => gathered.positions.rows,
+            None => self.window().span.rows,
+        }
     }
 
     pub fn at_region(&self) -> u32 {
@@ -409,7 +640,7 @@ impl<'c, B: Backend> Run<'c, B> {
         let rows = keep.min(handle.rows.saturating_sub(skip));
         let cut = self
             .handles
-            .cut(
+            .window(
                 handle.buf,
                 u64::from(skip) * stride,
                 u64::from(rows) * stride,
@@ -427,6 +658,11 @@ impl<'c, B: Backend> Run<'c, B> {
     fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
         let at = id.0 as usize;
 
+        // The mask plane is whole in every window: its rows' entries say
+        // where their columns lie.
+        if matches!(self.values[at].def, Def::Input(RuntimeInput::Mask)) {
+            return handle;
+        }
         if self.window().gathered.is_some() {
             return self.compacted(id, handle);
         }
@@ -440,20 +676,34 @@ impl<'c, B: Backend> Run<'c, B> {
         ) {
             return handle;
         }
+        match self.span_of(id) {
+            Some((skip, keep)) => self.slice(handle, skip, keep),
+            None => handle,
+        }
+    }
+
+    /// The rows of value `id` a window of the fire's own rows cuts, its
+    /// first and its count; `None` where it binds the value whole (no row
+    /// dimension, the capture's rows, the readouts).
+    fn span_of(&self, id: ValueId) -> Option<(u32, u32)> {
+        let at = id.0 as usize;
         let Ty::Tensor { shape, .. } = &self.values[at].ty else {
-            return handle;
+            return None;
         };
         let seated = self.window();
         let window = seated.span;
 
         let patch = seated.patch;
-        let (skip, keep) = match shape.first() {
+        Some(match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            Some(Dim::Readouts) => return handle,
-            Some(Dim::Const(_)) | None => return handle,
+            Some(Dim::Readouts) => return None,
+            // A capture's rows are the fire's capturing lanes, whatever the
+            // window: its kernels walk them through the capture table.
+            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return None,
+            Some(Dim::Const(_)) | None => return None,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
@@ -463,8 +713,59 @@ impl<'c, B: Backend> Run<'c, B> {
             }
             Some(Dim::Clips) => (seated.voxel.lane_offset, seated.voxel.lanes),
             Some(Dim::ClipsPlus(k)) => (seated.voxel.lane_offset, seated.voxel.lanes + k),
-        };
-        self.slice(handle, skip, keep)
+        })
+    }
+
+    /// Value `id` as a kernel that adds a first row to its rows binds it
+    /// (that row the fire's data, not its commands'): whole, the row of it
+    /// the window's first is, and the rows of it the window holds (what a
+    /// cut of it holds). A value no window cuts (a readout row, the mask, a
+    /// weight) is whole from row 0; in a gathered window, its compacted
+    /// column, from row 0.
+    pub fn rowed(&self, id: ValueId) -> (Tensor, u32, u32) {
+        let uncut = matches!(
+            self.values[id.0 as usize].def,
+            Def::Input(RuntimeInput::Mask)
+                | Def::Input(RuntimeInput::Geometry {
+                    kind: GeomKind::Indices,
+                    ..
+                })
+        );
+        if self.window().gathered.is_some() {
+            let cut = self.tensor(id);
+            return (cut, 0, cut.rows);
+        }
+        let whole = self.whole(id);
+        match self.span_of(id) {
+            Some((skip, keep)) if !uncut => {
+                (whole, skip, keep.min(whole.rows.saturating_sub(skip)))
+            }
+            _ => (whole, 0, whole.rows),
+        }
+    }
+
+    /// Row-shaped values as a kernel that adds one first row to each of
+    /// their rows binds them ([`Self::rowed`]), and the window's rows of
+    /// them from it ([`kernels_slang::ssm::RowSpan`]), the first's. Where
+    /// their first rows part, each is cut as [`Self::tensor`] cuts it and
+    /// the span starts at 0.
+    pub fn windowed<const N: usize>(
+        &self,
+        ids: [ValueId; N],
+    ) -> ([Tensor; N], kernels_slang::ssm::RowSpan) {
+        let bound = ids.map(|id| self.rowed(id));
+        let (row0, rows) = bound
+            .first()
+            .map_or((0, 0), |&(_, row0, rows)| (row0, rows));
+        if bound.iter().all(|&(_, at, _)| at == row0) {
+            return (
+                bound.map(|(t, _, _)| t),
+                kernels_slang::ssm::RowSpan { row0, rows },
+            );
+        }
+        let cut = ids.map(|id| self.tensor(id));
+        let rows = cut.first().map_or(0, |t| t.rows);
+        (cut, kernels_slang::ssm::RowSpan { row0: 0, rows })
     }
 
     fn compacted(&self, id: ValueId, handle: Tensor) -> Tensor {
@@ -550,7 +851,7 @@ impl<'c, B: Backend> Run<'c, B> {
         match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
-            Def::Input(RuntimeInput::Positions) => self.fire.positions,
+            Def::Input(RuntimeInput::Positions) => self.fire.rotations,
 
             Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
 
@@ -877,6 +1178,20 @@ impl<'c, B: Backend> Run<'c, B> {
 
     /// The host steps of the expert stages this walk made, in order: one
     /// for each segment a kept frame's flushes cut.
+    /// The walk picked `what` (a kernel by class).
+    pub fn pick(&self, what: impl FnOnce() -> String) {
+        if self.ctx.naming().is_none() {
+            self.picks.borrow_mut().insert(what());
+        }
+    }
+
+    /// The kernels the walk picked so far, by class, each once.
+    pub fn take_picks(&self) -> Vec<String> {
+        std::mem::take(&mut *self.picks.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
     pub fn take_cuts(&self) -> Vec<crate::store::experts::Cut<B>> {
         std::mem::take(&mut self.staged_layer.borrow_mut().cuts)
     }
@@ -893,11 +1208,21 @@ impl<'c, B: Backend> Run<'c, B> {
         // staged their misses in the arm's stage before the fire, which the
         // gather reads from the window's first row.
         let ring = match &self.values[ids_value.0 as usize].def {
-            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => self
-                .fire
-                .row_ring
-                .map(|arm| (arm, self.window().span.row_offset)),
+            Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
+                self.fire.row_ring
+            }
             _ => None,
+        };
+        // The fire's row the window's ids start at: a stage is laid by the
+        // fire's rows, each region's in its own.
+        let first = match (
+            &self.window().gathered,
+            &self.values[ids_value.0 as usize].ty,
+        ) {
+            (None, Ty::Tensor { shape, .. }) if shape.first() == Some(&Dim::Tokens) => {
+                self.window().span.row_offset
+            }
+            _ => 0,
         };
         let known = match &self.values[ids_value.0 as usize].def {
             Def::Input(RuntimeInput::Tokens) if self.window().gathered.is_none() => {
@@ -926,6 +1251,7 @@ impl<'c, B: Backend> Run<'c, B> {
             param,
             ids,
             ring,
+            first,
             known,
             &self.row_ids,
             pool,
@@ -961,6 +1287,22 @@ impl<'c, B: Backend> Run<'c, B> {
         }))
     }
 
+    /// A score capture's normalisers' room, where the trace captures.
+    pub fn score_stats(&self) -> Option<Tensor> {
+        Some(
+            self.scratch
+                .score_stats(self.handles)?
+                .unwrap_or_else(|fault| {
+                    panic!("the score normalisers' room this load reserved does not mint: {fault}")
+                }),
+        )
+    }
+
+    /// The fire's capturing lanes: the rows of a capture.
+    pub fn scored(&self) -> &Scored {
+        &self.arena.1
+    }
+
     pub fn index_scores(&self) -> Option<Tensor> {
         Some(
             self.scratch
@@ -985,24 +1327,22 @@ impl<'c, B: Backend> Run<'c, B> {
         }))
     }
 
-    pub fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
+    pub fn pool_state(&self, pages: ValueId) -> Option<kernels_slang::attn::pool::PoolState> {
         let at = pages.0 as usize;
         let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
             panic!("value {at} is not a cache row; the pooled state is keyed by one")
         };
-        Some(
-            self.scratch
-                .pool_state(self.handles, *row)?
-                .unwrap_or_else(|fault| {
-                    panic!("the compressor state this load reserved does not mint: {fault}")
-                }),
-        )
+        self.caches
+            .1
+            .iter()
+            .find(|(keyed, _)| keyed == row)
+            .map(|(_, state)| *state)
     }
 
     pub fn ple_hash(&self, mults: &[u64], primes: &[u64], offsets: &[u64]) -> Option<Tensor> {
         Some(
-            self.scratch
-                .ple_hash(self.handles, mults, primes, offsets)?
+            self.hashes
+                .bind(self.handles, mults, primes, offsets)?
                 .unwrap_or_else(|fault| {
                     panic!("the PLE hash plane this load wrote does not mint: {fault}")
                 }),
@@ -1037,6 +1377,11 @@ impl<'c, B: Backend> Run<'c, B> {
             .unwrap_or(0)
     }
 
+    /// Every row's pool the fire binds, in the pools' row order.
+    pub fn cache_pools(&self) -> &'c [CachePool] {
+        &self.caches.0
+    }
+
     pub fn pool(&self, id: ValueId) -> &KvPool {
         match self.cache(id) {
             CachePool::Kv(pool) => pool,
@@ -1050,7 +1395,7 @@ impl<'c, B: Backend> Run<'c, B> {
     pub fn recurrent(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => RecurrentPool {
-                slots: self.cut_rows(pool.slots),
+                slots: self.attended_rows(pool.slots),
                 ..*pool
             },
             CachePool::Kv(_) => panic!(

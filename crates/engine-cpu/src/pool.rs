@@ -1,5 +1,4 @@
-//! Sealed pages in host memory, by key, the lowest retention key and then
-//! the least recently used first to go; and, given a [`Store`], kept there
+//! Sealed pages in host memory, by key, the least recently used first to go; and, given a [`Store`], kept there
 //! too, so a pool that restarts comes back with what it held. A page in a
 //! store is one blob: `PIE2`, its layout's length and layout, its tokens'
 //! hashes' count and hashes, then its bytes. (A blob without the mark holds
@@ -21,9 +20,6 @@ struct Page {
     meta: Arc<Vec<u8>>,
     /// The page's tokens' hashes; empty when it came without them.
     slots: Vec<Key>,
-    /// The highest retention key of the runs it was sent in; 0 for a page
-    /// sent in none.
-    retention: i64,
     used: u64,
 }
 
@@ -37,8 +33,8 @@ const MARK: &[u8; 4] = b"PIE2";
 #[derive(Default)]
 struct Inner {
     pages: HashMap<Key, Page>,
-    /// (`retention`, `used`) → key, the first to go first.
-    order: BTreeMap<(i64, u64), Key>,
+    /// `used` → key, the first to go first.
+    order: BTreeMap<u64, Key>,
     /// The runs asked to be kept whole, by their last key.
     runs: HashMap<Key, Vec<Key>>,
     clock: u64,
@@ -50,15 +46,15 @@ impl Inner {
         self.clock += 1;
         let clock = self.clock;
         if let Some(page) = self.pages.get_mut(key) {
-            self.order.remove(&(page.retention, page.used));
+            self.order.remove(&page.used);
             page.used = clock;
-            self.order.insert((page.retention, clock), *key);
+            self.order.insert(clock, *key);
         }
     }
 
     fn remove(&mut self, key: &Key) {
         if let Some(page) = self.pages.remove(key) {
-            self.order.remove(&(page.retention, page.used));
+            self.order.remove(&page.used);
             self.bytes -= page.bytes.len();
         }
     }
@@ -169,18 +165,12 @@ impl Pool {
         pool
     }
 
-    /// Keeps `pages`, those of `keys[from..]`, as [`Self::put`] at
-    /// `retention`, and the run `keys` (from token 0) whole: one of
+    /// Keeps `pages`, those of `keys[from..]`, as [`Self::put`],
+    /// and the run `keys` (from token 0) whole: one of
     /// [`Self::runs`] while every page of it is here.
-    pub fn put_run(
-        &self,
-        keys: &[Key],
-        from: usize,
-        pages: Pages,
-        retention: i64,
-    ) -> Result<(), String> {
+    pub fn put_run(&self, keys: &[Key], from: usize, pages: Pages) -> Result<(), String> {
         let sent = keys.get(from..).ok_or("the pages start past their run")?;
-        self.put_at(sent, pages, retention)?;
+        self.put(sent, pages)?;
         let Some(last) = keys.last() else {
             return Ok(());
         };
@@ -201,16 +191,9 @@ impl Pool {
         Ok(())
     }
 
-    /// Keeps `pages`, one per key, letting the lowest retention key and
-    /// then the least recently used go to make room; refuses what is larger
-    /// than the pool.
+    /// Keeps `pages`, one per key, letting the least recently used go to
+    /// make room; refuses what is larger than the pool.
     pub fn put(&self, keys: &[Key], pages: Pages) -> Result<(), String> {
-        self.put_at(keys, pages, 0)
-    }
-
-    /// [`Self::put`], each page at `retention` or the higher key it has;
-    /// without a store, a page no lower one makes room for is refused.
-    fn put_at(&self, keys: &[Key], pages: Pages, retention: i64) -> Result<(), String> {
         let page_bytes = pages.page_bytes();
         if keys.len() != pages.count || page_bytes * pages.count != pages.data.len() {
             return Err("the pages do not match their keys".into());
@@ -247,43 +230,38 @@ impl Pool {
             .zip(pages.data.chunks(page_bytes.max(1)))
             .enumerate()
         {
-            let retention = inner
-                .pages
-                .get(key)
-                .map_or(retention, |page| page.retention.max(retention));
             inner.remove(key);
             if bytes.len() > self.capacity {
                 continue;
             }
-            // Room is made from pages kept at no higher key, and not from
-            // the pages this put keeps.
+            // Room is not made from the pages this put keeps.
             while inner.bytes + bytes.len() > self.capacity {
-                match inner.order.first_key_value() {
-                    Some((&(first, _), &going)) if first <= retention && !sent.contains(&going) => {
-                        inner.remove(&going)
-                    }
-                    _ => break,
+                let going = inner
+                    .order
+                    .values()
+                    .find(|key| !sent.contains(*key))
+                    .copied();
+                match going {
+                    Some(going) => inner.remove(&going),
+                    None => break,
                 }
             }
             if inner.bytes + bytes.len() > self.capacity {
                 if self.store.is_none() {
-                    return Err(format!(
-                        "this pool is full of pages kept above key {retention}"
-                    ));
+                    return Err("this pool holds no more than the pages it was sent".into());
                 }
                 continue;
             }
             inner.clock += 1;
             let used = inner.clock;
             inner.bytes += bytes.len();
-            inner.order.insert((retention, used), *key);
+            inner.order.insert(used, *key);
             inner.pages.insert(
                 *key,
                 Page {
                     bytes: bytes.to_vec(),
                     meta: meta.clone(),
                     slots: slots_of(at).to_vec(),
-                    retention,
                     used,
                 },
             );
@@ -397,11 +375,11 @@ impl Source for Pool {
         })
     }
 
-    /// A worker's own push, at key 0: a `replicate` for the run raises it.
+    /// A worker's own push.
     fn write(&self, keys: Vec<Key>, from: u32, pages: Pages) -> Taken {
         let pool = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || pool.put_run(&keys, from as usize, pages, 0))
+            tokio::task::spawn_blocking(move || pool.put_run(&keys, from as usize, pages))
                 .await
                 .map_err(|e| e.to_string())?
         })
@@ -470,29 +448,20 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pool_lets_the_lowest_key_go_first_and_never_for_a_lower_one() {
+    fn a_full_pool_lets_the_least_recently_used_run_go() {
         let pool = Pool::new(32);
-        let (high, low) = ([[1u8; 32], [2u8; 32]], [[3u8; 32], [4u8; 32]]);
-        pool.put_run(&high, 0, pages(1, 2), 5).unwrap();
-        pool.put_run(&low, 0, pages(3, 2), 1).unwrap();
-        // Reading the high run makes it the most recent; still the low run
-        // is what goes for a third run at key 3.
-        pool.get(&high, 0).unwrap();
-        pool.get(&low, 0).unwrap();
-        let mid = [[5u8; 32], [6u8; 32]];
-        pool.put_run(&mid, 0, pages(5, 2), 3).unwrap();
-        let mut runs: Vec<Key> = pool.runs().iter().map(|run| run[1]).collect();
-        runs.sort();
-        assert_eq!(runs, [high[1], mid[1]], "the run at key 1 went");
-        assert!(
-            pool.put_run(&low, 0, pages(3, 2), 2).is_err(),
-            "a run at key 2 takes no room from runs at 3 and 5"
+        let (a, b, c) = (
+            [[1u8; 32], [2u8; 32]],
+            [[3u8; 32], [4u8; 32]],
+            [[5u8; 32], [6u8; 32]],
         );
-        // A page sent in no run is at key 0, and takes no room from them.
-        assert!(pool.put(&[[7u8; 32]], pages(7, 1)).is_err());
+        pool.put_run(&a, 0, pages(1, 2)).unwrap();
+        pool.put_run(&b, 0, pages(3, 2)).unwrap();
+        pool.get(&a, 0).unwrap();
+        pool.put_run(&c, 0, pages(5, 2)).unwrap();
         let mut runs: Vec<Key> = pool.runs().iter().map(|run| run[1]).collect();
         runs.sort();
-        assert_eq!(runs, [high[1], mid[1]]);
+        assert_eq!(runs, [a[1], c[1]]);
     }
 
     #[test]
@@ -503,8 +472,8 @@ mod tests {
         let prefix = [[1u8; 32]];
         {
             let pool = Pool::with_store(8, Arc::new(Dir::open(dir.clone()).unwrap()));
-            pool.put_run(&run, 0, pages(3, 2), 1).unwrap();
-            pool.put_run(&prefix, 0, pages(3, 1), 1).unwrap();
+            pool.put_run(&run, 0, pages(3, 2)).unwrap();
+            pool.put_run(&prefix, 0, pages(3, 1)).unwrap();
             // Pages sent alone make no run.
             pool.put(&[[9u8; 32]], pages(9, 1)).unwrap();
             let mut runs = pool.runs();
@@ -522,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_run_a_worker_pushes_is_kept_as_a_run_at_key_0_and_a_replicate_raises_it() {
+    async fn a_run_a_worker_pushes_is_kept_as_a_run() {
         let pool = Pool::new(16);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -542,18 +511,6 @@ mod tests {
             pool.get(&run, 0).unwrap().data,
             [[1u8; 8], [2u8; 8]].concat()
         );
-        // At key 0, a run at key 1 takes its room.
-        let other = [[3u8; 32], [4u8; 32]];
-        pool.put_run(&other, 0, pages(3, 2), 1).unwrap();
-        assert_eq!(pool.runs(), [other.to_vec()]);
-        // A replicate at key 3 raises the run, and a push again at key 0
-        // does not lower it: a run at key 2 finds no room.
-        pool.put_run(&run, 0, pages(1, 2), 3).unwrap();
-        transport::tcp::put(&addr, &run, 0, &pages(1, 2))
-            .await
-            .unwrap();
-        assert!(pool.put_run(&other, 0, pages(3, 2), 2).is_err());
-        assert_eq!(pool.runs(), [run.to_vec()]);
     }
 
     #[test]

@@ -649,9 +649,52 @@ impl Run<'_> {
                 y_out,
             } => crate::lower::lower(self.ctx(), |l| {
                 let x_v = l.read(self.tensor(*x))?;
-                let bank_a_v = l.read(self.tensor(*bank_a))?;
                 let routes_v = l.read(self.tensor(*routes))?;
-                let bank_b_v = l.read(self.tensor(*bank_b))?;
+                // A bank is the fire's adapters' planes, `[k, plane]`: each
+                // a whole-plane block of the pool, gathered at its slot.
+                let planes = |bank: poem_ir::ValueId,
+                                  l: &mut crate::lower::Lower<'_, '_>|
+                 -> Result<kernels_xla::tensor::Operand, kernels_xla::Error> {
+                    let (pool, plane, starts) =
+                        self.adapter_plane(bank).ok_or_else(|| kernels_xla::Error::Backend {
+                            op: "linear.lora_correct",
+                            detail: "a LoRA bank this fire binds no adapter planes for: an \
+                                     adapter's planes lie in the pool's Adapter slots and \
+                                     a fire reads only its own lanes' adapters"
+                                .to_string(),
+                        })?;
+                    let pool_v = l.read(pool)?;
+                    let starts_v = l.read(starts)?;
+                    let f = l.f();
+                    let plane = i64::from(plane);
+                    // An `Adapter` slot is whole pool rows: u32 `[rows, 128]`
+                    // a plane, two bf16 a word.
+                    let words = i64::from(pool.width);
+                    let width = words * 2;
+                    let rows = (plane + width - 1) / width;
+                    let k = i64::from(starts.rows);
+                    let at = f.reshape(starts_v.val, &[k, 1])?;
+                    let at = f.broadcast(at, &[k, rows], &[0, 1])?;
+                    let step = f.iota(kernels_xla::hlo::Elem::I32, &[k, rows], 1);
+                    let at = f.add(at, step)?;
+                    let at = f.reshape(at, &[k * rows])?;
+                    let block = f.take_rows(pool_v.val, at)?;
+                    let block = f.bitcast(block, kernels_xla::hlo::Elem::Bf16)?;
+                    let flat = f.reshape(block, &[k, rows * width])?;
+                    let val = if rows * width == plane {
+                        flat
+                    } else {
+                        f.slice_axis(flat, 1, 0, plane)?
+                    };
+                    Ok(kernels_xla::tensor::Operand {
+                        val,
+                        rows: u32::try_from(k).unwrap_or(u32::MAX),
+                        width: u32::try_from(plane).unwrap_or(u32::MAX),
+                        dtype: dtype::Dtype::Bf16,
+                    })
+                };
+                let bank_a_v = planes(*bank_a, l)?;
+                let bank_b_v = planes(*bank_b, l)?;
                 let y_v = l.read(self.tensor(*y_out))?;
                 let o_y = self.tensor(*y_out);
                 if let Some(v) =
@@ -706,16 +749,26 @@ impl Run<'_> {
                 quantized: false,
                 quant: None,
                 ..
-            } => crate::lower::lower(self.ctx(), |l| {
-                let x_v = l.read(self.tensor(*x))?;
-                let routes_v = l.read(self.tensor(*routes))?;
-                let y_v = l.read(self.tensor(*y))?;
-                let bank_v = l.read(self.tensor(*bank))?;
-                let o_y = self.tensor(*y);
-                let tuning = l.tuning();
-                let v = linear::moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
-                l.land(o_y, v)
-            }),
+            } => {
+                let streamed = self.streamed_bank(*bank);
+                let param = self.weight_param_of(*bank);
+                let bank_t = self.tensor(*bank);
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(self.tensor(*x))?;
+                    let routes_v = l.read(self.tensor(*routes))?;
+                    let y_v = l.read(self.tensor(*y))?;
+                    let bank_v = match (streamed, param) {
+                        (Some(b), Some(p)) => {
+                            self.streamed_operand(l, b, p, bank_t.width, *routes, routes_v.val)?
+                        }
+                        _ => l.read(bank_t)?,
+                    };
+                    let o_y = self.tensor(*y);
+                    let tuning = l.tuning();
+                    let v = linear::moe::matmul_select(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                    l.land(o_y, v)
+                })
+            }
             Linear::MoeSelect {
                 x,
                 bank,

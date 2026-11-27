@@ -24,9 +24,6 @@ pub struct Group {
     pub sites: Vec<WorkerId>,
     /// The workers whose persistent disk tier keeps every page of it.
     pub disk_sites: Vec<WorkerId>,
-    /// The most leading tokens of it some worker's owner asked kept on
-    /// disk.
-    pub persist_tokens: Option<u64>,
 }
 
 impl From<DirectoryView> for Directory {
@@ -51,7 +48,6 @@ impl Directory {
                         keys: Arc::new(group.keys.clone()),
                         sites: group.sites.clone(),
                         disk_sites: group.disk_sites.clone(),
-                        persist_tokens: group.persist_tokens,
                     },
                 )
             })
@@ -125,19 +121,19 @@ mod tests {
                 GroupView {
                     keys: vec![[1; 32], [2; 32]],
                     sites: vec![WorkerId(1)],
+                    site_tiers: Vec::new(),
                     disk_sites: vec![WorkerId(1)],
-                    persist_tokens: Some(40),
                 },
             )],
             pools: vec![WorkerId(9)],
             peers: vec![(WorkerId(1), "a:1".into())],
+            links: Vec::new(),
             published: vec![(WorkerId(1), vec![("load".into(), "7".into())])],
             disk_tiers: vec![(WorkerId(1), (16, true))],
             disk: vec![(WorkerId(1), vec![[1; 32], [2; 32]])],
         });
         let groups = directory.groups();
         assert_eq!(*groups[&[2; 32]].keys, vec![[1; 32], [2; 32]]);
-        assert_eq!(groups[&[2; 32]].persist_tokens, Some(40));
         assert_eq!(directory.pools(), vec![WorkerId(9)]);
         assert_eq!(directory.peer(WorkerId(1)).as_deref(), Some("a:1"));
         assert_eq!(directory.peer(WorkerId(2)), None);

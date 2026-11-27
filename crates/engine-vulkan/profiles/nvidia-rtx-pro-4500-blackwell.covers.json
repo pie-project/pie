@@ -1,0 +1,32 @@
+[
+  {
+    "key": "Spirv|vulkan 10de:2c31 driver 0x94dc01c0|kernels 24 0xb1f86144|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x79a49bb4|qwen3-0.6b-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 5642.0,
+    "turnaround_us": 103.5
+  },
+  {
+    "key": "Spirv|vulkan 10de:2c31 driver 0x94dc01c0|kernels 27 0x12d2ddc9|emitter wgsl 13 compiler 3 plan 9 lanes 5|tuning 0x88a73081|qwen3-0.6b-bf16-kv-bf16|sampler source 04109ae88192a247|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 8421.0,
+    "turnaround_us": 101.5
+  },
+  {
+    "key": "Spirv|vulkan 10de:2c31 driver 0x94dc01c0|kernels 27 0x35cc87b7|emitter wgsl 13 compiler 3 plan 9 lanes 5|tuning 0x17fefe18|qwen3-8b-bf16-kv-bf16|sampler source 04109ae88192a247|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 38996.75,
+    "turnaround_us": 172.25
+  },
+  {
+    "key": "Spirv|vulkan 10de:2c31 driver 0x94dc01c0|kernels 39 0x2e0a5d9b|emitter wgsl 12 compiler 3 plan 9 lanes 5|tuning 0x90c15c55|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 7c154e7c09653ad1|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 6897.5,
+    "turnaround_us": 107.5
+  },
+  {
+    "key": "Spirv|vulkan 10de:2c31 driver 0x94dc01c0|kernels 48 0x93f92f0d|emitter wgsl 13 compiler 3 plan 9 lanes 5|tuning 0x2cb6b0ef|qwen35-d0.8b-vision-mtp-bf16-kv-bf16|sampler source 04109ae88192a247|frame 2|depth 2|context 4096",
+    "cover": 1,
+    "frame_us": 6368.125,
+    "turnaround_us": 85.125
+  }
+]

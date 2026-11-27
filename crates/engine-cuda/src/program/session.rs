@@ -12,7 +12,10 @@ use crate::error::{Fault, Result};
 
 use super::compile::Compiled;
 use super::endpoint::Endpoint;
-use super::launch::{ChannelShape, Cursor, Prepared, Rings, native_to_wire, wire_to_native};
+use super::launch::{
+    ChannelShape, Cursor, INTRINSIC_STORAGE_F32, INTRINSIC_STORAGE_RAW_BF16, Prepared, Rings,
+    native_to_wire, wire_to_native,
+};
 use super::ports;
 use super::wave::Wave;
 
@@ -37,6 +40,18 @@ struct Output {
     width: u32,
     row_stride: u32,
     row_offset: u32,
+    /// The rows from `row_offset` on that are the lane's own: a read past
+    /// them is another lane's rows, or past the plane.
+    rows: u32,
+}
+
+/// [`Session::move_seats`] over `outputs`.
+fn move_seats(outputs: &mut [((String, u32), Output)], from: u64, bytes: u64, to: u64) {
+    for (_, output) in outputs.iter_mut() {
+        if (from..from.saturating_add(bytes)).contains(&output.base) {
+            output.base = to + (output.base - from);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -49,6 +64,11 @@ pub struct Session {
     /// reading outputs seats them in its own table (`Prepared::slot_of`),
     /// whose names are that stage's, not another's.
     outputs: Vec<((String, u32), Output)>,
+    /// The outputs whose seats are rows: the program reads the output of
+    /// lane 0 alone, rows of it, and each row is its own lane's seat (the
+    /// readout rows of an instance's lanes), resolved through a row table
+    /// ([`Prepared::bind_rows`]).
+    row_sets: Vec<String>,
     poisoned: bool,
     fires: u64,
     /// A commit slot (two words the device writes) for each fire airborne
@@ -70,6 +90,12 @@ pub struct Session {
     /// A decode envelope's device-computed mask is packed into the staged
     /// mask on the device and never read on the host ([`Self::resolve_on`]).
     mask_on_device: bool,
+    /// A decode envelope's lanes state each beam's parent in a cell only the
+    /// device writes: the engine keeps the beams' page lists over it
+    /// ([`Self::parents_device_source`]).
+    parents_on_device: bool,
+    /// Where the instance's item keeps a beam group's page lists.
+    beam: Option<super::launch::BeamLayout>,
     /// The channels that are only a `lora` sink's planes: the bank is landed
     /// from their seeds at bind, so a fire never pulls their cells again.
     sink_planes: Vec<usize>,
@@ -78,6 +104,10 @@ pub struct Session {
 #[derive(Debug)]
 struct Minted {
     slot: usize,
+    /// Its lane of the wave it flies in, and where its live commit word
+    /// lies there once the wave has flown (0 until then).
+    lane: usize,
+    live: u64,
     before: Vec<Cursor>,
     next: Vec<Cursor>,
     tickets: Vec<Ticket>,
@@ -86,12 +116,15 @@ struct Minted {
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         compiled: &Compiled,
         plan: &ExecPlan,
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         endpoints: Vec<Option<Arc<Endpoint>>>,
+        held: super::launch::Held,
+        place: &super::launch::Place,
         shadow: bool,
         stream: *mut core::ffi::c_void,
     ) -> Result<Session> {
@@ -106,17 +139,20 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(&shapes, endpoints, stream)?;
+        let beam = held.beam;
+        let rings = Rings::allocate(&shapes, endpoints, held, place, stream)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
 
         let mut session = Session {
+            beam,
             rings,
             shapes,
             cursors,
             extents,
             outputs: Vec::new(),
+            row_sets: Vec::new(),
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -126,6 +162,7 @@ impl Session {
             shadow,
             device: PortMask::NONE,
             mask_on_device: false,
+            parents_on_device: false,
             sink_planes: crate::adapter::sink_of(&plan.package)
                 .ok()
                 .flatten()
@@ -165,6 +202,21 @@ impl Session {
         let seeded = session.cursors_now();
         session.rings.seed_registry(&seeded, stream)?;
         Ok(session)
+    }
+
+    /// Points the rings at `place`, where their pool slots lie now.
+    pub fn rebase(&mut self, place: &super::launch::Place) -> Result<()> {
+        self.rings.rebase(place)
+    }
+
+    /// Each ring's cell at `place`, pointing nothing ([`Rings::cells`]).
+    pub fn ring_cells(&self, place: &super::launch::Place) -> Result<Vec<u64>> {
+        self.rings.cells(place)
+    }
+
+    /// The rings pointed at `place`, their `cells` there.
+    pub fn rebase_to(&mut self, place: &super::launch::Place, cells: Vec<u64>) {
+        self.rings.rebase_to(place, cells);
     }
 
     #[must_use]
@@ -269,6 +321,11 @@ impl Session {
         self.poisoned
     }
 
+    /// Fails the instance: every later fire of it is refused by name.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     #[must_use]
     pub fn depth(&self, channel: u32) -> u64 {
         self.cursor(channel)
@@ -358,6 +415,56 @@ impl Session {
             && class == GeometryClass::DecodeEnvelope
             && engine::ports::engine_resolves(class, device, Port::AttnMask)
             && self.port_device_source(plan, Port::AttnMask).is_some();
+        self.parents_on_device = class == GeometryClass::DecodeEnvelope
+            && engine::ports::engine_resolves(class, device, Port::Parents);
+    }
+
+    /// Where the instance's scratch keeps its beam group's page lists, laid
+    /// how (offset from the scratch's first aligned byte).
+    #[must_use]
+    pub fn beam(&self) -> Option<super::launch::BeamLayout> {
+        self.beam
+    }
+
+    /// The beam group's state as its bind laid it in the instance's scratch.
+    pub fn set_beam(&mut self, beam: Option<super::launch::BeamLayout>) {
+        self.beam = beam;
+    }
+
+    /// Where the instance's item lies now.
+    #[must_use]
+    pub fn instance_base(&self) -> u64 {
+        self.rings.instance_base()
+    }
+
+    /// The device cell a decode envelope's beams' parents are read from,
+    /// `(address, bytes)`: `[lanes]` u32, read by the engine's beam step on
+    /// the device, never on the host. `Err` where the program computes them
+    /// in a cell the host also writes.
+    pub fn parents_device_source(&self, plan: &ExecPlan) -> Result<Option<(u64, u32)>> {
+        self.device_only_source(plan, Port::Parents)
+    }
+
+    fn device_only_source(&self, plan: &ExecPlan, port: Port) -> Result<Option<(u64, u32)>> {
+        if !self.parents_on_device
+            || !plan
+                .package
+                .ports
+                .iter()
+                .any(|binding| binding.port == port && !binding.is_const)
+        {
+            return Ok(None);
+        }
+        self.port_device_source(plan, port).map(Some).ok_or_else(|| {
+            crate::error::Fault::program(
+                "program::session",
+                format!(
+                    "the program states its lanes' {} in a channel the host writes too; a beam's \
+                     parents are read on the device from a cell only the device writes",
+                    port.name()
+                ),
+            )
+        })
     }
 
     /// Whether this instance resolves `port` under `class`
@@ -436,8 +543,9 @@ impl Session {
         Some((src, native))
     }
 
-    /// Points the program's reads of output `name` for `lane` at `base`;
-    /// an output the program does not read is let go.
+    /// Points the program's reads of output `name` for `lane` at `base`,
+    /// `rows` rows from `row_offset` on the lane's own; an output the
+    /// program does not read is let go.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_output(
         &mut self,
@@ -448,6 +556,7 @@ impl Session {
         width: u32,
         row_stride: u32,
         row_offset: u32,
+        rows: u32,
     ) -> Result<()> {
         let output = Output {
             base,
@@ -455,6 +564,7 @@ impl Session {
             width,
             row_stride,
             row_offset,
+            rows,
         };
         match self
             .outputs
@@ -465,6 +575,24 @@ impl Session {
             None => self.outputs.push(((name.to_string(), lane), output)),
         }
         Ok(())
+    }
+
+    /// The instance's fire seats `lanes` lanes: a seat bound at a lane past
+    /// them was a wider fire's, its rows another instance's by now, and
+    /// would still count as bound (`outputs_bound`) and as a row of a row
+    /// set (`take_lane`). Seats are kept across fires otherwise: a fire
+    /// binds only the outputs it writes.
+    pub fn seat_lanes(&mut self, lanes: u32) {
+        self.outputs.retain(|((_, at), _)| *at < lanes);
+    }
+
+    /// The instance's score rows moved from `from` to `to` (`bytes` of them,
+    /// its own slots rebound): every seat bound inside them moves with
+    /// them. A seat is bound only by a fire that writes the output, and
+    /// read by every fire its program reads it in: one left at `from` was
+    /// read and written there after the slots went to another owner.
+    pub fn move_seats(&mut self, from: u64, bytes: u64, to: u64) {
+        move_seats(&mut self.outputs, from, bytes, to);
     }
 
     fn bound(&self, name: &str, lane: u32) -> bool {
@@ -478,10 +606,13 @@ impl Session {
         self.extents
     }
 
+    /// Stages a fire at `at`; `rows_read` is what its stages read of each
+    /// output, by name, lane and rows.
     pub fn stage(
         &mut self,
         compiled: &Compiled,
         plan: &ExecPlan,
+        rows_read: &[(&str, u32, u32)],
         wave: &mut Wave,
         at: Attach,
     ) -> Result<Launched> {
@@ -493,6 +624,9 @@ impl Session {
         stages_and_plans_agree(compiled)?;
         if at != Attach::Prologue {
             self.outputs_bound(plan)?;
+            if let Some(unheld) = self.unheld_rows(rows_read) {
+                return Ok(Launched::Refused(Fired::Faulted(unheld)));
+            }
         }
         if let Some(blocked) = self.blocked_at(plan, at) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));
@@ -511,9 +645,41 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    /// An unbound output would make the emitted kernel dereference the side table's zero.
-    fn outputs_bound(&self, plan: &ExecPlan) -> Result<()> {
-        for (name, lane) in plan.outputs() {
+    /// An unbound output would make the emitted kernel dereference the side
+    /// table's zero; a seat no read of the program reaches is refused, not
+    /// dropped. Seats past lane 0 of an output the program reads only at
+    /// lane 0 are its rows, lane `r` the row `r`.
+    fn outputs_bound(&mut self, plan: &ExecPlan) -> Result<()> {
+        let reads = plan.outputs();
+        let read = |name: &str, lane: u32| reads.iter().any(|&(n, l)| n == name && l == lane);
+        let mut row_sets: Vec<String> = Vec::new();
+        for ((name, at), _) in &self.outputs {
+            if read(name, *at) {
+                continue;
+            }
+            let rows = read(name, 0) && !reads.iter().any(|&(n, l)| n == name && l > 0);
+            let lanes = self.outputs.iter().filter(|((n, _), _)| n == name).count() as u32;
+            if !rows || *at >= lanes {
+                return Err(Fault::program(
+                    "program::session",
+                    format!(
+                        "output `{name}` is bound at lane {at}, which this program reads no \
+                         row of: it reads {}",
+                        reads
+                            .iter()
+                            .filter(|(n, _)| *n == name)
+                            .map(|(_, l)| format!("lane {l}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+            if !row_sets.iter().any(|set| set == name) {
+                row_sets.push(name.clone());
+            }
+        }
+        self.row_sets = row_sets;
+        for (name, lane) in reads {
             if !self.bound(name, lane) {
                 return Err(Fault::program(
                     "program::session",
@@ -528,14 +694,102 @@ impl Session {
         Ok(())
     }
 
-    pub fn take_lane(&mut self, stages: Vec<&mut Prepared>) -> Result<()> {
+    /// The first read of an output past the rows its seats hold, refused by
+    /// name: a seat holds its lane's own rows, and an output read a row a
+    /// lane (`row_sets`) holds a row for each lane seated from lane 0.
+    fn unheld_rows(&self, rows_read: &[(&str, u32, u32)]) -> Option<String> {
+        let seat = |name: &str, lane: u32| {
+            self.outputs
+                .iter()
+                .find(|((n, at), _)| n == name && *at == lane)
+                .map(|(_, output)| output)
+        };
+        rows_read.iter().find_map(|&(name, lane, need)| {
+            let have = if lane == 0 && self.row_sets.iter().any(|set| set == name) {
+                (0..)
+                    .take_while(|&at| seat(name, at).is_some_and(|output| output.rows > 0))
+                    .count() as u64
+            } else {
+                seat(name, lane).map_or(0, |output| u64::from(output.rows))
+            };
+            (u64::from(need) > have).then(|| {
+                format!(
+                    "output `{name}` of lane {lane} is read {need} rows, and the fire seated \
+                     {have} of the lane's own"
+                )
+            })
+        })
+    }
+
+    /// The fire minted last flies in `wave`: its regions read its live
+    /// commit word there.
+    pub fn fly_in(&mut self, wave: &Wave) {
+        if let Some(minted) = self.pending.back_mut() {
+            minted.live = wave.commit_at(minted.lane);
+        }
+    }
+
+    pub fn take_lane(&mut self, stages: Vec<&mut Prepared>, scratch: u64) -> Result<()> {
         let Some(minted) = self.pending.back() else {
             return Ok(());
         };
-        let commit = self.commits[minted.slot].device();
+        // Its regions read the live word in the wave's device tables; the
+        // host word is the settle's to fill.
+        let commit = if minted.live != 0 {
+            minted.live
+        } else {
+            self.commits[minted.slot].device()
+        };
         for prepared in stages {
-            let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
+            let lane = prepared.stage_lane(&self.rings, &minted.before, commit, scratch)?;
+            for name in &self.row_sets {
+                let Some(slot) = prepared
+                    .slot_of(name, 0)
+                    .filter(|_| prepared.reads(name, 0))
+                else {
+                    continue;
+                };
+                let mut seats: Vec<(u32, &Output)> = self
+                    .outputs
+                    .iter()
+                    .filter(|((n, _), _)| n == name)
+                    .map(|((_, at), output)| (*at, output))
+                    .collect();
+                seats.sort_unstable_by_key(|(at, _)| *at);
+                let mut rows = Vec::with_capacity(seats.len());
+                let mut bf16 = None;
+                for (at, output) in &seats {
+                    let (elem, is_bf16) = match output.storage {
+                        INTRINSIC_STORAGE_F32 => (4u64, false),
+                        INTRINSIC_STORAGE_RAW_BF16 => (2u64, true),
+                        other => {
+                            return Err(Fault::program(
+                                "program::session",
+                                format!(
+                                    "output `{name}`'s lane {at} is seated in storage {other}, \
+                                     and only f32 or bf16 rows are read a row a lane"
+                                ),
+                            ));
+                        }
+                    };
+                    if bf16.is_some_and(|was| was != is_bf16) || output.width != seats[0].1.width {
+                        return Err(Fault::program(
+                            "program::session",
+                            format!("output `{name}`'s rows are not one width and one storage"),
+                        ));
+                    }
+                    bf16 = Some(is_bf16);
+                    rows.push(
+                        output.base
+                            + u64::from(output.row_offset) * u64::from(output.row_stride) * elem,
+                    );
+                }
+                prepared.bind_rows(lane, slot, &rows, seats[0].1.width, bf16.unwrap_or(false))?;
+            }
             for ((name, at), output) in &self.outputs {
+                if self.row_sets.contains(name) || !prepared.reads(name, *at) {
+                    continue;
+                }
                 let Some(slot) = prepared.slot_of(name, *at) else {
                     continue;
                 };
@@ -547,6 +801,7 @@ impl Session {
                     output.width,
                     output.row_stride,
                     output.row_offset,
+                    output.row_offset.saturating_add(output.rows),
                 )?;
             }
         }
@@ -603,6 +858,7 @@ impl Session {
             .filter(|binding| !binding.is_const && self.resolves(class, binding.port))
             .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
             .filter(|binding| !(binding.port == Port::AttnMask && mask_on_device))
+            .filter(|binding| binding.port != Port::Parents)
             .map(|binding| binding.channel)
             .collect()
     }
@@ -745,6 +1001,16 @@ impl Session {
                     | Ticket::ADVANCE_HEAD
                     | Ticket::ADVANCE_TAIL);
             }
+            // A host writer's cell is pulled for the program's kernels alone:
+            // a port it serves is stated on the lanes or read off the mirror
+            // ([`Self::port_device_source`]), and an input off the mirror
+            // ([`Self::feed_cell`]). With no op reading it nothing is pulled,
+            // and the ticket takes the cell as any other.
+            let native_bytes = if flags & Ticket::HOST_WRITER != 0 && !plan.ops_read_channel(slot) {
+                0
+            } else {
+                u32::try_from(shape.cell_bytes()).unwrap_or(u32::MAX)
+            };
             let cells = self
                 .rings
                 .cell_address(channel, 0)
@@ -767,14 +1033,14 @@ impl Session {
                 cells,
                 cap1: endpoint.cap1(),
                 wire_bytes: endpoint.wire_bytes(),
-                native_bytes: u32::try_from(shape.cell_bytes()).unwrap_or(u32::MAX),
+                native_bytes,
             });
         }
 
         let rings = self.rings.device();
         let commit = self.commits[slot].device();
 
-        let _lane = wave.stage(
+        let lane = wave.stage(
             &tickets,
             &taken,
             &put,
@@ -784,7 +1050,6 @@ impl Session {
                 ticket_offset: 0,
                 ticket_count: 0,
                 initial_commit: 1,
-                diagnose: 0,
             },
             rings.bump_lane(0, 0, 0, 0, commit),
             PublishLane {
@@ -796,6 +1061,8 @@ impl Session {
                 commit,
                 ticket_offset: 0,
                 ticket_count: 0,
+                // The wave's fly moves `commit` here and the live word in.
+                commit_host: 0,
             },
         );
 
@@ -812,6 +1079,8 @@ impl Session {
         }
         Ok(Minted {
             slot,
+            lane,
+            live: 0,
             before,
             next,
             tickets,
@@ -983,6 +1252,27 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    /// A seat inside the score rows moves with them; one elsewhere (an
+    /// arena plane, bound again by its fire) stays.
+    #[test]
+    fn seats_in_the_score_rows_move_with_them() {
+        let seat = |base| super::Output {
+            base,
+            storage: 0,
+            width: 8,
+            row_stride: 8,
+            row_offset: 0,
+            rows: 1,
+        };
+        let mut outputs = vec![
+            (("scores".to_string(), 0), seat(1000)),
+            (("score_pages".to_string(), 0), seat(1064)),
+            (("logits".to_string(), 0), seat(9000)),
+        ];
+        super::move_seats(&mut outputs, 1000, 128, 5000);
+        let bases: Vec<u64> = outputs.iter().map(|(_, output)| output.base).collect();
+        assert_eq!(bases, [5000, 5064, 9000]);
+    }
 
     #[test]
     fn a_launching_stage_paired_with_the_wrong_plan_is_refused() {

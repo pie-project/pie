@@ -1,0 +1,65 @@
+package pie:plex-ext@0.1.0;
+
+/// Cross-tenant KV sharing: a pie extension of PLEX 1.1, outside
+/// `plex:*@1.1.0` (see `crates/plex-host/EXTENSION.md`).
+///
+/// An inferlet asks to share its KV under a scope: its session, its tenant,
+/// or a named group. Session and tenant scopes never cross tenants and need
+/// no row here. A group scope matches KV across tenants, and only among the
+/// tenants this column names for that group: a tenant not named neither
+/// reads KV under the group nor writes KV into it. Its ask shares within
+/// its own tenant instead, and the inferlet is told which scope took effect.
+///
+/// Key: a group name. Value: tenants, as `snapshot.process.tenant` names
+/// them (authenticated, never a hint). Column default: no tenant, so with
+/// no row no group crosses tenants. A lease withdrawal (spec section 7)
+/// therefore fails closed: cross-tenant sharing stops, and nothing already
+/// cached is lost.
+///
+/// A row's grant is versioned: KV written under a group is keyed by the
+/// grant it was written under, so after a revoke or a re-grant it no longer
+/// matches.
+@since(version = 0.1.0)
+interface share-groups {
+    use plex:core/types@1.1.0.{error-code};
+
+    @since(version = 0.1.0)
+    type group = string;
+
+    @since(version = 0.1.0)
+    type tenant = string;
+
+    /// The row this policy wrote, if any.
+    @since(version = 0.1.0)
+    get: func(group: group) -> option<list<tenant>>;
+
+    /// An empty group name or tenant is `invalid-argument`.
+    @since(version = 0.1.0)
+    set: func(group: group, value: list<tenant>) -> result<_, error-code>;
+
+    @since(version = 0.1.0)
+    set-list: func(entries: list<tuple<group, list<tenant>>>) -> result<_, error-code>;
+
+    @since(version = 0.1.0)
+    delete: func(group: group);
+
+    /// The tenants of every group without a row.
+    @since(version = 0.1.0)
+    set-default: func(value: list<tenant>) -> result<_, error-code>;
+
+    @since(version = 0.1.0)
+    clear: func();
+
+    /// Always empty: a grant is enacted wherever it is read.
+    @since(version = 0.1.0)
+    get-refused: func() -> list<tuple<group, error-code>>;
+}
+
+/// The PLEX 1.1 cluster world and the grant column.
+@since(version = 0.1.0)
+world cluster {
+    include plex:policy/cluster@1.1.0;
+
+    @since(version = 0.1.0)
+    import share-groups;
+}

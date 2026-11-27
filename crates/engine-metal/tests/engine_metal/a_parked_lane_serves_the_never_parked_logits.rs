@@ -1,20 +1,19 @@
 #![cfg(target_vendor = "apple")]
 
 //! CONTRACT-BC 22 on device: a lane addressed by slot refs whose every slot
-//! (kv list pages, window list pages, its record's pieces) parks below the
-//! pool mid-decode and comes back to fresh slots in fresh chunks (the host
-//! tier after step 2; the kv list pages through the slot file, the rest
-//! through the host tier, after step 6) lands the never-parked lane's logits
-//! bit for bit, in one process (as `engine-cuda`'s `golden_offload`). A
-//! negative control parks the record and brings back another lane's. With
-//! `Offload::Bytes`, every slot parked on the host comes back through its
-//! bytes (`read_tier_slots`), written into other host slots
-//! (`write_tier_slots`), as a shared-pool snapshot restores.
+//! (kv list pages, window buffer pages, its ring's and record's pieces) parks in the slot
+//! file mid-decode, twice, and comes back to fresh slots in fresh chunks
+//! lands the never-parked lane's logits bit for bit. A negative control
+//! a kind brings back another lane's ring or record, or the kv or window
+//! pages in another order.
 
-use engine::chunk::{ShapeId, SlotCopy, SlotKind};
+use std::collections::BTreeMap;
+
+use engine::chunk::{ShapeId, SlotCopy};
+use engine::fire::{FoldLen, Lineage, WindowFold};
 use engine::transfer::{DeviceReach, MemoryDomain};
 use engine_metal::serve::Seated;
-use engine_metal::store::layout::{FIXED, LIST, WINDOWS};
+use engine_metal::store::layout::{FIXED, LIST, RING, WINDOWS};
 use engine_metal::{Lane, Shell};
 
 use super::a_scattered_pool_serves_the_same_logits::{
@@ -22,8 +21,13 @@ use super::a_scattered_pool_serves_the_same_logits::{
 };
 
 const CONTEXT: u32 = 1024;
-const PROMPT: u32 = 150;
+const PROMPT: u32 = 156;
 const STEPS: usize = 10;
+/// The steps after which every slot parks and comes back.
+const PARKS: [usize; 2] = [2, 6];
+/// Rows a windowed lane's fold trails its decodes by: its buffer slots are
+/// live where it parks.
+const LAG: u32 = 7;
 
 /// Slot refs a chunk at a time from `next`, each shape its own chunks.
 struct Refs {
@@ -47,84 +51,40 @@ impl Refs {
     }
 }
 
-/// Parks `slots` (0: a trimmed slot, skipped) of `shape` to `tier` and
-/// back to fresh slot refs: the fresh table.
-#[allow(clippy::too_many_arguments)]
+/// Parks `slots` (0: a trimmed slot, skipped) of `shape` to the slot file
+/// and back to fresh slot refs: the fresh table. `crossed` brings each slot
+/// back as the next one's.
 fn park(
     shell: &mut Shell,
     device: &mut Refs,
-    host: &mut Refs,
-    disk: &mut u32,
-    tier: MemoryDomain,
+    disk: &mut Refs,
     shape: ShapeId,
     per: u32,
     slots: &[u32],
-    bytes: bool,
+    crossed: bool,
 ) -> Vec<u32> {
+    let here = MemoryDomain::Device {
+        ordinal: 0,
+        reach: DeviceReach::HostShared,
+    };
     let out: Vec<(u32, u32)> = slots
         .iter()
         .filter(|&&slot| slot != 0)
-        .map(|&slot| {
-            let parked = if tier == MemoryDomain::LocalDisk {
-                *disk += 1;
-                *disk - 1
-            } else {
-                host.take(shape, per)
-            };
-            (slot, parked)
-        })
+        .map(|&slot| (slot, disk.take(shape, per)))
         .collect();
+    let mut away: Vec<u32> = out.iter().map(|&(_, parked)| parked).collect();
+    if crossed && !away.is_empty() {
+        away.rotate_left(1);
+    }
     shell
         .copy_slots(&SlotCopy {
             shape,
-            src: MemoryDomain::Device {
-                ordinal: 0,
-                reach: DeviceReach::HostShared,
-            },
-            dst: tier,
-            slots: out.clone(),
+            src: here,
+            dst: MemoryDomain::LocalDisk,
+            slots: out,
             runs: Vec::new(),
         })
         .expect("the slots park");
-    let out: Vec<(u32, u32)> = if bytes && tier == MemoryDomain::HostPinned && !out.is_empty() {
-        let away: Vec<u32> = out.iter().map(|&(_, parked)| parked).collect();
-        let read = shell
-            .read_tier_slots(&[(shape, away.clone())])
-            .expect("the host slots read");
-        let slot_bytes = shell
-            .pool_chunk_facts()
-            .shape(shape)
-            .expect("stated")
-            .slot_bytes;
-        assert_eq!(
-            read.len() as u64,
-            away.len() as u64 * slot_bytes,
-            "a host slot reads as its device slot's bytes"
-        );
-        let again: Vec<u32> = away.iter().map(|_| host.take(shape, per)).collect();
-        assert!(
-            shell
-                .write_tier_slots(&[(shape, again.clone())], &read[1..])
-                .is_err(),
-            "a byte count that differs is refused"
-        );
-        shell
-            .write_tier_slots(&[(shape, again.clone())], &read)
-            .expect("the host slots write");
-        assert_eq!(
-            shell
-                .read_tier_slots(&[(shape, again.clone())])
-                .expect("the written slots read"),
-            read,
-            "written host slots read back as written"
-        );
-        out.iter()
-            .zip(again)
-            .map(|(&(slot, _), parked)| (slot, parked))
-            .collect()
-    } else {
-        out
-    };
     let fresh: Vec<u32> = slots
         .iter()
         .map(|&slot| {
@@ -135,24 +95,27 @@ fn park(
             }
         })
         .collect();
-    let back: Vec<(u32, u32)> = out
-        .iter()
-        .zip(fresh.iter().filter(|&&slot| slot != 0))
-        .map(|(&(_, parked), &slot)| (parked, slot))
-        .collect();
     shell
         .copy_slots(&SlotCopy {
             shape,
-            src: tier,
-            dst: MemoryDomain::Device {
-                ordinal: 0,
-                reach: DeviceReach::HostShared,
-            },
-            slots: back,
+            src: MemoryDomain::LocalDisk,
+            dst: here,
+            slots: away
+                .into_iter()
+                .zip(fresh.iter().copied().filter(|&slot| slot != 0))
+                .collect(),
             runs: Vec::new(),
         })
         .expect("the slots come back");
     fresh
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    List,
+    Window,
+    Ring,
+    Record,
 }
 
 /// What the script does at its parking steps.
@@ -160,52 +123,45 @@ fn park(
 enum Offload {
     Never,
     Parked,
-    /// As `Parked`, each host slot read out as bytes and written back into
-    /// other host slots before it returns.
-    Bytes,
-    /// The record comes back from another record's parked copy.
-    Swapped,
+    /// One kind of slot comes back wrong: the kv or the window pages in
+    /// another order, or another lane's ring or record.
+    Wrong(Kind),
 }
 
-/// A prompt, then greedy decodes on one lane by slot refs; every logit row.
-fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
+/// How a windowed lane's fire folds: to row `after` of `end`, from `folded`.
+fn fold(folded: u32, have: u32, after: u32, page: u32) -> WindowFold {
+    WindowFold {
+        base: if folded < have { folded } else { after } / page * page,
+        fold: FoldLen::Host(after - folded),
+        lineage: Lineage::Set,
+    }
+}
+
+/// A prompt, then greedy decodes on one lane by slot refs, a windowed
+/// lane's fold trailing its decodes by [`LAG`] rows; every logit row, and
+/// the kinds of slot the lane holds.
+fn serve(fixture: &Fixture, offload: Offload) -> (Vec<Vec<f32>>, Vec<Kind>) {
     let mut shell = load_with(fixture, CONTEXT);
-    shell.seat_tier(64 << 20);
     let dir = std::env::temp_dir().join(format!(
-        "pie-bm-pool-{}-tiers-{offload:?}",
+        "pie-bm-pool-{}-disk-{offload:?}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("a disk tier's dir");
     shell
-        .seat_disk_kv(Some(64 << 20), Some(&dir), 1, CONTEXT)
+        .seat_disk_kv(Some(1 << 30), Some(&dir), 1, CONTEXT)
         .expect("the disk tier seats");
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
-    assert!(facts.host_chunks > 0, "a host tier is stated");
-    let per = |id: ShapeId| facts.shape(id).map(|s| s.slots_per_chunk);
-    let list = per(LIST);
-    let fixed = per(FIXED);
-    let windows: Vec<(ShapeId, u32, u32, u32)> = WINDOWS
-        .iter()
-        .filter_map(|&id| {
-            let shape = facts.shape(id)?;
-            let SlotKind::List {
-                tokens,
-                window: Some(rows),
-                ..
-            } = shape.kind
-            else {
-                return None;
-            };
-            Some((id, shape.slots_per_chunk, tokens, rows))
-        })
-        .collect();
-    assert!(
-        list.is_none() || facts.disk_chunks > 0,
-        "a disk tier is stated for the kv list"
-    );
+    assert!(facts.disk_chunks > 0, "a disk tier is stated");
+    let per = |id: ShapeId| facts.shape(id).map(|s| s.slots_per_chunk.max(1));
+    let (list, fixed) = (per(LIST), per(FIXED));
     let layout = shell.pool_layout();
-    let first = (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
+    let ring_pieces = shell.pool_ring().map_or(0, |ring| ring.pieces);
+    let buffered = (ring_pieces > 0).then(|| {
+        let window = layout.window(0).expect("a ring load's window buffer");
+        (window.tokens, per(WINDOWS[0]).expect("its shape"))
+    });
+    let first = layout.free_chunk().div_ceil(facts.segment_chunks) * facts.segment_chunks;
     shell
         .commit_segments((first + 64).div_ceil(facts.segment_chunks))
         .expect("the segments commit");
@@ -213,50 +169,41 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
         next: first,
         open: Vec::new(),
     };
-    let mut host = Refs {
+    let mut disk = Refs {
         next: 0,
         open: Vec::new(),
     };
-    let mut disk = 0u32;
-    let mut record: Vec<u32> = fixed.map_or_else(Vec::new, |per| {
-        (0..layout.pieces)
-            .map(|_| device.take(FIXED, per))
-            .collect()
-    });
-    // A second record, filled by a lane of its own, for the negative control.
-    let other: Vec<u32> = fixed.map_or_else(Vec::new, |per| {
-        (0..layout.pieces)
-            .map(|_| device.take(FIXED, per))
-            .collect()
-    });
-    let page = shell.paging().page_size;
-    let mut pages: Vec<u32> = Vec::new();
-    let mut tables: Vec<Vec<u32>> = vec![Vec::new(); windows.len()];
-    let mut held = 0u32;
-    let mut fed: Vec<u32> = (0..PROMPT).map(|at| (at * 37 + 11) % 256).collect();
-    let mut rows = Vec::new();
-    if offload == Offload::Swapped && !other.is_empty() {
-        let tokens: Vec<u32> = (0..40u32).map(|at| (at * 11 + 3) % 256).collect();
-        let own_pages: Vec<u32> = match list {
-            Some(per) => (0..40u32.div_ceil(page))
-                .map(|_| device.take(LIST, per))
-                .collect(),
-            None => Vec::new(),
-        };
-        let own_windows: Vec<Vec<u32>> = windows
-            .iter()
-            .map(|&(id, per, tokens_w, _)| {
-                (0..40u32.div_ceil(tokens_w))
-                    .map(|_| device.take(id, per))
+    let own = |device: &mut Refs| -> (Vec<u32>, Vec<u32>) {
+        (
+            fixed.map_or_else(Vec::new, |per| {
+                (0..layout.pieces)
+                    .map(|_| device.take(FIXED, per))
                     .collect()
-            })
-            .collect();
+            }),
+            (0..ring_pieces).map(|_| device.take(RING, 1)).collect(),
+        )
+    };
+    let (mut record, mut ring) = own(&mut device);
+    let page = shell.paging().page_size;
+    let cow = |ring: &[u32]| -> Vec<[u32; 2]> { ring.iter().map(|&p| [p, p]).collect() };
+
+    // Another lane's record and ring, for the control.
+    let (other_record, other_ring) = own(&mut device);
+    if matches!(offload, Offload::Wrong(Kind::Record | Kind::Ring)) {
+        let tokens: Vec<u32> = (0..40u32).map(|at| (at * 11 + 3) % 256).collect();
+        let pages: Vec<u32> = list.map_or_else(Vec::new, |per| {
+            (0..40u32.div_ceil(page))
+                .map(|_| device.take(LIST, per))
+                .collect()
+        });
+        let rings = cow(&other_ring);
         let seated = Seated {
             held: Some(0),
             refs: true,
-            pages: &own_pages,
-            windows: &own_windows,
-            record: Some(&other),
+            pages: &pages,
+            record: (!other_record.is_empty()).then_some(other_record.as_slice()),
+            ring: buffered.map(|_| rings.as_slice()),
+            window: buffered.map(|(page, _)| fold(0, 0, 40, page)),
             ..Seated::of(Lane {
                 slot: 1,
                 word: word(&fixture.trace, 40),
@@ -265,25 +212,56 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
         };
         shell.fire_seated(&[seated]).expect("the other lane fires");
     }
+
+    let mut pages: Vec<u32> = Vec::new();
+    // The buffer's slots by window page.
+    let mut buffer: BTreeMap<u32, u32> = BTreeMap::new();
+    let (mut held, mut folded) = (0u32, 0u32);
+    let mut fed: Vec<u32> = (0..PROMPT).map(|at| (at * 37 + 11) % 256).collect();
+    let mut rows = Vec::new();
+    let mut kinds = Vec::new();
     for step in 0..STEPS {
         let n = fed.len() as u32;
-        let after = held + n;
+        let end = held + n;
         if let Some(per) = list {
-            while (pages.len() as u32) < after.div_ceil(page) {
+            while (pages.len() as u32) < end.div_ceil(page) {
                 pages.push(device.take(LIST, per));
             }
         }
-        for (table, &(id, per, tokens, _)) in tables.iter_mut().zip(&windows) {
-            while (table.len() as u32) < after.div_ceil(tokens) {
-                table.push(device.take(id, per));
-            }
+        let after = if step == 0 {
+            end
+        } else {
+            end.saturating_sub(LAG).max(folded)
+        };
+        let rings = cow(&ring);
+        let mut tables = Vec::new();
+        let mut window = None;
+        if let Some((page, per)) = buffered {
+            let plan = fold(folded, held, after, page);
+            buffer.retain(|&at, _| at >= plan.base / page);
+            let table: Vec<u32> = if folded < held || after < end {
+                (plan.base / page..end.div_ceil(page))
+                    .map(|at| {
+                        *buffer
+                            .entry(at)
+                            .or_insert_with(|| device.take(WINDOWS[0], per))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            tables.push(table);
+            window = Some(plan);
         }
         let seated = Seated {
             held: Some(held),
+            folded: if buffered.is_some() { folded } else { 0 },
             refs: true,
             pages: &pages,
             windows: &tables,
             record: (!record.is_empty()).then_some(record.as_slice()),
+            ring: buffered.map(|_| rings.as_slice()),
+            window,
             ..Seated::of(Lane {
                 slot: 0,
                 word: word(&fixture.trace, n),
@@ -291,108 +269,156 @@ fn serve(fixture: &Fixture, offload: Offload) -> Vec<Vec<f32>> {
             })
         };
         let got = shell.fire_seated(&[seated]).expect("the fire lands");
-        held = after;
+        (held, folded) = (end, after);
         fed = vec![argmax(&got[0])];
         rows.extend(got);
-        if offload != Offload::Never && (step == 2 || step == 6) {
-            let kv_tier = if step == 2 {
-                MemoryDomain::HostPinned
+        if offload == Offload::Never || !PARKS.contains(&step) {
+            continue;
+        }
+        let wrong = |kind| step == PARKS[1] && offload == Offload::Wrong(kind);
+        kinds.clear();
+        if let Some(per) = list {
+            let crossed = wrong(Kind::List);
+            pages = park(
+                &mut shell,
+                &mut device,
+                &mut disk,
+                LIST,
+                per,
+                &pages,
+                crossed,
+            );
+            kinds.push(Kind::List);
+        }
+        if let Some((_, per)) = buffered {
+            let slots: Vec<u32> = buffer.values().copied().collect();
+            assert!(
+                step != PARKS[1] || slots.len() > 1,
+                "the buffer holds pages to cross"
+            );
+            let crossed = wrong(Kind::Window);
+            let fresh = park(
+                &mut shell,
+                &mut device,
+                &mut disk,
+                WINDOWS[0],
+                per,
+                &slots,
+                crossed,
+            );
+            for (slot, at) in buffer.values_mut().zip(fresh) {
+                *slot = at;
+            }
+            let from = if wrong(Kind::Ring) {
+                &other_ring
             } else {
-                MemoryDomain::LocalDisk
+                &ring
             };
-            if let Some(per) = list {
-                pages = park(
-                    &mut shell,
-                    &mut device,
-                    &mut host,
-                    &mut disk,
-                    kv_tier,
-                    LIST,
-                    per,
-                    &pages,
-                    offload == Offload::Bytes,
-                );
-            }
-            for (table, &(id, per, _, _)) in tables.iter_mut().zip(&windows) {
-                *table = park(
-                    &mut shell,
-                    &mut device,
-                    &mut host,
-                    &mut disk,
-                    MemoryDomain::HostPinned,
-                    id,
-                    per,
-                    table,
-                    offload == Offload::Bytes,
-                );
-            }
-            if let Some(per) = fixed {
-                let parked = if offload == Offload::Swapped && step == 2 {
-                    &other
-                } else {
-                    &record
-                };
-                record = park(
-                    &mut shell,
-                    &mut device,
-                    &mut host,
-                    &mut disk,
-                    MemoryDomain::HostPinned,
-                    FIXED,
-                    per,
-                    parked,
-                    offload == Offload::Bytes,
-                );
+            ring = park(&mut shell, &mut device, &mut disk, RING, 1, from, false);
+            kinds.extend([Kind::Window, Kind::Ring]);
+        }
+        if let Some(per) = fixed {
+            let from = if wrong(Kind::Record) {
+                &other_record
+            } else {
+                &record
+            };
+            record = park(&mut shell, &mut device, &mut disk, FIXED, per, from, false);
+            // A record with no recurrent state holds nothing a fire reads.
+            if fixture
+                .trace
+                .caches
+                .iter()
+                .any(|row| matches!(row, poem_ir::CacheRow::State { .. }))
+            {
+                kinds.push(Kind::Record);
             }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    rows
+    (rows, kinds)
 }
 
-fn check(model: &str) {
+fn check(model: &str) -> Vec<Kind> {
+    let fixture = fixture_of(model, None);
+    let (kept, _) = serve(&fixture, Offload::Never);
+    let (parked, kinds) = serve(&fixture, Offload::Parked);
+    same(&format!("{model}: parked against kept"), &parked, &kept);
+    eprintln!("{model}: parked = kept over {} rows", kept.len());
+    for kind in &kinds {
+        let (wrong, _) = serve(&fixture, Offload::Wrong(*kind));
+        assert_ne!(
+            wrong, kept,
+            "{model}: {kind:?} slots brought back wrong move the logits"
+        );
+    }
+    eprintln!("{model}: each of {kinds:?} brought back wrong moves the logits");
+    kinds
+}
+
+/// A kv list, a window's ring and buffer, and a record beside a kv list: every kind parks.
+#[test]
+fn a_lane_parked_to_disk_serves_the_never_parked_logits() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let fixture = fixture_of(model, None);
-    let kept = serve(&fixture, Offload::Never);
-    let parked = serve(&fixture, Offload::Parked);
-    same(&format!("{model}: parked against kept"), &parked, &kept);
-    eprintln!("{model}: parked = kept over {} rows", kept.len());
-    let bytes = serve(&fixture, Offload::Bytes);
-    same(
-        &format!("{model}: parked through bytes against kept"),
-        &bytes,
-        &kept,
-    );
-    eprintln!("{model}: parked through tier bytes = kept");
-    if fixture
-        .trace
-        .caches
-        .iter()
-        .any(|row| matches!(row, poem_ir::CacheRow::State { .. }))
-    {
-        let swapped = serve(&fixture, Offload::Swapped);
-        assert_ne!(
-            swapped, kept,
-            "{model}: another lane's record brought back moves the logits"
-        );
-        eprintln!("{model}: a swapped record moves the logits (the control)");
+    let parked: Vec<Kind> = ["qwen3-micro-text", "gemma4-e4b-mini-l1", "qwen35-tiny"]
+        .into_iter()
+        .flat_map(check)
+        .collect();
+    for kind in [Kind::List, Kind::Window, Kind::Ring, Kind::Record] {
+        assert!(parked.contains(&kind), "no model here parks {kind:?} slots");
     }
 }
 
+/// On a load that lays rings, a lane addressed by slot refs that states
+/// neither its ring nor a window fold is refused by name, outside the
+/// load's own pipeline walk.
 #[test]
-fn a_parked_dense_lane_serves_the_never_parked_logits() {
-    check("qwen3-micro-text");
-}
-
-#[test]
-fn a_parked_windowed_lane_serves_the_never_parked_logits() {
-    check("gemma4-e4b-mini-l1");
-}
-
-#[test]
-fn a_parked_hybrid_lane_serves_the_never_parked_logits() {
-    check("qwen35-tiny");
+fn a_ref_lane_stating_no_ring_is_refused() {
+    let _device = crate::device_alone();
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let fixture = fixture_of("gemma4-e4b-mini-l1", None);
+    let mut shell = load_with(&fixture, CONTEXT);
+    assert!(shell.pool_ring().is_some(), "a windowed load lays rings");
+    let layout = shell.pool_layout();
+    let per = shell
+        .pool_chunk_facts()
+        .shape(FIXED)
+        .map(|s| s.slots_per_chunk.max(1));
+    let low = layout.free_chunk();
+    let record: Vec<u32> = per.map_or_else(Vec::new, |per| {
+        (0..layout.pieces)
+            .map(|piece| (low + piece) * per)
+            .collect()
+    });
+    let segment = shell.pool_chunk_facts().segment_chunks;
+    shell
+        .commit_segments((low + layout.pieces + 1).div_ceil(segment))
+        .expect("the segments commit");
+    let why = shell
+        .fire_seated(&[Seated {
+            held: Some(0),
+            refs: true,
+            record: (!record.is_empty()).then_some(record.as_slice()),
+            ..Seated::of(Lane {
+                slot: 0,
+                word: word(&fixture.trace, 4),
+                tokens: &[1, 2, 3, 4],
+            })
+        }])
+        .expect_err("no page it would read is its own")
+        .to_string();
+    assert!(
+        why.contains("states no ring pieces and no window fold"),
+        "{why}"
+    );
+    shell
+        .warm_pipelines()
+        .expect("the pipeline walk, whose fires are dropped, states neither");
 }

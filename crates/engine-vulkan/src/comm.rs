@@ -23,7 +23,11 @@ impl Group {
             });
         }
         let slot_bytes = slot_bytes.next_multiple_of(SLOT_ALIGN).max(SLOT_ALIGN);
-        let band = Buffer::zeroed(device, slot_bytes * u64::from(world))?;
+        let band = Buffer::zeroed(
+            device,
+            slot_bytes * u64::from(world),
+            engine_gpu::books::owners::COLLECTIVE,
+        )?;
         Ok(Group {
             band: Arc::new(band),
 

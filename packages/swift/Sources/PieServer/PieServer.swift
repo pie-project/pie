@@ -20,14 +20,12 @@ public final class PieServer: Sendable {
 
     /// The boot configuration (`worker::embedded::Settings`), sized for a phone.
     public struct Configuration: Encodable, Sendable, Equatable {
-        /// Share of the device's recommended working set the engine may use.
-        public var deviceMemoryShare = 0.6
-        /// Bytes for the kv pages and state slots, with a unit (`"1GiB"`);
-        /// nil fills what `deviceMemoryShare` leaves past the weights.
-        public var deviceKvBudget: String? = nil
-        public var maxForwardTokens = 512
-        public var maxForwardRequests = 4
-        public var maxModelLength = 4096
+        /// The most of the device's memory the model may wire, with a unit
+        /// (`"2GiB"`): what the app leaves it. nil takes the device's
+        /// recommended working set.
+        public var budgetDevice: String? = nil
+        /// The longest sequence (prompt + output) one lane holds, in tokens.
+        public var maxContext = 4096
         /// The cap on each inferlet's linear memory.
         public var sandboxMemoryMB = 256
         public var maxConcurrentProcesses: Int? = 4
@@ -35,11 +33,8 @@ public final class PieServer: Sendable {
         public init() {}
 
         enum CodingKeys: String, CodingKey {
-            case deviceMemoryShare = "device_memory_share"
-            case deviceKvBudget = "device_kv_budget"
-            case maxForwardTokens = "max_forward_tokens"
-            case maxForwardRequests = "max_forward_requests"
-            case maxModelLength = "max_model_len"
+            case budgetDevice = "budget_device"
+            case maxContext = "max_context"
             case sandboxMemoryMB = "sandbox_memory_mb"
             case maxConcurrentProcesses = "max_concurrent_processes"
         }

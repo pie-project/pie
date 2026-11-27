@@ -62,6 +62,15 @@ pub enum SegmentError {
     },
     #[error("an evacuation of segment {0} no longer matches the pool")]
     Stale(u32),
+    #[error(
+        "an evacuation of segment {segment} would split the run of {run} chunk(s) from logical chunk {head} at its chunk {at}"
+    )]
+    SplitsRun {
+        segment: u32,
+        head: u32,
+        run: u32,
+        at: u32,
+    },
     #[error("releasing segment {segment} leaves {committed} chunks for {needed}")]
     Budget {
         segment: u32,

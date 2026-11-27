@@ -7,8 +7,6 @@ use crate::engine::{ChannelBinding, ChannelEndpoint};
 use eta_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
 use eta_ir::types::Dtype;
 
-pub const TICKET_NONE: u64 = u64::MAX;
-
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_channel_id() -> engine::ChannelId {
@@ -23,6 +21,10 @@ pub struct ChannelCell {
     pub capacity: u32,
     pub role: Option<HostRole>,
     pub seeded: bool,
+    /// Bound to a program as a row-extent channel: its engine cells are as
+    /// wide as the program's row bound, and a host write lands its own rows
+    /// there cut or padded with `ROW_PAD` bytes to it.
+    pub row_extent: bool,
     taken_seed: Option<Vec<u8>>,
     endpoint: Option<Arc<ChannelEndpoint>>,
     declared_dtype: Option<ChanDType>,
@@ -37,6 +39,8 @@ pub struct ChannelCell {
     reader: Option<ReaderMirror>,
     poisoned: Option<String>,
     front_override: Option<Vec<u8>>,
+    /// The cells the host has taken.
+    taken: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +104,7 @@ impl ChannelCell {
             capacity,
             role: None,
             seeded: false,
+            row_extent: false,
             taken_seed: None,
             endpoint: None,
             declared_dtype: None,
@@ -114,6 +119,7 @@ impl ChannelCell {
             reader: None,
             poisoned: None,
             front_override: None,
+            taken: 0,
         }
     }
 
@@ -261,41 +267,36 @@ impl ChannelCell {
         self.endpoint.clone()
     }
 
-    pub fn reserve_device_ticket(&mut self, consume: bool, publish: bool) -> (u64, u64) {
-        let expected_head = if consume {
-            let expected = self.device_reserved_head;
-            self.device_reserved_head += 1;
-            expected
-        } else {
-            TICKET_NONE
-        };
-        let expected_tail = if publish {
-            let expected = self.device_reserved_tail;
-            self.device_reserved_tail += 1;
-            expected
-        } else {
-            TICKET_NONE
-        };
-        (expected_head, expected_tail)
+    /// A fire that will move this device ring counts its moves here; the
+    /// engine, not the runtime, picks the cell each one touches.
+    pub fn reserve_device_moves(&mut self, consume: bool, publish: bool) {
+        self.device_reserved_head += u64::from(consume);
+        self.device_reserved_tail += u64::from(publish);
     }
 
-    pub fn rollback_device_ticket(&mut self, expected_head: u64, expected_tail: u64) -> bool {
-        let mut complete = true;
-        if expected_tail != TICKET_NONE {
-            if self.device_reserved_tail == expected_tail + 1 {
-                self.device_reserved_tail = expected_tail;
-            } else {
-                complete = false;
-            }
-        }
-        if expected_head != TICKET_NONE {
-            if self.device_reserved_head == expected_head + 1 {
-                self.device_reserved_head = expected_head;
-            } else {
-                complete = false;
-            }
-        }
-        complete
+    /// A fire that never reached the engine gives its moves back, whichever
+    /// fire reserved after it.
+    pub fn release_device_moves(&mut self, consume: bool, publish: bool) {
+        self.device_reserved_head -= u64::from(consume);
+        self.device_reserved_tail -= u64::from(publish);
+    }
+
+    /// The cells the host has taken.
+    #[must_use]
+    pub fn taken(&self) -> u64 {
+        self.taken
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_taken(&mut self, taken: u64) {
+        self.taken = taken;
+    }
+
+    /// The cell the newest fire reserved to publish, counted from the
+    /// ring's first (`None`: none has).
+    #[must_use]
+    pub fn last_published(&self) -> Option<u64> {
+        self.device_reserved_tail.checked_sub(1)
     }
 
     pub fn reader_wait_state(&self) -> Option<(Arc<ChannelEndpoint>, u64)> {
@@ -478,7 +479,7 @@ impl ChannelCell {
         } else {
             native.len()
         };
-        if wire_len != cell_bytes {
+        if wire_len != cell_bytes && !self.row_extent {
             return Err(ChannelError::BadLength {
                 expected: cell_bytes,
                 got: wire_len,
@@ -486,7 +487,14 @@ impl ChannelCell {
         }
         let cap1 = u64::from(binding.capacity).saturating_add(1);
         let offset = ((sequence % cap1) * cell_bytes as u64) as usize;
-        store_wire(Cells::of(&*binding.memory), offset, self.dtype, native);
+        store_wire(
+            Cells::of(&*binding.memory),
+            offset,
+            cell_bytes,
+            self.dtype,
+            native,
+            wire_len,
+        );
         let words = binding.memory.words();
         let tail = load_word(words, binding.tail_word_index as usize);
         store_word(words, binding.tail_word_index as usize, tail);
@@ -526,7 +534,7 @@ impl ChannelCell {
         } else {
             native.len()
         };
-        if wire_len != cell_bytes {
+        if wire_len != cell_bytes && !self.row_extent {
             return Err(ChannelError::BadLength {
                 expected: cell_bytes,
                 got: wire_len,
@@ -534,7 +542,14 @@ impl ChannelCell {
         }
         let cap1 = u64::from(binding.capacity).saturating_add(1);
         let offset = ((self.writer_tail % cap1) * cell_bytes as u64) as usize;
-        store_wire(Cells::of(&*binding.memory), offset, self.dtype, native);
+        store_wire(
+            Cells::of(&*binding.memory),
+            offset,
+            cell_bytes,
+            self.dtype,
+            native,
+            wire_len,
+        );
         self.writer_tail += 1;
         store_word(words, binding.tail_word_index as usize, self.writer_tail);
         self.ring_host_copies.push_back(native.to_vec());
@@ -607,6 +622,7 @@ impl ChannelCell {
             return Err(ChannelError::WrongRole { role, op: "take" });
         }
         let value = self.produced.pop_front().ok_or(ChannelError::Empty)?;
+        self.taken += 1;
         self.front_override = None;
         if let Some(reader) = &self.reader {
             let words = reader.memory.words();
@@ -838,9 +854,25 @@ fn read_mirror_cell(reader: &ReaderMirror, sequence: u64) -> Vec<u8> {
 }
 
 /// Writes `native` into the cell at `offset` as the wire carries it.
-fn store_wire(cells: Cells<'_>, offset: usize, dtype: Dtype, native: &[u8]) {
+/// Lands `native` in the `cell_bytes` cell at `offset`: bools packed, and
+/// a row-extent cell the program's row bound wide, the instance's rows cut
+/// or padded to it (the host keeps them all).
+fn store_wire(
+    cells: Cells<'_>,
+    offset: usize,
+    cell_bytes: usize,
+    dtype: Dtype,
+    native: &[u8],
+    wire_len: usize,
+) {
     if dtype != Dtype::Bool {
-        return cells.store(offset, native);
+        let rows = wire_len.min(cell_bytes);
+        cells.store(offset, &native[..rows]);
+        if rows < cell_bytes {
+            let pad = vec![crate::pipeline::program::ROW_PAD; cell_bytes - rows];
+            cells.store(offset + rows, &pad);
+        }
+        return;
     }
     let mut packed = [0u8; 4096];
     for (at, bits) in (offset..)
@@ -1106,6 +1138,7 @@ mod tests {
             5i32.to_le_bytes().to_vec(),
             "take consumes"
         );
+        assert_eq!(cells[1].lock().unwrap().taken(), 1, "and counts the take");
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap_err(),
             ChannelError::Empty

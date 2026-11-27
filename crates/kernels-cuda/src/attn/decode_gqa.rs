@@ -113,14 +113,14 @@ pub struct Gate {
 
 impl Gate {
     #[must_use]
-    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+    pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            on: tuning.decode_gqa,
-            from_64: tuning.decode_gqa_from_64,
-            whole_window: tuning.decode_gqa_whole_window,
-            cluster: tuning.decode_gqa_cluster,
-            deep_64: tuning.decode_gqa_deep_64,
-            min_group: tuning.decode_gqa_min_group,
+            on: tuning.decode_gqa(),
+            from_64: tuning.decode_gqa_from_64(),
+            whole_window: tuning.decode_gqa_whole_window(),
+            cluster: tuning.decode_gqa_cluster(),
+            deep_64: tuning.decode_gqa_deep_64(),
+            min_group: tuning.decode_gqa_min_group(),
         }
     }
 
@@ -220,7 +220,8 @@ pub fn takes(ctx: &Ctx, plan: &DecodePlan, pool: &KvPool, rel: bool) -> bool {
 }
 
 /// Fires the tensor-core decode over `params` (the FA2 decode's, its output
-/// already the split's partial plane where the plan splits). With `sinks`
+/// already the split's partial plane where the plan splits; its masks, where
+/// it carries the fire's, read per request). With `sinks`
 /// and no split, the sinks scale the output in the same pass. `e4m3` reads
 /// the pages as an e4m3 pool's.
 pub fn decode(
@@ -249,7 +250,7 @@ pub fn decode(
         [plan.shape.num_kv_heads * ranks, params.padded_batch_size, 1],
         [32 * stamp.warps, 1, 1],
     )
-    .programmatic(ctx.tuning().pdl);
+    .programmatic(ctx.tuning().pdl());
     let smem = stamp.smem_over(e4m3);
     let launch = if ranks > 1 {
         launch.cluster(ranks).smem(smem + (8 * head_dim + 8) * 4)
@@ -302,6 +303,9 @@ pub fn decode(
                 Some(s) if !params.partition_kv => s.ptr,
                 _ => 0,
             }),
+            ArgValue::Ptr(params.maybe_custom_mask),
+            ArgValue::Ptr(params.maybe_mask_indptr),
+            ArgValue::Ptr(params.maybe_mask_origin),
             ranks.arg(),
         ],
     )

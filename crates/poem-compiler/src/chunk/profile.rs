@@ -49,17 +49,22 @@ pub struct ChunkProfile {
     /// layer's: the rs list then holds them too. Else a Mamba-2 layer
     /// buffers nothing.
     pub rs_mamba2: bool,
+    /// Whether the backend's recurrent decode steps read a layer's
+    /// buffered rows as a linear attention over them (CUDA): the rs list
+    /// then keeps each row's keys and corrected values (a gated-delta or
+    /// KDA layer's) or its convolved `x | B` (a Mamba-2 layer's) beside its
+    /// conv input and gates, written once, when the row is a fire's own.
+    pub rs_corrected: bool,
+    /// Whether a gated-delta row's corrected planes keep its per-head
+    /// scalars after its corrected values ([`crate::rs::gdn_scalars_bytes`]):
+    /// a backend whose decode reads them (Metal). One that recomputes them
+    /// from the row's `[b | a]` and keys lays none.
+    pub rs_scalars: bool,
     /// The tokens a slot of the kv list holds, where the backend's kernels
-    /// page their rows by a count of their own (and a slot of each window
-    /// list too where `one_window` holds; else a window list still picks
+    /// page their rows by a count of their own (a window list still picks
     /// its own `T_w` no larger); `None` lets the plan choose
     /// ([`super::MIN_RUN`]).
     pub token_slot: Option<u32>,
-    /// Whether every windowed row shares one window list, of the widest
-    /// window: a backend that pages its windowed rows by one table (a row of
-    /// a narrower window then keeps slots its kernels no longer read). Else
-    /// a window list a window.
-    pub one_window: bool,
     /// The context a working set is held to, where the backend knows it: a
     /// window at least this wide keeps every token, so its rows are list
     /// rows.
@@ -74,14 +79,6 @@ impl ChunkProfile {
     pub const fn paged(mut self, tokens: u32, context: u32) -> ChunkProfile {
         self.token_slot = Some(tokens);
         self.full_from = Some(context);
-        self
-    }
-
-    /// The profile with every windowed row in one window list, of the
-    /// widest window ([`ChunkProfile::one_window`]).
-    #[must_use]
-    pub const fn merged(mut self) -> ChunkProfile {
-        self.one_window = true;
         self
     }
 
@@ -100,8 +97,9 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: false,
         rs_mamba2: true,
+        rs_corrected: true,
+        rs_scalars: false,
         token_slot: None,
-        one_window: false,
         full_from: None,
     };
 
@@ -120,8 +118,9 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: true,
         rs_mamba2: false,
+        rs_corrected: true,
+        rs_scalars: true,
         token_slot: None,
-        one_window: false,
         full_from: None,
     };
 
@@ -139,8 +138,9 @@ impl ChunkProfile {
         tma_rows: false,
         state_f32: false,
         rs_mamba2: false,
+        rs_corrected: false,
+        rs_scalars: false,
         token_slot: None,
-        one_window: false,
         full_from: None,
     };
 

@@ -7,4 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-policy = { path = "../../../../crates/policy" }
+plex = { path = "../../../plex-sdk" }
+worker-defaults = { path = "../worker-defaults" }

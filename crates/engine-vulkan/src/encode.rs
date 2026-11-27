@@ -23,6 +23,21 @@ pub fn frame_span_ns() -> u64 {
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit_frame_span(ns: u64) {
     FRAME_SPAN_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    LONGEST_SPAN_NS.with(|longest| longest.set(longest.get().max(ns)));
+}
+
+thread_local! {
+    /// The longest device span of a frame this thread waited on since it
+    /// last took it ([`take_longest_frame_span_ns`]).
+    static LONGEST_SPAN_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The longest device span (first dispatch's start to last's end, by the
+/// device's timestamps) of a frame this thread waited on since it last
+/// asked, while kernels were profiled ([`profile_kernels`]); 0 where none.
+/// What one submission took on the device, apart from any queued ahead of it.
+pub fn take_longest_frame_span_ns() -> u64 {
+    LONGEST_SPAN_NS.with(|longest| longest.replace(0))
 }
 
 static SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -85,6 +100,7 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
     KERNEL_PROFILE.time(name, ns);
+    KERNEL_PROFILE.fire(name);
 }
 
 pub fn reset_kernel_profile() {
@@ -135,7 +151,25 @@ struct Scratch {
     reads: Vec<crate::device::ctx::Span>,
     writes: Vec<crate::device::ctx::Span>,
     sets: Vec<ash::vk::WriteDescriptorSet<'static>>,
+    baked: Vec<(u64, u64, u64)>,
+    /// Each binding's pool segment, where it binds one (below the span's),
+    /// and whether it binds the buffer whole.
+    segments: Vec<Option<(u32, bool)>>,
+    /// Each binding's place in the frame's score room, where it binds the
+    /// room at a binding laid for it: the bytes past the room's byte.
+    rooms: Vec<Option<u64>>,
 }
+
+/// What stands for a pool segment's buffer in a frame's hash: its place,
+/// never the buffer, which a commit or a release changes under a recording
+/// that is rebound ([`crate::device::Context::rebind_segments`]).
+#[cfg(feature = "vulkan")]
+const SEGMENT_TAG: u64 = 0xffff_ffff_0000_0000;
+
+/// What stands for a score room's buffer in a frame's hash: the room's place
+/// is the fire's ([`crate::device::Kept::bind_room`]).
+#[cfg(feature = "vulkan")]
+const ROOM_TAG: u64 = 0xffff_fffe_0000_0000;
 
 #[cfg(feature = "vulkan")]
 pub struct Sink<'a> {
@@ -149,6 +183,10 @@ pub struct Sink<'a> {
     comm: Option<&'a crate::comm::Comm>,
 
     outer: engine_gpu::probe::Recording,
+
+    /// The pool's segments below the span's, by raw buffer, as the walk
+    /// found them placed.
+    segments: std::collections::HashMap<u64, u32>,
 }
 
 #[cfg(feature = "vulkan")]
@@ -163,6 +201,12 @@ impl<'a> Sink<'a> {
         let outer = engine_gpu::probe::set_frame(frame);
 
         LAST_FIRE.with(|cell| cell.set(None));
+        let segments = device
+            .core
+            .segments
+            .lock()
+            .expect("segments lock poisoned")
+            .clone();
         Sink {
             device,
             frame,
@@ -171,6 +215,7 @@ impl<'a> Sink<'a> {
             scratch: std::cell::RefCell::new(Scratch::default()),
             comm: None,
             outer,
+            segments,
         }
     }
 
@@ -235,6 +280,10 @@ impl Encode for Sink<'_> {
         Target::Spirv
     }
 
+    fn fixed_rows(&self) -> bool {
+        self.frame.fixed_rows()
+    }
+
     fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
@@ -280,6 +329,12 @@ impl Sink<'_> {
                 format!("not instantiated at the {} tier", fire.tier.name()),
             )
         })?;
+        let groups = engine_gpu::workgroups(
+            key,
+            fire.groups,
+            self.device.core.limits.max_compute_work_group_count,
+        )
+        .map_err(|fault| Sink::refuse(fire, fault))?;
         let pipeline = self
             .pipelines
             .get(self.device, fire.file, key)
@@ -295,11 +350,17 @@ impl Sink<'_> {
         scratch.push.clear();
         scratch.reads.clear();
         scratch.writes.clear();
-        let (infos, writes_at, extents, push) = (
+        scratch.segments.clear();
+        scratch.rooms.clear();
+        // Where a fired table's zero rows start in the scalars, if any.
+        let mut zeros_from: Option<usize> = None;
+        let (infos, writes_at, extents, push, segments, rooms) = (
             &mut scratch.infos,
             &mut scratch.writes_at,
             &mut scratch.extents,
             &mut scratch.push,
+            &mut scratch.segments,
+            &mut scratch.rooms,
         );
         for arg in args {
             match *arg {
@@ -314,6 +375,23 @@ impl Sink<'_> {
                         );
                         writes_at.push(false);
                         extents.push(0);
+                        segments.push(None);
+                        rooms.push(None);
+                        continue;
+                    }
+                    // A lay-only walk binds nothing: what a buffer argument
+                    // is matters to the commands, not to the block.
+                    if self.frame.lay_only() {
+                        infos.push(
+                            vk::DescriptorBufferInfo::default()
+                                .buffer(dummy.buffer)
+                                .offset(0)
+                                .range(dummy.size),
+                        );
+                        writes_at.push(false);
+                        extents.push(0);
+                        segments.push(None);
+                        rooms.push(None);
                         continue;
                     }
                     let binding = self.handles.get(handle).ok_or_else(|| {
@@ -345,17 +423,67 @@ impl Sink<'_> {
                     );
                     writes_at.push(mutable);
                     extents.push(binding.extent());
-                    self.frame.retain(binding.buffer().slab());
+                    let slab = binding.buffer().slab();
+                    // The score room at a binding laid for it is the fire's
+                    // (a replay binds the room it lays its rows in); a pool
+                    // segment is bound by its place.
+                    let at = infos.len() - 1;
+                    let room = (at < 64 && pipeline.rooms & (1 << at) != 0)
+                        .then_some(self.frame.room)
+                        .flatten()
+                        .filter(|&(room, _)| room == slab.buffer)
+                        .map(|(_, at)| binding.offset().saturating_sub(at));
+                    let segment = room
+                        .is_none()
+                        .then(|| {
+                            self.segments
+                                .get(&ash::vk::Handle::as_raw(slab.buffer))
+                                .map(|&at| {
+                                    (
+                                        at,
+                                        binding.offset() == 0
+                                            && binding.extent() == binding.buffer().bytes(),
+                                    )
+                                })
+                        })
+                        .flatten();
+                    segments.push(segment);
+                    rooms.push(room);
+                    // A recording holds neither a pool segment's buffer nor
+                    // its room's: a segment's release gives the memory back
+                    // (the recording rebound to its stand-in first), and a
+                    // room is its pair's. A walk run once holds them until
+                    // it lands.
+                    if (segment.is_none() && room.is_none()) || !self.frame.kept() {
+                        self.frame.retain(slab);
+                    }
                 }
-                ArgValue::I32(v) => push.extend_from_slice(&v.to_le_bytes()),
-                ArgValue::U32(v) => push.extend_from_slice(&v.to_le_bytes()),
-                ArgValue::F32(v) => push.extend_from_slice(&v.to_le_bytes()),
+                // A scalar after zeros: the zeros lie inside what is kept.
+                ArgValue::I32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::U32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::F32(v) => {
+                    zeros_from = None;
+                    push.extend_from_slice(&v.to_le_bytes());
+                }
+                ArgValue::Zeros(words) => {
+                    // What a lay keeps runs through the last non-zero byte:
+                    // the zeros are laid, not scanned.
+                    zeros_from.get_or_insert(push.len());
+                    push.resize(push.len() + words as usize * 4, 0);
+                }
             }
         }
 
         let declared = pipeline.bindings as usize;
+        let params_at = pipeline.fire.as_ref().map(|fire| fire.binding as usize);
         for at in infos.len()..declared {
-            if pipeline.used[at] {
+            if pipeline.used[at] && Some(at) != params_at {
                 return Err(Sink::backend(
                     fire,
                     format!(
@@ -376,16 +504,77 @@ impl Sink<'_> {
                 ));
             }
         }
-        if push.len() != pipeline.push_bytes as usize {
+        // A module that reads every scalar from the fire block pushes none.
+        let scalars = pipeline
+            .fire
+            .as_ref()
+            .map_or(0, |fire| fire.bytes)
+            .max(pipeline.push_bytes);
+        if push.len() != scalars as usize {
             return Err(Sink::backend(
                 fire,
                 format!(
-                    "the entry pushes {} bytes of scalars but the module declares a {}-byte push block",
+                    "the entry passes {} bytes of scalars but the module declares a {}-byte block",
                     push.len(),
-                    pipeline.push_bytes
+                    scalars
                 ),
             ));
         }
+        // The scalars the kernel reads from the fire block lie there, at a
+        // place the commands name; the rest are pushed and kept with the
+        // recording. The group counts lie there too, for an indirect
+        // dispatch where the frame's shapes differ in them.
+        let limits = &self.device.core.limits;
+        let mut fired_buffer: Option<vk::Buffer> = None;
+        let fired = match pipeline.fire.as_ref() {
+            Some(block) => {
+                let at = block.binding as usize;
+                if at < infos.len() {
+                    return Err(Sink::backend(
+                        fire,
+                        format!("argument {at} is a buffer at the module's fire block"),
+                    ));
+                }
+                let (buffer, place) = self
+                    .frame
+                    .lay_kept(
+                        push,
+                        limits.min_uniform_buffer_offset_alignment,
+                        zeros_from.unwrap_or(push.len()),
+                    )
+                    .map_err(|fault| Sink::refuse(fire, fault))?;
+                fired_buffer = Some(buffer);
+                infos.resize(
+                    at,
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(dummy.buffer)
+                        .offset(0)
+                        .range(dummy.size),
+                );
+                writes_at.resize(at, false);
+                extents.resize(at, 0);
+                segments.resize(at, None);
+                rooms.resize(at, None);
+                infos.push(
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buffer)
+                        .offset(place.1)
+                        .range(u64::from(block.bytes)),
+                );
+                writes_at.push(false);
+                extents.push(0);
+                segments.push(None);
+                rooms.push(None);
+                Some((place, &block.words))
+            }
+            None => None,
+        };
+        let group_words: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        let (indirect, groups_place) = self
+            .frame
+            .lay(&group_words, 4)
+            .map_err(|fault| Sink::refuse(fire, fault))?;
+        let indirect = self.frame.dispatched(groups).then_some(indirect);
         let stated = fire.group.iter().product::<u32>();
         if stated > 1 && fire.group != pipeline.local {
             return Err(Sink::backend(
@@ -397,9 +586,15 @@ impl Sink<'_> {
             ));
         }
 
+        // The kernel, in the frame's picks; a lay-only walk lays no more.
+        self.frame.pick(&key);
+        if self.frame.lay_only() {
+            self.frame.dispatches.set(self.frame.dispatches.get() + 1);
+            return Ok(());
+        }
         let (reads, writes) = (&mut scratch.reads, &mut scratch.writes);
         for (at, info) in infos.iter().enumerate().take(declared) {
-            if !pipeline.used[at] || info.buffer == dummy.buffer {
+            if !pipeline.used[at] || info.buffer == dummy.buffer || Some(at) == params_at {
                 continue;
             }
             let span = crate::device::ctx::Span::new(info.buffer, info.offset, extents[at]);
@@ -414,17 +609,154 @@ impl Sink<'_> {
         if owed {
             BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        {
+            // What the commands carry, but what a fire changes: the kernel,
+            // every binding but the block's (which lies at its place in every
+            // walk laid alike), the pushed scalars the kernel reads, the
+            // barrier. The group counts are the frame's to weigh.
+            use ash::vk::Handle;
+            scratch.baked.clear();
+            scratch.baked.extend(
+                infos
+                    .iter()
+                    .enumerate()
+                    .take(declared)
+                    .filter(|&(at, _)| pipeline.used[at] && Some(at) != params_at)
+                    .map(|(at, info)| {
+                        // A room's view is the fire's: where the room lies and
+                        // where in it the fire's rows do (the fill's
+                        // [`crate::device::Frame::room_past`]).
+                        if scratch.rooms.get(at).copied().flatten().is_some() {
+                            return (ROOM_TAG, 0, 0);
+                        }
+                        match scratch.segments.get(at).copied().flatten() {
+                            Some((segment, true)) => {
+                                (SEGMENT_TAG | u64::from(segment), 0, u64::MAX)
+                            }
+                            Some((segment, false)) => {
+                                (SEGMENT_TAG | u64::from(segment), info.offset, info.range)
+                            }
+                            None => (info.buffer.as_raw(), info.offset, info.range),
+                        }
+                    }),
+            );
+            let mut pushed = push.clone();
+            if let Some((_, words)) = fired {
+                for &(at, len) in words {
+                    pushed[at as usize..(at + len) as usize].fill(0);
+                }
+            }
+            if tracing::enabled!(target: "vkbake", tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: "vkbake",
+                    key,
+                    baked = ?scratch.baked,
+                    fired = ?fired.map(|(place, _)| place),
+                    groups = ?groups_place,
+                    owed,
+                    pushed = ?pushed,
+                    "bake"
+                );
+            }
+            self.frame.bake_dispatch(&(
+                key,
+                &scratch.baked,
+                fired.map(|(place, _)| place),
+                groups_place,
+                owed,
+                pushed,
+            ));
+        }
 
+        // A kept frame's buffer set is the device's for every recording
+        // that binds alike on the arm (its fire block's buffer): keyed by
+        // what the commands bake of its bindings (a pool segment by its
+        // place, a score room by its tag, both written again by a rebind
+        // or a replay).
+        let shared_key = self.frame.kept().then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            scratch.baked.hash(&mut h);
+            fired_buffer.map(ash::vk::Handle::as_raw).hash(&mut h);
+            let key = h.finish();
+            crate::device::ctx::note_tuple(key ^ ash::vk::Handle::as_raw(pipeline.set_layout));
+            key
+        });
+        // Where in the room each room binding lies, the fire's data.
+        for past in scratch.rooms.iter().take(declared).flatten() {
+            self.frame.room_past(*past);
+        }
+        // A fill walk records nothing: what it laid and hashed is its fill.
+        if self.frame.dry {
+            self.frame.dispatches.set(self.frame.dispatches.get() + 1);
+            return Ok(());
+        }
         let core = self.frame.core();
         let d = &core.device;
         let cmd = self.frame.cmd();
-        let set = self
-            .frame
-            .descriptor_set(pipeline.set_layout)
-            .map_err(|fault| Sink::refuse(fire, fault))?;
+        // A held shared set already binds what its key hashes: its
+        // bindings are written once, when it is made.
+        let (set, write) = match shared_key {
+            Some(key) => self.frame.shared_set_fresh(pipeline.set_layout, key),
+            None => self
+                .frame
+                .descriptor_set(pipeline.set_layout)
+                .map(|set| (set, true)),
+        }
+        .map_err(|fault| Sink::refuse(fire, fault))?;
+        // The fire block's set (set 1), the dispatch's place its dynamic
+        // offset: an arm's block's the device's one for the kernel, an
+        // arm-less frame's its own.
+        let fire_set = match (pipeline.fire_layout, fired, fired_buffer) {
+            (Some(layout), Some(((_, at), _)), Some(buffer)) => {
+                let binding = params_at.expect("a fire layout has its binding") as u32;
+                let range = u64::from(pipeline.fire.as_ref().map_or(0, |block| block.bytes));
+                let set = if self.frame.arms_block(buffer) {
+                    self.frame.fire_set(layout, binding, buffer, range)
+                } else {
+                    self.frame.own_fire_set(layout, binding, buffer, range)
+                }
+                .map_err(|fault| Sink::refuse(fire, fault))?;
+                Some((
+                    set,
+                    u32::try_from(at).map_err(|_| {
+                        Sink::backend(fire, format!("the fire block's place {at} past a u32"))
+                    })?,
+                ))
+            }
+            _ => None,
+        };
+        // A recording's pool segments are rebound as they are backed and
+        // given back: where its layout lays the binding update-after-bind;
+        // elsewhere it stands only while the segments do.
+        if self.frame.kept() {
+            for (at, info) in infos.iter().enumerate().take(declared) {
+                if !pipeline.used[at] {
+                    continue;
+                }
+                if let Some(past) = scratch.rooms.get(at).copied().flatten() {
+                    // 0 bytes: to the room's buffer's end, as a view binds.
+                    self.frame.room_binds(set, at as u32, past, 0);
+                    continue;
+                }
+                let Some((segment, whole)) = scratch.segments.get(at).copied().flatten() else {
+                    continue;
+                };
+                if at < 64 && pipeline.segments & (1 << at) != 0 {
+                    let bytes = if whole { u64::MAX } else { info.range };
+                    self.frame
+                        .rebinds(set, at as u32, segment, info.offset, bytes);
+                } else {
+                    self.frame.pin(format!(
+                        "kernel {key} binds pool segment {segment} at binding {at}, which its \
+                         layout does not lay update-after-bind"
+                    ));
+                }
+            }
+        }
         scratch.sets.clear();
         for (at, info) in infos.iter().enumerate().take(declared) {
-            if !pipeline.used[at] {
+            if !write || !pipeline.used[at] || Some(at) == params_at {
                 continue;
             }
 
@@ -434,11 +766,12 @@ impl Sink<'_> {
             // while `infos` is untouched; `sets` is cleared before `infos`
             // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
+            let ty = vk::DescriptorType::STORAGE_BUFFER;
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(at as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_type(ty)
                     .buffer_info(std::slice::from_ref(info)),
             );
         }
@@ -447,25 +780,44 @@ impl Sink<'_> {
         // further sync; every buffer it names is a live slab the frame retains,
         // with offsets and ranges from bound views. `cmd` is the open frame's
         // buffer, recorded only by this sink's thread (`Frame` is not `Sync`).
-        // The push block's length was checked against the layout's range,
-        // and a timestamp index stays below the pool's `capacity * 2`.
+        // The push block's length was checked against the layout's range;
+        // the fire block's uniform and group counts lie in chunks the frame
+        // retains, made with the uniform and indirect usages, at offsets the
+        // device's alignments allow; a timestamp index stays below the
+        // pool's `capacity * 2`.
         unsafe {
             if !scratch.sets.is_empty() {
                 d.update_descriptor_sets(&scratch.sets, &[]);
             }
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
             if declared > 0 {
-                d.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline.layout,
-                    0,
-                    &[set],
-                    &[],
-                );
+                match fire_set {
+                    Some((fire_set, at)) => d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline.layout,
+                        0,
+                        &[set, fire_set],
+                        &[at],
+                    ),
+                    None => d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pipeline.layout,
+                        0,
+                        &[set],
+                        &[],
+                    ),
+                }
             }
-            if !push.is_empty() {
-                d.cmd_push_constants(cmd, pipeline.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+            if pipeline.push_bytes > 0 {
+                d.cmd_push_constants(
+                    cmd,
+                    pipeline.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push[..pipeline.push_bytes as usize],
+                );
             }
 
             if owed {
@@ -501,12 +853,10 @@ impl Sink<'_> {
             if let Some((pool, at)) = timed {
                 d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, at * 2);
             }
-            d.cmd_dispatch(
-                cmd,
-                fire.groups[0].max(1),
-                fire.groups[1].max(1),
-                fire.groups[2].max(1),
-            );
+            match indirect {
+                Some(buffer) => d.cmd_dispatch_indirect(cmd, buffer, groups_place.1),
+                None => d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]),
+            }
             if let Some((pool, at)) = timed {
                 d.cmd_write_timestamp(
                     cmd,
@@ -514,10 +864,13 @@ impl Sink<'_> {
                     pool,
                     at * 2 + 1,
                 );
+            } else {
+                // A timed dispatch is counted where its time is credited, on
+                // every run of it (a kept frame's on every replay).
+                record_kernel(key);
             }
         }
         self.frame.dispatches.set(self.frame.dispatches.get() + 1);
-        record_kernel(key);
         if CAPTURING.load(std::sync::atomic::Ordering::Acquire) {
             use ash::vk::Handle;
             SHAPES
@@ -591,20 +944,37 @@ pub(crate) fn qmm_ladder(
     contraction: u32,
     bank: kernels_slang::Bank,
 ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning.qmm(&at).into_iter().map(qmm_rung).collect()
+}
+
+/// Every rung of the device's `kernel.qmm` ladder a batch of 1 to
+/// `capacity` rows reaches at this shape, as kernels-slang's rungs.
+pub(crate) fn qmm_rungs(
+    tuning: &crate::tuning::Tuning,
+    capacity: u32,
+    columns: u32,
+    contraction: u32,
+    bank: kernels_slang::Bank,
+) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    let at = |rows| tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning
+        .qmm_between(&at(1), &at(capacity.max(1)))
+        .into_iter()
+        .map(qmm_rung)
+        .collect()
+}
+
+fn qmm_rung(rung: crate::tuning::Qmm) -> kernels_slang::linear::qmm::Qmm {
     use crate::tuning::Qmm;
     use kernels_slang::linear::qmm::Qmm as Rung;
-    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
-    tuning
-        .qmm(&at)
-        .iter()
-        .map(|q| match *q {
-            Qmm::Coopmat => Rung::Coopmat,
-            Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
-            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
-            Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
-            Qmm::Qmv { vecs } => Rung::Qmv { vecs },
-        })
-        .collect()
+    match rung {
+        Qmm::Coopmat => Rung::Coopmat,
+        Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
+        Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+        Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
+        Qmm::Qmv { vecs } => Rung::Qmv { vecs },
+    }
 }
 
 /// The range argument `at` binds: the `remaining` bytes of its slab from its

@@ -6,13 +6,13 @@ device = "NVIDIA GeForce RTX 4090"
 # pie tune (quick) on a RunPod NVIDIA GeForce RTX 4090, each line's win end to end on gpt-oss-20b.
 [kernel]
 gemm.heuristics = 4  # 1.5% faster end to end
-mla.expanded_from = 40960  # 1.4% faster end to end
-moe.group_at = 3  # 1.4% faster end to end
+# mla.expanded_from = 40960 reset to its default: the tune timed it 1.4% faster on gpt-oss-20b,
+# which never reads it here (MLA attention; it has none): the win was noise.
 qmm.split_thin_max = 16  # 1.0% faster end to end
 qmm.split_warps_per_sm = 36  # 1.0% faster end to end
-sdpa.decode.static_max_requests = 320  # 2.5% faster end to end
 sdpa.merge_warp = true  # 1.4% faster end to end
-ssm.kda_step_fused = true  # 1.0% faster end to end
+# ssm.kda_step_fused = true reset to its default: the tune timed it 1.0% faster on gpt-oss-20b,
+# which never reads it here (a recurrent (SSM) path; it has none): the win was noise.
 
 # The L40S's sm_89 kernel lines (tensor-core attention, hyper-connection,
 # indexer and MoE paths), the same chip: DeepSeek-V4-Flash's mini raw decode
@@ -35,8 +35,6 @@ elemwise.rows_vec = true
 sdpa.pool_mma = true
 sdpa.selected_mma = true
 sdpa.compressed_replay = true
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 4
 
@@ -61,14 +59,9 @@ gemm.fp8_wide_from = 257
 # 128 lanes; at 65% pf16-512 15.9k to 22.5k tok/s and c256 5.7k to 6.1k.
 [engine]
 working_set_percent = 65
-# A process starts only while the pools hold the started ones to the end, a
-# decoding lane's pages before a waiting prompt's, as the A40, H100, H200 and
-# RTX PRO 6000 profiles: gemma-4-31b mini12 c256 2.01k -> 2.70k,
-# gemma-4-26b-a4b mini c256 1.82k -> 2.59k tok/s. Graph bodies keep their
-# quarter: held to 512 MiB, gpt-oss-20b armed 12 of its 106 compositions,
-# and at 640-768 MiB a guest program's scratch found no room mid-run.
-seated_first = true
-seat_to_end = true
+# Graph bodies keep their quarter: held to 512 MiB, gpt-oss-20b armed 12 of
+# its 106 compositions, and at 640-768 MiB a guest program's scratch found no
+# room mid-run.
 # Eight lattice buckets a doubling past 256 rows, as the L40S: a fire of a
 # batch's prompts pads less (gemma-4-E4B pf16-512 at 4480-row fires 16.6k ->
 # 17.1k tok/s).
@@ -83,12 +76,9 @@ dag_streams_until = 256
 
 [provenance]
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 35.9 -> 35.2 ms, 1-lane step 3.55 -> 3.48 ms, 4-lane step 5.23 -> 5.17 ms, 8-lane step 7.52 -> 7.47 ms, readout cosine 1.0000"
+# `measured` names only what gpt-oss-20b, the tune's model, reads on this device: the tune once listed
+# every decision, since a load counted each as read; those it cannot read are dropped (and reset where set).
 measured = [
-  "kernel.attn.qkv_rows_from",
-  "kernel.attn_res.fused_norm",
-  "kernel.elemwise.hc_mma",
-  "kernel.elemwise.hc_tile",
-  "kernel.elemwise.norm_emit",
   "kernel.elemwise.rows_vec",
   "kernel.gemm.affine_mma",
   "kernel.gemm.fp8_o_down",
@@ -97,17 +87,9 @@ measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.skinny_rows",
   "kernel.gemm.split_rows_from",
-  "kernel.gemm.tc5_raster",
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
   "kernel.gemv.splitk_max_n",
-  "kernel.mla.expanded_from",
-  "kernel.mla.path",
-  "kernel.moe.affine_grouped",
-  "kernel.moe.affine_grouped_from",
-  "kernel.moe.affine_wmma",
-  "kernel.moe.group_at",
-  "kernel.moe.grouped",
   "kernel.moe.mxfp4_cvt",
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
@@ -116,12 +98,6 @@ measured = [
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
   "kernel.moe.mxfp4_wmma",
-  "kernel.moe.nvfp4_mma_from",
-  "kernel.moe.routes_sized",
-  "kernel.moe.tc5",
-  "kernel.moe.tc5_from",
-  "kernel.moe.w4a4_fused_from",
-  "kernel.moe.w4a4_fused_layout",
   "kernel.moe.w4a8_fused_from",
   "kernel.pdl",
   "kernel.qmm.gemm_from",
@@ -130,45 +106,20 @@ measured = [
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
-  "kernel.sdpa.decode.chunk_floor_128",
   "kernel.sdpa.decode.gqa",
   "kernel.sdpa.decode.gqa_cluster",
   "kernel.sdpa.decode.gqa_deep_64",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
-  "kernel.sdpa.index_fp4_tc5",
-  "kernel.sdpa.index_mma",
-  "kernel.sdpa.index_radix",
-  "kernel.sdpa.index_split_until",
-  "kernel.sdpa.index_tc5",
   "kernel.sdpa.merge_warp",
-  "kernel.sdpa.mla_dense_short",
-  "kernel.sdpa.mla_sparse",
-  "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
-  "kernel.sdpa.prefill.tc5",
   "kernel.sdpa.prefill.wide_sliding",
-  "kernel.sdpa.selected_mma",
-  "kernel.ssm.conv_vec4",
-  "kernel.ssm.gdn_fused_scan",
-  "kernel.ssm.gdn_out_bf16",
-  "kernel.ssm.gdn_scan_until",
-  "kernel.ssm.gdn_step_blocks",
-  "kernel.ssm.gdn_tc5",
-  "kernel.ssm.kda_chunked",
-  "kernel.ssm.kda_step_fused",
   "engine.copies",
-  "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
-  "engine.recording",
-  "engine.seated_first",
   "engine.working_set_percent",
   "compiler.branches",
   "compiler.cond_fixed_us",

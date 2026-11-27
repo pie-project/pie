@@ -2,8 +2,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStage, ValueOrigin};
 use eta_ir::Dtype;
-use eta_ir::op::tags;
+use eta_ir::op::{Op, tags};
 use eta_ir::registry::{Port, Stage};
+use eta_ir::types::{Shape, ValueType};
 use eta_ir::validate::Direction;
 
 use super::value::{Value, decode_wire};
@@ -28,6 +29,11 @@ pub struct StagePlan {
     pub value_ids: Vec<u32>,
 
     pub op_by_result: HashMap<u32, usize>,
+
+    /// The stage's ops as the interpreter evaluates them (eta-compiler's
+    /// `eval_op`), by their index among the package stage's ops; empty in a
+    /// plan that is not executable.
+    pub ops: Vec<Op>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +43,10 @@ pub struct ExecPlan {
     pub stages: Vec<StagePlan>,
 
     pub const_ports: Vec<ConstPortValue>,
+
+    /// Every value's type, by its id in the package; empty in a plan that
+    /// is not executable.
+    pub types: Vec<ValueType>,
 
     pub executable: bool,
 
@@ -101,6 +111,16 @@ impl ExecPlan {
                         .any(|p| !p.is_const && p.channel == c && !port_consumes(p.port))))
     }
 
+    /// Whether an op of any stage takes or reads channel `c`: one that only
+    /// ports and inputs name has no reader among the program's kernels.
+    #[must_use]
+    pub fn ops_read_channel(&self, c: u32) -> bool {
+        self.package
+            .stages
+            .iter()
+            .any(|s| s.takes.contains(&c) || s.reads.contains(&c))
+    }
+
     #[must_use]
     pub fn puts_channel(&self, c: u32, at: Stage) -> bool {
         self.stages_at(at)
@@ -147,13 +167,13 @@ pub fn const_port_value(port: &eta_compiler::codegen::launch::LaunchPort) -> Val
     let count = shape_numel(&port.const_shape).max(1) as usize;
     let dtype = port.const_dtype;
     if dtype == Dtype::Bool {
-        let mut values: Vec<u8> = port
+        let mut values: Vec<bool> = port
             .const_data
             .iter()
             .take(count)
-            .map(|&b| u8::from(b != 0))
+            .map(|&b| b != 0)
             .collect();
-        values.resize(count, 0);
+        values.resize(count, false);
         return Value::Bool(values);
     }
     decode_wire(&port.const_data, dtype, count).unwrap_or_else(|| Value::zeros(dtype, count))
@@ -215,6 +235,7 @@ fn rebuild_stage_indexes(package: &LaunchPackage) -> Vec<StagePlan> {
             stage_index,
             value_ids: ids.into_iter().collect(),
             op_by_result,
+            ops: Vec::new(),
         });
     }
     plans
@@ -288,10 +309,23 @@ pub fn adopt_launch_package_with(
         package,
         stages,
         const_ports,
+        types: Vec::new(),
         executable: false,
         reject_reason: None,
     };
     classify_exec_plan(&mut plan);
+    match interpreted(&plan.package) {
+        Ok((ops, types)) => {
+            for (stage, ops) in plan.stages.iter_mut().zip(ops) {
+                stage.ops = ops;
+            }
+            plan.types = types;
+        }
+        Err(why) => {
+            plan.executable = false;
+            plan.reject_reason = Some(why);
+        }
+    }
 
     for stage in &plan.package.stages {
         for op in &stage.ops {
@@ -319,4 +353,43 @@ pub fn adopt_launch_package_with(
     }
 
     Ok(plan)
+}
+
+/// Each stage's ops as the interpreter evaluates them, and every value's
+/// type: what eta-compiler's `eval_op` reads. A launch op or value type the
+/// wire does not decode is named.
+fn interpreted(
+    package: &LaunchPackage,
+) -> std::result::Result<(Vec<Vec<Op>>, Vec<ValueType>), String> {
+    let ops = package
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(at, stage)| {
+            stage
+                .ops
+                .iter()
+                .map(|op| {
+                    op.to_op().ok_or_else(|| {
+                        format!(
+                            "stage {at}: launch op `{}` (value {}) does not decode to an op",
+                            eta_ir::op::spec(op.tag).map_or("?", |row| row.name),
+                            op.result_id
+                        )
+                    })
+                })
+                .collect()
+        })
+        .collect::<std::result::Result<_, String>>()?;
+    let types = package
+        .values
+        .iter()
+        .enumerate()
+        .map(|(id, value)| {
+            Shape::new(&value.shape)
+                .map(|shape| ValueType::new(shape, value.dtype))
+                .ok_or_else(|| format!("value {id}'s shape {:?} is not a shape", value.shape))
+        })
+        .collect::<std::result::Result<_, String>>()?;
+    Ok((ops, types))
 }

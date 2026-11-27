@@ -1,61 +1,43 @@
 #![cfg(target_vendor = "apple")]
+use crate::common::{bytes, f32s, mask_words, u32s, vals};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::{KvPool, PrefillPlan, RaggedTensor, Tensor, attn};
 use poem_ir::Dtype;
 
-fn bf(x: f32) -> f32 {
-    let b = x.to_bits();
-    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff0000)
-}
-fn vals(n: usize, s: u64) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let mut x = (i as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ s;
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
-            bf(((x >> 40) as f32 / 16777216. - 0.5) * 4.)
-        })
-        .collect()
-}
-fn bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
-        .collect()
-}
-fn u32s(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-fn f32s(v: &[u8]) -> Vec<f32> {
-    v.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
-        .collect()
-}
-
 #[test]
 fn mpp_attention_over_a_bf16_pool_matches_fp64() {
+    let _device = crate::device_alone();
     let Ok(dev) = Context::bind() else {
         return;
     };
     // MPP ships with Metal 4, which is what the elastic pool asks of the device too.
-    if !dev.supports_elastic() {
-        return;
-    }
     let handles = Handles::new();
     let pipes = Pipelines::new();
     let tuning = engine_metal::chip::tuning("[kernel]\nsdpa.prefill = \"mpp\"", false);
-    // (head dim, rows, query heads, kv heads, requests, pages per request, first position)
-    for (d, m, qh, kh, requests, np, base) in [
-        (128usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize),
-        (256, 35, 6, 2, 3, 3, 65),
-        (256, 64, 8, 4, 2, 4, 65),
-        (256, 600, 2, 1, 3, 10, 65),
-        (64, 35, 8, 1, 3, 3, 65),
-        (64, 600, 8, 1, 1, 21, 65),
+    // (head dim, rows, query heads, kv heads, requests, pages per request, first
+    // position, tokens a page). The 16-token cases are the page size a served
+    // model's chunk plan builds: the kernel reads a tile's two pages by their
+    // own addresses, and the arbiter takes MPP at both sizes.
+    for (d, m, qh, kh, requests, np, base, page) in [
+        (
+            128usize, 35usize, 6usize, 2usize, 3usize, 3usize, 65usize, 32usize,
+        ),
+        (256, 35, 6, 2, 3, 3, 65, 32),
+        (256, 64, 8, 4, 2, 4, 65, 32),
+        (256, 600, 2, 1, 3, 10, 65, 32),
+        (64, 35, 8, 1, 3, 3, 65, 32),
+        (64, 600, 8, 1, 1, 21, 65, 32),
+        (128, 600, 16, 8, 1, 42, 65, 16),
+        (256, 600, 2, 1, 3, 20, 65, 16),
+        (64, 600, 8, 1, 1, 42, 65, 16),
     ] {
-        let page = 32usize;
+        let form = attn::arbiter::prefill_form(d as u32, page as i32, &tuning);
+        assert_eq!(
+            form,
+            attn::arbiter::PrefillForm::Mpp,
+            "d={d}, {page}-token pages: the arbiter's form"
+        );
         let slots = np * requests * page;
         let k = vals(slots * kh * d, 7);
         let v = vals(k.len(), 19);
@@ -97,13 +79,13 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
         for (window, mode) in [(None, 0u8), (Some(19u32), 1), (None, 1), (None, 2)] {
             let mask: Vec<u8> = (0..m * np * page).map(|i| u8::from(i % 7 != 0)).collect();
             let mb = upload(&mask);
-            let eb = upload(&vec![mode; m]);
+            let eb = upload(&mask_words(&vec![u32::from(mode); m]));
             let plan = PrefillPlan {
                 positions: tensor(&po, m, 1, Dtype::I32),
                 last_page_len: tensor(&po, m, 1, Dtype::I32),
                 request_of_token: tensor(&ow, m, 1, Dtype::I32),
                 mask: tensor(&mb, mask.len(), 1, Dtype::U8),
-                mask_enabled: tensor(&eb, m, 1, Dtype::U8),
+                mask_enabled: tensor(&eb, m, 1, Dtype::U32),
                 mask_stride: (np * page) as u32,
             };
             let scale = 1. / (d as f32).sqrt();
@@ -214,7 +196,6 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
                 .sum::<f64>()
                 / reference.iter().map(|b| b * b).sum::<f64>().max(1e-30))
             .sqrt();
-            eprintln!("d={d} rows={m} window={window:?} mode={mode}: relative rms {rms:.6}");
             assert!(
                 rms < 0.008,
                 "d={d} rows={m} window={window:?} mode={mode}: relative rms {rms}"

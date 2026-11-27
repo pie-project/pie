@@ -214,7 +214,10 @@ pub(crate) fn slot_rows(
     stride: u64,
 ) -> Result<i64, Error> {
     let width = u64::from(bank.width());
-    if width == stride {
+    // one row a slot, padded to whole pool rows past a small state's stride
+    // (the state laid as `engine-xla`'s store lays it): its live stride at
+    // the row's front (`live`)
+    if width >= stride {
         return Ok(1);
     }
     if width != 0 && stride.is_multiple_of(width) {
@@ -232,6 +235,16 @@ pub(crate) fn slot_rows(
             bank.width()
         ),
     ))
+}
+
+/// A slot's live `stride` elements out of the rows `take_slots` read (each
+/// lane's slot, padded past a small state's stride to whole pool rows).
+pub(crate) fn live(f: &mut Func, rows: Val, stride: i64) -> Built<Val> {
+    if f.dims(rows)[1] == stride {
+        Ok(rows)
+    } else {
+        f.slice_axis(rows, 1, 0, stride)
+    }
 }
 
 /// The most lanes `take_slots` slices out of a one-row-per-slot bank row by
@@ -289,6 +302,33 @@ pub(crate) fn take_slots(f: &mut Func, slab: Val, slot: Val, per: i64) -> Built<
             )?;
             return f.reshape(got, &[l, per * width]);
         }
+        // More than one lane: the lanes in a loop, one body in the program
+        // whatever their count. Unrolled, each lane's slice is in the
+        // program, in every layer (a buffered fire's 130 lanes of a 2048-row
+        // state: 47,608 ops of Qwen3.5's program; a 16-lane prefill's slot
+        // moves, half its ops), and its code is the device's to hold: the
+        // loop costs no device time (v6e Qwen3.5, a 512-row prefill over 1 to
+        // 16 lanes and decodes of 4 and 16, within 1%).
+        if l > 1 {
+            let el = f.elem(slab);
+            let none = if el.is_int() {
+                f.const_i(el, 0, &[l, per * width])
+            } else {
+                f.const_f(el, 0.0, &[l, per * width])
+            };
+            let out = f.for_loop(l, &[none, slab, slot], |f, c, a| {
+                let zero = ci(f, 0);
+                let at = f.dynamic_slice(a[2], &[c], &[1])?;
+                let at = f.reshape(at, &[])?;
+                let p = ci(f, per);
+                let row_at = f.mul(at, p)?;
+                let blk = f.dynamic_slice(a[1], &[row_at, zero], &[per, width])?;
+                let blk = f.reshape(blk, &[1, per * width])?;
+                let out = f.dynamic_update_slice(a[0], blk, &[c, zero])?;
+                Ok(vec![out, a[1], a[2]])
+            })?;
+            return Ok(out[0]);
+        }
         let mut out = Vec::with_capacity(l as usize);
         for i in 0..l {
             let at = f.slice_axis(slot, 0, i, i + 1)?;
@@ -331,6 +371,15 @@ pub(crate) fn land_slots(
     rows: Val,
     per: i64,
 ) -> Built<Val> {
+    // a slot padded past its live stride lands zeros there
+    let full = per * f.dims(slab)[1];
+    let have = f.dims(rows)[1];
+    let rows = if have < full {
+        let zero = f.const_f(f.elem(rows), 0.0, &[]);
+        f.pad(rows, zero, &[0, 0], &[0, full - have], &[0, 0])?
+    } else {
+        rows
+    };
     if per == 1 {
         return land_rows(f, slab, slot, write, rows);
     }
@@ -342,24 +391,99 @@ pub(crate) fn land_slots(
         let rows = f.reshape(rows, &[l, per, width])?;
         let zero = ci(f, 0);
         let p = ci(f, per);
+        let blocks = n / per;
+        // Each lane lands its block at its slot, clamped into the bank first
+        // (an out-of-range slot times `per` overflows an i32, and a slice
+        // start out of range clamps: a dropped lane landed on slot 0); a lane
+        // not writing, or routed out of range, lands the block already there.
+        let lane = |f: &mut Func, i: i64| -> Built<(Val, Val)> {
+            let at = f.slice_axis(slot, 0, i, i + 1)?;
+            let at = f.reshape(at, &[])?;
+            let w = f.slice_axis(write, 0, i, i + 1)?;
+            let w = f.reshape(w, &[])?;
+            let lo = ci(f, 0);
+            let hi = ci(f, blocks - 1);
+            let inside = cmp_i(f, Cmp::Ge, at, 0)?;
+            let below = cmp_i(f, Cmp::Lt, at, blocks)?;
+            let inside = f.and(inside, below)?;
+            let lands = f.and(w, inside)?;
+            Ok((f.clamp(lo, at, hi)?, lands))
+        };
         // a pool view lands whole blocks (see `take_slots`)
         if f.is_view(slab) {
-            let mut out = f.reshape(slab, &[n / per, per, width])?;
+            let mut out = f.reshape(slab, &[blocks, per, width])?;
+            // More than one lane: the lanes in a loop (see `take_slots`); a
+            // buffered fire's recurrence lands every lane's block through a
+            // pool view.
+            if l > 1 {
+                let landed = f.for_loop(l, &[out, rows, slot, write], |f, c, a| {
+                    let zero = ci(f, 0);
+                    let at = f.dynamic_slice(a[2], &[c], &[1])?;
+                    let at = f.reshape(at, &[])?;
+                    let w = f.dynamic_slice(a[3], &[c], &[1])?;
+                    let w = f.reshape(w, &[])?;
+                    let lo = ci(f, 0);
+                    let hi = ci(f, blocks - 1);
+                    let inside = cmp_i(f, Cmp::Ge, at, 0)?;
+                    let below = cmp_i(f, Cmp::Lt, at, blocks)?;
+                    let inside = f.and(inside, below)?;
+                    let lands = f.and(w, inside)?;
+                    let at = f.clamp(lo, at, hi)?;
+                    let r_i = f.dynamic_slice(a[1], &[c, zero, zero], &[1, per, width])?;
+                    let held = f.dynamic_slice(a[0], &[at, zero, zero], &[1, per, width])?;
+                    let lands = f.broadcast(lands, &[1, per, width], &[])?;
+                    let r_i = f.select(lands, r_i, held)?;
+                    let out = f.dynamic_update_slice(a[0], r_i, &[at, zero, zero])?;
+                    Ok(vec![out, a[1], a[2], a[3]])
+                })?;
+                return f.reshape(landed[0], &[n, width]);
+            }
             for i in 0..l {
-                let at = f.slice_axis(slot, 0, i, i + 1)?;
-                let at = f.reshape(at, &[])?;
+                let (at, lands) = lane(f, i)?;
                 let r_i = f.slice_axis(rows, 0, i, i + 1)?;
+                let held = f.dynamic_slice(out, &[at, zero, zero], &[1, per, width])?;
+                let lands = f.broadcast(lands, &[1, per, width], &[])?;
+                let r_i = f.select(lands, r_i, held)?;
                 out = f.dynamic_update_slice(out, r_i, &[at, zero, zero])?;
             }
             return f.reshape(out, &[n, width]);
         }
+        // More than one lane: the lanes in a loop (see `take_slots`).
+        if l > 1 {
+            let out = f.for_loop(l, &[slab, rows, slot, write], |f, c, a| {
+                let zero = ci(f, 0);
+                let at = f.dynamic_slice(a[2], &[c], &[1])?;
+                let at = f.reshape(at, &[])?;
+                let w = f.dynamic_slice(a[3], &[c], &[1])?;
+                let w = f.reshape(w, &[])?;
+                let lo = ci(f, 0);
+                let hi = ci(f, blocks - 1);
+                let inside = cmp_i(f, Cmp::Ge, at, 0)?;
+                let below = cmp_i(f, Cmp::Lt, at, blocks)?;
+                let inside = f.and(inside, below)?;
+                let lands = f.and(w, inside)?;
+                let at = f.clamp(lo, at, hi)?;
+                let p = ci(f, per);
+                let row_at = f.mul(at, p)?;
+                let r_i = f.dynamic_slice(a[1], &[c, zero, zero], &[1, per, width])?;
+                let r_i = f.reshape(r_i, &[per, width])?;
+                let held = f.dynamic_slice(a[0], &[row_at, zero], &[per, width])?;
+                let lands = f.broadcast(lands, &[per, width], &[])?;
+                let r_i = f.select(lands, r_i, held)?;
+                let out = f.dynamic_update_slice(a[0], r_i, &[row_at, zero])?;
+                Ok(vec![out, a[1], a[2], a[3]])
+            })?;
+            return Ok(out[0]);
+        }
         let mut out = slab;
         for i in 0..l {
-            let at = f.slice_axis(slot, 0, i, i + 1)?;
-            let at = f.reshape(at, &[])?;
+            let (at, lands) = lane(f, i)?;
             let row_at = f.mul(at, p)?;
             let r_i = f.slice_axis(rows, 0, i, i + 1)?;
             let r_i = f.reshape(r_i, &[per, width])?;
+            let held = f.dynamic_slice(out, &[row_at, zero], &[per, width])?;
+            let lands = f.broadcast(lands, &[per, width], &[])?;
+            let r_i = f.select(lands, r_i, held)?;
             out = f.dynamic_update_slice(out, r_i, &[row_at, zero])?;
         }
         return Ok(out);

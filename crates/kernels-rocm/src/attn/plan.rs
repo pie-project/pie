@@ -102,6 +102,12 @@ pub struct DecodePlan {
     pub shape: Shape,
     pub window: Option<u32>,
     pub device: Device,
+    /// The fire's mask offsets (i64, one a request and one past) and words
+    /// (u32 a request), where it staged them: a decode reading a lane's mask
+    /// finds the lane's here. `plan_decode` leaves them `None`; the engine
+    /// sets them.
+    pub mask_indptr: Option<Tensor>,
+    pub mask_origin: Option<Tensor>,
 }
 
 impl DecodePlan {
@@ -149,8 +155,11 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
-    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
+    /// Per request its mask word (`kernels_cuda`'s `PrefillPlan::mask_origin`):
+    /// the engine binds it beside `mask_indptr`; ROCm's paged prefill takes
+    /// no mask, so nothing here reads it.
+    pub mask_origin: Option<Tensor>,
     pub device: Device,
 }
 
@@ -239,17 +248,14 @@ pub struct Toggles {
     pub chunk_floor_tokens: u32,
 
     pub prefill_ctas_per_sm: u32,
-
-    pub static_max_requests: u32,
 }
 
 impl Toggles {
     #[must_use]
-    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+    pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            chunk_floor_tokens: tuning.decode_chunk_floor_tokens,
-            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
-            static_max_requests: tuning.decode_static_max_requests,
+            chunk_floor_tokens: tuning.decode_chunk_floor_tokens(),
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
         }
     }
 }
@@ -319,36 +325,26 @@ pub fn plan_decode(
     let window_left = window_left(OP, window)?;
 
     let _ = window_left;
-    let built =
-        if sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles) {
-            sched_decode::static_nonsplit(
-                OP,
-                shape.num_requests,
-                live,
-                shape.page_size,
-                enable_cuda_graph,
-                workspace.int_bytes,
-            )?
-        } else {
-            let req = sched_decode::Request {
-                kv_indptr,
-                batch_size: shape.num_requests,
-                live,
-                num_qo_heads: shape.num_q_heads,
-                gqa_group_size: shape.group_size(),
-                page_size: shape.page_size,
-                head_dim: shape.head_dim,
-                enable_cuda_graph,
-                chunk_floor_tokens: toggles.chunk_floor_tokens,
-            };
-            sched_decode::plan(
-                OP,
-                &req,
-                max_grid_size,
-                workspace.int_bytes,
-                workspace.float_bytes,
-            )?
-        };
+    // An eager decode plans as a body does: its keys split while the
+    // lanes' head groups leave the grid unfilled (`sched_decode::estimate`).
+    let req = sched_decode::Request {
+        kv_indptr,
+        batch_size: shape.num_requests,
+        live,
+        num_qo_heads: shape.num_q_heads,
+        gqa_group_size: shape.group_size(),
+        page_size: shape.page_size,
+        head_dim: shape.head_dim,
+        enable_cuda_graph,
+        chunk_floor_tokens: toggles.chunk_floor_tokens,
+    };
+    let built = sched_decode::plan(
+        OP,
+        &req,
+        max_grid_size,
+        workspace.int_bytes,
+        workspace.float_bytes,
+    )?;
 
     Ok(DecodePlan {
         info: built.info,
@@ -359,6 +355,8 @@ pub fn plan_decode(
         shape,
         window,
         device: *device,
+        mask_indptr: None,
+        mask_origin: None,
     })
 }
 
@@ -400,25 +398,7 @@ pub fn plan_prefill(
         ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
-    let (built, capturable, graph_refusal) =
-        match sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph, None),
-            Err(declined) if enable_cuda_graph => {
-                let req = sched_prefill::Request {
-                    enable_cuda_graph: false,
-                    ..req
-                };
-                let built = sched_prefill::plan(
-                    OP,
-                    &req,
-                    device,
-                    workspace.int_bytes,
-                    workspace.float_bytes,
-                )?;
-                (built, false, Some(declined.to_string()))
-            }
-            Err(declined) => return Err(declined),
-        };
+    let built = sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
 
     Ok(PrefillPlan {
         info: built.info,
@@ -430,16 +410,60 @@ pub fn plan_prefill(
         total_tokens,
         window,
         causal,
-        graph_capturable: capturable,
-        graph_refusal,
+        graph_capturable: enable_cuda_graph,
         mask_indptr,
+        mask_origin: None,
         device: *device,
     })
 }
 
-pub use crate::attn::sched_prefill::{
-    graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
-};
+/// The float workspace a captured prefill plan of `rows` rows over `lanes`
+/// lanes lays: its split's partials, or nothing where its layout runs
+/// unsplit. It is [`plan_prefill`]'s own layout of that graph form (one
+/// live request of a row, one page of keys): a captured layout's tile,
+/// split and padded grid follow from its carved rows and lanes alone,
+/// never from the keys or the live rows, so every replay of that body asks
+/// exactly this. The load sizes the prefill grant as the most of it over
+/// the compositions its lattice arms (`engine_cuda::inputs`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_graph_float_bytes(
+    rows: u32,
+    lanes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    page_size: u32,
+    window: Option<u32>,
+    device: &Device,
+    toggles: Toggles,
+) -> Result<usize, Error> {
+    const OP: &str = "attn.plan_prefill";
+    window_left(OP, window)?;
+    // The live request carries a row: the layout reads the carve's rows
+    // (`total_num_rows`), and the live rows only fill its index tables.
+    let qo_indptr = [0, 1];
+    let req = sched_prefill::Request {
+        qo_indptr: &qo_indptr,
+        kv_indptr: &[0, 1],
+        total_num_rows: rows.max(1),
+        batch_size: lanes.max(1),
+        lane_offset: 0,
+        live: Live {
+            requests: 1,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: 1,
+        },
+        num_qo_heads: num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size: page_size.max(1),
+        enable_cuda_graph: true,
+        window_left: window.map(|w| w - 1),
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
+    };
+    Ok(sched_prefill::plan(OP, &req, device, usize::MAX, usize::MAX)?.float_bytes)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(
@@ -489,12 +513,23 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
     }
     #[cfg(feature = "rocm")]
     {
-        // SAFETY: `int_ptr` is the plan's device workspace, sized for the plan
-        // the host bytes describe.
+        // The plan's bytes are the caller's, dropped when its run ends: a
+        // copy from them may run after that, since HIP stages a pageable
+        // source only as it reaches it. A pinned slot of the stream's ring
+        // holds them until an event recorded after the copy fires.
+        let from = pinned::stage(op, ctx.stream(), bytes)?;
+        if crate::sizing::active() {
+            // A size-only walk (`crate::sizing`) moves nothing.
+            return pinned::sent(op, ctx.stream());
+        }
+        // SAFETY: `int_ptr` is the plan's device workspace, sized for the
+        // plan the host bytes describe; `from` is a pinned slot holding a
+        // copy of them, which the ring does not reuse until an event
+        // recorded after this copy fires.
         unsafe {
             crate::hip::memcpy_async(
                 int_ptr as usize as *mut core::ffi::c_void,
-                bytes.as_ptr().cast(),
+                from.cast(),
                 bytes.len(),
                 crate::hip::Direction::HostToDevice,
                 ctx.stream(),
@@ -505,7 +540,8 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
                 op,
                 format!("`hipMemcpyAsync` answered {code} staging the plan"),
             )
-        })
+        })?;
+        pinned::sent(op, ctx.stream())
     }
     #[cfg(not(feature = "rocm"))]
     {
@@ -543,6 +579,9 @@ pub struct PrefillPlanInfo {
     pub v_offset: Option<u32>,
     pub s_offset: Option<u32>,
     pub block_valid_mask_offset: Option<u32>,
+    /// A captured grid's live work items, one i32 staged each fire: the
+    /// prefill lays them in the unpadded grid's order and the rest exit.
+    pub block_live_offset: Option<u32>,
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
 }
@@ -567,4 +606,200 @@ pub struct MlaPlanInfo {
     pub work_indptr_offset: Option<u32>,
     pub partial_o_offset: Option<u32>,
     pub partial_lse_offset: Option<u32>,
+}
+
+/// Forgets the plan ring of `stream` before the caller destroys it
+/// (`pinned::forget_stream`). A no-op without the device runtime.
+pub fn forget_stream(stream: *mut core::ffi::c_void) {
+    #[cfg(feature = "rocm")]
+    pinned::forget_stream(stream.cast());
+    #[cfg(not(feature = "rocm"))]
+    let _ = stream;
+}
+
+/// The pinned host slots a plan's bytes are staged through, a ring a stream,
+/// each slot guarded by an event recorded after the copy that reads it.
+#[cfg(feature = "rocm")]
+mod pinned {
+    use super::{Error, refuse};
+    use crate::hip::rt;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// Slots before a stage waits for the oldest copy rather than grow.
+    const MOST: usize = 64;
+    /// The least a slot holds, so a batch's plans growing by a few rows
+    /// reuse what warm launches allocated.
+    const LEAST: usize = 64 << 10;
+    /// `hipErrorNotReady`: an event's work is still queued.
+    const NOT_READY: i32 = 600;
+    /// `hipEventDisableTiming`.
+    const DISABLE_TIMING: u32 = 2;
+
+    struct Slot {
+        host: *mut u8,
+        bytes: usize,
+        read: rt::Event,
+    }
+
+    struct Ring {
+        slots: Vec<Slot>,
+        next: usize,
+    }
+
+    // SAFETY: a ring holds page-locked allocations and events, runtime
+    // handles any thread may use; it is reached only under its lock.
+    unsafe impl Send for Ring {}
+
+    /// Every stream's ring, by its device and handle: each its own lock, so
+    /// a stage waiting out its stream's oldest copy holds back no other's.
+    static RINGS: Mutex<BTreeMap<(i32, usize), &'static Mutex<Ring>>> = Mutex::new(BTreeMap::new());
+
+    fn on_ring<R>(
+        op: &'static str,
+        stream: rt::Stream,
+        f: impl FnOnce(&mut Ring) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let device = crate::jit::cache::current_device()
+            .map_err(|fault| refuse(op, format!("staging the plan: {fault}")))?;
+        let ring: &'static Mutex<Ring> = RINGS
+            .lock()
+            .expect("plan rings lock poisoned")
+            .entry((device, stream as usize))
+            .or_insert_with(|| {
+                Box::leak(Box::new(Mutex::new(Ring {
+                    slots: Vec::new(),
+                    next: 0,
+                })))
+            });
+        f(&mut ring.lock().expect("plan ring lock poisoned"))
+    }
+
+    fn check(op: &'static str, what: &str, code: i32) -> Result<(), Error> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(refuse(
+                op,
+                format!("`{what}` answered {code} staging the plan"),
+            ))
+        }
+    }
+
+    /// `bytes` copied into the ring's next slot, waiting out the copy that
+    /// last read it; the slot's address.
+    pub(super) fn stage(
+        op: &'static str,
+        stream: rt::Stream,
+        bytes: &[u8],
+    ) -> Result<*const u8, Error> {
+        on_ring(op, stream, |ring| {
+            let at = ring.next;
+            // The slot at `at` is the oldest a copy read; one still queued
+            // gets a new slot before it, which keeps it the oldest.
+            let queued = at < ring.slots.len() && {
+                // SAFETY: an event this ring created.
+                let code = unsafe { rt::hipEventQuery(ring.slots[at].read) };
+                if code == NOT_READY {
+                    true
+                } else {
+                    check(op, "hipEventQuery", code)?;
+                    false
+                }
+            };
+            if queued && ring.slots.len() >= MOST {
+                // SAFETY: an event this ring created.
+                check(op, "hipEventSynchronize", unsafe {
+                    rt::hipEventSynchronize(ring.slots[at].read)
+                })?;
+            } else if queued || ring.slots.len() <= at {
+                let mut read: rt::Event = core::ptr::null_mut();
+                // SAFETY: an out-pointer for a new event.
+                check(op, "hipEventCreateWithFlags", unsafe {
+                    rt::hipEventCreateWithFlags(&raw mut read, DISABLE_TIMING)
+                })?;
+                ring.slots.insert(
+                    at,
+                    Slot {
+                        host: core::ptr::null_mut(),
+                        bytes: 0,
+                        read,
+                    },
+                );
+            }
+            let slot = &mut ring.slots[at];
+            if slot.bytes < bytes.len() {
+                if !slot.host.is_null() {
+                    // SAFETY: a page-locked allocation this slot owns, its
+                    // last copy run (the event above).
+                    unsafe { rt::hipHostFree(slot.host.cast()) };
+                    slot.host = core::ptr::null_mut();
+                    slot.bytes = 0;
+                }
+                let size = bytes.len().next_power_of_two().max(LEAST);
+                let mut host: *mut core::ffi::c_void = core::ptr::null_mut();
+                // SAFETY: an out-pointer for a new page-locked allocation.
+                check(op, "hipHostMalloc", unsafe {
+                    rt::hipHostMalloc(&raw mut host, size, 0)
+                })?;
+                slot.host = host.cast();
+                slot.bytes = size;
+            }
+            // SAFETY: the slot holds at least `bytes.len()` and no copy reads it.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.host, bytes.len()) };
+            Ok(slot.host.cast_const())
+        })
+    }
+
+    /// Forgets what `stream` recorded in its ring, before it is destroyed:
+    /// each slot's event waits (the stream still live) and is made again,
+    /// unrecorded, and the ring leaves the map, so a later stream at the
+    /// same address starts a ring of its own. A query of an event whose
+    /// stream was destroyed reads freed state (on ROCm, a lock no thread
+    /// holds, so the query waits forever).
+    pub(crate) fn forget_stream(stream: rt::Stream) {
+        let Ok(device) = crate::jit::cache::current_device() else {
+            return;
+        };
+        // A poisoned ring's slots are not to be trusted: their events stay
+        // undestroyed rather than read (a teardown never panics).
+        let Ok(mut rings) = RINGS.lock() else {
+            return;
+        };
+        let Some(ring) = rings.remove(&(device, stream as usize)) else {
+            return;
+        };
+        drop(rings);
+        let Ok(mut ring) = ring.lock() else {
+            return;
+        };
+        for slot in &mut ring.slots {
+            // SAFETY: the slot's own event, recorded only on `stream`, which
+            // is live until its caller destroys it after this returns.
+            unsafe {
+                let _ = rt::hipEventSynchronize(slot.read);
+                let _ = rt::hipEventDestroy(slot.read);
+                if !slot.host.is_null() {
+                    // The slot's last copy ran (the event above).
+                    let _ = rt::hipHostFree(slot.host.cast());
+                }
+            }
+            slot.host = core::ptr::null_mut();
+            slot.bytes = 0;
+        }
+        ring.slots.clear();
+        ring.next = 0;
+    }
+
+    /// The slot `stage` handed out is read once `stream` runs to here.
+    pub(super) fn sent(op: &'static str, stream: rt::Stream) -> Result<(), Error> {
+        on_ring(op, stream, |ring| {
+            let at = ring.next;
+            ring.next = (at + 1) % ring.slots.len();
+            // SAFETY: an event this ring created, on the caller's stream.
+            check(op, "hipEventRecord", unsafe {
+                rt::hipEventRecord(ring.slots[at].read, stream)
+            })
+        })
+    }
 }

@@ -5,25 +5,18 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .map_err(|error| format!("the metal boot config is not utf-8: {error}"))?
         .parse()
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
-    let profiles = profiles(&doc)?;
+    let profiles = dir(&doc, "profiles")?;
+    let cache = dir(&doc, "cache")?;
     crate::diag::publish(&diagnostics(&doc)?);
     Ok(Metal::new(
         DeviceBoot {
-            adapter_dir: adapter_dir(&doc),
             profiles,
+            cache,
+            measure: measure(&doc)?,
+            ..DeviceBoot::default()
         },
         contract_for,
     ))
-}
-
-fn adapter_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
-    doc.get("model")
-        .and_then(toml::Value::as_table)
-        .and_then(|model| model.get("adapter_dir"))
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-        .map(std::path::PathBuf::from)
 }
 
 fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
@@ -42,15 +35,30 @@ fn diagnostics(doc: &toml::Table) -> Result<crate::diag::Diagnostics, String> {
         .map_err(|error| format!("[metal] diagnostics: {error}"))
 }
 
-fn profiles(doc: &toml::Table) -> Result<Option<std::path::PathBuf>, String> {
+/// `[metal] measure`: `false` skips every measurement a load would take
+/// (`engine::rates::Measuring::Skip`); unstated, a load measures.
+fn measure(doc: &toml::Table) -> Result<engine::rates::Measuring, String> {
+    match doc
+        .get("metal")
+        .and_then(toml::Value::as_table)
+        .and_then(|metal| metal.get("measure"))
+    {
+        None => Ok(engine::rates::Measuring::Time),
+        Some(toml::Value::Boolean(measure)) => Ok(engine::rates::Measuring::of(*measure)),
+        Some(other) => Err(format!("[metal] measure is true or false, not {other}")),
+    }
+}
+
+/// `[metal] <key>`, a directory path; unstated or empty is `None`.
+fn dir(doc: &toml::Table, key: &str) -> Result<Option<std::path::PathBuf>, String> {
     let Some(metal) = doc.get("metal").and_then(toml::Value::as_table) else {
         return Ok(None);
     };
-    match metal.get("profiles") {
+    match metal.get(key) {
         None => Ok(None),
         Some(toml::Value::String(dir)) if dir.trim().is_empty() => Ok(None),
         Some(toml::Value::String(dir)) => Ok(Some(std::path::PathBuf::from(dir))),
-        Some(other) => Err(format!("[metal] profiles is a directory path, not {other}")),
+        Some(other) => Err(format!("[metal] {key} is a directory path, not {other}")),
     }
 }
 
@@ -70,7 +78,6 @@ mod tests {
         a_boot_document_that_says_nothing_about_this_engine_still_opens();
         a_boot_document_that_is_not_toml_is_refused_at_the_door();
         the_diagnostics_word_list_is_read_or_refused_by_name();
-        the_shared_adapter_directory_is_read_and_an_empty_one_is_off();
         the_profiles_directory_is_read_or_refused_by_name();
     }
 
@@ -101,19 +108,8 @@ mod tests {
         assert!(open(b"[metal]\ndiagnostics = \"teir-trace\"\n", nothing).is_err());
     }
 
-    fn the_shared_adapter_directory_is_read_and_an_empty_one_is_off() {
-        let read = |text: &str| adapter_dir(&text.parse::<toml::Table>().expect("valid TOML"));
-        assert_eq!(
-            read("[model]\nadapter_dir = \"/srv/pie/shared\""),
-            Some(std::path::PathBuf::from("/srv/pie/shared"))
-        );
-        assert_eq!(read("[model]\nadapter_dir = \"  \""), None, "empty is off");
-        assert_eq!(read("[model]"), None, "and so is absent");
-        assert_eq!(read(""), None);
-    }
-
     fn the_profiles_directory_is_read_or_refused_by_name() {
-        let of = |src: &str| super::profiles(&src.parse::<toml::Table>().unwrap());
+        let of = |src: &str| super::dir(&src.parse::<toml::Table>().unwrap(), "profiles");
         assert_eq!(of(""), Ok(None));
         assert_eq!(
             of("[metal]\nprofiles = \"/home/p/.pie/profiles\"\n"),

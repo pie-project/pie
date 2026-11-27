@@ -17,6 +17,22 @@ pub const FACTS: &[Var] = &[
 
 pub const AXES: &[&str] = &["rows"];
 
+/// The most command buffers the device's driver holds live, a fact of the
+/// device stated in its committed profile where measured (past it a driver
+/// may hand back a dead buffer, with no error, and fault on its first use):
+/// the arm walk stops below it, the rest stated eager. 0: none stated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.max_live_command_buffers", constant(range(0..=1_000_000)), default = 0, tune = never)]
+pub struct MaxLiveCommandBuffers(pub u32);
+
+/// The most memory maps the device's host lets a process hold
+/// (vm.max_map_count), stated in its profile for a host that does not let
+/// the process read it (Android): the arm walk keeps its recordings' maps
+/// under it. 0: none stated (read from the host where it can be).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "engine.max_map_count", constant(range(0..=100_000_000)), default = 0, tune = never)]
+pub struct MaxMapCount(pub u32);
+
 /// The kernel a dense affine-quantised matmul runs: the first rung whose
 /// shape it fits that can run. `fill` is how full the device is: eighths of
 /// a wave of 32x64 output tiles over its cores, so a rung can say "fills the
@@ -98,13 +114,31 @@ impl Qmm {
     }
 }
 
-/// How unquantised matmuls read prompt rows.
+/// How unquantised matmuls read prompt rows, by the rows a fire lands: the
+/// cooperative-matrix tile is 64 rows tall, so below its crossover it
+/// launches a row of workgroups that each walk the whole contraction, and
+/// the tiled or register-tiled kernel lands the same rows sooner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.path", default = "tiled", tune = search)]
+#[decision(id = "kernel.gemm.path", shape(rows), default = "tiled", tune = search)]
 pub enum GemmPath {
     Tiled,
     #[requires("coopmat")]
     Coopmat,
+}
+
+/// Cooperative-matrix tiles where the path takes them.
+fn gemm_tactic(coopmat: bool) -> kernels_slang::linear::gemm::Tactic {
+    kernels_slang::linear::gemm::Tactic {
+        tier: if coopmat {
+            kernels_slang::Tier::Coopmat
+        } else {
+            kernels_slang::Tier::Baseline
+        },
+        vector: 0,
+        // The wide tile where no cooperative matrix serves: the matmul curve
+        // is timed on it; a load weighs both tiles a rung.
+        wide: true,
+    }
 }
 
 /// How routed (mixture-of-experts) matmuls read their sorted rows.
@@ -161,7 +195,9 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeSplit>()
         .add::<DecodeSplitMinKeys>()
         .add::<DecodeThreads>()
-        .add::<SdpaTileRows>();
+        .add::<SdpaTileRows>()
+        .add::<MaxLiveCommandBuffers>()
+        .add::<MaxMapCount>();
 }
 
 /// The point a dense matmul is chosen at on a device with `cores` cores.
@@ -236,9 +272,47 @@ impl Tuning {
             .collect()
     }
 
+    /// Every rung a batch between the shapes `first` and `last` (one row
+    /// and the most a fire holds, the other widths the same) reaches: its
+    /// region meets the shapes between them and it fits one of the two,
+    /// since a rung tells rows apart only at one row ([`Qmm::fits_shape`]).
     #[must_use]
-    pub fn gemm_coopmat(&self) -> bool {
-        *self.profile.get::<GemmPath>() == GemmPath::Coopmat
+    pub fn qmm_between(&self, first: &QmmAt, last: &QmmAt) -> Vec<Qmm> {
+        use profile::Point as _;
+        let cell: Vec<profile::Set> = (0..Qmm::spec().vars.len())
+            .map(|var| match (first.coord(var), last.coord(var)) {
+                (Some(lo), Some(hi)) => profile::Set::span(lo, hi),
+                _ => unreachable!("a `kernel.qmm` point states every variable"),
+            })
+            .collect();
+        self.profile
+            .ladder::<Qmm>()
+            .meeting(&cell)
+            .filter(|rung| rung.fits(first) || rung.fits(last))
+            .copied()
+            .collect()
+    }
+
+    /// Whether a dense matmul over `rows` rows takes cooperative matrices.
+    #[must_use]
+    pub fn gemm_coopmat(&self, rows: u32) -> bool {
+        let at = GemmPathAt {
+            rows: i64::from(rows),
+        };
+        *self.profile.pick::<GemmPath>(&at) == GemmPath::Coopmat
+    }
+
+    /// Every path a dense matmul of 1 to `capacity` rows takes, in the
+    /// profile's order.
+    #[must_use]
+    pub fn gemm_paths(&self, capacity: u32) -> Vec<GemmPath> {
+        let rows = [profile::Set::span(1, i64::from(capacity.max(1)))];
+        self.profile
+            .ladder::<GemmPath>()
+            .reached(&rows)
+            .into_iter()
+            .copied()
+            .collect()
     }
 
     #[must_use]
@@ -303,6 +377,16 @@ impl engine_gpu::backend::Tactics for Tuning {
         crate::encode::qmm_ladder(self, rows, columns, contraction, bank)
     }
 
+    fn qmm_rungs(
+        &self,
+        capacity: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        crate::encode::qmm_rungs(self, capacity, columns, contraction, bank)
+    }
+
     /// The subgroup tier where every subgroup holds a 32-lane strip; four
     /// strips a workgroup, the 4090's best at every scheme and row count
     /// measured (kernels-slang.md §15).
@@ -317,15 +401,25 @@ impl engine_gpu::backend::Tactics for Tuning {
         }
     }
 
-    /// Cooperative-matrix tiles where the profile takes them.
-    fn gemm(&self, _tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic {
-        kernels_slang::linear::gemm::Tactic {
-            tier: if self.gemm_coopmat() {
-                kernels_slang::Tier::Coopmat
-            } else {
-                kernels_slang::Tier::Baseline
-            },
+    /// Cooperative-matrix tiles where the profile takes them at `rows`.
+    fn gemm(&self, _tier: kernels_slang::Tier, rows: u32) -> kernels_slang::linear::gemm::Tactic {
+        gemm_tactic(self.gemm_coopmat(rows))
+    }
+
+    /// The tactic of each path the profile takes over those rows.
+    fn gemm_tactics(
+        &self,
+        _tier: kernels_slang::Tier,
+        capacity: u32,
+    ) -> Vec<kernels_slang::linear::gemm::Tactic> {
+        let mut tactics = Vec::new();
+        for path in self.gemm_paths(capacity) {
+            let tactic = gemm_tactic(path == GemmPath::Coopmat);
+            if !tactics.contains(&tactic) {
+                tactics.push(tactic);
+            }
         }
+        tactics
     }
 
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
@@ -381,6 +475,10 @@ impl engine_gpu::backend::Tactics for Tuning {
     fn sdpa_split_groups(&self) -> u32 {
         Tuning::sdpa_split_groups(self)
     }
+
+    fn workgroup_bytes(&self) -> u32 {
+        self.limits.shared_bytes
+    }
 }
 
 #[cfg(test)]
@@ -400,5 +498,58 @@ mod tests {
             t.qmm(&t.qmm_at(64, 4096, 4100, 4, 64))[0],
             Qmm::Qmv { vecs: 4 }
         );
+    }
+
+    /// Regression (dace48ed3): a load whose rows cross a measured
+    /// `kernel.gemm.path` crossover names the pipelines of both paths, so no
+    /// serving fire builds one; below the crossover it names no
+    /// cooperative-matrix pipeline.
+    #[test]
+    fn a_row_crossover_inside_the_load_names_both_paths_pipelines() {
+        use engine_gpu::backend::Tactics as _;
+        use kernels_slang::linear::gemm;
+
+        let mut r = Registry::new("vulkan-test", FACTS, AXES);
+        register(&mut r);
+        let (profile, report) = r.read(&[profile::Candidate {
+            source: profile::Source::User("crossover".into()),
+            text: "api = 1\n[target]\nassumes = { coopmat = true }\n[kernel]\n\
+                   gemm.path = [{ when = \"rows < 96\", use = \"tiled\" }, \"coopmat\"]\n"
+                .into(),
+        }]);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        let t = Tuning::new(profile, Limits::ASSUMED);
+        let tier = kernels_slang::Tier::Coopmat;
+        let kernels = |tactic| {
+            gemm::kernels(
+                kernels_slang::Target::Spirv,
+                tactic,
+                "linear.matmul",
+                1024,
+                1024,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|fire| (fire.entrypoint, fire.tier))
+            .collect::<Vec<_>>()
+        };
+        let coopmat = ("linear_gemm_tiled_bm_64_bf16", kernels_slang::Tier::Coopmat);
+        for capacity in [95, 96, 256] {
+            let named: Vec<_> = t
+                .gemm_tactics(tier, capacity)
+                .into_iter()
+                .flat_map(kernels)
+                .collect();
+            for rows in 1..=capacity {
+                for kernel in kernels(t.gemm(tier, rows)) {
+                    assert!(
+                        named.contains(&kernel),
+                        "a fire of {rows} rows takes {kernel:?}, which a load of up to \
+                         {capacity} rows did not name"
+                    );
+                }
+            }
+            assert_eq!(named.contains(&coopmat), capacity >= 96, "{capacity} rows");
+        }
     }
 }

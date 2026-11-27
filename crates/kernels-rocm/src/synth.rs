@@ -464,7 +464,7 @@ impl Synthesized {
         let schedule = Schedule::of(
             self.width,
             rows.saturating_mul(parts),
-            ctx.multiprocessors().unwrap_or(1),
+            ctx.multiprocessors("synth.fire")?,
         );
         self.fire_laid(ctx, ins, outs, (rows, parts), schedule)
     }

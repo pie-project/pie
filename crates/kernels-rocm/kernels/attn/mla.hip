@@ -50,6 +50,10 @@ __global__ void mla_split_q_b(const T* __restrict__ q_b, T* __restrict__ q_nope,
 // WT·16·MS tokens, its four waves WN along N by WT along the tokens; a stage
 // 64 of K, the weight through LDS as [n][k] (KN transposed on the way in),
 // each wave's tokens straight to its registers.
+// A 16-byte weight piece as one vector value, so its copies stay in
+// registers (a struct's go through private memory).
+typedef u32 WPiece __attribute__((ext_vector_type(4)));
+
 template <bool KN, int WT, int MS>
 __global__ __launch_bounds__(256) void mla_absorb(const bf16* __restrict__ x, const bf16* __restrict__ w,
                                                   bf16* __restrict__ y, int tokens, int n, int k, int ldx, int ldy,
@@ -70,26 +74,29 @@ __global__ __launch_bounds__(256) void mla_absorb(const bf16* __restrict__ x, co
 
     // A thread's 16-byte pieces of a weight stage, piece p = tid + 256 i: KN
     // row p / 8 of the stage, columns 8 (p % 8) ..; else row n = p / 8, k
-    // 8 (p % 8) ...
-    auto wload = [&](int s, Pack8<bf16> (&v)[WL]) {
+    // 8 (p % 8) ... Held as words, not as `Pack8`: a struct's copies keep
+    // the pieces in private memory, and a private segment has ROCr grow the
+    // queue's scratch at the kernel's first dispatch.
+    auto wload = [&](int s, WPiece (&v)[WL]) {
 #pragma unroll
         for (int i = 0; i < WL; ++i) {
             const int p = tid + 256 * i, r = KN ? p / 8 : p / (KC / 8), c = KN ? 8 * (p % 8) : 8 * (p % (KC / 8));
             if constexpr (KN)
-                v[i] = *reinterpret_cast<const Pack8<bf16>*>(wh + static_cast<long long>(s * KC + r) * n + n0 + c);
+                v[i] = *reinterpret_cast<const WPiece*>(wh + static_cast<long long>(s * KC + r) * n + n0 + c);
             else
-                v[i] = *reinterpret_cast<const Pack8<bf16>*>(wh + static_cast<long long>(n0 + r) * k + s * KC + c);
+                v[i] = *reinterpret_cast<const WPiece*>(wh + static_cast<long long>(n0 + r) * k + s * KC + c);
         }
     };
-    auto wstore = [&](const Pack8<bf16> (&v)[WL], int b) {
+    auto wstore = [&](const WPiece (&v)[WL], int b) {
 #pragma unroll
         for (int i = 0; i < WL; ++i) {
             const int p = tid + 256 * i, r = KN ? p / 8 : p / (KC / 8), c = KN ? 8 * (p % 8) : 8 * (p % (KC / 8));
             if constexpr (KN) {
+                const Pack8<bf16> e = __builtin_bit_cast(Pack8<bf16>, v[i]);
 #pragma unroll
-                for (int j = 0; j < 8; ++j) wl[b][(c + j) * PITCH + r] = v[i].v[j];
+                for (int j = 0; j < 8; ++j) wl[b][(c + j) * PITCH + r] = e.v[j];
             } else {
-                *reinterpret_cast<Pack8<bf16>*>(&wl[b][r * PITCH + c]) = v[i];
+                *reinterpret_cast<WPiece*>(&wl[b][r * PITCH + c]) = v[i];
             }
         }
     };
@@ -104,7 +111,7 @@ __global__ __launch_bounds__(256) void mla_absorb(const bf16* __restrict__ x, co
 #pragma unroll
         for (int ms = 0; ms < MS; ++ms) acc[nb][ms] = mfma_zero();
     mfma_ab2 xb[MS][H2];
-    Pack8<bf16> wv[WL];
+    WPiece wv[WL];
     wload(0, wv);
 #pragma unroll
     for (int ms = 0; ms < MS; ++ms)

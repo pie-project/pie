@@ -66,28 +66,11 @@ impl ForwardHybrid for Micro {
 fn shell(trace: poem::Trace, path: &Path) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(1, 64),
-        patches: None,
-        page_size: 16,
-        context: 256,
-        slots: 1,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
+        ..crate::common::boot(trace, &contract, path, Budget::new(1, 64), 256, 1)
     })
     .expect("the shell loads");
     shell.open(0).expect("the slot opens");
@@ -152,21 +135,45 @@ fn bind(shell: &mut Shell) -> engine::InstanceId {
         .expect("the program registers");
     let count = bound.container.channels.len();
     let ids: Vec<engine::ChannelId> = (1..=count as u64).map(engine::ChannelId).collect();
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| false,
+    );
+    let extents = Extents {
+        row_count: ROWS,
+        token_count: ROWS,
+        sampled_rows: ROWS,
+        query_len: ROWS,
+        ..Extents::default()
+    };
+    let (scratch, pair) = guest.places(
+        (program, extents),
+        &shell
+            .guest_state(program, extents)
+            .expect("the program's guest state"),
+    );
     shell
         .bind_program(
             program,
             &[],
-            Extents {
-                row_count: ROWS,
-                token_count: ROWS,
-                sampled_rows: ROWS,
-                query_len: ROWS,
-                ..Extents::default()
-            },
+            extents,
             GeometryClass::DecodeEnvelope,
             PortMask::of(&[Port::EmbedTokens, Port::Positions]),
             &vec![None; count],
             &ids,
+            engine_cuda::program::Slots {
+                instance: slots.0,
+                rings: slots.1,
+                scratch,
+                pair,
+                pair_generation: 0,
+            },
         )
         .expect("the instance binds")
 }

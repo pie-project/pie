@@ -2,9 +2,8 @@
 
 //! Pins the affine `qmv_rows` kernel to an absolute, hand-built reference.
 //!
-//! The companion test `a_quantized_matmul_is_priced_by_its_rows` proves the
-//! folded kernel answers the *one-row* kernel identically. That is a relative
-//! check: if both kernels shared a bug it would say nothing. This test builds
+//! Checking the folded kernel against the *one-row* kernel alone would be a
+//! relative check: if both kernels shared a bug it would say nothing. This test builds
 //! affine-quantized weights and a bf16 activation in-process, dequantizes the
 //! weights back to f32 and computes the matmul in **f64** as ground truth, then
 //! drives the Metal `qmv_rows` kernel over the full dispatch grid and asserts
@@ -20,6 +19,7 @@
 //!   group size   in {32, 64, 128}
 //!   bit width    in {2, 4, 8}
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -30,21 +30,6 @@ use poem_ir::Dtype;
 const K: u32 = 2048; // contraction; a multiple of every group size and pack width
 const N: u32 = 256; // output columns
 const ROWS_MAX: u32 = 33; // the widest row_count we launch
-
-/// Splitmix-style byte noise, deterministic per index.
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-/// Store an f32 as bf16 exactly the way the kernel's inputs are laid down:
-/// keep the high 16 bits (truncation). Little-endian pair.
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
 
 /// The f64 value the kernel actually sees after a bf16 input store: the same
 /// top-16-bit truncation `bf16` applies, promoted back. Using this in the
@@ -92,13 +77,13 @@ fn rungs(packs: i32, bits: i32) -> &'static [i32] {
 
 #[test]
 fn the_folded_qmv_answers_the_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
     };
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    eprintln!("device: {}", device.name());
 
     let (k, n) = (K, N);
     let row_counts: Vec<u32> = (1..=17u32).chain([31, 32, 33]).collect();
@@ -174,14 +159,11 @@ fn the_folded_qmv_answers_the_reference() {
     const BF16_ULP: f64 = 1.0 / 256.0; // 2^-8
     const ACCUM: f64 = 1.0 / 512.0; // 2^-9: the measured relaxed-float device floor + margin
 
-    let mut points = 0usize;
-    let mut launches = 0usize;
     let mut worst_rel = 0.0f64;
     let mut worst_ratio = 0.0f64; // |err| / allowed; must stay < 1
     let mut failures: Vec<String> = Vec::new();
     // Per-bit-width worst device error as a fraction of |term| mass: the
     // relaxed-float accumulation floor the ACCUM budget is justified against.
-    let mut em = std::collections::BTreeMap::<i32, f64>::new();
 
     for &bits in &[2i32, 4, 8] {
         let ubits = bits.unsigned_abs();
@@ -258,7 +240,6 @@ fn the_folded_qmv_answers_the_reference() {
                     else {
                         continue;
                     };
-                    points += 1;
                     let (ki, ni) = (k as i32, n as i32);
                     for &m in &row_counts {
                         let mi = m as i32;
@@ -287,7 +268,6 @@ fn the_folded_qmv_answers_the_reference() {
                         )
                         .expect("the fold");
                         frame.commit().expect("commit");
-                        launches += 1;
 
                         let got = read(m);
                         for r in 0..m as usize {
@@ -300,9 +280,6 @@ fn the_folded_qmv_answers_the_reference() {
                                 let rel = err / want.abs().max(have.abs()).max(1e-6);
                                 worst_rel = worst_rel.max(rel);
                                 worst_ratio = worst_ratio.max(err / allowed.max(f64::MIN_POSITIVE));
-                                let m_here = mass[r * nn + col].max(f64::MIN_POSITIVE);
-                                let e = em.entry(bits).or_insert(0.0);
-                                *e = e.max(err / m_here);
                                 if err > allowed && failures.len() < 12 {
                                     failures.push(format!(
                                         "{} m={m} row={r} col={col}: want {want:.6} got {have:.6} \
@@ -318,19 +295,6 @@ fn the_folded_qmv_answers_the_reference() {
         }
     }
 
-    eprintln!(
-        "swept {points} stamped points x {} row counts = {launches} launches against f64 truth",
-        row_counts.len()
-    );
-    eprintln!(
-        "worst relative error {worst_rel:.3e}; worst |err|/allowed {worst_ratio:.3} (must be < 1)"
-    );
-    for (b, v) in &em {
-        eprintln!(
-            "  bits={b}: worst device err/mass = {v:.3e}  (log2 {:.2}; budget 2^-9)",
-            v.log2()
-        );
-    }
     assert!(
         failures.is_empty(),
         "{} grid points miss the f64 reference:\n  {}",

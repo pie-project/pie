@@ -95,6 +95,7 @@ fn load(engine: &mut engine_cerebras::CerebrasEngine, ckpt: &Path) -> engine::ca
             residency: Residency::default(),
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("flux2-mini loads, its stream programs compiled on load")
         .caps
@@ -148,6 +149,7 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
                 extern_dir: None,
                 capacity: decl.capacity.max(1),
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             })
             .expect("a channel registers");
         channels.push(id);
@@ -166,6 +168,7 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
                 query_len: n,
                 ..engine::program::BindExtents::default()
             },
+            ..Default::default()
         })
         .expect("the text pass binds")
         .id;
@@ -187,9 +190,11 @@ fn text_pass(engine: &mut engine_cerebras::CerebrasEngine, tokens: &[u32]) -> Ve
             lanes: 1,
             instance,
             adapter_only: false,
+            scratch: Default::default(),
         }],
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     });
     let mut ticket = engine.submit(&frame).expect("the text pass runs");
     engine.settle_frame(&mut ticket).expect("the frame settles");

@@ -50,8 +50,10 @@ pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Resu
         let honest = if claimed == LibraryOp::LaneCut {
             region.nodes.len() == 1 && region.inputs.len() == 2 && region.outputs.len() == 1
         } else if matches!(claimed, LibraryOp::NucleusSample | LibraryOp::RankSample) {
-            region.nodes.len() == 13
-                && (region.inputs.len() == 3 || region.inputs.len() == 5)
+            // The f32 chain (13 nodes), or the bf16 draw (9; its constant
+            // temperature, once or twice, an input beside the three).
+            (region.nodes.len() == 13 && region.inputs.len() == 3
+                || region.nodes.len() == 9 && (4..=5).contains(&region.inputs.len()))
                 && region.outputs.len() == 1
         } else {
             region.nodes.len() == 1

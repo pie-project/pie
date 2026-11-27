@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
+use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -33,7 +34,6 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
-use engine::{Channels, Completion, Engine, Pool, Programs, Tiers};
 use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -55,12 +55,12 @@ pub struct DeviceBoot {
     /// `$PIE_HOME/profiles`, where a user's TPU profiles live.
     pub profiles: Option<PathBuf>,
 
-    /// Trace and compile the first fire shapes at load (`serve/warm.rs`).
-    pub prewarm: bool,
-
-    /// Windowed kv rows live in their own pool; `false` keeps them in full
-    /// pages, for a test that compares the two.
-    pub window_pool: bool,
+    /// `[xla] measure` (`[engine] measure`, `pie serve --no-measure`):
+    /// `false` states the load skips measuring. An XLA load times nothing
+    /// on the device (its profile is the chip's, tuned by `pie tune`); the
+    /// runtime then takes its estimates for what it would time at load
+    /// (the host cover), by name.
+    pub measure: bool,
 
     /// Device bytes the load leaves past its weights and pool for XLA's
     /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
@@ -69,6 +69,20 @@ pub struct DeviceBoot {
     /// The tokens a hybrid's state slot is balanced against the kv pages
     /// for (a sequence's expected prompt and output); `None`: the context.
     pub seat_tokens: Option<u32>,
+
+    /// The load streams its streamable weights through the pool
+    /// (`crate::store::streamed`): set by each load from
+    /// `Residency::weights_held` (held: `false`, every plane lands as the
+    /// base build lands it).
+    pub stream_weights: bool,
+
+    /// Chunks a load that streams nothing adds to its pool: a test that
+    /// compares it with a streaming load at one pool size (the streamed
+    /// weights' chunks).
+    pub pool_extra_chunks: u32,
+    /// The staging ring's pinned host slots: the frames a load keeps in
+    /// flight, and one (`crate::store::stage`).
+    pub staging_slots: u32,
 }
 
 impl Default for DeviceBoot {
@@ -77,10 +91,12 @@ impl Default for DeviceBoot {
             plugin: None,
             ordinal: 0,
             profiles: None,
-            prewarm: false,
-            window_pool: true,
+            measure: true,
             headroom: None,
             seat_tokens: None,
+            stream_weights: false,
+            pool_extra_chunks: 0,
+            staging_slots: 2,
         }
     }
 }
@@ -93,6 +109,9 @@ pub struct Xla {
     /// readouts from. Its kept readouts are device buffers, so it drops
     /// before the shell that owns the client.
     pending: Option<(FrameId, Vec<StepSettle>)>,
+    /// The pending frame's step latches: under `PIE_XLA_SYNC` its settle
+    /// waits on each and fails by name on a fault one reports.
+    latches: Vec<std::sync::Arc<crate::program::Latch>>,
     programs: crate::program::Plane,
     boot: DeviceBoot,
     contract_for: ContractFor,
@@ -101,7 +120,27 @@ pub struct Xla {
     next_fire: u64,
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
-    adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    /// The adapter each instance bound: its id (first `Adapter` slot).
+    adapters: BTreeMap<InstanceId, u32>,
+    /// Per state record (its first piece's slot ref, [`record_key`]), how
+    /// far a device-counted fold this engine resolved has frozen it: the
+    /// runtime's `RsVerb::Buffer::folded` lags such a fold until its fire
+    /// settles, so a fire staged before then replays from here, not from
+    /// the stale count. A fork reads the record its parent wrote, so it
+    /// finds the parent's; a device slot copy carries it; leaving the
+    /// device with one unsettled is the runtime's to wait out.
+    rs_ahead: BTreeMap<u64, u32>,
+    /// Each set's written end as far as the fires admitted carried it,
+    /// ahead of what the runtime states until they settle
+    /// (`engine::extent`).
+    written: engine::extent::Written,
+    /// What the engine counts while it serves, read by the runtime: a
+    /// program a fire waited on (Compiled), a frame or registration
+    /// refused (Refused). Never Fallback: a guest runs on the device or is
+    /// refused at its registration.
+    /// Never Unrecorded: every serving fire runs a program, built if need
+    /// be.
+    live: engine::live::Live,
 }
 
 /// What a step's readouts are made from once it settles.
@@ -131,7 +170,11 @@ impl Xla {
             sink: None,
             programs: crate::program::Plane::default(),
             adapters: BTreeMap::new(),
+            rs_ahead: BTreeMap::new(),
+            written: engine::extent::Written::default(),
             pending: None,
+            latches: Vec::new(),
+            live: engine::live::Live::armed(),
         }
     }
 
@@ -147,6 +190,20 @@ impl Xla {
 
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
         self.shell.as_mut()
+    }
+
+    /// Guest passes run on the device so far: every pass a guest takes.
+    #[must_use]
+    pub fn guest_passes(&self) -> u64 {
+        self.programs.tally()
+    }
+
+    /// Guest stages compiled inside a fire, past their program's
+    /// registration: zero where every registration compiled every shape a
+    /// fire takes.
+    #[must_use]
+    pub fn guest_fire_compiles(&self) -> u64 {
+        self.programs.fire_compiles()
     }
 
     #[must_use]
@@ -180,6 +237,11 @@ fn port_error(error: engine::ports::PortError) -> Error {
 }
 
 pub(crate) fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } | Fault::NoDevice { .. } => {
             Error::Device(fault.to_string())
@@ -199,24 +261,18 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Unaffine { .. }
         | Fault::Unstructured { .. }
         | Fault::Straddled { .. }
-        | Fault::Adapter { .. }
-        | Fault::Blob { .. } => Error::Load(fault.to_string()),
+        | Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. }
         | Fault::Adapterless { .. }
         | Fault::AdapterWord { .. }
         | Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::AdapterSlots { .. } => Error::Exhausted {
-            resource: "adapter slots",
-            wanted: 1,
-            available: 0,
-        },
         Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Residency(_) => Error::Impossible(fault.to_string()),
     }
@@ -277,12 +333,17 @@ fn patch_bytes(
     }
 }
 
+/// Lands the adapter an instance of `program` carries, its planes the
+/// bind's seeds, in the `Adapter` slots the runtime took (`slots`): where
+/// another instance landed the same adapter there it joins it. Its adapter
+/// id, what its lanes route by; None where it carries none.
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
-) -> EngineResult<Option<crate::adapter::Binding>> {
+    slots: &[u32],
+) -> EngineResult<Option<u32>> {
     let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
         return Ok(None);
     };
@@ -303,20 +364,103 @@ fn adapter_of(
             })?;
         built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
     }
-    let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-        .iter()
-        .map(|(bank, bytes)| crate::weights::AdapterPlane {
-            bank: bank.as_str(),
-            bytes,
-        })
-        .collect();
     shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
+        .land_adapter(instance, slots, &built)
         .map(Some)
         .map_err(fault)
+}
+
+impl Xla {
+    /// [`Engine::submit`]'s frame, fired.
+    fn submit_frame(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
+        )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds.
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        self.pending = None;
+        tracing::debug!(
+            frame = id.0,
+            steps = frame.steps.len(),
+            airborne = self.programs.airborne(),
+            "xla submit"
+        );
+        let mut steps = Vec::with_capacity(frame.steps.len());
+        let mut settles = Vec::with_capacity(frame.steps.len());
+        let mut latches = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
+        for (index, step) in frame.steps.iter().enumerate() {
+            let at = engine::StepDone {
+                frame: id,
+                step: index as u32,
+            };
+            let latch = crate::program::Latch::new(
+                at,
+                u32::try_from(step.lanes.len()).unwrap_or(u32::MAX),
+                self.sink.clone(),
+            );
+            // A step refused before it fires leaves no device fold's
+            // position behind: what it noted of where its folds would leave
+            // their states goes with it (its latched report is never told).
+            let ahead = self.rs_ahead.clone();
+            // Nor any set's written end.
+            let written = self.written.clone();
+            let fired = if step.lanes.iter().any(|l| !l.rs_snapshots.is_empty()) {
+                self.fire_snapshotting(step, &latch)
+            } else {
+                self.fire_step(step, &latch)
+            };
+            let (ticket, settle) = match fired.inspect_err(|_| {
+                self.rs_ahead = ahead;
+                self.written = written;
+            }) {
+                Ok(both) => both,
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`); its latch is
+                // never told.
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            // The submitter's hold: the step is done once its passes land.
+            latch.release(Ok(()));
+            steps.push(ticket);
+            settles.push(settle);
+            latches.push(latch);
+        }
+        self.latches = latches;
+        let mut ticket = FrameTicket::of(id, steps, refused);
+        self.pending = Some((id, settles));
+        tracing::debug!(frame = id.0, "xla submitted");
+        if synchronous() {
+            self.settle_frame(&mut ticket)?;
+        }
+        Ok(ticket)
+    }
+
+    /// `result`, its refusal counted ([`engine::live::Tally::Refused`]).
+    fn refused<T>(&self, result: EngineResult<T>) -> EngineResult<T> {
+        if result.is_err() {
+            self.live.tally(engine::live::Tally::Refused, 1);
+        }
+        result
+    }
+}
+
+/// What a program's compile made off the engine's thread
+/// (`Xla::prepare_program`).
+struct Compiled {
+    pending: crate::program::Pending,
+    staged: std::result::Result<Vec<std::sync::Arc<crate::guest::run::Staged>>, String>,
 }
 
 impl Engine for Xla {
@@ -324,8 +468,48 @@ impl Engine for Xla {
         "xla"
     }
 
+    /// The widest fire XLA's warm ladder compiles: every shape it serves is
+    /// a program compiled before ready, so the ceiling bounds the ladder.
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(engine::load::FireCeiling {
+            lanes: 64,
+            tokens: 2608,
+            page_size: None,
+            context_binds: false,
+        })
+    }
+
+    fn live(&self) -> engine::live::Live {
+        self.live.clone()
+    }
+
     fn device_facts(&self) -> Option<&DeviceFacts> {
         self.caps.as_ref().map(|caps| &caps.device)
+    }
+
+    fn cover_fingerprint(&self) -> Option<String> {
+        let print = self.shell.as_ref()?.cover_fingerprint();
+        tracing::info!(
+            fingerprint = %print,
+            "the host cover's key on this engine: the TPU, the kernels its programs lower \
+             through, the tuning and the compiler's flags"
+        );
+        Some(print)
+    }
+
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    /// XLA times nothing at load that it keeps (its compile ledger is
+    /// in-process memory, not a measurement; the host cover is the
+    /// runtime's, said beside this): none.
+    fn measured_at_load(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn skips_measuring(&self) -> bool {
+        !self.boot.measure
     }
 
     fn load(&mut self, request: LoadRequest) -> EngineResult<Loaded> {
@@ -340,9 +524,14 @@ impl Engine for Xla {
             budgets,
             residency,
             ordinal,
-            frames_in_flight: _,
+            frames_in_flight,
+            steps,
         } = request;
         let mut boot = self.boot.clone();
+        // A fire's inputs wait in the staging ring until it runs: one slot
+        // for each frame in flight, and the one being written.
+        boot.staging_slots = u32::from(frames_in_flight.max(1)) + 1;
+        boot.stream_weights = !residency.weights_held;
         if ordinal > 0 {
             boot.ordinal = u32::try_from(ordinal).unwrap_or(0);
         }
@@ -371,18 +560,45 @@ impl Engine for Xla {
                 context: budgets.max_context,
                 slots,
                 kv_budget: residency.device_kv_budget,
-                memory_share: residency.device_memory_share,
+                allowance: residency.device,
                 device: &boot,
+                steps: Some(&steps),
             },
             voxels,
         )
         .map_err(fault)?;
         let mut shell = shell;
-        if boot.prewarm {
-            shell.prewarm().map_err(fault)?;
-            // from here a program built is a fire the ladder missed
-            shell.device().seal();
-        }
+        shell.set_host_programs(residency.host_programs);
+        shell.set_host_bound(residency.host_kv_budget);
+        // Every maintenance program a fire, a fork or a park runs later, one
+        // a slot size, compiled now whether or not the ladder runs: none is
+        // built after the load.
+        shell.warm_maintenance().map_err(fault)?;
+        // The step compositions the runtime's builder forms over this load's
+        // facts, computed before the warm ladder, which lays
+        // the buffered treatment for exactly the shapes the set states so.
+        let stated = shell.stated_steps(&steps);
+        shell.set_steps(stated.shapes.clone());
+        // The warm ladder, every fire shape the load serves, built before
+        // ready: none is built after it (a fire outside it is a ladder miss,
+        // named with its shape).
+        shell.prewarm().map_err(fault)?;
+        // A beam group's head program a width rung (BEAM-PAGE-LISTS): a
+        // group's bind, after ready, builds none.
+        shell.lay_beam_heads().map_err(fault)?;
+        // The program a bind or a host pass lands guest cells with.
+        let (rows, _) = shell.pool_geometry();
+        crate::guest::run::cells_program(shell.device(), rows).map_err(Error::Load)?;
+        // A known limitation: a program's generated code goes onto the
+        // device at its first run and stays while there is room; a load's
+        // programs together can take more than the device holds (v6e
+        // Qwen3.5: ~47 GB over 424 programs), and XLA's runtime evicts and
+        // reloads them, a device allocation after ready.
+        tracing::info!(
+            "engine-xla: program code is cached by XLA and may reload after ready; resident code follows in a later release"
+        );
+        // from here a program built is a fire the ladder missed
+        shell.device().seal();
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
@@ -402,6 +618,14 @@ impl Engine for Xla {
             .map_err(fault)?;
         let chunks = shell.tiered_facts();
         shell.log_chunk_recipe(&chunks);
+        if let engine::MixedLanes::Laid(rungs) = shell.mixed_lanes() {
+            tracing::info!(
+                pairs = ?rungs.iter().map(|r| (r.prompt_lanes, r.decode_lanes)).collect::<Vec<_>>(),
+                max_tokens = budgets.max_tokens,
+                max_lanes = budgets.max_lanes,
+                "xla mixed fires laid: prompt_lanes -> decode_lanes"
+            );
+        }
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
@@ -416,6 +640,12 @@ impl Engine for Xla {
                 storage_alignment: 256,
                 storage_max_tile_bytes: u64::MAX,
                 codegen_backend: None,
+                // its guest lowering (`guest::lower`) lowers a draw over a
+                // top-p / top-k cut and a bf16 row's cut as one region each
+                library_forms: engine::LibraryForms {
+                    draw: true,
+                    bf16_cut: true,
+                },
             },
             pools,
             chunks,
@@ -425,10 +655,13 @@ impl Engine for Xla {
                 max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
                 prefill_rows: 0,
+                prefill_lanes: shell.prefill_lanes(),
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
                 dispatch_depth: 0,
             },
             has_lora: true,
@@ -438,21 +671,64 @@ impl Engine for Xla {
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
+                .with(eta_ir::registry::Port::Parents)
                 .with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: true,
             rs_verbs: shell.serves_rs_verbs(),
-            rs_snapshots: 0,
+            windowed_state: shell.serves_windowed_state(),
+            rs_snapshots: shell.snapshots(),
             bidirectional_attention: true,
-            adapter_attachments: false,
+            adapter_attachments: true,
             facts: shell.trace().facts.clone(),
             inputs: shell.input_decls(),
             classes: shell.classes(),
+            // XLA states no bound on one submission.
+            guest_cost: engine::GuestCost::default(),
+            // A beam group's finish reads its chosen beam's list
+            // (`Engine::beam_list`, BEAM-PAGE-LISTS §6.6).
+            host_ops: engine::HostOps { beam_list: true },
+            // the staging ring's slots less the one being written
+            frames_in_flight: engine::stated_frames(
+                (shell.staging_facts().ring_slots as usize).saturating_sub(1),
+            )?,
+            mixed_lanes: shell.mixed_lanes(),
+            steps: engine::StatedSteps::default(),
         };
+
+        // The set the ladder laid (`Shell::set_steps`), stated: the runtime
+        // computes it again from the stated facts and refuses another.
+        let mut caps = caps;
+        caps.steps = stated;
+        debug_assert_eq!(
+            caps.steps.shapes,
+            engine::StepShapes::of(
+                &steps,
+                &engine::StepFacts::stated(
+                    &caps,
+                    &engine::ReadoutFacts {
+                        landing: engine::ReadoutLanding::InSpan,
+                        store_rows: Shell::readout_store_rows(&shell),
+                    }
+                ),
+            ),
+            "the set computed before the ladder is the one the caps state"
+        );
+        tracing::info!(
+            "engine-xla: step set: {}; the warm ladder lays each shape at the treatments it states",
+            caps.steps.shapes.census(),
+        );
         self.programs.seat(budgets.max_lanes);
         self.programs.seat_readouts(shell.readouts());
+        let (rows, sink_row) = shell.pool_geometry();
+        self.programs.seat_pool(rows, sink_row);
+        self.programs.seat_planes(shell.guest_planes());
+        // From here a program a fire waits on, a pass the host interprets,
+        // is served worse than the load prepared: counted.
+        shell.device().report_to(self.live.clone());
+        self.programs.report_to(self.live.clone());
+        shell.state_limits(caps.limits);
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -472,41 +748,16 @@ impl Engine for Xla {
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        frame.validate_for(
-            self.caps
-                .as_ref()
-                .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
-        )?;
-        let id = FrameId(self.next_frame);
-        self.next_frame = self.next_frame.wrapping_add(1);
-        self.pending = None;
-        tracing::debug!(
-            frame = id.0,
-            steps = frame.steps.len(),
-            airborne = self.programs.airborne(),
-            "xla submit"
-        );
-        let mut steps = Vec::with_capacity(frame.steps.len());
-        let mut settles = Vec::with_capacity(frame.steps.len());
-        for (index, step) in frame.steps.iter().enumerate() {
-            let at = engine::StepDone {
-                frame: id,
-                step: index as u32,
-            };
-            let latch = crate::program::Latch::new(at, self.sink.clone());
-            let (ticket, settle) = self.fire_step(step, &latch)?;
-            // The submitter's hold: the step is done once its passes land.
-            latch.release(Ok(()));
-            steps.push(ticket);
-            settles.push(settle);
+        let submitted = self.submit_frame(frame);
+        // A frame whose step refused its lanes by name fired the steps
+        // before it alone: a refusal too.
+        if submitted
+            .as_ref()
+            .is_ok_and(|ticket| !ticket.refused.is_empty())
+        {
+            self.live.tally(engine::live::Tally::Refused, 1);
         }
-        let mut ticket = FrameTicket { id, steps };
-        self.pending = Some((id, settles));
-        tracing::debug!(frame = id.0, "xla submitted");
-        if self.completion().is_none() {
-            self.settle_frame(&mut ticket)?;
-        }
-        Ok(ticket)
+        self.refused(submitted)
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -526,6 +777,19 @@ impl Engine for Xla {
         }
         // Every guest pass lands its cells before the frame answers.
         self.programs.settle();
+        // A settle in the submit (`PIE_XLA_SYNC`) waits on every step's
+        // device events too: a fault one reports (a fire's ready event, a
+        // guest pass's download) fails the frame by name, never dropped.
+        if synchronous() {
+            for (at, latch) in self.latches.iter().enumerate() {
+                if let Some(why) = latch.wait() {
+                    return Err(Error::Device(format!(
+                        "frame {}'s step {at} faulted on the device: {why}",
+                        ticket.id
+                    )));
+                }
+            }
+        }
         let (_, settles) = self.pending.as_ref().expect("checked just above");
         for (receipt, settle) in ticket.steps.iter_mut().zip(settles) {
             receipt.readouts = readouts_of(settle)?;
@@ -533,30 +797,332 @@ impl Engine for Xla {
         Ok(())
     }
 
-    fn completion(&mut self) -> Option<&mut dyn Completion> {
-        if synchronous() { None } else { Some(self) }
+    /// XLA's readouts ([`engine::Engine::readout_facts`]): every output
+    /// lands in a ring laid at load (`Pools::lay_readouts`), inside the
+    /// bytes the load reserved, so no term beside the rungs; a sequence
+    /// readout's ring holds the lane rung's rows a fire, the store the
+    /// runtime cuts a fire's sequence lanes to. Float lanes' rows land in a
+    /// ring of the top row rung's rows and are not bounded here.
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(engine::ReadoutFacts {
+            landing: engine::ReadoutLanding::InSpan,
+            store_rows: self.shell.as_ref().and_then(Shell::readout_store_rows),
+        })
     }
 
-    fn programs(&mut self) -> Option<&mut dyn Programs> {
+    fn completion(&mut self) -> Option<&mut dyn engine::Completion> {
         Some(self)
     }
 
-    fn channels(&mut self) -> Option<&mut dyn Channels> {
+    fn programs(&mut self) -> Option<&mut dyn engine::Programs> {
         Some(self)
     }
 
-    fn pool(&mut self) -> Option<&mut dyn Pool> {
+    fn programs_ref(&self) -> Option<&dyn engine::Programs> {
         Some(self)
     }
 
-    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+    fn channels(&mut self) -> Option<&mut dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn engine::Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn engine::WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn engine::Tiers> {
         Some(self)
     }
 }
 
-impl Programs for Xla {
+impl engine::Completion for Xla {
+    fn asynchronous(&self) -> bool {
+        !synchronous()
+    }
+
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+}
+
+impl engine::Programs for Xla {
     fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.programs.register(registration).map_err(refusal)
+        let device = self.shell.as_ref().map(|shell| shell.device());
+        let registered = self
+            .programs
+            .register(registration, device)
+            .map_err(refusal);
+        self.forget_evicted();
+        self.refused(registered)
+    }
+
+    /// The program checked and its stage shapes named here; its stages
+    /// compile in the returned compile, off the engine's thread, while
+    /// fires go on (`Plane::prepare`).
+    /// The runtime's standard samplers' guest stages, compiled before ready
+    /// at every batch rung exactly as their registrations compile them, so a
+    /// request that registers one finds every stage compiled (the device's
+    /// program cache holds them) and builds nothing after ready. The
+    /// programs compile side by side, each stage admitted by the guest
+    /// compile ledger (`guest::run`), so a cold boot is bounded by host
+    /// memory, not run in turn. A program that does not lower or compile
+    /// fails the load by name.
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
+        let device = self
+            .shell
+            .as_ref()
+            .map(Shell::device_shared)
+            .ok_or_else(|| Error::Program("the standard samplers prewarmed before load".into()))?;
+        let started = std::time::Instant::now();
+        let mut pending = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            pending.push(self.programs.prepare(registration).map_err(refusal)?);
+        }
+        let compiled: Vec<Result<(usize, f64), String>> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = pending
+                .iter()
+                .map(|program| {
+                    let device = &device;
+                    scope.spawn(move || {
+                        let at = std::time::Instant::now();
+                        program
+                            .compile(device)
+                            .map(|staged| (staged.len(), at.elapsed().as_secs_f64()))
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .unwrap_or_else(|_| Err("a standard sampler's compile panicked".into()))
+                })
+                .collect()
+        });
+        let mut stages = 0;
+        let mut slowest = 0f64;
+        for (registration, done) in registrations.iter().zip(compiled) {
+            let (count, seconds) = done.map_err(|why| {
+                Error::Load(format!(
+                    "the standard sampler program 0x{:016x}'s guest stages: {why}",
+                    registration.program_hash
+                ))
+            })?;
+            stages += count;
+            slowest = slowest.max(seconds);
+        }
+        tracing::info!(
+            programs = registrations.len(),
+            stages,
+            slowest_s = slowest,
+            s = started.elapsed().as_secs_f64(),
+            "xla standard samplers' guest stages compiled before ready"
+        );
+        // and now the programs: what the stages hold and the most one took
+        // to compile are known
+        if let Some(shell) = self.shell.as_mut() {
+            shell.load_parked_programs();
+        }
+        Ok(())
+    }
+
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let pending = self.programs.prepare(registration).map_err(refusal);
+        let pending = self.refused(pending)?;
+        let device = self.shell.as_ref().map(Shell::device_shared);
+        Ok(Box::new(move || {
+            let staged = match &device {
+                Some(device) => pending.compile(device),
+                None => Ok(Vec::new()),
+            };
+            engine::Prepared(Box::new(Compiled { pending, staged }))
+        }))
+    }
+
+    /// The stages a prepared program's compile made held, and the program
+    /// registered (`Plane::finish`).
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let Ok(compiled) = prepared.0.downcast::<Compiled>() else {
+            return Err(Error::Program(
+                "a prepared program XLA did not prepare".to_string(),
+            ));
+        };
+        let Compiled { pending, staged } = *compiled;
+        let registered = self.programs.finish(pending, staged).map_err(refusal);
+        self.forget_evicted();
+        self.refused(registered)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.programs.close_program(program).map_err(refusal)
+    }
+
+    /// The rings an instance keeps in the pool's `Channel` slots: its
+    /// program's carried channels on the device; every other ring lives on
+    /// the host. No `Instance` slots: the bind-time tables stay host-side.
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        // The adapter its `lora` sink lands: one plane a bank row, an
+        // `Adapter` slot each, taken once a content key and shared by
+        // every holder.
+        let sink = match self.programs.package(program) {
+            Some(package) => crate::adapter::sink_of(package).map_err(fault)?,
+            None => None,
+        };
+        let adapter = match (sink, self.shell.as_ref()) {
+            (Some(sink), Some(shell)) => {
+                let banks =
+                    crate::adapter::plane_banks(&sink, &shell.bank_seats()).map_err(fault)?;
+                engine::program::Footprint {
+                    bytes: banks.len() as u64 * shell.pools().adapter_slot(),
+                    slots: u32::try_from(banks.len()).unwrap_or(u32::MAX),
+                    contiguous: false,
+                }
+            }
+            _ => engine::program::Footprint::default(),
+        };
+        Ok(engine::program::ProgramFacts {
+            rings: self
+                .programs
+                .compiled_form(program)
+                .map_or_else(Vec::new, |c| c.rings()),
+            adapter,
+            ..Default::default()
+        })
+    }
+
+    /// The adapter a binding lands, keyed by its content
+    /// ([`crate::adapter::adapter_digest`]): its sink's site word and, in
+    /// the sink's plane order, each plane's bank role and seed.
+    fn adapter_key(&self, binding: &InstanceBinding) -> EngineResult<Option<u128>> {
+        let Some(package) = self.programs.package(binding.program) else {
+            return Ok(None);
+        };
+        let Some(sink) = crate::adapter::sink_of(package).map_err(fault)? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::adapter::adapter_digest(
+            sink.sites,
+            sink.planes.iter().map(|(role, channel)| {
+                let wire = binding
+                    .seeds
+                    .iter()
+                    .find(|seed| seed.channel == *channel)
+                    .map_or(&[][..], |seed| seed.bytes.as_slice());
+                (role.bank(), wire)
+            }),
+        )))
+    }
+
+    /// What a fire holding lanes of `program` takes beside the model's own:
+    /// its stages' temp past the load's largest (they share the runtime's
+    /// one reservation) and their outputs, as registration compiled them.
+    /// The same at any extents: every stage was compiled for every rung.
+    fn fire_facts(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+    ) -> EngineResult<engine::program::FireFacts> {
+        let _ = extents;
+        let load_temp = self
+            .shell
+            .as_ref()
+            .map_or(0, |shell| shell.device().load_temp());
+        Ok(self.programs.fire_facts(program, load_temp))
+    }
+
+    /// A beam group's state (BEAM-PAGE-LISTS §4) is the instance's resident
+    /// state: one run of `Instance` slots the runtime takes at the bind,
+    /// live to the close, moved whole by a park (`Rebind::Instance::resident`),
+    /// laid from the load's paging and frames in flight.
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+        class: eta_ir::registry::GeometryClass,
+    ) -> EngineResult<engine::program::GuestState> {
+        let _ = (extents, class);
+        let resident = match (
+            self.programs
+                .package(program)
+                .and_then(crate::beam::group_of),
+            self.shell.as_ref(),
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+                let layout =
+                    crate::beam::layout(group, paging.page_size, paging.pages_per_slot, frames);
+                crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT).0
+            }
+            _ => 0,
+        };
+        Ok(engine::program::GuestState {
+            resident,
+            ..engine::program::GuestState::default()
+        })
+    }
+
+    /// An instance's carried rings, or a registered channel's ring, moved to
+    /// fresh `Channel` slots (a park and its return): the cells are read and
+    /// written there from now on, by every instance bound to them.
+    fn rebind(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        match rebind {
+            engine::program::Rebind::Instance {
+                id,
+                rings,
+                adapter,
+                scratch: resident,
+                ..
+            } => {
+                // a beam group's state: the runtime copied the resident run
+                // to the slots `resident` names
+                if let (Some(_), engine::ScratchPlace::Run { first, .. }, Some(shell)) =
+                    (self.programs.beam_seat(id), resident, self.shell.as_ref())
+                {
+                    let row = shell.pools().instance_row(first).ok_or_else(|| {
+                        Error::Program(format!(
+                            "instance {id:?}'s beam state moved to Instance slot {first}, past \
+                             the pool"
+                        ))
+                    })?;
+                    self.programs.rebind_beam(id, row);
+                }
+                if let (Some(held), Some(shell)) = (self.adapters.get_mut(&id), self.shell.as_mut())
+                    && !adapter.is_empty()
+                {
+                    *held = shell.rebind_adapter(*held, &adapter).ok_or_else(|| {
+                        Error::Program(format!(
+                            "instance {id:?}'s adapter moved to slots {adapter:?}, which \
+                             hold no adapter it landed"
+                        ))
+                    })?;
+                }
+                let shell = self.shell.as_ref();
+                let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+                self.programs.rebind(id, &rings, &cell_row).map_err(refusal)
+            }
+            // This engine claims nothing at an instance's slots and an
+            // evacuation repoints none of a guest's: its next rebind names
+            // where it lies, before any fire of it.
+            engine::program::Rebind::Parked { .. } => Ok(()),
+            engine::program::Rebind::Channel { id, slots } => {
+                let shell = self.shell.as_ref();
+                let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+                (self.programs)
+                    .rebind_channel(id, &slots, &cell_row)
+                    .map_err(refusal)
+            }
+        }
     }
 
     fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
@@ -570,7 +1136,68 @@ impl Programs for Xla {
                 caps.ports, caps.geometry, binding.geometry
             )));
         }
-        let bound = self.programs.bind(binding).map_err(refusal)?;
+        let shell = self.shell.as_ref();
+        let cell_row = |slot: u32| shell.and_then(|shell| shell.channel_row(slot));
+        // A beam group's state (BEAM-PAGE-LISTS §4) in the resident run the
+        // runtime took for it, zeroed so its first fire primes it.
+        let beam = match (
+            self.programs
+                .package(binding.program)
+                .and_then(crate::beam::group_of),
+            shell,
+        ) {
+            (Some(group), Some(shell)) => {
+                let paging = shell.paging();
+                let layout = crate::beam::layout(
+                    group,
+                    paging.page_size,
+                    paging.pages_per_slot,
+                    caps.frames_in_flight,
+                );
+                let (_, slots) = crate::beam::state_slots(layout, crate::guest::CHANNEL_SLOT);
+                let first = match &binding.scratch {
+                    &engine::ScratchPlace::Run { first, slots: held } if held >= slots => first,
+                    other => {
+                        return Err(Error::Program(format!(
+                            "a beam group of {} lanes keeps its state in a resident run of \
+                             {slots} Instance slot(s); the bind names {other:?}",
+                            group.lanes
+                        )));
+                    }
+                };
+                let row = shell.pools().instance_row(first).ok_or_else(|| {
+                    Error::Program(format!("Instance slot {first} lies past the pool"))
+                })?;
+                Some(crate::beam::Seat {
+                    group,
+                    layout,
+                    row,
+                    fires: 0,
+                })
+            }
+            (Some(_), None) => {
+                return Err(Error::Program("a beam group bound before load".to_string()));
+            }
+            (None, _) => None,
+        };
+        let bound = self
+            .programs
+            .bind(binding, &cell_row, beam)
+            .map_err(refusal)?;
+        // the resident run cleared once, at the bind (§4)
+        if beam.is_some()
+            && let Some(shell) = self.shell.as_mut()
+            && let &engine::ScratchPlace::Run { first, slots } = &binding.scratch
+        {
+            let slots: Vec<(engine::chunk::ShapeId, u32)> = (first..first + slots)
+                .map(|slot| (crate::store::layout::INSTANCE, slot))
+                .collect();
+            let zeros = vec![0u8; slots.len() * crate::guest::CHANNEL_SLOT as usize];
+            if let Err(why) = shell.write_slot_bytes(&slots, &zeros) {
+                let _ = self.programs.close_instance(bound.id);
+                return Err(fault(why));
+            }
+        }
         let seeds: Vec<(u32, Vec<u8>)> = binding
             .seeds
             .iter()
@@ -578,7 +1205,9 @@ impl Programs for Xla {
             .collect();
         let package = self.programs.package(binding.program).cloned();
         let landed = match (package, self.shell.as_mut()) {
-            (Some(package), Some(shell)) => adapter_of(shell, &package, bound.id, &seeds),
+            (Some(package), Some(shell)) => {
+                adapter_of(shell, &package, bound.id, &seeds, &binding.adapter_slots)
+            }
             _ => Ok(None),
         };
         match landed {
@@ -594,29 +1223,90 @@ impl Programs for Xla {
         Ok(bound)
     }
 
-    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
         if let (Some(held), Some(shell)) = (self.adapters.remove(&id), self.shell.as_mut()) {
-            shell.release_adapter(&held);
+            shell.release_adapter(id, held);
         }
-        self.programs.close_instance(id).map_err(refusal)
+        if let Some(shell) = self.shell.as_mut() {
+            let (_, pool) = shell.device_and_pool();
+            self.programs
+                .flush_for_close(id, pool.as_ref())
+                .map_err(refusal)?;
+        }
+        self.programs.close_instance(id).map_err(refusal)?;
+        Ok(0)
     }
 
+    /// Refused: an adapter is an instance's, landed at its bind in the
+    /// pool's `Adapter` slots, never one the operator seats by id.
     fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<crate::weights::AdapterPlane<'_>> = registration
-            .planes
+        Err(Error::Invalid(format!(
+            "adapter {} registered by id: an adapter lands at the bind of the program \
+             instance that carries it, in the pool's Adapter slots, keyed by its \
+             content; this engine seats none by id",
+            registration.id
+        )))
+    }
+
+    /// Beam `beam`'s page list as the group's last fire left it:
+    /// row `beam` of the state's `map` (one
+    /// copy, words `2 + beam · cap`, `cap` columns), read out of the pool,
+    /// which every fire that wrote it lands before.
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        let seat = self.programs.beam_seat(instance).ok_or_else(|| {
+            Error::Program(format!("instance {instance} binds no beam group (parents)"))
+        })?;
+        let (lanes, cap) = (seat.layout.lanes, seat.layout.cap);
+        if i64::from(beam) >= lanes {
+            return Err(Error::Program(format!("beam {beam} of a group of {lanes}")));
+        }
+        let shell = self.loaded_mut()?;
+        let pool = shell.pools().buffer().ok_or_else(|| {
+            Error::Program("a beam group's state on an unbacked pool".to_string())
+        })?;
+        // the plugin reads from 32-byte-aligned offsets: the row's start (a
+        // pool row is 512 bytes) through the beam's list, sliced here
+        let at = i64::from(seat.row) * crate::store::layout::ROW_BYTES as i64;
+        let end = (2 + (i64::from(beam) + 1) * cap) * 4;
+        let state = pool
+            .read_raw(at, (end + 31) / 32 * 32)
+            .map_err(|e| Error::Program(e.to_string()))?;
+        if u32::from_le_bytes([state[0], state[1], state[2], state[3]]) == 0 {
+            return Err(Error::Program(format!(
+                "instance {instance}'s beam group has fired no step yet"
+            )));
+        }
+        let from = ((2 + i64::from(beam) * cap) * 4) as usize;
+        Ok(state[from..from + cap as usize * 4]
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|plane| crate::weights::AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect())
     }
 }
 
-impl Channels for Xla {
+impl engine::Channels for Xla {
+    /// A registered channel an instance may carry or feed on the device
+    /// keeps its ring in the pool's `Channel` slots, the rows every instance
+    /// bound to it reads; one only the host reads or writes takes none.
+    /// Every registration: its ring on the host, mirrored where the host
+    /// reads or writes it.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        if self.shell.is_none() {
+            return Ok(None);
+        }
+        Ok(crate::program::Plane::ring_facts(registration))
+    }
+
     fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         self.programs
             .register_channel(registration)
@@ -638,13 +1328,7 @@ impl Channels for Xla {
     }
 }
 
-impl Completion for Xla {
-    fn on_complete(&mut self, sink: engine::CompletionSink) {
-        self.sink = Some(sink);
-    }
-}
-
-impl Pool for Xla {
+impl engine::Pool for Xla {
     /// The pool is fixed at load: one segment, committed whole.
     fn commit(&mut self, segments: u32) -> EngineResult<()> {
         if segments <= 1 {
@@ -669,9 +1353,36 @@ impl Pool for Xla {
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        let shell = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?;
+        Ok(shell.pools().chunk_table().clone())
+    }
 }
 
-impl Tiers for Xla {
+impl engine::WeightCache for Xla {
+    /// Whole-slot copies on the device. HOST/DISK TIERS HOOK: a copy whose
+    /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
+    /// from sc/tier-shared's contract) lands here; until that contract is
+    /// merged only device-to-device copies are served.
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map(|()| 0)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        Ok(self.loaded_mut()?.weight_uses())
+    }
+}
+
+impl engine::Tiers for Xla {
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
         let served = self
@@ -689,7 +1400,7 @@ impl Tiers for Xla {
         let moves = copy.runs(page_size)?;
         shell.copy_kv(&moves).map_err(fault)?;
         // Windowed slots a write into a shared one copies first, whole
-        // (CONTRACT-BC 21, degenerate form; a pool states them as
+        // (degenerate form; a pool states them as
         // `Lane::slot_copies`).
         if let Some(id) = shell.pools().window_shape() {
             let pairs: Vec<(engine::chunk::ShapeId, u32, u32)> = copy
@@ -716,10 +1427,21 @@ impl Tiers for Xla {
             .map_err(fault)
     }
 
-    /// Whole-slot copies on the device. HOST/DISK TIERS HOOK: a copy whose
-    /// source or destination is a host or disk chunk (`SlotCopy`'s tier,
-    /// from sc/tier-shared's contract) lands here; until that contract is
-    /// merged only device-to-device copies are served.
+    /// Its copies land inside the call (see [`Engine::copy_slots_landing`]):
+    /// nothing to wait for.
+    fn settle(&mut self) -> EngineResult<()> {
+        Ok(())
+    }
+
+    /// Lands inside the call: a move between tiers reads its source slots
+    /// into host memory before it writes anywhere, and a move within the
+    /// device runs as a pool program, ordered ahead of every program (a
+    /// fire, a bind's seeds, a channel's cells) enqueued after it.
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, _token: u64) -> EngineResult<bool> {
+        engine::Tiers::copy(self, copy)?;
+        Ok(true)
+    }
+
     fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
         use crate::serve::Tier;
         let device = self.caps.as_ref().map(|caps| caps.device.domain);
@@ -736,9 +1458,22 @@ impl Tiers for Xla {
                 engine: "xla",
             });
         };
+        // A state record copied carries where a device fold left it, keyed
+        // by its tier too: each tier numbers its slot refs from 0, so a
+        // host ref is not the device ref of the same number.
+        for &(src, dst) in &copy.slots {
+            let (src, dst) = (
+                tier_key(from, copy.shape, src),
+                tier_key(to, copy.shape, dst),
+            );
+            match self.rs_ahead.get(&src).copied() {
+                Some(at) => self.rs_ahead.insert(dst, at),
+                None => self.rs_ahead.remove(&dst),
+            };
+        }
         let shell = self.loaded_mut()?;
         if from != Tier::Device || to != Tier::Device {
-            // Between tiers (CONTRACT-BC 22): whole slots, laid alike.
+            // Between tiers: whole slots, laid alike.
             if !copy.runs.is_empty() {
                 return Err(Error::Invalid(
                     "token runs move within the device; between tiers a slot moves whole".into(),
@@ -818,9 +1553,27 @@ struct DeviceLane {
     mask: Option<engine::fire::Masking>,
     /// The lane's windowed ids for `pages`, when the runtime handed any.
     window: Option<Vec<u32>>,
+    /// One past the last slot the lane's rows land at, in its set's own
+    /// slot numbering: its stated slots' highest, else what it held and its
+    /// rows (`engine::KvWrites::end`).
+    end: Option<u32>,
+    /// The slots its rows land at, in its set's own numbering, where its
+    /// program states them.
+    slots: Option<Vec<u32>>,
 }
 
 impl Xla {
+    /// Drops from the device's cache the compiled stages the guest stage
+    /// cache evicted, so their memory is freed with them.
+    fn forget_evicted(&mut self) {
+        let evicted = self.programs.take_evicted();
+        if let Some(shell) = &self.shell {
+            for key in &evicted {
+                shell.device().forget_key(key);
+            }
+        }
+    }
+
     /// Resolves every lane an instance bound in `DeviceGeometry` describes
     /// on its descriptor ports: its tokens, positions, KV extent, the slots
     /// its rows land in (whose page table and write descriptor come from
@@ -841,6 +1594,10 @@ impl Xla {
             .shell
             .as_ref()
             .and_then(|shell| shell.pools().window_shape());
+        let kv_shape = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.pools().kv_shape());
         for attached in &submission.attachments {
             if self.programs.geometry_of(attached.instance) != Some(GeometryClass::DeviceGeometry) {
                 continue;
@@ -860,6 +1617,15 @@ impl Xla {
                 .map(|lane| lane.tokens.len() as u32)
                 .collect();
             let carried = envelope.lanes();
+            let owned = attached.lanes.max(1) as usize;
+            if carried > owned {
+                return Err(program(format!(
+                    "instance {} is attached over {owned} lane(s) at lane {first} and its \
+                     `embed_indptr` port describes {carried}: a program's ports state its own \
+                     lanes' geometry, never the next request's",
+                    attached.instance
+                )));
+            }
             if first + carried > lanes.len() {
                 return Err(program(format!(
                     "instance {} is attached at lane {first} and its `embed_indptr` port \
@@ -878,7 +1644,12 @@ impl Xla {
                 }
                 let lane = &lanes[source];
                 let ports = envelope.lane(at, source).map_err(port_error)?;
-                let table = &lane.kv.translation;
+                let table: &[u32] = match lane.list {
+                    engine::fire::ListKind::Translation => {
+                        kv_shape.and_then(|id| table_of(lane, id)).unwrap_or(&[])
+                    }
+                    engine::fire::ListKind::Pages => &[],
+                };
                 let translate = |page: u32, port: &str| -> EngineResult<u32> {
                     table.get(page as usize).copied().ok_or_else(|| {
                         program(format!(
@@ -916,6 +1687,13 @@ impl Xla {
                                 .map(|&page| windows.get(page as usize).copied().unwrap_or(0))
                                 .collect::<Vec<u32>>()
                         });
+                        // A row lands only in what the lane may write: below
+                        // its floor is a frozen prefix other sets read, and
+                        // past its reservation is not its own.
+                        if let Some(why) = engine::fire::misplaced_write(lane.kv.writable(), slots)
+                        {
+                            return Err(Error::lane(source as u32, why));
+                        }
                         let writes = (
                             slots
                                 .iter()
@@ -958,7 +1736,7 @@ impl Xla {
                         }
                         Some(after - rows as u32)
                     }
-                    () => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    () => holds_kv(lane, kv_shape).then_some(lane.kv.held),
                 };
                 if let Some(have) = have {
                     ports
@@ -973,6 +1751,10 @@ impl Xla {
                         .map(<[u32]>::to_vec),
                     None => None,
                 };
+                let end = match slots {
+                    Some(slots) => slots.iter().max().map(|&slot| slot + 1),
+                    None => have.map(|have| have + rows as u32),
+                };
                 out[source] = Some(DeviceLane {
                     tokens,
                     positions,
@@ -982,6 +1764,8 @@ impl Xla {
                     first,
                     mask,
                     window,
+                    end,
+                    slots: slots.map(<[u32]>::to_vec),
                 });
             }
         }
@@ -989,26 +1773,40 @@ impl Xla {
     }
 
     /// Runs each attached prologue first: the forward reads the cells a prologue put.
-    fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
-        let prologues: Vec<(InstanceId, u32)> = submission
+    fn run_prologues(
+        &mut self,
+        submission: &engine::fire::Step,
+        latch: &std::sync::Arc<crate::program::Latch>,
+    ) -> EngineResult<()> {
+        let prologues: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| {
                 !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
             })
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| {
+                (
+                    attachment.instance,
+                    attachment.lane,
+                    attachment.lanes.max(1),
+                )
+            })
             .collect();
         if prologues.is_empty() {
             return Ok(());
         }
-        let device = self
+        let (device, pool) = self
             .shell
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
-            .device();
-        self.programs
-            .fire_guests(device, &prologues, None, Stage::Prologue)
+            .device_and_pool();
+        let (_, faults) = self
+            .programs
+            .fire_guests_with(device, &prologues, None, pool, None, Stage::Prologue)
             .map_err(refusal)?;
+        for (instance, why) in faults {
+            latch.fault_instances(&[instance], &why);
+        }
         Ok(())
     }
 
@@ -1098,26 +1896,48 @@ impl Xla {
         Ok(LaneFeeds { cells, voxels })
     }
 
+    /// A step whose lanes snapshot their recurrent state inside the pass,
+    /// fired in pieces (`crate::snapshot`): the last piece's ticket.
+    fn fire_snapshotting(
+        &mut self,
+        step: &engine::fire::Step,
+        latch: &std::sync::Arc<crate::program::Latch>,
+    ) -> EngineResult<(FireTicket, StepSettle)> {
+        let shell = self.shell.as_ref().ok_or_else(|| {
+            Error::Load("the xla engine has no model loaded; load one first".into())
+        })?;
+        let records: Vec<engine::chunk::ShapeId> =
+            shell.pools().fixed_shapes().map(|(id, _)| id).collect();
+        let bits = crate::snapshot::Bits::of(&shell.trace().facts);
+        let pieces = crate::snapshot::pieces(step, bits, &records).map_err(fault)?;
+        let last = pieces.len() - 1;
+        for (at, piece) in pieces.into_iter().enumerate() {
+            let fired = self.fire_step(&piece.step, latch)?;
+            if !piece.copies.is_empty() {
+                self.loaded_mut()?
+                    .copy_slots(&piece.copies)
+                    .map_err(fault)?;
+            }
+            if at == last {
+                return Ok(fired);
+            }
+        }
+        unreachable!("a step cuts into one piece at least")
+    }
+
     fn fire_step(
         &mut self,
         submission: &engine::fire::Step,
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
         capture(submission);
-        // Checked before a prologue moves the cursors the caller predicted.
-        for attachment in &submission.attachments {
-            if let Some(lane) = submission.lanes.get(attachment.lane as usize)
-                && !lane.channels.is_empty()
-                && let Some(why) = self
-                    .programs
-                    .disagreeing_ticket(attachment.instance, &lane.channels)
-            {
-                return Err(Error::Program(format!(
-                    "this fire's channel predictions and the engine's disagree: {why}"
-                )));
-            }
-        }
-        self.run_prologues(submission)?;
+        // Each attached instance's lanes: where its pass's fault lands.
+        latch.seat_spans(
+            (submission.attachments.iter())
+                .map(|a| (a.instance, a.lane..a.lane + a.lanes.max(1)))
+                .collect(),
+        );
+        self.run_prologues(submission, latch)?;
         let fed = self.lane_feeds(submission)?;
         let input_cells: Vec<Vec<crate::serve::InputCell<'_>>> = fed
             .cells
@@ -1174,6 +1994,62 @@ impl Xla {
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let device = self.device_lanes(submission)?;
+        // A page holds what its last owner left until its set writes it: no
+        // lane reads past what its set holds written (`engine::extent`).
+        let kv_shape = self
+            .shell
+            .as_ref()
+            .and_then(|shell| shell.pools().kv_shape());
+        let mut extents = engine::extent::FireExtents::default();
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if lane.kv_less {
+                continue;
+            }
+            let set = (lane.kv.set, lane.kv.readable);
+            match device[at].as_ref() {
+                Some(DeviceLane {
+                    have: Some(have),
+                    slots,
+                    tokens,
+                    ..
+                }) => {
+                    let reach = have.saturating_add(tokens.len() as u32);
+                    match slots {
+                        Some(slots) => extents.lane(
+                            &self.written,
+                            at,
+                            lane.slot,
+                            set,
+                            slots.iter().map(|&slot| slot..slot.saturating_add(1)),
+                            reach,
+                        ),
+                        None => extents.lane(
+                            &self.written,
+                            at,
+                            lane.slot,
+                            set,
+                            std::iter::once(*have..reach),
+                            reach,
+                        ),
+                    }
+                }
+                Some(_) => {}
+                None if holds_kv(lane, kv_shape) => {
+                    let reach = lane.kv.held.saturating_add(lane.rows());
+                    extents.lane(
+                        &self.written,
+                        at,
+                        lane.slot,
+                        set,
+                        std::iter::once(lane.kv.held..reach),
+                        reach,
+                    );
+                }
+                None => {}
+            }
+        }
+        extents.check().map_err(Error::Program)?;
+        self.written.commit(extents);
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
         let mut resolved_masks: Vec<Option<engine::fire::Masking>> =
             vec![None; submission.lanes.len()];
@@ -1207,12 +2083,11 @@ impl Xla {
                 {
                     None => None,
                     Some(crate::program::Tokens::Host(ids)) => Some(ids),
-                    Some(crate::program::Tokens::Device { out, words }) => {
-                        let stand_in = vec![0; words.len()];
+                    Some(crate::program::Tokens::Device { at }) => {
+                        let stand_in = vec![0; at.len()];
                         token_feeds.push(crate::serve::TokenFeed {
                             lane: lane_index,
-                            src: out,
-                            words,
+                            at,
                         });
                         Some(stand_in)
                     }
@@ -1225,35 +2100,268 @@ impl Xla {
                 }
             }
         }
+        // Beam groups (BEAM-PAGE-LISTS): an instance stating parents, its
+        // lanes its beams; each group's head runs before the fire.
+        let mut beam_lanes: Vec<Option<crate::beam::BeamLane>> = vec![None; submission.lanes.len()];
+        let mut heads: Vec<(kernels_xla::beam::Layout, crate::store::beam::Head)> = Vec::new();
+        let mut groups: Vec<(InstanceId, u32, u32)> = Vec::new();
+        for attachment in &submission.attachments {
+            let Some(seat) = self.programs.beam_seat(attachment.instance) else {
+                continue;
+            };
+            let shell = self
+                .shell
+                .as_ref()
+                .ok_or_else(|| Error::Program("a beam fire before load".to_string()))?;
+            let kv = shell.pools().kv_shape().ok_or_else(|| {
+                Error::Program("a beam group on a load that keeps no kv".to_string())
+            })?;
+            let live = self
+                .programs
+                .lane_count(attachment.instance)
+                .map_err(refusal)?;
+            let first = attachment.lane as usize;
+            let beams = submission.lanes.get(first..first + live).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "instance {}'s beams run past the fire's lanes",
+                    attachment.instance
+                ))
+            })?;
+            if live as i64 > seat.layout.lanes {
+                return Err(Error::Program(format!(
+                    "instance {}'s beam group runs {live} beams on a rung of {}",
+                    attachment.instance, seat.layout.lanes
+                )));
+            }
+            let lane0 = &beams[0];
+            let slot = lane0.kv.held;
+            if beams
+                .iter()
+                .any(|lane| lane.kv.held != slot || lane.rows() != 1)
+            {
+                return Err(Error::Program(format!(
+                    "instance {}'s beams write different slots or more than one row; every \
+                     beam writes its depth, one row a fire",
+                    attachment.instance
+                )));
+            }
+            let page = shell.paging().page_size.max(1);
+            let folded = lane0.kv.folded;
+            let f0 = folded / page;
+            let column = (slot / page).saturating_sub(f0);
+            let pool_refs = lane0.reserve.get(f0 as usize..).unwrap_or(&[]);
+            // the pages the beams can name this fire (the lowest-free rule
+            // bounds them: §3), as engine-cuda stages them
+            let frames = self.caps.as_ref().map_or(1, |caps| caps.frames_in_flight);
+            let live32 = live as u32;
+            let backed = (live32 * (column + 2) + live32 * frames + 1).min(pool_refs.len() as u32);
+            let pool = shell
+                .pools()
+                .grains(kv, &pool_refs[..backed as usize])
+                .map_err(fault)?;
+            let parents_row = self
+                .programs
+                .parents_row(attachment.instance)
+                .map_err(refusal)?;
+            let results_row =
+                seat.row + u32::try_from((seat.layout.words() + 127) / 128).unwrap_or(u32::MAX);
+            for (b, slot_of) in beam_lanes[first..first + live].iter_mut().enumerate() {
+                *slot_of = Some(crate::beam::BeamLane {
+                    results_row,
+                    beam: b as u32,
+                    lanes: seat.layout.lanes as u32,
+                    cap: seat.layout.cap as u32,
+                    first_page: f0,
+                    column,
+                });
+            }
+            heads.push((
+                seat.layout,
+                crate::store::beam::Head {
+                    state_row: seat.row,
+                    parents_row,
+                    folded,
+                    slot,
+                    live: live32,
+                    pool,
+                },
+            ));
+            self.programs.beam_fired(attachment.instance);
+            groups.push((attachment.instance, first as u32, live32));
+        }
         let mut verbs: Vec<engine::fire::RsVerb> = submission
             .lanes
             .iter()
             .map(|lane| lane.rs.clone())
             .collect();
-        for attachment in &submission.attachments {
-            if let engine::fire::RsVerb::Buffer { fold, .. } = &mut verbs[attachment.lane as usize]
-                && *fold == engine::fire::FoldLen::Device
-                && let Some(n) = self
-                    .programs
-                    .envelope_fold(attachment.instance)
-                    .map_err(refusal)?
-            {
-                *fold = engine::fire::FoldLen::Host(n);
+        // The lanes whose fold length was the device's, resolved here.
+        let mut device_folds = vec![false; submission.lanes.len()];
+        // A state a device-counted fold froze past what the runtime counts
+        // replays from where the fold left it.
+        for (lane, verb) in submission.lanes.iter().zip(verbs.iter_mut()) {
+            let Some((read, write)) = record_key(lane) else {
+                continue;
+            };
+            // A state starting afresh holds nothing an earlier fold froze.
+            let fresh = match lane.rs_reset {
+                engine::fire::RsReset::Fresh => true,
+                engine::fire::RsReset::Inferred => lane.kv.held == 0,
+                engine::fire::RsReset::Held => false,
+            };
+            if fresh {
+                self.rs_ahead.remove(&write);
+                continue;
+            }
+            if let engine::fire::RsVerb::Buffer { folded, .. } = verb {
+                match self.rs_ahead.get(&read).copied() {
+                    Some(ahead) if ahead > *folded => *folded = ahead,
+                    Some(_) if read == write => {
+                        self.rs_ahead.remove(&read);
+                    }
+                    _ => {}
+                }
             }
         }
+        // A reporting lane with no recurrent state to fold (a KV-only set)
+        // is folded by the count its program's `fold` port states just the
+        // same: the count, as read, is its report's fold.
+        let mut kv_folds: Vec<Option<u32>> = vec![None; submission.lanes.len()];
+        for attachment in &submission.attachments {
+            let at = attachment.lane as usize;
+            match &mut verbs[at] {
+                engine::fire::RsVerb::Buffer { fold, .. }
+                    if *fold == engine::fire::FoldLen::Device =>
+                {
+                    if let Some(n) = self
+                        .programs
+                        .envelope_fold(attachment.instance)
+                        .map_err(refusal)?
+                    {
+                        *fold = engine::fire::FoldLen::Host(n);
+                        device_folds[at] = true;
+                    }
+                }
+                engine::fire::RsVerb::Buffer { .. } => {}
+                _ if submission
+                    .lanes
+                    .get(at)
+                    .is_some_and(|lane| lane.reports != 0) =>
+                {
+                    kv_folds[at] = self
+                        .programs
+                        .envelope_fold(attachment.instance)
+                        .map_err(refusal)?;
+                }
+                _ => {}
+            }
+        }
+        // Where each device-counted fold leaves its state, for the fires
+        // staged before this one settles.
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if let (
+                engine::fire::RsVerb::Buffer {
+                    folded,
+                    fold: engine::fire::FoldLen::Host(n),
+                    ..
+                },
+                Some((_, slot)),
+                true,
+            ) = (&verbs[at], record_key(lane), device_folds[at])
+            {
+                let first = device
+                    .get(at)
+                    .and_then(Option::as_ref)
+                    .and_then(|p| p.first.or(p.have))
+                    .unwrap_or(lane.kv.held);
+                let to = folded
+                    .saturating_add(*n)
+                    .min(first + lane.tokens.len() as u32);
+                self.rs_ahead.insert(slot, to);
+            }
+        }
+        // What each reported lane wrote, told when the step lands: one past
+        // the last slot its rows landed at (the runtime bounds what a
+        // device-placed lane carries by it, `engine::fire::rung_holds`), and
+        // where its fold length was the device's, the slots this fire's fold
+        // froze, clamped to its rows' end as the plan clamps it
+        // (`engine::rs::LanePlan::of`).
+        latch.report(
+            submission
+                .lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| lane.reports != 0)
+                .map(|(at, lane)| {
+                    let rows = lane.tokens.len() as u32;
+                    let placed = device.get(at).and_then(Option::as_ref);
+                    let first = placed
+                        .and_then(|p| p.first.or(p.have))
+                        .unwrap_or(lane.kv.held);
+                    let end = match placed {
+                        Some(placed) => placed.end,
+                        None => (!lane.kv_less).then_some(first + rows),
+                    };
+                    let fold = match &verbs[at] {
+                        engine::fire::RsVerb::Buffer {
+                            folded,
+                            fold: engine::fire::FoldLen::Host(n),
+                            ..
+                        } if device_folds[at] => {
+                            let to = folded.saturating_add(*n).min(first + rows);
+                            Some(to.saturating_sub(*folded))
+                        }
+                        _ => kv_folds[at],
+                    };
+                    engine::KvWrites {
+                        tag: lane.reports,
+                        fold,
+                        end,
+                        ..engine::KvWrites::default()
+                    }
+                })
+                .collect(),
+        );
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
         for attachment in &submission.attachments {
             if let Some(bound) = self.adapters.get(&attachment.instance)
                 && let Some(slot) = lane_adapters.get_mut(attachment.lane as usize)
             {
-                *slot = Some(bound.slot);
+                *slot = Some(*bound);
             }
         }
         let (kv_shape, window_shape) = self.shell.as_ref().map_or((None, None), |shell| {
             (shell.pools().kv_shape(), shell.pools().window_shape())
         });
         let shell = self.loaded_mut()?;
+        // A load that holds state is told every lane's record: its pieces,
+        // or none (`LaneRecord::Null`, which names no piece).
+        if shell.state_slot_bytes() > 0
+            && let Some(lane) = submission
+                .lanes
+                .iter()
+                .find(|lane| matches!(lane.record, engine::fire::LaneRecord::Unstated))
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} states no record, and this load holds recurrent state: the \
+                 runtime states every lane's record, or that it has none",
+                lane.slot
+            )));
+        }
+        // A load serving windowed layers as ring + buffer: every lane the
+        // runtime seats states its fold, a kv-less one none.
+        if shell.serves_windowed_state()
+            && let Some(lane) = submission
+                .lanes
+                .iter()
+                .find(|lane| !lane.kv_less && lane.window.is_none())
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} states no window fold, and this load serves its windowed layers \
+                 as ring + buffer: the runtime states every seated lane's",
+                lane.slot
+            )));
+        }
         let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
         for (at, slot) in lane_adapters.iter().enumerate() {
             if slot.is_none() {
@@ -1284,16 +2392,15 @@ impl Xla {
                     Some(DeviceLane {
                         pages: Some(pages), ..
                     }) => pages,
-                    _ => kv_shape
-                        .and_then(|id| table_of(lane, id))
-                        .unwrap_or(&lane.kv.pages),
+                    _ => kv_shape.and_then(|id| table_of(lane, id)).unwrap_or(&[]),
                 },
                 held: match &device[at] {
                     Some(DeviceLane {
                         have: Some(have), ..
                     }) => Some(*have),
-                    _ => (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    _ => holds_kv(lane, kv_shape).then_some(lane.kv.held),
                 },
+                folded: lane.kv.folded,
                 mask: device[at]
                     .as_ref()
                     .and_then(|resolved| resolved.mask.as_ref())
@@ -1313,7 +2420,6 @@ impl Xla {
                 },
                 quiet: matches!(lane.readout, Readout::None),
                 rs_reset: lane.rs_reset,
-                rs_slot: lane.rs_slot,
                 rs: &verbs[at],
                 media: media_of[at],
                 inputs: &input_cells[at],
@@ -1334,8 +2440,11 @@ impl Xla {
                         .and_then(|id| table_of(lane, id))
                         .unwrap_or(&[]),
                 },
-                fixed: &lane.fixed,
+                fixed: lane.record.pieces(),
+                window_fold: lane.window,
                 copies: &lane.slot_copies,
+                beam: beam_lanes[at],
+                replay_stated: lane.replay_stated,
             })
             .collect();
         let clips: Vec<crate::serve::Clips<'_>> = submission
@@ -1350,7 +2459,13 @@ impl Xla {
             .collect();
         // The readout stays on the device: guest passes read it there, and
         // the host copy is made only for a row something on the host reads.
+        // each beam group's head, on the pool before the fire (stream order)
+        let mut head_faults = Vec::with_capacity(heads.len());
+        for ((layout, head), group) in heads.iter().zip(&groups) {
+            head_faults.push((*group, shell.run_beam_head(*layout, head).map_err(fault)?));
+        }
         shell.feed_tokens(token_feeds);
+        shell.shape_next(submission.shape);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
         let kept = fired.kept.clone();
         // The step waits on its fire too, so a fault on the device reaches it.
@@ -1370,29 +2485,70 @@ impl Xla {
             }
         }
 
-        let attached: Vec<(InstanceId, u32)> = submission
+        // Each beam group's fault words (§7), read once its head lands: a
+        // faulted beam fails by name, the rest of the step commits.
+        for ((instance, first, live), words) in head_faults {
+            latch.hold();
+            let hold = std::sync::Arc::clone(latch);
+            std::thread::spawn(move || {
+                let outcome = words.download().map_err(|e| e.to_string()).map(|bytes| {
+                    let words: Vec<u32> = bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                        .collect();
+                    for (b, &code) in words.iter().take(live as usize).enumerate() {
+                        if code != 0 {
+                            let lane = first + b as u32;
+                            hold.fault_lane(
+                                lane,
+                                instance,
+                                &engine::beam::fault_reason(code, lane as usize, "engine-xla"),
+                            );
+                        }
+                    }
+                    // the group's common slot, after the lanes' faults (§11.3)
+                    if let Some(&common) = words.last() {
+                        hold.beam_common(instance, common);
+                    }
+                });
+                hold.release(outcome);
+            });
+        }
+        let attached: Vec<(InstanceId, u32, u32)> = submission
             .attachments
             .iter()
             .filter(|attachment| !attachment.adapter_only)
-            .map(|attachment| (attachment.instance, attachment.lane))
+            .map(|attachment| {
+                (
+                    attachment.instance,
+                    attachment.lane,
+                    attachment.lanes.max(1),
+                )
+            })
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
         if !attached.is_empty() {
-            let device = self
+            let (device, pool) = self
                 .shell
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
-                .device();
-            let ran = self
+                .device_and_pool();
+            let (ran, faults) = self
                 .programs
                 .fire_guests_with(
                     device,
                     &attached,
                     kept.as_deref(),
+                    pool,
                     Some(latch),
                     Stage::Epilogue,
                 )
                 .map_err(refusal)?;
+            for (instance, why) in faults {
+                latch.fault_instances(&[instance], &why);
+            }
             for (attachment, ran) in submission
                 .attachments
                 .iter()
@@ -1485,4 +2641,39 @@ fn table_of(lane: &engine::fire::Lane, id: engine::chunk::ShapeId) -> Option<&[u
         .iter()
         .find(|(held, _)| *held == id)
         .map(|(_, table)| table.as_slice())
+}
+
+/// A device slot ref of shape `shape` as one key.
+fn ref_key(shape: engine::chunk::ShapeId, slot: u32) -> u64 {
+    (u64::from(shape.0) << 32) | u64::from(slot)
+}
+
+/// A slot ref of shape `shape` on `tier` as one key: a device ref's is its
+/// [`ref_key`], what a lane's record reads; the host tier's and the slot
+/// file's stand apart from it.
+fn tier_key(tier: crate::serve::Tier, shape: engine::chunk::ShapeId, slot: u32) -> u64 {
+    let tag: u64 = match tier {
+        crate::serve::Tier::Device => 0,
+        crate::serve::Tier::Host => 1,
+        crate::serve::Tier::Disk => 2,
+    };
+    (tag << 62) | ref_key(shape, slot)
+}
+
+/// The state record a lane reads and the one it writes: its first fixed
+/// shape's first piece, `[run, cow]` (a fork's `cow` differs); none where
+/// it holds no record.
+fn record_key(lane: &engine::fire::Lane) -> Option<(u64, u64)> {
+    let (id, &[run, cow]) = lane
+        .record
+        .pieces()
+        .first()
+        .and_then(|(id, pieces)| Some((*id, pieces.first()?)))?;
+    Some((ref_key(id, run), ref_key(id, cow)))
+}
+
+/// Whether the lane holds kv pages: its kv list's table names any.
+fn holds_kv(lane: &engine::fire::Lane, kv: Option<engine::chunk::ShapeId>) -> bool {
+    kv.and_then(|id| table_of(lane, id))
+        .is_some_and(|table| !table.is_empty())
 }

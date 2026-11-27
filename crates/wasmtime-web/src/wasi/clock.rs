@@ -72,6 +72,13 @@ pub fn fire_due_timers() -> Option<u64> {
     TIMERS.lock().unwrap().iter().map(|(d, _)| *d).min()
 }
 
+/// The earliest deadline a guest's timer waits for, where one does: read
+/// after a tick, so a timer the tick's guests set is counted (the page sleeps
+/// until it).
+pub fn next_timer() -> Option<u64> {
+    TIMERS.lock().unwrap().iter().map(|(d, _)| *d).min()
+}
+
 fn register(deadline: u64, waker: &Waker) {
     let mut timers = TIMERS.lock().unwrap();
     if let Some(slot) = timers

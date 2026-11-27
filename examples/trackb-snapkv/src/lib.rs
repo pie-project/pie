@@ -21,8 +21,6 @@ struct Input {
     /// page, which is where the decode writes.
     #[serde(default = "default_page_budget")]
     page_budget: u32,
-    #[serde(default = "default_heads")]
-    heads: u32,
     #[serde(default)]
     prompt_tokens: Option<Vec<u32>>,
     #[serde(default)]
@@ -44,10 +42,6 @@ fn default_seed() -> u32 {
 fn default_page_budget() -> u32 {
     4
 }
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
-}
 
 /// Tie-break ramp: equal-mass pages go to the earlier one, the StreamingLLM prior.
 const SEED_SCALE: f32 = 1e-4;
@@ -64,7 +58,6 @@ struct Output {
     /// Pages the prompt occupies. Only these compete for the budget.
     prompt_pages: u32,
     page_size: u32,
-    layers_observed: u32,
     /// Slots inside the prompt that carry a finite, non-negative score.
     live_scored: usize,
     tail_nonzero: usize,
@@ -102,27 +95,21 @@ async fn main(input: Input) -> Result<Output> {
     if input.page_budget == 0 {
         return Err("page_budget must be at least 1".into());
     }
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
-    let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
-        return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
-        ));
-    }
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
+    let score_pages = model::lane_of(&[])?
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "attn.scores.pages")
+        .ok_or("this model reads out no page scores")?
+        .width;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -165,8 +152,9 @@ async fn main(input: Input) -> Result<Output> {
 
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
-    // `naive-baseline`'s salt, so the all-keep arm differs from it only by the mask.
-    let rng_p = Channel::from([input.seed ^ 0x5bd1, 0]);
+    // `naive-baseline`'s streams — `seed` for the prefill, `seed ^ 0x5bd1` for
+    // the decode — so the all-keep arm differs from it only by the mask.
+    let rng_p = Channel::from([input.seed, 0]);
     let tok_out_p = Channel::new([1], dtype::i32);
 
     let scores_out = Channel::new([kv_max], dtype::f32);
@@ -174,7 +162,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
+    fwd_p.state(&[&ws], StateGeometry::default())?;
 
     fwd_p.epilogue(move || {
         let r = rng_p.take();
@@ -183,13 +171,17 @@ async fn main(input: Input) -> Result<Output> {
         tok_out_p.put(&token);
         rng_p.put(&(&r + iota(2)));
 
-        // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-        let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-        let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
+        let folded = gather(
+            &reshape(intrinsics::output(0, "attn.scores"), [score_kv]),
+            iota(kv_max),
+        );
         scores_out.put(&folded);
 
         // Exact: `kv_max = p_max * page_size`.
-        page_mass_out.put(reduce_sum(reshape(&folded, [p_max, page_size])));
+        page_mass_out.put(gather(
+            &reshape(intrinsics::output(0, "attn.scores.pages"), [score_pages]),
+            iota(p_max),
+        ));
     });
 
     fwd_p.submit(&pipe).context("prefill submit")?;
@@ -201,7 +193,6 @@ async fn main(input: Input) -> Result<Output> {
     generated.push(g0 as u32);
 
     let prefill_scores = scores_out.take_host::<Vec<f32>>().await?;
-    let layers_observed = layers;
     let device_page_mass = page_mass_out.take_host::<Vec<f32>>().await?;
 
     let ranked = |p: u32| -> f32 {
@@ -228,7 +219,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x5bd1, 2]);
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
         let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
         let fill = Channel::from([n + 1]);
@@ -247,7 +238,7 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.mask(&mask)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
 
         fwd.epilogue(move || {
             let length = fill.take();
@@ -311,7 +302,6 @@ async fn main(input: Input) -> Result<Output> {
         page_budget,
         prompt_pages,
         page_size,
-        layers_observed,
         live_scored: prefill_scores[..live]
             .iter()
             .filter(|s| s.is_finite() && **s >= 0.0)

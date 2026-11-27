@@ -1,58 +1,76 @@
-//! Keeps every run some worker caches on two serving workers: the two a
-//! rendezvous hash of the run picks among the decode workers not draining,
-//! so a run's copies stay where they are as workers come and go, and losing
-//! a worker leaves each of its runs on another.
+//! Keeps every run some worker caches on two decode workers, over what
+//! `default-cluster` does: the two a rendezvous hash of the run picks among
+//! those not draining, so a run's copies stay where they are as workers
+//! come and go, and losing a worker leaves each of its runs on another.
+//!
+//! No event says a run was cached, so the policy looks each second; the
+//! controller reads what the workers hold each second too. Which tier a
+//! copy sits in, and whether it stays, is the receiving worker's retention.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
 
-use policy::{Replicate, Site, Subject, SubjectKind, Tier, attr, candidates, cluster};
+use cluster_defaults::{Helpers, Placement, decode_workers, pools, rank, wake};
+use plex::prelude::*;
 
 /// Workers each run is kept on; the one that computed it may be one of them.
 const COPIES: usize = 2;
 
-#[derive(Default)]
-struct KeepTwo;
+/// How often it looks for runs cached since.
+const LOOK: Duration = SECOND;
 
-fn score(group: &str, worker: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    (group, worker).hash(&mut hasher);
-    hasher.finish()
+/// The rows a column takes.
+const MAX_ROWS: usize = 65_536;
+
+#[derive(Default)]
+struct Replicate {
+    placement: Placement,
+    helpers: Helpers,
+    /// The next look.
+    next: Mark,
 }
 
-impl cluster::Policy for KeepTwo {
-    fn plan(&mut self, _now_ms: u64) {
-        let workers: Vec<String> = candidates(SubjectKind::Worker)
-            .into_iter()
-            .filter(|worker| {
-                let of = Subject::Worker(worker.clone());
-                attr(&of, "role").text() == Some("decode")
-                    && attr(&of, "draining").boolean() != Some(true)
-            })
-            .collect();
+impl Replicate {
+    /// A run's row stands in for the default, so it names the pools too.
+    fn copies(&self) {
+        let pools = pools();
+        let workers: Vec<WorkerId> = decode_workers().into_iter().map(|load| load.id).collect();
+        replication::workers::clear();
+        if !pools.is_empty() {
+            replication::workers::set_default(&pools).ok();
+        }
         if workers.len() < COPIES {
             return;
         }
-        let entries: Vec<Replicate> = candidates(SubjectKind::Group)
+        let rows: Vec<(Prefix, Vec<WorkerId>)> = snapshot::get_working_sets()
             .into_iter()
-            .map(|group| {
-                let mut ranked: Vec<&String> = workers.iter().collect();
-                ranked.sort_by_key(|worker| std::cmp::Reverse(score(&group, worker)));
-                Replicate {
-                    at: ranked
-                        .into_iter()
-                        .take(COPIES)
-                        .map(|worker| Site {
-                            worker: worker.clone(),
-                            tier: Tier::Host,
-                        })
-                        .collect(),
-                    group,
-                    upto: None,
-                }
+            .take(MAX_ROWS)
+            .map(|set| {
+                let mut at = workers.clone();
+                at.sort_by_key(|worker| Reverse(rank(&set.id, worker)));
+                at.truncate(COPIES);
+                at.extend(pools.iter().cloned());
+                (Prefix::all(set.id), at)
             })
             .collect();
-        cluster::install_replication(&entries);
+        replication::workers::set_list(&rows).ok();
     }
 }
 
-policy::cluster!(KeepTwo);
+impl Policy for Replicate {
+    fn on_worker_changed(&mut self, _worker: &WorkerId, now: Mark) {
+        self.next = now;
+    }
+
+    fn plan(&mut self, now: Mark) {
+        let again = self.placement.plan(now, |_| None, BTreeMap::new());
+        self.helpers.plan();
+        if now >= self.next {
+            self.copies();
+            self.next = now.saturating_add(LOOK);
+        }
+        wake([again, Some(self.next)]);
+    }
+}
+
+plex::export!(Replicate);

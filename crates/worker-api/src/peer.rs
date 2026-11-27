@@ -41,6 +41,9 @@ pub struct KvAccess {
 /// computes the partial page at the end itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefill {
+    /// The asking set's cache domain: the executor keys the tokens under
+    /// it, so its pages are found only within the asker's scope.
+    pub domain: [u8; 32],
     pub tokens: Vec<u32>,
     pub from_page: u32,
     /// The asker's bulk-bytes address: the executor fetches from it, by key,

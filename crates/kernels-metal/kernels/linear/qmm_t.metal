@@ -315,9 +315,9 @@ METAL_FUNC void qmm_t_aligned_half_impl(
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
+  wl += int64_t(y_col) * K_w;
+  scales += int64_t(y_col) * K_g;
+  biases += int64_t(y_col) * K_g;
   loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
 
   qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS, WITH_RESIDUAL,
@@ -355,9 +355,9 @@ METAL_FUNC void qmm_t_aligned_impl(
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
+  wl += int64_t(y_col) * K_w;
+  scales += int64_t(y_col) * K_g;
+  biases += int64_t(y_col) * K_g;
   loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
                     WM, WN>(
@@ -392,9 +392,9 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
+  wl += int64_t(y_col) * K_w;
+  scales += int64_t(y_col) * K_g;
+  biases += int64_t(y_col) * K_g;
   using loader_w_t = typename AffineLoaderFor<
       bfloat, BN, BK, BK_padded, WM * WN * SIMD_SIZE, group_size, bits, half>::type;
   loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
@@ -751,10 +751,10 @@ METAL_FUNC void mxfp4_qmm_t_routed_impl(
   const ulong w_row = ulong(K) / 2, s_row = ulong(K / 32);
   const device uint8_t* wb = (const device uint8_t*)expert_plane(
       (const device char*)w, codes_at, pieces, piece_rows, ulong(N) * w_row, w_row,
-      uint(e), uint(y_col)) + y_col * K / 2;
+      uint(e), uint(y_col)) + int64_t(y_col) * K / 2;
   const device uint8_t* sb = (const device uint8_t*)expert_plane(
       (const device char*)exponents, scales_at, pieces, piece_rows, ulong(N) * s_row, s_row,
-      uint(e), uint(y_col)) + y_col * (K / 32);
+      uint(e), uint(y_col)) + int64_t(y_col) * (K / 32);
 
   using loader_w_t = Mxfp4VecLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
   loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
@@ -999,9 +999,9 @@ METAL_FUNC void qmm_t_strided_impl(
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
+  wl += int64_t(y_col) * K_w;
+  scales += int64_t(y_col) * K_g;
+  biases += int64_t(y_col) * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, false>(
       x, y, residual, Xs, Ws, row_stride, row_stride, K,
@@ -1080,9 +1080,9 @@ METAL_FUNC void qmm_t_strided_fp16_precast_impl(
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
+  wl += int64_t(y_col) * K_w;
+  scales += int64_t(y_col) * K_g;
+  biases += int64_t(y_col) * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<half, bfloat, loader_w_t, BM, BK, BN,
                     WITH_RESIDUAL, false>(
@@ -1188,9 +1188,9 @@ template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
 
   const int row_w = K * bits / 8;
   const int row_g = K / group_size;
-  const device uint8_t* wrow = (const device uint8_t*)w + row * row_w;
-  const device T* srow = scales + row * row_g;
-  const device T* brow = biases + row * row_g;
+  const device uint8_t* wrow = (const device uint8_t*)w + int64_t(row) * row_w;
+  const device T* srow = scales + int64_t(row) * row_g;
+  const device T* brow = biases + int64_t(row) * row_g;
 
   const device T* xv[vecs_per_tg];
   for (int v = 0; v < vecs_per_tg; ++v)
@@ -1268,9 +1268,9 @@ METAL_FUNC void qmm_t_splitk_impl(
   const int y_col = int(tid.x) * BN;
 
   auto wl = (const device uint8_t*)w;
-  wl += y_col * K_w;
-  scales += y_col * K_g;
-  biases += y_col * K_g;
+  wl += int64_t(y_col) * K_w;
+  scales += int64_t(y_col) * K_g;
+  biases += int64_t(y_col) * K_g;
   loader_w_t loader_w(wl, scales, biases, ld, Ws, simd_gid, simd_lid);
   qmm_t_loaded_impl<T, P, loader_w_t, BM, BK, BN, false, false>(
       x, y, nullptr, Xs, Ws, K, N, k_len,

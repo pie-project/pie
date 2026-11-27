@@ -78,6 +78,7 @@ pub(crate) static OPS: &[Op] = &[
             "bias",
             "extent",
             "log_scaling",
+            "mask",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -93,6 +94,7 @@ pub(crate) static OPS: &[Op] = &[
             let bias: Option<Value> = a.next()?;
             let extent: Option<u32> = a.next()?;
             let log_scaling: Option<(u32, f32)> = a.next()?;
+            let mask: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.decode", || {
@@ -110,6 +112,7 @@ pub(crate) static OPS: &[Op] = &[
                         bias.as_ref(),
                         extent,
                         log_scaling,
+                        mask.as_ref(),
                     )
                 })?,
             )
@@ -1011,9 +1014,9 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "attn",
-        name: "score_capture",
+        name: "capture_scores",
         params: &[
-            "q", "inputs", "kv", "q_heads", "kv_heads", "head_dim", "sm_scale", "observe", "kv_max",
+            "q", "inputs", "kv", "q_heads", "kv_heads", "head_dim", "sm_scale", "observe",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1024,14 +1027,59 @@ pub(crate) static OPS: &[Op] = &[
             let head_dim: u32 = a.next()?;
             let sm_scale: f32 = a.next()?;
             let observe: u32 = a.next()?;
-            let kv_max: u32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.capture_scores", || {
+                    ops::attn::capture_scores(
+                        &q, &inputs, &kv.0, q_heads, kv_heads, head_dim, sm_scale, observe,
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "score_capture",
+        params: &[
+            "q", "inputs", "kv", "q_heads", "kv_heads", "head_dim", "sm_scale", "observe", "into",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let inputs: Input = a.next()?;
+            let kv: StateName = a.next()?;
+            let q_heads: u32 = a.next()?;
+            let kv_heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            let observe: u32 = a.next()?;
+            let into: Option<Value> = a.next()?;
             result(
                 heap,
                 dsl("attn.score_capture", || {
                     ops::attn::score_capture(
-                        &q, &inputs, &kv.0, q_heads, kv_heads, head_dim, sm_scale, observe, kv_max,
+                        &q,
+                        &inputs,
+                        &kv.0,
+                        q_heads,
+                        kv_heads,
+                        head_dim,
+                        sm_scale,
+                        observe,
+                        into.as_ref(),
                     )
                 })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "score_pages",
+        params: &["keys"],
+        call: |a, heap| {
+            let keys: Value = a.next()?;
+            result(
+                heap,
+                dsl("attn.score_pages", || ops::attn::score_pages(&keys))?,
             )
         },
     },

@@ -22,7 +22,7 @@ pub fn build(
             user.model.name,
         );
     }
-    let model = build_model(&user.model, &user.runtime, engines, metadata)?;
+    let model = build_model(user, engines, metadata)?;
     runtime_config(user, home, builtins, model)
 }
 
@@ -36,8 +36,7 @@ pub fn build_without_engine(
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::Config> {
     let model = runtime::bootstrap::ModelConfig {
-        memory_tolerance: user.model.memory_tolerance,
-        weight_streaming: user.model.weight_streaming,
+        memory_yield: user.engine.memory.yields()?,
         name: user.model.name.clone(),
         model_id: deployment.to_string(),
         kv_page_size: ENGINELESS_PAGE_SIZE as usize,
@@ -45,6 +44,7 @@ pub fn build_without_engine(
         metadata,
         engines: Vec::new(),
         scheduler: scheduler(&user.runtime, 0),
+        media_device: media_device(&user.engine),
     };
     runtime_config(user, home, builtins, model)
 }
@@ -58,6 +58,7 @@ pub fn builtins() -> Vec<runtime::bootstrap::BuiltinProgram> {
         .map(|b| runtime::bootstrap::BuiltinProgram {
             name: b.name,
             component: b.component,
+            source: b.source,
         })
         .collect()
 }
@@ -69,9 +70,9 @@ fn runtime_config(
     model: runtime::bootstrap::ModelConfig,
 ) -> Result<runtime::bootstrap::Config> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = match user.runtime.worker_policy.as_deref() {
-        Some(spec) => Some((spec.to_string(), builtins::policy_component(spec)?)),
-        None => None,
+    let policy = {
+        let spec = &user.runtime.worker_policy;
+        Some((spec.clone(), builtins::policy_component(spec)?))
     };
     // The browser runs no policy.
     #[cfg(target_arch = "wasm32")]
@@ -121,8 +122,6 @@ fn scheduler(
     engine_depth: u32,
 ) -> runtime::bootstrap::SchedulerConfig {
     let c = runtime::bootstrap::SchedulerConfig {
-        submit_deadline_us: runtime.submit_deadline.as_micros(),
-        silence_timeout_secs: runtime.silence_timeout.as_secs(),
         frame_size: runtime.frame_size,
         frame_dispatch_depth: runtime.dispatch_depth(engine_depth),
     };
@@ -135,11 +134,11 @@ fn scheduler(
 }
 
 fn build_model(
-    m: &config::ModelConfig,
-    runtime: &config::RuntimeConfig,
+    user: &config::Config,
     engines: ModelEngines,
     metadata: runtime::model::ModelMetadata,
 ) -> Result<runtime::bootstrap::ModelConfig> {
+    let (m, runtime) = (&user.model, &user.runtime);
     let group0_caps = engines.groups[0].caps.clone();
     let snapshot_dir = engines.groups[0].snapshot_dir.clone();
     let engines_facts = engines.groups[0].facts.trace_name.clone();
@@ -159,20 +158,11 @@ fn build_model(
         .into_iter()
         .enumerate()
         .map(|(group, g)| {
-            let disk_kept = kept_disk(m, group, &g);
+            let disk_kept = kept_disk(&user.engine.memory, group, &g);
             runtime::bootstrap::EngineConfig {
-                weights_fit: g.facts.weights_resident,
-                total_pages: g.caps.pools.kv_pages as usize,
                 chunks: g.caps.chunks.clone(),
-                window_tokens: g.caps.pools.window_tokens,
-                cpu_pages: g.caps.pools.host_kv_pages as usize,
-                disk_pages: g.caps.pools.disk_kv_pages,
+                windowed_state: g.caps.windowed_state,
                 disk_kept,
-                rs_cache_slots: g.caps.pools.state_slots as usize,
-                seated_first: g.caps.pools.seated_first,
-                seat_to_end: g.caps.pools.seat_to_end,
-                seat_spread: g.caps.pools.seat_spread,
-                rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 draft_block: g.caps.draft_block,
                 draft_mask_token: g.caps.draft_mask_token,
                 draft_proposals_from: g.caps.draft_proposals_from,
@@ -180,7 +170,10 @@ fn build_model(
                 has_lora: g.caps.has_lora,
                 adapter_attachments: g.caps.adapter_attachments,
                 rs_snapshots: g.caps.rs_snapshots,
+                guest_cost: g.caps.guest_cost,
+                frames_in_flight: g.caps.frames_in_flight,
                 device_geometry_port_mask: g.caps.ports,
+                host_ops: g.caps.host_ops,
                 facts: g.caps.facts.clone(),
                 inputs: g.caps.inputs.clone(),
                 classes: g.caps.classes.clone(),
@@ -190,45 +183,66 @@ fn build_model(
                     max_page_refs: g.caps.limits.max_page_refs as usize,
                     max_context: g.caps.limits.max_context as usize,
                     prefill_rows: g.caps.limits.prefill_rows as usize,
+                    prefill_lanes: g.caps.limits.prefill_lanes as usize,
                     max_readouts: g.caps.limits.max_readouts as usize,
+                    max_replayed_rows: g.caps.limits.replayed_rows as usize,
+                    shapes: None,
+                    readout_store: 0,
                 },
+                steps: g.caps.steps.clone(),
+                mixed_lanes: g.caps.mixed_lanes.clone(),
                 engine_backend: g.backend,
             }
         })
         .collect();
 
     Ok(runtime::bootstrap::ModelConfig {
-        memory_tolerance: m.memory_tolerance,
-        weight_streaming: m.weight_streaming,
+        memory_yield: user.engine.memory.yields()?,
         name: m.name.clone(),
         model_id: engines_facts,
-        kv_page_size: group0_caps.pools.kv_page_size as usize,
+        kv_page_size: group0_caps.chunks.page_tokens() as usize,
         tokenizer_path,
         metadata,
         engines,
         scheduler: scheduler(runtime, group0_caps.limits.dispatch_depth),
+        media_device: media_device(&user.engine),
     })
 }
 
+/// The CUDA device a media encode runs on: the cuda engine's first device
+/// (`cuda:<n>`), else device 0.
+fn media_device(engine: &config::EngineConfig) -> u32 {
+    if engine.kind != config::EngineKind::Cuda {
+        return 0;
+    }
+    engine
+        .device
+        .first()
+        .and_then(|device| device.strip_prefix("cuda:"))
+        .and_then(|index| index.parse().ok())
+        .unwrap_or(0)
+}
+
 /// The disk tier `g` keeps for the next run, its journal beside its slot
-/// files, when `disk_kv_persistent` asked for one and the engine kept it.
+/// files, when `[engine.memory] disk_persistent` asked for one and the
+/// engine kept it.
 fn kept_disk(
-    m: &config::ModelConfig,
+    memory: &config::MemoryConfig,
     group: usize,
     g: &crate::backend::GroupEngine,
 ) -> Option<runtime::bootstrap::KeptDisk> {
-    let pools = &g.caps.pools;
-    match (&g.disk_kv_dir, pools.disk_kv_persistent) {
+    let chunks = &g.caps.chunks;
+    match (&g.disk_kv_dir, chunks.disk_persistent) {
         (Some(dir), true) => Some(runtime::bootstrap::KeptDisk {
             journal: dir.join(format!("g{group}.journal")),
-            kept: pools.disk_kv_kept,
+            kept: chunks.disk_kept,
         }),
         _ => {
-            if m.disk_kv_persistent {
+            if memory.disk_persistent {
                 tracing::warn!(
                     engine = %g.backend.kind(),
-                    disk_pages = pools.disk_kv_pages,
-                    "disk_kv_persistent: this engine keeps no disk tier across runs; it is scratch"
+                    disk_pages = chunks.kv_disk_pages(),
+                    "disk_persistent: this engine keeps no disk tier across runs; it is scratch"
                 );
             }
             None

@@ -17,7 +17,7 @@ use crate::when::When;
 pub const API: i64 = 1;
 
 /// Top-level keys that are not decisions.
-const RESERVED: [&str; 3] = ["api", "target", "provenance"];
+const RESERVED: [&str; 4] = ["api", "target", "provenance", "rates"];
 
 /// A typed ladder, and the flag it raises when evaluated at a point.
 type Build = fn(
@@ -52,6 +52,13 @@ pub enum Strict {
     CheckedIn,
     /// A user or autotune profile: a constant it leaves out takes its default.
     User,
+    /// A committed measured profile (`<device>.measured.toml`, written by
+    /// `pie tune export`): a user's stored measurements checked in, in the
+    /// user file's format. It states `[rates]` alone, every entry keyed
+    /// (`rates.measured_on`, `rates.measured_by`, each curve's and the
+    /// settle's own key); a decision, a `[target]` or an entry stored
+    /// without a key is refused by name.
+    Measured,
 }
 
 /// One complaint about a file, at a line and column (both from 1).
@@ -67,6 +74,9 @@ pub struct Diagnostic {
 pub struct Refusal {
     pub origin: String,
     pub diagnostics: Vec<Diagnostic>,
+    /// The `[rates]` keys the file states that this pie does not read (a
+    /// schema the file outlived): a load refuses a checked-in file by them.
+    pub stale_rates: Vec<String>,
 }
 
 impl std::fmt::Display for Refusal {
@@ -109,6 +119,16 @@ pub struct File {
     pub measured: Vec<&'static str>,
     /// Decisions the file spells, by id.
     pub entries: BTreeMap<&'static str, Vec<Rung>>,
+    /// `[rates]` ([`crate::fire`]).
+    pub tuned: crate::rates::Tuned,
+    /// `[rates]` keys a user file states that this pie no longer reads:
+    /// left unread (the rest of the file is read, a load measures what it
+    /// lacks, and a save drops them, [`Registry::prune`]).
+    pub ignored_rates: Vec<String>,
+    /// `[rates]` entries of a user file that did not read (another pie's
+    /// form), each with why: skipped alone and measured again, the rest of
+    /// the file read.
+    pub skipped_rates: Vec<String>,
 }
 
 impl Registry {
@@ -328,16 +348,17 @@ impl Registry {
         let mut walk = Walk::new(self, text, strict);
         walk.under = under;
         walk.inherited = inherited;
-        let refuse = |diagnostics| Refusal {
+        let refuse = |walk: Walk<'_>| Refusal {
             origin: origin.to_string(),
-            diagnostics,
+            diagnostics: walk.diags,
+            stale_rates: walk.stale_rates,
         };
         let table = match DeTable::parse(text) {
             Ok(table) => table,
             Err(e) => {
                 let at = e.span().map_or(0, |s| s.start);
                 walk.err(at, e.message().trim().to_string());
-                return Err(refuse(walk.diags));
+                return Err(refuse(walk));
             }
         };
         let mut file = File {
@@ -358,7 +379,13 @@ impl Registry {
                         None => walk.err(value.span().start, "`api` is an integer"),
                     }
                 }
+                "target" if strict == Strict::Measured => walk.err(
+                    key.span().start,
+                    "a measured profile states measurements alone (`[rates]`, `[provenance]`); \
+                     `[target]` belongs in the device's decision profile",
+                ),
                 "target" => file.target = walk.target(value),
+                "rates" => file.tuned.rates = walk.rates(value),
                 "provenance" => match value.get_ref() {
                     DeValue::Table(t) => {
                         for (k, v) in t.iter() {
@@ -372,17 +399,33 @@ impl Registry {
                     }
                     _ => walk.err(value.span().start, "`provenance` is a table"),
                 },
+                other if strict == Strict::Measured => walk.err(
+                    key.span().start,
+                    format!(
+                        "a measured profile states measurements alone (`[rates]`, \
+                         `[provenance]`); `{other}` is a decision, which belongs in the device's \
+                         decision profile"
+                    ),
+                ),
                 other => walk.node(other, value, &mut file.entries),
             }
+        }
+        if strict == Strict::Measured
+            && walk.diags.is_empty()
+            && let Some(why) = file.tuned.rates.unkeyed()
+        {
+            walk.err(0, format!("a measured profile keys every entry: {why}"));
         }
         if !api_seen {
             walk.err(0, format!("a profile starts with `api = {API}`"));
         }
         walk.file_lints(&file);
+        file.ignored_rates = std::mem::take(&mut walk.ignored_rates);
+        file.skipped_rates = std::mem::take(&mut walk.skipped_rates);
         if walk.diags.is_empty() {
             Ok(file)
         } else {
-            Err(refuse(walk.diags))
+            Err(refuse(walk))
         }
     }
 }
@@ -399,6 +442,101 @@ impl Registry {
         let mut walk = Walk::new(self, text, Strict::User);
         let target = walk.target(value);
         walk.diags.is_empty().then_some(target)
+    }
+}
+
+impl Registry {
+    /// `text` (a user's profile) with every key this pie no longer reads
+    /// taken out (a decision it removed, a `[rates]` key of a schema it
+    /// outlived, a `provenance.measured` item naming a removed decision),
+    /// and those keys by name; everything it still reads is kept as
+    /// written. A file that does not parse as TOML is returned as it is.
+    #[must_use]
+    pub fn prune(&self, text: &str) -> (String, Vec<String>) {
+        let mut text = text.to_string();
+        let mut dropped = Vec::new();
+        // Each pass takes out what it found; a table emptied by one shows
+        // as unread itself in the next.
+        loop {
+            let unread = {
+                let mut walk = Walk::new(self, &text, Strict::User);
+                let Ok(table) = DeTable::parse(&text) else {
+                    break;
+                };
+                for (key, value) in table.get_ref().iter() {
+                    match key.get_ref().as_ref() {
+                        "api" | "target" => {}
+                        "rates" => {
+                            walk.rates(value);
+                        }
+                        "provenance" => {
+                            if let DeValue::Table(t) = value.get_ref() {
+                                for (k, v) in t.iter() {
+                                    if k.get_ref() == "measured" {
+                                        walk.measured(v);
+                                    }
+                                }
+                            }
+                        }
+                        other => walk.node(other, value, &mut BTreeMap::new()),
+                    }
+                }
+                walk.unread
+            };
+            if unread.is_empty() {
+                break;
+            }
+            let mut cuts: Vec<Range<usize>> = unread
+                .iter()
+                .map(|(_, at)| match at {
+                    Unread::Entry(span) => {
+                        let from = text[..span.start].rfind('\n').map_or(0, |i| i + 1);
+                        let to = text[span.end..]
+                            .find('\n')
+                            .map_or(text.len(), |i| span.end + i + 1);
+                        from..to
+                    }
+                    Unread::Table(span) => {
+                        let from = text[..span.start].rfind('\n').map_or(0, |i| i + 1);
+                        let after = text[span.end..]
+                            .find('\n')
+                            .map_or(text.len(), |i| span.end + i + 1);
+                        // To the next table's header (a line that starts
+                        // with `[`), or the end.
+                        let mut to = after;
+                        while to < text.len() && !text[to..].starts_with('[') {
+                            to = text[to..].find('\n').map_or(text.len(), |i| to + i + 1);
+                        }
+                        from..to
+                    }
+                    Unread::Item(span) => {
+                        let rest = &text[span.end..];
+                        let sep = rest.len() - rest.trim_start_matches([',', ' ']).len();
+                        if rest[sep..].starts_with(']') {
+                            // The list's last: the separator before it goes.
+                            let head = text[..span.start].trim_end_matches([',', ' ']);
+                            head.len()..span.end
+                        } else {
+                            span.start..span.end + sep
+                        }
+                    }
+                })
+                .collect();
+            cuts.sort_by_key(|r| std::cmp::Reverse(r.start));
+            let before = text.len();
+            let mut last = usize::MAX;
+            for cut in cuts {
+                if cut.end <= last {
+                    text.replace_range(cut.clone(), "");
+                    last = cut.start;
+                }
+            }
+            dropped.extend(unread.into_iter().map(|(key, _)| key));
+            if text.len() == before {
+                break;
+            }
+        }
+        (text, dropped)
     }
 }
 
@@ -456,7 +594,7 @@ fn parse_consistent(rule: &str) -> Result<(&str, &str), String> {
     Ok((id.trim(), alt.trim()))
 }
 
-fn int(v: &DeValue<'_>) -> Option<i64> {
+pub(crate) fn int(v: &DeValue<'_>) -> Option<i64> {
     match v {
         DeValue::Integer(i) => {
             let digits: String = i.as_str().chars().filter(|&c| c != '_').collect();
@@ -493,7 +631,7 @@ fn literal(kind: &Kind, v: &DeValue<'_>) -> Option<Value> {
     }
 }
 
-fn found(v: &DeValue<'_>) -> String {
+pub(crate) fn found(v: &DeValue<'_>) -> String {
     match v {
         DeValue::String(s) => format!("\"{s}\""),
         DeValue::Integer(i) => i.as_str().to_string(),
@@ -524,17 +662,41 @@ pub(crate) fn when_vars(spec: &Spec, facts: &[Var]) -> Vec<Var> {
     spec.vars.iter().chain(facts).copied().collect()
 }
 
-struct Walk<'a> {
+pub(crate) struct Walk<'a> {
     reg: &'a Registry,
     text: &'a str,
-    strict: Strict,
-    diags: Vec<Diagnostic>,
+    pub(crate) strict: Strict,
+    pub(crate) diags: Vec<Diagnostic>,
     /// Where each entry was spelled, for lints that point at it.
     spans: BTreeMap<&'static str, usize>,
     /// What a decision the file leaves out holds, when not the default.
     under: &'a BTreeMap<&'static str, Vec<Rung>>,
     /// Facts the layers below assume, which the file may rely on.
     inherited: &'a [(usize, i64)],
+    /// `[rates]` keys stated that no rate reads.
+    pub(crate) stale_rates: Vec<String>,
+    /// Of `stale_rates`, those a user file states: left unread, the file
+    /// read for the rest.
+    pub(crate) ignored_rates: Vec<String>,
+    /// What the file states that this pie no longer reads: each key (or a
+    /// list's item) by name, and where it lies ([`Registry::prune`]).
+    pub(crate) unread: Vec<(String, Unread)>,
+    /// `[rates]` entries of a user file that did not read, each with why:
+    /// skipped alone, the rest read.
+    pub(crate) skipped_rates: Vec<String>,
+}
+
+/// Where a key this pie no longer reads lies in a file's text.
+#[derive(Clone, Debug)]
+pub(crate) enum Unread {
+    /// A `key = value` entry: its value's span, the lines it spans removed.
+    Entry(Range<usize>),
+    /// A table (`[kernel.moe]`): from its first line to the next table's
+    /// header, its body with it.
+    Table(Range<usize>),
+    /// An item of a list (`provenance.measured`): its span, removed with
+    /// the separator beside it.
+    Item(Range<usize>),
 }
 
 impl<'a> Walk<'a> {
@@ -548,6 +710,10 @@ impl<'a> Walk<'a> {
             spans: BTreeMap::new(),
             under: &NONE,
             inherited: &[],
+            stale_rates: Vec::new(),
+            ignored_rates: Vec::new(),
+            skipped_rates: Vec::new(),
+            unread: Vec::new(),
         }
     }
 
@@ -573,16 +739,22 @@ impl<'a> Walk<'a> {
                     self.err(item.span().start, format!("`{id}` is listed twice"));
                 }
                 Some((id, _)) => out.push(*id),
-                None => self.err(
-                    item.span().start,
-                    format!("`{id}` is not a decision of {}", self.reg.backend),
-                ),
+                None => {
+                    self.unread.push((
+                        format!("provenance.measured: {id}"),
+                        Unread::Item(item.span()),
+                    ));
+                    self.err(
+                        item.span().start,
+                        format!("`{id}` is not a decision of {}", self.reg.backend),
+                    );
+                }
             }
         }
         out
     }
 
-    fn err(&mut self, at: usize, message: impl Into<String>) {
+    pub(crate) fn err(&mut self, at: usize, message: impl Into<String>) {
         let at = at.min(self.text.len());
         let before = &self.text[..at];
         let line = before.matches('\n').count() + 1;
@@ -662,6 +834,17 @@ impl<'a> Walk<'a> {
         } else {
             format!("under `{parent}`: {}", names(siblings))
         };
+        // A table under its own `[header]` goes whole; an inline one
+        // (`key = { ... }`) is an entry of its table like any other.
+        let line = self.text[..value.span().start]
+            .rfind('\n')
+            .map_or(0, |i| i + 1);
+        let headed = self.text[line..].trim_start().starts_with('[');
+        let at = match value.get_ref() {
+            DeValue::Table(_) if headed => Unread::Table(value.span()),
+            _ => Unread::Entry(value.span()),
+        };
+        self.unread.push((path.to_string(), at));
         self.err(
             value.span().start,
             format!(

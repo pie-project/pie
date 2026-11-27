@@ -319,7 +319,12 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<Option<
                     if code != rt::cudaError::cudaSuccess {
                         return Err(fail("cudaStreamCreateWithFlags", code));
                     }
-                    let code = rt::cudaMemsetAsync(mixed as *mut c_void, 0, 4, stream);
+                    let code = if crate::sizing::active() {
+                        // A size-only walk (`crate::sizing`) moves nothing.
+                        rt::cudaError::cudaSuccess
+                    } else {
+                        rt::cudaMemsetAsync(mixed as *mut c_void, 0, 4, stream)
+                    };
                     if code != rt::cudaError::cudaSuccess {
                         return Err(fail("cudaMemsetAsync", code));
                     }
@@ -338,13 +343,18 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<Option<
                         ],
                     );
                     let mut flag = 0i32;
-                    let copied = rt::cudaMemcpyAsync(
-                        (&raw mut flag).cast(),
-                        mixed as *const c_void,
-                        4,
-                        rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                        stream,
-                    );
+                    let copied = if crate::sizing::active() {
+                        // A size-only walk (`crate::sizing`) moves nothing.
+                        rt::cudaError::cudaSuccess
+                    } else {
+                        rt::cudaMemcpyAsync(
+                            (&raw mut flag).cast(),
+                            mixed as *const c_void,
+                            4,
+                            rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                            stream,
+                        )
+                    };
                     let code = rt::cudaStreamSynchronize(stream);
                     let _ = rt::cudaStreamDestroy(stream);
                     fired?;
@@ -397,7 +407,7 @@ pub fn matmul(
     }
     // cuBLASLt takes the rows in whole fours; the padding rows are zero.
     let mpad = m.div_ceil(4) * 4;
-    let workspace = (ctx.tuning().gemm_workspace_mb as usize) << 20;
+    let workspace = (ctx.tuning().gemm_workspace_mb() as usize) << 20;
     let Some((handle, plan)) = plan_for(mpad, n, k, workspace, false) else {
         return Ok(false);
     };
@@ -494,24 +504,30 @@ fn run(
         {
             return Err(refuse(op, "cuBLASLt refused the block scales' pointers"));
         }
-        lt::cublasLtMatmul(
-            handle,
-            plan.desc,
-            std::ptr::from_ref(&alpha).cast(),
-            codes as usize as *const c_void,
-            plan.a,
-            xq as usize as *const c_void,
-            plan.b,
-            std::ptr::from_ref(&beta).cast(),
-            d as usize as *const c_void,
-            plan.d,
-            d as usize as *mut c_void,
-            plan.d,
-            &raw const plan.algo,
-            slab,
-            workspace,
-            ctx.stream().cast(),
-        )
+        // A size-only walk (`crate::sizing`) runs no product.
+        if crate::sizing::active() {
+            crate::sizing::counted();
+            OK
+        } else {
+            lt::cublasLtMatmul(
+                handle,
+                plan.desc,
+                std::ptr::from_ref(&alpha).cast(),
+                codes as usize as *const c_void,
+                plan.a,
+                xq as usize as *const c_void,
+                plan.b,
+                std::ptr::from_ref(&beta).cast(),
+                d as usize as *const c_void,
+                plan.d,
+                d as usize as *mut c_void,
+                plan.d,
+                &raw const plan.algo,
+                slab,
+                workspace,
+                ctx.stream().cast(),
+            )
+        }
     };
     if status != OK {
         return Err(refuse(
@@ -569,7 +585,7 @@ pub fn matmul_mx(
     }
     // the rows in whole 128s, the scales' tile: the padding rows' products are dropped
     let mpad = m.div_ceil(128) * 128;
-    let workspace = (ctx.tuning().gemm_workspace_mb as usize) << 20;
+    let workspace = (ctx.tuning().gemm_workspace_mb() as usize) << 20;
     let Some((handle, plan)) = plan_for(mpad, n, k, workspace, true) else {
         return Ok(false);
     };

@@ -137,7 +137,7 @@ async fn main(input: Input) -> Result<Output> {
     if let Some(mask_p) = &mask_p {
         fwd_p.mask(mask_p)?;
     }
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
@@ -178,7 +178,7 @@ async fn main(input: Input) -> Result<Output> {
         if masked {
             fwd.mask(&mask)?;
         }
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
             let base = fill.take(); // [1] u32

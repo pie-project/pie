@@ -1,7 +1,7 @@
 //! The hardware-dependent decisions the HIP kernels read, and [`Tuning`]:
 //! the values one load runs under.
 
-use profile::{Anywhere, Decision, Profile, Registry};
+use profile::{Decision, Profile, Registry};
 
 /// Whether routed matmuls over bf16 or f16 banks take the grouped GEMM once
 /// an expert's routes pay for it; off, every route reads its expert alone.
@@ -101,12 +101,6 @@ pub struct QmmSplitWideMax(pub u32);
 #[decision(id = "kernel.sdpa.prefill.ctas_per_sm", constant(range(1..=8)), default = 2, tune = search)]
 pub struct PrefillCtasPerSm(pub u32);
 
-/// The most requests an eager decode serves with the static, unsplit
-/// schedule (which skips planning).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.static_max_requests", constant(range(0..=65_536)), default = 512, tune = search)]
-pub struct DecodeStaticMaxRequests(pub u32);
-
 /// The most rows the fused skinny bf16 GEMM (GEGLU, soft-capped heads)
 /// serves; past it cuBLAS does. Its tile holds 64; 0 never takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -148,12 +142,6 @@ pub struct GemmTurnUntil(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemm.turn_wide_until", constant(range(0..=32)), default = 16, tune = search)]
 pub struct GemmTurnWideUntil(pub u32);
-
-/// The fewest output columns (a bank's rows) the turned kernel takes: a
-/// narrower bank's tiles leave the card idle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.turn_min_n", constant(range(0..=4_194_304)), default = 2048, tune = search)]
-pub struct GemmTurnMinN(pub u32);
 
 /// Routes an expert must average before bf16/f16 routed matmuls group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -313,7 +301,6 @@ pub fn register(registry: &mut Registry) {
         .add::<QmmSplitThinMax>()
         .add::<QmmSplitWideMax>()
         .add::<PrefillCtasPerSm>()
-        .add::<DecodeStaticMaxRequests>()
         .add::<GemmSkinnyRows>()
         .add::<GemmSkinnyQuadFrom>()
         .add::<GemmSkinnyDenseRows>()
@@ -321,7 +308,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmTurnFrom>()
         .add::<GemmTurnUntil>()
         .add::<GemmTurnWideUntil>()
-        .add::<GemmTurnMinN>()
         .add::<MoeGroupAt>()
         .add::<MoeMxfp4GroupedReuse>()
         .add::<MoeAffineGrouped>()
@@ -349,175 +335,198 @@ pub fn register(registry: &mut Registry) {
 }
 
 /// The kernel decisions one load runs under, read once from its profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Tuning {
-    pub moe_grouped: bool,
-    pub moe_lt_grouped: bool,
-    pub moe_lt_mlp_from: u32,
-    pub moe_lt_tile_deep: u32,
-    pub moe_lt_tile_shallow: u32,
-    pub moe_lt_deep_k: u32,
-    pub moe_ordered_from: u32,
-    pub mxfp4_grouped: bool,
-    pub mxfp4_wmma: bool,
-    pub decode_chunk_floor_tokens: u32,
-    pub gemv_splitk_max_n: u32,
-    pub qmm_gemm_from: u32,
-    pub qmm_long_rows: u32,
-    pub qmm_split_warps_per_sm: u32,
-    pub qmm_split_thin_max: u32,
-    pub qmm_split_wide_max: u32,
-    pub prefill_ctas_per_sm: u32,
-    pub decode_static_max_requests: u32,
-    pub gemm_skinny_rows: u32,
-    pub gemm_skinny_quad_from: u32,
-    pub gemm_skinny_dense_rows: u32,
-    pub gemm_skinny_batch_min_n: u32,
-    pub gemm_turn_from: u32,
-    pub gemm_turn_until: u32,
-    pub gemm_turn_wide_until: u32,
-    pub gemm_turn_min_n: u32,
-    pub moe_group_at: u32,
-    pub mxfp4_grouped_reuse: u32,
-    pub affine_grouped: bool,
-    pub affine_wmma: bool,
-    pub affine_grouped_from: u32,
-    pub moe_batch: bool,
-    pub moe_batch_from: u32,
-    pub moe_batch_until: u32,
-    pub moe_dense_batch_until: u32,
-    pub moe_dense_wide_from: u32,
-    pub dense_batch_from: u32,
-    pub dense_batch_until: u32,
-    pub dense_batch_weight_mi: u32,
-    pub dense_batch_weight_max_mi: u32,
-    pub mla_absorb_q_until: u32,
-    pub mla_absorb_out_from: u32,
-    pub mla_absorb_out_until: u32,
-    pub fp8_decode_until: u32,
-    pub fp8_narrow_until: u32,
-    pub ssm_gdn_wide_from: u32,
-    pub gemm_live_from: u32,
-    pub gemm_live_tiles: [u32; 3],
-    /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
-    /// never on ROCm.
-    pub compressed_prefill_from: u32,
-    pub compressed_replay: bool,
+/// [`Tuning`]'s decision fields, each with its registry default and its
+/// read off a profile (`on D` a flag decision, `get D` a constant one's
+/// value), as CUDA's: each has an accessor of its name that records the
+/// decision as read on the profile it came from, so a decision counts as
+/// read only where a dispatch consults it for the loaded model's shapes, and
+/// `pie tune` times it only on models it can move.
+macro_rules! tuning {
+    ($($field:ident: $ty:ty = $default:expr, $how:ident $decision:ident;)*) => {
+        /// The kernel decisions one load runs under, resolved once from its
+        /// profile; dispatch reads them through the accessors, which record
+        /// the read (a field read directly records nothing: for tests and
+        /// for code that sizes rather than dispatches).
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct Tuning {
+            $(pub $field: $ty,)*
+            /// The live-tile GEMM's three tiles (`kernel.gemm.live_tile_*`).
+            pub gemm_live_tiles: [u32; 3],
+            /// The device's measured rates (the profile's `[rates]`, 0 where
+            /// unmeasured): what a dispatch adds inside a recorded body, in ns, and
+            /// device memory's copy rate, in GB/s. A route that trades a launch for
+            /// redundant reads prices both with them.
+            pub launch_ns: u32,
+            pub hbm_gbps: u32,
+            /// The reads the last-level caches serve, in GB/s (`[rates]
+            /// cached_gbps`; 0 unmeasured): a normed skinny product's redundant
+            /// reads of its rows, which every block reads, are priced at it.
+            pub cached_gbps: u32,
+            /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
+            /// never on ROCm.
+            pub compressed_prefill_from: u32,
+            pub compressed_replay: bool,
+            /// The profile's read flags, one a decision: `None` for values
+            /// built by hand.
+            pub reads: Reads,
+        }
+
+        #[allow(non_camel_case_types)]
+        enum Field { $($field,)* gemm_live_tile_small, gemm_live_tile_mid, gemm_live_tile_large }
+
+        impl Tuning {
+            /// The registry defaults; a test holds the two equal.
+            pub const DEFAULT: Tuning = Tuning {
+                $($field: $default,)*
+                gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
+                launch_ns: 0,
+                hbm_gbps: 0,
+                cached_gbps: 0,
+                compressed_prefill_from: 0,
+                compressed_replay: false,
+                reads: Reads(None),
+            };
+
+            /// `profile`'s values, unread until a dispatch consults one.
+            #[must_use]
+            pub fn of(profile: &Profile) -> Tuning {
+                let marks = vec![
+                    $(profile.mark::<$decision>(),)*
+                    profile.mark::<GemmLiveTileSmall>(),
+                    profile.mark::<GemmLiveTileMid>(),
+                    profile.mark::<GemmLiveTileLarge>(),
+                ];
+                Tuning {
+                    $($field: tuning!(@peek profile, $how $decision),)*
+                    gemm_live_tiles: [
+                        tuning!(@peek profile, get GemmLiveTileSmall),
+                        tuning!(@peek profile, get GemmLiveTileMid),
+                        tuning!(@peek profile, get GemmLiveTileLarge),
+                    ],
+                    launch_ns: profile
+                        .rates()
+                        .launch_ns
+                        .map_or(0, |ns| u32::try_from(ns).unwrap_or(u32::MAX)),
+                    hbm_gbps: profile.rates().hbm_gbps.map_or(0, |gbps| gbps as u32),
+                    cached_gbps: profile.rates().cached_gbps.map_or(0, |gbps| gbps as u32),
+                    compressed_prefill_from: 0,
+                    compressed_replay: false,
+                    reads: Reads(Some(Box::leak(marks.into_boxed_slice()))),
+                }
+            }
+
+            $(
+                #[doc = concat!("`", stringify!($field), "`, recorded as read.")]
+                #[must_use]
+                #[inline]
+                pub fn $field(&self) -> $ty {
+                    self.reads.raise(Field::$field as usize);
+                    self.$field
+                }
+            )*
+
+            /// `gemm_live_tiles`, its three decisions recorded as read.
+            #[must_use]
+            #[inline]
+            pub fn gemm_live_tiles(&self) -> [u32; 3] {
+                self.reads.raise(Field::gemm_live_tile_small as usize);
+                self.reads.raise(Field::gemm_live_tile_mid as usize);
+                self.reads.raise(Field::gemm_live_tile_large as usize);
+                self.gemm_live_tiles
+            }
+
+            /// DeepSeek's fused prefill pass: never on ROCm.
+            #[must_use]
+            pub const fn compressed_prefill_from(&self) -> u32 {
+                self.compressed_prefill_from
+            }
+
+            /// DeepSeek's bounded replay: never on ROCm.
+            #[must_use]
+            pub const fn compressed_replay(&self) -> bool {
+                self.compressed_replay
+            }
+        }
+    };
+    (@peek $p:ident, on $d:ident) => { $p.peek::<$d>().is_some() };
+    (@peek $p:ident, get $d:ident) => { $p.peek::<$d>().expect("a constant is total").0 };
 }
 
-impl Tuning {
-    /// The registry defaults; a test holds the two equal.
-    pub const DEFAULT: Tuning = Tuning {
-        moe_grouped: true,
-        moe_lt_grouped: false,
-        moe_lt_mlp_from: 0,
-        moe_lt_tile_deep: 256_192_064,
-        moe_lt_tile_shallow: 256_160_032,
-        moe_lt_deep_k: 2048,
-        moe_ordered_from: 0,
-        mxfp4_grouped: true,
-        mxfp4_wmma: true,
-        decode_chunk_floor_tokens: 64,
-        gemv_splitk_max_n: 4096,
-        qmm_gemm_from: 128,
-        qmm_long_rows: 512,
-        qmm_split_warps_per_sm: 58,
-        qmm_split_thin_max: 32,
-        qmm_split_wide_max: 16,
-        prefill_ctas_per_sm: 2,
-        decode_static_max_requests: 512,
-        gemm_skinny_rows: 64,
-        gemm_skinny_quad_from: 3,
-        gemm_skinny_dense_rows: 4,
-        gemm_skinny_batch_min_n: 65536,
-        gemm_turn_from: 0,
-        gemm_turn_until: 16,
-        gemm_turn_wide_until: 16,
-        gemm_turn_min_n: 2048,
-        moe_group_at: 4,
-        mxfp4_grouped_reuse: 2,
-        affine_grouped: true,
-        affine_wmma: true,
-        affine_grouped_from: 16,
-        moe_batch: true,
-        moe_batch_from: 2,
-        moe_batch_until: 32,
-        moe_dense_batch_until: 160,
-        moe_dense_wide_from: 26,
-        dense_batch_from: 8,
-        dense_batch_until: 16,
-        dense_batch_weight_mi: 128,
-        dense_batch_weight_max_mi: 192,
-        mla_absorb_q_until: 0,
-        mla_absorb_out_from: 0,
-        mla_absorb_out_until: 0,
-        fp8_decode_until: 64,
-        fp8_narrow_until: 0,
-        ssm_gdn_wide_from: 0,
-        gemm_live_from: 0,
-        gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
-        compressed_prefill_from: 0,
-        compressed_replay: false,
-    };
+tuning! {
+    moe_grouped: bool = true, on MoeGrouped;
+    moe_lt_grouped: bool = false, on MoeLtGrouped;
+    moe_lt_mlp_from: u32 = 0, get MoeLtMlpFrom;
+    moe_lt_tile_deep: u32 = 256_192_064, get MoeLtTileDeep;
+    moe_lt_tile_shallow: u32 = 256_160_032, get MoeLtTileShallow;
+    moe_lt_deep_k: u32 = 2048, get MoeLtDeepK;
+    moe_ordered_from: u32 = 0, get MoeOrderedFrom;
+    mxfp4_grouped: bool = true, on MoeMxfp4Grouped;
+    mxfp4_wmma: bool = true, on MoeMxfp4Wmma;
+    decode_chunk_floor_tokens: u32 = 64, get DecodeChunkFloorTokens;
+    gemv_splitk_max_n: u32 = 4096, get GemvSplitkMaxN;
+    qmm_gemm_from: u32 = 128, get QmmGemmFrom;
+    qmm_long_rows: u32 = 512, get QmmLongRows;
+    qmm_split_warps_per_sm: u32 = 58, get QmmSplitWarpsPerSm;
+    qmm_split_thin_max: u32 = 32, get QmmSplitThinMax;
+    qmm_split_wide_max: u32 = 16, get QmmSplitWideMax;
+    prefill_ctas_per_sm: u32 = 2, get PrefillCtasPerSm;
+    gemm_skinny_rows: u32 = 64, get GemmSkinnyRows;
+    gemm_skinny_quad_from: u32 = 3, get GemmSkinnyQuadFrom;
+    gemm_skinny_dense_rows: u32 = 4, get GemmSkinnyDenseRows;
+    gemm_skinny_batch_min_n: u32 = 65536, get GemmSkinnyBatchMinN;
+    gemm_turn_from: u32 = 0, get GemmTurnFrom;
+    gemm_turn_until: u32 = 16, get GemmTurnUntil;
+    gemm_turn_wide_until: u32 = 16, get GemmTurnWideUntil;
+    moe_group_at: u32 = 4, get MoeGroupAt;
+    mxfp4_grouped_reuse: u32 = 2, get MoeMxfp4GroupedReuse;
+    affine_grouped: bool = true, on MoeAffineGrouped;
+    affine_wmma: bool = true, on MoeAffineWmma;
+    affine_grouped_from: u32 = 16, get MoeAffineGroupedFrom;
+    moe_batch: bool = true, on MoeBatch;
+    moe_batch_from: u32 = 2, get MoeBatchFrom;
+    moe_batch_until: u32 = 32, get MoeBatchUntil;
+    moe_dense_batch_until: u32 = 160, get MoeDenseBatchUntil;
+    moe_dense_wide_from: u32 = 26, get MoeDenseWideFrom;
+    dense_batch_from: u32 = 8, get DenseBatchFrom;
+    dense_batch_until: u32 = 16, get DenseBatchUntil;
+    dense_batch_weight_mi: u32 = 128, get DenseBatchWeightMi;
+    dense_batch_weight_max_mi: u32 = 192, get DenseBatchWeightMaxMi;
+    mla_absorb_q_until: u32 = 0, get MlaAbsorbQUntil;
+    mla_absorb_out_from: u32 = 0, get MlaAbsorbOutFrom;
+    mla_absorb_out_until: u32 = 0, get MlaAbsorbOutUntil;
+    fp8_decode_until: u32 = 64, get Fp8DecodeUntil;
+    fp8_narrow_until: u32 = 0, get Fp8NarrowUntil;
+    ssm_gdn_wide_from: u32 = 0, get SsmGdnWideFrom;
+    gemm_live_from: u32 = 0, get GemmLiveFrom;
+}
 
-    #[must_use]
-    pub fn of(profile: &Profile) -> Tuning {
-        Tuning {
-            moe_grouped: profile.on::<MoeGrouped>(&Anywhere),
-            moe_lt_grouped: profile.on::<MoeLtGrouped>(&Anywhere),
-            moe_lt_mlp_from: profile.get::<MoeLtMlpFrom>().0,
-            moe_lt_tile_deep: profile.get::<MoeLtTileDeep>().0,
-            moe_lt_tile_shallow: profile.get::<MoeLtTileShallow>().0,
-            moe_lt_deep_k: profile.get::<MoeLtDeepK>().0,
-            moe_ordered_from: profile.get::<MoeOrderedFrom>().0,
-            mxfp4_grouped: profile.on::<MoeMxfp4Grouped>(&Anywhere),
-            mxfp4_wmma: profile.on::<MoeMxfp4Wmma>(&Anywhere),
-            decode_chunk_floor_tokens: profile.get::<DecodeChunkFloorTokens>().0,
-            gemv_splitk_max_n: profile.get::<GemvSplitkMaxN>().0,
-            qmm_gemm_from: profile.get::<QmmGemmFrom>().0,
-            qmm_long_rows: profile.get::<QmmLongRows>().0,
-            qmm_split_warps_per_sm: profile.get::<QmmSplitWarpsPerSm>().0,
-            qmm_split_thin_max: profile.get::<QmmSplitThinMax>().0,
-            qmm_split_wide_max: profile.get::<QmmSplitWideMax>().0,
-            prefill_ctas_per_sm: profile.get::<PrefillCtasPerSm>().0,
-            decode_static_max_requests: profile.get::<DecodeStaticMaxRequests>().0,
-            gemm_skinny_rows: profile.get::<GemmSkinnyRows>().0,
-            gemm_skinny_quad_from: profile.get::<GemmSkinnyQuadFrom>().0,
-            gemm_skinny_dense_rows: profile.get::<GemmSkinnyDenseRows>().0,
-            gemm_skinny_batch_min_n: profile.get::<GemmSkinnyBatchMinN>().0,
-            gemm_turn_from: profile.get::<GemmTurnFrom>().0,
-            gemm_turn_until: profile.get::<GemmTurnUntil>().0,
-            gemm_turn_wide_until: profile.get::<GemmTurnWideUntil>().0,
-            gemm_turn_min_n: profile.get::<GemmTurnMinN>().0,
-            moe_group_at: profile.get::<MoeGroupAt>().0,
-            mxfp4_grouped_reuse: profile.get::<MoeMxfp4GroupedReuse>().0,
-            affine_grouped: profile.on::<MoeAffineGrouped>(&Anywhere),
-            affine_wmma: profile.on::<MoeAffineWmma>(&Anywhere),
-            affine_grouped_from: profile.get::<MoeAffineGroupedFrom>().0,
-            moe_batch: profile.on::<MoeBatch>(&Anywhere),
-            moe_batch_from: profile.get::<MoeBatchFrom>().0,
-            moe_batch_until: profile.get::<MoeBatchUntil>().0,
-            moe_dense_batch_until: profile.get::<MoeDenseBatchUntil>().0,
-            moe_dense_wide_from: profile.get::<MoeDenseWideFrom>().0,
-            dense_batch_from: profile.get::<DenseBatchFrom>().0,
-            dense_batch_until: profile.get::<DenseBatchUntil>().0,
-            dense_batch_weight_mi: profile.get::<DenseBatchWeightMi>().0,
-            dense_batch_weight_max_mi: profile.get::<DenseBatchWeightMaxMi>().0,
-            mla_absorb_q_until: profile.get::<MlaAbsorbQUntil>().0,
-            mla_absorb_out_from: profile.get::<MlaAbsorbOutFrom>().0,
-            mla_absorb_out_until: profile.get::<MlaAbsorbOutUntil>().0,
-            fp8_decode_until: profile.get::<Fp8DecodeUntil>().0,
-            fp8_narrow_until: profile.get::<Fp8NarrowUntil>().0,
-            ssm_gdn_wide_from: profile.get::<SsmGdnWideFrom>().0,
-            gemm_live_from: profile.get::<GemmLiveFrom>().0,
-            gemm_live_tiles: [
-                profile.get::<GemmLiveTileSmall>().0,
-                profile.get::<GemmLiveTileMid>().0,
-                profile.get::<GemmLiveTileLarge>().0,
-            ],
-            compressed_prefill_from: 0,
-            compressed_replay: false,
+/// Where a [`Tuning`]'s reads land: its profile's read flags, one a
+/// decision, held for the life of the process (a load's tuning is copied
+/// onto every stream it opens). Equal whatever it holds: two tunings with
+/// the same values are the same tuning.
+#[derive(Clone, Copy, Default)]
+pub struct Reads(Option<&'static [profile::Mark]>);
+
+impl Reads {
+    #[inline]
+    fn raise(self, field: usize) {
+        if let Some(marks) = self.0 {
+            marks[field].raise();
         }
+    }
+}
+
+impl PartialEq for Reads {
+    fn eq(&self, _: &Reads) -> bool {
+        true
+    }
+}
+
+impl Eq for Reads {}
+
+impl core::fmt::Debug for Reads {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Reads")
     }
 }
 

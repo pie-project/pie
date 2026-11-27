@@ -909,3 +909,87 @@ fn the_shelf_check_keeps_one_family_and_one_device_file_per_device() {
         "{e}"
     );
 }
+
+const M9_DERIVED: &str = r#"
+api = 1
+[target]
+device = "Apple M9"
+[rates]
+hbm_gbps = 400
+"#;
+
+#[test]
+fn a_device_file_states_its_rates_and_a_layer_above_replaces_them() {
+    let r = registry();
+    let shelf = profile::Shelf {
+        backend: "toy",
+        seeded: &[
+            ("apple10.toml", APPLE10),
+            ("derived/apple-m9.toml", M9_DERIVED),
+        ],
+        derived: SHELF.derived,
+    };
+    let dir = std::env::temp_dir().join(format!("pie-shelf-rates-{}", std::process::id()));
+    let path = shelf.user_path(&dir, "Apple M9");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // The user's layer (a load's measurement saved there) fills the key
+    // the checked-in file lacks, and a checked-in value wins over its own.
+    std::fs::write(
+        &path,
+        "api = 1\n[rates]\nlaunch_ns = 9000\nhbm_gbps = 999.0\n",
+    )
+    .unwrap();
+    let (p, _) = shelf.resolve(&r, "Apple M9", &facts(11, true), Some(&dir));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(p.rates().hbm_gbps, Some(400.0), "the checked-in value wins");
+    assert_eq!(
+        p.rates().launch_ns,
+        Some(9000),
+        "the saved value fills the gap"
+    );
+}
+
+/// A user's file a load rewrites keeps every key this pie reads (a person's
+/// own decisions) and drops, by name, each it no longer reads: a removed
+/// decision in a table, one written dotted, a stale inline table (alone: the
+/// keys after it stay), a `[rates]` key of an old schema, a
+/// `provenance.measured` item naming a removed decision.
+#[test]
+fn a_user_file_keeps_what_reads_and_drops_what_no_longer_does_by_name() {
+    let r = registry();
+    let text = "api = 1\n\
+        [engine]\n\
+        recording = { use = \"bodies\", mem_mb = 4096 }\n\
+        prefill.chunk = 2048\n\
+        graphs = \"on\"\n\
+        \n\
+        [kernel.moe]\n\
+        group_at = 8\n\
+        \n\
+        [rates]\n\
+        bytes_per_ns = 650.0\n\
+        hbm_gbps = 700.0\n\
+        \n\
+        [provenance]\n\
+        measured = [\"engine.prefill.chunk\", \"engine.recording\"]\n";
+    let (kept, dropped) = r.prune(text);
+    assert_eq!(
+        dropped,
+        [
+            "engine.recording",
+            "engine.graphs",
+            "kernel.moe",
+            "rates.bytes_per_ns",
+            "provenance.measured: engine.recording"
+        ],
+        "{kept}"
+    );
+    let file = r
+        .parse(&kept, "kept", profile::Strict::User)
+        .unwrap_or_else(|e| panic!("{e}\n{kept}"));
+    assert_eq!(file.entries.len(), 1, "the person's chunk kept");
+    assert_eq!(file.tuned.rates.hbm_gbps, Some(700.0));
+    assert_eq!(file.measured, ["engine.prefill.chunk"]);
+    // What reads is untouched: pruning it again drops nothing.
+    assert_eq!(r.prune(&kept), (kept.clone(), Vec::new()));
+}

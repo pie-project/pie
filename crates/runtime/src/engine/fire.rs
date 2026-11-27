@@ -1,24 +1,61 @@
 use engine::fire::{KvDelta, Lane, Step};
+
+pub use self::lane::FireLane;
 use eta_ir::registry::GeometryClass;
 
 use crate::engine::completion::CellPtr;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FireRequest {
-    pub lanes: Vec<Lane>,
+    pub lanes: Vec<FireLane>,
     pub geometry: GeometryClass,
     pub single_token_mode: bool,
     pub has_user_mask: bool,
     pub boundary_program: bool,
     pub voxels: Vec<engine::fire::StepVoxels>,
     pub media: Vec<engine::fire::StepMedia>,
+    /// The recurrent rows its lanes carry unfolded into the fire, which it
+    /// replays ahead of its own, summed over them
+    /// ([`engine::fire::rung_holds`]): their count where the host places
+    /// its rows, a bound on it where the device does.
+    pub carried: u32,
+    /// The buffered recurrent rows its lanes replay ahead of their own,
+    /// summed over every lane, a decode lane's included: what the engine's
+    /// stated [`::engine::FireLimits::replayed_rows`] bounds a step by.
+    pub replayed: u32,
+    /// Its rs scratch is compact ([`::engine::fire::scratch_compact`], as
+    /// the runtime evaluated it from what it puts in the fire).
+    pub scratch_compact: bool,
+    /// The load's stated rungs ([`::engine::RungReplay`], by tokens), on a
+    /// fire carrying recurrent state: a step of several such fires runs at
+    /// the rung its members' rows together pick, and takes no more of them
+    /// than that rung's replay scratch holds together. `None` on a fire
+    /// carrying none.
+    pub replay_rungs: Option<crate::store::shared::Replays>,
+    /// Where its lanes buffer recurrent rows, the stated buffered rung its
+    /// step pads up to ([`engine::StepFacts::buffered_rungs`]: buffered steps
+    /// run at a coarser lattice than folded ones), set at admission from the
+    /// load's stated set; 0 where its lanes fold. What it asks its activation
+    /// rung for where that is more than its rows.
+    pub pads_to: u32,
+    /// The ring ends this fire moves. Two fires moving one end never share
+    /// a step; the engine picks each move's cell from its ring's cursor.
+    pub ring_moves: Vec<RingMove>,
+}
+
+/// A fire takes from (`takes`) or puts to (`puts`) a ring's cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingMove {
+    pub channel: engine::ChannelId,
+    pub takes: bool,
+    pub puts: bool,
 }
 
 impl FireRequest {
     #[must_use]
-    pub fn one(lane: Lane) -> FireRequest {
+    pub fn one(lane: impl Into<FireLane>) -> FireRequest {
         FireRequest {
-            lanes: vec![lane],
+            lanes: vec![lane.into()],
             ..FireRequest::default()
         }
     }
@@ -35,6 +72,16 @@ impl FireRequest {
         self.lanes.iter().map(|lane| lane.tokens.len().max(1)).sum()
     }
 
+    /// What the fire asks its activation rung for: its own rows, or the
+    /// rows it carries where they are more ([`engine::fire::rung_holds`]),
+    /// or the buffered rung its step pads to ([`Self::pads_to`]).
+    #[must_use]
+    pub fn rung_rows(&self) -> usize {
+        self.tokens()
+            .max(self.carried as usize)
+            .max(self.pads_to as usize)
+    }
+
     /// The rows the fire reads out: a lane's last row, the rows it names,
     /// or none.
     #[must_use]
@@ -49,14 +96,32 @@ impl FireRequest {
             .sum()
     }
 
+    /// The rows the fire's sequence lanes read out: [`Self::readouts`]
+    /// without its float lanes' (`kv_less`, an encoder's or an embedding's
+    /// every row), which land through the engine's readout landing whatever
+    /// its fixed store holds (`::engine::ReadoutFacts::store_rows`). What
+    /// fires are cut to and refused against the store by.
+    #[must_use]
+    pub fn sequence_readouts(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|lane| !lane.kv_less)
+            .map(|lane| match &lane.readout {
+                engine::fire::Readout::Last => 1,
+                engine::fire::Readout::Rows(rows) => rows.len(),
+                engine::fire::Readout::None => 0,
+            })
+            .sum()
+    }
+
     pub fn pages(&self) -> impl Iterator<Item = u32> + '_ {
         self.lanes
             .iter()
-            .flat_map(|lane| lane.kv.pages.iter().copied())
+            .flat_map(|lane| lane.pages.iter().copied())
     }
 
     #[must_use]
-    pub fn lane(&self) -> Option<&Lane> {
+    pub fn lane(&self) -> Option<&FireLane> {
         self.lanes.first()
     }
 
@@ -94,8 +159,21 @@ pub struct StepFire {
     pub terminal_cells: Vec<CellPtr>,
     /// The completions those cells are of, resolved once the step lands.
     pub completions: Vec<crate::engine::WorkItemCompletion>,
-    pub instances: Vec<::engine::InstanceId>,
+    /// Which of the step's lanes are each fire's: fire `i` has lanes
+    /// `member_lanes[i]..member_lanes[i + 1]`, so a lane that faults fails
+    /// its own fire alone.
     pub member_lanes: Vec<u32>,
+    pub instances: Vec<::engine::InstanceId>,
+    /// Each fire's logical id and when its request was handed to the
+    /// scheduler, where known (a debug check names a stale request by them).
+    pub fire_stamps: Vec<(u64, crate::rt::wall::Instant)>,
+    /// Each lane's kv set, in lane order, where known.
+    pub lane_sets: Vec<Option<crate::store::kv::page_table::WorkingSetId>>,
+    /// The load's stated step set the step's shape (`submission.shape`) is
+    /// an index into: a step its refused members are stripped from states
+    /// its shape again in it (`scheduler::lane`). `None` where the limits
+    /// state no set (a test building them by hand).
+    pub shapes: Option<&'static ::engine::StepShapes>,
 }
 
 #[derive(Default)]
@@ -141,15 +219,62 @@ pub fn bitmask_words(lanes: &[Lane]) -> MaskWords {
 }
 
 #[must_use]
-pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane {
-    Lane {
-        slot,
-        tokens,
-        kv: KvDelta {
-            held,
-            pages,
-            ..Default::default()
+pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> FireLane {
+    FireLane {
+        lane: Lane {
+            slot,
+            tokens,
+            kv: KvDelta {
+                held,
+                ..Default::default()
+            },
+            ..Lane::default()
         },
-        ..Lane::default()
+        pages,
+        ..FireLane::default()
+    }
+}
+
+mod lane {
+    use engine::fire::Lane;
+
+    /// A lane of a fire the runtime builds: the engine's lane, and the ids
+    /// the runtime's stores place its state by, which the fire names to the
+    /// engine in the lane's slot tables (`pipeline::fire::rs::apply_shared`)
+    /// and never otherwise.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct FireLane {
+        pub lane: Lane,
+        /// The kv store's page ids, in token order.
+        pub pages: Vec<u32>,
+        /// Where stated, the slot each of `pages` stands in (a shared
+        /// prefix's), in its place.
+        pub translation: Vec<u32>,
+        /// The kv set its pages, translation and reserve were read from, as
+        /// they were stamped: a debug check at the engine reads them against
+        /// that set's table as it stands then.
+        pub ws: Option<crate::store::kv::page_table::WorkingSetId>,
+    }
+
+    impl From<Lane> for FireLane {
+        fn from(lane: Lane) -> Self {
+            FireLane {
+                lane,
+                ..FireLane::default()
+            }
+        }
+    }
+
+    impl std::ops::Deref for FireLane {
+        type Target = Lane;
+        fn deref(&self) -> &Lane {
+            &self.lane
+        }
+    }
+
+    impl std::ops::DerefMut for FireLane {
+        fn deref_mut(&mut self) -> &mut Lane {
+            &mut self.lane
+        }
     }
 }

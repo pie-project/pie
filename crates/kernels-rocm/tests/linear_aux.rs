@@ -90,7 +90,8 @@ fn linear_lora_correct() {
     let bt = gpu.tensor(&b, adapters, out * rank, Dtype::Bf16);
     let rt = gpu.column(&routes);
     let mut y = gpu.tensor(&y0, rows, out, Dtype::Bf16);
-    lora::correct(&ctx, xt, at, bt, rt, &mut y, None).unwrap();
+    gpu.laid(&ctx, |ctx| lora::correct(ctx, xt, at, bt, rt, &mut y, None))
+        .unwrap();
     let all: Vec<f32> = (0..rows as usize * o_)
         .map(|i| want(i / o_, i % o_))
         .collect();

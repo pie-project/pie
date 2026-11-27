@@ -192,6 +192,7 @@ pub mod rt {
     #[repr(i32)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum cudaDeviceAttr {
+        cudaDevAttrIntegrated = 16,
         cudaDevAttrComputeCapabilityMajor = 23,
         cudaDevAttrComputeCapabilityMinor = 61,
         cudaDevAttrMultiProcessorCount = 63,
@@ -297,10 +298,36 @@ pub mod rt {
         // the enum's ids, which are HIP's.
         cudaError::of(unsafe { hip::hipDeviceGetP2PAttribute(value, attr as c_int, src, dst) })
     }
+    /// The device's free bytes as one allocation can take them: HIP's
+    /// figure less the wave save areas of this process's queues, which the
+    /// driver holds and HIP's figure counts as free
+    /// ([`kernels_cuda::hip::kfd::save_areas`]). Read live, so a queue made
+    /// inside a capture window falls inside the window's measure.
     pub unsafe fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError {
         // SAFETY: `hipMemGetInfo` takes the same arguments with the same
         // contract, which the caller of this fn upholds.
-        cudaError::of(unsafe { hip::hipMemGetInfo(free, total) })
+        let asked = cudaError::of(unsafe { hip::hipMemGetInfo(free, total) });
+        if asked != cudaError::cudaSuccess {
+            return asked;
+        }
+        // The load opens every stream it fires on before its pools.
+        match kernels_cuda::hip::kfd::held() {
+            Ok(areas) => {
+                // SAFETY: the caller's live out-parameter, just written.
+                unsafe { *free = (*free).saturating_sub(areas.bytes() as usize) };
+                cudaError::cudaSuccess
+            }
+            Err(why) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    eprintln!(
+                        "engine-cuda: the driver's queue save areas are not readable ({why}); \
+                         the device's free figure cannot be stated"
+                    );
+                });
+                cudaError::cudaErrorInitializationError
+            }
+        }
     }
     pub unsafe fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> cudaError {
         // SAFETY: `hipMalloc` takes the same arguments with the same contract,
@@ -503,6 +530,15 @@ pub mod rt {
         // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventSynchronize(event) })
     }
+    pub unsafe fn cudaEventElapsedTime(
+        ms: *mut f32,
+        start: cudaEvent_t,
+        stop: cudaEvent_t,
+    ) -> cudaError {
+        // SAFETY: `hipEventElapsedTime` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
+        cudaError::of(unsafe { hip::hipEventElapsedTime(ms, start, stop) })
+    }
     pub unsafe fn cudaEventQuery(event: cudaEvent_t) -> cudaError {
         // SAFETY: `hipEventQuery` takes the same arguments with the same
         // contract, which the caller of this fn upholds.
@@ -666,6 +702,24 @@ pub mod dr {
         // `attr` is one of the enum's ids, which are HIP's.
         CUresult::of(unsafe { hip::hipFuncGetAttribute(value, attr as c_int, function) })
     }
+    pub unsafe fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        blocks: *mut c_int,
+        function: CUfunction,
+        block: c_int,
+        shared_bytes: usize,
+    ) -> CUresult {
+        // SAFETY: `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` takes
+        // the same arguments with the same contract, which the caller of this
+        // fn upholds.
+        CUresult::of(unsafe {
+            hip::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                blocks,
+                function,
+                block,
+                shared_bytes,
+            )
+        })
+    }
     pub unsafe fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult {
         // SAFETY: `hipModuleLoadData` takes the same arguments with the same
         // contract, which the caller of this fn upholds.
@@ -707,8 +761,9 @@ pub mod dr {
             )
         })
     }
-    /// Only a value whose four bytes are one byte repeated (zero, as the
-    /// engine sets): HIP has no 32-bit 2D memset, so the rows go as bytes.
+    /// Only a value whose four bytes are one byte repeated (zero, and the
+    /// scratch poison of a test fill, as the engine sets): HIP has no 32-bit
+    /// 2D memset, so the rows go as bytes.
     pub unsafe fn cuMemsetD2D32Async(
         dst: CUdeviceptr,
         pitch: usize,
@@ -733,6 +788,19 @@ pub mod dr {
                 height,
                 stream,
             )
+        })
+    }
+    /// The GEQ flag of `cuStreamWaitValue32_v2`, as HIP's `hipStreamWaitValueGte`.
+    pub const CU_STREAM_WAIT_VALUE_GEQ: c_uint = 0;
+    pub unsafe fn cuStreamWaitValue32_v2(
+        stream: CUstream,
+        addr: CUdeviceptr,
+        value: u32,
+        flags: c_uint,
+    ) -> CUresult {
+        // SAFETY: the caller's contract for a device-visible word at `addr`.
+        CUresult::of(unsafe {
+            hip::hipStreamWaitValue32(stream, addr as *mut c_void, value, flags, u32::MAX)
         })
     }
     pub unsafe fn cuGraphGetNodes(
@@ -934,7 +1002,9 @@ pub mod blas {
         match sys::rocblas() {
             // SAFETY: the caller's `handle` contract, forwarded to rocBLAS's
             // entry of the same signature.
-            Ok(blas) => cublasStatus_t::of(unsafe { (blas.rocblas_create_handle)(handle) }),
+            // A handle holding no workspace of its own: its calls run on laid
+            // slabs (`kernels_cuda::hip::blas::create`).
+            Ok(_) => cublasStatus_t::of(unsafe { kernels_cuda::hip::blas::create(handle) }),
             Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
         }
     }

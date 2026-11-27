@@ -167,6 +167,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "archery"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,6 +399,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "bitmaps"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
+
+[[package]]
 name = "blake3"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -443,6 +455,10 @@ checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 [[package]]
 name = "builtins"
 version = "0.6.0"
+dependencies = [
+ "plex-host",
+ "wit-component 0.251.0",
+]
 
 [[package]]
 name = "bumpalo"
@@ -575,6 +591,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizer",
+ "web-std",
 ]
 
 [[package]]
@@ -784,6 +801,7 @@ dependencies = [
  "futures",
  "ids",
  "pie-client-api",
+ "plex-host",
  "rustix",
  "serde",
  "serde_json",
@@ -794,19 +812,19 @@ dependencies = [
  "toml",
  "tracing",
  "units",
- "wasmparser 0.263.0",
- "wasmtime",
- "wasmtime-wasi",
 ]
 
 [[package]]
 name = "controller-api"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
  "ids",
  "serde",
  "serde_json",
  "tarpc",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1231,6 +1249,12 @@ dependencies = [
  "cmov",
  "subtle",
 ]
+
+[[package]]
+name = "cty"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
 
 [[package]]
 name = "cudarc"
@@ -1727,13 +1751,16 @@ name = "engine"
 version = "0.6.0"
 dependencies = [
  "eta-compiler",
+ "libc",
  "pie-eta-ir",
  "pie-poem-ir",
+ "pie-profile",
  "rustix",
  "serde",
  "serde_json",
  "state",
  "thiserror 2.0.21",
+ "tracing",
  "web-std",
 ]
 
@@ -1753,12 +1780,14 @@ dependencies = [
  "pie-dtype",
  "pie-eta-dsl",
  "pie-eta-ir",
+ "pie-poem",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
  "pie-profile",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "toml",
  "tracing",
@@ -1785,6 +1814,8 @@ dependencies = [
  "checkpoint",
  "cudarc",
  "engine",
+ "engine-cpu",
+ "engine-cuda",
  "eta-compiler",
  "eta-exec",
  "inferlet",
@@ -1803,6 +1834,7 @@ dependencies = [
  "state",
  "tempfile",
  "toml",
+ "tracing",
  "windows-sys 0.61.2",
  "ztensor",
  "ztensor-compat",
@@ -1819,13 +1851,15 @@ dependencies = [
  "kernels-slang",
  "libc",
  "memmap2",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem-compiler",
  "pie-poem-exec",
  "pie-poem-ir",
  "pie-profile",
- "toml",
  "tracing",
+ "web-std",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1835,6 +1869,8 @@ dependencies = [
  "block2",
  "checkpoint",
  "engine",
+ "engine-cpu",
+ "engine-metal",
  "eta-compiler",
  "eta-exec",
  "kernels-metal",
@@ -1864,7 +1900,9 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "engine-gpu",
+ "engine-vulkan",
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
@@ -1890,12 +1928,12 @@ dependencies = [
  "ash",
  "checkpoint",
  "engine",
+ "engine-cpu",
  "engine-gpu",
+ "engine-wgpu",
  "eta-compiler",
  "eta-exec",
  "kernels-slang",
- "libc",
- "memmap2",
  "naga",
  "pie-eta-ir",
  "pie-poem",
@@ -1907,6 +1945,7 @@ dependencies = [
  "tracing",
  "web-std",
  "wgpu",
+ "windows",
  "ztensor",
 ]
 
@@ -1923,6 +1962,7 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "pie-dtype",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem",
  "pie-poem-compiler",
@@ -1930,6 +1970,7 @@ dependencies = [
  "pie-poem-ir",
  "pie-profile",
  "prost",
+ "serde",
  "serde_json",
  "toml",
  "tracing",
@@ -2033,6 +2074,7 @@ dependencies = [
 name = "eta-compiler"
 version = "0.6.0"
 dependencies = [
+ "eta-compiler",
  "naga",
  "pie-eta-ir",
  "serde",
@@ -2861,6 +2903,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "imbl"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4308a675e4cfc1920f36a8f4d8fb62d5533b7da106844bd1ec51c6f1fa94a0c"
+dependencies = [
+ "archery",
+ "bitmaps",
+ "imbl-sized-chunks",
+ "rand_core 0.9.5",
+ "rand_xoshiro",
+ "version_check",
+]
+
+[[package]]
+name = "imbl-sized-chunks"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f4241005618a62f8d57b2febd02510fb96e0137304728543dfc5fd6f052c22d"
+dependencies = [
+ "bitmaps",
+]
+
+[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3067,6 +3132,7 @@ name = "kernels-cuda"
 version = "0.6.0"
 dependencies = [
  "cudarc",
+ "engine",
  "kernels-ir",
  "pie-dtype",
  "pie-profile",
@@ -3096,12 +3162,15 @@ dependencies = [
 name = "kernels-rocm"
 version = "0.6.0"
 dependencies = [
+ "engine",
  "kernels-ir",
+ "kernels-rocm",
  "libloading 0.9.0",
  "miniz_oxide 0.9.1",
  "pie-dtype",
  "pie-profile",
  "tracing",
+ "zstd 0.14.3",
 ]
 
 [[package]]
@@ -3174,6 +3243,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
+ "cty",
 ]
 
 [[package]]
@@ -3720,18 +3790,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "objc2-core-graphics"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
-dependencies = [
- "dispatch2",
- "objc2",
- "objc2-core-foundation",
- "objc2-io-surface",
-]
-
-[[package]]
 name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3742,17 +3800,6 @@ name = "objc2-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
-dependencies = [
- "bitflags 2.13.1",
- "objc2",
- "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-io-surface"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
 dependencies = [
  "bitflags 2.13.1",
  "objc2",
@@ -3781,7 +3828,6 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
- "objc2-core-graphics",
  "objc2-foundation",
  "objc2-metal",
 ]
@@ -4333,6 +4379,7 @@ version = "0.6.0"
 dependencies = [
  "pie-profile-macros",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -4431,6 +4478,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plex-host"
+version = "1.1.0"
+dependencies = [
+ "imbl",
+ "serde",
+ "serde_json",
+ "wasmtime",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4441,13 +4498,6 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide 0.8.9",
-]
-
-[[package]]
-name = "policy"
-version = "0.6.0"
-dependencies = [
- "wit-bindgen 0.63.0",
 ]
 
 [[package]]
@@ -4812,6 +4862,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
+name = "rand_xoshiro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
+dependencies = [
+ "rand_core 0.9.5",
+]
+
+[[package]]
 name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5107,6 +5166,7 @@ dependencies = [
  "getrandom 0.4.3",
  "grammar",
  "http",
+ "http-body-util",
  "ipnet",
  "lru",
  "media",
@@ -5115,11 +5175,13 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "pie-client-api",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem",
  "pie-poem-compiler",
  "pie-poem-ir",
  "pie-profile",
+ "plex-host",
  "rand 0.10.3",
  "runtime-sys",
  "rustc-hash 2.1.3",
@@ -6930,6 +6992,16 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a879a421bd17c528b74721b2abf4c62e8f1d1889c2ba8c3c50d02deaf2ce395"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.251.0",
+]
+
+[[package]]
+name = "wasm-encoder"
 version = "0.258.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f64765e43c000fae008a48db8b288e175e237fc9ce20a26586836878c1bee89f"
@@ -6946,6 +7018,18 @@ checksum = "4495a6f85dd94c411c749303efcbc5defade0b0cbdbc0541495241ab917a9b5a"
 dependencies = [
  "leb128fmt",
  "wasmparser 0.262.0",
+]
+
+[[package]]
+name = "wasm-metadata"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f998ccc6e012f7b86865eb2a106c8a0422017a1a88977ce01a69f2244be2e57"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "wasm-encoder 0.251.0",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]
@@ -6983,6 +7067,18 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "437970b35b1a85cfde9c74b2398352d8d653f3bd8e3a3db0c063ea8f5b4b36ff"
+dependencies = [
+ "bitflags 2.13.1",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "semver",
 ]
 
 [[package]]
@@ -7536,20 +7632,10 @@ dependencies = [
  "rustc-hash 1.1.0",
  "smallvec",
  "thiserror 2.0.21",
- "wgpu-core-deps-apple",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-naga-bridge",
  "wgpu-types",
-]
-
-[[package]]
-name = "wgpu-core-deps-apple"
-version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "061f3d319a40d39d00b1ecc2c33b89fe21d4e6fe01859df3500a3a8ecccd6b68"
-dependencies = [
- "wgpu-hal",
 ]
 
 [[package]]
@@ -7572,7 +7658,6 @@ dependencies = [
  "ash",
  "bit-set 0.10.0",
  "bitflags 2.13.1",
- "block2",
  "bytemuck",
  "cfg-if",
  "cfg_aliases 0.2.2",
@@ -7583,12 +7668,6 @@ dependencies = [
  "log",
  "naga",
  "naga-types",
- "objc2",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-foundation",
- "objc2-metal",
- "objc2-quartz-core",
  "once_cell",
  "ordered-float",
  "parking_lot",
@@ -8021,6 +8100,25 @@ dependencies = [
 
 [[package]]
 name = "wit-component"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83a5e60173c413659c689f0581b0cf5d1a2404077568f9ffdce748a9eb2fc913"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.1",
+ "indexmap",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder 0.251.0",
+ "wasm-metadata 0.251.0",
+ "wasmparser 0.251.0",
+ "wit-parser 0.251.0",
+]
+
+[[package]]
+name = "wit-component"
 version = "0.258.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0fca88950af0c1f42bc77e17315e48798b8d68340171b6d204f62bc19a878a6"
@@ -8055,6 +8153,25 @@ dependencies = [
  "wasm-metadata 0.262.0",
  "wasmparser 0.262.0",
  "wit-parser 0.262.0",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.251.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e960732e824fab95099971a09e638979347c94ca48568d3c854c945729196947"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.1",
+ "id-arena",
+ "indexmap",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]
@@ -8121,6 +8238,7 @@ dependencies = [
  "futures",
  "gateway",
  "ids",
+ "libmimalloc-sys",
  "mimalloc",
  "pie-client",
  "pie-client-api",

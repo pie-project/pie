@@ -13,6 +13,14 @@ export function name(): string;
 export function architecture(): string;
 export function draftBlock(): BlockDrafter | undefined;
 /**
+ * How many tokens the model's own draft head proposes in one pass, each
+ * fed the one before it: the leading entries of the `mtp.drafts` output
+ * that are a chain, whatever width that output has. A guest drafting from
+ * the head drafts at most this many a round. 0 for a model whose text
+ * states no draft head. Static.
+ */
+export function draftDepth(): number;
+/**
  * Every switch the bound model declares; empty for a one-path model.
  */
 export function switches(): Array<SwitchDecl>;
@@ -39,6 +47,12 @@ export function outputVocabSize(): number;
  */
 export function kvPageSize(): number;
 /**
+ * Tokens one sequence may hold before a fire growing it is refused:
+ * the engine's context in whole KV pages, the least across engines; 0
+ * when no engine sets one.
+ */
+export function maxSequenceTokens(): number;
+/**
  * Waves per frame (k) for this deployment — a static constant fixed at
  * engine start, exactly like kv-page-size. `forward.submit` takes exactly
  * this many ordered slots; slot i executes in wave i. Guests must be
@@ -47,53 +61,6 @@ export function kvPageSize(): number;
  * frame and never adapted from runtime timing.
  */
 export function frameSize(): number;
-/**
- * How long (microseconds) a pipeline may hold a frame's wait-set without
- * submitting before the engine stops waiting for it.
- * 
- * A frame does not dispatch until every participating pipeline has
- * submitted its slot, so membership is a promise to keep submitting, and
- * this is that promise's bound. The clock is per pipeline, measures
- * CONSECUTIVE silence while actually blocking a seal, and is suspended
- * whenever the engine is what the pipeline is waiting on — so it is not a
- * latency budget and a pipeline that keeps submitting can never trip it
- * however long it runs.
- * 
- * A pipeline that intends to stop — blocked on a user turn, waiting on a
- * peer, or simply done for now — calls `forward.park` instead, which
- * leaves the wait-set and stops the clock. What this bound catches is
- * therefore only the case the engine cannot otherwise distinguish: a
- * member that will never submit again.
- * 
- * Small (50ms by default) because it measures a much narrower interval
- * than its size suggests: run-ahead, an unsettled dispatch, a bind in
- * flight and `forward.park` all stop the clock, so what is left is a
- * pipeline hard-blocking the seal with nothing owed to it. It is not
- * smaller because the one-off cost of BUILDING the first pass of a loop
- * — tracing and compiling it after the prefill result lands — is on the
- * clock and was measured between 5ms and 20ms; a steady decode turnaround
- * is far below that.
- * 
- * The corollary is the one thing a pipeline has to be deliberate about:
- * work done between receiving a result and submitting the next fire is
- * ON the clock, because during it the fleet is stalled on this pipeline
- * and nothing is owed back. Anything that can outlast this bound —
- * tokenizing a large document, compiling a grammar, an RPC, a decision
- * that waits on another pipeline — should be preceded by `forward.park`
- * and is rejoined by simply submitting again. Parking is cheap and
- * unparking is implicit, so when in doubt, park.
- * 
- * Overrunning it is not fatal. The engine simply stops waiting: the slot
- * leaves the frame, already-submitted work still runs, and the next
- * submit rejoins. What it costs is a boundary — so treat this as the
- * budget that keeps you IN each frame, not as a deadline you die to.
- * (Termination is reserved for a pipeline that goes silent for orders of
- * magnitude longer without ever parking, i.e. an abandoned one.)
- * 
- * Static, like frame-size and unlike channel-capacity: guests read it
- * once and size their work against it, so it must not move.
- */
-export function submitDeadlineUs(): bigint;
 /**
  * Host-reader channel capacity, in cells, that lets one lane sustain the
  * engine's run-ahead without the ring becoming the bottleneck. Size every
@@ -120,6 +87,14 @@ export function channelCapacity(): number;
  * Not static, for the same reason `channel-capacity` is not.
  */
 export function runAheadWindow(): number;
+/**
+ * Frames the engine keeps in flight (`[runtime] frame_dispatch_depth`, the
+ * engine's `frames_in_flight`): a beam group's freed pages wait this many
+ * fires before they are handed out again, so a guest sizing a beam pool
+ * reads it here.
+ * Static for the run.
+ */
+export function framesInFlight(): number;
 /**
  * Size in bytes of one folded recurrent state. 0 if the model keeps
  * none (attention only, windowed or not).
@@ -163,7 +138,7 @@ export interface SwitchDecl {
  * 
  * ## `"voxel"`
  */
-export type InputAxis = 'lane' | 'row' | 'voxel';
+export type InputAxis = "lane" | "row" | "voxel";
 /**
  * The rows a lane binding an input carries: exactly `n`, or the fewest
  * multiple of `n` holding the guest's own; the guest zero-pads to them.
@@ -194,7 +169,10 @@ export interface InputDecl {
  * `width` values of `dtype` per `axis` entry, stacked `layers` deep when
  * the model writes it per layer (0 when it does not); at most `max-rows`
  * rows a pass. `readout`: its rows are the lane's readout rows, which
- * `forward-pass.readout` chooses.
+ * `forward-pass.readout` chooses. `planes`: how one entry's `width`
+ * values factor, outermost first, each run contiguous: `[q-heads,
+ * keys]` for `attn.scores`, so a guest folds over the heads the model
+ * states. Empty when the entry is one flat run.
  */
 export interface OutputDecl {
   name: string,
@@ -204,6 +182,7 @@ export interface OutputDecl {
   layers: number,
   maxRows: number,
   readout: boolean,
+  planes: Uint32Array,
 }
 /**
  * A lane of given switches: the inputs it binds (exactly these), whether
@@ -241,7 +220,7 @@ export interface LatentSpace {
  * 
  * v-prediction.
  */
-export type ScheduleKind = 'flow' | 'epsilon' | 'v';
+export type ScheduleKind = "flow" | "epsilon" | "v";
 /**
  * The noise schedule the denoiser was trained under: `shift` is the
  * trained timestep shift (1.0 = none; a flow model's base `mu` when it

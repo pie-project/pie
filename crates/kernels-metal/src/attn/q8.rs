@@ -14,6 +14,13 @@ pub fn enabled(pool: &KvPool, dim: u32) -> bool {
         && u64::from(pool.keys.width) == pool.seq_stride
 }
 
+/// Whether the MPP kernel serves a `dim`-wide head over a bf16 pool of
+/// `page_size`-token pages at all: what no row count or mask changes. A
+/// 32-key tile is one page of 32 or two of 16.
+pub(super) fn mpp_serves(dim: u32, page_size: i32) -> bool {
+    matches!(dim, 64 | 128 | 256) && super::arbiter::MPP_PAGE_SIZES.contains(&page_size)
+}
+
 /// Whether the MPP kernel serves these rows over a pool stored as it was written.
 pub(super) fn mpp_fits(
     q: Tensor,
@@ -26,8 +33,7 @@ pub(super) fn mpp_fits(
     causal
         && (!lse || dim == 64)
         && q.rows >= rows.from
-        && matches!(dim, 64 | 128 | 256)
-        && pool.page_size == 32
+        && mpp_serves(dim, pool.page_size)
         && pool.keys.dtype == Dtype::Bf16
         && pool.values.dtype == Dtype::Bf16
         && pool.head_stride == u64::from(dim)
@@ -61,9 +67,11 @@ pub(super) fn attention(
     let mpp = allow_mpp
         && causal
         && (lse.is_none() || (dim == 64 && !q8))
-        && pool.page_size == 32
+        // A q8 pool's kernels read 32-token pages; a bf16 pool's, 32 or 16.
+        && (pool.page_size == 32 || (!q8 && mpp_serves(dim, pool.page_size)))
         && (matches!(dim, 128 | 256) || (dim == 64 && !q8))
         && q.rows >= from;
+    let p16 = mpp && pool.page_size == 16;
     let paired = !mpp
         && dim == 256
         && shape.rows < paired_below
@@ -79,6 +87,11 @@ pub(super) fn attention(
             (true, _, 128) if q8 => "q8_mpp_d128",
             (true, _, 256) if q8 && q.rows >= direct_from => "q8_visit_direct",
             (true, _, 256) if q8 => "q8_mpp_d256",
+            (true, false, 64) if p16 => "sdpa_mpp_d64_p16",
+            (true, true, 64) if p16 => "sdpa_mpp_lse_d64_p16",
+            (true, _, 128) if p16 => "sdpa_mpp_d128_p16",
+            (true, _, 256) if p16 && q.rows >= direct_from => "sdpa_visit_direct_p16",
+            (true, _, 256) if p16 => "sdpa_mpp_d256_p16",
             (true, false, 64) => "sdpa_mpp_d64",
             (true, true, 64) => "sdpa_mpp_lse_d64",
             (true, _, 128) => "sdpa_mpp_d128",

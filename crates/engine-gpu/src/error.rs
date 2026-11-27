@@ -4,6 +4,9 @@ use poem_exec::KernelError;
 
 #[derive(Debug)]
 pub enum Fault {
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Deviceless,
 
     Device {
@@ -28,6 +31,16 @@ pub enum Fault {
         why: String,
     },
 
+    /// The device was lost (Vulkan's `VK_ERROR_DEVICE_LOST`; on wgpu its
+    /// lost callback, or a mapping refused once a submission faulted):
+    /// `what` first saw it, and every call after fails by this name. The
+    /// device is not recovered.
+    DeviceLost {
+        what: &'static str,
+
+        why: String,
+    },
+
     NoDevice {
         detail: String,
     },
@@ -46,6 +59,42 @@ pub enum Fault {
         need: u64,
 
         have: u64,
+    },
+
+    /// One dispatch asks more workgroups on an axis than the device takes.
+    Workgroups {
+        kernel: String,
+
+        axis: char,
+
+        count: u32,
+
+        limit: u32,
+    },
+
+    /// A kernel binds more storage buffers in its shader stage than the
+    /// device binds one.
+    StorageBuffers {
+        kernel: String,
+
+        /// The buffers the kernel declares for itself.
+        own: u32,
+
+        /// The pool segments it binds beside them.
+        pool: u32,
+
+        limit: u32,
+    },
+
+    /// A kernel's layout declares more storage buffers than the device
+    /// binds a shader stage.
+    StageBuffers {
+        kernel: String,
+
+        /// The storage buffers its layout declares.
+        binds: u32,
+
+        limit: u32,
     },
 
     PatchPayload {
@@ -116,12 +165,9 @@ pub enum Fault {
         rows: u64,
     },
 
-    MaskWord {
+    MaskUnread {
         lane: u32,
-
         word: u64,
-
-        runs_masked_arm: bool,
     },
 
     Adapterless {
@@ -135,6 +181,11 @@ pub enum Fault {
 
         runs_correction: bool,
     },
+
+    /// Two live guest holders' state would overlap, or a member alone would
+    /// move its group's pair: a bind or a rebind refused before it wrote
+    /// there ([`engine::guest_claims`]).
+    Claimed(engine::guest_claims::Refusal),
 
     Program {
         at: &'static str,
@@ -199,6 +250,40 @@ pub enum Fault {
     Recipe(String),
 }
 
+impl Fault {
+    /// The lane of its step a fault refuses for its own sake, where one
+    /// does: what the lane states (its word, mask, positions, adapter,
+    /// payload) is what this load cannot serve, and every other lane of
+    /// the step could be ([`engine::Error::Lanes`]).
+    #[must_use]
+    pub fn lane(&self) -> Option<u32> {
+        match self {
+            Self::PatchPayload { lane, .. }
+            | Self::Mask { lane, .. }
+            | Self::Maskless { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::Positions { lane, .. }
+            | Self::MaskUnread { lane, .. }
+            | Self::Adapterless { lane, .. }
+            | Self::AdapterWord { lane, .. } => Some(*lane),
+            Self::Fire(error) => error.lane(),
+            _ => None,
+        }
+    }
+
+    /// A mask staging's fault, its lane counted in `rows`' order, named by
+    /// the step's lane that row is of.
+    #[must_use]
+    pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
+        if let Self::Mask { lane, .. } | Self::MaskRows { lane, .. } = &mut self
+            && let Some(row) = rows.get(*lane as usize)
+        {
+            *lane = row.source;
+        }
+        self
+    }
+}
+
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -211,8 +296,14 @@ impl fmt::Display for Fault {
                 write!(f, "`{what}` returned VkResult {code}")
             }
             Self::Wgpu { what, why } => write!(f, "`{what}` refused: {why}"),
+            Self::DeviceLost { what, why } => write!(
+                f,
+                "DeviceLost: the device was lost (seen at `{what}`: {why}); every call on it fails \
+                 from here, and it is not recovered"
+            ),
             Self::NoDevice { detail } => write!(f, "no GPU device to bind: {detail}"),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Shader {
                 file,
                 entrypoint,
@@ -221,6 +312,38 @@ impl fmt::Display for Fault {
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire asks for {need} {what} and the load reserved {have}"
+            ),
+            Self::Workgroups {
+                kernel,
+                axis,
+                count,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}` launches {count} workgroups on its {axis} axis and this device \
+                 takes {limit} on it (Vulkan's `maxComputeWorkGroupCount`, wgpu's \
+                 `max_compute_workgroups_per_dimension`)"
+            ),
+            Self::StorageBuffers {
+                kernel,
+                own,
+                pool,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}` binds {} storage buffers in its shader stage ({own} of its own and \
+                 {pool} pool segments) and this adapter binds a stage {limit} \
+                 (`maxStorageBuffersPerShaderStage`)",
+                own + pool
+            ),
+            Self::StageBuffers {
+                kernel,
+                binds,
+                limit,
+            } => write!(
+                f,
+                "`{kernel}`'s layout declares {binds} storage buffers and this device binds a \
+                 shader stage {limit} (`maxPerStageDescriptorStorageBuffers`)"
             ),
             Self::PatchPayload {
                 lane,
@@ -272,8 +395,9 @@ impl fmt::Display for Fault {
                 extent,
             } => write!(
                 f,
-                "lane {lane} states a mask over {stated} keys and will read {extent}; a \
-                 mask must REACH the extent (a longer one is fine and is clipped)"
+                "lane {lane} states a mask over {stated} columns and will read {extent} (its \
+                 buffer from its committed boundary, then its rows); a mask must REACH the \
+                 extent (a longer one is fine and is clipped)"
             ),
             Self::Maskless { lane } => write!(
                 f,
@@ -291,15 +415,11 @@ impl fmt::Display for Fault {
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"
             ),
-            Self::MaskWord {
-                lane,
-                word,
-                runs_masked_arm,
-            } => write!(
+            Self::MaskUnread { lane, word } => write!(
                 f,
-                "lane {lane}'s word {word:#x} {} the masked arm and its mask says the \
-                 other thing",
-                if *runs_masked_arm { "runs" } else { "skips" }
+                "lane {lane} states an attention mask and its word {word:#x} reads it in no \
+                 arm this engine applies a mask in: here a relative bias's and a per-head \
+                 selection's arms read no per-lane mask"
             ),
             Self::Adapterless { lane } => write!(
                 f,
@@ -353,6 +473,7 @@ impl fmt::Display for Fault {
                  more"
             ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
+            Self::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
             Self::Unaffine {
                 slot,
                 point,
@@ -430,6 +551,44 @@ impl From<poem_exec::store::Fault> for Fault {
 
 pub type Result<T> = std::result::Result<T, Fault>;
 
+/// The workgroups one dispatch of `kernel` launches on each axis (an axis
+/// it does not spread over launches one), checked where the dispatch is
+/// emitted against `limit`, what the device reports it takes on each
+/// (Vulkan's `maxComputeWorkGroupCount`, wgpu's
+/// `max_compute_workgroups_per_dimension` on all three). A count past it
+/// is refused by the kernel, the axis and the count: on Vulkan such a
+/// dispatch is undefined, not an error the device returns.
+pub fn workgroups(kernel: &str, groups: [u32; 3], limit: [u32; 3]) -> Result<[u32; 3]> {
+    let launched = groups.map(|count| count.max(1));
+    match (0..launched.len()).find(|&axis| launched[axis] > limit[axis]) {
+        Some(axis) => Err(Fault::Workgroups {
+            kernel: kernel.to_string(),
+            axis: ['x', 'y', 'z'][axis],
+            count: launched[axis],
+            limit: limit[axis],
+        }),
+        None => Ok(launched),
+    }
+}
+
+/// The storage buffers `kernel` binds in its shader stage (`own` it
+/// declares for itself, `pool` segments beside them, both as its module
+/// states them), held to `limit`, what the adapter binds a stage
+/// (`maxStorageBuffersPerShaderStage`): a kernel past it is refused by its
+/// name, both counts and the limit, where it would otherwise fail as a
+/// pipeline the device does not validate.
+pub fn storage_buffers(kernel: &str, own: u32, pool: u32, limit: u32) -> Result<()> {
+    if own + pool > limit {
+        return Err(Fault::StorageBuffers {
+            kernel: kernel.to_string(),
+            own,
+            pool,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 impl From<kernels_slang::Error> for Fault {
     fn from(error: kernels_slang::Error) -> Self {
         Fault::from(kernel(error))
@@ -443,5 +602,82 @@ pub fn kernel(error: kernels_slang::Error) -> KernelError {
             KernelError::DtypeUnsupported { op, dtype }
         }
         kernels_slang::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+    }
+}
+
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dispatch past the device's count on an axis is refused by its
+    /// kernel, the axis and the count; one at the count launches, and an
+    /// axis a kernel does not spread over launches one group.
+    #[test]
+    fn a_dispatch_past_the_devices_workgroup_count_is_refused_by_name() {
+        let limit = [65_535, 65_535, 64];
+        assert_eq!(
+            workgroups("gather_embed_bf16", [16, 65_535, 0], limit).unwrap(),
+            [16, 65_535, 1]
+        );
+        let refused = workgroups("gather_embed_bf16", [16, 65_536, 1], limit).unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                Fault::Workgroups { kernel, axis: 'y', count: 65_536, limit: 65_535 }
+                    if kernel == "gather_embed_bf16"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "`gather_embed_bf16` launches 65536 workgroups on its y axis and this device takes \
+             65535 on it (Vulkan's `maxComputeWorkGroupCount`, wgpu's \
+             `max_compute_workgroups_per_dimension`)"
+        );
+        // Each axis against its own count: z takes fewer here.
+        assert!(matches!(
+            workgroups("k", [1, 1, 65], limit),
+            Err(Fault::Workgroups {
+                axis: 'z',
+                count: 65,
+                limit: 64,
+                ..
+            })
+        ));
+        assert!(matches!(
+            workgroups("k", [u32::MAX, 1, 1], limit),
+            Err(Fault::Workgroups {
+                axis: 'x',
+                count: u32::MAX,
+                ..
+            })
+        ));
+    }
+
+    /// A kernel binding more storage buffers than the adapter binds a
+    /// stage is refused by its name, its own buffers, the pool's and the
+    /// limit; one at the limit binds.
+    #[test]
+    fn a_kernel_past_the_adapters_storage_buffers_is_refused_by_name() {
+        storage_buffers("attn_sdpa_decode_bf16_d_64", 8, 4, 12).unwrap();
+        let refused = storage_buffers("attn_sdpa_decode_bf16_d_64", 8, 4, 10).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "`attn_sdpa_decode_bf16_d_64` binds 12 storage buffers in its shader stage (8 of \
+             its own and 4 pool segments) and this adapter binds a stage 10 \
+             (`maxStorageBuffersPerShaderStage`)"
+        );
     }
 }

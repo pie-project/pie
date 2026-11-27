@@ -52,28 +52,24 @@ impl Facts {
         }
         let compiled =
             compile_axes(&trace, &axes, &DeviceProfile::default()).map_err(|e| e.to_string())?;
-        let exports = poem_exec::feeds::class_outputs(&trace, &compiled)?;
+        let exports = poem_exec::feeds::class_outputs(
+            &trace,
+            &compiled,
+            budgets.max_context,
+            budgets.page_size,
+        )?;
         if exports.is_empty() {
             return Err("the trace has no output, so a fire would compute nothing".into());
         }
         let least = u64::from(budgets.max_context.div_ceil(budgets.page_size.max(1)));
         let cells = u64::from(u32::MAX) / u64::from(budgets.page_size.max(1)) - 1;
-        let window = trace
-            .caches
-            .iter()
-            .filter_map(|row| match row {
-                CacheRow::Kv { window, .. } => *window,
-                CacheRow::State { .. } => None,
-            })
-            .max();
         let paging = Paging::of(
             budgets.page_size,
             budgets.max_context,
             slots,
             FILL_PAGES.max(least).min(cells),
         )
-        .map_err(|e| e.to_string())?
-        .windowed(window, budgets.max_tokens);
+        .map_err(|e| e.to_string())?;
         Ok(Facts {
             trace,
             compiled,
@@ -112,6 +108,30 @@ impl Facts {
             }
         };
         Some((out.decl.name.clone(), out.decl.width))
+    }
+
+    /// The windowed (sliding-window attention) layers, ascending, each with
+    /// the rows it attends back over: a layer whose kv rows the trace keeps
+    /// through a window narrower than the context. A window that spans the
+    /// context is no window.
+    pub fn windowed_layers(&self) -> R<Vec<(u32, u32)>> {
+        let census = poem_compiler::chunk::census::census(&self.trace, false, false, false, false)
+            .map_err(|e| e.to_string())?;
+        let mut layers: Vec<(u32, u32)> = Vec::new();
+        for row in &census.tokens {
+            let (Some(layer), Some(window)) = (row.layer, row.window) else {
+                continue;
+            };
+            if window >= self.paging.context() {
+                continue;
+            }
+            match layers.iter_mut().find(|(l, _)| *l == layer) {
+                Some((_, widest)) => *widest = (*widest).max(window),
+                None => layers.push((layer, window)),
+            }
+        }
+        layers.sort_unstable();
+        Ok(layers)
     }
 
     /// Whether the trace keeps recurrent state (its lanes' state replays from tokens here).

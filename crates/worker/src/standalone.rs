@@ -108,11 +108,9 @@ impl PolicyReload {
     /// (`[cluster] cluster_policies`) and the worker's `[runtime]
     /// worker_policy`.
     pub async fn reload(&self, config: &crate::Config) -> Result<()> {
-        if !config.cluster.cluster_policies.is_empty() {
-            self.controller
-                .reload_policies(&config.cluster.cluster_policies)
-                .await?;
-        }
+        self.controller
+            .reload_policies(&config.cluster.policies())
+            .await?;
         crate::reload_policy(config).await
     }
 }
@@ -193,12 +191,14 @@ pub async fn run_standalone(
 
 /// The three role configs one combined file yields: the worker reads the
 /// whole file; the controller and gateway take their defaults.
+/// `path` is the file `combined` was read from, named by a refusal.
 pub fn derive_standalone(
     combined: &str,
+    path: Option<&std::path::Path>,
 ) -> Result<(controller::Config, gateway::Config, crate::Config)> {
-    let worker = crate::Config::parse(combined).context("parsing config")?;
+    let worker = crate::Config::parse_file(combined, path).context("parsing config")?;
     let mut controller = controller::Config::parse("").context("controller defaults")?;
-    controller.cluster_policies = worker.cluster.cluster_policies.clone();
+    controller.cluster_policies = worker.cluster.policies();
     let gateway = gateway::Config::parse("").context("gateway defaults")?;
     Ok((controller, gateway, worker))
 }

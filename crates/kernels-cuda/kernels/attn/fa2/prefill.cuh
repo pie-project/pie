@@ -2910,9 +2910,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       uint32_t num_iterations_mask;
       uint32_t num_iterations = 0;
 
+      // PIE: a request's custom-mask rows are causal unless they read both
+      // ways (its word's wide bit): their keys past the diagonal are never
+      // read, and its diagonal tiles mask as the causal arm's do.
+      bool causal_bound = MASK_MODE == MaskMode::kCausal;
+      if constexpr (MASK_MODE == MaskMode::kCustom) {
+        causal_bound = !variant.mask_wide;
+      }
       if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
         num_iterations = ceil_div(
-            (MASK_MODE == MaskMode::kCausal
+            (causal_bound
                  ? min(chunk_size,
                        sub_if_greater_or_zero(
                            kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size),
@@ -2952,7 +2959,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           CTA_TILE_KV);
 
       const uint32_t mask_iteration =
-          (MASK_MODE == MaskMode::kCausal || MASK_MODE == MaskMode::kMultiItemScoring
+          (causal_bound || MASK_MODE == MaskMode::kMultiItemScoring
                ? min(chunk_size,
                      sub_if_greater_or_zero(
                          kv_len + ceil_div((qo_tile_idx * CTA_TILE_Q), group_size) - qo_len,
@@ -3045,9 +3052,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                   kv_head_idx);
 
         if (MASK_MODE == MaskMode::kCustom) {
-          logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
-                               kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
-                               kv_head_idx);
+          // PIE: a warp's keys wholly below the request's committed boundary and
+          // its chunk's end read no mask bit: only the causal and window bounds
+          // apply, as the plain arm applies them.
+          const uint32_t warp_kv_end = kv_idx_base + KTraits::NUM_MMA_KV * 16;
+          const bool committed =
+              warp_kv_end <= variant.mask_origin && warp_kv_end <= chunk_end;
+          if (!committed || (!variant.mask_wide && iter >= mask_iteration) ||
+              iter < window_iteration) {
+            logits_mask<KTraits>(params, variant, request_idx, qo_packed_idx_base,
+                                 kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
+                                 kv_head_idx);
+          }
         } else {
           if constexpr (MASK_MODE != MaskMode::kMultiItemScoring) {
             if (iter >= mask_iteration || iter < window_iteration) {

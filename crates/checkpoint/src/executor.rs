@@ -17,6 +17,19 @@ pub struct HostStorage {
     pub tensors: HashMap<String, Vec<u8>>,
 }
 
+/// How this machine's reads go, as a walk splits them across threads
+/// (`walk`'s `Split`): one thread's spawn and join (seconds), the fastest
+/// one thread has read (bytes a second), and the most several have read
+/// together. A walk given them splits its first read by them; it leaves the
+/// fastest it saw in them, so a caller may keep them for the next. Zero
+/// where unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ReadRates {
+    pub spawn_s: f64,
+    pub thread_bytes_per_s: f64,
+    pub whole_bytes_per_s: f64,
+}
+
 pub enum Residency<'a> {
     Arena(&'a mut dyn ArenaBacking),
     Streaming,
@@ -30,6 +43,7 @@ pub struct Execution<'a> {
     sink: Option<&'a mut dyn TensorSink>,
     progress: Option<&'a mut dyn FnMut(Progress<'_>)>,
     consume: Option<&'a crate::consume::SourceLedger>,
+    reads: Option<&'a mut ReadRates>,
 }
 
 impl<'a> Execution<'a> {
@@ -42,7 +56,16 @@ impl<'a> Execution<'a> {
             sink: None,
             progress: None,
             consume: None,
+            reads: None,
         }
+    }
+
+    /// Splits reads by `rates` (what an earlier walk on this machine saw),
+    /// and leaves in them what this walk sees.
+    #[must_use]
+    pub fn read_rates(mut self, rates: &'a mut ReadRates) -> Self {
+        self.reads = Some(rates);
+        self
     }
 
     #[must_use]
@@ -86,6 +109,7 @@ impl<'a> Execution<'a> {
             sink,
             progress,
             consume,
+            reads,
         } = self;
         let mut owned_sink = MemorySink::default();
         let mut unwatched = |_: Progress<'_>| {};
@@ -107,7 +131,15 @@ impl<'a> Execution<'a> {
                 (None, false) => Residency::Arena(&mut owned_backing),
             };
             match sink {
-                Some(sink) => walk::run(plan, snapshot_dir, residency, sink, progress, consume)?,
+                Some(sink) => walk::run(
+                    plan,
+                    snapshot_dir,
+                    residency,
+                    sink,
+                    progress,
+                    consume,
+                    reads,
+                )?,
                 None => {
                     walk::run(
                         plan,
@@ -116,6 +148,7 @@ impl<'a> Execution<'a> {
                         &mut owned_sink,
                         progress,
                         consume,
+                        reads,
                     )?;
                 }
             }

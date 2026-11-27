@@ -3,7 +3,7 @@
 //! projections, the paged append) and the paged attention over latents,
 //! causal and over a selection.
 
-use kernels_slang::{KvPool, RaggedTensor, Tensor};
+use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, landed, noise};
@@ -176,8 +176,10 @@ fn mla_answers_the_reference() {
     let indptr = [0u32, 2, 3];
     let (pi, pp) = (gpu.up_u32(&pages), gpu.up_u32(&indptr));
     let u = |buf: u32, r: usize| Tensor::new(buf, r as u32, 1, Dtype::U32);
+    let one = gpu.one_segment();
     let pool = |ckv: u32, kpe: u32| {
-        KvPool::planes(
+        crate::gpu::kv_planes(
+            one,
             b(ckv, slots, RANK),
             b(kpe, slots, ROPE),
             u(pi, 3),
@@ -205,10 +207,8 @@ fn mla_answers_the_reference() {
         &mut gpu,
         "mla kv append",
         &|g| {
-            vec![
-                (g.zeros(slots * RANK), slots * RANK, false),
-                (g.zeros(slots * ROPE), slots * ROPE, false),
-            ]
+            let (ckv, kpe) = g.zeros_planes(slots * RANK, slots * ROPE);
+            vec![(ckv, slots * RANK, false), (kpe, slots * ROPE, false)]
         },
         &[want_ckv, want_kpe],
         &|g, o| {
@@ -227,8 +227,8 @@ fn mla_answers_the_reference() {
 
     // Attention: rows 0, 1 belong to request 0 at positions 5, 7; row 2 to
     // request 1 at position 2.
-    let (ckv, ckvr) = gpu.up(&noise(9, slots * RANK));
-    let (kpe, kper) = gpu.up(&noise(10, slots * ROPE));
+    let ((ckv, ckvr), (kpe, kper)) =
+        gpu.up_planes(&noise(9, slots * RANK), &noise(10, slots * ROPE));
     let (qa, qar) = gpu.up(&noise(11, rows * HEADS * RANK));
     let (qpe, qper) = gpu.up(&noise(12, rows * HEADS * ROPE));
     let (ckvr, kper, qar, qper) = (f64s(&ckvr), f64s(&kper), f64s(&qar), f64s(&qper));

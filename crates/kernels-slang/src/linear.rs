@@ -7,3 +7,6 @@ pub mod lora;
 pub mod moe;
 pub mod qmm;
 pub mod qmv;
+
+#[cfg(test)]
+mod dispatch_tests;

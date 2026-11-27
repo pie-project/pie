@@ -50,9 +50,9 @@ pub struct Layout {
     pub planes: Vec<Plane>,
     pub regions: Vec<Region>,
 
-    pub in_of: HashMap<u32, usize>,
+    pub in_of: std::collections::BTreeMap<u32, usize>,
 
-    pub out_of: HashMap<u32, usize>,
+    pub out_of: std::collections::BTreeMap<u32, usize>,
 
     pub token_bytes: u64,
 
@@ -306,17 +306,56 @@ pub struct WindowMap {
 /// Out of every buffer's range: a write there is dropped.
 pub const DROP: i32 = i32::MAX;
 
+/// The carried rows a fire of a `rung`-token rung replays at most, summed
+/// over its lanes (`engine::fire::rung_holds`): its rung's tokens. The one
+/// place the bound is read: a fire past it is refused at prepare, and a
+/// fire that replays lays each window's scratch for it.
+#[must_use]
+pub fn carried_room(rung: u32) -> u32 {
+    rung
+}
+
+/// What a `rung`-token rung holds of a fire's replay, as the load states it
+/// (`ChunkFacts::act_replay`) and prepare checks it, both by
+/// `engine::fire::rung_holds`: its own rows at most the rung's tokens, and
+/// its window scratch, one row each of every lane's replayed rows (a decode
+/// lane's included: the scratch lays them, so the load is not compact) and
+/// of its own, at most the rung's own rows and its carried room
+/// ([`carried_room`]), the room [`WindowMap::of`] lays. The scratch is
+/// stated as one byte a row, so the bytes bound is that row bound.
+#[must_use]
+pub fn rung_replay(rung: u32) -> engine::RungReplay {
+    let mut scratch = engine::ScratchBytes {
+        slot_bytes: vec![1],
+        lane_bytes: 0,
+        room_bytes: 0,
+        pad: 1,
+    };
+    scratch.room_bytes = scratch.bytes(rung.saturating_add(carried_room(rung)), 1);
+    engine::RungReplay {
+        own_max: Some(rung),
+        carried_max: None,
+        scratch,
+    }
+}
+
 impl WindowMap {
     /// The map of the window covering lanes `lane0..lane0 + lanes` whose own
     /// rows are cut by `indptr` (window-local), for rs list slots of
     /// `page_tokens` rows. A buffer row is `q · page_tokens + token` of the
     /// slot's grain index `q` (each plane maps `q` to its own block before
     /// it reads or writes, `dispatch/rs.rs`).
+    ///
+    /// `rung`: the fire's rung where it replays carried rows: the window's
+    /// scratch holds the rung's own rows and its carried room
+    /// ([`carried_room`]), one size at every such fire of the rung. `None`:
+    /// the fire replays nothing, the scratch holds the window's own rows.
     pub fn of(
         plans: &[LanePlan],
         indptr: &[i32],
         lane0: u32,
         page_tokens: u32,
+        rung: Option<u32>,
     ) -> Result<WindowMap> {
         let mut map = WindowMap::default();
         let rows_own = indptr.last().copied().unwrap_or(0).max(0) as usize;
@@ -366,7 +405,22 @@ impl WindowMap {
                 }
             }
         }
-        let ext = map.from_buffer.len().max(16).next_power_of_two();
+        let laid = map.from_buffer.len();
+        let ext = match rung {
+            Some(rung) => {
+                let room = rung as usize + carried_room(rung) as usize;
+                if laid > room {
+                    return Err(Fault::Ceiling {
+                        what: "carried rows a fire's lanes replay (the tokens of the rung it runs at)",
+                        need: laid as u64,
+                        have: room as u64,
+                    });
+                }
+                room
+            }
+            None => laid,
+        };
+        let ext = ext.max(16).next_power_of_two();
         map.from_buffer.resize(ext, 0);
         map.buffer_row.resize(ext, 0);
         map.own_row.resize(ext, 0);

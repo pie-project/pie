@@ -251,7 +251,7 @@ pub(super) fn select_rows(
 }
 
 fn select(ctx: &Ctx, params: ArgValue<'_>, selection: &mut Tensor) -> Result<(), Error> {
-    let radix = ctx.tuning().index_radix;
+    let radix = ctx.tuning().index_radix();
     ctx.fire(
         "attn.index_topk",
         Fire::at(kernel(

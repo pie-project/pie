@@ -7,7 +7,6 @@ use engine::ProgramRegistration;
 use engine::{ChannelId, InstanceId};
 use engine_cuda::device::Context;
 use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::session::Fired;
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
@@ -109,7 +108,7 @@ impl Rig {
             launch,
             ..Default::default()
         };
-        let mut plane = Plane::new(Disk::disabled());
+        let mut plane = crate::guest::alone_plane();
         let program = plane
             .register(&context, &registration)
             .expect("the program compiles for the device");
@@ -133,6 +132,8 @@ impl Rig {
                 false,
                 &vec![None; count],
                 &ids,
+                crate::guest::alone_slots(&plane, program),
+                &crate::guest::alone_span,
                 context.stream(),
             )
             .expect("the instance binds");

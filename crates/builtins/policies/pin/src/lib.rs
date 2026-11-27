@@ -1,30 +1,25 @@
-//! Sends a launch to the worker its `worker` prop names.
+//! Sends a launch first to the worker its client names, over what
+//! `default-cluster` does.
+//!
+//! - Hint `worker` (int or text): the worker's number. The other workers
+//!   that take new processes come after it. One that is gone, draining or
+//!   no decode worker is named for nothing, and with every worker full the
+//!   launch waits as any other.
 
-use policy::{Placement, Subject, SubjectKind, candidates, cluster, prop};
+use std::collections::BTreeMap;
+
+use cluster_defaults::{Defaults, named, wake};
+use plex::prelude::*;
 
 #[derive(Default)]
-struct Pin;
+struct Pin {
+    defaults: Defaults,
+}
 
-impl cluster::Policy for Pin {
-    fn plan(&mut self, _now_ms: u64) {
-        let placements: Vec<_> = candidates(SubjectKind::Process)
-            .into_iter()
-            .filter_map(|process| {
-                let named = prop(&Subject::Process(process.clone()), "worker");
-                let worker = match named.int() {
-                    Some(n) => n.to_string(),
-                    None => named.text()?.to_string(),
-                };
-                Some(Placement {
-                    process,
-                    worker: Some(worker),
-                    executors: Vec::new(),
-                    props: Vec::new(),
-                })
-            })
-            .collect();
-        let _ = cluster::install_placement(&placements);
+impl Policy for Pin {
+    fn plan(&mut self, now: Mark) {
+        wake([self.defaults.plan(now, named, BTreeMap::new())]);
     }
 }
 
-policy::cluster!(Pin);
+plex::export!(Pin);

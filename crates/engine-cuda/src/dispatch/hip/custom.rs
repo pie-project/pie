@@ -64,6 +64,8 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. } => self.fused_linear(op),
+            Fused::ResidualAddRmsnormMatmul { .. } => self.norm_matmul(op),
+            Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. } => self.norm_mlp(op),
             // Kernels this backend does not ship as one: never formed for it,
             // and run as the primitives they stand for where a trace states
             // them.
@@ -363,8 +365,27 @@ impl Run<'_> {
     /// A fused op as the primitives it replaced, each over the values the
     /// fused op keeps.
     fn primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather, DispatchLinear};
-        use poem_ir::{Attn, Elemwise, Gather, Linear};
+        match op {
+            Fused::MatmulGlu { .. }
+            | Fused::MatmulSplitRows { .. }
+            | Fused::MatmulMoeRoute { .. } => self.primitives_matmul(op),
+            Fused::MoeSelectGlu { .. } | Fused::MoeMega { .. } | Fused::MoeExperts { .. } => {
+                self.primitives_moe(op)
+            }
+            Fused::LseSink { .. }
+            | Fused::RopeYarnAppend { .. }
+            | Fused::SplitRopeYarnAppend { .. } => self.primitives_attn(op),
+            _ => Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
+    /// The fused products: a GLU over its matmul, a matmul split into row
+    /// ranges, a router over its matmul.
+    fn primitives_matmul(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchGather, DispatchLinear};
+        use poem_ir::{Gather, Linear};
         match op {
             Fused::MatmulGlu {
                 act,
@@ -472,6 +493,17 @@ impl Run<'_> {
                     },
                 )
             }
+            _ => Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
+    /// The fused MoE layers: the selected experts' GLU, the whole MoE block,
+    /// the experts' MLP.
+    fn primitives_moe(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchElemwise, DispatchLinear};
+        match op {
             Fused::MoeSelectGlu { select, glu } => {
                 DispatchLinear::dispatch(self, select)?;
                 DispatchLinear::dispatch(self, glu)
@@ -519,6 +551,18 @@ impl Run<'_> {
                     _ => Ok(()),
                 }
             }
+            _ => Err(crate::error::kernel(kernels_cuda::Error::Unsupported {
+                op: op.name(),
+            })),
+        }
+    }
+
+    /// The fused attention steps: the sink-weighted LSE merge, the YaRN rope
+    /// and its append (split or not).
+    fn primitives_attn(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchAttn, DispatchElemwise, DispatchGather};
+        use poem_ir::{Attn, Elemwise, Gather};
+        match op {
             Fused::LseSink {
                 attn,
                 sink,
@@ -535,7 +579,7 @@ impl Run<'_> {
                 | Attn::Prefill {
                     o,
                     lse: Some(lse),
-                    mask: None,
+                    mask: _,
                     selection: None,
                     bias: None,
                     ..
@@ -685,10 +729,8 @@ impl Run<'_> {
     /// The gated-delta decode step whole where the kernel covers it, else
     /// its primitives over the values the fused op keeps.
     fn gdn_step(&mut self, op: &Fused) -> Result<(), KernelError> {
-        use poem_exec::{DispatchGather, DispatchSsm};
         let Fused::GdnStep {
             qkvz,
-            width,
             qkv,
             z,
             conv_weight,
@@ -699,18 +741,66 @@ impl Run<'_> {
             ba,
             dt_bias,
             a_log,
-            gates,
             state,
             k_heads,
             v_heads,
             k_dim,
             v_dim,
             y,
+            ..
         } = *op
         else {
             unreachable!("only the gated-delta step comes here");
         };
-        if !self.rs_extended() {
+        // A buffering fire's lanes carry rows and land their own: the fused
+        // step reads them where it covers the shape, else its primitives'
+        // carried steps do.
+        if !self.rs_extended() && self.rs_buffered(qkv) {
+            const OP: &str = "fused.gdn_step";
+            let conv_pool = self.recurrent_absolute(conv_state);
+            let pool = self.recurrent_absolute(state);
+            let x_plane = self.rs_plane(OP, qkv).map_err(crate::error::kernel)?;
+            let k_plane = self
+                .rs_planes()
+                .and_then(|planes| planes.keys_of(conv))
+                .map(|(plane, _, _)| plane);
+            if let Some(k_plane) = k_plane {
+                let conv_carry = self
+                    .rs_carry(OP, &[x_plane, k_plane], &conv_pool)
+                    .map_err(crate::error::kernel)?;
+                let step_planes = self.gdn_planes(OP, ba, y).map_err(crate::error::kernel)?;
+                let step_carry = self
+                    .rs_carry(OP, &step_planes, &pool)
+                    .map_err(crate::error::kernel)?;
+                let done = kernels_cuda::ssm::gdn_step_fused_carried(
+                    self.ctx(),
+                    self.tensor(qkvz),
+                    self.tensor(conv_weight),
+                    &crate::run::one_token(conv_pool),
+                    conv_width,
+                    dilation,
+                    self.tensor(ba),
+                    self.tensor(dt_bias),
+                    self.tensor(a_log),
+                    &crate::run::one_token(pool),
+                    k_heads,
+                    v_heads,
+                    k_dim,
+                    v_dim,
+                    &mut self.tensor(qkv),
+                    &mut self.tensor(z),
+                    &mut self.tensor(y),
+                    &conv_carry,
+                    &step_carry,
+                )
+                .map_err(crate::error::kernel)?;
+                if done {
+                    return Ok(());
+                }
+                return self.gdn_step_primitives(op);
+            }
+        }
+        if !self.rs_extended() && !self.rs_buffered(qkv) {
             let done = kernels_cuda::ssm::gdn_step_fused(
                 self.ctx(),
                 self.tensor(qkvz),
@@ -739,6 +829,37 @@ impl Run<'_> {
                     .map_err(crate::error::kernel);
             }
         }
+        self.gdn_step_primitives(op)
+    }
+
+    /// The gated-delta decode step as its primitives, over the values the
+    /// fused op keeps.
+    fn gdn_step_primitives(&mut self, op: &Fused) -> Result<(), KernelError> {
+        use poem_exec::{DispatchGather, DispatchSsm};
+        let Fused::GdnStep {
+            qkvz,
+            width,
+            qkv,
+            z,
+            conv_weight,
+            conv_state,
+            conv_width,
+            dilation,
+            conv,
+            ba,
+            dt_bias,
+            a_log,
+            gates,
+            state,
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            y,
+        } = *op
+        else {
+            unreachable!("only the gated-delta step comes here");
+        };
         DispatchGather::dispatch(
             self,
             &poem_ir::Gather::SplitRows {

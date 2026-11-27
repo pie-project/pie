@@ -43,6 +43,14 @@ impl Extents {
     }
 }
 
+/// The bytes an element of `dtype` takes in a guest's device scratch, the
+/// one layout every backend's kernels read: its width rounded up to a
+/// byte, so a bool a byte, a 16-bit float two, a 32-bit value a word.
+#[must_use]
+pub const fn element_bytes(dtype: Dtype) -> u64 {
+    dtype.bytes_ceil()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct ValueDesc {
@@ -75,15 +83,13 @@ impl Default for ValueDesc {
 }
 
 impl ValueDesc {
+    /// The bytes the value takes in a guest's device scratch: its elements
+    /// at their dtype's width ([`element_bytes`]), at least a word.
     #[must_use]
     pub fn device_bytes(&self) -> u64 {
-        let len = u64::from(self.len);
-        let bytes = if self.dtype() == Dtype::Bool {
-            len
-        } else {
-            len * 4
-        };
-        bytes.max(4)
+        u64::from(self.len)
+            .saturating_mul(element_bytes(self.dtype()))
+            .max(4)
     }
 
     #[must_use]

@@ -22,14 +22,14 @@ export function architecture(): string {
   return _model.architecture();
 }
 
-/** How long a pipeline may hold a frame's wait-set, in microseconds. */
-export function submitDeadlineUs(): number {
-  return Number(_model.submitDeadlineUs());
-}
-
 /** The bound model's block drafter, if it carries one. */
 export function draftBlock(): BlockDrafter | undefined {
   return _model.draftBlock();
+}
+
+/** Tokens the model's draft head chains in one pass; 0 with no head. */
+export function draftDepth(): number {
+  return _model.draftDepth();
 }
 
 /** Fires one lane may have submitted and not yet taken. */

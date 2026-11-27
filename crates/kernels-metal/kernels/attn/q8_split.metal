@@ -16,7 +16,7 @@ template <int GH, typename KV = int8_t, int DD = 256>
     const constant int &n_kv_heads [[buffer(10)]], const constant float &scale [[buffer(11)]],
     const device uchar *attention_mask [[buffer(12)]],
     const device uint &attention_mask_stride [[buffer(13)]],
-    const device uchar *attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int &window [[buffer(15)]], const device bfloat *sinks [[buffer(16)]],
     device float *workspace [[buffer(17)]], constant uint &splits [[buffer(18)]],
     constant uint &qrows [[buffer(19)]], constant uint &tile_base [[buffer(20)]],
@@ -44,7 +44,7 @@ template <int GH, typename KV = int8_t, int DD = 256>
     const int req0 = req_of_token[row0], pos0 = position_ids[row0];
     for (int r = 0; r < 8; ++r)
       simple &= req_of_token[row0 + r] == req0 && position_ids[row0 + r] == pos0 + r &&
-                attention_mask_enabled[row0 + r] == 0;
+                (attention_mask_enabled[row0 + r] & 3u) == 0;
   }
   const device bfloat *packed_q =
       reinterpret_cast<const device bfloat *>(workspace) + tile.x * M * D;
@@ -82,7 +82,7 @@ template <int GH, typename KV = int8_t, int DD = 256>
       if (req_of_token[row0 + r] != req)
         continue;
       int pos = position_ids[row0 + r];
-      const bool wide = window < 0 || attention_mask_enabled[row0 + r] == 2;
+      const bool wide = window < 0 || (attention_mask_enabled[row0 + r] & 3u) == 2;
       const int extent = window < 0 ? -window - 1 : window;
       last = max(last, wide ? int(kv_page_indptr[req + 1] - kv_page_indptr[req]) * N - 1 : pos);
       first = min(first, extent > 0 ? max(0, pos - extent + 1) : 0);
@@ -96,8 +96,8 @@ template <int GH, typename KV = int8_t, int DD = 256>
         break;
 
       const uint physical = kv_page_indices[kv_page_indptr[req] + page];
-      const ulong k_at = ulong(physical) * (k_page_stride / sizeof(KV)) + ulong(kv) * W;
-      const ulong v_at = ulong(physical) * (v_page_stride / sizeof(KV)) + ulong(kv) * W;
+      const ulong k_at = pie_page_at(physical, k_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
+      const ulong v_at = pie_page_at(physical, v_page_stride / sizeof(KV), sizeof(KV)) + ulong(kv) * W;
       auto k = tensor(const_cast<device KV *>(kplane) + k_at, dextents<int, 2>{D, N},
                       array<int, 2>{1, n_kv_heads * W});
       auto score =
@@ -128,13 +128,13 @@ template <int GH, typename KV = int8_t, int DD = 256>
           if (simple) {
             keep[j] = active && kp <= pos;
           } else {
-            const bool wide = window < 0 || (row < int(qrows) && attention_mask_enabled[row] == 2);
+            const bool wide = window < 0 || (row < int(qrows) && (attention_mask_enabled[row] & 3u) == 2);
             const int extent = window < 0 ? -window - 1 : window;
             keep[j] = active && row < int(qrows) && req_of_token[row] == req &&
                       (wide || kp <= pos) && (extent <= 0 || kp >= pos - extent + 1);
-            if (keep[j] && attention_mask_enabled[row])
-              keep[j] = uint(kp) < attention_mask_stride &&
-                        attention_mask[ulong(row) * attention_mask_stride + kp] != 0;
+            if (keep[j] && (attention_mask_enabled[row] & 3u))
+              keep[j] = pie_mask_admits(attention_mask, attention_mask_stride,
+                                        attention_mask_enabled[row] >> 2, uint(row), uint(kp));
           }
           const float ks = kscale[col + j];
           svv[j] = keep[j] ? scores[r * N + col + j] * scale * ks : -1e30f;
@@ -236,14 +236,14 @@ kernel void pie_q8_batch_reduce(const device float *workspace [[buffer(0)]],
       const device bfloat *, const device int8_t *, const device int8_t *, device bfloat *, \
       const constant int &, const device int *, const device int *, const device uint *, \
       const device uint *, const constant int &, const constant int &, const constant float &, \
-      const device uchar *, const device uint &, const device uchar *, const constant int &, \
+      const device uchar *, const device uint &, const device uint*, const constant int &, \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint); \
   template [[host_name("pie_bf16_batch_split_g" #gh)]] [[kernel]] void pie_q8_batch_split<gh, bfloat>( \
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *, \
       const constant int &, const device int *, const device int *, const device uint *, \
       const device uint *, const constant int &, const constant int &, const constant float &, \
-      const device uchar *, const device uint &, const device uchar *, const constant int &, \
+      const device uchar *, const device uint &, const device uint*, const constant int &, \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint); \
   template [[host_name("pie_q8_batch_pack_g" #gh)]] [[kernel]] void pie_q8_batch_pack<gh>( \
@@ -259,7 +259,7 @@ kernel void pie_q8_batch_reduce(const device float *workspace [[buffer(0)]],
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *, \
       const constant int &, const device int *, const device int *, const device uint *, \
       const device uint *, const constant int &, const constant int &, const constant float &, \
-      const device uchar *, const device uint &, const device uchar *, const constant int &, \
+      const device uchar *, const device uint &, const device uint*, const constant int &, \
       const device bfloat *, device float *, constant uint &, constant uint &, constant uint &, \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint); \
   template [[host_name("pie_q8_batch_pack_g" #gh "_d128")]] [[kernel]] void pie_q8_batch_pack<gh, 128>( \

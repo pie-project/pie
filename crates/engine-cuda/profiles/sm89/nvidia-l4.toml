@@ -30,8 +30,6 @@ sdpa.selected_mma = true
 # DeepSeek-V4.1 bounded replay, as vLLM prefills it (its decoder layers
 # route a quarter of a 2048-token batch): pf16-512 prefill 19.8k to ~29.8k tok/s.
 sdpa.compressed_replay = true
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 moe.mxfp4_fp8_from = 256
 # MXFP4 experts averaging up to 16 routes on the 512-code-run select, past
 # them the staged one (gpt-oss-120b's miniature at c128 on an L40S: 2490 to
@@ -41,11 +39,8 @@ moe.mxfp4_fp8_from = 256
 moe.mxfp4_mma_per_from = 0
 
 [engine]
-seated_first = true
 # a fire's working set may take 65% of the 24 GB card past the weights, as on the RTX 4090
 working_set_percent = 65
-recording = { use = "bodies", mem_mb = 1024 }
-forward_tokens = 2304
 prefill_lattice_steps = 8
 
 [provenance]
@@ -61,8 +56,6 @@ measured = [
   "kernel.moe.affine_grouped",
   "kernel.moe.affine_grouped_from",
   "kernel.moe.affine_wmma",
-  "kernel.moe.group_at",
-  "kernel.moe.grouped",
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
   "kernel.moe.mxfp4_wmma",
@@ -73,22 +66,15 @@ measured = [
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
-  "kernel.sdpa.decode.chunk_floor_128",
   "kernel.sdpa.decode.grouped_prefill_from",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.pool_mma",
   "kernel.sdpa.index_mma",
   "kernel.sdpa.index_radix",
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.prefill_lattice_steps",
-  "engine.graphs",
   "engine.lattice_steps",
-  "engine.recording",
   "engine.working_set_percent",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
   "compiler.cond_fixed_us",

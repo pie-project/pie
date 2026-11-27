@@ -16,6 +16,7 @@ use super::intrinsics::{
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{library_region_valid, outputs_bindable, used_channel_slots};
 use crate::codegen::fault::{FUSED_GEOMETRY_MISMATCH, M3_THREADS_EXCEEDED};
+use crate::codegen::lane_scratch::LANE_SCRATCH;
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
 
@@ -140,6 +141,12 @@ pub fn emit_fused_region(
             return Err(EmitError::RegionNodeOutOfRange(RegionForm::Fused));
         };
         let mut slots = Slots::of(op, bases[node], value_ptr);
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`.
+            slots.o1 = value_ptr(state);
+        }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             if op.chan < 0 || op.chan as usize >= channel_bindings.len() {
                 return Err(EmitError::ChannelRootBindingOutOfRange);
@@ -193,7 +200,11 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device M1ValueDesc* all_descriptors [[buffer(1)]],\n");
     source.push_str("    const device M1OpParams* params [[buffer(2)]],\n");
     source.push_str("    const device uint* offsets [[buffer(3)]],\n");
-    source.push_str("    device uchar* all_scratch [[buffer(4)]],\n");
+    let _ = writeln!(
+        source,
+        "    const device ulong* {} [[buffer({})]],",
+        LANE_SCRATCH.name, LANE_SCRATCH.metal_buffer
+    );
     source.push_str("    const device M3GroupLayout* layout [[buffer(5)]],\n");
     source.push_str("    const device uint* channel_bindings [[buffer(6)]],\n");
     source.push_str("    device uchar* pending_flags [[buffer(7)]],\n");
@@ -247,7 +258,7 @@ pub fn emit_grouped_fused_region(
          dispatch_lane * layout->reserved2;\n",
     );
     source.push_str(
-        "  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;\n",
+        "  device uchar* scratch = reinterpret_cast<device uchar*>(lane_scratch[dispatch_lane]);\n",
     );
     source.push_str("  device uchar* temporary = scratch + layout->temporary_offset;\n");
     source.push_str(
@@ -361,6 +372,12 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
+        if op.tag == tags::GUMBEL_ARGMAX
+            && let Some(&state) = op.args.get(3)
+        {
+            // The rng state, the fourth operand, rides in `o1`.
+            slots.o1 = value_ptr(alias.resolve(state));
+        }
         if op.tag == tags::OUTPUT
             && let Some(slot) = addressed_slot(stage, op, base)
         {
@@ -427,8 +444,9 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, o0: &str) {
         "    device int* am_out = reinterpret_cast<device int*>({o0});"
     );
     source.push_str("    for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {\n");
-    source.push_str("      const uint am_src_row = row_indices[am_row_base + am_r];\n");
-    source.push_str("      const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;\n");
+    source.push_str(
+        "      const device bfloat* am_src = logits + ulong(row_indices[am_row_base + am_r]);\n",
+    );
     source.push_str("      M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};\n");
     source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
     source.push_str("      const uint am_w = m3_threads;\n");
@@ -492,11 +510,22 @@ pub(super) fn emit_addressed_gather(
         "    const uint addressed_stride = \
          addressed_seat.stride == 0u ? addressed_width : addressed_seat.stride;\n",
     );
+    // Ids read an i32 seat (2); floats any other: f32 (0), bf16 (1), or a
+    // table of row addresses whose rows are bf16 (3) or f32 (4), a lane-0
+    // read's rows seated at the instance's lanes.
     let storage = if ints { "!= 2u" } else { "== 2u" };
     let _ = writeln!(
         source,
         "    if (addressed_seat.at == 0ul || addressed_stride < addressed_width || \
          addressed_seat.storage {storage}) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+    );
+    // Defence in depth: the binder refuses a read past the rows the seat's
+    // lane holds; a read that reaches past them anyway faults here, never
+    // reading another request's rows.
+    let _ = writeln!(
+        source,
+        "    if ((addressed_desc.len + addressed_width - 1u) / addressed_width > addressed_seat.rows) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     source.push_str(
@@ -515,9 +544,16 @@ pub(super) fn emit_addressed_gather(
     } else {
         let _ = writeln!(
             source,
-            "      reinterpret_cast<device float*>({o0})[i] = addressed_seat.storage == 0u \
+            "      m1_store_fd({o0}, i, addressed_seat.storage >= 3u \
+             ? (addressed_seat.storage == 4u \
+                ? reinterpret_cast<const device float*>(reinterpret_cast<const device ulong*>(\
+                    addressed_seat.at)[i / addressed_width])[i % addressed_width] \
+                : float(reinterpret_cast<const device bfloat*>(reinterpret_cast<const device ulong*>(\
+                    addressed_seat.at)[i / addressed_width])[i % addressed_width])) \
+             : addressed_seat.storage == 0u \
              ? reinterpret_cast<const device float*>(addressed_seat.at)[from] \
-             : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]);"
+             : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]), \
+             addressed_desc.dtype);"
         );
     }
     source.push_str("    }\n");
@@ -554,24 +590,23 @@ pub(super) fn emit_logits_gather(
          intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
-    let _ = writeln!(
-        source,
-        "    device float* intrinsic_out = reinterpret_cast<device float*>({o0});"
-    );
+    let _ = writeln!(source, "    device uchar* intrinsic_out = {o0};");
     source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_width;\n");
     source.push_str("    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n");
     source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
-    source.push_str("      const uint source_row = row_indices[gather_row_base + gr];\n");
     source.push_str(
-        "      const device bfloat* gather_src = logits + \
-         ulong(source_row) * gather_stride;\n",
+        "      const device bfloat* gather_src = logits + ulong(row_indices[gather_row_base + gr]);\n",
     );
-    source.push_str("      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;\n");
+    source.push_str("      const uint gather_dst = gr * gather_width;\n");
     source.push_str(
         "      for (uint column = gather_begin; column < gather_width; \
          column += gather_step) {\n",
     );
-    source.push_str("        gather_dst[column] = float(gather_src[column]);\n");
+    // Stored at the intrinsic's dtype: a bf16 output keeps the plane's
+    // element exactly.
+    source.push_str(
+        "        m1_store_fd(intrinsic_out, gather_dst + column, float(gather_src[column]), intrinsic_desc.dtype);\n",
+    );
     source.push_str("      }\n");
     source.push_str("    }\n");
     source.push_str("  }\n");

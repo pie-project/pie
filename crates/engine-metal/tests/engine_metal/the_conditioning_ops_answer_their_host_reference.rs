@@ -1,5 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_floats, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::elemwise::{gate, modulate, norm, pointwise, rope_axes, sinusoid};
@@ -16,28 +17,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
-}
-
-fn bf16_floats(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
-        .collect()
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -142,7 +121,6 @@ fn within_a_bf16_ulp(what: &str, want: &[f32], got: &[f32]) {
             at = i;
         }
     }
-    eprintln!("{what}: worst {worst:.3} ulp at {at}");
     assert!(
         worst <= 1.0,
         "{what}: parts from the reference by {worst:.2} bf16 ulp at {at} \
@@ -163,7 +141,6 @@ fn within_relative(what: &str, want: &[f32], got: &[f32], bar: f32) {
             at = i;
         }
     }
-    eprintln!("{what}: worst relative {worst:.3e} at {at}");
     assert!(
         worst <= bar,
         "{what}: parts from the reference by {worst:.3e} at {at} (want {}, got {})",
@@ -180,6 +157,7 @@ const LANE_OF_ROW: [i32; ROWS as usize] = [0, 0, 1, 2, 1, 2, 2];
 
 #[test]
 fn the_conditioning_ops_answer_their_host_reference_every_case() {
+    let _device = crate::device_alone();
     the_pointwise_arms_answer_the_reference_at_both_elements();
     a_modulation_reads_its_vector_per_lane_and_per_token();
     the_gated_residual_folds_what_the_reference_folds();
@@ -199,7 +177,6 @@ fn the_pointwise_arms_answer_the_reference_at_both_elements() {
         eprintln!("not asked: no Metal device");
         return;
     };
-    eprintln!("device: {}", rig.device.name());
 
     for dtype in [Dtype::Bf16, Dtype::F32] {
         let n = (ROWS * WIDTH) as usize;
@@ -554,7 +531,6 @@ fn the_timestep_embedding_matches_the_diffusers_formula() {
                 .zip(&got)
                 .map(|(w, g)| (w - g).abs())
                 .fold(0.0f32, f32::max);
-            eprintln!("sinusoid dim {dim} flip {flip}: worst absolute {worst:.3e}");
             assert!(worst < 5e-5, "sinusoid dim {dim} flip {flip}: {worst:.3e}");
             if dim % 2 == 1 {
                 for row in 0..LANES as usize {
@@ -617,7 +593,6 @@ fn the_centring_answers_the_two_pass_reference() {
         .zip(&got)
         .map(|(w, g)| (w - g).abs())
         .fold(0.0f32, f32::max);
-    eprintln!("layernorm_no_scale f32: worst absolute {worst:.3e}");
     assert!(
         worst < 1e-3,
         "layernorm_no_scale f32: worst absolute {worst:.3e}"
@@ -808,7 +783,6 @@ fn the_relative_bias_table_reads_the_bucket_torch_lands() {
             (i % span as usize) as i32 - (MAX_LEN as i32 - 1)
         );
     }
-    eprintln!("relative_bucket_bias: {} cells exact", want.len());
 }
 
 fn the_head_gate_scales_by_one_logit_a_head() {
@@ -995,7 +969,6 @@ fn the_residual_blend_scores_normalized_and_blends_raw() {
                 at = i;
             }
         }
-        eprintln!("res_blend {dtype:?}: worst absolute {worst:.3e} at {at}");
         assert!(
             worst <= bar,
             "res_blend {dtype:?}: parts from the reference by {worst:.3e} at {at} \

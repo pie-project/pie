@@ -14,9 +14,12 @@ pub mod linear;
 pub mod runtime;
 pub mod sampling;
 pub mod seat;
+pub mod sizing;
 pub mod source;
 pub mod ssm;
+pub mod stored;
 pub mod synth;
+pub mod tally;
 pub mod tensor;
 mod voxels;
 

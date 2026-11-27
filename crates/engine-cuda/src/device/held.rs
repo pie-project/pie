@@ -66,7 +66,50 @@ pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl
     if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
         slot.store(next, Ordering::Release);
     }
+    // What the stream enqueued lands before it goes, and no kept fence
+    // outlives it holding a mark of it: a mark's event belongs to the stream
+    // it was recorded on, and a query of it once the stream is destroyed
+    // reads freed state (on ROCm, a lock no thread holds). Every fence the
+    // stores can see then marks only live streams.
+    // SAFETY: the stream is live till `destroy`, and no recorder can reach
+    // it while `LIVE` is write-held.
+    unsafe { rt::cudaStreamSynchronize(stream.cast()) };
+    forget_stream(stream);
     destroy();
+}
+
+/// Every mark a store or a staging ring keeps of `stream`, forgotten: the
+/// fences kept memory waits on, and on ROCm the staging rings' slots (the
+/// pageable ring's and the attention plans'), whose events belong to the
+/// stream they were recorded on. The stream must still be live and drained.
+fn forget_stream(stream: *mut core::ffi::c_void) {
+    let at = stream as usize;
+    pool::forget_stream(at);
+    heap::forget_stream(at);
+    #[cfg(feature = "rocm")]
+    {
+        crate::device::hip::held::forget_stream(at);
+        kernels_cuda::attn::plan::forget_stream(stream);
+    }
+}
+
+/// Destroys a stream no context adopted (a side, notify, tap, swap, fan or
+/// staging lane stream): drained, every mark of it forgotten
+/// ([`forget_stream`]), then destroyed, so no later query reaches an event
+/// it recorded.
+///
+/// # Safety
+///
+/// `stream` is a live stream nothing launches on again.
+pub unsafe fn destroy_unadopted_stream(stream: *mut core::ffi::c_void) {
+    if stream.is_null() {
+        return;
+    }
+    // SAFETY: as the caller promises.
+    unsafe { rt::cudaStreamSynchronize(stream.cast()) };
+    forget_stream(stream);
+    // SAFETY: as the caller promises; nothing below reaches it again.
+    let _ = unsafe { rt::cudaStreamDestroy(stream.cast()) };
 }
 
 /// Opens a capture on `stream` with `begin`, the work it holds before the
@@ -110,17 +153,6 @@ pub(crate) fn end_capture<R>(stream: *mut core::ffi::c_void, end: impl FnOnce() 
     ended
 }
 
-/// The device `ptr`, an allocation of device memory, lives on.
-fn device_of(ptr: u64) -> Option<i32> {
-    // SAFETY: a zeroed attribute record the call fills.
-    let mut attrs: rt::cudaPointerAttributes = unsafe { core::mem::zeroed() };
-    // SAFETY: `attrs` is a live local the call writes; `ptr` is only looked up.
-    let code =
-        unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, ptr as *const core::ffi::c_void) };
-    (code == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeDevice)
-        .then_some(attrs.device)
-}
-
 pub(crate) fn current_device() -> Option<i32> {
     let mut device = 0i32;
     // SAFETY: writes one int.
@@ -137,7 +169,11 @@ pub(crate) fn adopted(device: i32) -> bool {
 }
 
 /// An event recorded on a stream, destroyed once its last holder lets go.
-struct Mark(rt::cudaEvent_t);
+struct Mark {
+    event: rt::cudaEvent_t,
+    /// The stream the event was recorded on, which it belongs to.
+    stream: usize,
+}
 
 // SAFETY: the event is a process-wide device object, destroyed once.
 unsafe impl Send for Mark {}
@@ -154,7 +190,10 @@ impl Mark {
         {
             return None;
         }
-        let mark = Mark(event);
+        let mark = Mark {
+            event,
+            stream: stream as usize,
+        };
         // SAFETY: the event is the mark's own; the caller keeps `stream` live.
         (unsafe { rt::cudaEventRecord(event, stream.cast()) } == rt::cudaError::cudaSuccess)
             .then_some(mark)
@@ -162,14 +201,14 @@ impl Mark {
 
     fn landed(&self) -> bool {
         // SAFETY: the event is this mark's own.
-        unsafe { rt::cudaEventQuery(self.0) == rt::cudaError::cudaSuccess }
+        unsafe { rt::cudaEventQuery(self.event) == rt::cudaError::cudaSuccess }
     }
 }
 
 impl Drop for Mark {
     fn drop(&mut self) {
         // SAFETY: the event is this mark's own, destroyed once.
-        unsafe { rt::cudaEventDestroy(self.0) };
+        unsafe { rt::cudaEventDestroy(self.event) };
     }
 }
 
@@ -198,6 +237,12 @@ impl Fence {
 
     pub(crate) fn landed(&self) -> bool {
         self.0.iter().all(|mark| mark.landed())
+    }
+
+    /// Lets go of the marks recorded on `stream`, which has landed and is
+    /// being retired ([`retire_stream`]).
+    fn forget_stream(&mut self, stream: usize) {
+        self.0.retain(|mark| mark.stream != stream);
     }
 }
 
@@ -320,6 +365,25 @@ pub mod pool {
         Some((words, mirror, cells))
     }
 
+    /// `count` summed over every kept endpoint's fence.
+    pub(super) fn fences(count: &dyn Fn(&Fence) -> usize) -> usize {
+        let pool = POOL.lock().expect("pool lock poisoned");
+        pool.iter()
+            .flat_map(|map| map.values())
+            .flatten()
+            .map(|entry| count(&entry.fence))
+            .sum()
+    }
+
+    /// Drops `stream`'s marks from every kept endpoint's fence
+    /// ([`super::retire_stream`]).
+    pub(super) fn forget_stream(stream: usize) {
+        let mut pool = POOL.lock().expect("pool lock poisoned");
+        for entry in pool.iter_mut().flat_map(|map| map.values_mut()).flatten() {
+            entry.fence.forget_stream(stream);
+        }
+    }
+
     /// Keeps `held` for `key`'s shape behind a fence on the compute
     /// streams; frees it (by dropping) when the pool is full or the fence
     /// will not record.
@@ -349,165 +413,115 @@ pub mod pool {
 /// while frames are airborne (a lane table outgrown, a channel closed) would
 /// stall it for the frame in flight. Kept behind a fence on the compute
 /// streams instead, a buffer is handed out again once that fence lands.
-pub(crate) mod recycle {
-    use std::collections::HashMap;
+/// Device buffers dropped while their load serves: never freed then (a
+/// free waits on the device, and on ROCm on every queue of it), freed once
+/// the shell is down ([`release_idle`]). Nothing is kept for reuse.
+pub(crate) mod deferred {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Fence, current_device, device_of};
     use crate::device::rt;
-    use crate::error::Result;
 
-    /// The bytes kept across every size at most; an allocation the device
-    /// refuses frees them all first, so this bounds only what an idle load
-    /// sits on.
-    const BUDGET: usize = 8 << 30;
+    static DROPPED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-    struct Kept {
-        ptr: u64,
-        fence: Fence,
+    /// `ptr` is freed once the shell is down.
+    pub(crate) fn later(ptr: u64) {
+        DROPPED.lock().expect("deferred lock poisoned").push(ptr);
     }
 
-    /// Kept buffers by (device, bytes).
-    type Shelf = Option<HashMap<(i32, usize), Vec<Kept>>>;
-
-    static KEPT: Mutex<Shelf> = Mutex::new(None);
-    static HELD: AtomicUsize = AtomicUsize::new(0);
-
-    fn kept() -> std::sync::MutexGuard<'static, Shelf> {
-        KEPT.lock().expect("kept lock poisoned")
-    }
-
-    /// `bytes` of device memory: a kept buffer whose last reader has
-    /// landed, else a fresh one; on a refusal everything kept is freed and
-    /// the allocation is tried once more.
-    pub(crate) fn alloc(bytes: usize) -> Result<u64> {
-        if let Some(device) = current_device() {
-            let mut kept = kept();
-            if let Some(list) = kept.as_mut().and_then(|map| map.get_mut(&(device, bytes)))
-                && let Some(at) = list.iter().position(|entry| entry.fence.landed())
-            {
-                let entry = list.swap_remove(at);
-                drop(kept);
-                HELD.fetch_sub(bytes, Ordering::Relaxed);
-                return Ok(entry.ptr);
-            }
+    /// Frees every buffer dropped while serving; how many.
+    pub(crate) fn free() -> usize {
+        let dropped = std::mem::take(&mut *DROPPED.lock().expect("deferred lock poisoned"));
+        for &ptr in &dropped {
+            // SAFETY: each pointer is a dropped buffer's own, freed once; the
+            // shell that served it is down, so no frame reads it.
+            let _ = unsafe { rt::cudaFree(ptr as *mut core::ffi::c_void) };
         }
-        let fresh = |bytes: usize| {
-            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-            // SAFETY: `base` is a live local the call fills.
-            let code = unsafe { rt::cudaMalloc(&raw mut base, bytes) };
-            crate::device::ctx::check("cudaMalloc", code).map(|()| base as u64)
-        };
-        match fresh(bytes) {
-            Ok(ptr) => Ok(ptr),
-            Err(_) if drain() => {
-                fresh(bytes).map_err(|fault| crate::device::alloc::out_of_room(fault, bytes))
-            }
-            Err(fault) => Err(crate::device::alloc::out_of_room(fault, bytes)),
-        }
-    }
-
-    /// Keeps `ptr` for its size behind a fence on its device's compute
-    /// streams, or frees it when the budget is spent or the fence will not
-    /// record. Its device is the one it was made on, whichever this thread
-    /// has bound: a group's leader drops every rank's buffers.
-    pub(crate) fn release(ptr: u64, bytes: usize) {
-        if HELD.load(Ordering::Relaxed) + bytes <= BUDGET
-            && let Some(device) = device_of(ptr)
-            && let Some(fence) = Fence::record(device)
-        {
-            HELD.fetch_add(bytes, Ordering::Relaxed);
-            kept()
-                .get_or_insert_with(HashMap::new)
-                .entry((device, bytes))
-                .or_default()
-                .push(Kept { ptr, fence });
-            return;
-        }
-        // SAFETY: the pointer came from `alloc` and is freed exactly once.
-        let _ = unsafe { rt::cudaFree(ptr as *mut core::ffi::c_void) };
-    }
-
-    /// Frees every kept buffer whose last reader has landed; the bytes
-    /// given back. A buffer kept is held for the next of its size, and is
-    /// idle until then: at a load, and once a shell is down, nothing is
-    /// served that would ask for it before the driver could hand it out
-    /// again, so the device's word on what is free is the process's own.
-    /// Each free is of memory no frame reads, made where the engine's
-    /// thread already allocates and frees: never mid-step, where a free
-    /// could wait on a peer spinning for this rank.
-    pub(crate) fn trim() -> usize {
-        let idle: Vec<(u64, usize)> = {
-            let mut kept = kept();
-            let Some(map) = kept.as_mut() else {
-                return 0;
-            };
-            let mut idle = Vec::new();
-            for (&(_, bytes), list) in map.iter_mut() {
-                list.retain(|entry| {
-                    let landed = entry.fence.landed();
-                    if landed {
-                        idle.push((entry.ptr, bytes));
-                    }
-                    !landed
-                });
-            }
-            map.retain(|_, list| !list.is_empty());
-            idle
-        };
-        let mut freed = 0;
-        for (ptr, bytes) in idle {
-            HELD.fetch_sub(bytes, Ordering::Relaxed);
-            freed += bytes;
-            // SAFETY: the pointer came from `alloc` and left the shelf
-            // above, so it is freed exactly once; its fence has landed, so
-            // no reader is left.
-            unsafe {
-                let _ = rt::cudaFree(ptr as *mut core::ffi::c_void);
-            }
-        }
-        freed
-    }
-
-    /// The bytes kept now, across every device.
-    pub(crate) fn kept_bytes() -> usize {
-        HELD.load(Ordering::Relaxed)
-    }
-
-    /// Frees every kept buffer; whether there was any.
-    fn drain() -> bool {
-        let Some(map) = kept().take() else {
-            return false;
-        };
-        let mut any = false;
-        for entry in map.into_values().flatten() {
-            any = true;
-            // SAFETY: each pointer is its entry's own; `cudaFree` waits for
-            // the device, so no reader is left.
-            unsafe {
-                let _ = rt::cudaFree(entry.ptr as *mut core::ffi::c_void);
-            }
-        }
-        HELD.store(0, Ordering::Relaxed);
-        any
+        dropped.len()
     }
 }
 
-/// Gives the driver back the device memory the process keeps idle
-/// ([`recycle`]'s dropped buffers whose last reader has landed); the bytes
-/// freed. A load calls it before it measures the card, and a shell once it
-/// is down, so a model loaded after another was dropped fits as it would in
-/// a fresh process.
+/// Frees the device buffers dropped while a shell served
+/// ([`deferred`]); how many. A load calls it before it measures the card,
+/// and a shell once it is down.
 pub fn release_idle() -> usize {
-    recycle::trim()
+    deferred::free()
 }
 
-/// The device bytes the process keeps from dropped buffers, for the next
-/// of their size ([`recycle`]).
+/// A load begins: what the allocator and hipBLASLt took so far is what the
+/// device held before it ([`malloced_since`], [`blas_library_since`]).
+pub fn heap_mark() {
+    #[cfg(feature = "rocm")]
+    {
+        MALLOC_MARK.store(
+            kernels_cuda::hip::rt::malloced_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        LT_MARK.store(
+            kernels_cuda::hip::lt::held_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The device bytes hipBLASLt took on its own since the last load began
+/// (its library's code and each handle's state), where the build has it:
+/// what the ledger enters apart from the driver's.
 #[must_use]
-pub fn kept_bytes() -> usize {
-    recycle::kept_bytes()
+pub fn blas_library_since() -> u64 {
+    #[cfg(feature = "rocm")]
+    {
+        kernels_cuda::hip::lt::held_bytes()
+            .saturating_sub(LT_MARK.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        0
+    }
+}
+
+#[cfg(feature = "rocm")]
+static LT_MARK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The device bytes this process took from the allocator itself since the
+/// last load began, where it can tell (`None` where it cannot): what the
+/// device holds past them and what it held before is the driver's.
+#[must_use]
+pub fn malloced_since() -> Option<u64> {
+    #[cfg(feature = "rocm")]
+    {
+        Some(
+            kernels_cuda::hip::rt::malloced_bytes()
+                .saturating_sub(MALLOC_MARK.load(std::sync::atomic::Ordering::Relaxed)),
+        )
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "rocm")]
+static MALLOC_MARK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The marks the kept stores' fences hold of streams no live context owns:
+/// none, since a context's close lets go of every mark of its stream
+/// ([`retire_stream`]), and a take queries only live streams' events.
+#[must_use]
+pub fn dead_marks() -> usize {
+    let live: Vec<usize> = LIVE
+        .read()
+        .expect("live lock poisoned")
+        .iter()
+        .map(|entry| entry.stream)
+        .collect();
+    let dead = |fence: &Fence| {
+        fence
+            .0
+            .iter()
+            .filter(|mark| !live.contains(&mark.stream))
+            .count()
+    };
+    pool::fences(&dead) + heap::fences(&dead)
 }
 
 /// Small memory carved from chunks made ahead and kept: pinned (a channel's
@@ -535,21 +549,18 @@ pub(crate) mod heap {
     pub enum Kind {
         /// Mapped and portable host memory: one heap serves every device.
         Pinned,
-        Device,
     }
 
     impl Kind {
         const fn smallest(self) -> usize {
             match self {
                 Kind::Pinned => 64,
-                Kind::Device => 256,
             }
         }
 
         const fn largest(self) -> usize {
             match self {
                 Kind::Pinned => 1 << 20,
-                Kind::Device => 64 << 20,
             }
         }
 
@@ -557,7 +568,6 @@ pub(crate) mod heap {
         const fn chunk(self) -> usize {
             match self {
                 Kind::Pinned => 64 << 20,
-                Kind::Device => 256 << 20,
             }
         }
 
@@ -584,7 +594,6 @@ pub(crate) mod heap {
                 kind,
                 ordinal: match kind {
                     Kind::Pinned => -1,
-                    Kind::Device => current_device()?,
                 },
             })
         }
@@ -630,23 +639,6 @@ pub(crate) mod heap {
                         host: host as usize,
                         device: device as u64,
                         ordinal: -1,
-                    })
-                }
-                Kind::Device => {
-                    let mut device: *mut core::ffi::c_void = core::ptr::null_mut();
-                    // SAFETY: `device` is a live local the call fills; the
-                    // chunk is kept for the life of the process.
-                    let made = unsafe {
-                        crate::device::ctx::check(
-                            "cudaMalloc",
-                            rt::cudaMalloc(&raw mut device, bytes),
-                        )
-                    };
-                    made.map_err(|fault| crate::device::alloc::out_of_room(fault, bytes))?;
-                    Ok(Cell {
-                        host: 0,
-                        device: device as u64,
-                        ordinal: self.ordinal,
                     })
                 }
             }
@@ -819,6 +811,26 @@ pub(crate) mod heap {
         Ok(())
     }
 
+    /// `count` summed over every kept cell's fence.
+    pub(super) fn fences(count: &dyn Fn(&Fence) -> usize) -> usize {
+        let all = locked(&heaps().heaps);
+        all.values()
+            .flat_map(|heap| heap.free.iter().flatten())
+            .map(|kept| count(&kept.fence))
+            .sum()
+    }
+
+    /// Drops `stream`'s marks from every kept cell's fence
+    /// ([`super::retire_stream`]).
+    pub(super) fn forget_stream(stream: usize) {
+        let mut all = locked(&heaps().heaps);
+        for heap in all.values_mut() {
+            for kept in heap.free.iter_mut().flatten() {
+                kept.fence.forget_stream(stream);
+            }
+        }
+    }
+
     /// A cell of `class`: a freed one whose last reader has landed, else one
     /// carved from the current chunk or one made ahead. Only a heap that
     /// has run dry makes a chunk here, holding no lock while it does.
@@ -876,7 +888,6 @@ pub(crate) mod heap {
         // Pinned memory is read by whichever device this thread serves.
         let device = match kind {
             Kind::Pinned => current_device(),
-            Kind::Device => Some(cell.ordinal),
         };
         let Some(fence) = device.map_or(Some(Fence(Vec::new())), Fence::record) else {
             return;
@@ -895,7 +906,8 @@ pub(crate) mod heap {
 
         #[test]
         fn a_size_is_carved_in_the_least_power_of_two_that_holds_it() {
-            for kind in [Kind::Pinned, Kind::Device] {
+            {
+                let kind = Kind::Pinned;
                 assert_eq!(class_of(kind, 1), Some(0));
                 assert_eq!(class_of(kind, kind.smallest()), Some(0));
                 assert_eq!(class_of(kind, kind.smallest() + 1), Some(1));

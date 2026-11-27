@@ -430,12 +430,26 @@ thread_local! {
     pub(crate) static TILED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// The cuts the compiler inferred for the deployment being read.
     pub(crate) static CUTS: RefCell<Vec<(String, crate::Shard)>> = const { RefCell::new(Vec::new()) };
+    /// Set while a deployment's formats are recognized without its lowering
+    /// (`Package::may_read`): whether anything read the lowering.
+    pub(crate) static UNLOWERED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A read of the deployment's lowering: noted where a recognition runs
+/// without one, whose verdict then rests on nothing it skipped.
+fn lowering_read() {
+    UNLOWERED.with(|u| {
+        if u.get().is_some() {
+            u.set(Some(true));
+        }
+    });
 }
 
 /// `w` as the deployment being read cuts it: as it states, else as the
 /// compiler inferred, else whole.
 pub(crate) fn resolved(mut w: Weight) -> Weight {
     if w.shard == crate::Shard::Inferred {
+        lowering_read();
         w.shard = CUTS.with(|cuts| {
             cuts.borrow()
                 .iter()
@@ -682,6 +696,7 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
         #[starlark(require = pos)] path: &str,
         heap: Heap<'v>,
     ) -> anyhow::Result<Value<'v>> {
+        lowering_read();
         Ok(JOINS.with(|joins| {
             joins
                 .borrow()

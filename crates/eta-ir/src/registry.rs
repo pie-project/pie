@@ -47,6 +47,7 @@ crate::declare_tagged_enum! {
         AttnMask = 9, "attn_mask";
         Slots = 16, "slots";
         Fold = 17, "fold";
+        Parents = 18, "parents";
     }
 }
 

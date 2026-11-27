@@ -24,16 +24,8 @@ fn sparse() -> Option<(Context, std::sync::Arc<Sparse>)> {
         return None;
     }
     let device = Context::bind().expect("the system device");
-    match device
-        .sparse()
-        .expect("the mapping side opens or is absent")
-    {
-        Some(sparse) => Some((device, sparse)),
-        None => {
-            eprintln!("not a Metal 4 device, so no heap grew or shrank; skipping");
-            None
-        }
-    }
+    let sparse = device.sparse().expect("the mapping side opens");
+    Some((device, sparse))
 }
 
 fn grow(buffer: &mut elastic::Elastic, bytes: u64) -> engine_metal::Result<()> {
@@ -50,6 +42,7 @@ fn shrink(buffer: &mut elastic::Elastic, bytes: u64) -> engine_metal::Result<()>
 
 #[test]
 fn the_kv_pool_grows_in_place() {
+    let _device = crate::device_alone();
     let Some((device, sparse)) = sparse() else {
         return;
     };

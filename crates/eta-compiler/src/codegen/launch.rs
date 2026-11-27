@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use eta_ir::container::{ChanDType, ExternDir, HostRole, PortSource};
 use eta_ir::op::{ChannelIndex, tags};
 use eta_ir::registry::{Port, Stage};
-use eta_ir::types::{Dtype, RngKind, ValueType, from_wire};
+use eta_ir::types::{Dtype, RngKind, ValueType, from_wire, to_wire};
 use eta_ir::validate::{BoundTrace, Direction};
 
 use crate::plan::{
@@ -78,6 +78,31 @@ impl LaunchOp {
     /// Every value the op reads, by the wire's rule ([`eta_ir::wire::reads`]).
     pub fn reads(&self) -> impl Iterator<Item = u32> + '_ {
         eta_ir::wire::reads(self.tag, &self.args, self.pred_payload)
+    }
+
+    /// The op this launch op is, its value ids the package's: what the
+    /// interpreter ([`crate::eval::interp::eval_op`]) evaluates. `None` for
+    /// a tag, dtype, shape or predicate the wire does not decode.
+    #[must_use]
+    pub fn to_op(&self) -> Option<eta_ir::op::Op> {
+        eta_ir::wire::OpWire {
+            tag: self.tag,
+            chan: self.channel.map_or(-1, i64::from),
+            name_idx: u16::try_from(self.name_index).ok()?,
+            args: self.args.clone(),
+            results: u32::from(self.result_count),
+            imm: self.imm,
+            imm2: self.imm2,
+            imm3: self.imm3,
+            pred_tag: self.pred_tag,
+            pred_payload: self.pred_payload,
+            lit_dtype: to_wire(self.lit_dtype)?,
+            lit_bits: self.lit_bits,
+            dtype: to_wire(self.dtype)?,
+            shape: self.shape.clone(),
+            kind: self.rng_kind as u8,
+        }
+        .to_op()
     }
 }
 
@@ -201,6 +226,20 @@ pub struct LaunchRegion {
     /// out over.
     #[serde(default)]
     pub order: Vec<u32>,
+    /// Whether the CUDA emitter's kernel runs each row across several blocks
+    /// of its lane ([`crate::codegen::cuda::fused::splits_rows`]).
+    #[serde(default)]
+    pub splits_rows: bool,
+    /// The launches a region whose rows split runs in, one a phase: its
+    /// blocks' partials of a reduction (or candidates of an argmax) are all
+    /// written by one launch's end, and every block folds them in the next,
+    /// so no block waits on another (`fused::split_phases`). 1 otherwise.
+    #[serde(default = "one")]
+    pub phases: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,31 +311,49 @@ pub const fn reduction_floats(width: u64) -> u64 {
 }
 
 /// The bytes a block of the generated region `region` keeps in its
-/// temporary arena over rows at most `widest` wide: [`reduction_floats`] for
-/// each f32 reduction it holds, which a row stream may hold all at once,
-/// each at its own slot.
+/// temporary arena over rows at most `widest` wide, which only its sums,
+/// maxima and minima do: [`reduction_floats`] for each over f32, which a
+/// row stream may hold all at once, each at its own slot; the row's own
+/// words for one over integers, which the interpreter folds in place, one
+/// after another.
 #[must_use]
 pub fn generated_temporary_bytes(
     plan: &LaunchStagePlan,
     region: &LaunchRegion,
     widest: u64,
 ) -> u64 {
-    let reductions = region
+    let (mut floats, mut integers) = (0u64, false);
+    for op in region
         .nodes
         .iter()
         .filter_map(|&node| plan.ops.get(node as usize))
-        .filter(|op| {
-            matches!(
-                op.tag,
-                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
-            ) && op
-                .args
-                .first()
-                .and_then(|&value| plan.value_types.get(value as usize))
-                .is_some_and(|value| value.dtype == Dtype::F32)
-        })
-        .count() as u64;
-    4 * reduction_floats(widest) * reductions.max(1)
+    {
+        if !matches!(
+            op.tag,
+            tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+        ) {
+            continue;
+        }
+        let float = op
+            .args
+            .first()
+            .and_then(|&value| plan.value_types.get(value as usize))
+            .is_some_and(|value| eta_ir::types::is_float(value.dtype));
+        if float {
+            floats += 1;
+        } else {
+            integers = true;
+        }
+    }
+    let streamed = 4u64
+        .saturating_mul(reduction_floats(widest))
+        .saturating_mul(floats);
+    let folded = if integers {
+        widest.saturating_mul(4)
+    } else {
+        0
+    };
+    streamed.max(folded)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,7 +368,52 @@ pub struct LaunchPackage {
     pub fault_classes: Vec<FaultClass>,
 }
 
+/// The words an engine with no `bf16` guest dtype refuses a program by.
+pub const NO_BF16: &str = "this engine has no bf16 guest dtype";
+
 impl LaunchPackage {
+    /// Whether the program takes the bf16 guest work: it stores anything as
+    /// `bf16` (a value, a stage plan's value, a channel or a constant port)
+    /// or draws with `gumbel_argmax`, the reduction that keeps a bf16 row's
+    /// draw in f32. An engine whose guest runtime has neither refuses such
+    /// a program at registration ([`LaunchPackage::refuse_bf16`]); it never
+    /// computes it as another dtype.
+    #[must_use]
+    pub fn stores_bf16(&self) -> bool {
+        self.plans
+            .iter()
+            .flat_map(|plan| &plan.ops)
+            .any(|op| op.tag == tags::GUMBEL_ARGMAX)
+            || self.values.iter().any(|value| value.dtype == Dtype::Bf16)
+            || self
+                .plans
+                .iter()
+                .flat_map(|plan| &plan.value_types)
+                .any(|value| value.dtype == Dtype::Bf16)
+            || self
+                .channels
+                .iter()
+                .any(|channel| channel.dtype == ChanDType::Concrete(Dtype::Bf16))
+            || self
+                .ports
+                .iter()
+                .any(|port| port.const_dtype == Dtype::Bf16)
+    }
+
+    /// The refusal of an engine with no `bf16` guest dtype: `Err` naming it
+    /// ([`NO_BF16`]) where the program stores a `bf16`, else `Ok`.
+    pub fn refuse_bf16(&self) -> Result<(), String> {
+        if self.stores_bf16() {
+            Err(alloc::format!(
+                "{NO_BF16}: the program stores a bf16 value or draws with gumbel_argmax \
+                 (vocab-sized guest intermediates are bf16 by default), and this engine runs \
+                 it once its guest runtime has both"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     #[must_use]
     pub fn plan_local(&self, global: u32) -> Option<(usize, Option<u32>)> {
         let mut base = 0u32;
@@ -637,6 +739,8 @@ fn lower_region(stage: &CompiledStage, region: &Region) -> LaunchRegion {
     LaunchRegion {
         spent: crate::codegen::cuda::spent_values(stage, region),
         order: crate::codegen::cuda::emitted_order(stage, region),
+        splits_rows: crate::codegen::cuda::fused::splits_rows(stage, region),
+        phases: crate::codegen::cuda::fused::split_phases(stage, region),
         kind: region.kind,
         schedule: region.schedule as u8,
         nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),

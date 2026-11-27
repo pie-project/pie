@@ -8,6 +8,7 @@ pub mod error;
 pub mod intrinsics;
 mod lint;
 pub mod model;
+pub mod sampler;
 pub mod value;
 
 pub use builder::{Builder, PortInput, Traced};

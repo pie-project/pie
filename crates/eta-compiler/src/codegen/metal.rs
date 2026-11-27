@@ -3,7 +3,6 @@ pub mod fused;
 pub mod intrinsics;
 pub mod nucleus;
 pub mod preamble;
-pub mod singleton;
 pub mod streamed;
 pub mod streamed_topk;
 pub mod topk;
@@ -20,16 +19,25 @@ pub use intrinsics::{
 };
 pub use nucleus::emit_grouped_nucleus;
 pub use preamble::RUNTIME_TEMPLATE;
-pub use singleton::emit_singleton_region;
 pub use streamed::{
-    StepKind, emit_streamed_region, reduce_dispatch_levels, reduce_levels, step_kind, step_value,
-    streamed_step,
+    M4_STEP_CONSTANT, STEP_NODE, STEP_NODES, STEP_VIEW, StepKind, StepNodes, emit_streamed_region,
+    is_streamed_select, reduce_dispatch_levels, reduce_levels, step_kind, step_node_table,
+    step_value, streamed_step, streamed_temporary_need,
 };
-pub use streamed_topk::emit_streamed_topk;
+pub use streamed_topk::{TOPK_ROW_BYTES, emit_streamed_topk, streamed_topk_temporary_need};
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 60;
+/// The library forms Metal's emitters serve: the nucleus sampler over f32
+/// rows, its rank cut, an f32 lane cut. The temperature-scaled Gumbel draw
+/// and a bf16 row's lane cut are planned as generated regions (Metal's own
+/// two-level draw, `m4_gumbel_*`), as before those forms existed.
+pub const LIBRARY_FORMS: crate::plan::LibraryForms = crate::plan::LibraryForms {
+    draw: false,
+    bf16_cut: false,
+};
+
+pub const METAL_M1_EMITTER_VERSION: u16 = 82;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

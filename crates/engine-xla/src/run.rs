@@ -97,9 +97,27 @@ pub struct DitBindings {
     pub group_masks: Vec<GroupMask>,
 }
 
+/// A fire's adapters' planes ([`FireBindings::adapter_planes`]): the pool,
+/// and each registered bank's param, plane elements and first pool rows.
+pub type AdapterPlanes = (Tensor, Vec<(usize, u32, Tensor)>);
+
 #[derive(Clone, Debug)]
 pub struct FireBindings {
     pub tokens: Tensor,
+
+    /// Each token row's pool row and lane the last guest pass put its token
+    /// in (row `-1`: the host staged it in `tokens`): the fire gathers them
+    /// at its start, before any read of `tokens`. Staged at every fire, all
+    /// `-1` where no guest pass fed one, so a fed fire and a host-fed one
+    /// of the same shape are one program.
+    pub token_words: (Tensor, Tensor),
+
+    /// Each entry of the first page table's indices and each row's write
+    /// page: the pool row and lane where a beam group's head resolved it
+    /// (row `-1`: as staged), gathered at the fire's start. Staged at every
+    /// fire, all `-1` where no lane is a beam, so a beam fire is the plain
+    /// fire's program.
+    pub beam_words: (Tensor, Tensor, Tensor, Tensor),
 
     /// Each row's stated position: what the rotary ops read.
     pub positions: Tensor,
@@ -115,7 +133,17 @@ pub struct FireBindings {
     /// lanes'.
     pub readout_indptr: Vec<u32>,
 
+    /// The readout rows the fire's planes take, where its padding lanes'
+    /// rows are left out (a fire whose lanes read more than their last row,
+    /// padded): each plane row's index in `readout_rows`. `None`: the
+    /// planes take `readout_rows` as they are.
+    pub readout_pick: Option<Tensor>,
+
     pub adapter_routes: Option<Tensor>,
+    /// The fire's adapters' planes: the pool, and for each registered bank
+    /// (by param) its plane's elements and the first pool row of each
+    /// fire-local adapter's plane of it, i32 `[k]`.
+    pub adapter_planes: Option<AdapterPlanes>,
 
     pub mrope_positions: Option<Tensor>,
 
@@ -210,7 +238,17 @@ pub struct Run<'c> {
     /// value, with the routes value and the span they were cut on: the next
     /// routed op on the same routes reads them as they are.
     tiled: std::cell::RefCell<Vec<TiledEntry>>,
+    /// The streamed weights' tables of this fire (`crate::store::streamed`).
+    streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
+    /// Each streamed layer staged on this walk: `(group, routes, span)` and
+    /// its banks' tables.
+    staged: std::cell::RefCell<Vec<StagedGroup>>,
 }
+
+type StagedGroup = (
+    (u32, ValueId, (u32, u32)),
+    Vec<(usize, kernels_xla::hlo::Val)>,
+);
 
 /// A tile-ordered routed result: its value, the routes value it was sorted
 /// on, the span `(lane_offset, lanes)` it was cut on, and its rows.
@@ -260,7 +298,110 @@ impl<'c> Run<'c> {
             group_routes: Vec::new(),
             boundaries: Vec::new(),
             tiled: std::cell::RefCell::new(Vec::new()),
+            staged: std::cell::RefCell::new(Vec::new()),
+            streamed: None,
         }
+    }
+
+    /// Hands the walk this fire's streamed-weight tables.
+    #[must_use]
+    pub fn with_streamed(
+        mut self,
+        streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
+    ) -> Self {
+        self.streamed = streamed;
+        self
+    }
+
+    fn weight_param(&self, id: ValueId) -> Option<usize> {
+        match &self.values.get(id.0 as usize)?.def {
+            Def::Weight(w) => Some(*w as usize),
+            _ => None,
+        }
+    }
+
+    /// A registered bank's planes this fire reads: the pool, its plane's
+    /// elements and the first pool row of each fire-local adapter's plane.
+    pub(crate) fn adapter_plane(&self, bank: ValueId) -> Option<(Tensor, u32, Tensor)> {
+        let param = self.weight_param(bank)?;
+        let (view, banks) = self.fire.adapter_planes.as_ref()?;
+        banks
+            .iter()
+            .find(|(p, ..)| *p == param)
+            .map(|&(_, plane, starts)| (*view, plane, starts))
+    }
+
+    /// A streamed table's pool view and the fire's row of it for each of
+    /// its token rows.
+    pub(crate) fn streamed_rows(&self, table: ValueId) -> Option<(Tensor, Tensor)> {
+        let param = self.weight_param(table)?;
+        self.streamed.as_ref()?.rows_of(param)
+    }
+
+    /// How a select reads a streamed bank.
+    pub(crate) fn streamed_bank(&self, bank: ValueId) -> Option<crate::store::streamed::Bank> {
+        let param = self.weight_param(bank)?;
+        self.streamed.as_ref()?.bank_of(param)
+    }
+
+    /// Streamed bank `bank` as a select on `routes` reads it: its layer's
+    /// banks staged first, once a `(routes, span)` (`Lower::stage_group`).
+    pub(crate) fn streamed_operand(
+        &self,
+        l: &mut crate::lower::Lower<'_, '_>,
+        bank: crate::store::streamed::Bank,
+        param: usize,
+        width: u32,
+        routes: ValueId,
+        routes_v: kernels_xla::hlo::Val,
+    ) -> Result<kernels_xla::tensor::Operand, kernels_xla::Error> {
+        let span = self.window().span;
+        let key = (bank.group, routes, (span.lane_offset, span.lanes));
+        let known = self
+            .staged
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, t)| t.clone());
+        let stages = self.streamed.as_ref().is_some_and(|f| f.stages);
+        let tables = match known {
+            Some(t) => t,
+            None if !stages => {
+                // Every expert where its table says: no staging.
+                let group = self
+                    .streamed
+                    .as_ref()
+                    .map(|f| f.group(bank.group))
+                    .unwrap_or_default();
+                let t = l.tables(&group)?;
+                self.staged.borrow_mut().push((key, t.clone()));
+                t
+            }
+            None => {
+                let group = self
+                    .streamed
+                    .as_ref()
+                    .map(|f| f.group(bank.group))
+                    .unwrap_or_default();
+                let t = l.stage_group(&group, routes_v)?;
+                self.staged.borrow_mut().push((key, t.clone()));
+                t
+            }
+        };
+        let table = tables
+            .iter()
+            .find(|(p, _)| *p == param)
+            .map(|&(_, t)| t)
+            .ok_or_else(|| kernels_xla::Error::Backend {
+                op: "linear.moe_select",
+                detail: format!("streamed bank {param} staged with no table"),
+            })?;
+        l.pooled_bank(bank, width, table)
+    }
+
+    /// The param a weight value reads (a streamed bank's).
+    pub(crate) fn weight_param_of(&self, id: ValueId) -> Option<usize> {
+        self.weight_param(id)
     }
 
     /// The tile-ordered rows of `value` on `routes`, cut on this span.
@@ -493,6 +634,8 @@ impl<'c> Run<'c> {
                 None => return handle,
             },
             Some(Dim::Const(_)) | None => return handle,
+            // A capturing fire is refused before a value of either is cut.
+            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return handle,
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),

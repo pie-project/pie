@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use controller_api::{DirectoryView, GroupView, Key, StateReport};
+use controller_api::{DirectoryView, GroupView, Key, OffDevice, StateReport};
 use ids::WorkerId;
 
 #[derive(Clone, Default)]
@@ -32,11 +32,10 @@ struct Inner {
     published: HashMap<WorkerId, HashMap<String, String>>,
     /// The pages each worker's persistent disk tier keeps a copy of.
     disk: HashMap<WorkerId, HashSet<Key>>,
-    /// The runs whose owner asked a prefix kept on disk, by last key: the
-    /// tokens asked.
-    hints: HashMap<WorkerId, HashMap<Key, u64>>,
     /// Each worker's kv page, in tokens, and whether its disk tier is kept.
     disk_tiers: HashMap<WorkerId, (u32, bool)>,
+    /// The held pages each worker keeps off the device, and where.
+    off: HashMap<WorkerId, HashMap<Key, OffDevice>>,
 }
 
 /// A run some worker keeps whole, and the workers (pools among them) that
@@ -45,11 +44,11 @@ struct Inner {
 pub struct Group {
     pub keys: Arc<Vec<Key>>,
     pub sites: Vec<WorkerId>,
+    /// The sites whose copy is not wholly on the device, and the lowest
+    /// tier any of its pages is on.
+    pub site_tiers: Vec<(WorkerId, OffDevice)>,
     /// The workers whose persistent disk tier keeps every page of it.
     pub disk_sites: Vec<WorkerId>,
-    /// The most leading tokens of it some worker's owner asked kept on
-    /// disk.
-    pub persist_tokens: Option<u64>,
 }
 
 impl Directory {
@@ -104,16 +103,14 @@ impl Directory {
     }
 
     /// The pages `worker`'s persistent disk tier gained and lost a copy of
-    /// (all of them when `full`); the runs whose owner asked a prefix kept on
-    /// disk, whole, when they changed; and its page size and whether its
-    /// disk tier is kept, when it says.
+    /// (all of them when `full`); and its page size and whether its disk
+    /// tier is kept, when it says.
     pub fn report_disk(
         &self,
         worker: WorkerId,
         added: Vec<Key>,
         removed: Vec<Key>,
         full: bool,
-        hints: Option<Vec<(Key, u64)>>,
         tier: Option<(u32, bool)>,
     ) {
         let mut inner = self.inner.lock().unwrap();
@@ -125,9 +122,6 @@ impl Directory {
             disk.remove(&key);
         }
         disk.extend(added);
-        if let Some(hints) = hints {
-            inner.hints.insert(worker, hints.into_iter().collect());
-        }
         if let Some(tier) = tier {
             inner.disk_tiers.insert(worker, tier);
         }
@@ -159,6 +153,13 @@ impl Directory {
         if let Some(link) = report.link {
             self.report_link(worker, link);
         }
+        if let Some(off) = report.off_device {
+            self.inner
+                .lock()
+                .unwrap()
+                .off
+                .insert(worker, off.into_iter().collect());
+        }
         self.report(
             worker,
             report.peer,
@@ -181,7 +182,6 @@ impl Directory {
             report.disk_added,
             report.disk_removed,
             report.full,
-            report.persist_hints,
             report.disk_tier,
         );
     }
@@ -197,8 +197,8 @@ impl Directory {
                     GroupView {
                         keys: group.keys.as_ref().clone(),
                         sites: group.sites,
+                        site_tiers: group.site_tiers,
                         disk_sites: group.disk_sites,
-                        persist_tokens: group.persist_tokens,
                     },
                 )
             })
@@ -218,6 +218,7 @@ impl Directory {
                 pools
             },
             peers: sorted(inner.peers.iter().map(|(w, p)| (*w, p.clone())).collect()),
+            links: sorted(inner.links.iter().map(|(w, l)| (*w, l.clone())).collect()),
             published: sorted(
                 inner
                     .published
@@ -256,8 +257,8 @@ impl Directory {
         inner.runs.remove(&worker);
         inner.pools.remove(&worker);
         inner.disk.remove(&worker);
-        inner.hints.remove(&worker);
         inner.disk_tiers.remove(&worker);
+        inner.off.remove(&worker);
     }
 
     pub fn pools(&self) -> Vec<WorkerId> {
@@ -287,6 +288,14 @@ impl Directory {
                 .map(|(worker, _)| *worker)
                 .collect();
             sites.sort_by_key(|w| w.0);
+            group.site_tiers = sites
+                .iter()
+                .filter_map(|w| {
+                    let off = inner.off.get(w)?;
+                    let lowest = group.keys.iter().filter_map(|key| off.get(key)).max()?;
+                    Some((*w, *lowest))
+                })
+                .collect();
             group.sites = sites;
             let mut disk_sites: Vec<WorkerId> = inner
                 .disk
@@ -296,13 +305,6 @@ impl Directory {
                 .collect();
             disk_sites.sort_by_key(|w| w.0);
             group.disk_sites = disk_sites;
-        }
-        for hints in inner.hints.values() {
-            for (last, &tokens) in hints {
-                if let Some(group) = groups.get_mut(last) {
-                    group.persist_tokens = group.persist_tokens.max(Some(tokens));
-                }
-            }
         }
         groups
     }
@@ -453,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_on_a_worker_s_disk_tier_reads_as_a_disk_site_with_the_tokens_asked() {
+    fn a_group_on_a_worker_s_disk_tier_reads_as_a_disk_site() {
         let directory = Directory::default();
         let run = vec![key(1), key(2), key(3)];
         directory.report(WorkerId(1), Some("a:1".into()), run.clone(), vec![], true);
@@ -469,7 +471,6 @@ mod tests {
             run[..2].to_vec(),
             vec![],
             true,
-            Some(vec![(key(3), 40), (key(2), 40)]),
             Some((16, true)),
         );
         let groups = directory.groups();
@@ -482,17 +483,11 @@ mod tests {
             groups[&key(3)].disk_sites.is_empty(),
             "the whole run is not"
         );
-        assert_eq!(groups[&key(3)].persist_tokens, Some(40));
         assert!(directory.on_disk(WorkerId(1), &run[..2]));
         assert_eq!(directory.disk_tier(WorkerId(1)), Some((16, true)));
 
-        directory.report_disk(WorkerId(1), vec![], vec![key(1)], false, None, None);
+        directory.report_disk(WorkerId(1), vec![], vec![key(1)], false, None);
         assert!(directory.groups()[&key(2)].disk_sites.is_empty());
-        assert_eq!(
-            directory.groups()[&key(3)].persist_tokens,
-            Some(40),
-            "hints stand until the worker sends others"
-        );
         directory.forget(WorkerId(1));
         assert_eq!(directory.disk_tier(WorkerId(1)), None);
     }
@@ -531,7 +526,27 @@ mod tests {
 
         directory.report_state(WorkerId(3), StateReport::default());
         assert_eq!(directory.view(5), view, "a quiet report");
+        let off = |directory: &Directory| directory.view(5).groups[0].1.site_tiers.len();
+        directory.report_state(
+            WorkerId(3),
+            StateReport {
+                off_device: Some(vec![(key(1), OffDevice::Host)]),
+                ..StateReport::default()
+            },
+        );
+        assert_eq!(off(&directory), 1);
         directory.forget(WorkerId(3));
         assert!(directory.view(6).groups.is_empty());
+        // Back, it has said nothing is off its device.
+        directory.report_state(
+            WorkerId(3),
+            StateReport {
+                added: run.clone(),
+                full: true,
+                runs_added: vec![run],
+                ..StateReport::default()
+            },
+        );
+        assert_eq!(off(&directory), 0);
     }
 }

@@ -20,11 +20,12 @@
 //! under the micro's narrow banks).
 //!
 //! The fusions are turned off as a user turns them off, by a `[fuse]` file
-//! in the profile directory the load resolves; the walk is eager
-//! (`engine.graphs = "off"`) so each fire's count is that fire's alone.
+//! in the profile directory the load resolves; the walk is eager (a test's
+//! `Knobs::pin`) so each fire's count is that fire's alone.
 
 use std::path::{Path, PathBuf};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Knobs, Lane, Shell};
 use poem::{Dtype, Platform, Request};
@@ -32,8 +33,6 @@ use poem_compiler::Budget;
 use poem_ir::{Fused, Linear, Operation, ParamSource, Trace};
 
 const CEILING: u32 = 256;
-const PAGE: u32 = 16;
-
 /// Routed rows of bf16 planes: Qwen3-MoE's softmax router, GLM-4.5-Air's
 /// biased sigmoid, DeepSeek-V4's biased sqrt-softplus (its hashed layers
 /// routed apart) and Qwen3.5's softmax under a gated shared expert, each MLP
@@ -83,15 +82,6 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// A plane's bf16 values, by its name.
@@ -207,7 +197,7 @@ fn logits(
             std::fs::write(
                 &user,
                 format!(
-                    "api = 1\n\n[engine]\ngraphs = \"off\"\n\n[fuse]\nmatmul_moe_route = {}\n\
+                    "api = 1\n\n[fuse]\nmatmul_moe_route = {}\n\
                      moe_mega = {}\n",
                     flags.router, flags.mega
                 ),
@@ -215,13 +205,15 @@ fn logits(
             .expect("the user profile");
             Knobs {
                 profiles: Some(profiles.to_path_buf()),
+                pin: Some((engine_cuda::Graphs::Off, None)),
                 ..Knobs::default()
             }
         }
         Tuning::Defaults => Knobs {
             chip: Some(engine_cuda::chip::profile(
-                "[engine]\ngraphs = \"off\"\n[fuse]\nmatmul_moe_route = false\nmoe_mega = false\n",
+                "[fuse]\nmatmul_moe_route = false\nmoe_mega = false\n",
             )),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..Knobs::default()
         },
     };
@@ -231,25 +223,15 @@ fn logits(
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
     let staged = Shell::stage(engine_cuda::Boot {
-        trace: trace.clone(),
-        contract: &contract,
-        checkpoint: container,
-        budget: Budget::new(1, CEILING),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CEILING,
-        slots: 1,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
         knobs,
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
+        ..crate::common::boot(
+            trace.clone(),
+            &contract,
+            container,
+            Budget::new(1, CEILING),
+            CEILING,
+            1,
+        )
     })
     .expect("the row loads");
     let mut shell = staged.finish().expect("the row arms");

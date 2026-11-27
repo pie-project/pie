@@ -27,7 +27,7 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
                            const int page_size, const pie_kv_layout kvl,
                            const int n_kv_heads, const float scale,
                            const device uchar *attention_mask, const uint attention_mask_stride,
-                           const device uchar *attention_mask_enabled, const int window,
+                           const device uint* attention_mask_enabled, const int window,
                            const device T *sinks, device float *lse, threadgroup float *outputs,
                            threadgroup float *max_scores, threadgroup float *sum_exp_scores,
                            uint3 tid, uint3 tpg, uint simd_gid, uint simd_lid) {
@@ -51,7 +51,7 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
   const int r = req_of_token[row];
   const int q_pos = position_ids[row];
 
-  const int mask_word = int(attention_mask_enabled[row]);
+  const int mask_word = int((attention_mask_enabled[row] & 3u));
   const bool wide = window < 0 || mask_word == 2;
   const int extent = window < 0 ? (-window - 1) : window;
   const int kv_start = (extent > 0 && q_pos >= extent) ? (q_pos - extent + 1) : 0;
@@ -74,9 +74,9 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
   auto absorb = [&](uint page, uint off) {
     const ulong at = (ulong(off) * n_kv_heads + kv_head_idx) * ulong(2 * D);
     const device char *kb = reinterpret_cast<const device char *>(k_pages) + kvl.k_offset +
-                            ulong(page) * kvl.k_page + at;
+                            pie_page_at(page, kvl.k_page, 1) + at;
     const device char *vb = reinterpret_cast<const device char *>(v_pages) + kvl.v_offset +
-                            ulong(page) * kvl.v_page + at;
+                            pie_page_at(page, kvl.v_page, 1) + at;
     const float ks = *reinterpret_cast<const device float *>(kb + D);
     const float vs = *reinterpret_cast<const device float *>(vb + D);
     for (int j = 0; j < qk_per_thread; ++j)
@@ -94,8 +94,8 @@ inline void q8_decode_body(const device T *queries, const device T *k_pages,
   };
 
   auto attends = [&](int kp) {
-    return !masked || (uint(kp) < attention_mask_stride &&
-                       attention_mask[size_t(row) * attention_mask_stride + uint(kp)] != 0);
+    return !masked || pie_mask_admits(attention_mask, attention_mask_stride,
+                                      attention_mask_enabled[row] >> 2, uint(row), uint(kp));
   };
 
   const int stride = page_size;
@@ -172,7 +172,7 @@ template <typename T, int D, int V = D, int MERGE = (V == 256 ? 4 : 1)>
     const constant int &n_kv_heads [[buffer(10)]], const constant float &scale [[buffer(11)]],
     const device uchar *attention_mask [[buffer(12)]],
     const device uint &attention_mask_stride [[buffer(13)]],
-    const device uchar *attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int &window [[buffer(15)]], const device T *sinks [[buffer(16)]],
     const constant ulong& k_page_stride [[buffer(17)]],
     const constant ulong& v_page_stride [[buffer(18)]],
@@ -201,7 +201,7 @@ template <typename T, int D, int V = D>
     const constant int &n_kv_heads [[buffer(10)]], const constant float &scale [[buffer(11)]],
     const device uchar *attention_mask [[buffer(12)]],
     const device uint &attention_mask_stride [[buffer(13)]],
-    const device uchar *attention_mask_enabled [[buffer(14)]],
+    const device uint* attention_mask_enabled [[buffer(14)]],
     const constant int &window [[buffer(15)]], const device T *sinks [[buffer(16)]],
     device float *lse [[buffer(17)]],
     const constant ulong& k_page_stride [[buffer(18)]],
@@ -226,7 +226,7 @@ template <typename T, int D, int V = D>
       const device itype *, const device itype *, const device itype *, device itype *,            \
       const constant int &, const device int *, const device int *, const device uint *,           \
       const device uint *, const constant int &, const constant int &, const constant float &,     \
-      const device uchar *, const device uint &, const device uchar *, const constant int &,       \
+      const device uchar *, const device uint &, const device uint*, const constant int &,       \
       const device itype *, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged(bfloat16, bfloat, 256, 256)
@@ -240,7 +240,7 @@ instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)
       const device itype *, const device itype *, const device itype *, device itype *,            \
       const constant int &, const device int *, const device int *, const device uint *,           \
       const device uint *, const constant int &, const constant int &, const constant float &,     \
-      const device uchar *, const device uint &, const device uchar *, const constant int &,       \
+      const device uchar *, const device uint &, const device uint*, const constant int &,       \
       const device itype *, device float *, PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_lse(bfloat16, bfloat, 64, 64)
@@ -257,7 +257,7 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
               const device uint *ptr [[buffer(8)]], constant int &page_size [[buffer(9)]],
               constant int &kv_heads [[buffer(10)]], constant float &scale [[buffer(11)]],
               const device uchar *mask [[buffer(12)]], constant uint &mask_stride [[buffer(13)]],
-              const device uchar *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
+              const device uint *enabled [[buffer(14)]], constant int &window [[buffer(15)]],
               const device bfloat *sinks [[buffer(16)]],
               const constant ulong& k_page_stride [[buffer(17)]],
               const constant ulong& v_page_stride [[buffer(18)]],
@@ -267,7 +267,8 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
               uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   constexpr int D = 256, PER = 8, BN = 32, MERGE = 4;
   const int head = tile.x * GH, heads = grid.x * GH, row = tile.y, kv = head / gqa;
-  const int req = owners[row], pos = positions[row], flag = enabled[row];
+  const int req = owners[row], pos = positions[row], flag = int(enabled[row] & 3u);
+  const uint origin = enabled[row] >> 2;
   const bool wide = window < 0 || flag == 2;
   const int extent = window < 0 ? -window - 1 : window;
   const int start = extent > 0 && pos >= extent ? pos - extent + 1 : 0;
@@ -288,9 +289,9 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
   auto absorb = [&](uint page, uint off) {
     const size_t at = (size_t(off) * kv_heads + kv) * 2 * D;
     const device char *kb =
-        reinterpret_cast<const device char *>(keys) + k_offset + ulong(page) * k_page_stride + at;
+        reinterpret_cast<const device char *>(keys) + k_offset + pie_page_at(page, k_page_stride, 1) + at;
     const device char *vb = reinterpret_cast<const device char *>(values) + v_offset +
-                            ulong(page) * v_page_stride + at;
+                            pie_page_at(page, v_page_stride, 1) + at;
     const float ks = *reinterpret_cast<const device float *>(kb + D);
     const float vs = *reinterpret_cast<const device float *>(vb + D);
     float k[PER], v[PER];
@@ -314,7 +315,7 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
     }
   };
   auto attends = [&](int kp) {
-    return flag == 0 || (uint(kp) < mask_stride && mask[size_t(row) * mask_stride + uint(kp)] != 0);
+    return flag == 0 || pie_mask_admits(mask, mask_stride, origin, uint(row), uint(kp));
   };
   if (lastpage - firstpage + 1 >= BN) {
     for (int pix = firstpage + sg; pix <= lastpage; pix += BN) {
@@ -364,6 +365,6 @@ q8_vector_gqa(const device bfloat *queries [[buffer(0)]], const device bfloat *k
       const device bfloat *, const device bfloat *, const device bfloat *, device bfloat *,        \
       constant int &, const device int *, const device int *, const device uint *,                 \
       const device uint *, constant int &, constant int &, constant float &, const device uchar *, \
-      constant uint &, const device uchar *, constant int &, const device bfloat *,                \
+      constant uint &, const device uint *, constant int &, const device bfloat *,                 \
       PIE_KV_LAYOUT_TYPES uint3, uint3, uint, uint);
 PIE_VECTOR_GQA("q8_vector_gqa_2", 2)

@@ -1,0 +1,95 @@
+package plex:schedule@1.1.0;
+
+/// When a worker's processes run. One row per process.
+///
+/// Every column of every PLEX table has the same seven functions:
+///
+/// - `get`: the row this policy wrote, if any. The tables live in the host,
+///   so a restarted policy reads back what it wrote.
+/// - `set`, `set-list`: write rows. `set-list` takes all of its entries,
+///   or on an error none.
+/// - `delete`: the row's subject follows the default again.
+/// - `set-default`: the value for every subject without a row. Until it is
+///   set, the column's own default, stated on the column.
+/// - `clear`: no rows and no default, as if the policy had never written.
+///   A policy that plans from the snapshot clears and writes again each
+///   call; the host enacts the difference.
+/// - `get-refused`: the rows the host cannot enact, as of this call's
+///   snapshot, and why.
+@since(version = 1.1.0)
+interface types {
+    /// Higher is admitted first, runs first, resumes first, and is
+    /// preempted last. Equal priorities fall to the engine's own order.
+    @since(version = 1.1.0)
+    type priority = s64;
+}
+
+/// The order of a worker's processes. Default: 0, so a policy that writes
+/// nothing leaves the engine's own order.
+///
+/// A waiting process does not displace a running one for having a higher
+/// priority: a policy that wants that holds the victim (`hold`).
+@since(version = 1.1.0)
+interface priority {
+    use plex:core/types@1.1.0.{process-id, error-code};
+    use types.{priority};
+
+    @since(version = 1.1.0)
+    get: func(process: process-id) -> option<priority>;
+
+    @since(version = 1.1.0)
+    set: func(process: process-id, value: priority) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    set-list: func(entries: list<tuple<process-id, priority>>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(process: process-id);
+
+    @since(version = 1.1.0)
+    set-default: func(value: priority) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    clear: func();
+
+    @since(version = 1.1.0)
+    get-refused: func() -> list<tuple<process-id, error-code>>;
+}
+
+/// Whether a process may run. A held process does not start, and is paused
+/// if it is running. Default: false.
+@since(version = 1.1.0)
+interface hold {
+    use plex:core/types@1.1.0.{process-id, error-code};
+
+    @since(version = 1.1.0)
+    get: func(process: process-id) -> option<bool>;
+
+    @since(version = 1.1.0)
+    set: func(process: process-id, value: bool) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    set-list: func(entries: list<tuple<process-id, bool>>) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    delete: func(process: process-id);
+
+    @since(version = 1.1.0)
+    set-default: func(value: bool) -> result<_, error-code>;
+
+    @since(version = 1.1.0)
+    clear: func();
+
+    @since(version = 1.1.0)
+    get-refused: func() -> list<tuple<process-id, error-code>>;
+}
+
+@since(version = 1.1.0)
+world imports {
+    @since(version = 1.1.0)
+    import types;
+    @since(version = 1.1.0)
+    import priority;
+    @since(version = 1.1.0)
+    import hold;
+}

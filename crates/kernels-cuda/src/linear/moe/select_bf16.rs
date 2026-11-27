@@ -20,11 +20,7 @@ pub(super) fn select_bf16_wgmma(
 ) -> Result<(), Error> {
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    let slice: u32 = if fan.route_count.div_ceil(experts.max(1)) <= 8 {
-        16
-    } else {
-        32
-    };
+    let slice = wgmma_slice(fan.route_count.div_ceil(experts.max(1)));
     let RouteOrder {
         order,
         offsets,
@@ -73,11 +69,49 @@ pub(super) fn select_bf16_wgmma(
     )
 }
 
-/// Whether the graph-safe bf16 grouped mma.sync kernel takes a fire of
-/// `routes` routes: `kernel.moe.bf16_mma_from ..= kernel.moe.bf16_mma_until`.
-pub(super) fn bf16_mma_spans(ctx: &Ctx, routes: u32) -> bool {
-    let t = ctx.tuning();
-    t.bf16_mma_until > 0 && t.bf16_mma_from <= routes && routes <= t.bf16_mma_until
+/// The grouped mma.sync select's `nb` for experts averaging `per` routes: its
+/// slices are `8 nb` routes (8, 16, 32 or 64), each reading its weight rows
+/// once for all of them.
+pub const fn mma_nb(per: u32) -> u32 {
+    match per {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=40 => 4,
+        _ => 8,
+    }
+}
+
+/// Hopper's wgmma select's slice for experts averaging `per` routes: 16
+/// routes, or 32 past an average of 8.
+pub const fn wgmma_slice(per: u32) -> u32 {
+    if per <= 8 { 16 } else { 32 }
+}
+
+/// Whether [`Leg::Mma`] runs Hopper's wgmma select, at `n` product columns.
+pub fn wgmma_takes(n: u32, experts: ExpertTable) -> bool {
+    hopper_wgmma() && n.is_multiple_of(128) && !experts.streams()
+}
+
+/// The [`Leg::Mma`] leg's tile for experts averaging `per` routes at an
+/// `n x k` plane: the wgmma select's slice by 64 columns on Hopper, else
+/// `8 nb` routes by 128 columns in three stages of 64 of K.
+pub fn mma_tile(per: u32, n: u32, k: u32, cores: Cores) -> Tile {
+    if cores.hopper && n.is_multiple_of(128) && !cores.streams {
+        let slice = wgmma_slice(per);
+        let atoms: u32 = if k.is_multiple_of(128) { 2 } else { 1 };
+        Tile {
+            slice,
+            cols: 64,
+            smem: 3 * atoms * (64 + slice) * 128 + 1024,
+        }
+    } else {
+        let nb = mma_nb(per);
+        Tile {
+            slice: 8 * nb,
+            cols: 128,
+            smem: 3 * (128 + 8 * nb) * (64 + 8) * 2,
+        }
+    }
 }
 
 /// `y[route] = x[route or its token] . W[routes[route]]^T` on the grouped
@@ -100,15 +134,7 @@ pub(super) fn select_bf16_mma(
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     let k = stated(op, x.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
-    // An expert's slice is 8, 16, 32 or 64 routes, by how many the average
-    // expert holds: each slice reads its weight rows once for all of them.
-    let per = fan.route_count.div_ceil(experts.max(1));
-    let nb: u32 = match per {
-        0..=8 => 1,
-        9..=16 => 2,
-        17..=40 => 4,
-        _ => 8,
-    };
+    let nb = mma_nb(fan.route_count.div_ceil(experts.max(1)));
     let RouteOrder {
         order,
         offsets,
@@ -162,25 +188,49 @@ pub(super) fn select_bf16_mma(
 /// bank as fast.
 pub(super) const FP8_GEMM_FROM: u32 = 8192;
 
-/// From this many routes a fire (with K in whole 64s), a bf16 select is the
-/// tiled GEMM (`moe_select_bf16_gemm`), a CTA 64 of an expert's routes: a
-/// batch's routes crowd onto a few hot experts as often as not, and its
-/// tiles stream a hot expert's rows once a 64 routes, near the card's rate
-/// with the routes spread.
-pub(super) const BF16_GEMM_FROM: u32 = 256;
-
 /// The fewest routes an expert averages that Hopper's warp-specialized
 /// wgmma GEMM (`moe_select_bf16_wsgemm`) takes a tiled bf16 select at:
 /// a prefill's, in slices of 128.
 pub(super) const BF16_WSGEMM_FROM: u32 = 64;
 
-/// A routed select over a bf16 bank (`experts x n x k` at `bank`) on mma.sync
-/// (`linear/moe_w8.cuh`): the register-held `moe_select_bf16_held`, each
-/// expert's rows streamed once a slice of its routes, or from
-/// `BF16_GEMM_FROM` routes the tiled `moe_select_bf16_gemm`; the GLU in its
-/// epilogue where `glu` says. `Ok(false)` for a fire it does not take.
+/// The tiled leg's tile ([`Leg::Tiled`]) for a plain select whose experts
+/// average `per` routes: Hopper's warp-specialized wgmma GEMM's slices of
+/// 128 by 256 columns, the wide tile's 128 by 256 where its experts average
+/// it (`kernel.moe.bf16_wide_from`, never below 128), else 64 by 128 in
+/// `kernel.moe.bf16_gemm_stages` stages.
+pub fn tiled_tile(per: u32, k: u32, cores: Cores) -> Tile {
+    if cores.hopper && !cores.streams && per >= BF16_WSGEMM_FROM && k.is_multiple_of(64) {
+        Tile {
+            slice: 128,
+            cols: 256,
+            smem: WS_STAGES * 49152 + 1024 + 128,
+        }
+    } else if per >= cores.wide_from.max(128) {
+        Tile {
+            slice: 128,
+            cols: 256,
+            smem: 2 * (128 + 256) * 128,
+        }
+    } else {
+        let stages = cores.stages.clamp(2, 4);
+        Tile {
+            slice: 64,
+            cols: 128,
+            smem: stages * (64 + 128) * 128,
+        }
+    }
+}
+
+/// The warp-specialized wgmma GEMM's stages.
+const WS_STAGES: u32 = 4;
+
+/// A routed select over a bf16 bank (`experts x n x k` at `bank`) on the
+/// tiled GEMM ([`Leg::Tiled`]): `moe_select_bf16_gemm`, a CTA 64 of an
+/// expert's routes (the wide tile's 128 where its experts average them), on
+/// Hopper `moe_select_bf16_wsgemm`; the GLU in its epilogue where `glu`
+/// says. `Ok(false)` for a fire it does not take.
 #[allow(clippy::too_many_arguments)]
-pub fn select_bf16_held(
+pub fn select_bf16_tiled(
     ctx: &Ctx,
     op: &'static str,
     x: Tensor,
@@ -191,12 +241,10 @@ pub fn select_bf16_held(
     glu: Option<crate::linear::gemm_sm100::Glu>,
     table: ExpertTable,
 ) -> Result<bool, Error> {
-    const THREADS: u32 = 128;
-    const DEPTH: u32 = 2;
     let fan = selected(op, x, routes, y)?;
     if x.dtype != Dtype::Bf16
         || y.dtype != Dtype::Bf16
-        || !x.width.is_multiple_of(32)
+        || !x.width.is_multiple_of(64)
         || !bank.is_multiple_of(16)
     {
         return Ok(false);
@@ -209,9 +257,7 @@ pub fn select_bf16_held(
     if relu2
         && (crate::linear::gemm_sm100::supported()
             || (hopper_wgmma()
-                && fan.route_count.div_ceil(experts.clamp(1, EXPERT_CAP)) < BF16_WSGEMM_FROM)
-            || fan.route_count < BF16_GEMM_FROM
-            || !x.width.is_multiple_of(64))
+                && fan.route_count.div_ceil(experts.clamp(1, EXPERT_CAP)) < BF16_WSGEMM_FROM))
     {
         return Ok(false);
     }
@@ -221,42 +267,28 @@ pub fn select_bf16_held(
     let n = stated(op, nonzero(op, "N, the bank's output width", bank_rows)?)?;
     let inter = stated(op, y.width)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+    let share = if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
+        Share::Keep
+    } else {
+        Share::Take
+    };
+    let per = fan.route_count.div_ceil(experts);
     // A prefill's routes on Hopper's warp-specialized wgmma GEMM, an
     // expert's slice 128 of them by 256 weight rows (128 gate and their up
     // rows with a GLU), the GLU in its epilogue. A streamed table stays on
     // the mma.sync kernels below, whose loads go through it.
-    if hopper_wgmma()
-        && !table.streams()
-        && fan.route_count >= BF16_GEMM_FROM
-        && fan.route_count.div_ceil(experts) >= BF16_WSGEMM_FROM
-        && x.width.is_multiple_of(64)
-        && (0..=6).contains(&code)
-    {
-        const STAGES: u32 = 4;
-        let order = route_order_sliced(
-            ctx,
-            op,
-            routes,
-            &fan,
-            experts,
-            128,
-            true,
-            if glu.is_some() || KEEP_NEXT.with(core::cell::Cell::get) {
-                Share::Keep
-            } else {
-                Share::Take
-            },
-        )?;
+    if hopper_wgmma() && !table.streams() && per >= BF16_WSGEMM_FROM && (0..=6).contains(&code) {
+        let order = route_order_sliced(ctx, op, routes, &fan, experts, 128, true, share)?;
         let cols = if glu.is_some() { 128 } else { 256 };
         ctx.fire(
             op,
             Fire::at(kernel(
                 SELECT_SM90,
-                &format!("::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"),
+                &format!("::pie::linear::moe_select_bf16_wsgemm<{WS_STAGES}, {code}>"),
             ))
             .apply(
                 Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
-                    .smem(STAGES * 49152 + 1024 + 128),
+                    .smem(WS_STAGES * 49152 + 1024 + 128),
             ),
             &[
                 x.arg(),
@@ -280,69 +312,33 @@ pub fn select_bf16_held(
     }
     // A prefill's experts averaging the wide tile's routes lay their order in
     // its 128-route slices once, kept for the down select.
-    let wide = fan.route_count.div_ceil(experts) >= ctx.tuning().bf16_wide_from.max(128);
-    let SelectPlan {
-        nb,
-        tiled,
-        tiles,
-        ksplit,
-        order,
-    } = select_plan(
-        ctx,
-        op,
-        routes,
-        &fan,
-        experts,
-        y,
-        glu.is_some(),
-        fan.route_count >= BF16_GEMM_FROM && x.width.is_multiple_of(64),
-        // bf16 codes stream twice an fp8 bank's bytes: deeper K splits keep
-        // more of them in flight (Hy4's decode +2%).
-        8,
-        wide.then_some(128),
-    )?;
-    if relu2 && !tiled {
-        return Ok(false);
-    }
-    let fire = if tiled {
-        // Three stages of 64 routes' and 128 rows' 64 of K, four warps a
-        // CTA each 32 routes by 64 rows: two CTAs an SM.
-        let stages = ctx.tuning().bf16_gemm_stages.clamp(2, 4);
+    let wide = per >= ctx.tuning().bf16_wide_from().max(128);
+    let bm: u32 = if wide { 128 } else { 64 };
+    let order = route_order_sliced(ctx, op, routes, &fan, experts, bm, true, share)?;
+    let fire = if wide {
+        let cols = if glu.is_some() { 128 } else { 256 };
+        Fire::at(kernel(
+            SELECT_SM80,
+            &format!("::pie::linear::moe_select_bf16_gemm_wide<{code}>"),
+        ))
+        .apply(
+            Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [256, 1, 1])
+                .smem(2 * (128 + 256) * 128),
+        )
+    } else {
+        // Stages of 64 routes' and 128 rows' 64 of K, four warps a CTA each
+        // 32 routes by 64 rows: two CTAs an SM.
+        let stages = ctx.tuning().bf16_gemm_stages().clamp(2, 4);
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
-        let bm: u32 = if wide { 128 } else { 64 };
-        if bm == 128 {
-            let cols = if glu.is_some() { 128 } else { 256 };
-            Fire::at(kernel(
-                SELECT_SM80,
-                &format!("::pie::linear::moe_select_bf16_gemm_wide<{code}>"),
-            ))
-            .apply(
-                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [256, 1, 1])
-                    .smem(2 * (128 + 256) * 128),
-            )
-        } else {
-            Fire::at(kernel(
-                SELECT_SM80,
-                &format!("::pie::linear::moe_select_bf16_gemm<{stages}, {code}, {WN}, {bm}>"),
-            ))
-            .apply(
-                Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [bm * WN, 1, 1])
-                    .smem(stages * (bm + 128) * 128),
-            )
-        }
-    } else {
-        let cols = if glu.is_some() { 64 } else { 64 * tiles };
         Fire::at(kernel(
-            SELECT,
-            &format!(
-                "::pie::linear::moe_select_bf16_held<{nb}, {DEPTH}, {code}, {tiles}, {ksplit}>"
-            ),
+            SELECT_SM80,
+            &format!("::pie::linear::moe_select_bf16_gemm<{stages}, {code}, {WN}, {bm}>"),
         ))
-        .apply(Launch::grid(
-            [order.work_cap, y.width.div_ceil(cols), 1],
-            [THREADS * ksplit, 1, 1],
-        ))
+        .apply(
+            Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [bm * WN, 1, 1])
+                .smem(stages * (bm + 128) * 128),
+        )
     };
     ctx.fire(
         op,
@@ -393,7 +389,7 @@ pub fn select_bf16_copy(
         || y.dtype != Dtype::Bf16
         || !x.width.is_multiple_of(64)
         || !bank.is_multiple_of(16)
-        || fan.route_count < ctx.tuning().mxfp4_bf16_from.max(1)
+        || fan.route_count < ctx.tuning().mxfp4_bf16_from().max(1)
         || bias.is_some_and(|b| b.dtype != Dtype::Bf16)
         || matches!(glu, Some(crate::linear::gemm_sm100::Glu::Relu2))
     {

@@ -67,6 +67,18 @@ unsafe impl Send for Sparse {}
 // `Mutex`-guarded ticks.
 unsafe impl Sync for Sparse {}
 
+/// Lets go of every allocation the residency set holds. The set is
+/// attached to the shell's frame queue, which keeps it, and the
+/// allocations in it, past the shell: without this a dropped shell's
+/// weight-cache tables stay allocated (`currentAllocatedSize`), and the
+/// next load in the process measures them as held outside it.
+impl Drop for Sparse {
+    fn drop(&mut self) {
+        self.residency.removeAllAllocations();
+        self.residency.commit();
+    }
+}
+
 impl std::fmt::Debug for Sparse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ticks = self.ticks();
@@ -79,20 +91,19 @@ impl std::fmt::Debug for Sparse {
 
 impl Sparse {
     /// Whether `device` can map tiles at all.
-    #[must_use]
-    pub fn supported(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-        device.supportsFamily(MTLGPUFamily::Metal4)
-    }
-
-    /// The mapping side for `device`, or `None` when it is not a Metal 4
-    /// device. The residency set is attached to `frames`, the queue the
-    /// shell's frames run on, so heaps mapped here are resident there.
+    /// The mapping side for `device`, a Metal 4 device ([`super::Context::bind`]
+    /// refuses any other). The residency set is attached to `frames`, the
+    /// queue the shell's frames run on, so heaps mapped here are resident
+    /// there.
     pub fn open(
         device: &Retained<ProtocolObject<dyn MTLDevice>>,
         frames: &ProtocolObject<dyn MTLCommandQueue>,
-    ) -> Result<Option<Arc<Sparse>>> {
-        if !Sparse::supported(device) {
-            return Ok(None);
+    ) -> Result<Arc<Sparse>> {
+        if !device.supportsFamily(MTLGPUFamily::Metal4) {
+            return Err(Fault::Device {
+                call: "supportsFamily(Metal4)",
+                why: "placement sparse buffers need a Metal 4 device".to_string(),
+            });
         }
         let queue = device.newMTL4CommandQueue().ok_or(Fault::Device {
             call: "newMTL4CommandQueue",
@@ -109,7 +120,7 @@ impl Sparse {
                 why: error.localizedDescription().to_string(),
             })?;
         frames.addResidencySet(&residency);
-        Ok(Some(Arc::new(Sparse {
+        Ok(Arc::new(Sparse {
             device: device.clone(),
             queue,
             event,
@@ -119,7 +130,7 @@ impl Sparse {
                 landed: 0,
                 dirty: false,
             }),
-        })))
+        }))
     }
 
     pub(crate) fn device(&self) -> &ProtocolObject<dyn MTLDevice> {

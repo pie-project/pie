@@ -172,7 +172,6 @@ async fn main(input: Input) -> Result<Output> {
     prompt_tokens.extend(chat::user(&input.question));
     prompt_tokens.extend(chat::cue());
     let n = prompt_tokens.len() as u32;
-    let stop = chat::stop_tokens();
 
     let soft_tokens: u32 = images.iter().map(media::Image::token_count).sum();
     let grid = img.grid();
@@ -208,7 +207,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let chat_dec = chat::Decoder::new();
     let mut text = String::new();
-    let mut done = stop.contains(&(g0 as u32));
+    let mut done = chat::is_stop(g0 as u32);
     if !done {
         match chat_dec.feed(&[g0 as u32])? {
             chat::Event::Delta(s) => text.push_str(&s),
@@ -248,7 +247,7 @@ async fn main(input: Input) -> Result<Output> {
     run_ahead(&pipe, &fwd, budget, async || {
         let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
-        if stop.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         match chat_dec.feed(&[token])? {

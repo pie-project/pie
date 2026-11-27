@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+    let root = manifest_dir().join("../../models");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut packages: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for dir in std::fs::read_dir(&root).expect("the repository's models/") {
@@ -83,4 +83,13 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) {
             out.push((format!("{prefix}{file}"), path.display().to_string()));
         }
     }
+}
+
+/// This crate's directory, read when the build script runs: a path baked in
+/// when the script was compiled would name another checkout's crate where
+/// worktrees share a target directory.
+fn manifest_dir() -> std::path::PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR for a build script")
+        .into()
 }

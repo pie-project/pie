@@ -697,7 +697,7 @@ impl Epilogue {
         }
         self.load(&skeletons, n, k, tuning)?;
         #[cfg(feature = "cuda")]
-        if self.leg(n).is_some() && RowLeg::of(self, n).is_none() {
+        if self.leg(n).is_some() && !RowLeg::loaded(self, n) {
             return Err(refuse(
                 OP,
                 format!("the unfused leg's row kernel over {n} columns did not load"),
@@ -711,7 +711,7 @@ impl Epilogue {
     /// device: an epilogue over a product landed apart runs on them alone.
     pub fn load_leg(&self, n: u32) -> Result<(), Error> {
         #[cfg(feature = "cuda")]
-        if RowLeg::of(self, n).is_none() {
+        if !RowLeg::loaded(self, n) {
             return Err(refuse(
                 OP,
                 format!("the unfused leg's row kernel over {n} columns did not load"),
@@ -1118,7 +1118,7 @@ impl Skeleton {
                 n,
                 k,
                 epi.parts,
-                tuning.gemm_skinny_rows,
+                tuning.gemm_skinny_rows(),
                 epi.span,
             ),
         }
@@ -1186,7 +1186,7 @@ impl Skeleton {
                     m,
                     n,
                     k,
-                    ctx.tuning().pdl,
+                    ctx.tuning().pdl(),
                 ),
                 Skeleton::Skinny => {
                     crate::linear::skinny::skinny(ctx, epi, w, act, ins, outs, paging, m, n, k)
@@ -1232,6 +1232,15 @@ struct Piece {
 
 #[cfg(feature = "cuda")]
 impl RowLeg {
+    /// Whether `epi`'s leg over `n` columns is cut and its kernels are loaded
+    /// on the current device. A leg cut for an earlier device is loaded here
+    /// too: a model loads on each device before any fire of it, where a
+    /// module load cannot wait behind a peer's collective.
+    pub(crate) fn loaded(epi: &Epilogue, n: u32) -> bool {
+        RowLeg::of(epi, n)
+            .is_some_and(|leg| leg.pieces.iter().all(|piece| piece.kernel.load().is_ok()))
+    }
+
     /// The row skeleton's kernels for `epi` over `n` columns, loaded on the
     /// current device, or `None` where the row skeleton does not carry it
     /// ([`Epilogue::leg`]).

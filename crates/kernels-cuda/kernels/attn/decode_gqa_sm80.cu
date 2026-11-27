@@ -16,6 +16,10 @@
 // A sliding window starts the walk at the window, and where the plan does
 // not split the sinks scale the output as `sink_rescale` does.
 //
+// With the fire's masks (`mask_origin` not null), a request's keys from its
+// word's boundary on are read where its bits admit them: a request stating no
+// mask has its boundary past every key, and its tiles read no bit.
+//
 // With `ranks` above one, a cluster of that many blocks reads one (request,
 // kv head) unsplit by the plan, each block a slice of its keys, and the
 // cluster folds the slices through distributed shared memory: each block
@@ -112,6 +116,9 @@ __device__ __forceinline__ void decode_body(
     bf16* __restrict__ o,
     float* __restrict__ lse,
     const S* __restrict__ sinks,
+    const unsigned char* __restrict__ mask,
+    const long long* __restrict__ mask_indptr,
+    const u32* __restrict__ mask_origin,
     u32 ranks)
 {
     constexpr bool FP8 = sizeof(KV) == 1;
@@ -154,6 +161,14 @@ __device__ __forceinline__ void decode_body(
         pages > 0 ? (pages - 1) * static_cast<int>(page_size) + last_page_len[batch] : 0;
     int window_start = 0;
     if (window_left >= 0 && kv_len > window_left + 1) window_start = kv_len - window_left - 1;
+    // The request's mask: its keys from `origin` on read their bits, a row
+    // of `kv_len - origin` from byte `mask_indptr[batch]` (`variants.cuh`).
+    int origin = 0x7fffffff;
+    const unsigned char* bits = nullptr;
+    if (mask_origin != nullptr) {
+        origin = static_cast<int>(mask_origin[batch] & 0x7fffffffu);
+        if (origin < kv_len) bits = mask + mask_indptr[batch];
+    }
     const int chunk = partition_kv ? *kv_chunk_size_ptr : kv_len - window_start;
     int chunk_start = window_start + (partition_kv ? kv_tile * chunk : 0);
     int chunk_end = partition_kv ? min(window_start + (kv_tile + 1) * chunk, kv_len) : kv_len;
@@ -310,11 +325,18 @@ __device__ __forceinline__ void decode_body(
         // Scale and mask; each lane's columns are heads 2t and 2t + 1, its
         // rows keys g and g + 8 of each 16.
         float mx0 = -1e30f, mx1 = -1e30f;
+        // A tile wholly below the boundary reads no bit.
+        const bool speaks = base + TILE > origin;
+        auto admits = [&](int k) {
+            if (!speaks || k < origin) return true;
+            const int at = k - origin;
+            return ((bits[at >> 3] >> (at & 7)) & 1) != 0;
+        };
         const float s_scale = FP8 ? 1.f : scale;
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             const int r0 = base + mt * 16 + g;
-            const bool v0 = r0 < chunk_end, v1 = r0 + 8 < chunk_end;
+            const bool v0 = r0 < chunk_end && admits(r0), v1 = r0 + 8 < chunk_end && admits(r0 + 8);
             s[mt][0] = v0 ? s[mt][0] * s_scale : kMasked;
             s[mt][1] = v0 ? s[mt][1] * s_scale : kMasked;
             s[mt][2] = v1 ? s[mt][2] * s_scale : kMasked;
@@ -562,12 +584,16 @@ __global__ void __launch_bounds__(32 * WARPS) decode(
     bf16* __restrict__ o,
     float* __restrict__ lse,
     const S* __restrict__ sinks,
+    const unsigned char* __restrict__ mask,
+    const long long* __restrict__ mask_indptr,
+    const u32* __restrict__ mask_origin,
     u32 ranks)
 {
     decode_body<HEAD_DIM, MT, WARPS, STAGES, S, KV, false>(
         q, k_data, v_data, page_indices, page_indptr, last_page_len, page_size, stride_page, stride_n,
         stride_h, q_indptr, q_stride_n, request_indices, kv_tile_indices, kv_chunk_size_ptr,
-        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks, ranks);
+        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks,
+        mask, mask_indptr, mask_origin, ranks);
 }
 
 // The swizzled stamp over a bf16 pool, `MIN_CTAS` blocks an SM (as many as
@@ -598,12 +624,16 @@ __global__ void __launch_bounds__(32 * WARPS, MIN_CTAS) decode_deep(
     bf16* __restrict__ o,
     float* __restrict__ lse,
     const S* __restrict__ sinks,
+    const unsigned char* __restrict__ mask,
+    const long long* __restrict__ mask_indptr,
+    const u32* __restrict__ mask_origin,
     u32 ranks)
 {
     decode_body<HEAD_DIM, MT, WARPS, STAGES, S, bf16, true>(
         q, k_data, v_data, page_indices, page_indptr, last_page_len, page_size, stride_page, stride_n,
         stride_h, q_indptr, q_stride_n, request_indices, kv_tile_indices, kv_chunk_size_ptr,
-        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks, ranks);
+        block_valid_mask, partition_kv, num_qo_heads, group, window_left, sm_scale, o, lse, sinks,
+        mask, mask_indptr, mask_origin, ranks);
 }
 
 }

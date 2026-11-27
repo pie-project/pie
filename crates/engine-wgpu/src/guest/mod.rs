@@ -39,6 +39,8 @@ fn for_tint(source: String) -> String {
 }
 
 #[cfg(feature = "wgpu")]
+pub mod outbox;
+#[cfg(feature = "wgpu")]
 pub mod run;
 #[cfg(feature = "wgpu")]
 pub mod session;

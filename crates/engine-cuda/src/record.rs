@@ -29,15 +29,10 @@ pub struct Fire<'a> {
     pub stream: *mut core::ffi::c_void,
     pub lanes: Option<Lanes<'a>>,
     pub conditionals: Option<crate::window::Conditionals<'a>>,
-    pub decoding: &'a poem_ir::ClassSet,
-    pub tiers: &'a Tiers,
-    pub towered: bool,
-    pub lane_ceiling: u32,
     pub ceilings: Ceilings<'a>,
-    /// [`BodyKey::islands`] as prepared for this fire.
-    pub islands: &'a [u8],
-    /// [`BodyKey::rs`] as prepared for this fire.
-    pub rs: RsBody,
+    /// The body's key as the fire was prepared (`serve::prepare`): the
+    /// one derivation of a fire's key.
+    pub key: &'a BodyKey,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -63,6 +58,14 @@ pub struct Recorder {
     bstats: BodyTally,
     last_capture: LastCapture,
     sealed_seen: HashSet<BodyKey>,
+    /// The key of the body the last fire replayed.
+    replayed: Option<BodyKey>,
+    /// Compositions arming stated eager by name (the bodies' allowance
+    /// spent before them): their fires walk eagerly by statement.
+    stated: HashSet<BodyKey>,
+    /// A fire arming makes to learn a stated composition's key, not to
+    /// capture it (`Bodies::state_eager`).
+    stating: bool,
 }
 
 /// Whether a sealed-map decline is worth a log line: the first fire of each
@@ -114,8 +117,8 @@ impl Bodies {
         tally.eager_unbodied += 1;
         let count = tally.eager_unbodied;
         if count.is_power_of_two() {
-            eprintln!(
-                "engine-cuda: WARNING: a serving fire ran with no recorded body ({why}); \
+            tracing::warn!(
+                "a serving fire ran with no recorded body ({why}); \
                  {count} such fire(s) so far (BodyTally::eager_unbodied). Every serving \
                  composition of a load that records bodies should replay one"
             );
@@ -397,7 +400,7 @@ pub fn cuts(
     Ok(cuts)
 }
 
-/// Bodies a load keeps beside `mem_mb`: the count bounds host bookkeeping and
+/// Bodies a load keeps, whatever their bytes: the count bounds host bookkeeping and
 /// graph handles, which bytes do not measure.
 pub const MAX_BODIES: usize = 1024;
 
@@ -411,12 +414,16 @@ pub struct Tiers {
 /// buffer rows past their state but replay none, and one where a lane
 /// replays buffered rows ahead of its own (every recurrence then runs over
 /// the extended rows). Where a lane's rows land and which it replays are
-/// data the body reads (`inputs::RsHandles`), not part of the key.
+/// data the body reads (`inputs::RsHandles`), not part of the key. A
+/// buffering fire where a decoding lane carries more than one chunk of rows
+/// splits each carried read over the device's spare blocks
+/// (`kernels_cuda::ssm::Carry::split`), a grid only such a fire launches.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum RsBody {
     #[default]
     Folds,
     Buffers,
+    Splits,
     Replays,
 }
 
@@ -438,31 +445,15 @@ pub struct BodyKey {
     /// a whole one at the same bucket and classes, and a body is only
     /// replayable for the admissibility it was recorded under.
     pub islands: Box<[u8]>,
-    /// How the fire's lanes treat their recurrent rows.
+    /// How the fire's lanes treat their recurrent rows. (A lane's attention
+    /// mask, a group's too, is no part of the key: it is data each fire
+    /// stages and one body reads.)
     pub rs: RsBody,
 }
 
 impl BodyKey {
-    #[cfg(test)]
     #[must_use]
     pub fn of(
-        classes: &WindowTable,
-        bucket: u32,
-        decoding: &poem_ir::ClassSet,
-        lane_ceiling: u32,
-        tiers: &Tiers,
-    ) -> BodyKey {
-        BodyKey {
-            bucket,
-            classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
-            patch: None,
-            islands: Box::default(),
-            rs: RsBody::Folds,
-        }
-    }
-
-    #[must_use]
-    pub fn of_axes(
         classes: &WindowTable,
         bucket: u32,
         decoding: &poem_ir::ClassSet,
@@ -477,6 +468,33 @@ impl BodyKey {
             islands: Box::default(),
             rs: RsBody::Folds,
         }
+    }
+
+    /// The key a fire of `composition` records and replays under: its
+    /// token axis's classes and bucket (and its patch axis's, where the
+    /// load is towered) under the lane ceiling, its lanes' treatment of
+    /// their recurrent rows. Prepare derives it once (`serve::prepare`) and
+    /// hands it down; the body map and arming read that one.
+    #[must_use]
+    pub fn for_fire(
+        composition: &poem_exec::fire::Composition,
+        decoding: &poem_ir::ClassSet,
+        lane_ceiling: u32,
+        tiers: &Tiers,
+        towered: bool,
+        rs: RsBody,
+    ) -> BodyKey {
+        let tokens = composition.axis(poem_ir::RowAxis::Tokens);
+        let patches = composition.axis(poem_ir::RowAxis::Patches);
+        BodyKey::of(
+            &tokens.classes,
+            tokens.bucket,
+            decoding,
+            lane_ceiling,
+            tiers,
+            towered.then_some((&patches.classes, patches.bucket)),
+        )
+        .with_rs(rs)
     }
 
     /// The same key, for a fire whose lanes treat their recurrent rows so.
@@ -606,6 +624,7 @@ impl core::fmt::Display for BodyKey {
         match self.rs {
             RsBody::Folds => {}
             RsBody::Buffers => f.write_str("~rs")?,
+            RsBody::Splits => f.write_str("~rss")?,
             RsBody::Replays => f.write_str("~rsx")?,
         }
         Ok(())
@@ -698,6 +717,10 @@ enum Step {
 
 struct Body {
     script: Box<[Step]>,
+    /// The step whose stretch lays the fire's fold gate first
+    /// (`Run::lay_gate`): recorded in its graph, or laid ahead of it where
+    /// it walks. None where the body gates no fold.
+    gate_step: Option<usize>,
     grids: Box<[(u32, u32)]>,
     shape: u64,
     launched_at: u64,
@@ -770,6 +793,10 @@ pub struct BodyTally {
     /// their composition was never armed (and not captured as it served)
     /// or is one a body cannot carry. Each is warned of at a power of two.
     pub eager_unbodied: u64,
+    /// Fires of compositions the load stated eager by name at arming (the
+    /// bodies' allowance spent before them): eager by statement, not a
+    /// body that should have been there (`sealed_declines`).
+    pub stated_eager: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -803,7 +830,7 @@ impl core::fmt::Display for BodyStats {
             f,
             "[body-stats] hits={} misses={} reshapes={} captures={} \
              declines={} refusals={} evictions={} armed_at_load={} \
-             sealed_declines={} sealed_short={} eager_buffered={} \
+             sealed_declines={} stated_eager={} sealed_short={} eager_buffered={} \
              eager_copy_world={} | last-capture: nodes={} edges={} islands={} \
              | resident: bodies={} segmented={} bytes={}",
             tally.hits,
@@ -815,6 +842,7 @@ impl core::fmt::Display for BodyStats {
             tally.evictions,
             tally.armed_at_load,
             tally.sealed_declines,
+            tally.stated_eager,
             tally.sealed_short,
             tally.eager_buffered,
             tally.eager_copy_world,
@@ -829,6 +857,19 @@ impl core::fmt::Display for BodyStats {
 }
 
 impl Bodies {
+    /// The counts alone, with no census taken: what a fire reads on either
+    /// side of itself to say how it was served.
+    #[must_use]
+    pub fn tally(&self) -> BodyTally {
+        self.recorder.bstats
+    }
+
+    /// The key of the body the last fire replayed (`None` till one has).
+    #[must_use]
+    pub fn replayed(&self) -> Option<&BodyKey> {
+        self.recorder.replayed.as_ref()
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> BodyStats {
         BodyStats {
@@ -872,12 +913,55 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// While `on`, a sealed fire states its composition eager by name
+    /// instead of declining it: arming fires a composition the allowance
+    /// left no room for once, sealed, to learn its key.
+    pub fn state_eager(&mut self, on: bool) {
+        self.recorder.stating = on;
+    }
+
+    /// The compositions stated eager at arming, by name, in a stable order.
+    #[must_use]
+    pub fn stated_eager(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .recorder
+            .stated
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Whether the load's arming sealed the bodies: from then on a fire is
+    /// a serving one.
+    #[must_use]
+    pub fn bodies_sealed(&self) -> bool {
+        self.map.sealed()
+    }
+
     /// Drops every recorded body and what was refused, unsealed: what the
     /// bodies captured (a kernel chosen for where a weight lay) no longer
     /// holds, and the lattice is armed again.
     pub fn forget_bodies(&mut self) {
         self.map = BodyMap::default();
         self.recorder.sealed_seen.clear();
+        self.recorder.stated.clear();
+    }
+
+    /// Drops the recorded bodies of bucket `bucket` (every kind) and what
+    /// was refused there, unsealed so they arm again; the other buckets'
+    /// stay armed. What a load's product choice re-arms where it timed a
+    /// choice over that bucket's rows (`Shell::routes_by_body`).
+    pub fn forget_bodies_at(&mut self, bucket: u32) {
+        self.map.forget_bucket(bucket);
+        self.recorder.sealed_seen.retain(|key| key.bucket != bucket);
+    }
+
+    /// Drops the one recorded body `key`: arming gives back the capture
+    /// that took the bodies past their allowance (`Shell::arm_target`).
+    pub fn forget_body(&mut self, key: &BodyKey) {
+        self.map.forget(key);
     }
 
     #[must_use]
@@ -904,20 +988,7 @@ impl Bodies {
         prepare.settle()?;
         crate::serve::btrace::mark("settle");
         let shape = run.schedule_shape();
-        let mut key = BodyKey::of_axes(
-            at.descriptor.table(poem_ir::RowAxis::Tokens),
-            at.descriptor.bucket,
-            at.decoding,
-            at.lane_ceiling,
-            at.tiers,
-            at.towered.then_some((
-                at.descriptor.table(poem_ir::RowAxis::Patches),
-                at.descriptor.patch_bucket,
-            )),
-        );
-        key.islands = at.islands.into();
-        key.rs = at.rs;
-
+        let key = at.key.clone();
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
         let (short, moved, empty) = match self.map.bodies.get(&key) {
@@ -970,7 +1041,9 @@ impl Bodies {
             let upto = REPLAY_UPTO.load(std::sync::atomic::Ordering::Relaxed);
             let from = REPLAY_FROM.load(std::sync::atomic::Ordering::Relaxed);
             let mut nth = 0usize;
-            for step in body.script.iter() {
+            for (index, step) in body.script.iter().enumerate() {
+                // The gate a walked step would have recorded, laid ahead of it.
+                let gates = body.gate_step == Some(index);
                 match step {
                     Step::Exec { exec, cut } => {
                         let launch = !at.eager_twin && nth >= from && nth < upto;
@@ -980,10 +1053,16 @@ impl Bodies {
                             exec.launch(at.stream)?;
                             crate::serve::btrace::mark("launch");
                         } else {
+                            if gates {
+                                lay_gate(run)?;
+                            }
                             walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                         }
                     }
                     Step::Island(cut) => {
+                        if gates {
+                            lay_gate(run)?;
+                        }
                         walk_capture_cut(at, run, place, Streams::Serial, *cut)?;
                     }
                 }
@@ -991,6 +1070,7 @@ impl Bodies {
             body.launched_at = at_seq;
             self.map.touch(&key);
             self.recorder.bstats.hits += 1;
+            self.recorder.replayed = Some(key);
             return Ok(());
         }
 
@@ -1009,10 +1089,21 @@ impl Bodies {
             && run.capturable()
             && (cold || (!refused && self.map.warmed(&key) + 1 >= WARM_FIRES));
         if !captures {
+            lay_gate(run)?;
             walk_capture(at, run, place, Streams::Warm)?;
         }
 
         if self.sealed_decline() {
+            // Stated at arming, or being stated: eager by statement.
+            if self.recorder.stating {
+                self.recorder.stated.insert(key.clone());
+                return Ok(());
+            }
+            if self.recorder.stated.contains(&key) {
+                self.recorder.bstats.stated_eager += 1;
+                return Ok(());
+            }
+            self.recorder.bstats.sealed_declines += 1;
             let declines = self.recorder.bstats.sealed_declines;
             if reports_decline(&mut self.recorder.sealed_seen, &key, declines) {
                 let why = if !self.map.bodies.contains_key(&key) {
@@ -1024,8 +1115,8 @@ impl Bodies {
                 } else {
                     "the resident body is empty"
                 };
-                eprintln!(
-                    "engine-cuda: WARNING: the sealed map holds no body for {key} ({why}) — \
+                tracing::warn!(
+                    "the sealed map holds no body for {key} ({why}) — \
                      this shape walks eagerly for the life of the load \
                      (BodyTally::sealed_declines counts each such fire; {declines} so far) {}",
                     self.body_stats()
@@ -1041,13 +1132,10 @@ impl Bodies {
         }
         if !run.capturable() {
             if warmed == WARM_FIRES {
-                eprintln!(
-                    "engine-cuda: body {key} declines to capture — a schedule it \
-                     built refused its graph form ({}), so `graph_capturable` \
-                     is false and this composition walks eagerly for good. The \
-                     prefill float grant is sized at the lattice's top rung in \
-                     `inputs::reserve` (`prefill_float_bytes`); a bucket that \
-                     outgrows it is this line.",
+                tracing::info!(
+                    "body {key} declines to capture ({}), so this \
+                     composition walks eagerly for good, each serving fire counted \
+                     unrecorded.",
                     run.uncapturable_why().join("; ")
                 );
             }
@@ -1072,9 +1160,34 @@ impl Bodies {
         let mut edges = 0;
         let mut islands = 0usize;
         let mut bytes: Option<usize> = Some(0);
-        for cut in script {
+        // The fold gate is laid by the first stretch that runs a kernel,
+        // recorded in its graph ahead of the stretch's own (or ahead of the
+        // island, where that stretch walks): a stretch of plan builds alone
+        // records nothing the gate's readers follow.
+        let prepare_only = |cut: &Stretch| {
+            (cut.from..cut.upto).all(|at_region| {
+                at.compiled
+                    .template()
+                    .get(at_region as usize)
+                    .is_some_and(|region| region.phase == poem_compiler::Phase::Prepare)
+            })
+        };
+        let gate_cut = run
+            .gates()
+            .then(|| {
+                script
+                    .iter()
+                    .position(|cut| cut.island || !prepare_only(cut))
+            })
+            .flatten();
+        let mut gate_step: Option<usize> = None;
+        for (index, cut) in script.into_iter().enumerate() {
+            let gates = gate_cut == Some(index);
             if cut.island {
                 islands += 1;
+                if gates {
+                    gate_step = Some(steps.len());
+                }
                 steps.push(Step::Island(cut));
                 continue;
             }
@@ -1083,6 +1196,9 @@ impl Bodies {
                     PTR_TAG.store(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 let captured = Graph::capture(at.stream, || {
+                    if gates {
+                        lay_gate(run)?;
+                    }
                     walk_capture_cut(at, run, place, Streams::Forked, cut)
                 });
                 PTR_TAG.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1113,28 +1229,35 @@ impl Bodies {
                 );
             }
             if graph.nodes() == Some(0) {
-                let prepare_only = (cut.from..cut.upto).all(|at_region| {
-                    at.compiled
-                        .template()
-                        .get(at_region as usize)
-                        .is_some_and(|region| region.phase == poem_compiler::Phase::Prepare)
-                });
-                if prepare_only {
+                if prepare_only(&cut) {
                     continue;
                 }
                 islands += 1;
+                if gates {
+                    gate_step = Some(steps.len());
+                }
                 steps.push(Step::Island(cut));
                 continue;
             }
-            let per_node = Recorder::node_price(&graph);
+            // What the instantiation holds on the device is what it took of
+            // the card's free bytes, landed: weighed as it is made, whatever
+            // the graph (one with conditional nodes holds one instantiation
+            // at a time, so no copies of it can be weighed apart).
+            let before = crate::device::free_bytes();
             let exec = graph.instantiate(at.stream)?;
+            crate::device::ctx::sync(at.stream)?;
             let took = exec.nodes();
-            bytes = match (bytes, per_node) {
-                (Some(held), Some(price)) => Some(held + took * price),
+            bytes = match (bytes, before, crate::device::free_bytes()) {
+                (Some(held), Some(before), Some(after)) => {
+                    Some(held + usize::try_from(before.saturating_sub(after)).unwrap_or(0))
+                }
                 _ => None,
             };
             nodes += took;
             edges += graph.edges().unwrap_or(0);
+            if gates {
+                gate_step = Some(steps.len());
+            }
             steps.push(Step::Exec { exec, cut });
         }
         // Every rank instantiated before any launches what it captured.
@@ -1179,6 +1302,7 @@ impl Bodies {
             key,
             Body {
                 script: steps.into_boxed_slice(),
+                gate_step,
                 grids,
                 shape,
                 bytes,
@@ -1190,11 +1314,7 @@ impl Bodies {
     }
 
     fn sealed_decline(&mut self) -> bool {
-        if !self.map.sealed() {
-            return false;
-        }
-        self.recorder.bstats.sealed_declines += 1;
-        true
+        self.map.sealed()
     }
 
     fn insert_body(&mut self, key: BodyKey, body: Body) -> bool {
@@ -1205,26 +1325,6 @@ impl Bodies {
     }
 }
 
-impl Recorder {
-    fn node_price(graph: &Graph) -> Option<usize> {
-        const COPIES: usize = 8;
-
-        static PRICE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        *PRICE.get_or_init(|| {
-            let nodes = graph.nodes().filter(|nodes| *nodes > 0)?;
-            let bytes = graph.instantiated_bytes(COPIES).ok()?;
-            let price = (bytes > 0.0).then(|| (bytes / nodes as f64).ceil() as usize);
-            if crate::serve::diag::on().arm_trace {
-                eprintln!(
-                    "[arm-trace] node price {price:?} B/node, weighed on a {nodes}-node graph \
-                     ({bytes:.0} B per instantiation over {COPIES} copies)"
-                );
-            }
-            price
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Seating {
     seated: bool,
@@ -1232,6 +1332,21 @@ struct Seating {
 }
 
 impl BodyMap {
+    fn forget_bucket(&mut self, bucket: u32) {
+        self.bodies.retain(|key, _| key.bucket != bucket);
+        self.body_order.retain(|key| key.bucket != bucket);
+        self.body_warm.retain(|key, _| key.bucket != bucket);
+        self.cold_refused.retain(|key| key.bucket != bucket);
+        self.bodies_refused.retain(|key| key.bucket != bucket);
+        self.sealed = false;
+    }
+
+    fn forget(&mut self, key: &BodyKey) {
+        self.bodies.remove(key);
+        self.body_order.retain(|held| held != key);
+        self.body_warm.remove(key);
+    }
+
     fn holds(&self, key: &BodyKey) -> bool {
         self.bodies.contains_key(key)
     }
@@ -1375,6 +1490,13 @@ impl<'a> Fire<'a> {
         }
         Cursor::new(place)
     }
+}
+
+/// The fire's fold gate (`Run::lay_gate`), on its stream: inside a capture,
+/// recorded as the first node of the stretch that lays it.
+fn lay_gate(run: &Run<'_>) -> Result<()> {
+    run.lay_gate()
+        .map_err(|error| crate::error::Fault::from(crate::error::kernel(error)))
 }
 
 fn walk_capture(at: &Fire<'_>, run: &mut Run<'_>, place: &At, streams: Streams) -> Result<()> {
@@ -1523,19 +1645,27 @@ mod tests {
 
     fn a_rung_is_the_keys_own_ceiling_and_arming_computes_the_same_one() {
         let decoding = poem_ir::ClassSet::of([0usize]);
-        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers());
+        let fired = BodyKey::of(&table(&[(3, 3)]), 8, &decoding, LANES, &plain_tiers(), None);
         assert_eq!(
             fired.to_string(),
             "b8[c0:4]",
             "the lane ceiling binds below the bucket, and three rows say nothing",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers()).to_string(),
+            BodyKey::of(&table(&[(3, 3)]), 2, &decoding, LANES, &plain_tiers(), None).to_string(),
             "b2[c0:2]",
             "and the bucket binds below the lane ceiling",
         );
         assert_eq!(
-            BodyKey::of(&table(&[(3, 3)]), 8, &prefill_only(), LANES, &plain_tiers()).to_string(),
+            BodyKey::of(
+                &table(&[(3, 3)]),
+                8,
+                &prefill_only(),
+                LANES,
+                &plain_tiers(),
+                None
+            )
+            .to_string(),
             "b8[c0:8]",
             "a class the decode arm does not name takes the bucket whole",
         );
@@ -1583,6 +1713,7 @@ mod tests {
                 island: true,
             })]
             .into_boxed_slice(),
+            gate_step: None,
             grids: Vec::new().into_boxed_slice(),
             shape: 0,
             launched_at: crate::settle::Airborne::NEVER,
@@ -1631,9 +1762,10 @@ mod tests {
     fn the_map_never_inserts_a_body_whose_script_is_empty() {
         let mut graphs = Bodies::new();
         let classes = table(&[(8, 1)]);
-        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers());
+        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES, &plain_tiers(), None);
         let empty = Body {
             script: Box::new([]),
+            gate_step: None,
             grids: Box::new([]),
             shape: 0,
             launched_at: crate::settle::Airborne::NEVER,

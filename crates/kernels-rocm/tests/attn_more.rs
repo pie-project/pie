@@ -445,10 +445,13 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         )
         .unwrap();
         built.stage(&ctx).unwrap();
-        let took = attn::prefill_selected_tiled(
-            &ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
-        )
-        .unwrap();
+        let took = gpu
+            .laid(&ctx, |ctx| {
+                attn::prefill_selected_tiled(
+                    ctx, q, &built, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
+                )
+            })
+            .unwrap();
         assert!(took, "the tiled selected prefill refused d{d} {hq}/{hk}");
         gpu.sync();
         let got = gpu.read(&o);
@@ -461,9 +464,11 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         got
     } else if walk == Decode {
         let mut o = o;
-        selected::attention_decode_selected(
-            &ctx, q, selection, &pool, None, d, scale, ratio, per_head, &mut o,
-        )
+        gpu.laid(&ctx, |ctx| {
+            selected::attention_decode_selected(
+                ctx, q, selection, &pool, None, d, scale, ratio, per_head, &mut o,
+            )
+        })
         .unwrap();
         let got = gpu.read(&o);
         spread(&mut |pool, mut o| {
@@ -475,9 +480,11 @@ fn check_selected(gpu: &Gpu, case: Sel) {
         got
     } else {
         let mut o = o;
-        selected::attention_prefill_selected(
-            &ctx, q, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
-        )
+        gpu.laid(&ctx, |ctx| {
+            selected::attention_prefill_selected(
+                ctx, q, selection, &pool, None, d, hk, scale, ratio, per_head, &mut o,
+            )
+        })
         .unwrap();
         let got = gpu.read(&o);
         spread(&mut |pool, mut o| {
@@ -678,14 +685,44 @@ fn score_capture_averages_the_observed_rows_mass() {
         },
     )
     .unwrap();
-    let (observe, lane_offset, kv_max) = (3u32, 1u32, 40u32);
+    // The context past a lane's keys and short of another's.
+    let (observe, lane_offset, context) = (3u32, 1u32, 40u32);
     let rows = lane_offset + n;
-    let mut scores = gpu.tensor(
-        &vec![9.0; (rows * hq * kv_max) as usize],
+    let page_rows = context.div_ceil(ps);
+    let scores = gpu.tensor(
+        &vec![9.0; (rows * context) as usize],
         rows,
-        hq * kv_max,
+        context,
         Dtype::F32,
     );
+    let paged = gpu.tensor(
+        &vec![0.0; (rows * page_rows) as usize],
+        rows,
+        page_rows,
+        Dtype::F32,
+    );
+    // Each capturing lane's key row and page row, as u64s; the lanes
+    // before them have no row.
+    let table = |base: u64, floats: u32| -> u64 {
+        let words: Vec<i32> = (0..rows)
+            .map(|lane| {
+                if lane < lane_offset {
+                    0
+                } else {
+                    base + u64::from(lane * floats) * 4
+                }
+            })
+            .flat_map(|at| [at as u32 as i32, (at >> 32) as u32 as i32])
+            .collect();
+        gpu.ints_shaped(&words, rows, 2).ptr
+    };
+    let table = kernels_rocm::attn::score::CaptureRows {
+        keys: table(scores.ptr, context),
+        pages: table(paged.ptr, page_rows),
+        lanes: rows,
+        context,
+        page_size: ps,
+    };
     let scale = 1.0 / (d as f32).sqrt();
     kernels_rocm::attn::score::capture(
         &ctx,
@@ -694,11 +731,12 @@ fn score_capture_averages_the_observed_rows_mass() {
         &pool,
         d,
         hk,
+        hq,
         scale,
         observe,
         lane_offset,
-        kv_max,
-        &mut scores,
+        table,
+        true,
     )
     .unwrap();
     let got = gpu.read(&scores);
@@ -709,7 +747,6 @@ fn score_capture_averages_the_observed_rows_mass() {
         &[],
         &[out(&scores)],
         |_, pools, _| {
-            let mut scores = scores;
             kernels_rocm::attn::score::capture(
                 &ctx,
                 q,
@@ -717,11 +754,12 @@ fn score_capture_averages_the_observed_rows_mass() {
                 &pools[0],
                 d,
                 hk,
+                hq,
                 scale,
                 observe,
                 lane_offset,
-                kv_max,
-                &mut scores,
+                table,
+                true,
             )
             .unwrap();
         },
@@ -730,8 +768,8 @@ fn score_capture_averages_the_observed_rows_mass() {
     for r in 0..n as usize {
         let kv = kv_lens[r] as usize;
         let rows = (observe as usize).min(fresh[r] as usize);
+        let mut want = vec![0f64; context as usize];
         for h in 0..hq as usize {
-            let mut want = vec![0f64; kv_max as usize];
             for w in 0..rows {
                 let t = qo[r + 1] as usize - rows + w;
                 let limit = (kv - rows + w + 1).min(kv);
@@ -748,27 +786,75 @@ fn score_capture_averages_the_observed_rows_mass() {
                 let m = s.iter().copied().fold(f64::MIN, f64::max);
                 let z: f64 = s.iter().map(|x| (x - m).exp()).sum();
                 for (j, x) in s.iter().enumerate() {
-                    if j < kv_max as usize {
-                        want[j] += (x - m).exp() / z / rows as f64;
+                    if j < context as usize {
+                        want[j] += (x - m).exp() / z / (rows * hq as usize) as f64;
                     }
                 }
             }
-            let at = ((lane_offset as usize + r) * hq as usize + h) * kv_max as usize;
-            let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
-            close_abs(
-                &format!("score req {r} head {h}"),
-                &got[at..at + kv_max as usize],
-                &want,
-                2e-5,
-            );
         }
+        let at = (lane_offset as usize + r) * context as usize;
+        let want: Vec<f32> = want.iter().map(|&x| x as f32).collect();
+        close_abs(
+            &format!("score req {r}"),
+            &got[at..at + context as usize],
+            &want,
+            2e-5,
+        );
     }
     // The lanes before the capture's keep what they held.
     assert!(
-        got[..(lane_offset * hq * kv_max) as usize]
+        got[..(lane_offset * context) as usize]
             .iter()
             .all(|&x| x == 9.0)
     );
+    // The first layer's capture zeroes the row (`agrees` left it poisoned),
+    // the next layer's adds into what it left, and its pages sum it.
+    for zero in [true, false] {
+        kernels_rocm::attn::score::capture(
+            &ctx,
+            q,
+            &built,
+            &pool,
+            d,
+            hk,
+            hq,
+            scale,
+            observe,
+            lane_offset,
+            table,
+            zero,
+        )
+        .unwrap();
+    }
+    kernels_rocm::attn::score::pages(&ctx, table, lane_offset, n).unwrap();
+    let summed = gpu.read(&scores);
+    // The capturing lanes' rows (`agrees` poisons the rest).
+    let capturing = (lane_offset * context) as usize..;
+    for (i, (s, g)) in summed[capturing.clone()]
+        .iter()
+        .zip(&got[capturing])
+        .enumerate()
+    {
+        assert!(
+            (s - 2.0 * g).abs() <= 4e-5,
+            "summed at {i}: {s} against {}",
+            2.0 * g
+        );
+    }
+    let pages = gpu.read(&paged);
+    for lane in lane_offset as usize..rows as usize {
+        let row = &summed[lane * context as usize..(lane + 1) * context as usize];
+        let want: Vec<f32> = row
+            .chunks(ps as usize)
+            .map(|page| page.iter().sum())
+            .collect();
+        close_abs(
+            &format!("pages of lane {lane}"),
+            &pages[lane * page_rows as usize..(lane + 1) * page_rows as usize],
+            &want,
+            1e-5,
+        );
+    }
 }
 
 // ------------------------------------------------------------- dynconv --
@@ -1004,15 +1090,20 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
     let Some(gpu) = Gpu::open() else { return };
     let ctx = gpu.ctx();
     // 64/128/256/512 run the wavefront entry, 96 the block entry; the
-    // wavefront entry also into e4m3 pages.
-    for (d, rotary, hnd, fp8) in [
-        (128u32, 128u32, false, false),
-        (64, 32, true, false),
-        (256, 256, false, false),
-        (512, 128, true, false),
-        (96, 64, true, false),
-        (128, 128, false, true),
-        (64, 32, true, true),
+    // wavefront entry also into e4m3 pages. v normed (Gemma's) or as it is
+    // (Qwen's weighted q and k).
+    for (d, rotary, hnd, fp8, v_norm) in [
+        (128u32, 128u32, false, false, true),
+        (64, 32, true, false, true),
+        (256, 256, false, false, true),
+        (512, 128, true, false, true),
+        (96, 64, true, false, true),
+        (128, 128, false, true, true),
+        (64, 32, true, true, true),
+        (128, 128, false, false, false),
+        (128, 128, true, false, false),
+        (96, 64, true, false, false),
+        (128, 128, false, true, false),
     ] {
         let (hq, hk, ps, rows) = (4u32, 2u32, 8u32, 5u32);
         let width = (hq + 2 * hk) * d;
@@ -1060,7 +1151,7 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                 Some(gpu.column(&positions)),
                 Some(gpu.tensor(&qw, 1, d, Dtype::Bf16)),
                 Some(gpu.tensor(&kw, 1, d, Dtype::Bf16)),
-                true,
+                v_norm,
                 eps,
                 &pool,
                 gpu.column(&w_page),
@@ -1162,7 +1253,9 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                     let at = kv_at(w_page[r] as usize, w_off[r] as usize, h);
                     let ks = &src[(hq as usize + h) * d_..(hq as usize + h + 1) * d_];
                     let vs = &src[((hq + hk) as usize + h) * d_..((hq + hk) as usize + h + 1) * d_];
-                    let tag = format!("fused d{d} hnd={hnd} win={win:?} row {r} kv head {h}");
+                    let tag = format!(
+                        "fused d{d} hnd={hnd} v_norm={v_norm} win={win:?} row {r} kv head {h}"
+                    );
                     kv_close(
                         &format!("{tag} fp8={fp8} k"),
                         &k[at..at + d_],
@@ -1173,7 +1266,11 @@ fn fused_qkv_norms_ropes_and_writes_the_kv_slot() {
                     kv_close(
                         &format!("{tag} fp8={fp8} v"),
                         &v[at..at + d_],
-                        &normed(vs, None),
+                        &if v_norm {
+                            normed(vs, None)
+                        } else {
+                            vs.to_vec()
+                        },
                         1.0,
                         1e-2,
                     );

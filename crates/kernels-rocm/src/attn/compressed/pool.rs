@@ -431,7 +431,7 @@ fn attend_pool(
                 num_heads: num_q_heads,
                 page_size: entries.page_size,
                 ratio,
-                splits: latent::splits(ctx, rows, num_q_heads, max_list),
+                splits: latent::splits(ctx.multiprocessors(op)?, rows, num_q_heads, max_list),
                 scale_log2: read.sm_scale * core::f32::consts::LOG2_E,
                 compact: i32::from(compact),
                 ..latent::Gather::default()
@@ -448,7 +448,7 @@ fn attend_pool(
             ),
         ));
     }
-    let g = naive::wave_group(num_q_heads, stated(op, rows)?);
+    let g = naive::wave_group(num_q_heads, stated(op, rows)?, ctx.multiprocessors(op)?);
     #[allow(clippy::cast_sign_loss)]
     let launch = Launch::grid(
         [rows, (num_q_heads / g).max(1) as u32, 1],

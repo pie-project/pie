@@ -97,7 +97,6 @@ async fn main(input: Input) -> Result<String> {
     let window = input.amateur_window.min(span);
     span.checked_add(window)
         .ok_or("amateur attention geometry exceeds the u32 range")?;
-    let stop_tokens = chat::stop_tokens();
     let lambda = input.lambda;
     let alpha = input.alpha;
 
@@ -126,7 +125,7 @@ async fn main(input: Input) -> Result<String> {
     let prefill = ForwardPass::new();
     prefill.embed(&prefill_prompt, &prefill_embed_indptr)?;
     prefill.mask(&prefill_mask)?;
-    prefill.state(&streams, StateGeometry::folding())?;
+    prefill.state(&streams, StateGeometry::default())?;
     prefill.epilogue(move || {
         let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
         let amateur = reshape(gather(&logits, iota(1)), [vocab]);
@@ -138,10 +137,10 @@ async fn main(input: Input) -> Result<String> {
     let first = read_expert_token(&first_out).await?;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
+    if !chat::is_stop(first) {
         generated.push(first);
     }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
+    if generated.len() >= input.max_tokens || chat::is_stop(first) {
         return model::decode(&generated);
     }
 
@@ -158,7 +157,7 @@ async fn main(input: Input) -> Result<String> {
     let decode = ForwardPass::new();
     decode.embed(&toks, &embed_indptr)?;
     decode.mask(&mask)?;
-    decode.state(&streams, StateGeometry::folding())?;
+    decode.state(&streams, StateGeometry::default())?;
     decode.epilogue(move || {
         let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
         let amateur = reshape(gather(&logits, iota(1)), [vocab]);
@@ -184,7 +183,7 @@ async fn main(input: Input) -> Result<String> {
     let budget = input.max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &decode, budget, async || {
         let token = read_expert_token(&out).await?;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);

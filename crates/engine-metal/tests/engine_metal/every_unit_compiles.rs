@@ -10,6 +10,7 @@ use engine_metal::device::{Context, Pipelines};
 
 #[test]
 fn every_unit_compiles() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("no Metal device; skipping");
         return;

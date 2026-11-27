@@ -20,6 +20,30 @@ use eta_ir::types::Dtype;
 
 use super::pie;
 
+/// Asked checkpoints, on a lane whose set shares nothing: refused, whichever
+/// of `state` and `checkpoints` comes second.
+const UNSHARED_CHECKPOINT: &str =
+    "a checkpoint on a set that shares nothing can never be resumed; ask share first";
+
+/// `final-rows` beside `parents`: a beam search keeps its rows buffered
+/// (`BEAM-PAGE-LISTS.md` §11.3), and reorders them every fire.
+const FINAL_BEAMS: &str = "final rows: a beam search's rows are not final; a pass binding \
+     `parents` states no final rows";
+
+/// A beam group on a model with windowed layers: its page lists name the
+/// beams' full-context pages alone, and a beam's windowed rows, which its
+/// parents cut, lie in a ring and buffer no list names. `None` where a pass
+/// binding `parents` (or not) may bind.
+const fn windowed_beams(binds_parents: bool, window_state: bool) -> Option<&'static str> {
+    if binds_parents && window_state {
+        return Some(
+            "forward pass state binds parents on a model with windowed layers; a beam group's \
+             page lists hold full-context rows alone. Give each beam a working set of its own",
+        );
+    }
+    None
+}
+
 type Anyhow<T> = anyhow::Result<T>;
 
 /// The rows or clip a channel bound to `input` carries, once its shape and dtype match it.
@@ -111,16 +135,10 @@ fn state_rebind_diff(existing: &StateBinding, next: &StateBinding) -> Option<&'s
     if existing.fold != next.fold {
         return Some("fold");
     }
+    if existing.parents != next.parents {
+        return Some("parents");
+    }
     None
-}
-
-fn first_repeat(reps: &[u32]) -> Option<(usize, usize)> {
-    reps.iter().enumerate().find_map(|(again, rep)| {
-        reps[..again]
-            .iter()
-            .position(|earlier| earlier == rep)
-            .map(|first| (first, again))
-    })
 }
 
 fn validate_descriptor_bindings(
@@ -275,11 +293,12 @@ async fn materialize_channel(
                 })?;
                 match state {
                     ChannelPoll::AwaitCompletion(fires) => {
+                        crate::pipeline::fire::tell_front_awaited(Some(&fires));
                         fires.await_front_completion().await;
                         continue;
                     }
                     ChannelPoll::Finalize(op) => {
-                        let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
+                        let finalized = crate::pipeline::fire::finalize_op_await(op).await;
                         accessor.with(|mut access| {
                             crate::pipeline::fire::complete_finalize(access.get(), finalized);
                         });
@@ -300,6 +319,7 @@ async fn materialize_channel(
             ChannelPoll::AwaitCompletion(_) => unreachable!("completion wait holds finalizer gate"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
+                crate::pipeline::fire::tell_front_awaited(fires.as_ref());
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
@@ -327,11 +347,12 @@ pub(crate) async fn materialize_channel_blocking(
                 let state = poll_channel(ctx, &this, mode, true, settle_ready_take)?;
                 match state {
                     ChannelPoll::AwaitCompletion(fires) => {
+                        crate::pipeline::fire::tell_front_awaited(Some(&fires));
                         fires.await_front_completion().await;
                         continue;
                     }
                     ChannelPoll::Finalize(op) => {
-                        let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
+                        let finalized = crate::pipeline::fire::finalize_op_await(op).await;
                         crate::pipeline::fire::complete_finalize(ctx, finalized);
                         settle_ready_take = false;
                         continue;
@@ -350,6 +371,7 @@ pub(crate) async fn materialize_channel_blocking(
             ChannelPoll::AwaitCompletion(_) => unreachable!("completion wait holds finalizer gate"),
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
+                crate::pipeline::fire::tell_front_awaited(fires.as_ref());
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
@@ -507,6 +529,8 @@ impl ProcessCtx {
             slots,
             kv_len,
             fold,
+            parents,
+            parents_end,
         } = geom;
         if lanes.is_empty() {
             return Ok(Err(
@@ -516,17 +540,53 @@ impl ProcessCtx {
         for lane in &lanes {
             let _ = self.ctx().table.get(lane)?;
         }
-        for channel in [&positions, &slots, &kv_len, &fold].into_iter().flatten() {
+        let window_state = crate::model::registered().is_some_and(|m| m.rs_caps().window_state);
+        if let Some(why) = windowed_beams(parents.is_some(), window_state) {
+            return Ok(Err(why.to_string()));
+        }
+        if parents.is_some() {
+            if lanes.windows(2).any(|pair| pair[0].rep() != pair[1].rep()) {
+                return Ok(Err(
+                    "forward pass state binds parents and its lanes name more than one working \
+                     set; a beam search's lanes share one, whose pool their page lists hold"
+                        .to_string(),
+                ));
+            }
+            if kv_len.is_some() || fold.is_some() {
+                return Ok(Err(
+                    "forward pass state binds parents beside kv-len or fold; a beam's rows read \
+                     their own pages to their own slot and fold nothing"
+                        .to_string(),
+                ));
+            }
+            if parents_end.is_none_or(|end| end == 0) {
+                return Ok(Err(
+                    "forward pass state binds parents with no parents-end; a beam group states \
+                     the slot past its search's last row, which its page lists are laid for"
+                        .to_string(),
+                ));
+            }
+        } else if parents_end.is_some() {
+            return Ok(Err(
+                "forward pass state states a parents-end with no parents; only a beam group \
+                 has a search's depth"
+                    .to_string(),
+            ));
+        }
+        for channel in [&positions, &slots, &kv_len, &fold, &parents]
+            .into_iter()
+            .flatten()
+        {
             let _ = self.ctx().table.get(channel)?;
         }
         let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
-        if crate::model::model().rs_caps().window_tokens > 0
-            && let Some((first, again)) = first_repeat(&reps)
+        if !self.ctx().table.get(&this)?.bindings.checkpoints.is_empty()
+            && self.shares_nothing(&reps)?
         {
-            return Ok(Err(format!(
-                "lanes {first} and {again} name the same working set; on a model whose \
-                 state is a window each lane needs a working set of its own"
-            )));
+            return Ok(Err(UNSHARED_CHECKPOINT.to_string()));
+        }
+        if parents.is_some() && self.ctx().table.get(&this)?.bindings.final_rows {
+            return Ok(Err(FINAL_BEAMS.to_string()));
         }
         let binding = StateBinding {
             lanes: reps,
@@ -534,6 +594,8 @@ impl ProcessCtx {
             slots: slots.map(|resource| resource.rep()),
             kv_len: kv_len.map(|resource| resource.rep()),
             fold: fold.map(|resource| resource.rep()),
+            parents: parents.map(|resource| resource.rep()),
+            parents_end,
         };
         let pass = self.ctx().table.get(&this)?;
         if pass.is_bound() {
@@ -582,6 +644,21 @@ impl ProcessCtx {
         Ok((kv, rs))
     }
 
+    /// Whether some lane's working set shares nothing (`working-set.share`).
+    fn shares_nothing(&mut self, lanes: &[u32]) -> Anyhow<bool> {
+        let (kv_lanes, _) = self.lane_parts(lanes)?;
+        for rep in kv_lanes {
+            let kv = super::working_set::kv_of(self, rep)?;
+            let stores = crate::store::registry::get(kv.model, kv.engine);
+            if !crate::store::registry::with_kv_lock(&stores.kv, "host-forward", |s| {
+                s.shares(kv.id)
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn core_checkpoints(
         &mut self,
         this: Resource<ForwardPass>,
@@ -589,11 +666,44 @@ impl ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         slots.sort_unstable();
         slots.dedup();
+        let lanes = self
+            .ctx()
+            .table
+            .get(&this)?
+            .bindings
+            .state
+            .as_ref()
+            .map(|s| s.lanes.clone());
+        if !slots.is_empty()
+            && let Some(lanes) = lanes
+            && self.shares_nothing(&lanes)?
+        {
+            return Ok(Err(UNSHARED_CHECKPOINT.to_string()));
+        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
         pass.bindings.checkpoints = slots;
+        Ok(Ok(()))
+    }
+
+    /// The pass states its sampled rows final (`forward.wit` `final-rows`,
+    /// CONTRACT-BC 25).
+    async fn core_final_rows(&mut self, this: Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if pass
+            .bindings
+            .state
+            .as_ref()
+            .is_some_and(|state| state.parents.is_some())
+        {
+            return Ok(Err(FINAL_BEAMS.to_string()));
+        }
+        pass.bindings.final_rows = true;
         Ok(Ok(()))
     }
 
@@ -916,9 +1026,15 @@ impl ProcessCtx {
             };
             if reads_state
                 && let Some(state) = &state
-                && [state.positions, state.slots, state.kv_len, state.fold]
-                    .iter()
-                    .any(Option::is_some)
+                && [
+                    state.positions,
+                    state.slots,
+                    state.kv_len,
+                    state.fold,
+                    state.parents,
+                ]
+                .iter()
+                .any(Option::is_some)
             {
                 return Ok(Err(
                     "this pass's lanes read no kv cache: each fire folds one slot of their \
@@ -1058,13 +1174,54 @@ impl ProcessCtx {
             )
         };
         {
-            let prog = match crate::pipeline::program::register(container_bytes, readouts) {
+            let t0 = crate::rt::Instant::now();
+            // A pass over the kv registers one program for every prompt
+            // length: its per-row channels are declared at the rows one fire
+            // binds (`model.max-pass-rows()`). A float pass counts its rows
+            // from its channels' lengths, so keeps them.
+            let rows = match float {
+                Some(_) => None,
+                None => Some(
+                    u32::try_from(crate::engine::get_spec(0)?.limits.max_forward_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+            };
+            let prog = match crate::pipeline::program::register(
+                container_bytes,
+                readouts,
+                Some(self.id()),
+                rows,
+            ) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
+            let t_register = t0.elapsed();
             crate::inferlet::process::ensure_bind_admitted(self).await;
 
             let decls = prog.bound.container.channels.clone();
+            // Each channel as this instance carries it: a row-extent channel
+            // (declared at the program's row bound) at its own rows, which
+            // the host resolves its ports from; the rest as declared. Its
+            // engine cell is the bound wide (`ChannelRegistration` below),
+            // its seed fitted to it (`program::fit_row_extent`).
+            let mut attached = decls.clone();
+            for (dense, ch) in channels.iter().enumerate() {
+                if !prog.row_extents.get(dense).copied().unwrap_or(false) {
+                    continue;
+                }
+                let cell = self.ctx().table.get(ch)?.cell.clone();
+                let shape = cell.lock().unwrap().shape.clone();
+                let [len] = shape[..] else {
+                    return Ok(Err(format!(
+                        "pipeline: channel {dense} binds a per-row port with shape {shape:?}, \
+                         not a vector"
+                    )));
+                };
+                if let Some(decl) = attached.get_mut(dense) {
+                    decl.shape = eta_ir::types::Shape::vector(len);
+                }
+                cell.lock().unwrap().row_extent = true;
+            }
             let extern_bindings = decls
                 .iter()
                 .enumerate()
@@ -1099,6 +1256,7 @@ impl ProcessCtx {
                 (Port::KvLen, geometry(|state| state.kv_len)),
                 (Port::AttnMask, mask),
                 (Port::Fold, geometry(|state| state.fold)),
+                (Port::Parents, geometry(|state| state.parents)),
                 (Port::Readout, readout),
             ];
             if let Err(error) =
@@ -1145,7 +1303,7 @@ impl ProcessCtx {
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
-                    if let Err(e) = c.validate_attachment(&decls[i], writes(i), extern_binding) {
+                    if let Err(e) = c.validate_attachment(&attached[i], writes(i), extern_binding) {
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
@@ -1180,107 +1338,79 @@ impl ProcessCtx {
                 Some(&rep) => super::working_set::kv_of(self, rep)?.engine,
                 None => crate::planner::engine_of(self.id()),
             };
-            let (devgeo, decode_envelope, geometry_class) = if float.is_none() {
-                let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
-                let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
-                    matches!(binding.port, eta_ir::registry::Port::AttnMask)
-                        && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
-                });
-                let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
-                    && (!needs_mask_port
-                        || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
+            // The class is chosen once, here; a pass whose program is
+            // host-evaluated says why, by name, and its fires are counted; one
+            // whose device class the engine cannot read is refused by name
+            // (`pipeline::fire::host_geometry`).
+            let (devgeo, decode_envelope, geometry_class, host_geometry) = if float.is_none() {
+                use crate::pipeline::fire::{geometry as fire_geometry, host_geometry};
+                let spec = crate::engine::get_spec(engine)?;
                 let taint = prog.geometry_taint();
-                let devgeo = if !taint.host_derivable() {
-                    match crate::pipeline::fire::geometry::detect_pooled_device_geometry(
-                        &prog.bound.container,
-                    ) {
-                        Some(_) if !devgeo_capable => {
-                            tracing::info!(
-                                "device-geometry program on an engine without device geometry \
-                                 ports (mask {device_port_mask:?}): falling back to \
-                                 host-evaluated serialized execution"
-                            );
-                            None
-                        }
-                        // A program the decode envelope covers runs ahead: its
-                        // pages and write slots are the host's, so the next fire
-                        // is staged while this one runs. Device geometry reads
-                        // every descriptor port back from the device before it
-                        // stages, so it is only the pass for programs the
-                        // envelope declines.
-                        Some(_)
-                            if envelope_runs_ahead(
-                                &prog.bound.container,
-                                taint,
-                                device_port_mask,
-                            ) =>
-                        {
-                            None
-                        }
-                        Some(qo_indptr) => {
-                            tracing::info!(
-                                "device-carried decode ({} lane(s), {} row(s)) re-publishes \
-                                 where its rows land: executes as a device-geometry pass",
-                                qo_indptr.len().saturating_sub(1),
-                                qo_indptr.last().copied().unwrap_or(0)
-                            );
-                            Some(qo_indptr)
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
+                let host_derivable = taint.host_derivable();
+                let mut why = String::new();
+                let program = host_geometry::ProgramGeometry {
+                    host_derivable,
+                    pooled: if host_derivable {
+                        None
+                    } else {
+                        fire_geometry::detect_pooled_device_geometry(&prog.bound.container)
+                    },
+                    envelope: if host_derivable {
+                        Ok(None)
+                    } else {
+                        fire_geometry::classify_decode_envelope_why(
+                            &prog.bound.container,
+                            taint,
+                            &mut why,
+                        )
+                    },
+                    why,
+                    needs_mask_port: prog.bound.container.ports.iter().any(|binding| {
+                        matches!(binding.port, eta_ir::registry::Port::AttnMask)
+                            && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
+                    }),
                 };
-                let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
-                    None
-                } else {
-                    let mut why = String::new();
-                    match crate::pipeline::fire::geometry::classify_decode_envelope_why(
-                        &prog.bound.container,
-                        taint,
-                        &mut why,
-                    ) {
-                        Ok(Some(required)) => {
-                            if device_port_mask.covers(required) {
-                                Some(required)
-                            } else {
-                                tracing::info!(
-                                    "decode envelope on an engine without device geometry ports \
-                                     (mask {device_port_mask:?}, needs {required:?}): falling \
-                                     back to host-evaluated serialized execution"
-                                );
-                                None
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::info!(
-                                "not a decode envelope: {why}; falling back to host-evaluated \
-                                 execution"
-                            );
-                            None
-                        }
-                        Err(reason) => {
-                            tracing::warn!(
-                                "device-dependent geometry is not a decode envelope \
-                                 ({reason}); falling back to host-evaluated execution — fires \
-                                 block loudly on values the host cannot derive"
-                            );
-                            None
-                        }
-                    }
+                let bound = match host_geometry::classify(
+                    program,
+                    spec.device_geometry_port_mask,
+                    spec.kind,
+                ) {
+                    Ok(bound) => bound,
+                    Err(lacks) => return Ok(Err(lacks.refusal(prog.hash))),
                 };
-                let geometry_class = if devgeo.is_some() {
-                    GeometryClass::DeviceGeometry
-                } else if decode_envelope.is_some() {
-                    GeometryClass::DecodeEnvelope
-                } else {
-                    GeometryClass::Host
-                };
-                (devgeo, decode_envelope, geometry_class)
+                if let Some(qo_indptr) = &bound.devgeo {
+                    tracing::info!(
+                        "device-carried decode ({} lane(s), {} row(s)) re-publishes \
+                         where its rows land: executes as a device-geometry pass",
+                        qo_indptr.len().saturating_sub(1),
+                        qo_indptr.last().copied().unwrap_or(0)
+                    );
+                }
+                let counted = bound.host.as_ref().map(|host| {
+                    tracing::info!("{}", host.bind_message(prog.hash));
+                    host_geometry::counter(host_geometry::FireKey {
+                        engine,
+                        kind: spec.kind,
+                        program: prog.hash,
+                    })
+                });
+                (bound.devgeo, bound.decode_envelope, bound.class, counted)
             } else {
-                (None, None, GeometryClass::Host)
+                (None, None, GeometryClass::Host, None)
             };
 
+            // A row-extent channel's engine cell is the program's, the bound
+            // wide: only the host, resolving the geometry from the
+            // instance's own rows, reads them.
+            if geometry_class != GeometryClass::Host && prog.row_extents.contains(&true) {
+                return Ok(Err(format!(
+                    "pipeline: program 0x{:016x} declares its per-row channels at the {} rows \
+                     one fire binds, and binds in {geometry_class:?} geometry, which reads them \
+                     on the device",
+                    prog.hash, prog.row_bound
+                )));
+            }
+            let t_geometry = t0.elapsed();
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
                 let extern_binding = extern_bindings[dense]
@@ -1288,7 +1418,7 @@ impl ProcessCtx {
                     .map(|(name, dir)| (name.as_str(), *dir));
                 if let Err(error) = cell.lock().unwrap().attach(
                     instance_id,
-                    &decls[dense],
+                    &attached[dense],
                     writes(dense),
                     extern_binding,
                 ) {
@@ -1317,6 +1447,7 @@ impl ProcessCtx {
                     extern_name: extern_binding
                         .map(|(name, _)| name.as_bytes().to_vec())
                         .unwrap_or_default(),
+                    slots: Vec::new(),
                 });
             }
             let channel_ids: Vec<::engine::ChannelId> =
@@ -1328,6 +1459,7 @@ impl ProcessCtx {
                 reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
+            let t_launch = t0.elapsed();
             let pricing_rows = prog.pricing.rows;
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
@@ -1348,6 +1480,11 @@ impl ProcessCtx {
                     let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                     crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);
                     packed
+                } else if prog.row_extents.get(dense).copied().unwrap_or(false) {
+                    // The instance keeps its own rows; its engine cell is the
+                    // program's row bound wide.
+                    let elem = eta_ir::container::const_elem_size(cell.dtype);
+                    crate::pipeline::program::fit_row_extent(bytes, elem, prog.row_bound)
                 } else {
                     bytes
                 };
@@ -1362,8 +1499,20 @@ impl ProcessCtx {
                 seeds: instance_seeds,
             };
             let process_id = self.id();
-            let (registered, bound_instance, scheduler) =
-                match crate::scheduler::register_channels_bind_classified(
+            // A beam group's depth (`parents-end`): its page lists are laid
+            // for it at the bind, as the most keys a lane reads.
+            let beam_end = self
+                .ctx()
+                .table
+                .get(&this)?
+                .bindings
+                .state
+                .as_ref()
+                .and_then(|state| state.parents_end);
+            let (registered, bound_instance, scheduler) = match crate::inferlet::process::said(
+                "bind",
+                process_id,
+                crate::scheduler::register_channels_bind_classified(
                     engine,
                     Some(process_id),
                     registration_plans,
@@ -1372,23 +1521,31 @@ impl ProcessCtx {
                     seed_values,
                     geometry_class,
                     ::engine::BindExtents {
+                        // The rows the instance reads: a beam group's
+                        // instance reads its beams' rows, one a lane.
                         sampled_rows: pricing_rows.max(1),
+                        key_len: beam_end.unwrap_or(::engine::BindExtents::default().key_len),
                         ..::engine::BindExtents::default()
                     },
                     // The ports the program computes on the device: the
                     // engine's to resolve, and no others.
                     decode_envelope.unwrap_or(PortMask::NONE),
-                )
-                .await
-                {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        for attached in &cells {
-                            attached.lock().unwrap().detach(instance_id);
-                        }
-                        return Ok(Err(format!("pipeline: register+bind: {error:#}")));
+                    // A float pass reads out every row it embeds, through the
+                    // engine's readout landing: no store bounds its bind.
+                    float.is_some(),
+                ),
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    for attached in &cells {
+                        attached.lock().unwrap().detach(instance_id);
                     }
-                };
+                    return Ok(Err(format!("pipeline: register+bind: {error:#}")));
+                }
+            };
+            let t_bind = t0.elapsed();
             if registered.len() != missing_dense.len() {
                 let _ = scheduler
                     .close_instance(bound_instance.instance_id, bound_instance.pacing_wait_id);
@@ -1431,6 +1588,17 @@ impl ProcessCtx {
                 instance.program.shadow_plan(),
                 &instance.seeds,
             );
+            tracing::debug!(
+                target: "pie::launch",
+                process = %process_id,
+                program = format_args!("0x{:016x}", instance.program.hash),
+                register_us = t_register.as_micros() as u64,
+                geometry_us = (t_geometry - t_register).as_micros() as u64,
+                launch_us = (t_launch - t_geometry).as_micros() as u64,
+                bind_us = (t_bind - t_launch).as_micros() as u64,
+                shadow_us = (t0.elapsed() - t_bind).as_micros() as u64,
+                "pass bound"
+            );
             let bound = BoundForwardPass {
                 instance,
                 bound_instance,
@@ -1444,6 +1612,7 @@ impl ProcessCtx {
                 failed: None,
                 devgeo,
                 decode_envelope,
+                host_geometry,
                 host_shadow,
                 facts,
                 float,
@@ -1482,6 +1651,121 @@ impl pie::inferlet::forward::Host for ProcessCtx {
     }
 }
 
+impl ProcessCtx {
+    /// A beam search's finish (`forward.wit` `adopt-beam`,
+    /// `BEAM-PAGE-LISTS.md` §6.6): beam `beam`'s page list read from the
+    /// pass's instance (behind its fires, on the engine's lane), then its
+    /// working set's pages past `f0` re-listed to it, kv and (on a hybrid)
+    /// recurrent rows alike, up to slot `end`.
+    async fn core_adopt_beam(
+        &mut self,
+        this: Resource<ForwardPass>,
+        beam: u32,
+        end: u32,
+    ) -> Anyhow<Result<(), String>> {
+        let (instance, scheduler, kv_rep, rs_rep) = {
+            let pass = self.ctx().table.get(&this)?;
+            if pass
+                .bindings
+                .state
+                .as_ref()
+                .and_then(|state| state.parents)
+                .is_none()
+            {
+                return Ok(Err(
+                    "adopt-beam: the pass binds no parents (it runs no beam group)".to_string(),
+                ));
+            }
+            let bound = match pass.bound() {
+                Ok(bound) => bound,
+                Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+            };
+            (
+                bound.bound_instance.instance_id,
+                bound.scheduler.clone(),
+                bound.kv_lanes.first().copied(),
+                bound.rs_ws.first().copied(),
+            )
+        };
+        let Some(kv_rep) = kv_rep else {
+            return Ok(Err(
+                "adopt-beam: the pass's lanes name no working set".to_string()
+            ));
+        };
+        let kv: crate::store::kv::working_set::KvWorkingSet = self
+            .ctx()
+            .table
+            .get(&Resource::<crate::store::kv::working_set::KvWorkingSet>::new_borrow(kv_rep))?
+            .clone();
+        let bytes = match scheduler
+            .host_kv(crate::scheduler::worker::HostKvOp::BeamList(instance, beam))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(Err(format!("adopt-beam: beam {beam}'s page list: {error}"))),
+        };
+        let list: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        let stores = crate::store::registry::get(kv.model, kv.engine);
+        let page = stores.kv_page_size.max(1);
+        let folded =
+            match crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |s| {
+                s.folded(kv.id)
+            }) {
+                Ok(folded) => u32::try_from(folded).unwrap_or(u32::MAX),
+                Err(error) => return Ok(Err(format!("adopt-beam: {error}"))),
+            };
+        let f0 = folded / page;
+        if end <= f0 * page {
+            return Ok(Err(format!(
+                "adopt-beam: the search ends at slot {end}, below its first page's {}",
+                f0 * page
+            )));
+        }
+        let columns = ((end - 1) / page - f0 + 1) as usize;
+        let Some(order) = list.get(..columns) else {
+            return Ok(Err(format!(
+                "adopt-beam: the search's {columns} column(s) pass beam {beam}'s list of {}",
+                list.len()
+            )));
+        };
+        let order = order.to_vec();
+        if let Err(error) = crate::pipeline::fire::relist_beam(
+            self,
+            kv.model,
+            kv.engine,
+            kv.id,
+            Some(kv.suspend_handle()),
+            u64::from(f0),
+            &order,
+        )
+        .await
+        {
+            return Ok(Err(format!("adopt-beam: kv: {error}")));
+        }
+        if let Some(rs_rep) = rs_rep {
+            let rs: crate::store::rs::working_set::RsWorkingSet = self
+                .ctx()
+                .table
+                .get(&Resource::<crate::store::rs::working_set::RsWorkingSet>::new_borrow(rs_rep))?
+                .clone();
+            if let Err(error) = stores
+                .rs
+                .lock()
+                .unwrap()
+                .relist_beam(rs.id, f0, page, &order, end)
+            {
+                return Ok(Err(format!("adopt-beam: recurrent rows: {error}")));
+            }
+        }
+        Ok(Ok(()))
+    }
+}
+
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
         self.core_new().await
@@ -1502,6 +1786,10 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         slots: Vec<u32>,
     ) -> Anyhow<Result<(), String>> {
         self.core_checkpoints(this, slots).await
+    }
+
+    async fn final_rows(&mut self, this: Resource<ForwardPass>) -> Anyhow<Result<(), String>> {
+        self.core_final_rows(this).await
     }
 
     async fn media(
@@ -1572,6 +1860,15 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         self.core_group(this, lane, id).await
     }
 
+    async fn adopt_beam(
+        &mut self,
+        this: Resource<ForwardPass>,
+        beam: u32,
+        end: u32,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_adopt_beam(this, beam, end).await
+    }
+
     async fn mask(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1595,7 +1892,7 @@ fn lane_index(lane: u32) -> Result<usize, String> {
 }
 
 /// An output as a program reads it: an i32 output as i32, any float one f32.
-fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::OutputDecl {
+pub(crate) fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::OutputDecl {
     use eta_ir::registry::Axis;
     eta_ir::registry::OutputDecl {
         name: output.name.clone(),
@@ -1611,21 +1908,6 @@ fn eta_output(output: &poem_ir::OutputDecl) -> eta_ir::registry::OutputDecl {
         },
         layers: output.layers,
         readout: output.readout,
-    }
-}
-
-/// Whether the decode envelope classifies `container` and the engine reads
-/// every port that envelope requires from the device.
-fn envelope_runs_ahead(
-    container: &eta_ir::container::TraceContainer,
-    taint: &eta_compiler::eval::pareval::GeometryTaint,
-    device_port_mask: PortMask,
-) -> bool {
-    let mut why = String::new();
-    match crate::pipeline::fire::geometry::classify_decode_envelope_why(container, taint, &mut why)
-    {
-        Ok(Some(required)) => device_port_mask.covers(required),
-        Ok(None) | Err(_) => false,
     }
 }
 
@@ -1728,6 +2010,169 @@ mod tests {
         assert_eq!(input_rows(&[bound("timestep", None)]), Ok(None));
     }
 
+    /// Only a beam group on a windowed model is refused at its bind: a
+    /// group on a full-context one, and any other pass, binds.
+    #[test]
+    fn a_beam_group_on_a_windowed_model_is_refused_at_the_bind() {
+        use super::windowed_beams;
+        assert!(windowed_beams(true, true).is_some_and(|why| why.contains("windowed layers")));
+        assert!(windowed_beams(true, false).is_none());
+        assert!(windowed_beams(false, true).is_none());
+    }
+
+    /// An asked checkpoint on a set that shares nothing is refused by name,
+    /// whichever of `state` and `checkpoints` comes second; on a set that
+    /// shares it is taken, and asking none is no fault.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_checkpoint_on_a_set_that_shares_nothing_is_refused() -> anyhow::Result<()> {
+        use super::*;
+        use crate::store::kv::working_set::KvWorkingSet;
+        let model = crate::store::registry::register_model(16, &[8], &[1]);
+        let stores = crate::store::registry::get(model, 0);
+        let mut context = ProcessCtx::new(
+            uuid::Uuid::new_v4(),
+            crate::inferlet::process::OutputMode::Discard,
+            &crate::inferlet::sandbox::InstancePolicy::deny_all(),
+            None,
+        )
+        .await?;
+        let lane = |context: &mut ProcessCtx, shared: bool| -> anyhow::Result<u32> {
+            let id = {
+                let mut kv = stores.kv.lock();
+                let id = kv.create_working_set();
+                if shared {
+                    kv.share(id, crate::policy::share::test_tenant())
+                        .map_err(anyhow::Error::msg)?;
+                }
+                id
+            };
+            let kv = context
+                .ctx()
+                .table
+                .push(KvWorkingSet::new(model, 0, id, 16))?
+                .rep();
+            Ok(context
+                .ctx()
+                .table
+                .push(WorkingSet {
+                    kv,
+                    rs: None,
+                    cursor: Default::default(),
+                })?
+                .rep())
+        };
+        let geom = || pie::inferlet::forward::StateGeometry {
+            positions: None,
+            slots: None,
+            kv_len: None,
+            fold: None,
+            parents: None,
+            parents_end: None,
+        };
+        let refused = Err(UNSHARED_CHECKPOINT.to_string());
+        let bind = |context: &mut ProcessCtx, pass: u32, ws: u32| -> anyhow::Result<()> {
+            let pass: Resource<ForwardPass> = Resource::new_borrow(pass);
+            context.ctx().table.get_mut(&pass)?.bindings.state = Some(StateBinding {
+                lanes: vec![ws],
+                positions: None,
+                slots: None,
+                kv_len: None,
+                fold: None,
+                parents: None,
+                parents_end: None,
+            });
+            Ok(())
+        };
+        for shared in [false, true] {
+            let want = if shared { Ok(()) } else { refused.clone() };
+            // The state first, then the ask.
+            let ws = lane(&mut context, shared)?;
+            let pass = context.ctx().table.push(ForwardPass::default())?.rep();
+            bind(&mut context, pass, ws)?;
+            let none = context
+                .core_checkpoints(Resource::new_borrow(pass), Vec::new())
+                .await?;
+            assert_eq!(none, Ok(()), "asking none is no fault");
+            let asked = context
+                .core_checkpoints(Resource::new_borrow(pass), vec![16])
+                .await?;
+            assert_eq!(asked, want, "shared: {shared}");
+        }
+        // The ask first, then the state: refused at the state.
+        let ws = lane(&mut context, false)?;
+        let pass = context.ctx().table.push(ForwardPass::default())?.rep();
+        let asked = context
+            .core_checkpoints(Resource::new_borrow(pass), vec![16])
+            .await?;
+        assert_eq!(asked, Ok(()), "no lane bound yet");
+        let bound = context
+            .core_state(
+                Resource::new_borrow(pass),
+                vec![Resource::new_borrow(ws)],
+                geom(),
+            )
+            .await?;
+        assert_eq!(bound, refused);
+        Ok(())
+    }
+
+    /// A pass states its rows final only by `final-rows` (CONTRACT-BC 25):
+    /// the SDKs send it on every pass not declared retractable, so a default
+    /// pass reaches the fire final and a retractable one (which sends
+    /// nothing) lagged; the runtime infers nothing from the pass. Refused
+    /// once the program is attached, and on a pass binding `parents` (a
+    /// beam) by name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_is_final_only_by_its_statement() -> anyhow::Result<()> {
+        use super::*;
+        let mut context = ProcessCtx::new(
+            uuid::Uuid::new_v4(),
+            crate::inferlet::process::OutputMode::Discard,
+            &crate::inferlet::sandbox::InstancePolicy::deny_all(),
+            None,
+        )
+        .await?;
+        let final_of = |context: &mut ProcessCtx, pass: u32| -> anyhow::Result<bool> {
+            let pass: Resource<ForwardPass> = Resource::new_borrow(pass);
+            Ok(context.ctx().table.get(&pass)?.bindings.final_rows)
+        };
+        // The SDK's default: stated, so final.
+        let stated = context.ctx().table.push(ForwardPass::default())?.rep();
+        assert_eq!(
+            context
+                .core_final_rows(Resource::new_borrow(stated))
+                .await?,
+            Ok(())
+        );
+        assert!(final_of(&mut context, stated)?, "a default pass is final");
+        // `retractable`: nothing sent, so lagged.
+        let retractable = context.ctx().table.push(ForwardPass::default())?.rep();
+        assert!(
+            !final_of(&mut context, retractable)?,
+            "a retractable pass is not"
+        );
+        // A beam's pass binds `parents`: refused by name, left lagged.
+        let beam = context.ctx().table.push(ForwardPass::default())?.rep();
+        {
+            let pass: Resource<ForwardPass> = Resource::new_borrow(beam);
+            context.ctx().table.get_mut(&pass)?.bindings.state = Some(StateBinding {
+                lanes: Vec::new(),
+                positions: None,
+                slots: None,
+                kv_len: None,
+                fold: None,
+                parents: Some(1),
+                parents_end: None,
+            });
+        }
+        assert_eq!(
+            context.core_final_rows(Resource::new_borrow(beam)).await?,
+            Err(FINAL_BEAMS.to_string())
+        );
+        assert!(!final_of(&mut context, beam)?);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_ready_take_keeps_pending_kv_for_teardown() -> anyhow::Result<()> {
         use super::*;
@@ -1818,6 +2263,8 @@ mod tests {
             slots: None,
             kv_len: Some(4),
             fold: Some(6),
+            parents: None,
+            parents_end: None,
         };
         let forks = StateBinding {
             lanes: vec![7, 8],

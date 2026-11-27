@@ -161,34 +161,41 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
                 .iter()
                 .map(|&e| 2f32.powi(i32::from(e) - 127))
                 .collect();
-            let (q, s) = act_quant::quantized_codes(
-                &ctx,
-                "linear.matmul",
-                gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
-                128,
-                true,
-                1,
-            )
-            .unwrap();
-            act_quant::matmul_fp8_quantized(
-                &ctx,
-                "linear.matmul",
-                q,
-                s,
-                wt,
-                gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32),
-                &mut y,
-            )
+            let (q, s) = gpu
+                .laid(&ctx, |ctx| {
+                    act_quant::quantized_codes(
+                        ctx,
+                        "linear.matmul",
+                        gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+                        128,
+                        true,
+                        1,
+                    )
+                })
+                .unwrap();
+            gpu.laid(&ctx, |ctx| {
+                act_quant::matmul_fp8_quantized(
+                    ctx,
+                    "linear.matmul",
+                    q,
+                    s,
+                    wt,
+                    gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32),
+                    &mut y,
+                )
+            })
             .unwrap();
         } else {
-            act_quant::matmul_fp8b32_lanes(
-                &ctx,
-                "linear.matmul",
-                gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
-                wt,
-                gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
-                &mut y,
-            )
+            gpu.laid(&ctx, |ctx| {
+                act_quant::matmul_fp8b32_lanes(
+                    ctx,
+                    "linear.matmul",
+                    gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+                    wt,
+                    gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
+                    &mut y,
+                )
+            })
             .unwrap();
         }
         let (cdna4, weight) = (mfma_truncates(), &w);
@@ -210,16 +217,18 @@ fn run_fp8b_on(m: usize, n: usize, k: usize, tile_holds: bool, side: usize, lane
         }
         return;
     }
-    act_quant::matmul_fp8b128(
-        &ctx,
-        "linear.matmul",
-        gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
-        gpu.upload(&codes, n as u32, k as u32, Dtype::E4m3),
-        gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
-        side as u32,
-        tile_holds,
-        &mut y,
-    )
+    gpu.laid(&ctx, |ctx| {
+        act_quant::matmul_fp8b128(
+            ctx,
+            "linear.matmul",
+            gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+            gpu.upload(&codes, n as u32, k as u32, Dtype::E4m3),
+            gpu.upload(&exps, nb as u32, kb as u32, Dtype::E8m0),
+            side as u32,
+            tile_holds,
+            &mut y,
+        )
+    })
     .unwrap();
     close_abs(
         &format!("fp8b{side} m{m} n{n} k{k} tile {tile_holds}"),
@@ -455,14 +464,16 @@ fn run_fp8_mfma_tuned(m: usize, n: usize, k: usize, edge_codes: bool, tall: usiz
     let wt = gpu.upload(&codes, n as u32, k as u32, Dtype::E4m3);
     let (wt, nans) = canonical(&gpu, wt, n, k);
     assert_eq!(nans, 0);
-    act_quant::matmul_fp8(
-        &ctx,
-        "linear.matmul",
-        gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
-        wt,
-        gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32),
-        &mut y,
-    )
+    gpu.laid(&ctx, |ctx| {
+        act_quant::matmul_fp8(
+            ctx,
+            "linear.matmul",
+            gpu.tensor(&x, m as u32, k as u32, Dtype::Bf16),
+            wt,
+            gpu.tensor(&factors, nb as u32, kb as u32, Dtype::F32),
+            &mut y,
+        )
+    })
     .unwrap();
     let got = gpu.read(&y);
     let big = want.iter().fold(0f32, |a, v| a.max(v.abs()));
@@ -548,23 +559,25 @@ fn an_fp8_bank_on_the_matrix_core_folds_each_route() {
         let ct = gpu.upload(&codes, experts as u32, (n * k) as u32, Dtype::U8);
         let (ct, nans) = canonical(&gpu, ct, experts * n, k);
         assert_eq!(nans, 0);
-        moe::matmul_select_fp8_mfma(
-            &ctx,
-            xt,
-            ct,
-            gpu.upload(
-                &factors
-                    .iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-                experts as u32,
-                (4 * nb * kb) as u32,
-                Dtype::U8,
-            ),
-            gpu.ints_shaped(&routes, tokens as u32, top_k as u32),
-            &mut y,
-            moe::ExpertTable::RESIDENT,
-        )
+        gpu.laid(&ctx, |ctx| {
+            moe::matmul_select_fp8_mfma(
+                ctx,
+                xt,
+                ct,
+                gpu.upload(
+                    &factors
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                    experts as u32,
+                    (4 * nb * kb) as u32,
+                    Dtype::U8,
+                ),
+                gpu.ints_shaped(&routes, tokens as u32, top_k as u32),
+                &mut y,
+                moe::ExpertTable::RESIDENT,
+            )
+        })
         .unwrap();
         let got = gpu.read(&y);
         let mut big = 0f32;

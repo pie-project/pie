@@ -176,6 +176,16 @@ mod tests {
         assert!(of("[cerebras]\nprogram = \"p\"\n").is_err());
         assert!(of("[cerebras.wafer]\nbuild = \"sometimes\"\n").is_err());
         assert!(of("[cerebras.debug]\nposted_loop = 4\n").is_err());
+        // No serving switch: a token loop is posted, bounded by the lane's
+        // pages and as long as the program's plan states.
+        for gone in [
+            "[cerebras]\nposted_loop = 4\n",
+            "[cerebras.debug]\nforce_prompt = true\n",
+            "[cerebras.debug]\nposted = false\n",
+            "[cerebras.debug]\nloop_room = false\n",
+        ] {
+            assert!(of(gone).is_err(), "{gone}");
+        }
         assert!(of("[cerebras]\nlookahead = \"8\"\n").is_err());
     }
 }

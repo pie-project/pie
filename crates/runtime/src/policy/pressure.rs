@@ -2,24 +2,18 @@
 //! reads it.
 //!
 //! Three roles share memory. The governor decides how much a tier holds;
-//! PLEX decides what stays in it; the pool decides how it moves. So the
-//! runtime never drops state on its own. A waiter short of room calls
-//! [`raise`] with what its tier is short of. The worker policy hears that as
-//! one `tier-pressure` edge per band crossing, and reads the bytes as attrs
-//! on the worker (`{device,host}-{total,state,live,wanted,act,short}-bytes`
-//! and `-band`). It answers with the verbs it already has: `discard` a
-//! working set, or install retention keys.
+//! PLEX decides what stays in it; the pool decides how it moves. A waiter
+//! short of room calls [`raise`] with what its tier is short of. The worker
+//! policy reads that as attrs on the worker (`pie/{device,host}-band`),
+//! beside the device's two ledger terms ([`Ledger`]). Attrs are not verbs.
 //!
-//! When no installed policy subscribes to `tier-pressure`, the default
-//! responder answers for it ([`choose`]). It uses the same `discard` verb a
-//! policy would, lowest retention key first, so a parked waiter always has
-//! someone to answer it. This is policy-layer code: it decides what goes, as
-//! a policy would. It is not part of the stores, which only carry out
-//! discards.
-//!
-//! The one thing the runtime may still reclaim without asking is idle cache
-//! whose PLEX retention key says it may be dropped ([`may_drop`]). Everything
-//! else goes through `tier-pressure`.
+//! No runtime responder answers pressure: the stores answer it by enacting
+//! the retention columns. Each tier holds the highest `retention/priority`
+//! first; idle cache yields to running work, moves down to the next tier
+//! its `retention/tiers` row names, and is dropped only where it names none
+//! (with no rows: every tier, least recently used first among equals). What
+//! no move can make room for waits at the planner's capacity gate, with no
+//! deadline; only a process that never fits alone is refused, by name.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -125,6 +119,50 @@ pub struct Bytes {
     pub act: u64,
 }
 
+/// One engine's device bytes outside its state pools, as the ledger
+/// (REDESIGN 2.1, 2.8) puts them to the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ledger {
+    /// The model cache: weight atoms resident above the floor, what live
+    /// demand may take before any state gives way.
+    pub model: u64,
+    /// What the driver holds beside the engine's span (graph bodies,
+    /// modules, library workspaces), as the engine stated it at load
+    /// ([`::engine::chunk::ChunkFacts::outside_bytes`]).
+    pub outside: u64,
+}
+
+/// Per engine, its [`Ledger`]: `outside` as its load stated it, `model` as
+/// its governor last read it.
+static LEDGERS: RwLock<BTreeMap<usize, Ledger>> = RwLock::new(BTreeMap::new());
+
+/// `engine`'s model cache bytes now: what its governor reads each tick.
+pub fn set_model(engine: usize, model: u64) {
+    LEDGERS.write().unwrap().entry(engine).or_default().model = model;
+}
+
+/// What `engine`'s driver holds outside its span: a load fact, set once
+/// when the engine is registered.
+pub fn set_outside(engine: usize, outside: u64) {
+    LEDGERS.write().unwrap().entry(engine).or_default().outside = outside;
+}
+
+/// Every engine's ledger terms on `tier`, summed; none off the device.
+#[must_use]
+pub fn ledger(tier: Tier) -> Ledger {
+    if tier != Tier::Device {
+        return Ledger::default();
+    }
+    LEDGERS
+        .read()
+        .unwrap()
+        .values()
+        .fold(Ledger::default(), |sum, one| Ledger {
+            model: sum.model.saturating_add(one.model),
+            outside: sum.outside.saturating_add(one.outside),
+        })
+}
+
 /// What reads a tier's bytes. The stores' own reading ([`stores`]) stands
 /// until a pool installs a better one ([`install_meter`]).
 pub trait Meter: Send + Sync {
@@ -160,8 +198,7 @@ impl Gauge {
     }
 }
 
-/// A shortfall that stands unchanged is reported again this often, so the
-/// default responder looks again when its last discard freed too little.
+/// A shortfall that stands unchanged is reported again this often.
 pub const AGAIN: Duration = Duration::from_millis(100);
 
 static GAUGES: Mutex<[Gauge; 2]> = Mutex::new([Gauge::new(), Gauge::new()]);
@@ -173,12 +210,12 @@ pub(crate) fn reset() {
     *GAUGES.lock().unwrap() = [Gauge::new(), Gauge::new()];
     *METER.write().unwrap() = None;
     SCALES.write().unwrap().clear();
+    LEDGERS.write().unwrap().clear();
 }
 
 /// Says that waiters on `tier` from `from` (an engine's planner) are short
 /// of `short_bytes` in all, now: not an increment. Zero once they are all
-/// served. The worker policy hears of it when the tier's band changes; the
-/// default responder, whenever the shortfall changes or stands for a while.
+/// served. The worker policy reads it when the tier's band changes.
 pub fn raise(tier: Tier, from: usize, short_bytes: u64) {
     let total = meter_bytes(tier).map_or(0, |bytes| bytes.total);
     let reading = {
@@ -223,13 +260,6 @@ pub fn reading(tier: Tier) -> Reading {
         band: gauge.band,
         short: gauge.short(),
     }
-}
-
-/// Whether the runtime may drop idle cache under `key` without asking the
-/// policy. Only a key at or below the retention floor says so; above it,
-/// room is asked for with `tier-pressure`.
-pub const fn may_drop(key: i64) -> bool {
-    !super::retention::above_floor(key)
 }
 
 /// Replaces the meter the worker policy reads bytes from.
@@ -348,45 +378,4 @@ pub fn stores(tier: Tier) -> Option<Bytes> {
         };
     }
     Some(sum)
-}
-
-/// The retention key that pins a working set: the default responder never
-/// discards it, however short a tier is. Only a policy that answers
-/// `tier-pressure` itself may let it go.
-pub const PINNED: i64 = i64::MAX;
-
-/// A working set the default responder may discard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
-    pub id: String,
-    /// Its retention key: the highest any of its tokens has.
-    pub key: i64,
-    pub last_use_ms: u64,
-    /// What discarding it frees on the pressed tier; `None` where unknown.
-    pub bytes: Option<u64>,
-}
-
-/// The default responder: which working sets to discard so that `short`
-/// bytes come free. Lowest retention key first, so whatever a key `<= 0`
-/// lets go goes before anything a policy keyed higher; then least recently
-/// used. One that frees nothing on the tier, or one [`PINNED`], is passed
-/// over. It stops once
-/// what it chose covers `short`, or after one whose size is unknown: the
-/// waiter's next [`raise`] says whether that was enough.
-pub fn choose(mut candidates: Vec<Candidate>, short: u64) -> Vec<String> {
-    candidates.retain(|c| c.bytes != Some(0) && c.key != PINNED);
-    candidates.sort_by(|a, b| (a.key, a.last_use_ms, &a.id).cmp(&(b.key, b.last_use_ms, &b.id)));
-    let mut chosen = Vec::new();
-    let mut freed: u64 = 0;
-    for candidate in candidates {
-        if freed >= short {
-            break;
-        }
-        chosen.push(candidate.id);
-        match candidate.bytes {
-            Some(bytes) => freed = freed.saturating_add(bytes),
-            None => break,
-        }
-    }
-    chosen
 }

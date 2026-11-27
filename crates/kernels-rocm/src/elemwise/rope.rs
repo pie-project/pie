@@ -88,7 +88,21 @@ pub fn full(
     let num_kv_heads = heads(OP, k.width, head_dim)?;
     let half = head_dim / 2;
     let pairs = cache_pairs(half);
-    let per_block = heads_per_block(half);
+    // A block turns as many of a row's heads as leave the rows' blocks two
+    // waves of the device: each block computes its row's angles, which are
+    // the work, not the bytes, so a long prefill turns a row in one block
+    // and a decode's few rows spread their heads as before.
+    let heads = num_q_heads + num_kv_heads;
+    let per_block = if pairs > 0 {
+        let groups = (2 * ctx.multiprocessors(OP)?)
+            .div_ceil(q.rows.max(1))
+            .max(1);
+        heads
+            .div_ceil(groups)
+            .clamp(heads_per_block(half).min(heads), heads)
+    } else {
+        heads_per_block(half)
+    };
     ctx.fire(
         OP,
         Fire::at(kernel(

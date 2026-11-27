@@ -7,14 +7,12 @@
 //! with those chunks evacuated mid-decode out of the pool's top segment,
 //! which is then given back, the decode running on through the moved
 //! chunks. Two miniatures: a dense one and a gated-delta hybrid.
-//!
-//! (Before the per-plane pools were deleted this script also ran over them in
-//! the same process and landed the same bits.)
 
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::ModelContract;
 use engine::chunk::{Evacuation, Growth};
+use engine::fire::{FoldLen, Lineage, WindowFold};
 use engine_metal::serve::Seated;
 use engine_metal::store::layout::{FIXED, LIST};
 use engine_metal::{Boot, Lane, Shell};
@@ -65,7 +63,7 @@ pub(super) fn write_serving(path: &Path, trace: &Trace) {
 }
 
 /// `trace`'s checkpoint planes seeded by name, by name.
-fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
+pub(super) fn seeded(trace: &Trace) -> Vec<(String, Vec<u64>, ztensor::Leaf, Vec<u8>)> {
     let mut out = Vec::new();
     let mut planes: Vec<_> = trace
         .params
@@ -191,11 +189,7 @@ pub(super) fn deployed_fixture(name: &str) -> Fixture {
     if !encoded {
         return fixture_from(trace, name);
     }
-    let dir = std::env::var_os("PIE_FIXTURE_DIR").map_or_else(
-        || std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id())),
-        std::path::PathBuf::from,
-    );
-    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (dir, owned) = fixture_dir();
     let floats = dir.join(format!("{name}.floats.zt"));
     if !floats.exists() {
         write_checkpoint(&floats, &trace);
@@ -230,13 +224,37 @@ pub(super) fn deployed_fixture(name: &str) -> Fixture {
         trace,
         contract,
         container,
+        owned,
     }
+}
+
+/// Where a fixture's files go: a directory of its own under the temp dir,
+/// which the fixture removes when dropped (`owned`), passing or failing.
+fn fixture_dir() -> (PathBuf, Option<PathBuf>) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "pie-bm-pool-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    (dir.clone(), Some(dir))
 }
 
 pub(super) struct Fixture {
     pub(super) trace: Trace,
     pub(super) contract: ModelContract,
     pub(super) container: PathBuf,
+    /// The directory the fixture made for itself, removed with it.
+    owned: Option<PathBuf>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some(dir) = self.owned.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 fn fixture(model: &str) -> Fixture {
@@ -259,11 +277,7 @@ pub(super) fn fixture_of(model: &str, layers: Option<u32>) -> Fixture {
 /// The fixture of `trace`, its checkpoint written under `name`.
 pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
     // `PIE_FIXTURE_DIR` keeps the fixtures across processes (a probe).
-    let dir = std::env::var_os("PIE_FIXTURE_DIR").map_or_else(
-        || std::env::temp_dir().join(format!("pie-bm-pool-{}", std::process::id())),
-        std::path::PathBuf::from,
-    );
-    std::fs::create_dir_all(&dir).expect("the fixture dir");
+    let (dir, owned) = fixture_dir();
     let container = dir.join(format!("{name}.zt"));
     if !container.exists() {
         write_checkpoint(&container, &trace);
@@ -275,6 +289,7 @@ pub(super) fn fixture_from(trace: Trace, name: &str) -> Fixture {
         trace,
         contract,
         container,
+        owned,
     }
 }
 
@@ -284,29 +299,141 @@ pub(super) fn load_with(fixture: &Fixture, context: u32) -> Shell {
 
 /// The shell, its pool's recipe aiming its chunk near `chunk` bytes where
 /// stated.
-fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
-    let residency = engine_metal::ResidencyPlan::default();
-    Shell::load(Boot {
-        trace: fixture.trace.clone(),
-        contract: &fixture.contract,
-        checkpoint: &fixture.container,
-        budget: Budget::new(SEATS, 256),
-        patches: None,
-        voxels: None,
-        profile: None,
-        page_size: PAGE,
+pub(super) fn load_near(fixture: &Fixture, context: u32, chunk: Option<u64>) -> Shell {
+    load_ahead(fixture, context, chunk, engine::runahead::Runahead::F1)
+}
+
+/// [`load_near`] keeping `runahead`'s frames in flight.
+pub(super) fn load_ahead(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    runahead: engine::runahead::Runahead,
+) -> Shell {
+    load_boot(fixture, context, chunk, runahead, None)
+}
+
+/// [`load_near`] keeping what it measures in `profiles` and taking what an
+/// earlier load stored there. The loads a test compares to the bit share
+/// one: each load otherwise times its own kernel.dense curves and may fit
+/// another ladder (FOLLOWUPS F57: a 40-row prompt on mpp in one load and on
+/// tile in the other), so their logits agree within a tolerance, not to the
+/// bit.
+pub(super) fn load_stored(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    profiles: &Profiles,
+) -> Shell {
+    load_boot(
+        fixture,
         context,
-        slots: SEATS,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        runahead: engine::runahead::Runahead::F1,
+        chunk,
+        engine::runahead::Runahead::F1,
+        Some(profiles.0.clone()),
+    )
+}
+
+/// A profile directory of one test's own, gone when dropped: the loads that
+/// test compares share it ([`load_stored`]), and no other test reads what
+/// they stored.
+pub(super) struct Profiles(PathBuf);
+
+impl Profiles {
+    pub(super) fn new(test: &str) -> Profiles {
+        let dir = std::env::temp_dir().join(format!("pie-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Profiles(dir)
+    }
+
+    pub(super) fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for Profiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn load_boot(
+    fixture: &Fixture,
+    context: u32,
+    chunk: Option<u64>,
+    runahead: engine::runahead::Runahead,
+    profiles: Option<PathBuf>,
+) -> Shell {
+    let residency = engine_metal::ResidencyPlan::default();
+    Load {
+        context,
+        runahead,
         residency: match chunk {
             Some(bytes) => residency.with_chunk_bytes(bytes),
             None => residency,
         },
-        profiles: None,
-    })
+        profiles,
+        ..Load::default()
+    }
+    .boot(fixture)
+    .and_then(|mut shell| shell.raise_whole().map(|()| shell))
     .unwrap_or_else(|why| panic!("the shell loads: {why}"))
+}
+
+/// A test load's settings past its fixture, each as the shell tests lay it
+/// unless the test states its own (`..Load::default()`); every rung served
+/// (`Top::EveryRung`), the whole device allowed.
+pub(super) struct Load {
+    pub(super) budget: Budget,
+    pub(super) page_size: u32,
+    pub(super) context: u32,
+    pub(super) slots: u32,
+    pub(super) kv_budget: Option<u64>,
+    pub(super) runahead: engine::runahead::Runahead,
+    pub(super) residency: engine_metal::ResidencyPlan,
+    pub(super) profiles: Option<PathBuf>,
+    pub(super) measure: engine::rates::Measuring,
+}
+
+impl Default for Load {
+    fn default() -> Load {
+        Load {
+            budget: Budget::new(SEATS, 256),
+            page_size: PAGE,
+            context: CONTEXT,
+            slots: SEATS,
+            kv_budget: None,
+            runahead: engine::runahead::Runahead::F1,
+            residency: engine_metal::ResidencyPlan::default(),
+            profiles: None,
+            measure: engine::rates::Measuring::Time,
+        }
+    }
+}
+
+impl Load {
+    /// `fixture` loaded under these settings.
+    pub(super) fn boot(self, fixture: &Fixture) -> engine_metal::Result<Shell> {
+        Shell::load(Boot {
+            trace: fixture.trace.clone(),
+            contract: &fixture.contract,
+            checkpoint: &fixture.container,
+            budget: self.budget,
+            patches: None,
+            voxels: None,
+            profile: None,
+            page_size: self.page_size,
+            context: self.context,
+            slots: self.slots,
+            kv_budget: self.kv_budget,
+            allowance: engine::Allowance::WHOLE,
+            runahead: self.runahead,
+            residency: self.residency,
+            profiles: self.profiles,
+            top: engine_metal::Top::EveryRung,
+            measure: self.measure,
+        })
+    }
 }
 
 pub(super) fn word(trace: &Trace, rows: u32) -> u64 {
@@ -326,31 +453,95 @@ enum Placement {
     /// Slot refs the runtime would name: pages strided over chunks
     /// `first .. first + 3` from the top down, the lanes' pages interleaved
     /// in each and scattered over its slots (no two share one), piece `p`
-    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`.
+    /// of lane `l`'s record in chunk `first + 3 + l * pieces + p`, and on a
+    /// ring load lane `l`'s ring piece `p` in chunk
+    /// `first + 3 + 2 * pieces + l * ring_pieces + p`.
     Refs {
         first: u32,
-        per_list: u32,
+        /// The kv list's slots a chunk; `None` where the load states no kv
+        /// list (every layer windowed), so no fire reads a page table.
+        per_list: Option<u32>,
         per_fixed: u32,
         pieces: u32,
+        /// The ring's pieces and the window buffer's rows a slot, where the
+        /// load lays rings: each lane folds every fire through its own.
+        ring: Option<(u32, u32)>,
     },
+}
+
+/// Page `page` of lane `lane` among the three chunks `base .. base + 3` of
+/// `per` slots each: chunks from the top down, the lanes in turn in each,
+/// at an odd stride coprime to `per`.
+fn scatter(base: u32, per: u32, lane: u32, page: u32) -> u32 {
+    let chunk = base + 2 - (page % 3);
+    let nth = (page / 3) * 2 + lane;
+    let stride = (7..)
+        .step_by(2)
+        .find(|&s| gcd(s, per) == 1)
+        .expect("an odd stride coprime to the slots");
+    let index = (stride * nth + 3) % per;
+    chunk * per + index
 }
 
 impl Placement {
     fn page(&self, lane: u32, page: u32) -> u32 {
         match *self {
-            Placement::Seats => unreachable!(),
             Placement::Refs {
-                first, per_list, ..
-            } => {
-                let chunk = first + 2 - (page % 3);
-                let nth = (page / 3) * 2 + lane;
-                let stride = (7..)
-                    .step_by(2)
-                    .find(|&s| gcd(s, per_list) == 1)
-                    .expect("an odd stride coprime to the slots");
-                let index = (stride * nth + 3) % per_list;
-                chunk * per_list + index
-            }
+                first,
+                per_list: Some(per),
+                ..
+            } => scatter(first, per, lane, page),
+            _ => unreachable!("a page table of a placement with a kv list"),
+        }
+    }
+
+    /// Lane `lane`'s ring pieces, `[run, cow]` chunk refs, where the load
+    /// lays rings.
+    fn ring(&self, lane: u32) -> Option<Vec<[u32; 2]>> {
+        match *self {
+            Placement::Refs {
+                first,
+                pieces,
+                ring: Some((ring, _)),
+                ..
+            } => Some(
+                (0..ring)
+                    .map(|p| first + 3 + 2 * pieces + lane * ring + p)
+                    .map(|chunk| [chunk, chunk])
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// How a lane of `have` rows folds a fire of `rows` through its ring:
+    /// every row, its buffer based past them.
+    fn fold(&self, have: u32, rows: u32) -> Option<WindowFold> {
+        match *self {
+            Placement::Refs {
+                ring: Some((_, tokens)),
+                ..
+            } => Some(WindowFold {
+                base: (have + rows) / tokens * tokens,
+                fold: FoldLen::Host(rows),
+                lineage: Lineage::Set,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The lane's kv page table and window table over its first `rows`.
+    fn tables(&self, lane: u32, rows: u32, page: u32) -> (Vec<u32>, Vec<Vec<u32>>) {
+        match *self {
+            Placement::Seats => (Vec::new(), Vec::new()),
+            Placement::Refs { per_list, .. } => (
+                per_list.map_or_else(Vec::new, |_| {
+                    (0..rows.div_ceil(page))
+                        .map(|p| self.page(lane, p))
+                        .collect()
+                }),
+                Vec::new(),
+            ),
         }
     }
 
@@ -368,19 +559,26 @@ impl Placement {
         }
     }
 
-    /// Every slot ref of both lanes' `pages` pages is its own.
-    fn distinct(&self, pages: u32) -> bool {
-        let refs: std::collections::BTreeSet<u32> = (0..2)
-            .flat_map(|lane| (0..pages).map(move |p| self.page(lane, p)))
-            .collect();
-        refs.len() == 2 * pages as usize
+    /// Every slot ref of both lanes' tables over `rows` rows is its own, in
+    /// the kv list and in the window list.
+    fn distinct(&self, rows: u32, page: u32) -> bool {
+        let tables = [self.tables(0, rows, page), self.tables(1, rows, page)];
+        let pages: Vec<u32> = tables.iter().flat_map(|t| t.0.clone()).collect();
+        let windows: Vec<u32> = tables.iter().flat_map(|t| t.1.concat()).collect();
+        let unique = |refs: &[u32]| {
+            refs.iter().collect::<std::collections::BTreeSet<_>>().len() == refs.len()
+        };
+        unique(&pages) && unique(&windows)
     }
 
-    /// The chunks this placement holds: three of pages and the records.
+    /// The chunks this placement holds: three of pages, the records, and
+    /// both lanes' rings where the load lays them.
     fn held(&self) -> u32 {
         match *self {
             Placement::Seats => 0,
-            Placement::Refs { pieces, .. } => 3 + 2 * pieces,
+            Placement::Refs { pieces, ring, .. } => {
+                3 + 2 * pieces + 2 * ring.map_or(0, |(ring, _)| ring)
+            }
         }
     }
 }
@@ -413,27 +611,25 @@ fn serve(
     let mut fed: [Vec<u32>; 2] = prompts();
     let page = shell.paging().page_size;
     assert!(
-        !refs || place.distinct(CONTEXT.div_ceil(page)),
+        !refs || place.distinct(CONTEXT, page),
         "the lanes' pages share no slot"
     );
     let records = [place.record(0), place.record(1)];
+    let rings = [place.ring(0), place.ring(1)];
     let mut rows = Vec::new();
-    let tables = |held: [u32; 2], rows: [u32; 2]| -> [Vec<u32>; 2] {
-        [0, 1].map(|lane| {
-            if !refs {
-                return Vec::new();
-            }
-            let pages = (held[lane] + rows[lane]).div_ceil(page);
-            (0..pages)
-                .map(|page| place.page(lane as u32, page))
-                .collect()
-        })
+    let tables = |held: [u32; 2], rows: [u32; 2]| -> [(Vec<u32>, Vec<Vec<u32>>); 2] {
+        [0, 1].map(|lane| place.tables(lane as u32, held[lane] + rows[lane], page))
     };
-    let fire = |shell: &mut Shell, lanes: &[(u32, &[u32], u32, &[u32])]| -> Vec<Vec<f32>> {
+    type Fired<'t> = (u32, &'t [u32], u32, &'t (Vec<u32>, Vec<Vec<u32>>));
+    let fire = |shell: &mut Shell, lanes: &[Fired<'_>]| -> Vec<Vec<f32>> {
         let seated: Vec<Seated<'_>> = lanes
             .iter()
-            .map(|&(lane, tokens, have, pages)| Seated {
+            .map(|&(lane, tokens, have, (pages, windows))| Seated {
+                replay_stated: None,
                 pages,
+                windows,
+                ring: rings[lane as usize].as_deref(),
+                window: place.fold(have, tokens.len() as u32),
                 held: Some(have),
                 record: refs.then(|| records[lane as usize].as_slice()),
                 refs,
@@ -479,6 +675,46 @@ fn serve(
     rows
 }
 
+/// The most a logit of one placement may differ from the same logit of
+/// another, `ulps` bf16 units in the last place of the larger magnitude:
+/// the lanes' rows meet the kernels in another order once their pages lie
+/// elsewhere, and bf16 operands round each partial sum to 8 significant
+/// bits, so the same row may land a few such units apart (no batch
+/// invariance is promised; an argmax apart, or a logit past this, is a bug).
+fn bf16_bound(a: f32, b: f32, ulps: f32) -> f32 {
+    let magnitude = a.abs().max(b.abs()).max(f32::MIN_POSITIVE);
+    // A bf16's unit in the last place: 2^(exponent - 7).
+    ulps * 2f32.powi(magnitude.log2().floor() as i32 - 7)
+}
+
+/// Panics at the first row whose argmax differs, or a logit of which lies
+/// past [`bf16_bound`] of two units from the other's.
+pub(super) fn close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    assert_eq!(got.len(), want.len(), "{what}: rows");
+    for (at, (got, want)) in got.iter().zip(want).enumerate() {
+        assert_eq!(got.len(), want.len(), "{what}: row {at}'s logits");
+        assert_eq!(argmax(got), argmax(want), "{what}: row {at}'s argmax");
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(&a, &b)| ((a - b).abs(), bf16_bound(a, b, 2.0), a, b))
+            .filter(|&(apart, bound, ..)| {
+                !matches!(
+                    apart.partial_cmp(&bound),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            worst.is_empty(),
+            "{what}: row {at}: {} of {} logits past two bf16 units, first {:?}",
+            worst.len(),
+            want.len(),
+            worst.first()
+        );
+    }
+}
+
 /// Panics at the first row whose logits differ in a bit.
 pub(super) fn same(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
@@ -504,31 +740,27 @@ fn check(model: &str, hybrid: bool) {
         eprintln!("skipping: no Metal device");
         return;
     }
-    check_near(model, hybrid, None);
+    check_near(
+        model,
+        hybrid,
+        None,
+        &Profiles::new(&format!("scattered-{model}")),
+    );
 }
 
 /// [`check`] over a pool whose chunk aims near `chunk` bytes where stated:
 /// the seats' logits.
-fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
+/// The seats' run and the scattered one are two loads compared to the bit:
+/// both load in `profiles`, so they fire the same kernels (a caller that
+/// compares the result with another `check_near` passes the same one).
+fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles) -> Vec<Vec<f32>> {
     let fixture = fixture(model);
     const STEPS: usize = 12;
-    let load = |fixture: &Fixture| load_near(fixture, CONTEXT, chunk);
+    let load = |fixture: &Fixture| load_stored(fixture, CONTEXT, chunk, profiles);
 
     let mut shell = load(&fixture);
     let facts = shell.pool_chunk_facts();
     facts.validate().expect("the facts hang together");
-    eprintln!(
-        "{model}: {} chunks of {} B, {} a segment, segments {:?}, shapes {:?}",
-        facts.total_chunks,
-        facts.chunk_bytes,
-        facts.segment_chunks,
-        facts.segments,
-        facts
-            .shapes
-            .iter()
-            .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
-            .collect::<Vec<_>>()
-    );
     assert!(facts.shapes.iter().all(|s| s.pinned.is_none()));
     assert_eq!(facts.shape(FIXED).is_some(), hybrid);
     let seats = serve(
@@ -547,13 +779,26 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     let facts = shell.pool_chunk_facts();
     let layout = shell.pool_layout();
     let segment = facts.segment_chunks;
-    let low = 1 + layout.seat_chunks();
+    let low = layout.free_chunk();
     let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
+    let per_list = facts.shape(LIST).map(|s| s.slots_per_chunk);
+    // A windowed model's rings: each lane's by slot ref too, so the
+    // scattered serve moves every row the fire reads.
+    let ring = shell.pool_ring().map(|ring| {
+        (
+            ring.pieces,
+            layout
+                .window(0)
+                .expect("a ring load's window buffer")
+                .tokens,
+        )
+    });
     let place = Placement::Refs {
         first: 0,
-        per_list: per(LIST),
+        per_list,
         per_fixed: per(FIXED),
         pieces: layout.pieces,
+        ring,
     };
     let held = place.held();
     let kept = (low + held).div_ceil(segment);
@@ -565,9 +810,10 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     );
     let place = Placement::Refs {
         first,
-        per_list: per(LIST),
+        per_list,
         per_fixed: per(FIXED),
         pieces: layout.pieces,
+        ring,
     };
     shell.commit_segments(commit).expect("the segments commit");
     let sparse = facts.segments.growth == Growth::Bottom;
@@ -591,7 +837,7 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
             }
         },
     );
-    same(
+    close(
         &format!("{model}: scattered and evacuated slots against the seats' runs"),
         &scattered,
         &seats,
@@ -599,18 +845,127 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>) -> Vec<Vec<f32>> {
     seats
 }
 
+/// An evacuation refused past its copies and its rebind (a holder whose refs
+/// the moved table cannot resolve) is taken back whole:
+/// the refusal answered, the chunk table as it stood, and the lanes decode on
+/// at the refs they lay in, the seats' logits bit for bit.
+#[test]
+fn a_refused_evacuation_moves_nothing() {
+    let _device = crate::device_alone();
+    if !engine_metal::device::present() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    for model in ["qwen3-micro-text", "qwen35-tiny"] {
+        let fixture = fixture(model);
+        const STEPS: usize = 8;
+        let profiles = Profiles::new(&format!("refused-evacuation-{model}"));
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
+        let seats = serve(
+            &mut shell,
+            &fixture.trace,
+            &Placement::Seats,
+            STEPS,
+            usize::MAX,
+            &mut |_| {},
+        );
+        drop(shell);
+
+        let mut shell = load_stored(&fixture, CONTEXT, None, &profiles);
+        let facts = shell.pool_chunk_facts();
+        let layout = shell.pool_layout();
+        let segment = facts.segment_chunks;
+        let low = layout.free_chunk();
+        let per = |id| facts.shape(id).map_or(1, |s| s.slots_per_chunk);
+        let place = |first| Placement::Refs {
+            first,
+            per_list: facts.shape(LIST).map(|s| s.slots_per_chunk),
+            per_fixed: per(FIXED),
+            pieces: layout.pieces,
+            ring: None,
+        };
+        let held = place(0).held();
+        let kept = (low + held).div_ceil(segment);
+        let first = kept * segment;
+        shell
+            .commit_segments(kept + held.div_ceil(segment))
+            .expect("the segments commit");
+        let scattered = serve(
+            &mut shell,
+            &fixture.trace,
+            &place(first),
+            STEPS,
+            STEPS / 2,
+            &mut |shell| {
+                let before = shell.chunk_table().clone();
+                let moves = (0..held).map(|at| (first + at, low + at)).collect();
+                engine_metal::serve::fail_next_repoint();
+                let refused = shell.evacuate(&Evacuation { moves });
+                assert!(
+                    refused.is_err(),
+                    "{model}: the injected refusal is answered"
+                );
+                assert_eq!(
+                    shell.chunk_table(),
+                    &before,
+                    "{model}: a refused evacuation moves nothing"
+                );
+            },
+        );
+        close(
+            &format!("{model}: decoding on past a refused evacuation, against the seats' runs"),
+            &scattered,
+            &seats,
+        );
+    }
+}
+
 #[test]
 fn a_scattered_dense_pool_serves_the_same_logits() {
+    let _device = crate::device_alone();
     check("qwen3-micro-text", false);
 }
 
 #[test]
 fn a_scattered_windowed_pool_serves_the_same_logits() {
+    let _device = crate::device_alone();
     check("gemma4-e4b-mini-l1", false);
 }
 
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
+    let _device = crate::device_alone();
+    check("qwen35-tiny", true);
+}
+
+/// Caps each buffer of a pool loaded while it lives at one segment, so a
+/// small model's range spans several buffers; lifted when dropped.
+struct OverBuffers;
+
+impl OverBuffers {
+    fn cap() -> OverBuffers {
+        engine_metal::store::pool::cap_parts(1);
+        OverBuffers
+    }
+}
+
+impl Drop for OverBuffers {
+    fn drop(&mut self) {
+        engine_metal::store::pool::cap_parts(0);
+    }
+}
+
+/// The range over several buffers, a segment each: kv pages, records and
+/// the activation span in buffers past the first, read through each
+/// buffer's place from the first, give the seats' logits.
+#[test]
+fn a_pool_over_buffers_serves_the_same_logits() {
+    let _device = crate::device_alone();
+    if !engine_metal::device::present() {
+        return;
+    }
+    let _over = OverBuffers::cap();
+    check("qwen3-micro-text", false);
     check("qwen35-tiny", true);
 }
 
@@ -621,6 +976,7 @@ fn a_scattered_hybrid_pool_serves_the_same_logits() {
 /// whole record's under the profile's own chunk.
 #[test]
 fn a_record_in_pieces_serves_the_whole_records_logits() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
@@ -634,9 +990,9 @@ fn a_record_in_pieces_serves_the_whole_records_logits() {
         pieces > 1,
         "{model}'s record is whole in a {CHUNK}-byte chunk"
     );
-    eprintln!("{model}: the record in {pieces} pieces");
-    let cut = check_near(model, true, Some(CHUNK));
-    let whole = check_near(model, true, None);
+    let profiles = Profiles::new("record-in-pieces");
+    let cut = check_near(model, true, Some(CHUNK), &profiles);
+    let whole = check_near(model, true, None, &profiles);
     same(
         &format!("{model}: the record in {pieces} pieces against whole"),
         &cut,
@@ -650,6 +1006,7 @@ fn a_record_in_pieces_serves_the_whole_records_logits() {
 #[test]
 #[allow(unsafe_code)]
 fn a_reserved_hybrid_pool_states_shared_chunks() {
+    let _device = crate::device_alone();
     use engine_metal::store::layout::Layout;
     use engine_metal::store::{Pools, Rows};
 
@@ -680,7 +1037,12 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
         SEATS,
         4,
     )
-    .expect("a layout");
+    .expect("a layout")
+    // The state maps' run of the engine's tables, as a load sizes it.
+    .with_tables(
+        u32::try_from(Pools::map_bytes(rows.state_rows(), 4).div_ceil(chunk))
+            .expect("a chunk count"),
+    );
     let paging = engine_metal::store::kv::Paging::of(rows.tokens, 256, SEATS, 1).expect("a paging");
     let bands = rows.bands.clone();
     let mut pools = Pools::reserve(&device, rows, layout, paging).expect("a pool");
@@ -709,231 +1071,24 @@ fn a_reserved_hybrid_pool_states_shared_chunks() {
     }
     assert_eq!(facts.chunk_bytes % facts.shape(LIST).unwrap().slot_bytes, 0);
     assert_eq!(facts.segments.max, 3);
-    assert!(facts.act_chunks.is_empty(), "activation lives in the arena");
+    assert!(
+        facts.act_chunks.is_empty(),
+        "a layout with no activation span states none"
+    );
     if facts.segments.growth != Growth::Bottom {
         assert_eq!(facts.segments.committed, 3);
         return;
     }
-    assert_eq!(facts.segments.committed, 0);
+    // The engine's tables run is backed from the load: its segments, and
+    // no other.
+    assert_eq!(
+        facts.segments.committed,
+        (1 + pools.layout().tables).div_ceil(segment)
+    );
     pools.commit_segments(2).expect("two segments");
     assert_eq!(pools.chunk_facts().segments.committed, 2);
     assert!(pools.committed_bytes() >= 2 * u64::from(segment) * chunk);
     // SAFETY: nothing ran on this pool.
     unsafe { pools.release_segments(1) }.expect("one goes back");
     assert_eq!(pools.chunk_facts().segments.committed, 1);
-}
-
-/// A window list the runtime trims (CONTRACT-BC 19, 21): pages wholly behind
-/// the window read the null chunk (ref 0). One lane of a 1-layer windowed
-/// miniature prefills past its 512-row window and decodes on; its logits are
-/// the same bits whether the window list holds every page (seat-addressed)
-/// or only the window's, scattered over chunks by slot ref and trimmed as
-/// the runtime trims, each step.
-#[test]
-fn a_trimmed_window_list_reads_as_the_whole_one() {
-    trimmed_window("gemma4-e4b-mini-l1", None, 1024, 700);
-}
-
-/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a window list of
-/// `T_w` = 16-token slots beside 32-token kv pages (CONTRACT-BC 21): four
-/// layers of a sliding-window decoder past its 2048-row window.
-#[test]
-fn a_trimmed_window_list_of_smaller_slots_reads_as_the_whole_one() {
-    trimmed_window("muse-glimmer-30b-mini-l8", Some(4), 2560, 2200);
-}
-
-/// As [`a_trimmed_window_list_reads_as_the_whole_one`], a latent model's
-/// 128-row window list of 16-token slots beside its 128-token kv pages,
-/// its plans reading the kv list's geometry. Its windowed rows are the ones
-/// a pool gather compresses: the compressor's state lies in their window
-/// slots, read by slot ref as the rows are. (Seven window slots a chunk.)
-#[test]
-fn a_trimmed_window_list_beside_a_compressed_kv_list_reads_as_the_whole_one() {
-    trimmed_window("dsv4-flash-mini", None, 1024, 700);
-}
-
-fn trimmed_window(model: &str, layers: Option<u32>, context: u32, prompt: u32) {
-    if !engine_metal::device::present() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
-    trimmed_windows(model, &fixture_of(model, layers), context, prompt, 1);
-}
-
-/// Seat-addressed (every window page held) against slot refs trimmed as the
-/// runtime trims, each of the load's `lists` window lists by its own window
-/// and `T_w`, its slots in chunks of its own.
-fn trimmed_windows(model: &str, fixture: &Fixture, context: u32, prompt: u32, lists: usize) {
-    use engine_metal::store::layout::WINDOWS;
-
-    let prompt: Vec<u32> = (0..prompt).map(|at| (at * 37 + 11) % 256).collect();
-    const STEPS: usize = 24;
-    let run = |trimmed: bool| -> Vec<Vec<f32>> {
-        let mut shell = load_with(fixture, context);
-        let facts = shell.pool_chunk_facts();
-        eprintln!(
-            "{model}: shapes {:?}",
-            facts
-                .shapes
-                .iter()
-                .map(|s| (s.id.0, s.kind, s.slot_bytes, s.slots_per_chunk))
-                .collect::<Vec<_>>()
-        );
-        let layout = shell.pool_layout();
-        let mut first =
-            (1 + layout.seat_chunks()).div_ceil(facts.segment_chunks) * facts.segment_chunks;
-        // Each window list: (T_w, window, slots a chunk, first chunk, step).
-        let mut windows = Vec::new();
-        for id in &WINDOWS[..lists] {
-            let window = facts.shape(*id).expect("a window list");
-            let engine::chunk::SlotKind::List {
-                tokens,
-                window: Some(rows),
-                ..
-            } = window.kind
-            else {
-                panic!("the window list states its window: {:?}", window.kind);
-            };
-            let per = window.slots_per_chunk;
-            // Page k of the lane in chunk first + k / per, slots strided in
-            // it by a step prime to `per`, so each page has a slot of its own.
-            let step = [7u32, 11, 13, 17]
-                .into_iter()
-                .find(|step| !per.is_multiple_of(*step))
-                .expect("a step prime to the slots a chunk");
-            windows.push((tokens, rows, per, first, step));
-            first += context.div_ceil(tokens).div_ceil(per);
-        }
-        assert!(
-            facts.shape(WINDOWS[lists]).is_none(),
-            "{model} states more than {lists} window lists"
-        );
-        let mut rows_retained: Vec<u32> = windows.iter().map(|w| w.1).collect();
-        rows_retained.dedup();
-        assert_eq!(rows_retained.len(), lists, "each list its own window");
-        // A kv list beside the window lists: its pages in the chunks above
-        // theirs.
-        let list = facts.shape(LIST).map(|list| {
-            let engine::chunk::SlotKind::List { tokens, .. } = list.kind else {
-                panic!("the kv list is a list: {:?}", list.kind);
-            };
-            (tokens, list.slots_per_chunk)
-        });
-        let list_chunks = list.map_or(0, |(t, per)| context.div_ceil(t).div_ceil(per));
-        let commit = (first + list_chunks + 1).div_ceil(facts.segment_chunks);
-        shell.commit_segments(commit).expect("the segments commit");
-        let list_ref = |k: u32| {
-            let (_, per) = list.expect("a kv list");
-            (first + k / per) * per + (k * 5 + 1) % per
-        };
-        let mut rows_out = Vec::new();
-        let mut held = 0u32;
-        let mut fed: Vec<u32> = prompt.clone();
-        for step in 0..=STEPS {
-            let chunks: Vec<Vec<u32>> = if step == 0 {
-                fed.chunks(256).map(<[u32]>::to_vec).collect()
-            } else {
-                vec![fed.clone()]
-            };
-            let mut last = Vec::new();
-            for tokens_in in chunks {
-                let n = tokens_in.len() as u32;
-                let after = held + n;
-                // Trimmed as the runtime trims: a page whose last row lies
-                // below `committed_end - window` reads the null chunk.
-                let tables: Vec<Vec<u32>> = windows
-                    .iter()
-                    .map(|&(tokens, rows, per, first, step)| {
-                        (0..after.div_ceil(tokens))
-                            .map(|k| {
-                                let last_row = (k + 1) * tokens - 1;
-                                if last_row + rows < held {
-                                    0
-                                } else {
-                                    (first + k / per) * per + (k * step + 3) % per
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let list_pages: Vec<u32> = match list {
-                    Some((t, _)) if trimmed => (0..after.div_ceil(t)).map(list_ref).collect(),
-                    _ => Vec::new(),
-                };
-                let seated = Seated {
-                    held: Some(held),
-                    refs: trimmed,
-                    pages: &list_pages,
-                    windows: if trimmed { &tables } else { &[] },
-                    ..Seated::of(Lane {
-                        slot: 0,
-                        word: word(&fixture.trace, n),
-                        tokens: &tokens_in,
-                    })
-                };
-                last = shell.fire_seated(&[seated]).expect("the fire lands");
-                held = after;
-            }
-            fed = vec![argmax(&last[0])];
-            rows_out.extend(last);
-        }
-        rows_out
-    };
-    let whole = run(false);
-    let trimmed = run(true);
-    same(&format!("{model}: trimmed against whole"), &trimmed, &whole);
-}
-
-/// Two window lists, each trimmed by its own window (CONTRACT-BC 21): a
-/// synthetic miniature, muse-glimmer-30b-mini-l8 with every other windowed
-/// layer's window halved (1024 beside 2048), its catalog copied and patched
-/// for this test alone. Past both windows, the trimmed lists read as the
-/// whole ones bit for bit.
-#[test]
-fn two_trimmed_window_lists_read_as_the_whole_ones() {
-    if !engine_metal::device::present() {
-        eprintln!("skipping: no Metal device");
-        return;
-    }
-    let model = "muse-glimmer-30b-mini-l8";
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-    let copy = std::env::temp_dir().join(format!("pie-bm-pool-{}-models", std::process::id()));
-    let _ = std::fs::remove_dir_all(&copy);
-    std::fs::create_dir_all(&copy).expect("the catalog copy");
-    for entry in std::fs::read_dir(&root).expect("the catalog") {
-        let entry = entry.expect("a catalog entry");
-        let into = copy.join(entry.file_name());
-        if entry.file_type().expect("its type").is_dir() {
-            let status = std::process::Command::new("cp")
-                .arg("-R")
-                .arg(entry.path())
-                .arg(&into)
-                .status()
-                .expect("cp runs");
-            assert!(status.success());
-        } else {
-            std::fs::copy(entry.path(), &into).expect("the file copies");
-        }
-    }
-    let poem = copy.join("muse_glimmer.poem");
-    let text = std::fs::read_to_string(&poem).expect("the package reads");
-    let patched = text.replace(
-        "        win = windows[reading]\n",
-        "        win = windows[reading]\n        if win and l % 2 == 1:\n            win = m.window // 2\n",
-    );
-    assert_ne!(patched, text, "the patch applies");
-    std::fs::write(&poem, patched).expect("the package writes");
-    let catalog = poem_compiler::catalog::Catalog::from_dir(&copy).expect("the copy reads");
-    let package = catalog.package_of(model).expect("the model is listed");
-    let trace = package
-        .trace(
-            model,
-            &poem_compiler::catalog::one_rank(Dtype::Bf16, Dtype::Bf16),
-            model,
-            Platform::Metal,
-        )
-        .unwrap_or_else(|why| panic!("`{model}` traces: {why:#}"));
-    std::fs::remove_dir_all(&copy).expect("the copy goes");
-    let fixture = fixture_from(trace, &format!("{model}-two-windows"));
-    trimmed_windows(model, &fixture, 2560, 2200, 2);
 }

@@ -71,6 +71,26 @@ impl Drop for RawProgram {
     }
 }
 
+/// Writes `bytes` to `directory/name` unless it holds them already: into a
+/// partial file of this writer's own (the process and a counter), renamed
+/// over the name. Two writers of one name (two threads compiling the same
+/// program, or two processes) never share a partial, so neither renames
+/// the other's away from under it; the last rename leaves whole bytes.
+pub(crate) fn write_cached(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = directory.join(name);
+    if std::fs::read(&path).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    let writer = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial = directory.join(format!("{name}.{}.{writer}.partial", std::process::id()));
+    std::fs::write(&partial, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&partial, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        e.to_string()
+    })
+}
+
 impl Program {
     /// Writes `mil` and `weights` under `cache`, keyed by their fingerprint,
     /// and compiles and loads them. A program compiled earlier from the same
@@ -80,12 +100,7 @@ impl Program {
         let directory = cache.join(&key);
         std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
         for (name, bytes) in [("model.mil", mil.as_bytes()), ("weights.bin", weights)] {
-            let path = directory.join(name);
-            if std::fs::read(&path).ok().as_deref() != Some(bytes) {
-                let partial = directory.join(format!("{name}.{}.partial", std::process::id()));
-                std::fs::write(&partial, bytes).map_err(|e| e.to_string())?;
-                std::fs::rename(&partial, &path).map_err(|e| e.to_string())?;
-            }
+            write_cached(&directory, name, bytes)?;
         }
         let directory =
             CString::new(directory.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
@@ -256,5 +271,43 @@ impl Drop for RawBinding {
         // SAFETY: the handle came from `pie_ane_bind` and this is its one
         // owner's last reference, so nothing uses it after the free.
         unsafe { sys::pie_ane_binding_free(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod write_cached_tests {
+    use super::write_cached;
+
+    #[test]
+    fn two_concurrent_writers_of_one_name_both_land() {
+        let directory = std::env::temp_dir().join(format!("pie-ane-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the directory");
+        let bytes: Vec<u8> = (0..4u32 << 20).map(|at| (at % 251) as u8).collect();
+        for round in 0..16 {
+            let name = format!("weights-{round}.bin");
+            let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+                let writers: Vec<_> = (0..4)
+                    .map(|_| scope.spawn(|| write_cached(&directory, &name, &bytes)))
+                    .collect();
+                writers
+                    .into_iter()
+                    .map(|w| w.join().expect("the writer"))
+                    .collect()
+            });
+            for result in results {
+                result.expect("every writer lands");
+            }
+            assert_eq!(
+                std::fs::read(directory.join(&name)).expect("the file"),
+                bytes,
+                "whole bytes"
+            );
+        }
+        let leftover = std::fs::read_dir(&directory)
+            .expect("the directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".partial"));
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(!leftover, "no partial left behind");
     }
 }

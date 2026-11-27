@@ -10,11 +10,13 @@ pub mod api;
 pub mod arena;
 pub mod blob;
 pub mod boot;
+pub mod check;
 pub mod checkpoint_serving;
 pub mod chip;
 pub mod comm;
 pub mod device;
 mod dispatch;
+pub mod dissect;
 pub mod ep;
 mod error;
 pub mod experts;
@@ -23,21 +25,27 @@ pub mod group;
 #[cfg(not(feature = "rocm"))]
 pub mod grouped_decode;
 pub mod inputs;
+pub(crate) mod landing_ring;
 pub mod lockstep;
 pub mod mask;
 pub mod narrow;
 pub mod program;
+pub mod rates;
 pub mod record;
 pub mod replay;
 pub mod run;
+pub mod scores;
 pub mod serve;
 pub mod settle;
+pub mod sizing;
 #[cfg(feature = "rocm")]
 pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
+pub mod stored;
 pub mod synth;
 pub mod tap;
+pub mod top;
 pub mod tune;
 pub mod voxels;
 pub mod weights;
@@ -86,6 +94,8 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         vec![
             rules::qkv_fused_qknorm_rope_vnorm_write(),
             rules::rmsnorm_residual_add(),
+            rules::residual_add_rmsnorm_matmul(),
+            rules::residual_add_rmsnorm_matmul_swiglu_matmul(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
             rules::residual_add_rmsnorm(),
@@ -151,13 +161,6 @@ pub fn residual_norms(
         .collect()
 }
 
-/// The fused kernels left on with `fuse-chains=off`: none on CUDA.
-#[cfg(not(feature = "rocm"))]
-pub const UNCHAINED: &[&str] = &[];
-/// On ROCm the hand residual norm stays on with `fuse-chains=off` (as on main).
-#[cfg(feature = "rocm")]
-pub const UNCHAINED: &[&str] = &["fused.residual_add_rmsnorm"];
-
 /// What `op` reads of a seat's rows: the seat table's entry for its name,
 /// but a gated unit of routed rows (each times its route's weight) reads
 /// routed rows, none of the seat's, a predicted route only the prediction's,
@@ -209,8 +212,8 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use serve::{
-    Armed, Boot, DEFAULT_BODIES_MEGABYTES, Diagnostics, Golden, Graphs, Knobs, Lane, Media,
-    Recording, Seal, Seated, Shell,
+    Armed, Boot, Diagnostics, EveryRung, Golden, Graphs, Knobs, Lane, Media, QueueMasks, Recording,
+    Seal, Seated, Shell, WeightPin,
 };
 
 pub use blob::{
@@ -223,20 +226,6 @@ pub use window::{Cursor, Window, WindowShape, Windows};
 mod tests {
     use poem_ir::Operation;
 
-    /// What `fuse-chains=off` keeps is a rule this backend holds.
-    #[test]
-    fn what_fuse_chains_off_keeps_is_a_rule_held() {
-        let held: Vec<&str> = super::FUSIONS
-            .iter()
-            .map(poem_compiler::fuse::Rule::kernel)
-            .collect();
-        let stray: Vec<&&str> = super::UNCHAINED
-            .iter()
-            .filter(|k| !held.contains(k))
-            .collect();
-        assert!(stray.is_empty(), "kept, and no rule: {stray:?}");
-    }
-
     /// Every table this backend keys by op name names an op: an entry under
     /// a name no op carries is never read, and the op it meant falls to the
     /// table's default without a word.
@@ -246,7 +235,6 @@ mod tests {
             .iter()
             .map(|entry| entry.name)
             .chain(super::FUSIONS.iter().map(poem_compiler::fuse::Rule::kernel))
-            .chain(super::UNCHAINED.iter().copied())
             .chain(super::GROUPED)
             .chain(super::PLANNED)
             .chain(super::EXCLUSIVE)
@@ -290,13 +278,20 @@ mod tests {
             matches!(&t.values[v.0 as usize].ty,
                 Ty::Tensor { shape, .. } if matches!(shape.last(), Some(Dim::Const(n)) if n % 8 != 0))
         };
-        for rule in super::retired() {
-            let kernel = rule.kernel();
-            let only = [rule];
-            for row in poem_compiler::catalog::deployments() {
-                let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
-                    continue;
-                };
+        // A row is traced, fused and folded once, each retired rule then
+        // read against both: tracing the catalog once a rule is the cost of
+        // the whole sweep.
+        let retired = super::retired();
+        for row in poem_compiler::catalog::deployments() {
+            let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
+                continue;
+            };
+            let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+            let (anchored, _) = crate::synth::fold_anchors(fused.clone());
+            let (folded, _) =
+                poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
+            for rule in &retired {
+                let kernel = rule.kernel();
                 // The sites the rule forms in `t` that it fused (its product
                 // bf16 against a bf16 weight), and of those the ones too
                 // narrow for a row skeleton.
@@ -326,17 +321,13 @@ mod tests {
                     }
                     held
                 };
-                let formed = |t: Trace| {
-                    let before = sites(&t);
-                    let after = sites(&poem_compiler::fuse::fuse(t, only.iter()));
+                let formed = |t: &Trace| {
+                    let before = sites(t);
+                    let after = sites(&poem_compiler::fuse::fuse(t.clone(), [rule]));
                     (after.0 - before.0, after.1 - before.1)
                 };
-                let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
-                let (here, _) = formed(fused.clone());
-                let (anchored, _) = crate::synth::fold_anchors(fused);
-                let (folded, _) =
-                    poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
-                let (left, thin) = formed(folded);
+                let (here, _) = formed(&fused);
+                let (left, thin) = formed(&folded);
                 let held = census.entry(kernel).or_default();
                 held.0 += here;
                 held.1 += usize::from(here > 0);
@@ -364,10 +355,11 @@ mod tests {
     #[test]
     fn every_fused_op_its_rules_form_is_one_dispatch_fires() {
         let mut refused = std::collections::BTreeSet::new();
-        for row in poem_compiler::catalog::deployments().chain(poem_compiler::catalog::splits()) {
-            let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
-                continue;
-            };
+        let platform = poem_ir::Platform::Cuda;
+        let whole = poem_compiler::catalog::deployments()
+            .filter_map(|row| Some((row.name.clone(), row.try_trace(platform).ok()?)));
+        let split = poem_compiler::catalog::traced_splits(platform).map(|(row, t)| (row.name, t));
+        for (name, trace) in whole.chain(split) {
             #[cfg(feature = "rocm")]
             let trace = crate::split_arm::split_into_arms(trace);
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
@@ -375,7 +367,7 @@ mod tests {
                 if let Operation::Fused(op) = &node.op
                     && crate::dispatch::refuses(op)
                 {
-                    refused.insert(format!("{}: {}", row.name, poem_ir::Operands::name(op)));
+                    refused.insert(format!("{name}: {}", poem_ir::Operands::name(op)));
                 }
             }
         }

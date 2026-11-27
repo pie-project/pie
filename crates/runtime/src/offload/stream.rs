@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::rt::wall::Instant;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -81,6 +83,7 @@ static TOLD: LazyLock<Told> = LazyLock::new(|| {
 /// last one ended with its runtime.
 pub(crate) fn reset() {
     *STREAMS.lock().unwrap() = Streams::default();
+    UNSTREAMED.store(0, std::sync::atomic::Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
     *TOLD.tx.lock().unwrap() = tx;
     *TOLD.rx.lock().unwrap() = Some(rx);
@@ -96,9 +99,19 @@ pub(crate) fn sink() -> engine::TapSink {
 }
 
 /// Registers a run to stream: `keys` from token 0, sent from page `from`.
-/// `None` where this worker's engine reads no layer out as it computes.
-pub(crate) async fn expect(keys: &[Hash256], from: usize) -> Option<u64> {
-    let groups = crate::scheduler::tap_groups(0).await?;
+/// Refused, with why, where this worker's engine reads no layer out as it
+/// computes or could not be asked.
+pub(crate) async fn expect(keys: &[Hash256], from: usize) -> Result<u64, String> {
+    let groups = match crate::scheduler::tap_groups(0).await {
+        Ok(Some(groups)) => groups,
+        Ok(None) => {
+            let kind = crate::engine::get_spec(0).map_or("unknown", |spec| spec.kind);
+            return Err(format!(
+                "engine 0 ({kind}) reads no layer out as it computes (it states no tap groups)"
+            ));
+        }
+        Err(error) => return Err(format!("{error:#}")),
+    };
     if let Some(told) = TOLD.rx.lock().unwrap().take() {
         tokio::spawn(route(told));
     }
@@ -132,7 +145,22 @@ pub(crate) async fn expect(keys: &[Hash256], from: usize) -> Option<u64> {
             since: now,
         },
     );
-    Some(id)
+    Ok(id)
+}
+
+static UNSTREAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A prefill asked for streamed went whole: this worker's engine could not
+/// stream it ([`expect`] said why).
+pub(crate) fn count_unstreamed() {
+    UNSTREAMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The prefills asked for streamed that went whole: the model status's
+/// `offload.prefill_unstreamed`.
+#[must_use]
+pub(crate) fn unstreamed() -> u64 {
+    UNSTREAMED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Lets go the runs no fetch took within [`UNTAKEN_TTL`].
@@ -225,7 +253,7 @@ pub(crate) fn tap(pid: ProcessId, stores: &Stores, req: &mut crate::engine::Fire
     if filled.is_empty() {
         return;
     }
-    let Some(pages) = lane.kv.pages.get(filled.clone()).map(<[u32]>::to_vec) else {
+    let Some(pages) = lane.pages.get(filled.clone()).map(<[u32]>::to_vec) else {
         fail(
             &mut streams,
             run,

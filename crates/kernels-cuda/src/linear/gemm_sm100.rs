@@ -1288,7 +1288,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let quant = job.plan.swap && matches!(epi.out, Out::Nvfp4 { .. });
     // A grouped launch's routing for its bank's experts alone where the
     // profile says (`kernel.moe.routes_sized`), the room going to the ring.
-    let routes = if group.mode != 0 && ctx.tuning().moe_routes_sized {
+    let routes = if group.mode != 0 && ctx.tuning().moe_routes_sized() {
         group.experts + 1
     } else {
         MAX_ROUTES
@@ -1341,11 +1341,11 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
         _ => (0, 0),
     };
     let epi_args = EpiArgs {
-        raster: i32::try_from(ctx.tuning().gemm_tc5_raster.max(1)).unwrap_or(8),
+        raster: i32::try_from(ctx.tuning().gemm_tc5_raster().max(1)).unwrap_or(8),
         // A swapped grouped launch's units, dealt evenly from as many waves
         // as the profile says (`kernel.moe.even_waves_from`).
         even_waves: if group.mode != 0 && plan.swap {
-            i32::try_from(ctx.tuning().moe_even_waves_from).unwrap_or(0)
+            i32::try_from(ctx.tuning().moe_even_waves_from()).unwrap_or(0)
         } else {
             0
         },
@@ -1376,7 +1376,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     // Under `kernel.gemm.tc5_split_tickets` a tile's last split sums it, a
     // count a CTA of each tile (a contiguous group's tiles bounded by its
     // experts' ragged ends), left at zero by the kernel.
-    let tickets = if splits > 1 && job.y_rows <= ctx.tuning().gemm_tc5_split_tickets {
+    let tickets = if splits > 1 && job.y_rows <= ctx.tuning().gemm_tc5_split_tickets() {
         let count =
             ctas as usize * (job.tiles as usize + group.experts as usize * n.div_ceil(32) as usize);
         ctx.scratch_stream_zeroed(OP, SPLIT_TICKETS, count * 4)? as u64
@@ -1451,7 +1451,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             )
             .smem(smem)
             .cluster(ctas)
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &values,
     )?;
@@ -1475,7 +1475,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     ctx.fire(
         OP,
         Fire::at(kernel(GEMM_SM100, "::pie::linear::tc5_finalize"))
-            .apply(Launch::flat(quads, 256).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::flat(quads, 256).programmatic(ctx.tuning().pdl())),
         &[
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),
@@ -1503,7 +1503,7 @@ fn fire_routed(
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, entry))
-            .apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl())),
         &[
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),

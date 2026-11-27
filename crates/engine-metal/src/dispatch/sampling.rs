@@ -20,18 +20,18 @@ impl Run<'_> {
                 indices,
             } => sampling::topk(
                 self.ctx(),
-                self.tensor(*x),
+                self.tensor(*x)?,
                 *k,
-                self.tensor(*values),
-                self.tensor(*indices),
+                self.tensor(*values)?,
+                self.tensor(*indices)?,
             ),
             Sampling::Argmax { xs, y } => {
                 for (column, x) in xs.iter().enumerate() {
                     sampling::argmax(
                         self.ctx(),
-                        self.tensor(*x),
+                        self.tensor(*x)?,
                         u32::try_from(column).expect("a draft depth inside u32"),
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                     )?;
                 }
                 Ok(())
@@ -47,14 +47,14 @@ impl Run<'_> {
                 picks,
             } => sampling::selector_walk::walk(
                 self.ctx(),
-                self.ragged(*cand),
-                self.tensor(*unary),
-                hp.map(|hp| self.tensor(hp)),
-                self.tensor(*tokens),
-                self.tensor(*pred),
-                self.tensor(*succ),
+                self.ragged(*cand)?,
+                self.tensor(*unary)?,
+                hp.map(|hp| self.tensor(hp)).transpose()?,
+                self.tensor(*tokens)?,
+                self.tensor(*pred)?,
+                self.tensor(*succ)?,
                 *first,
-                self.tensor(*picks),
+                self.tensor(*picks)?,
             ),
             Sampling::MarkovWalk { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
         }

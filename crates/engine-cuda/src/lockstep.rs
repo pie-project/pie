@@ -5,7 +5,7 @@
 //! submissions into one sequence of steps.
 //!
 //! A step forms when its first frame arrives. It waits for each rank that
-//! has announced a next frame (`Completion::expect_fire`) or brought one to the
+//! has announced a next frame (`Engine::expect_fire`) or brought one to the
 //! step before, and has not yet brought it, up to a deadline from when the
 //! step before is done; any other rank is idle and is not waited for, and a
 //! busy rank that misses the deadline is idle from then on. Without the
@@ -32,7 +32,7 @@ use engine::load::{LoadRequest, Loaded};
 use engine::placement::Limits;
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle};
-use engine::{Channels, Completion, Engine, Peers, Programs, Taps, Tiers};
+use engine::{Channels, Completion, Engine, Peers, Pool, Programs, Taps, Tiers};
 
 /// What a rank brings to a step: its frame and the token bucket it asks.
 pub struct Arrival<F> {
@@ -346,7 +346,7 @@ fn serve(
             Ok(Some(done)) => Some(Ok(done)),
             Ok(None) => None,
             Err(error) => {
-                eprintln!("engine-cuda: expert-parallel rank {rank} refused: {error}");
+                tracing::warn!("expert-parallel rank {rank} refused: {error}");
                 Some(Err(error))
             }
         };
@@ -379,6 +379,28 @@ impl Group {
     /// the others; the last to come maps every rank's EP buffers into the
     /// others. Each rank then lays its layers' placements on its own device.
     fn meet(&self, rank: usize, shell: &mut crate::serve::Shell) -> Result<(), String> {
+        // The spare a rebalance copies an expert through is laid at load, on
+        // the leader's device where the copies run: the widest expert's
+        // planes of any layer.
+        if rank == 0
+            && let Some(rebalancer) = &self.rebalancer
+            && let Some((ep, _)) = shell.rebalance_view()
+        {
+            let widest = ep
+                .layers()
+                .filter_map(|(layer, ..)| {
+                    ep.planes(layer)
+                        .ok()
+                        .map(|planes| planes.iter().map(|plane| plane.slot_bytes).sum::<u64>())
+                })
+                .max()
+                .unwrap_or(0);
+            rebalancer
+                .lock()
+                .expect("lockstep rebalance lock poisoned")
+                .lay_spare(widest)
+                .map_err(|fault| fault.to_string())?;
+        }
         let shape = shell
             .ep_shape()
             .ok_or("the loaded trace dispatches nothing: it is not an expert-parallel rank's")?;
@@ -682,6 +704,21 @@ impl Rank {
 }
 
 impl Engine for Rank {
+    /// A lockstep rank keys no host cover, and `measure = false` is refused for one by name (worker config).
+    fn committed_covers(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Not tracked for a lockstep rank: its ranks measure at every boot (`measure =
+    /// false` is refused for one), said so by name.
+    fn measured_at_load(&self) -> Vec<String> {
+        vec!["cuda (a lockstep rank): what it measured is not tracked".to_string()]
+    }
+
+    fn skips_measuring(&self) -> bool {
+        false
+    }
+
     fn kind(&self) -> &'static str {
         "cuda"
     }
@@ -709,6 +746,10 @@ impl Engine for Rank {
         loaded
     }
 
+    fn readout_facts(&self) -> EngineResult<engine::ReadoutFacts> {
+        Ok(crate::api::readout_facts())
+    }
+
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
         self.group.ready()?;
         let (id, buckets) = self.with(|cuda| cuda.lockstep_frame(frame))?;
@@ -719,7 +760,15 @@ impl Engine for Rank {
                 frame: id,
                 step: index as u32,
             };
-            let (ticket, pending) = self.step(step, at, bucket)?;
+            // A formed step's lanes are the group's, not this rank's: a
+            // lane it refuses refuses the frame (`engine::Error::Lanes`
+            // names a lane of the step submitted).
+            let (ticket, pending) = self.step(step, at, bucket).map_err(|error| match error {
+                Error::Lanes(_) => Error::Invalid(format!(
+                    "{error}, of an expert-parallel group's formed step"
+                )),
+                other => other,
+            })?;
             tickets.push(ticket);
             settled.push(pending);
         }
@@ -727,7 +776,7 @@ impl Engine for Rank {
             cuda.adopt(id, settled);
             Ok(())
         })?;
-        Ok(FrameTicket { id, steps: tickets })
+        Ok(FrameTicket::of(id, tickets, None))
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -742,7 +791,19 @@ impl Engine for Rank {
         Some(self)
     }
 
+    fn programs_ref(&self) -> Option<&dyn Programs> {
+        Some(self)
+    }
+
     fn channels(&mut self) -> Option<&mut dyn Channels> {
+        Some(self)
+    }
+
+    fn channels_ref(&self) -> Option<&dyn Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn Pool> {
         Some(self)
     }
 
@@ -759,55 +820,11 @@ impl Engine for Rank {
     }
 }
 
-impl Programs for Rank {
-    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        self.with(|cuda| cuda.register(registration))
-    }
-
-    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
-        self.with(|cuda| cuda.bind(binding))
-    }
-
-    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
-        self.with(|cuda| Programs::close(cuda, id))
-    }
-
-    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        self.with(|cuda| cuda.adapter(registration))
-    }
-}
-
-impl Channels for Rank {
-    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
-        self.with(|cuda| Channels::open(cuda, registration))
-    }
-
-    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
-        self.with(|cuda| Channels::close(cuda, id))
-    }
-
-    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
-        self.with(|cuda| cuda.publish(instance, channel, cell))
-    }
-
-    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
-        self.with(|cuda| cuda.take(instance, channel))
-    }
-}
-
-impl Taps for Rank {
-    fn groups(&self) -> Option<engine::TapGroups> {
-        self.group.ranks[self.rank].try_lock().ok()?.groups()
-    }
-
-    fn subscribe(&mut self, sink: engine::TapSink) {
-        if let Ok(mut cuda) = self.cuda() {
-            cuda.subscribe(sink);
-        }
-    }
-}
-
 impl Completion for Rank {
+    fn asynchronous(&self) -> bool {
+        true
+    }
+
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         if let Ok(mut cuda) = self.cuda() {
             cuda.on_complete(sink);
@@ -823,6 +840,162 @@ impl Completion for Rank {
     }
 }
 
+impl Programs for Rank {
+    fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        self.with(|cuda| cuda.register(registration))
+    }
+
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        self.with(|cuda| cuda.prepare(registration))
+    }
+
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        self.with(|cuda| cuda.finish(prepared))
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.with(|cuda| cuda.close_program(program))
+    }
+
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::program::ProgramFacts> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.facts(program),
+            None => Err(Error::Program(
+                "a rank is busy: its program's facts are asked between frames".to_string(),
+            )),
+        }
+    }
+
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        extents: &engine::program::BindExtents,
+        class: engine::ports::GeometryClass,
+    ) -> EngineResult<engine::GuestState> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.guest_state(program, extents, class),
+            None => Err(Error::Program(
+                "a rank is busy: a program's guest state is asked between frames".to_string(),
+            )),
+        }
+    }
+
+    fn rebind(&mut self, rebind: engine::program::Rebind) -> EngineResult<()> {
+        self.with(|cuda| cuda.rebind(rebind))
+    }
+
+    fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
+        self.with(|cuda| cuda.bind(binding))
+    }
+
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
+        self.with(|cuda| Programs::close(&mut *cuda, id))
+    }
+
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        self.with(|cuda| cuda.adapter(registration))
+    }
+}
+
+impl Channels for Rank {
+    /// As the CUDA engine it steps.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::program::RingFacts>> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.ring_facts(registration),
+            None => Err(Error::Program(
+                "a rank is busy: a ring's facts are asked between frames".to_string(),
+            )),
+        }
+    }
+
+    fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
+        self.with(|cuda| Channels::open(&mut *cuda, registration))
+    }
+
+    fn close(&mut self, id: ChannelId) -> EngineResult<()> {
+        self.with(|cuda| Channels::close(&mut *cuda, id))
+    }
+
+    fn publish(&mut self, instance: InstanceId, channel: u32, cell: &[u8]) -> EngineResult<bool> {
+        self.with(|cuda| cuda.publish(instance, channel, cell))
+    }
+
+    fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
+        self.with(|cuda| cuda.take(instance, channel))
+    }
+}
+
+impl Pool for Rank {
+    fn commit(&mut self, segments: u32) -> EngineResult<()> {
+        self.with(|cuda| cuda.commit(segments))
+    }
+
+    fn release(&mut self, segments: u32) -> EngineResult<()> {
+        self.with(|cuda| cuda.release(segments))
+    }
+
+    /// Every rank moves the same chunks and rebases its guests' rings.
+    fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
+        self.with(|cuda| cuda.evacuate(evacuation))
+    }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        match self.group.ranks[self.rank].try_lock().ok() {
+            Some(rank) => rank.chunk_table(),
+            None => Err(Error::Program(
+                "a rank is busy: its chunk table is read between frames".to_string(),
+            )),
+        }
+    }
+}
+
+impl Tiers for Rank {
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+        self.with(|cuda| cuda.copy_kv(copy))
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.with(|cuda| cuda.copy(copy))
+    }
+
+    fn settle(&mut self) -> EngineResult<()> {
+        self.with(|cuda| cuda.settle())
+    }
+
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
+        self.with(|cuda| cuda.copy_landing(copy, token))
+    }
+
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        if let Ok(mut cuda) = self.cuda() {
+            cuda.on_landed(sink);
+        }
+    }
+
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        self.with(|cuda| Tiers::read(&mut *cuda, slots))
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        self.with(|cuda| Tiers::write(&mut *cuda, slots, bytes))
+    }
+}
+
 impl Peers for Rank {
     fn export(&self) -> Option<KvHandle> {
         self.group.ranks[self.rank].try_lock().ok()?.export()
@@ -833,33 +1006,23 @@ impl Peers for Rank {
     }
 
     fn read(&mut self, slots: &[u32]) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| Peers::read(cuda, slots))
+        self.with(|cuda| Peers::read(&mut *cuda, slots))
     }
 
     fn write(&mut self, slots: &[u32], bytes: &[u8]) -> EngineResult<()> {
-        self.with(|cuda| Peers::write(cuda, slots, bytes))
+        self.with(|cuda| Peers::write(&mut *cuda, slots, bytes))
     }
 }
 
-impl Tiers for Rank {
-    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
-        self.with(|cuda| Tiers::read(cuda, slots))
+impl Taps for Rank {
+    fn groups(&self) -> Option<engine::TapGroups> {
+        self.group.ranks[self.rank].try_lock().ok()?.groups()
     }
 
-    fn write(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
-        self.with(|cuda| Tiers::write(cuda, slots, bytes))
-    }
-
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
-        self.with(|cuda| cuda.copy_kv(copy))
-    }
-
-    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.with(|cuda| cuda.copy(copy))
+    fn subscribe(&mut self, sink: engine::TapSink) {
+        if let Ok(mut cuda) = self.cuda() {
+            cuda.subscribe(sink);
+        }
     }
 }
 

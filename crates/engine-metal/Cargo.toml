@@ -12,6 +12,20 @@ repository = "https://github.com/pie-project/pie"
 name = "engine_metal"
 path = "src/lib.rs"
 
+[features]
+# Test builds: the scratch a hollow value points at is poisoned after each
+# zero fill, so a kernel that reads one breaks a golden.
+test-slot-fill = []
+# Tests only: `device::fail_next_frame`, which answers the next frame a
+# thread commits as failed. Off by default, so a served binary has no
+# injection path; engine-metal's own tests turn it on (the dev-dependency
+# on this crate below).
+fault-injection = []
+# Tests only: `DeviceBoot::top`, a load's top rung stated in place of the
+# ruling's (a test hand-building frames past a miniature's ruled top). Off
+# by default, so no served load can name it.
+test-limits = []
+
 [dependencies]
 toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
@@ -43,6 +57,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSError",
     "NSRange",
     "NSProcessInfo",
+    "NSURL",
+    "NSArray",
 ] }
 objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
@@ -57,6 +73,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLComputePipeline",
     "MTLLibrary",
     "MTLBlitCommandEncoder",
+    "MTLBinaryArchive",
     "MTLTypes",
     "block2",
     "MTLIndirectCommandBuffer",
@@ -78,6 +95,9 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+engine-metal = { path = ".", features = ["fault-injection", "test-limits"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
+engine-cpu = { path = "../engine-cpu" }
 media = { path = "../media" }
 poem = { package = "pie-poem", path = "../poem" }
 serde_json = "1"

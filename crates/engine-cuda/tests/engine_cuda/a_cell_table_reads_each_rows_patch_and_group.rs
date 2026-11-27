@@ -159,7 +159,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
     let path = weights.write(dir.path());
     let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
         .expect("the engine opens");
-    engine
+    let loaded = engine
         .load(LoadRequest {
             trace,
             checkpoint: Checkpoint::Path(path),
@@ -177,11 +177,16 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 max_voxels: Some(128),
                 max_clips: Some(4),
             },
-            residency: Residency::default(),
+            residency: Residency {
+                device_kv_budget: Some(crate::POOL),
+                ..Residency::default()
+            },
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("the cell plan loads");
+    let mut guest = crate::guest::Guest::on(&mut engine, &loaded.caps.chunks);
 
     let clips = [[2u32, 4, 6], [1, 2, 4]];
     let text_rows = [3u32, 5];
@@ -263,31 +268,41 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             },
         )
         .expect("the channel registers");
-        let instance = engine
-            .bind(&InstanceBinding {
-                program,
-                channels: vec![channel],
-                seeds: Vec::new(),
-                geometry: GeometryClass::Host,
-                device_resolved: Default::default(),
-                extents: engine::program::BindExtents {
-                    row_count: rows,
-                    token_count: rows,
-                    sampled_rows: rows,
-                    query_len: rows,
-                    ..engine::program::BindExtents::default()
+        let instance = guest
+            .bind(
+                &mut engine,
+                InstanceBinding {
+                    program,
+                    channels: vec![channel],
+                    seeds: Vec::new(),
+                    geometry: GeometryClass::Host,
+                    device_resolved: Default::default(),
+                    extents: engine::program::BindExtents {
+                        row_count: rows,
+                        token_count: rows,
+                        sampled_rows: rows,
+                        query_len: rows,
+                        ..engine::program::BindExtents::default()
+                    },
+                    instance_slots: Vec::new(),
+                    ring_slots: Vec::new(),
+                    adapter_slots: Vec::new(),
+                    scratch: engine::ScratchPlace::None,
+                    pair: engine::ScratchPlace::None,
+                    pair_generation: 0,
                 },
-            })
-            .expect("the instance binds")
+            )
             .id;
         attachments.push(Attachment {
             lane: at as u32,
             lanes: 1,
             instance,
             adapter_only: false,
+            scratch: ::engine::ScratchPlace::None,
         });
         readers.push(instance);
     }
@@ -297,6 +312,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             attachments,
             media: Vec::new(),
             voxels,
+            shape: None,
         }))
         .expect("the frame fires");
     engine.settle_frame(&mut ticket).expect("the frame settles");

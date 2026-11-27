@@ -4,10 +4,19 @@ api = 1
 device = "Apple M4 Pro"
 
 [provenance]
-measured = ["kernel.qmm_splitk", "kernel.ane.mlp", "kernel.moe.tile_rows"]
+# No run states the check models these lines were compared on, so none is
+# called measured (a decision is measured only where a check model read it
+# and the run changed it or kept it within the agreement tolerance). The
+# values stand on their own comments; `pie tune metal` on an M4 Pro states
+# them anew.
+measured = []
 
 [kernel]
+# From the first device profile's search (#942): the split-K fill a 4-bit
+# decode's matmul takes on this GPU's cores. Read by a quantized model.
 qmm_splitk      = { use = "fill", fill_tg = 896, max = 8 }
+# Set by hand in #993: Splash's measured share and least chunk for the MLP
+# on the Neural Engine; the projections stay on the GPU.
 ane.mlp         = [{ when = "ane", use = "share", percent = 74 }, "gpu"]
 ane.projections = "gpu"
 ane.min_rows    = 512

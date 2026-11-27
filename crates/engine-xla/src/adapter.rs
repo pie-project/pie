@@ -5,7 +5,7 @@ use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
 use crate::error::{Fault, Result};
-use crate::weights::{AdapterPlane, BankSeat};
+use crate::weights::BankSeat;
 
 pub const LORA: &str = "lora";
 
@@ -254,12 +254,9 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
     }))
 }
 
-pub fn planes_of(
-    role: Role,
-    site: Option<Site>,
-    wire: &[u8],
-    seats: &[BankSeat],
-) -> Result<Vec<(String, Vec<u8>)>> {
+/// The banks a sink's plane of `role` at `site` fills, one a layer in layer
+/// order: each holds one plane of an adapter.
+pub fn banks_of(role: Role, site: Option<Site>, seats: &[BankSeat]) -> Result<Vec<&BankSeat>> {
     let refuse = |why: String| Fault::Adapter {
         bank: role.bank().to_string(),
         why,
@@ -334,6 +331,59 @@ pub fn planes_of(
             seat.elem, seat.name
         )));
     }
+    Ok(banks)
+}
+
+/// Every bank a sink's planes fill, in the order its planes land: the
+/// sink's planes in order, each's banks in layer order. An instance's
+/// `Adapter` slots are in this order (`ProgramFacts::adapter`).
+pub fn plane_banks(sink: &Sink, seats: &[BankSeat]) -> Result<Vec<BankSeat>> {
+    let site = sink.site()?;
+    let mut out = Vec::new();
+    for (role, _) in &sink.planes {
+        out.extend(banks_of(*role, site, seats)?.into_iter().cloned());
+    }
+    Ok(out)
+}
+
+/// The content key of an adapter (`Engine::adapter_key`): two independent
+/// 64-bit digests (FNV-1a high, SipHash low) of the sink's site word and, in
+/// the sink's plane order, each plane's bank role, its seed's length and its
+/// seed, word for word as CUDA's and Metal's, so one adapter keys the same
+/// on every engine.
+#[must_use]
+pub fn adapter_digest<'a>(sites: u32, planes: impl Iterator<Item = (&'a str, &'a [u8])>) -> u128 {
+    let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut sip = std::collections::hash_map::DefaultHasher::new();
+    let mut eat = |bytes: &[u8]| {
+        use std::hash::Hasher;
+        for byte in bytes {
+            fnv = (fnv ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        sip.write(bytes);
+    };
+    eat(&sites.to_le_bytes());
+    for (bank, wire) in planes {
+        eat(bank.as_bytes());
+        eat(&(wire.len() as u64).to_le_bytes());
+        eat(wire);
+    }
+    let sip = std::hash::Hasher::finish(&sip);
+    (u128::from(fnv) << 64) | u128::from(sip)
+}
+
+pub fn planes_of(
+    role: Role,
+    site: Option<Site>,
+    wire: &[u8],
+    seats: &[BankSeat],
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let refuse = |why: String| Fault::Adapter {
+        bank: role.bank().to_string(),
+        why,
+    };
+    let banks = banks_of(role, site, seats)?;
+    let seat = banks[0];
 
     let bank_rank = seat.rows.min(seat.cols);
     let hidden = seat.rows.max(seat.cols);
@@ -406,104 +456,87 @@ pub fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Source<'a> {
-    Own {
-        instance: InstanceId,
-
-        planes: &'a [AdapterPlane<'a>],
-    },
-
-    Shared {
-        name: &'a str,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Binding {
-    pub slot: u32,
-
-    pub shared: bool,
-
-    pub landed: bool,
-
-    pub key: Key,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Key {
-    Instance(InstanceId),
-
-    Shared(crate::blob::Stamp),
-}
-
+/// The adapters landed in the pool's `Adapter` slots, each named by its
+/// first slot ref (what its lanes route by) and held by the instances that
+/// bound it: the runtime keys an adapter by its content
+/// (`Engine::adapter_key`), so instances that carry the same adapter bind
+/// the same slots and it lands once.
 #[derive(Debug, Default)]
-pub struct Slots {
-    seats: u32,
-
-    held: BTreeMap<Key, (u32, u32)>,
+pub struct Landings {
+    held: BTreeMap<u32, Landing>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Grant {
-    pub slot: u32,
-
-    pub fresh: bool,
+#[derive(Debug)]
+struct Landing {
+    /// Its slots, one a plane in [`plane_banks`] order.
+    slots: Vec<u32>,
+    /// The bank each slot's plane fills.
+    banks: Vec<String>,
+    holders: std::collections::BTreeSet<InstanceId>,
 }
 
-impl Slots {
-    #[must_use]
-    pub fn new(seats: u32) -> Slots {
-        Slots {
-            seats,
-            held: BTreeMap::new(),
+impl Landings {
+    /// Whether `slots` already hold a landed adapter; `instance` joins it.
+    pub fn join(&mut self, instance: InstanceId, slots: &[u32]) -> Option<u32> {
+        let first = *slots.first()?;
+        let landing = self.held.get_mut(&first)?;
+        landing.holders.insert(instance);
+        Some(first)
+    }
+
+    /// Records `slots` as landed for `instance`; its id, the first slot.
+    pub fn land(&mut self, instance: InstanceId, slots: &[u32], banks: Vec<String>) -> u32 {
+        let first = slots[0];
+        self.held.insert(
+            first,
+            Landing {
+                slots: slots.to_vec(),
+                banks,
+                holders: std::iter::once(instance).collect(),
+            },
+        );
+        first
+    }
+
+    /// `instance` lets go of adapter `id`; the last holder's release frees
+    /// the landing (the runtime frees its slots).
+    pub fn release(&mut self, instance: InstanceId, id: u32) {
+        if let Some(landing) = self.held.get_mut(&id) {
+            landing.holders.remove(&instance);
+            if landing.holders.is_empty() {
+                self.held.remove(&id);
+            }
         }
     }
 
+    /// Adapter `id` now lies in `slots` (the runtime moved it).
+    pub fn rebind(&mut self, id: u32, slots: &[u32]) -> Option<u32> {
+        let mut landing = self.held.remove(&id)?;
+        landing.slots = slots.to_vec();
+        let first = *slots.first()?;
+        self.held.insert(first, landing);
+        Some(first)
+    }
+
+    /// Adapter `id`'s slots, one a plane in [`plane_banks`] order.
     #[must_use]
-    pub fn seats(&self) -> u32 {
-        self.seats
+    pub fn slots(&self, id: u32) -> Option<&[u32]> {
+        self.held.get(&id).map(|landing| landing.slots.as_slice())
+    }
+
+    /// The slot adapter `id` holds bank `bank`'s plane in.
+    #[must_use]
+    pub fn slot_of(&self, id: u32, bank: &str) -> Option<u32> {
+        let landing = self.held.get(&id)?;
+        let at = landing.banks.iter().position(|b| b == bank)?;
+        landing.slots.get(at).copied()
     }
 
     #[must_use]
     pub fn live(&self) -> usize {
         self.held.len()
     }
-
-    pub fn acquire(&mut self, key: Key) -> Result<Grant> {
-        if let Some((slot, count)) = self.held.get_mut(&key) {
-            *count += 1;
-            return Ok(Grant {
-                slot: *slot,
-                fresh: false,
-            });
-        }
-        let taken: Vec<u32> = self.held.values().map(|(slot, _)| *slot).collect();
-        let slot = (0..self.seats)
-            .find(|slot| !taken.contains(slot))
-            .ok_or(Fault::AdapterSlots { seats: self.seats })?;
-        self.held.insert(key, (slot, 1));
-        Ok(Grant { slot, fresh: true })
-    }
-
-    pub fn abandon(&mut self, key: &Key) {
-        self.release_key(key);
-    }
-
-    pub fn release(&mut self, key: &Key) {
-        self.release_key(key);
-    }
-
-    fn release_key(&mut self, key: &Key) {
-        let drop = match self.held.get_mut(key) {
-            Some((_, count)) => {
-                *count = count.saturating_sub(1);
-                *count == 0
-            }
-            None => false,
-        };
-        if drop {
-            self.held.remove(key);
-        }
-    }
 }
+
+#[cfg(test)]
+mod digest_tests {}

@@ -71,28 +71,19 @@ impl ForwardHybrid for Micro {
 fn shell(trace: poem::Trace, path: &Path, runahead: Runahead) -> Shell {
     let contract = contract_for(&trace, path).expect("the random planes fit the trace");
     let mut shell = Shell::load(Boot {
-        voxels: None,
-        residency: engine_cuda::experts::Plan::default(),
-        trace,
-        contract: &contract,
-        checkpoint: path,
-        budget: Budget::new(MAX_BEAMS, 64),
-        patches: None,
-        page_size: PAGE,
-        context: 256,
-        slots: MAX_BEAMS,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
         knobs: engine_cuda::Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, None)),
+            pin: Some((Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
-        cache_dir: None,
         runahead,
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
+        ..crate::common::boot(
+            trace,
+            &contract,
+            path,
+            Budget::new(MAX_BEAMS, 64),
+            256,
+            MAX_BEAMS,
+        )
     })
     .expect("the shell loads");
     for slot in 0..MAX_BEAMS {
@@ -176,6 +167,14 @@ fn token(beam: u32) -> u32 {
 }
 
 fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
+    bind_on(shell, beams, device, false)
+}
+
+/// [`bind`], its rings the instance's own or (`shared`) registered rings
+/// only the device touches, as the runtime binds a program's channels: the
+/// host's view of such a ring is its mirror, filled as the device's puts
+/// land.
+fn bind_on(shell: &mut Shell, beams: u32, device: PortMask, shared: bool) -> engine::InstanceId {
     let bound = crate::bound::logits(beam_step(beams), VOCAB).expect("the beam step binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
@@ -203,21 +202,77 @@ fn bind(shell: &mut Shell, beams: u32, device: PortMask) -> engine::InstanceId {
     let positions: Vec<u8> = (0..beams).flat_map(|_| 999u32.to_le_bytes()).collect();
     let count = bound.container.channels.len();
     let ids: Vec<engine::ChannelId> = (1..=count as u64).map(engine::ChannelId).collect();
+    let facts = shell.chunk_facts().expect("the chunk facts");
+    let segments = facts.segments.committed.max(1);
+    shell
+        .commit_segments(segments)
+        .expect("the first segment commits");
+    let mut guest = crate::guest::Guest::of(&facts, segments * facts.segment_chunks);
+    let adopted: Vec<Option<std::sync::Arc<engine_cuda::program::Endpoint>>> = if shared {
+        bound
+            .container
+            .channels
+            .iter()
+            .map(|channel| {
+                let ChanDType::Concrete(dtype) = channel.dtype else {
+                    panic!("the beam step's channels are concrete");
+                };
+                let numel = channel.shape.numel() as usize;
+                let cell = engine_cuda::program::launch::native_cell_bytes(dtype, numel) as u32;
+                let span = engine_cuda::program::Endpoint::cell_span(cell, channel.capacity);
+                let slots =
+                    guest.channel(&shell.guest_footprint(engine::chunk::SlotRole::Channel, span));
+                let at = shell
+                    .guest_span(engine::chunk::SlotRole::Channel, &slots, span)
+                    .expect("the ring's slots");
+                Some(std::sync::Arc::new(
+                    engine_cuda::program::Endpoint::open(
+                        HostRole::None,
+                        cell,
+                        channel.capacity,
+                        Some((at, slots)),
+                        shell.stream(),
+                    )
+                    .expect("the ring opens"),
+                ))
+            })
+            .collect()
+    } else {
+        vec![None; count]
+    };
+    let slots = guest.slots(
+        &shell.program_facts(program).expect("the program's facts"),
+        |_| shared,
+    );
+    let extents = Extents {
+        row_count: beams,
+        token_count: beams,
+        sampled_rows: beams,
+        query_len: beams,
+        ..Extents::default()
+    };
+    let (scratch, pair) = guest.places(
+        (program, extents),
+        &shell
+            .guest_state(program, extents)
+            .expect("the program's guest state"),
+    );
     shell
         .bind_program(
             program,
             &[(TOKENS, tokens), (MASK, mask), (POSITIONS, positions)],
-            Extents {
-                row_count: beams,
-                token_count: beams,
-                sampled_rows: beams,
-                query_len: beams,
-                ..Extents::default()
-            },
+            extents,
             GeometryClass::DecodeEnvelope,
             device,
-            &vec![None; count],
+            &adopted,
             &ids,
+            engine_cuda::program::Slots {
+                instance: slots.0,
+                rings: slots.1,
+                scratch,
+                pair,
+                pair_generation: 0,
+            },
         )
         .expect("the instance binds")
 }
@@ -369,4 +424,101 @@ fn a_decode_envelope_packs_its_device_mask_into_each_lane() {
         .fire_media(&pool.lanes(&trace, false), &attached, &[])
         .expect_err("two sources for one port are refused");
     assert!(format!("{refused}").contains("one side"), "{refused}");
+}
+
+/// A decode envelope's fire prepared before the epilogue that puts its
+/// tokens has run on the device (the step ahead still queued behind a held
+/// stream) embeds each lane's token from the device cell that epilogue
+/// writes, its first lane's as much as the others'. Its rings are shared,
+/// as the runtime binds them, so the host's view of that cell is a mirror
+/// the put has not reached yet. A fire the shell does not stage ahead (one
+/// frame in flight) resolves its envelope on the host and is no exception:
+/// a beam's first lane embedding the mirror's stale token is how beam
+/// search diverged at `frame_dispatch_depth = 1`.
+#[test]
+fn a_decode_envelope_embeds_each_lanes_token_its_epilogue_has_yet_to_put() {
+    use engine::frame::Shell as FrameShell;
+    use engine_cuda::serve::StepView;
+
+    if !engine_cuda::device::present() {
+        eprintln!("no CUDA device: skipping");
+        return;
+    }
+    let trace = poem::trace_hybrid("envelope-micro", &Micro, Platform::Cuda);
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = Weights::random(&trace, 3307).write(dir.path());
+    let device = PortMask::of(&[Port::EmbedTokens, Port::AttnMask]);
+    for beams in [2, MAX_BEAMS] {
+        let pool = Pool::new(beams);
+        for runahead in [Runahead::F1, Runahead::of(2)] {
+            let mut shell = shell(trace.clone(), &path, runahead);
+            prefill(&mut shell, &trace, &pool.pages);
+            let want: Vec<Readout> = (0..beams).map(|_| Readout::Last).collect();
+            let host = shell
+                .fire_rows(&pool.lanes(&trace, true), &want)
+                .expect("the host-masked beams fire");
+            let instance = bind_on(&mut shell, beams, device, true);
+            let attached = [Attached {
+                lane: 0,
+                lanes: beams,
+                instance,
+                adapter_only: false,
+            }];
+
+            let lanes = pool.lanes(&trace, false);
+            // A first fire lands whole: what the instance's first fire sets
+            // up is behind the host before the stream is held.
+            shell
+                .fire_media(&lanes, &attached, &[])
+                .expect("the device-masked beams fire");
+
+            // The stream holds until the next two fires are prepared and
+            // queued: the second is prepared before the first's epilogue
+            // puts the tokens it embeds.
+            let (open, gate) = std::sync::mpsc::channel::<()>();
+            let held_too_long = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let told = std::sync::Arc::clone(&held_too_long);
+            engine_cuda::device::ctx::host_fn_on(
+                shell.stream(),
+                Box::new(move || {
+                    if gate
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .is_err()
+                    {
+                        told.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }),
+            )
+            .expect("the gate is queued on the compute stream");
+            let step = || StepView {
+                lanes: &lanes,
+                attachments: &attached,
+                media: &[],
+                voxels: &[],
+                shape: None,
+            };
+            let fire = |shell: &mut Shell| {
+                let prepared = FrameShell::prepare(shell, step(), None).expect("the beams prepare");
+                let enqueued = FrameShell::enqueue(shell, prepared).expect("the beams enqueue");
+                FrameShell::settle(shell, enqueued).expect("the beams settle")
+            };
+            let _first = fire(&mut shell);
+            let mut second = fire(&mut shell);
+            let _ = open.send(());
+            shell
+                .read_out(&mut second)
+                .expect("the second fire reads out");
+            assert!(
+                !held_too_long.load(std::sync::atomic::Ordering::SeqCst),
+                "{beams} beams, {runahead:?}: preparing the two fires waited on the stream the \
+                 gate held, so the second was not prepared ahead of the first's epilogue"
+            );
+            let off = worst(&second.logits, &host);
+            assert!(
+                off <= 1e-5,
+                "{beams} beams, {runahead:?}: a fire prepared ahead of the epilogue that puts \
+                 its tokens answers {off} away from the same tokens stated on the host"
+            );
+        }
+    }
 }

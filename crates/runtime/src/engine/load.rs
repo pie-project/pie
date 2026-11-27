@@ -27,25 +27,22 @@ pub fn trace(name: &str, platform: Platform) -> Result<Trace> {
 }
 
 /// What the deployment `name` needs of this Mac's GPU to hold one sequence
-/// of `context` tokens on `page_size` pages, under the default
-/// `device_memory_share`: the planner a boot admits by, run before any weight
-/// is read. Beside it, this Mac's physical memory.
+/// of `context` tokens, where the operator states no budget: the rule a boot
+/// admits by, run before any weight is read. Beside it, this Mac's physical
+/// memory.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
-pub fn need(
-    name: &str,
-    context: u32,
-    page_size: u32,
-) -> Result<(engine_metal::store::accounting::Need, u64)> {
+pub fn need(name: &str, context: u32) -> Result<(engine_metal::store::accounting::Need, u64)> {
     let trace = trace(name, Platform::Metal)?;
-    let working_set = engine_metal::Context::bind()
-        .map_err(|why| anyhow!("this Mac's GPU: {why}"))?
-        .working_set();
+    let device = engine_metal::Context::bind().map_err(|why| anyhow!("this Mac's GPU: {why}"))?;
+    let caches = device
+        .hold_resident(std::iter::empty(), true)
+        .map_err(|why| anyhow!("this Mac's GPU: {why}"))?;
     let need = engine_metal::store::accounting::Need::of(
         &trace,
         context,
-        page_size,
-        working_set,
-        engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        device.working_set(),
+        device.allocated(),
+        caches,
     )
     .map_err(|why| anyhow!("`{name}` at {context} tokens: {why}"))?;
     Ok((need, engine_metal::Context::physical_memory()))
@@ -295,10 +292,30 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
     }
     let source = open_source(checkpoint)?;
     let metadata = checkpoint_metadata(checkpoint)?;
-    let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
+    first_fit(&metadata, platform, catalog().fits(&source, platform)).map_err(|misses| {
+        anyhow!(
+            "{checkpoint:?} matches no deployment this build ships:\n  {}",
+            misses.join("\n  ")
+        )
+    })
+}
 
+/// The first of `fits` (each deployment, in catalog order, and how it reads
+/// the checkpoint `metadata` describes) that lands on this platform; else
+/// why each does not.
+fn first_fit(
+    metadata: &Metadata,
+    platform: Platform,
+    fits: impl Iterator<
+        Item = (
+            Deployment,
+            std::result::Result<ModelContract, poem::import::Error>,
+        ),
+    >,
+) -> std::result::Result<String, Vec<String>> {
+    let target = checkpoint::plan::StorageTarget::for_backend(backend_of(platform), 0, 1);
     let mut misses: Vec<String> = Vec::new();
-    for (deployment, read) in catalog().fits(&source, platform) {
+    for (deployment, read) in fits {
         // Metal multiplies activations as they are: a deployment that quantizes them is CUDA's.
         if platform == Platform::Metal && deployment.deploy.weights.iter().any(|w| w.act.is_some())
         {
@@ -315,15 +332,12 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<String> {
                 continue;
             }
         };
-        match checkpoint::plan::compile(&metadata, &contract, target.clone()) {
+        match checkpoint::plan::compile(metadata, &contract, target.clone()) {
             Ok(_) => return Ok(deployment.name.clone()),
             Err(why) => misses.push(format!("{}: {why}", deployment.name)),
         }
     }
-    Err(anyhow!(
-        "{checkpoint:?} matches no deployment this build ships:\n  {}",
-        misses.join("\n  ")
-    ))
+    Err(misses)
 }
 
 #[must_use]
@@ -412,48 +426,31 @@ pub fn conversion_contract(
     platform: Platform,
 ) -> Option<(String, ModelContract)> {
     let target = convert_target();
-    let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
-    let pinned = std::env::var("PIE_IMPORT_DEPLOYMENT").ok();
     for deployment in catalog().candidates_of(source, platform) {
-        let read = deployment.contract(source, platform);
-        if pinned
-            .as_deref()
-            .is_some_and(|name| name != deployment.name)
-        {
-            continue;
-        }
-        let contract = match read {
+        let contract = match deployment.contract(source, platform) {
             Ok(contract) => contract,
             Err(why) => {
-                if trace {
-                    eprintln!(
-                        "identify: {} does not read this source: {why}",
-                        deployment.name
-                    );
-                }
+                tracing::debug!(
+                    deployment = %deployment.name,
+                    "identify: does not read this source: {why}"
+                );
                 continue;
             }
         };
-        if pinned.is_none()
-            && let Some(plane) = poem_compiler::catalog::requantizes(&contract)
-        {
-            if trace {
-                eprintln!(
-                    "identify: {} reads it only by re-quantizing `{plane}`; not by identification",
-                    deployment.name
-                );
-            }
+        if let Some(plane) = poem_compiler::catalog::requantizes(&contract) {
+            tracing::debug!(
+                deployment = %deployment.name,
+                "identify: reads it only by re-quantizing `{plane}`; not by identification"
+            );
             continue;
         }
         match checkpoint::plan::compile(metadata, &contract, target.clone()) {
             Ok(_) => return Some((deployment.name, contract)),
             Err(why) => {
-                if trace {
-                    eprintln!(
-                        "identify: {} reads it but does not compile: {why}",
-                        deployment.name
-                    );
-                }
+                tracing::debug!(
+                    deployment = %deployment.name,
+                    "identify: reads it but does not compile: {why}"
+                );
             }
         }
     }
@@ -564,6 +561,9 @@ pub fn request(
         residency,
         ordinal,
         frames_in_flight,
+        // The step builder's rules: the engine computes the set of step
+        // compositions it will be sent from them before its arm walk.
+        steps: ::engine::StepRules::runtime(),
     })
 }
 

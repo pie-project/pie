@@ -56,6 +56,8 @@ fn held<'a>(name: &'a str, shape: &'a [u64]) -> Option<Held<'a>> {
     })
 }
 
+/// Through an arena or streaming as the load walks, each plane lands over
+/// its held one, a transformed one (`w.ab`) as a verbatim one.
 #[test]
 fn a_checkpoint_lands_each_plane_over_the_held_one() {
     let (dir, contract) = checkpoint();
@@ -66,29 +68,43 @@ fn a_checkpoint_lands_each_plane_over_the_held_one() {
         held("w.bb", &[8]),
         held("w.ab", &[5, 2]),
     ];
-    let overwrite =
-        Overwrite::plan(dir.path(), &contract, StorageTarget::default(), &planes).unwrap();
-    let mut written = Vec::new();
-    let landed = overwrite
-        .run(None, |at, plane| {
-            written.push((at, plane.to_vec()));
-            Ok(())
-        })
+    for streaming in [false, true] {
+        let overwrite = if streaming {
+            Overwrite::streaming(dir.path(), &contract, StorageTarget::default(), &planes)
+        } else {
+            Overwrite::plan(dir.path(), &contract, StorageTarget::default(), &planes)
+        }
         .unwrap();
-    written.sort();
-    assert_eq!(landed, (4, 112));
-    assert_eq!(
-        written,
-        [
-            (0, bytes(&[7.0, 8.0, 9.0, 10.0])),
-            (2, bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
-            (3, bytes(&[7.0, 8.0, 9.0, 10.0, 7.0, 8.0, 9.0, 10.0])),
-            (
-                4,
-                bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
-            ),
-        ]
-    );
+        if streaming {
+            assert_eq!(
+                overwrite.arena_bytes(),
+                0,
+                "a streaming overwrite takes no arena"
+            );
+        }
+        let mut written = Vec::new();
+        let landed = overwrite
+            .run(None, |at, plane| {
+                written.push((at, plane.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        written.sort();
+        assert_eq!(landed, (4, 112), "streaming: {streaming}");
+        assert_eq!(
+            written,
+            [
+                (0, bytes(&[7.0, 8.0, 9.0, 10.0])),
+                (2, bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                (3, bytes(&[7.0, 8.0, 9.0, 10.0, 7.0, 8.0, 9.0, 10.0])),
+                (
+                    4,
+                    bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+                ),
+            ],
+            "streaming: {streaming}"
+        );
+    }
 }
 
 #[test]

@@ -70,90 +70,15 @@ impl Run<'_> {
             return self.attention(&op);
         }
         match op {
-            Attn::ScoreCapture {
-                q,
-                plan,
-                cache,
-                head_dim,
-                kv_heads,
-                sm_scale,
-                observe,
-                kv_max,
-                scores,
-            } => {
-                let pool = *self.pool(*cache);
-                let span = self.window().span;
-                let page_indptr =
-                    (self.handles()).cut(pool.page_indptr, span.lane_offset, span.lanes + 1);
-                let q = self.ragged(*q);
-                let positions = self.prefill_plan(*plan).positions;
-                let scores = self.tensor(*scores);
-                let requests = self.requests();
-                let max_q = self
-                    .qo_indptr_host()
-                    .windows(2)
-                    .map(|w| (w[1] - w[0]).max(0) as u32)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
-                let (head_dim, kv_heads, sm_scale, observe, kv_max) = (
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    (*observe).min(max_q),
-                    *kv_max,
-                );
-                crate::lower::lower(self.ctx(), |l| {
-                    let page_indptr = l.read(page_indptr)?;
-                    let page_indices = l.read(pool.page_indices)?;
-                    let indptr = l.read(q.indptr)?;
-                    let positions = l.read(positions)?;
-                    let data = l.read(q.data)?;
-                    let keys = l.read(pool.keys)?;
-                    let heads = data.width / head_dim.max(1);
-                    let slab = if requests == scores.rows {
-                        kernels_xla::tensor::Operand {
-                            val: l.f().const_f(kernels_xla::hlo::Elem::F32, 0.0, &[]),
-                            rows: scores.rows * heads,
-                            width: kv_max,
-                            dtype: scores.dtype,
-                        }
-                    } else {
-                        let slab = l.read(scores)?;
-                        // The slab as a `kv_max` row per lane and head.
-                        kernels_xla::tensor::Operand {
-                            val: l.f().reshape(
-                                slab.val,
-                                &[i64::from(scores.rows * heads), i64::from(kv_max)],
-                            )?,
-                            rows: scores.rows * heads,
-                            width: kv_max,
-                            dtype: slab.dtype,
-                        }
-                    };
-                    let tuning = l.tuning();
-                    let v = attn::score::capture(
-                        l.f(),
-                        kernels_xla::tensor::RaggedTensor { data, indptr },
-                        positions,
-                        keys,
-                        page_indptr,
-                        page_indices,
-                        &pool,
-                        None,
-                        head_dim,
-                        kv_heads,
-                        sm_scale,
-                        observe,
-                        0,
-                        heads,
-                        0,
-                        kv_max,
-                        requests,
-                        slab,
-                        tuning,
-                    )?;
-                    l.land(scores, v)
+            // A capturing lane's rows lie in its reading program's guest
+            // region (`poem_ir::Dim::Capturing`); this backend lays none
+            // yet, so a capturing fire is refused by name.
+            Attn::ScoreCapture { .. } | Attn::ScorePages { .. } => {
+                Err(kernels_xla::Error::Backend {
+                    op: "attn.score_capture",
+                    detail: "this backend does not yet lay a capturing lane's score rows in its \
+                         reading program's guest region"
+                        .to_string(),
                 })
             }
             Attn::Voxel {
@@ -251,6 +176,9 @@ impl Run<'_> {
                 Ok(())
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -384,6 +312,9 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 selection: Some(selection),
@@ -477,13 +408,24 @@ impl Run<'_> {
             } => {
                 let stated = self.group_mask(*q_indptr, *kv_indptr);
                 let mask = match (mask, stated) {
+                    (poem_ir::RaggedMask::Stated, Some(stated)) => {
+                        attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        }
+                    }
                     (
                         poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
-                        Some(stated),
-                    ) => attn::ragged::RaggedMask::Custom {
-                        bits: stated.bits,
-                        indptr: stated.indptr,
-                    },
+                        Some(_),
+                    ) => {
+                        return Err(kernels_xla::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention its model states \
+                                     none on: only an attention the model text spells \
+                                     `stated_group_mask()` reads a lane's mask"
+                                .to_string(),
+                        });
+                    }
                     (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_xla::Error::Backend {
                             op: "attn.ragged",
@@ -493,9 +435,12 @@ impl Run<'_> {
                                 .to_string(),
                         });
                     }
-                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
-                        attn::ragged::RaggedMask::Segments
-                    }
+                    (
+                        poem_ir::RaggedMask::None
+                        | poem_ir::RaggedMask::GroupBlockDiagonal
+                        | poem_ir::RaggedMask::Stated,
+                        None,
+                    ) => attn::ragged::RaggedMask::Segments,
                     (poem_ir::RaggedMask::RelativeBias { table, max_len }, None) => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
@@ -518,6 +463,9 @@ impl Run<'_> {
                 )
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,
@@ -661,6 +609,9 @@ impl Run<'_> {
                 crate::lower::attn::attend_fresh(self.ctx(), call, pool, self.fresh(*cache))
             }
             Attn::Decode {
+                // A lane stating a mask never reaches `attn.decode` here: its
+                // fire is refused (`Fault::MaskUnread`), so the masks state none.
+                mask: _,
                 q,
                 plan,
                 cache,

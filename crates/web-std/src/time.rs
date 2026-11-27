@@ -15,6 +15,32 @@ pub fn set_clock(clock: ClockFn) {
     let _ = CLOCK.set(clock);
 }
 
+static WALL: OnceLock<ClockFn> = OnceLock::new();
+
+/// The wall clock, milliseconds since the Unix epoch, that [`since_epoch`]
+/// reads on wasm32 (the tab sets `Date.now`).
+pub fn set_wall_clock(clock: ClockFn) {
+    let _ = WALL.set(clock);
+}
+
+/// The time since the Unix epoch: `SystemTime::now()`'s natively, the
+/// clock [`set_wall_clock`] set on wasm32 (zero before it is set), where
+/// std's panics.
+pub fn since_epoch() -> Duration {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        WALL.get().map_or(Duration::ZERO, |clock| {
+            Duration::from_secs_f64(clock().max(0.0) / 1e3)
+        })
+    }
+}
+
 fn now_ns() -> u64 {
     match CLOCK.get() {
         Some(clock) => (clock() * 1_000_000.0) as u64,

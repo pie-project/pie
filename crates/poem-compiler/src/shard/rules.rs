@@ -38,6 +38,11 @@ pub(super) enum Rule {
     /// Group indices for a grouped matmul, which reads no value: they are
     /// a rank's share of the groups when the row it groups is split.
     Groups,
+    /// A score capture: its query split by head with its cache as a head
+    /// rule's, each rank adds its heads' share of the key row's average
+    /// (over every query head of the model), so the row a rank holds is one
+    /// term of a sum, as is the earlier layers' row it adds into.
+    Scores,
 }
 
 /// An op whose `follow` inputs are split by head or channel, every output
@@ -76,7 +81,10 @@ impl Cache {
 }
 
 impl Heads {
-    const fn of(follow: &'static [&'static str], scale: &'static [&'static str]) -> Heads {
+    pub(super) const fn of(
+        follow: &'static [&'static str],
+        scale: &'static [&'static str],
+    ) -> Heads {
         Heads {
             follow,
             scale,
@@ -85,7 +93,7 @@ impl Heads {
         }
     }
 
-    const fn cache(self, cache: Cache) -> Heads {
+    pub(super) const fn cache(self, cache: Cache) -> Heads {
         Heads { cache, ..self }
     }
 
@@ -283,10 +291,13 @@ pub(super) fn rule(op: &Operation) -> Rule {
     if let Operation::Attn(Attn::Prefill { .. }) = op {
         return Rule::Heads(Heads::of(&["q", "bias"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
     }
-    // Each rank captures its query heads' runs, a band of the row.
     if let Operation::Attn(Attn::ScoreCapture { .. }) = op {
-        return Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
+        return Rule::Scores;
     }
+    // A page's sum reads its key row whole: the row is reduced once, for
+    // `attn.scores` and the page sums alike, and each rank sums its pages.
+    // (No `Linear` rule: that would leave the pages a second partial sum to
+    // reduce.)
     let name = op.name();
     match name {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {
@@ -448,6 +459,36 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                         at.name
                     ));
                 }
+            }
+        }
+        Rule::Scores => {
+            let heads = Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole);
+            at.whole_except(pass, &["q", "into"])?;
+            let q = at.one("q").expect("a score capture reads its queries");
+            if pass.dist(q)? == Dist::Partial {
+                at.make_whole(pass, q)?;
+            }
+            let split = matches!(pass.dist(q)?, Dist::Split(_));
+            at.check_state(pass, split, heads.cache)?;
+            let into = at.one("into");
+            if split {
+                at.check_kv_parts(pass, heads.kv)?;
+                let whole_kv = !at.reads_split_cache(pass);
+                at.scale(pass, heads.scale, !whole_kv)?;
+                if let Some(into) = into
+                    && pass.dist(into)? != Dist::Partial
+                {
+                    return Err(format!(
+                        "`{}` adds a share of its heads into a row the ranks hold whole",
+                        at.name
+                    ));
+                }
+                vec![Dist::Partial; outs.len()]
+            } else {
+                if let Some(into) = into {
+                    at.make_whole(pass, into)?;
+                }
+                vec![Dist::Whole; outs.len()]
             }
         }
         Rule::Heads(heads) => {

@@ -1,3 +1,4 @@
+#include "prim/ieee.slang"
 #include "prim/params.slang"
 #include "prim/slot16.slang"
 #if !defined(PIE_GEMV_V)
@@ -10,12 +11,29 @@ struct Params {
     int m;
     int n;
     int k;
+    // M as a constant of the commands, or 0: a fire of at most the vector
+    // kernel's widest row tile carries its rows so (a decode body, a small
+    // mixed fire: no fire-block read on its hot path); a wider one reads M
+    // from the fire block, so every row count of its rung is one body.
+    int m_fixed;
+    // The window's first row in the bound rows of x and the landing (both
+    // the fire's whole): the fire's data.
+    uint row0;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
+
+uint gemm_m() {
+    return params.m_fixed != 0 ? uint(params.m_fixed) : uint(PIE_FIRE(m));
+}
+
+// A window row's row in the bound rows.
+uint bound_row(uint row) {
+    return PIE_FIRE(row0) + row;
+}
 
 #if !defined(PIE_GEMV_V)
 float load_x(uint row, uint kk) {
-    return slot_at(x, row * uint(params.k) + kk);
+    return slot_at(x, bound_row(row) * uint(params.k) + kk);
 }
 
 float load_w(uint col, uint kk) {
@@ -24,10 +42,10 @@ float load_w(uint col, uint kk) {
 #endif
 
 void write_out(uint row, uint col, float acc) {
-    if (row >= uint(params.m) || col >= uint(params.n)) {
+    if (row >= gemm_m() || col >= uint(params.n)) {
         return;
     }
-    slot_put(out_, row * uint(params.n) + col, acc);
+    slot_put(out_, bound_row(row) * uint(params.n) + col, acc);
 }
 
 #if defined(PIE_GEMV)
@@ -44,7 +62,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
     uint col = gid.y;
     uint row = gid.z;
     float acc = 0.0;
-    if (col < uint(params.n) && row < uint(params.m)) {
+    if (col < uint(params.n) && row < gemm_m()) {
         uint k = uint(params.k);
         uint kk = klane;
         for (; kk + 3u * PIE_KLANES < k; kk += 4u * PIE_KLANES) {
@@ -82,7 +100,9 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID) {
 #ifndef PIE_NLANES
 #define PIE_NLANES 8u
 #endif
+#ifndef PIE_VROWS
 #define PIE_VROWS 4u
+#endif
 
 groupshared float partial[PIE_NLANES * PIE_VROWS * PIE_KLANES];
 
@@ -104,7 +124,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint klane = local.x;
     uint clane = local.y;
     uint col = group.x * PIE_NLANES + clane;
-    uint m = uint(params.m);
+    // A row of workgroups a PIE_VROWS rows: this one's first and its count.
+    uint row0 = group.y * PIE_VROWS;
+    uint m = min(gemm_m() - min(row0, gemm_m()), PIE_VROWS);
     uint n = uint(params.n);
     uint k8 = uint(params.k) / 8u;
     float acc[PIE_VROWS];
@@ -120,7 +142,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint4 w3 = w4[wbase + c + 3u * PIE_KLANES];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
                 if (r < m) {
-                    uint xb = r * k8 + c;
+                    uint xb = bound_row(row0 + r) * k8 + c;
                     acc[r] += dot8(x4[xb], w0) + dot8(x4[xb + PIE_KLANES], w1)
                         + dot8(x4[xb + 2u * PIE_KLANES], w2) + dot8(x4[xb + 3u * PIE_KLANES], w3);
                 }
@@ -129,7 +151,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (; c < k8; c += PIE_KLANES) {
             uint4 wv = w4[wbase + c];
             [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-                if (r < m) acc[r] += dot8(x4[r * k8 + c], wv);
+                if (r < m) acc[r] += dot8(x4[bound_row(row0 + r) * k8 + c], wv);
             }
         }
     }
@@ -151,7 +173,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     if (klane == 0u && col < n) {
         [ForceUnroll] for (uint r = 0u; r < PIE_VROWS; r++) {
-            if (r < m) slot_put(out_, r * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
+            if (r < m) slot_put(out_, bound_row(row0 + r) * n + col, partial[(clane * PIE_VROWS + r) * PIE_KLANES]);
         }
     }
 }
@@ -182,7 +204,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint flat = lane + 32u * sg;
     uint tile_row = group.y * CM_BM;
     uint tile_col = group.x * CM_BN;
-    uint m = uint(params.m);
+    uint m = gemm_m();
     uint n = uint(params.n);
     uint k = uint(params.k);
 
@@ -202,7 +224,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (flat < CM_BM) {
         float amax = max(row_max[flat * 2u], row_max[flat * 2u + 1u]);
         float scale = 1.0;
-        if (amax > 32768.0 && !isinf(amax) && !isnan(amax)) {
+        if (amax > 32768.0 && ieee_finite(amax)) {
             scale = exp2(-ceil(log2(amax / 32768.0)));
         }
         row_scale[flat] = scale;
@@ -282,7 +304,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         for (uint e = flat; e < PIE_BM * PIE_BK; e += PIE_LANES) {
             uint r = e / PIE_BK;
             uint kk = e - r * PIE_BK;
-            bool live = kk < kn && (tile_row + r) < uint(params.m);
+            bool live = kk < kn && (tile_row + r) < gemm_m();
             xs[e] = live ? load_x(tile_row + r, kb + kk) : 0.0;
         }
         for (uint e = flat; e < PIE_BK * PIE_BN4; e += PIE_LANES) {
@@ -320,5 +342,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 // pie:instantiate linear_gemm_gemv_bf16 PIE_GEMV=1 PIE_TARGET=spirv
 // pie:instantiate linear_gemm_gemv_v_bf16 PIE_GEMV_V=1 PIE_TARGET=spirv
+// pie:instantiate linear_gemm_gemv_v1_bf16 PIE_GEMV_V=1 PIE_VROWS=1u PIE_TARGET=spirv
+// pie:instantiate linear_gemm_gemv_v8_bf16 PIE_GEMV_V=1 PIE_VROWS=8u PIE_TARGET=spirv
+// pie:instantiate linear_gemm_gemv_v16_bf16 PIE_GEMV_V=1 PIE_VROWS=16u PIE_TARGET=spirv
 // pie:instantiate linear_gemm_tiled_bf16 PIE_TARGET=spirv
 // pie:instantiate linear_gemm_tiled_bm_64_bf16 PIE_TIER=coopmat PIE_TARGET=spirv

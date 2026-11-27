@@ -31,8 +31,28 @@ pub const FIXED: ShapeId = ShapeId(1);
 /// The first window list's shape.
 pub const WINDOW: ShapeId = ShapeId(2);
 pub const RS: ShapeId = ShapeId(3);
+/// A windowed lane's ring (`SlotRole::Ring`): its own fixed
+/// shape of one slot a chunk, each piece a whole chunk tiled by window-slot
+/// pages from its start (`chunks::MetalRing`). A windowed recipe pages one
+/// window table, so the second window list's id is free for it.
+pub const RING: ShapeId = ShapeId(4);
 
-/// The most window lists a load pages (CONTRACT-BC 21).
+/// A guest instance's bind-time launch tables (`SlotRole::Instance`). The
+/// weight shapes follow the guest shapes (`streamed::WEIGHTS`).
+pub const INSTANCE: ShapeId = ShapeId(7);
+/// A ring's cells (`SlotRole::Channel`).
+pub const CHANNEL: ShapeId = ShapeId(8);
+/// One plane of a landed adapter (`SlotRole::Adapter`): a bank's plane a
+/// slot, shared by every instance that lands the same adapter.
+pub const ADAPTER: ShapeId = ShapeId(9);
+
+/// An `Instance` slot's bytes: every measured instance's tables in one.
+/// Structural, not config.
+pub const INSTANCE_SLOT: u64 = 4 << 10;
+/// A `Channel` slot's bytes: every measured ring in one.
+pub const CHANNEL_SLOT: u64 = 1 << 10;
+
+/// The most window lists a load pages.
 pub const MAX_WINDOWS: usize = 4;
 
 /// Each window list's shape, in the recipe's order: the first is
@@ -50,14 +70,6 @@ pub struct WindowList {
 
 /// The chunk an on-device Metal recipe aims at.
 pub const TARGET_CHUNK: u64 = 2 << 20;
-
-#[must_use]
-pub fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
 
 /// One slot shape's place in the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +116,10 @@ impl Slots {
     }
 }
 
+/// The most activation rungs a layout states: every power of two of tokens
+/// a fire can carry.
+pub const MAX_RUNGS: usize = 32;
+
 /// The pool's chunk size, its shapes and its extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -116,16 +132,39 @@ pub struct Layout {
     pub pieces: u32,
     pub list: Option<Slots>,
     pub fixed: Option<Slots>,
-    /// The window lists (CONTRACT-BC 19, 21), one a distinct window: each
+    /// The window lists, one a distinct window: each
     /// `T_w` tokens a slot of the rows it windows, a table in its own token
     /// order a lane; slots trimmed behind the window are the null chunk.
     pub windows: [Option<WindowList>; MAX_WINDOWS],
-    /// The rs list (CONTRACT-BC 18, 20): `rs_tokens` unfolded rows of every
+    /// The rs list: `rs_tokens` unfolded rows of every
     /// recurrent layer's rs planes a slot.
     pub rs: Option<Slots>,
     pub rs_tokens: u32,
+    /// A windowed load's rings ([`RING`]): one slot a chunk, `ring_pieces` a
+    /// record, stated before the record's state shape; the window list is
+    /// then its window buffer (`SlotRole::WindowBuffer`).
+    pub ring: Option<Slots>,
+    pub ring_pieces: u32,
     /// The seats seat-addressed lanes take.
     pub seats: u32,
+    /// Guest instances' tables and rings: shapes no
+    /// working set holds, taken per instance and channel.
+    pub instance: Option<Slots>,
+    pub channel: Option<Slots>,
+    /// Landed adapters' planes, one a slot ([`Layout::with_adapter`]);
+    /// none for a model with no registered banks.
+    pub adapter: Option<Slots>,
+    /// The activation span: `(rung tokens, chunks)` a fire of
+    /// up to that many tokens takes out of the range's top, ascending, the
+    /// first `act_rungs`; the last is the span. None where activation lives
+    /// apart.
+    pub act: [(u32, u32); MAX_RUNGS],
+    pub act_rungs: usize,
+    /// The engine's own tables (`Reserved::Tables`): this many chunks right
+    /// after the null chunk, laid at the load ([`super::Pools::tables`]):
+    /// the registered adapter banks, the weight caches' atom tables and use
+    /// counters and the state maps. The seat runs lie past them.
+    pub tables: u32,
 }
 
 impl Layout {
@@ -154,7 +193,15 @@ impl Layout {
             windows: [None; MAX_WINDOWS],
             rs: None,
             rs_tokens: 0,
+            ring: None,
+            ring_pieces: 0,
             seats,
+            instance: Slots::of(INSTANCE, INSTANCE_SLOT, chunk_bytes),
+            channel: Slots::of(CHANNEL, CHANNEL_SLOT, chunk_bytes),
+            adapter: None,
+            act: [(0, 0); MAX_RUNGS],
+            act_rungs: 0,
+            tables: 0,
         };
         if let Some(shape) = layout.shapes().find(|s| s.per_chunk == 0) {
             return Err(Fault::Ceiling {
@@ -207,7 +254,7 @@ impl Layout {
             });
         }
         let seats = self.seats;
-        window.seat_chunk = 1 + self.seat_chunks();
+        window.seat_chunk = 1 + self.tables + self.seat_chunks();
         window.seat_slots = seats.saturating_mul(pages_per_seat);
         self.windows[at] = Some(WindowList {
             slots: window,
@@ -215,6 +262,19 @@ impl Layout {
             tokens,
         });
         Ok(self)
+    }
+
+    /// A windowed load's rings: `pieces` whole chunks a record ([`RING`],
+    /// one slot a chunk). The layers they hold and their bytes are the
+    /// pool's to state (`Pools::chunk_facts`, `ChunkFacts::windowed`).
+    #[must_use]
+    pub fn with_ring(mut self, pieces: u32) -> Layout {
+        if pieces == 0 {
+            return self;
+        }
+        self.ring = Slots::of(RING, self.chunk_bytes, self.chunk_bytes);
+        self.ring_pieces = pieces;
+        self
     }
 
     /// The window lists, in order.
@@ -230,6 +290,92 @@ impl Layout {
 
     /// This layout with an rs list of `bytes` slots of `tokens` rows; its
     /// seat run, `pages_per_seat` slots a seat, after the others.
+    /// This layout with an activation span of `rungs`, `(tokens, chunks)`
+    /// ascending in both, the last the span; refused where the span leaves
+    /// the range no chunk beside the null one.
+    pub fn with_act(mut self, rungs: &[(u32, u32)]) -> Result<Layout> {
+        if rungs.len() > MAX_RUNGS {
+            return Err(Fault::Ceiling {
+                what: "activation rungs",
+                need: rungs.len() as u64,
+                have: MAX_RUNGS as u64,
+            });
+        }
+        let span = rungs.last().map_or(0, |&(_, chunks)| chunks);
+        if span.saturating_add(1) >= self.total_chunks {
+            return Err(Fault::Ceiling {
+                what: "chunks of the range beside its activation span",
+                need: u64::from(span) + 2,
+                have: u64::from(self.total_chunks),
+            });
+        }
+        self.act[..rungs.len()].copy_from_slice(rungs);
+        self.act_rungs = rungs.len();
+        Ok(self)
+    }
+
+    /// Each rung's `(tokens, chunks)`, ascending.
+    #[must_use]
+    pub fn act(&self) -> &[(u32, u32)] {
+        &self.act[..self.act_rungs]
+    }
+
+    /// The activation span's chunks: the largest rung's.
+    #[must_use]
+    pub fn act_span(&self) -> u32 {
+        self.act().last().map_or(0, |&(_, chunks)| chunks)
+    }
+
+    /// This layout with `Adapter` slots of `bytes`, the widest plane of a
+    /// registered bank: a landed adapter takes one a bank.
+    pub fn with_adapter(mut self, bytes: u64) -> Result<Layout> {
+        if bytes == 0 {
+            return Ok(self);
+        }
+        let slots = Slots::of(ADAPTER, bytes, self.chunk_bytes).ok_or(Fault::Ceiling {
+            what: "bytes of a pool chunk an adapter plane fits in",
+            need: bytes,
+            have: self.chunk_bytes,
+        })?;
+        if slots.per_chunk == 0 {
+            return Err(Fault::Ceiling {
+                what: "bytes of a pool chunk an adapter plane fits in",
+                need: bytes,
+                have: self.chunk_bytes,
+            });
+        }
+        self.adapter = Some(slots);
+        Ok(self)
+    }
+
+    /// This layout with the engine's tables in `chunks` chunks right after
+    /// the null chunk: every seat run moves past them.
+    #[must_use]
+    pub fn with_tables(mut self, chunks: u32) -> Layout {
+        let by = chunks - self.tables;
+        for shape in [&mut self.list, &mut self.fixed, &mut self.rs]
+            .into_iter()
+            .flatten()
+            .chain(
+                self.windows
+                    .iter_mut()
+                    .flatten()
+                    .map(|window| &mut window.slots),
+            )
+        {
+            shape.seat_chunk += by;
+        }
+        self.tables = chunks;
+        self
+    }
+
+    /// The first chunk past the null chunk, the tables and the seat runs:
+    /// where a caller addressing slots by ref starts.
+    #[must_use]
+    pub fn free_chunk(&self) -> u32 {
+        1 + self.tables + self.seat_chunks()
+    }
+
     pub fn with_rs(mut self, bytes: u64, tokens: u32, pages_per_seat: u32) -> Result<Layout> {
         let Some(mut rs) = Slots::of(RS, bytes, self.chunk_bytes) else {
             return Ok(self);
@@ -241,7 +387,7 @@ impl Layout {
                 have: self.chunk_bytes,
             });
         }
-        rs.seat_chunk = 1 + self.seat_chunks();
+        rs.seat_chunk = 1 + self.tables + self.seat_chunks();
         rs.seat_slots = self.seats.saturating_mul(pages_per_seat);
         self.rs = Some(rs);
         self.rs_tokens = tokens;
@@ -254,6 +400,10 @@ impl Layout {
             .chain(&self.fixed)
             .chain(self.window_lists().map(|window| &window.slots))
             .chain(&self.rs)
+            .chain(&self.ring)
+            .chain(&self.instance)
+            .chain(&self.channel)
+            .chain(&self.adapter)
     }
 
     #[must_use]
@@ -267,15 +417,41 @@ impl Layout {
         self.shapes().map(Slots::seat_chunks).sum()
     }
 
-    /// What an rs-list page id counts: `gcd(chunk, rs slot)`.
-    #[must_use]
-    pub fn rs_stride(&self) -> u64 {
-        self.rs
-            .map_or(256, |rs| gcd(self.chunk_bytes, rs.slot_bytes))
-    }
-
     /// The chunks one working set at `pages` kv pages takes beside the null
     /// chunk: its pages, its record and one a fire writes copy-on-write.
+    /// The state room, in bytes, a pool of this layout states for
+    /// `seats` seat-addressed lanes of `pages` kv pages each and a fire's
+    /// `rows_pages` pages landing past them, fired directly with no runtime
+    /// (`pie tune --check-estimate`'s shells): their pages in list chunks and
+    /// their records' pieces in fixed chunks, at least one working set
+    /// ([`Layout::least_chunks`]). The null chunk, the tables run and that
+    /// state are rounded up to whole segments, and one more segment absorbs
+    /// what a buffer's mapped tail takes back: they all lie in bottom
+    /// segments a direct caller backs, none in the segment the activation
+    /// span starts in.
+    #[must_use]
+    pub fn shell_room(&self, seats: u32, pages: u64, rows_pages: u64) -> u64 {
+        let chunks = |slots: u64, shape: Option<Slots>| {
+            shape.map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
+        };
+        let seats = u64::from(seats);
+        let held = chunks(seats * pages + rows_pages, self.list)
+            + chunks(seats * u64::from(self.pieces), self.fixed);
+        let least = u64::from(Self::least_chunks(
+            self.chunk_bytes,
+            [
+                self.list.map_or(0, |list| list.slot_bytes),
+                self.fixed.map_or(0, |fixed| fixed.slot_bytes),
+            ],
+            self.pieces,
+            u32::try_from(pages).unwrap_or(u32::MAX),
+        ));
+        let segment = u64::from(self.segment_chunks.max(1));
+        let below = 1 + u64::from(self.tables);
+        let state = (below + held.max(least)).next_multiple_of(segment) + segment - below;
+        state * self.chunk_bytes
+    }
+
     #[must_use]
     pub fn least_chunks(chunk_bytes: u64, [list, fixed]: [u64; 2], pieces: u32, pages: u32) -> u32 {
         let chunks = |slots: u32, bytes: u64| -> u32 {
@@ -290,7 +466,7 @@ impl Layout {
 
     /// The pool as the runtime counts it: one shared chunk space, chunk 0
     /// null, segments of `segment_chunks` growing from the bottom where the
-    /// pool is sparse; activation lives in the arena apart.
+    /// pool is sparse, the activation span (where stated) the top chunks.
     #[must_use]
     pub fn facts(&self, growth: Growth, committed: u32, rows: &[Vec<u32>; 2]) -> ChunkFacts {
         let segments = self.total_chunks.div_ceil(self.segment_chunks.max(1));
@@ -316,18 +492,28 @@ impl Layout {
                 &rows[0],
             ));
         }
-        // The window lists: lists of their own slots, each with its window
-        // (CONTRACT-BC 19, 21).
+        // The window lists: lists of their own slots, each with its window.
+        // A windowed load's one window table is its window buffer: a list of
+        // `T` unfolded rows of every windowed layer, no window of its own.
+        let buffered = self.ring.is_some();
         for window in self.window_lists() {
-            shapes.push(shape(
+            let listed = shape(
                 &window.slots,
                 SlotKind::List {
                     tokens: window.tokens,
                     rate: 1,
-                    window: Some(window.rows),
+                    window: (!buffered).then_some(window.rows),
                 },
                 &Vec::new(),
-            ));
+            );
+            shapes.push(if buffered {
+                SlotShape {
+                    role: SlotRole::WindowBuffer,
+                    ..listed
+                }
+            } else {
+                listed
+            });
         }
         if let Some(rs) = &self.rs {
             shapes.push(SlotShape {
@@ -343,6 +529,19 @@ impl Layout {
                 )
             });
         }
+        // The rings: their own fixed shape, stated before the record's state.
+        if let Some(ring) = &self.ring {
+            shapes.push(SlotShape {
+                role: SlotRole::Ring,
+                ..shape(
+                    ring,
+                    SlotKind::Fixed {
+                        pieces: self.ring_pieces,
+                    },
+                    &Vec::new(),
+                )
+            });
+        }
         if let Some(fixed) = &self.fixed {
             shapes.push(shape(
                 fixed,
@@ -352,7 +551,35 @@ impl Layout {
                 &rows[1],
             ));
         }
+        for (slots, role) in [
+            (&self.instance, SlotRole::Instance),
+            (&self.channel, SlotRole::Channel),
+            (&self.adapter, SlotRole::Adapter),
+        ] {
+            if let Some(slots) = slots {
+                // The role, not the count, keeps these out of a working
+                // set: the runtime takes them per instance and channel.
+                shapes.push(SlotShape {
+                    role,
+                    ..shape(slots, SlotKind::Fixed { pieces: 1 }, &Vec::new())
+                });
+            }
+        }
         ChunkFacts {
+            // A mapped placement heap is resident whether touched or not:
+            // the span is backed as fires and lent state need it.
+            span_backed_on_demand: !self.act().is_empty(),
+            // The load pins the range below the segment the largest rung's
+            // carve starts in (`Pool::reserve`): a carve reaches no lower
+            // (`Pool::cover`), with its guests' terms.
+            act_span_chunks: (!self.act().is_empty()).then(|| {
+                self.total_chunks
+                    - super::pool::top_first(
+                        self.total_chunks,
+                        self.segment_chunks,
+                        self.act_span(),
+                    )
+            }),
             chunk_bytes: self.chunk_bytes,
             total_chunks: self.total_chunks,
             segment_chunks: self.segment_chunks,
@@ -365,18 +592,34 @@ impl Layout {
                 max: segments,
                 growth,
             },
-            reserved: vec![ReservedRun {
+            reserved: std::iter::once(ReservedRun {
                 what: Reserved::Null,
                 first: 0,
                 chunks: 1,
-            }],
+            })
+            .chain((self.tables > 0).then_some(ReservedRun {
+                what: Reserved::Tables,
+                first: 1,
+                chunks: self.tables,
+            }))
+            .collect(),
             shapes,
-            act_chunks: Vec::new(),
+            act_chunks: self.act().to_vec(),
+            // Each rung's rs scratch, from its reserve: the shell states it
+            // (`Shell::pool_chunk_facts`).
+            act_replay: Vec::new(),
+            rs_compact: false,
+            rs_scratch_per_fire: false,
+            eager_rungs: Vec::new(),
+            held_bytes: 0,
+            outside_bytes: 0,
             host_chunks: 0,
             disk_chunks: 0,
             disk_persistent: false,
             disk_kept: false,
             weights: Vec::new(),
+            record_bytes: 0,
+            windowed: Vec::new(),
         }
     }
 }

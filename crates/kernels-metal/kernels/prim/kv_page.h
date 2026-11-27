@@ -20,6 +20,55 @@ constant ulong pie_fc_v_page [[function_constant(1)]];
 constant bool pie_fc_pages = is_function_constant_defined(pie_fc_k_page) &&
                              is_function_constant_defined(pie_fc_v_page);
 
+// A pool past one buffer's length spans as many buffers as it takes
+// (`engine-metal`'s `store::pool`): a page id then names its buffer in the
+// bits over `pie_fc_part_shift` (the bits that count the buffers, under the
+// sign bit, so every id stays a non-negative `int` in the page tables) and
+// its page in that buffer under them, and a kernel reaches buffer `b` from
+// the plane bound in the first by buffer `b`'s address less the first's:
+// entry `b` of the delta table at device address `pie_fc_part_table` (bytes,
+// wrapping), a buffer of its own outside the pool. Function constants,
+// fixed for a load, so a pool of one buffer compiles to `page * stride`,
+// bit for bit.
+constant bool pie_fc_pool_split [[function_constant(2)]];
+constant uint pie_fc_part_shift [[function_constant(3)]];
+constant ulong pie_fc_part_table [[function_constant(4)]];
+constant bool pie_pool_split =
+    is_function_constant_defined(pie_fc_pool_split) && pie_fc_pool_split;
+
+// A page id names a slot (`engine-metal`'s `store::pool::PageIds`): under
+// its buffer, its slot in the buffer where every paged shape's slots tile a
+// chunk, else its chunk in the buffer over `pie_fc_slot_shift` bits and its
+// index in that chunk under them, a chunk being `pie_fc_chunk_bytes`. Load
+// constants: a pool whose slots tile its chunks compiles to `page * stride`.
+constant bool pie_fc_slot_split [[function_constant(6)]];
+constant uint pie_fc_slot_shift [[function_constant(7)]];
+constant ulong pie_fc_chunk_bytes [[function_constant(8)]];
+constant bool pie_slot_split =
+    is_function_constant_defined(pie_fc_slot_split) && pie_fc_slot_split;
+
+// Where page `page` starts, from the plane bound in the first buffer, in
+// units of `unit` bytes (an element's, or 1 for bytes): `stride` units a
+// page (a slot).
+inline ulong pie_page_at(uint page, ulong stride, ulong unit) {
+  if (!pie_pool_split && !pie_slot_split) {
+    return ulong(page) * stride;
+  }
+  const uint local = pie_pool_split ? page & ((1u << pie_fc_part_shift) - 1u) : page;
+  const ulong at =
+      pie_slot_split
+          ? ulong(local >> pie_fc_slot_shift) * (pie_fc_chunk_bytes / unit) +
+                ulong(local & ((1u << pie_fc_slot_shift) - 1u)) * stride
+          : ulong(local) * stride;
+  if (!pie_pool_split) {
+    return at;
+  }
+  const uint part = page >> pie_fc_part_shift;
+  const ulong delta =
+      part == 0u ? 0ul : reinterpret_cast<const device ulong*>(pie_fc_part_table)[part];
+  return at + ulong(long(delta) / long(unit));
+}
+
 struct pie_kv_layout {
   ulong k_page;
   ulong v_page;
@@ -47,4 +96,16 @@ template <typename T>
 inline device T* pie_kv_plane(device T* plane, ulong offset) {
   (void)offset;
   return plane;
+}
+
+// Whether a masked row admits key `kp`. A row's mask speaks of the slots from
+// its lane's committed boundary `origin` on: every key below it is committed
+// and read under the model's own bounds alone, and the plane's column `c` is
+// key `origin + c`. A row's mask word packs its enable flag (bits 0-1: 1
+// masked, 2 wide) and `origin` (bits 2-31).
+inline bool pie_mask_admits(const device uchar* plane, uint stride, uint origin, uint row,
+                            uint kp) {
+  if (kp < origin) return true;
+  const uint column = kp - origin;
+  return column < stride && plane[ulong(row) * ulong(stride) + column] != 0;
 }

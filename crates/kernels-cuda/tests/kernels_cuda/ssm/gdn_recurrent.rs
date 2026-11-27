@@ -104,18 +104,20 @@ fn check_at(geo: Geometry, window: Option<Window>, boundary: Boundary, pad: usiz
         snapshots: kernels_cuda::Snapshots::NONE,
     };
     let mut y = Tensor::new(y_at, rows, (vh * vd) as u32, Dtype::F32);
-    ssm::gated_delta(
-        &ctx,
-        Tensor::new(qkv_at, rows, conv_dim as u32, Dtype::Bf16),
-        Tensor::ABSENT,
-        Tensor::new(gates_at, rows, (2 * vh) as u32, Dtype::F32),
-        &pool,
-        k_heads,
-        v_heads,
-        k_dim,
-        v_dim,
-        &mut y,
-    )
+    gpu.laid(&ctx, |ctx| {
+        ssm::gated_delta(
+            ctx,
+            Tensor::new(qkv_at, rows, conv_dim as u32, Dtype::Bf16),
+            Tensor::ABSENT,
+            Tensor::new(gates_at, rows, (2 * vh) as u32, Dtype::F32),
+            &pool,
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            &mut y,
+        )
+    })
     .expect("the step fires");
     gpu.sync();
     let got_y: Vec<f32> = gpu.down(y_at, planes as usize * vh * vd);

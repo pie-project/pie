@@ -29,7 +29,7 @@ const fn scan_smem_at(k_dim: u32, bv: u32) -> u32 {
 /// where the profile turns the scan on and this device's blocks can opt
 /// into its shared memory at half a head, else a quarter.
 fn fused_scan(ctx: &Ctx, k_dim: u32) -> Option<u32> {
-    if !ctx.tuning().ssm_gdn_fused_scan {
+    if !ctx.tuning().ssm_gdn_fused_scan() {
         return None;
     }
     let cap = ctx.smem_per_block_optin()?;
@@ -84,8 +84,8 @@ fn gated_delta_chunked_tc5(
     const GDN_CHUNK_SM100: &str = "ssm/gdn_chunk_sm100.cu";
     /// `pie::ssm::sm100::smem_bytes()`.
     const SMEM: u32 = 213_504 + 1024;
-    if !(ctx.tuning().ssm_gdn_tc5
-        && supported()
+    if !(supported()
+        && ctx.tuning().ssm_gdn_tc5()
         && shape.k_dim == 128
         && shape.v_dim == 128
         && shape.v_heads.is_multiple_of(shape.k_heads.max(1))
@@ -501,7 +501,7 @@ pub fn gated_delta_chunked(
     dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => () });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
     // A short fire (a verify, a fold) scans its rows in order instead.
-    let scan = y.rows <= ctx.tuning().ssm_gdn_scan_until;
+    let scan = y.rows <= ctx.tuning().ssm_gdn_scan_until();
     if y.dtype == Dtype::Bf16 {
         // Narrowed for its gated norm: the tcgen05 walk lands bf16 itself;
         // any other walk lands f32 in a plane, cast after.
@@ -607,7 +607,7 @@ pub fn gated_delta_chunked(
     }
 
     if k_dim <= WARP_TILED_K_MAX {
-        seated(OP, state, "gdn_chunked_warp_tiled", true, false, false)?;
+        seated(OP, state, "gdn_chunked_warp_tiled", true, true, true)?;
         return ctx.fire(
             OP,
             Fire::at(kernel(
@@ -632,7 +632,9 @@ pub fn gated_delta_chunked(
                 stated(OP, k_dim)?.arg(),
                 stated(OP, v_dim)?.arg(),
                 state.write_state.arg(),
+                state.commit_len.arg(),
                 state.write_state_mask.arg(),
+                state.begin_at.arg(),
                 ctx.stage(),
             ],
         );

@@ -26,9 +26,15 @@ impl Shell {
     /// The regions whose attention stages at a prefill's width, and the
     /// width (`crate::window::Staging`).
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {
+        // A load with no staging attention never asks its width.
+        let stages = self.staging.contains(&true);
         crate::window::Staging {
             regions: &self.staging,
-            from: self.device.ctx().tuning().compressed_prefill_from,
+            from: if stages {
+                self.device.ctx().tuning().compressed_prefill_from()
+            } else {
+                0
+            },
         }
     }
 
@@ -41,6 +47,29 @@ impl Shell {
     #[must_use]
     pub fn budget(&self) -> &Budget {
         &self.budget
+    }
+
+    /// What the runtime's host cover depends on in this load
+    /// (`engine::Engine::cover_fingerprint`): the device and its kernel
+    /// libraries' code ([`crate::stored::Keys`]; the device a part of its
+    /// own, as `pie tune export` finds a device's covers by), the guest emitter's
+    /// version and the decode products' kernels as picked (their routes'
+    /// table). Not the lanes and tokens a fire spans: the cover is timed over
+    /// a lone lane's one-row decode frames, and both follow the memory a load
+    /// finds.
+    #[must_use]
+    pub fn cover_fingerprint(&self) -> String {
+        let routes = self
+            .device
+            .ctx()
+            .routes()
+            .map_or(0, |routes| routes.fingerprint());
+        format!(
+            "cuda|{}|kernels {}|emitter {}|routes {routes:#010x}",
+            profile::rates::Now::on(&self.keys),
+            self.keys.codes_said(),
+            eta_compiler::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION,
+        )
     }
 
     #[must_use]
@@ -94,9 +123,35 @@ impl Shell {
         self.graphs
     }
 
+    /// The rungs this load weighed its top by and the estimate it weighed
+    /// them with: what a check of the estimate reads.
+    #[must_use]
+    pub fn weighed(&self) -> Option<&crate::top::Weighed> {
+        self.weighed.as_ref()
+    }
+
+    /// What the device's free bytes paid for the bodies the load armed,
+    /// the figure a load with no record measures (0 where none armed).
+    #[must_use]
+    pub const fn bodies_took(&self) -> u64 {
+        self.bodies_took
+    }
+
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()
+    }
+
+    /// The serving fires counted as `tally` since load (`engine::live`).
+    #[must_use]
+    pub fn tallied(&self, tally: engine::live::Tally) -> u64 {
+        self.live.tallied(tally)
+    }
+
+    /// The key of the body the last fire replayed (`None` till one has).
+    #[must_use]
+    pub fn replayed_body(&self) -> Option<&record::BodyKey> {
+        self.cache.replayed()
     }
 
     #[must_use]
@@ -144,22 +199,89 @@ impl Shell {
     /// See `Pool::evacuate`: the copy and the table change are ordered on
     /// the stream behind every fire enqueued so far and before the next.
     pub fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> crate::Result<()> {
-        self.pools.evacuate(self.device.stream(), evacuation)
+        self.evacuate_with(evacuation, &[]).map(drop)
+    }
+
+    /// [`Self::evacuate`], all or nothing: every check it makes (the table
+    /// it leaves, each guest's state where it then lies and its claims
+    /// there, each channel span of `channels`, `(slots, bytes)`) is made
+    /// before anything moves, and an `Err` leaves the pool, the claims and
+    /// every ring as they were. Past the copy's enqueue nothing fails but
+    /// the device. Answers each channel's address after.
+    pub fn evacuate_with(
+        &mut self,
+        evacuation: &engine::chunk::Evacuation,
+        channels: &[(Vec<u32>, u64)],
+    ) -> crate::Result<Vec<u64>> {
+        let stream = self.device.stream();
+        self.pools.fence_all_swaps(stream)?;
+        let mut evacuated = self.pools.prepare_evacuation(evacuation)?;
+        let programs = &self.programs;
+        let (rebase, at) = self.pools.as_if(&mut evacuated, |pools| {
+            // A guest's rings bind their slots' chunks by place.
+            let rebase = programs.plan_rebase(&|item, bytes| pools.guest_item(item, bytes))?;
+            let at = channels
+                .iter()
+                .map(|(slots, bytes)| {
+                    pools.guest_span(engine::chunk::SlotRole::Channel, slots, *bytes)
+                })
+                .collect::<crate::Result<Vec<u64>>>()?;
+            crate::Result::Ok((rebase, at))
+        })?;
+        let before = self.programs.claim_rebase(&rebase)?;
+        if let Err(fault) = self.pools.move_chunks(stream, evacuated) {
+            self.programs.unclaim_rebase(before);
+            return Err(fault);
+        }
+        drop(before);
+        self.programs.apply_rebase(rebase);
+        self.pools.restage_after_move(stream)?;
+        Ok(at)
+    }
+
+    /// The state pool's chunk table as it stands (`Pool::chunk_table`).
+    #[must_use]
+    pub fn chunk_table(&self) -> &engine::chunk::ChunkTable {
+        self.pools.chunk_table()
     }
 
     /// The state pool as the runtime counts it
     /// ([`crate::store::Pools::chunk_facts`]).
     pub fn chunk_facts(&mut self) -> crate::Result<engine::chunk::ChunkFacts> {
         let max_tokens = self.budget().max_tokens;
-        let lanes = if self.records_bodies() {
-            crate::window::lane_capacity(self.budget().max_lanes)
-        } else {
-            0
-        };
-        let rungs = self
-            .arena
-            .rungs(self.compiled.arena_forked.as_ref(), u64::from(lanes));
-        self.pools.chunk_facts(max_tokens, &rungs)
+        let rungs = self.arena.rungs(self.compiled.arena_forked.as_ref());
+        let mut facts = self.pools.chunk_facts(max_tokens, &rungs)?;
+        (facts.held_bytes, facts.outside_bytes) = self.held_and_outside();
+        facts.record_bytes = self.record_bytes();
+        facts.windowed = self.windowed_layers();
+        // Each rung's replay scratch, from the extended run's reserve
+        // (`store::rs::Buffers::reserve`): `RsScratch::need(rows_ext, row)`,
+        // `(rows_ext + 64) * row + 4 MiB`, laid for the widest bucket's
+        // `rows_ext(max_tokens)` whatever the fire's bucket, so the rows a
+        // fire's extended run takes, its own and its replayed (a decoding
+        // lane's none: its decode step reads them as a linear attention, so
+        // its scratch is always compact), are at most that many.
+        if let Some(buffers) = &self.buffers {
+            let row = buffers.ext_row_bytes();
+            let rows = u64::from(crate::store::rs::Buffers::rows_ext(max_tokens));
+            facts.act_replay = facts
+                .act_chunks
+                .iter()
+                .map(|&(tokens, _)| engine::RungReplay {
+                    own_max: Some(tokens),
+                    carried_max: Some(max_tokens),
+                    scratch: engine::ScratchBytes {
+                        slot_bytes: vec![row],
+                        lane_bytes: 0,
+                        room_bytes: rows.saturating_mul(row),
+                        pad: 1,
+                    },
+                })
+                .collect();
+            facts.rs_compact = true;
+            facts.rs_scratch_per_fire = false;
+        }
+        Ok(facts)
     }
 
     /// Names the recurrent record whose pieces lie in the slot refs
@@ -178,6 +300,7 @@ impl Shell {
     /// cannot hold them), the runtime streams them from a pinned copy made
     /// of it, as from the file's.
     pub(crate) fn preseat_weights(&mut self, filed: bool, copied: bool) -> crate::Result<()> {
+        self.preseated_as = Some((filed, copied));
         if filed {
             self.pools.file_weights();
         }
@@ -187,7 +310,19 @@ impl Shell {
                 self.pools.keep_clear(chunks);
                 self.pools.preseat_weights(self.device.stream(), &plan)?;
             }
-            None if filed || copied => self.pools.pin_weight_hosts()?,
+            None if filed || copied => {
+                // A load told its weights are held (`copied`: its held copy)
+                // whose pool cannot seat them serves them streamed: said.
+                if copied {
+                    let (have, need) = self.pools.preseat_chunks();
+                    tracing::info!(
+                        "{}: told held, but the pool's fitted chunks hold {have} of {need} \
+                         weight chunks: serving from a pinned host copy over the host link",
+                        self.device.name()
+                    );
+                }
+                self.pools.pin_weight_hosts()?;
+            }
             None => {}
         }
         self.device.synchronize()?;
@@ -196,10 +331,12 @@ impl Shell {
     }
 
     /// See `WeightCache::set_residency`: stream-ordered before the next fire.
+    /// Answers what the fit holds back of the chunks stated
+    /// ([`Self::held_and_outside`]) once the set is taken.
     pub fn weight_residency(
         &mut self,
         residency: &engine::chunk::WeightResidency,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<u64> {
         // The pages this shell seats for its lanes itself stay clear of the
         // chunks the runtime lays weights in. One already there is let go
         // with every other, which only a shell holding no lane's rows may.
@@ -239,6 +376,10 @@ impl Shell {
             self.device.synchronize()?;
             self.pools.stand_in(false)?;
             armed?;
+            // Every composition has fired and the bodies hold what they
+            // take: the fit the load left unsettled settles, once, and the
+            // answer below says what it still holds back.
+            self.settle_fit()?;
         } else if flipped {
             if self.pools.by_refs() {
                 // The lattice fires lanes this shell seats itself, which a
@@ -246,8 +387,8 @@ impl Shell {
                 if self.pools.weights_located() {
                     // The recorded bodies keep the plain-load select they
                     // chose, which reads a located table as well.
-                    eprintln!(
-                        "engine-cuda: a held weight set arrived after lanes named slot refs; \
+                    tracing::info!(
+                        "a held weight set arrived after lanes named slot refs; \
                          the recorded bodies keep the per-route select (send the set before \
                          the first fire)"
                     );
@@ -266,8 +407,7 @@ impl Shell {
                 // bank's experts lay: the lattice is recorded again over
                 // where they lie now.
                 self.device.synchronize()?;
-                self.cache.forget_bodies();
-                self.arm_bodies()?;
+                self.rearm_bodies()?;
             }
         }
         if self.pools.copied_from_file() {
@@ -284,14 +424,14 @@ impl Shell {
             let freed = tier.release_host(&held);
             if freed > 0 {
                 self.pools.drop_weight_hosts();
-                eprintln!(
-                    "engine-cuda: the weights the pool holds whole are read from it alone; \
+                tracing::info!(
+                    "the weights the pool holds whole are read from it alone; \
                      {} MiB of their host copy freed",
                     freed >> 20
                 );
             }
         }
-        Ok(())
+        Ok(self.pools.kept_back_bytes())
     }
 
     /// The row-streamed tables' blocks named a slot, and all of them: the
@@ -309,6 +449,13 @@ impl Shell {
     /// From here on lanes name their slots by slot ref.
     pub fn take_refs(&mut self) {
         self.pools.take_refs();
+    }
+
+    /// The record a lane bound to none reads and writes, where lanes name
+    /// refs and the load holds state: the null record, ref 0.
+    #[must_use]
+    pub fn null_record(&self) -> Option<u32> {
+        (self.pools.by_refs() && self.pools.has_record()).then_some(0)
     }
 
     /// Copies a working set's recurrent record from slot `src` onto `dst`,
@@ -332,7 +479,7 @@ impl Shell {
             .copy_whole_slots(self.device.stream(), shape, pairs)
     }
 
-    /// Copies whole slots of `shape` between tiers (CONTRACT-BC 22), on
+    /// Copies whole slots of `shape` between tiers, on
     /// the stream behind the fires enqueued and ahead of the next.
     pub fn copy_tier_slots(
         &mut self,
@@ -341,9 +488,53 @@ impl Shell {
         to: crate::store::Tier,
         pairs: &[(u32, u32)],
     ) -> crate::Result<()> {
+        // A record that leaves the device, or arrives on it, moves when the
+        // runtime's count of its folds has caught up (it moves no set with
+        // a device-counted fold unsettled): what a fold left ahead of that
+        // count belongs to neither the slot it left nor the one it lands
+        // in, and a later record seated there must not inherit it.
+        if shape == crate::store::layout::FIXED {
+            for &(src, dst) in pairs {
+                if from == crate::store::Tier::Device {
+                    self.rs_ahead.remove(&src);
+                }
+                if to == crate::store::Tier::Device {
+                    self.rs_ahead.remove(&dst);
+                }
+            }
+        }
         let swap = (!super::diag::on().tier_inline).then(|| self.device.swap_stream());
         self.pools
             .copy_tier_slots(self.device.stream(), swap, shape, from, to, pairs)
+    }
+
+    /// Waits, on the host, until every move between the device and the host
+    /// tier enqueued so far has landed.
+    pub fn settle_moves(&mut self) -> crate::Result<()> {
+        self.pools.settle_swaps()
+    }
+
+    /// Where the next move between the host tier and the slot file is told
+    /// how it ended ([`crate::store::Pools::defer_disk_tell`]); returns a
+    /// tell no such move took.
+    pub fn defer_disk_tell(
+        &mut self,
+        told: Option<super::landing::Told>,
+    ) -> Option<super::landing::Told> {
+        self.pools.defer_disk_tell(told)
+    }
+
+    /// Tells `landed` how every move between the device and the host tier
+    /// enqueued so far ended (landed, or failed with its fault), from a
+    /// waiter of its own: nothing is enqueued on the swap stream for it, so
+    /// no later move waits on it. `false` (and `landed` dropped) where the
+    /// moves ride no swap stream, so each has landed by the time it returned.
+    pub fn tell_swaps_landed(&mut self, landed: super::landing::Told) -> crate::Result<bool> {
+        if super::diag::on().tier_inline {
+            return Ok(false);
+        }
+        super::landing::tell_when_landed(self.device.swap_stream(), landed)?;
+        Ok(true)
     }
 
     /// Copies whole slots and token runs of a kv shape (`windowed`: the windowed

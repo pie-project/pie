@@ -4,10 +4,12 @@
 //! behind the runtime's run-ahead window.
 //!
 //! The sampler is one ETA epilogue: the OpenAI penalties (presence,
-//! frequency, and the multiplicative repetition penalty) over the lane's
-//! tokens carried on the device, an optional grammar mask, temperature,
+//! frequency, and the multiplicative repetition penalty) over a vocabulary
+//! histogram carried on the device, an optional grammar mask, temperature,
 //! then min-p, top-k and top-p truncation and a Gumbel-max draw. Temperature
 //! zero is exact greedy. Asked for logprobs, the epilogue also lands the
+//! sampled token's log-probability and the `top_logprobs` likeliest tokens',
+//! scored as vLLM's `logprobs_mode` says (`raw_logprobs` by default).
 //!
 //! Asked for prompt logprobs, the prefill reads out every prompt row but the
 //! last and scores row `i` against token `i + 1`: its logprob, its rank and
@@ -27,6 +29,7 @@ use inferlet::eta::prelude::*;
 use inferlet::grammar::Matcher;
 use inferlet::mask::unpack_mask;
 use inferlet::media;
+use inferlet::sampler::{self, Knobs, Slots};
 
 use crate::prompt::Prompt;
 
@@ -48,6 +51,7 @@ pub struct Sampling {
     pub top_p: f32,
     /// 0 means off.
     pub top_k: u32,
+    /// Drawn fresh from the host's entropy for every request that names none.
     pub seed: u32,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
@@ -66,38 +70,14 @@ pub struct Sampling {
     pub prompt_logprobs: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LogprobsMode {
-    #[default]
-    RawLogprobs,
-    RawLogits,
-    ProcessedLogprobs,
-    ProcessedLogits,
-}
-
-impl LogprobsMode {
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "raw_logprobs" => Self::RawLogprobs,
-            "raw_logits" => Self::RawLogits,
-            "processed_logprobs" => Self::ProcessedLogprobs,
-            "processed_logits" => Self::ProcessedLogits,
-            _ => return None,
-        })
-    }
-
-    fn processed(self) -> bool {
-        matches!(self, Self::ProcessedLogprobs | Self::ProcessedLogits)
-    }
-
-    fn logits(self) -> bool {
-        matches!(self, Self::RawLogits | Self::ProcessedLogits)
-    }
-}
+/// What a step's logprobs score (vLLM's `logprobs_mode`).
+pub use inferlet::sampler::LogprobsMode;
 
 /// The most alternatives a step reports, as OpenAI caps `top_logprobs`.
 pub const MAX_TOP_LOGPROBS: u32 = 20;
 
+/// A sampled token's logprob (as [`LogprobsMode`] scores it), and the
+/// likeliest tokens' with theirs, most likely first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Logprob {
     pub logprob: f32,
@@ -149,7 +129,7 @@ impl Default for Sampling {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
-            seed: 0x51ed,
+            seed: fresh_seed(),
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repetition_penalty: 1.0,
@@ -159,6 +139,22 @@ impl Default for Sampling {
             prompt_logprobs: None,
         }
     }
+}
+
+/// A seed for a request that names none: drawn fresh from the host's
+/// entropy each time, so unseeded requests sample independently and only an
+/// explicit seed reproduces. `RandomState` keys from the OS random source
+/// (WASI `random` in a guest); the counter keeps draws within one instance
+/// distinct.
+fn fresh_seed() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(DRAWN.fetch_add(1, Ordering::Relaxed));
+    let x = hasher.finish();
+    (x as u32) ^ ((x >> 32) as u32)
 }
 
 impl Sampling {
@@ -173,15 +169,9 @@ impl Sampling {
     }
 
     fn penalized(&self) -> bool {
-        self.repeats() || self.counted()
-    }
-
-    fn repeats(&self) -> bool {
-        self.repetition_penalty != 1.0
-    }
-
-    fn counted(&self) -> bool {
-        self.presence_penalty != 0.0 || self.frequency_penalty != 0.0
+        self.presence_penalty != 0.0
+            || self.frequency_penalty != 0.0
+            || self.repetition_penalty != 1.0
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -212,27 +202,10 @@ impl Sampling {
     }
 }
 
-/// The sampler's knob values as scalars. Which knobs exist is the program's
-/// shape; their values ride in channels, so requests that differ only in
-/// value share one program and fly as one batch.
-struct Knobs {
-    /// A program constant: a channel-fed divisor costs the fused sampler
-    /// ~20% of a decode step, more than mixed temperatures cost by splitting.
-    temperature: Option<f32>,
-    top_p: Option<Tensor>,
-    top_k: Option<Tensor>,
-    min_p: Option<Tensor>,
-    repetition: Option<Tensor>,
-    frequency: Option<Tensor>,
-    presence: Option<Tensor>,
-    /// A program constant: how many alternatives a step lands, if any.
-    logprobs: Option<u32>,
-    logprobs_mode: LogprobsMode,
-}
-
-/// The channels a pass's knobs are seeded in.
+/// The channels a pass's knobs are seeded in: the temperature as its
+/// reciprocal (`sampler::inverse_temperature`).
 struct KnobChannels {
-    temperature: Option<f32>,
+    temperature: Option<Channel>,
     top_p: Option<Channel>,
     top_k: Option<Channel>,
     min_p: Option<Channel>,
@@ -249,16 +222,17 @@ impl KnobChannels {
         let sampled = s.temperature > 0.0;
         let penalized = s.penalized();
         Self {
-            temperature: sampled.then(|| s.temperature.max(1e-4)),
+            temperature: sampled
+                .then(|| Channel::from([sampler::inverse_temperature(s.temperature.max(1e-4))])),
             top_p: f(sampled && s.top_p < 1.0, s.top_p),
             top_k: (sampled && s.top_k > 0).then(|| Channel::from([s.top_k])),
             min_p: f(sampled && s.min_p > 0.0, s.min_p),
-            repetition: f(
-                penalized && s.repetition_penalty != 1.0,
-                s.repetition_penalty,
-            ),
-            frequency: f(penalized && s.frequency_penalty != 0.0, s.frequency_penalty),
-            presence: f(penalized && s.presence_penalty != 0.0, s.presence_penalty),
+            // Penalized, all three ride, the unasked at their neutral
+            // values: which penalties a request asks for is data, so every
+            // penalized request is one program (`sampler::standard`'s).
+            repetition: f(penalized, s.repetition_penalty),
+            frequency: f(penalized, s.frequency_penalty),
+            presence: f(penalized, s.presence_penalty),
             logprobs: s.logprobs,
             logprobs_mode: s.logprobs_mode,
         }
@@ -268,7 +242,7 @@ impl KnobChannels {
     fn read(&self) -> Knobs {
         let t = |c: &Option<Channel>| c.as_ref().map(|c| reshape(c.read(), []));
         Knobs {
-            temperature: self.temperature,
+            temperature: t(&self.temperature),
             top_p: t(&self.top_p),
             top_k: t(&self.top_k),
             min_p: t(&self.min_p),
@@ -276,189 +250,23 @@ impl KnobChannels {
             frequency: t(&self.frequency),
             presence: t(&self.presence),
             logprobs: self.logprobs,
-            logprobs_mode: self.logprobs_mode,
         }
     }
 }
 
-/// What a step lands beside its token when asked for logprobs: the sampled
-/// token's logprob then the alternatives' (`[1 + top]` f32), and the
-/// alternatives' ids (`[top]` i32, absent for none).
-struct Landed {
-    logprobs: Tensor,
-    ids: Option<Tensor>,
-}
-
-#[derive(Clone, Copy)]
-struct History<T> {
-    seen: Option<T>,
-    counts: Option<T>,
-}
-
-impl<T> History<T> {
-    fn map<U>(self, mut f: impl FnMut(T) -> U) -> History<U> {
-        History {
-            seen: self.seen.map(&mut f),
-            counts: self.counts.map(f),
-        }
+/// A step's channels as the standard sampler's stage bodies take them.
+fn slots(
+    rng: Channel,
+    hist: Option<(Channel, Channel)>,
+    mask: Option<Channel>,
+    logprobs: Option<(Channel, Option<Channel>)>,
+) -> Slots {
+    Slots {
+        rng: rng.traced(),
+        hist: hist.map(|(c, p)| (c.traced(), p.traced())),
+        mask: mask.map(|m| m.traced()),
+        logprobs: logprobs.map(|(values, ids)| (values.traced(), ids.map(|ids| ids.traced()))),
     }
-
-    fn as_ref(&self) -> History<&T> {
-        History {
-            seen: self.seen.as_ref(),
-            counts: self.counts.as_ref(),
-        }
-    }
-}
-
-impl History<Channel> {
-    fn seeded(s: &Sampling, vocab: u32, prompt: &[u32], generated: Option<i32>) -> Self {
-        let at = |t: i64| usize::try_from(t).ok().filter(|&t| t < vocab as usize);
-        let generated = generated.and_then(|t| at(i64::from(t)));
-        History {
-            seen: s.repeats().then(|| {
-                let mut seen = vec![false; vocab as usize];
-                for t in prompt.iter().filter_map(|&t| at(i64::from(t))).chain(generated) {
-                    seen[t] = true;
-                }
-                Channel::from(seen)
-            }),
-            counts: s.counted().then(|| {
-                let mut counts = vec![0.0f32; vocab as usize];
-                if let Some(t) = generated {
-                    counts[t] = 1.0;
-                }
-                Channel::from(counts)
-            }),
-        }
-    }
-
-    fn queued(s: &Sampling, vocab: u32) -> Self {
-        History {
-            seen: s
-                .repeats()
-                .then(|| Channel::new([vocab], dtype::bool).queued()),
-            counts: s
-                .counted()
-                .then(|| Channel::new([vocab], dtype::f32).queued()),
-        }
-    }
-
-    fn take(&self) -> History<Tensor> {
-        self.map(|c| c.take())
-    }
-
-    fn put(&self, next: &History<Tensor>) {
-        if let (Some(c), Some(v)) = (self.seen, &next.seen) {
-            c.put(v);
-        }
-        if let (Some(c), Some(v)) = (self.counts, &next.counts) {
-            c.put(v);
-        }
-    }
-}
-
-/// The sampled token as a rank-0 i32, the lane's history past it, and the
-/// step's logprobs where the knobs ask.
-fn sample(
-    vocab: u32,
-    k: &Knobs,
-    r: &Tensor,
-    history: History<&Tensor>,
-    mask: Option<&Tensor>,
-) -> (Tensor, History<Tensor>, Option<Landed>) {
-    let mut logits = reshape(intrinsics::output(0, "logits"), [vocab]);
-    let processed = k.logprobs.is_some() && k.logprobs_mode.processed();
-    let raw = k
-        .logprobs
-        .filter(|_| !k.logprobs_mode.processed())
-        .map(|_| logits.clone());
-    let zero = broadcast(0.0f32, [vocab]);
-    if let (Some(rep), Some(seen)) = (&k.repetition, history.seen) {
-        let rp = broadcast(rep, [vocab]);
-        let positive = gt(&logits, &zero);
-        let repenalized = select(&positive, &logits / &rp, &logits * &rp);
-        logits = select(seen, &repenalized, &logits);
-    }
-    if let Some(counts) = history.counts {
-        if let Some(freq) = &k.frequency {
-            logits = &logits - broadcast(freq, [vocab]) * counts;
-        }
-        if let Some(pres) = &k.presence {
-            logits = &logits - broadcast(pres, [vocab]) * cast(gt(counts, &zero), dtype::f32);
-        }
-    }
-    if let Some(mask) = mask {
-        logits = mask_apply(&logits, mask);
-    }
-    let (token, drawn_from) = match k.temperature {
-        None => (reduce_argmax(&logits), processed.then(|| logits.clone())),
-        Some(temperature) => {
-            let scaled = &logits / temperature;
-            let mut keep: Option<Tensor> = None;
-            if k.top_k.is_some() || k.top_p.is_some() || k.min_p.is_some() {
-                let probs = softmax(&scaled);
-                if let Some(min_p) = &k.min_p {
-                    let floor = reduce_max(&probs) * min_p;
-                    keep = Some(ge(&probs, broadcast(&floor, [vocab])));
-                }
-                if let Some(top_k) = &k.top_k {
-                    let ranked = pivot_threshold(&probs, rank_le(top_k));
-                    keep = Some(match keep {
-                        Some(k) => and(&k, &ranked),
-                        None => ranked,
-                    });
-                }
-                if let Some(top_p) = &k.top_p {
-                    let nucleus = pivot_threshold(&probs, cummass_le(top_p));
-                    keep = Some(match keep {
-                        Some(k) => and(&k, &nucleus),
-                        None => nucleus,
-                    });
-                }
-            }
-            let truncated = match keep {
-                Some(keep) => mask_apply(&scaled, keep),
-                None => scaled,
-            };
-            (
-                gumbel_max(&truncated, r),
-                processed.then(|| truncated.clone()),
-            )
-        }
-    };
-    let next = History {
-        seen: history.seen.map(|seen| scatter_set(seen, &token, true)),
-        counts: history.counts.map(|counts| scatter_add(counts, &token, 1.0f32)),
-    };
-    let landed = raw.or(drawn_from).zip(k.logprobs).map(|(scored, top)| {
-        let lp = if k.logprobs_mode.logits() {
-            scored
-        } else {
-            log_softmax(&scored)
-        };
-        let chosen = reshape(scalar_gather(&lp, reshape(&token, [1])), [1]);
-        if top == 0 {
-            return Landed {
-                logprobs: chosen,
-                ids: None,
-            };
-        }
-        let (values, ids) = top_k(&lp, top);
-        Landed {
-            logprobs: concat_f32(&chosen, &values, top),
-            ids: Some(cast(&ids, dtype::i32)),
-        }
-    });
-    (token, next, landed)
-}
-
-/// `[1]` and `[n]` f32 rows as one `[1 + n]` row.
-fn concat_f32(head: &Tensor, tail: &Tensor, n: u32) -> Tensor {
-    let at = iota(n + 1);
-    let first = eq(&at, broadcast(0u32, [n + 1]));
-    let shifted = gather(tail, select(&first, broadcast(0u32, [n + 1]), &at - 1u32));
-    select(&first, broadcast(reshape(head, []), [n + 1]), &shifted)
 }
 
 /// The host's read of a step's landed logprobs.
@@ -482,16 +290,6 @@ fn logprob_channels(logprobs: Option<u32>, capacity: u32) -> Option<(Channel, Op
             (top > 0).then(|| Channel::new([top], dtype::i32).capacity(capacity)),
         )
     })
-}
-
-/// A step's landed logprobs put in its channels, where asked.
-fn land(landed: Option<Landed>, channels: Option<(Channel, Option<Channel>)>) {
-    if let (Some(landed), Some((values, ids))) = (landed, channels) {
-        values.put(&landed.logprobs);
-        if let (Some(landed), Some(ids)) = (landed.ids, ids) {
-            ids.put(&landed);
-        }
-    }
 }
 
 /// A step's logprobs off the host side of its channels.
@@ -619,6 +417,15 @@ fn prompt_rows(
 ///
 /// With a `guide`, every fire's logits are masked to what it allows next,
 /// and generation ends when it terminates.
+///
+/// Every pass but the speculative path's is final, the SDK's default:
+/// the prompt's and the decode's fires fold at fire and
+/// run the plain folded step. A request makes its own working set and
+/// releases it when it ends, so a stop (a stop token, a stop sequence, the
+/// budget, a grammar's end) only ends the output: what ran past it stays in
+/// the set, published keyed by the tokens it holds, and nothing is taken
+/// back. The speculative path rewrites a rejected draft's slots, so its
+/// passes are `ForwardPass::retractable`.
 pub async fn generate(
     prompt: &Prompt,
     sampling: Sampling,
@@ -674,7 +481,22 @@ pub async fn generate(
     let vocab = model::output_vocab_size();
     let n = prompt.len() as u32;
 
-    let ws = WorkingSet::new();
+    // Each request is a process of its own: a system prompt is reused
+    // across requests only within the tenant.
+    let ws = WorkingSet::shared(ShareScope::Tenant)?;
+
+    let penalized = sampling.penalized();
+    let present: Vec<f32> = if penalized {
+        let mut v = vec![0.0f32; vocab as usize];
+        for &t in prompt {
+            if (t as usize) < v.len() {
+                v[t as usize] = 1.0;
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
 
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     // Scored, every prompt row but the last is prefilled by the scoring
@@ -697,13 +519,23 @@ pub async fn generate(
     let carried_on = (guide.is_none() && sampling.logprobs.is_none()).then(|| {
         (
             Channel::new([1], dtype::i32).queued(),
-            History::queued(&sampling, vocab),
+            penalized.then(|| {
+                (
+                    Channel::new([vocab], dtype::f32).queued(),
+                    Channel::new([vocab], dtype::f32).queued(),
+                )
+            }),
         )
     });
     let toks = Channel::from(&prompt_i32[base..]);
     let embed_indptr = Channel::from([0u32, n - base as u32]);
     let rng = Channel::from([sampling.seed, 0u32]);
-    let hist = History::seeded(&sampling, vocab, prompt, None);
+    let hist = penalized.then(|| {
+        (
+            Channel::from(vec![0.0f32; vocab as usize]),
+            Channel::from(present.clone()),
+        )
+    });
     let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
     let g0_ch = Channel::new([1], dtype::i32);
     let lp_ch = logprob_channels(sampling.logprobs, 1);
@@ -718,17 +550,17 @@ pub async fn generate(
     }
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let r = rng.take();
-        let taken = hist.take();
-        let m = mask.map(|m| m.take());
-        let (token, next, landed) = sample(vocab, &knobs.read(), &r, taken.as_ref(), m.as_ref());
-        let token = reshape(token, [1]);
-        g0_ch.put(&token);
-        land(landed, lp_ch);
-        if let Some((tok_in, carried)) = carried_on {
-            tok_in.put(&token);
-            carried.put(&next);
-        }
+        let carried_on = carried_on.map(|(tok_in, hist)| {
+            (tok_in.traced(), hist.map(|(c, p)| (c.traced(), p.traced())))
+        });
+        sampler::prefill_with(
+            vocab,
+            &knobs.read(),
+            knobs.logprobs_mode,
+            &slots(rng, hist, mask, lp_ch),
+            &g0_ch.traced(),
+            carried_on.as_ref(),
+        );
     });
     if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
         m.put(unpack_mask(&guide.mask(), vocab));
@@ -775,8 +607,17 @@ pub async fn generate(
     let knobs = KnobChannels::new(&sampling);
     let lp_ch = logprob_channels(sampling.logprobs, channel_capacity() as u32);
     let lane1 = Channel::from([0u32, 1u32]);
-    let hist =
-        carried_hist.unwrap_or_else(|| History::seeded(&sampling, vocab, prompt, Some(g0)));
+    let hist = carried_hist.unwrap_or_else(|| {
+        penalized.then(|| {
+            let mut counts0 = vec![0.0f32; vocab as usize];
+            if let Ok(g0) = usize::try_from(g0)
+                && g0 < counts0.len()
+            {
+                counts0[g0] = 1.0;
+            }
+            (Channel::from(counts0), Channel::from(present.clone()))
+        })
+    });
     let mask = guide.is_some().then(|| Channel::new([vocab], dtype::bool));
 
     let fwd = ForwardPass::new();
@@ -784,20 +625,14 @@ pub async fn generate(
     fwd.embed(&tok_in, &lane1)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let r = rng.take();
-        let taken = hist.take();
-        let m = mask.map(|m| m.take());
-        let k = knobs.read();
-
-        let (token, next, landed) = sample(vocab, &k, &r, taken.as_ref(), m.as_ref());
-        let token = reshape(token, [1]);
-        land(landed, lp_ch);
-        let r_next = &r + iota(2);
-
-        tok_in.put(&token);
-        out.put(&token);
-        rng.put(&r_next);
-        hist.put(&next);
+        sampler::decode_with(
+            vocab,
+            &knobs.read(),
+            knobs.logprobs_mode,
+            &slots(rng, hist, mask, lp_ch),
+            &tok_in.traced(),
+            &out.traced(),
+        );
     });
 
     let budget = max_tokens - 1;
@@ -892,6 +727,13 @@ mod tests {
         let rows = prompt_rows(&[-1.0], &[3.0], &[], &[], 0);
         assert_eq!(rows[0].top, Vec::new());
         assert_eq!(rows[0].rank, Some(3));
+    }
+
+    #[test]
+    fn unseeded_requests_draw_distinct_seeds() {
+        let seeds: std::collections::HashSet<u32> =
+            (0..64).map(|_| Sampling::default().seed).collect();
+        assert!(seeds.len() > 60, "{} distinct of 64", seeds.len());
     }
 
     #[test]

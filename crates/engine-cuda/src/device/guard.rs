@@ -275,7 +275,7 @@ mod cupti {
             let on = thread
                 .name()
                 .map_or_else(|| format!("{:?}", thread.id()), ToString::to_string);
-            eprintln!("engine-cuda: [sync-guard] a fire on `{on}` calls {call}, from:\n{from}");
+            tracing::warn!("[sync-guard] a fire on `{on}` calls {call}, from:\n{from}");
         }
         let _ = NOTED.try_with(|noted| {
             if let Ok(mut noted) = noted.try_borrow_mut() {
