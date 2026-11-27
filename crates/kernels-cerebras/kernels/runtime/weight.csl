@@ -142,8 +142,10 @@ const kv = @import_module("ops/kv.csl", .{ .pe = pe, .fab = fab, .math = math, .
   .AROW = AROW, .KEV = KEV, .Qh = Qh, .DcS = DcS, .DcG = DcG, .NES = NES, .NEG = NEG, .PYW = PYW, .HDS = HDS, .HDG = HDG, //+seats
   .WSPEC = WSPEC, .RING = RING, .WIN = WIN, .XHI = XHI, .PLOG = PLOG, .DIAG = DIAG, .SEATS = SEATS }); //+seats
 var kvlog_ptr: [*]f32 = &kv.kvlog;
-const swa = @import_module("ops/swa.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 2, .K = K, .KM = KM, .Qh = Qh,
-  .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ, .QKN = QKN, .HD = HD, .EPS = EPS });
+const swa = @import_module("ops/swa.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 2, .K = K, .KM = KM, .Qh = Qh, //-seats
+  .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ, .QKN = QKN, .HD = HD, .EPS = EPS }); //-seats
+const swa = @import_module("ops/swa.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 2, .K = K, .KM = KM, .Qh = Qh, //+seats
+  .Dc = Dc, .NE = NE, .QO = QO, .PYW = PYW, .WIN = WIN, .PFTZ = PFTZ, .QKN = QKN, .HD = HD, .EPS = EPS, .SEATS = SEATS }); //+seats
 const moe = @import_module("ops/moe.csl", .{ .pe = pe, .fab = fab, .ON = MIXK == 3, .K = K, .Hc = Hc, .Ic = Ic, .NEX = NEX, .TK = TK,
   .XF = XF });
 var wr_ptr: [*]f32 = &moe.wr;
@@ -302,6 +304,7 @@ fn layer3(l: u16) void {
   stamp(2 + 4 * l);
   moe.up(l);
   stamp(3 + 4 * l);
+  if (l + 1 == K) { pe.post_in(); } //+seats
   moe.down(l);
   stamp(4 + 4 * l);
 }
@@ -316,7 +319,7 @@ task pass_task() void {
     var l: u16 = 0;
     // (RCW 26, flags bit 0: the pass-start relay is the token loop's embedding: none before step 1)
     if (RCW < 26 or i > 0 or (pe.rcfg[pe.RQ + 25] & 1) == 0) { pe.relay(18, if (MIXK == 1) 0 else 1); } //-seats
-    pe.relay_in(18); //+seats
+    if (RCW < 26 or i >= SEATS or (pe.rcfg[pe.RQ + 25] & 1) == 0) { pe.relay_in(18); }   // (no embedding before a seat's lap 1) //+seats
     if (MIXK == 1 and SH == 1) { kv.pass_start(pos0 + i, i); }
     stamp(0);
     const nl: u16 = if ((DIAG & 2) != 0) 1 else K;

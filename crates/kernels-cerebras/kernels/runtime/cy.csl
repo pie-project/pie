@@ -125,8 +125,10 @@ const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = ma
 const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K, .SEATS = SEATS, .LV = PLV }); //+seats
 var pl_ptr: [*]f32 = &ple.pl;
 var plog_ptr: [*]f32 = &ple.plog;
-const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh,
-  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN, .SKW = SKW });
+const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh, //-seats
+  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN, .SKW = SKW }); //-seats
+const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh, //+seats
+  .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN, .SKW = SKW, .SEATS = SEATS }); //+seats
 var qb_ptr: [*]f32 = &swa.qb;
 var snk_ptr: [*]f32 = &swa.snk;
 const moe = @import_module("ops/cy_moe.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = MIXK == 3, .K = K, .Ic = Ic,
@@ -203,8 +205,11 @@ task pass_task() void {
     const nl: u16 = if ((DIAG & 2) != 0) 1 else K;
     var l: u16 = 0;
     if (MIXK == 2) {
+      seats.at(@ptrcast([*]u32, &pe.tab));   // the pass's position, seat and the next pass's //+seats
       pe.stamp(0);
-      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { swa.layer(l, pos0 + s); }
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { swa.layer(l, pos0 + s); } //-seats
+      while ((DIAG & 1) == 0 and l < nl) : (l += 1) { swa.layer(l, pe.tab[0]); } //+seats
+      seats.next(); //+seats
     } else if (MIXK == 3) {
       pe.stamp(0);
       while ((DIAG & 1) == 0 and (DIAG & 4) == 0 and l < nl) : (l += 1) { moe.layer(l); }

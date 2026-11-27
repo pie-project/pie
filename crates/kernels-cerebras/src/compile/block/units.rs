@@ -158,11 +158,17 @@ pub fn unit_chains(plan: &Plan, floor: &Floor, w: &mut Wiring) -> R<()> {
 
 /// The weight column each row's handoff turns in on arriving at `u`: column r, but over a ring a
 /// turn takes a level-2 input its reduction roles leave idle ([`common::weight`]), so a row whose
-/// column heads a group of both reductions swaps columns with the nearest row it can.
+/// column heads a group of both reductions swaps columns with the nearest row it can; and a unit
+/// of halves turns in its MoE half (an attention PE's last read of a pass, the MoE half's x it
+/// drops, has no partial after it to order the turn's re-colour by).
 ///
 /// [`common::weight`]: crate::compile::kernels::common::weight
 pub fn turns(plan: &Plan, u: &Unit) -> Vec<u32> {
-    let mut col: Vec<u32> = (0..u.rows()).collect();
+    let half = match plan.partition.attn_cols {
+        Some(ax) if plan.seats > 1 => ax,
+        _ => 0,
+    };
+    let mut col: Vec<u32> = (half..half + u.rows()).collect();
     let red = &plan.partition.reduce;
     if plan.seats <= 1 || red.row == 0 || red.col == 0 {
         return col;

@@ -257,19 +257,20 @@ fn bound_words(c: &Code) -> Result<BTreeMap<i64, bool>, String> {
 /// A row partial's send.
 const SEND_ROW: &str = "send_x(";
 
-/// Whether `text` (module `m`'s) sends a row partial: itself, or by a call of a function of the
-/// module that does.
+/// Whether `text` (module `m`'s) sends a row partial: itself, or by a call of a function (of the
+/// module or one it imports) that does.
 fn sends_row(c: &Code, m: usize, text: &str) -> bool {
     text.contains(SEND_ROW)
-        || (c.modules[m].funcs.iter())
-            .filter(|(_, f)| f.body.contains(SEND_ROW))
-            .any(|(n, _)| calls(text, n))
-}
-
-/// Whether `text` calls `name` (unqualified).
-fn calls(text: &str, name: &str) -> bool {
-    text.match_indices(&format!("{name}("))
-        .any(|(i, _)| !text[..i].ends_with(|ch: char| ident(ch) || ch == '.'))
+        || text.match_indices('(').any(|(i, _)| {
+            let b = &text[..i];
+            let s = b.rfind(|ch: char| !ident(ch)).map_or(0, |p| p + 1);
+            let qual = b[..s]
+                .strip_suffix('.')
+                .map(|q| &q[q.rfind(|ch: char| !ident(ch)).map_or(0, |p| p + 1)..]);
+            s < i
+                && c.resolve(m, qual, &b[s..])
+                    .is_some_and(|(t, f)| c.modules[t].funcs[&f].body.contains(SEND_ROW))
+        })
 }
 
 /// Whether the call at `i` of `body` sits in an `if` whose condition is a conjunction with a term

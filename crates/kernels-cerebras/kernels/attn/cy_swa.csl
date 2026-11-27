@@ -27,6 +27,7 @@ param QB: u16 = 1;
 param SNK: u16 = 1;
 param QKN: u16 = 0;
 param SKW: u16 = 0;
+param SEATS: u16 = 1; //+seats
 
 const QD: u16 = Qh * Dc;
 const NV: u16 = Qh * (Dc + 1);
@@ -35,7 +36,10 @@ const QAN: u16 = if (ON) NQA else 1;
 var qb = @zeros([if (ON) K * NQA else 1]f32);
 const qb_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QAN} -> qb[i] });
 var snk = @zeros([if (ON) K * Qh else 1]f32);
-var mref = @zeros([if (ON) K * Qh else 1]f32);
+var mref = @zeros([if (ON) K * Qh else 1]f32); //-seats
+var mrefs = @zeros([if (ON) SEATS * K * Qh else 1]f32);   // (seats) a reference a seat //+seats
+var mref: [*]f32 = &mrefs;   // the pass's seat's //+seats
+var moff: u16 = 0; //+seats
 var rot = @zeros([if (ON) NLV * 8 * 2 * NROT else 1]f32);
 const RN: u16 = if (ON) NROT else 1;
 var rc = @zeros([RN]f32);
@@ -67,7 +71,8 @@ const vs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> vs[i] });
 const vp_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> vp[i] });
 const vk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> vk[i] });
 const snk_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> snk[i] });
-const mref_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> mref[i] });
+const mref_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> mref[i] }); //-seats
+const mref_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QN} -> mrefs[i] }); //+seats
 const lst_d = pe.ts(Dc, QN, Dc + 1);   // the heads' sums l
 // a buffer's high halves (u16, stride 2, offset 1)
 fn hi(a: [*]f32) mem1d_dsd { return @increment_dsd_offset(@set_dsd_stride(@set_dsd_base_addr(vk_d, @ptrcast([*]u16, a)), 2), 1, u16); }
@@ -132,6 +137,8 @@ fn launch() void {
   while (l < K) : (l += 1) { pe.tdbg[1 + 3 * K + l] = 0; }
 }
 fn layer(l: u16, pos: u32) void {
+  mref = @ptrcast([*]f32, &mrefs[@as(u16, pe.tab[1]) * K * Qh]);   // (seats: pos the seat's own) //+seats
+  moff = @as(u16, pe.tab[1]) * K * Qh; //+seats
   pe.reduce(NQA + 1);
   pe.stamp(1 + 3 * l);
   const rr = math.rsqrt(pe.t[NQA] / pe.HID + pe.EPS);
@@ -158,10 +165,13 @@ fn layer(l: u16, pos: u32) void {
   var h: u16 = 0;
   @fmuls(pe.uv(0, QD), pe.tv(0, QD), QSC);
   @fmovs(pe.uv(QD, 2 * Dc), pe.tv(QD, 2 * Dc));
-  pe.u[QD + 2 * Dc] = @as(f32, pos);
+  pe.u[QD + 2 * Dc] = @as(f32, pos); //-seats
+  // (seats: 2 seat + its reset, 65536 a step, over the window's position) //+seats
+  pe.u[QD + 2 * Dc] = @as(f32, (2 * pe.tab[1] + (if (pos == 0) @as(u32, 1) else 0)) * 65536 + pe.tab[3] + pos); //+seats
   pe.mcast(QD + 2 * Dc + 1 + (if (QKN == 1) Qh + 1 else 0));
   pe.stamp(2 + 3 * l);
-  if (l == K - 1) { rope_tables_at(pos + 1); }   // (ROPEP) the next pass's tables, off the path
+  if (l == K - 1) { rope_tables_at(pos + 1); }   // (ROPEP) the next pass's tables, off the path //-seats
+  if (l == K - 1) { rope_tables_at(pe.tab[2]); }   // (ROPEP) the next pass's tables, off the path //+seats
   if (pos == 0) {
     h = 0;
     while (h < Qh) : (h += 1) { mref[l * Qh + h] = 0.0; }
@@ -173,7 +183,8 @@ fn layer(l: u16, pos: u32) void {
     if (CYV != 0) {
       @fmovs(lh_d, lst_d);
       if (SNK == 1) {
-        @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, l * Qh), f32));
+        @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, l * Qh), f32)); //-seats
+        @fsubs(ve_d, @increment_dsd_offset(snk_d, @as(i16, l * Qh), f32), @increment_dsd_offset(mref_d, @as(i16, moff + l * Qh), f32)); //+seats
         if (CYV == 3) { h = 0; while (h < Qh) : (h += 1) { ve[h] = math.exp1(ve[h]); } } else { vexpq(); }
         @fadds(ve_d, lh_d, ve_d);
         if (SKW == 1) { @fmovs(lw_d, ve_d); }

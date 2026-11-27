@@ -14,7 +14,7 @@ type R<T> = Result<T, String>;
 /// Preset keys: attention and MoE columns a unit (AX, MX), rows (PY), unit slots (UNX x UNY),
 /// scores and router segments (SWA, SWR), band vocabulary columns (HVC), KV entries a row (NE),
 /// RoPE levels (NLV), reduction groups (G2, G2W), logits prescale (HSCALE), posted loop (LOOP).
-/// Overrides: `NE`, `G2`, `G2W`, `G3W`, `CAP`, `LOOP`, `WL` (the token loop; on unless 0).
+/// Overrides: `NE`, `G2`, `G2W`, `G3W`, `CAP`, `LOOP`, `WL` (the token loop; on unless 0), `SEATS`.
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (ax, mx, py) = (pr.need("AX")?, pr.need("MX")?, pr.need("PY")?);
     let (unx, uny) = (pr.need("UNX")?, pr.need("UNY")?);
@@ -77,6 +77,14 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         ));
     }
     let ne = pr.need("NE")?;
+    // a ring of seats shares the full KV pool, NE PY: a sequence holds what the others' least
+    // windows (a launch's laps, whole rows) leave
+    let seats = pr.int("SEATS").unwrap_or(1).max(1);
+    let cap = pr.int("CAP").unwrap_or(256);
+    let least = (cap / seats).max(1).div_ceil(py) * py;
+    if seats > ne || (seats - 1) * least >= ne * py {
+        return Err(format!("split: {seats} seats over {ne} KV entries a row"));
+    }
     let partition = Partition {
         unit_grid: Some((unx, uny)),
         units,
@@ -115,10 +123,10 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         arrangement: None,
     };
     let contract = Contract {
-        positions: ne * py,
+        positions: ne * py - (seats - 1) * least,
         rope_levels: pr.need("NLV")?,
         rope_bits: 3,
-        cap: pr.int("CAP").unwrap_or(256),
+        cap,
         loop_len: pr.need("LOOP")?,
         token_loop: pr.int("WL").is_none_or(|v| v != 0),
         logit_scale: pr.float("HSCALE").unwrap_or(1.0) as f32,
@@ -128,6 +136,6 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         partition,
         contract,
         levers: pr.levers.clone(),
-        seats: 1,
+        seats,
     })
 }

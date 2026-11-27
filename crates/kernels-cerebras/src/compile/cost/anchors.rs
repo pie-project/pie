@@ -53,7 +53,7 @@ pub const ANCHORS: &[Anchor] = &[
             head: 4352.0,
         },
         head_moves: false,
-        code: &[],
+        code: EXPERTS,
         attention: 0.0,
     },
 ];
@@ -128,3 +128,12 @@ const WINDOWS: &[Code] = &[
         bytes: 120.0,
     },
 ];
+
+/// The routed experts' weight image (the MoE half's): a ring of seats' code (the gpt-oss links at
+/// 2 to 11 seats: 304 B).
+const EXPERTS: &[Code] = &[Code {
+    what: "a ring of seats",
+    on: |p: &Plan| p.seats > 1,
+    anchor: false,
+    bytes: 304.0,
+}];
