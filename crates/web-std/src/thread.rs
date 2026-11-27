@@ -75,11 +75,16 @@ impl Builder {
             }
         })
         .map_err(|(error, _stack)| std::io::Error::other(format!("green thread: {error}")))?;
-        let _ = self.name;
-        crate::executor::spawn(GreenTask {
-            fiber: Some(fiber),
-            suspend: slot,
-        });
+        crate::executor::spawn_labelled(
+            GreenTask {
+                fiber: Some(fiber),
+                suspend: slot,
+            },
+            format!(
+                "green thread {}",
+                self.name.as_deref().unwrap_or("(unnamed)")
+            ),
+        );
         Ok(JoinHandle { state })
     }
 }
