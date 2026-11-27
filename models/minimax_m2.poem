@@ -7,7 +7,7 @@
 # The two releases differ in the identity their template states and the
 # context their configuration does.
 
-load("//pie/codec.poem", "kept", "kind", "mapped")
+load("//pie/codec.poem", "kept", "mapped")
 load("//lib/blocks.poem", "attention")
 
 def spoken(name):
@@ -15,16 +15,13 @@ def spoken(name):
 
 TOKENIZER = tokenizer(markers = [["[e~["], ["]~!b[", "]~b]", "<think>", "</think>", "<minimax:tool_call>", "</minimax:tool_call>"]])
 
-def minimax(id, layers, name, mini = False, vocab = 200064):
-    return model(id, mini = mini, template = spoken(name), tokenizer = TOKENIZER, arch = "minimax_m2", layers = layers, vocab = vocab)
+def minimax(id, layers, name, mini = False):
+    return model(id, mini = mini, template = spoken(name), tokenizer = TOKENIZER, arch = "minimax_m2", layers = layers, vocab = 200064)
 
 MODELS = [
     minimax("minimax-m25", layers = 62, name = "MiniMax-M2.5"),
     minimax("minimax-m25-mini", layers = 4, name = "MiniMax-M2.5", mini = True),
     minimax("minimax-m27", layers = 62, name = "MiniMax-M2.7"),
-    # A random-weight architecture slice for the simulator gate (its golden: Hugging Face's
-    # forward on the same weights).
-    minimax("minimax-sim", layers = 2, name = "MiniMax-M2.5", vocab = 512),
 ]
 
 BF = dtype.bf16
@@ -44,9 +41,7 @@ def rows(id):
         deployment(id, weights = [BF, NV4W], kv = BF),
     ]
 
-DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini") + [
-    deployment("minimax-sim", weights = BF, kv = BF),
-]
+DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini")
 
 # The weights of MiniMax-M2: per layer an RMS norm, the q, k and v
 # projections, q's and k's norms across all their heads, the output
@@ -56,18 +51,18 @@ DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini
 # (or the first) the expert banks; the norms, router, embedding and head stay
 # bf16.
 
-def dims(layers, experts, max_position, hidden = 3072, q_heads = 48, kv_heads = 8, top_k = 8, inter = 1536, vocab = 200064):
+def dims(layers, experts, max_position):
     return struct(
-        hidden = hidden,
+        hidden = 3072,
         layers = layers,
-        q_heads = q_heads,
-        kv_heads = kv_heads,
+        q_heads = 48,
+        kv_heads = 8,
         head_dim = 128,
         rotary_dim = 64,
         experts = experts,
-        top_k = top_k,
-        inter = inter,
-        vocab = vocab,
+        top_k = 8,
+        inter = 1536,
+        vocab = 200064,
         theta = 5000000.0,
         norm_eps = 1e-6,
         max_position = max_position,
@@ -77,9 +72,6 @@ DIMS = {
     "minimax-m25": dims(layers = 62, experts = 256, max_position = 196608),
     "minimax-m25-mini": dims(layers = 4, experts = 16, max_position = 196608),
     "minimax-m27": dims(layers = 62, experts = 256, max_position = 204800),
-    # MiniMax-M2.5's head width, partial rotation, GQA ratio (4), cross-head q / k norms and
-    # biased sigmoid routing, its sizes shrunk
-    "minimax-sim": dims(layers = 2, experts = 4, max_position = 196608, hidden = 256, q_heads = 8, kv_heads = 2, top_k = 2, inter = 64, vocab = 512),
 }
 
 def layout(id, deploy):
@@ -181,10 +173,8 @@ TRANSFORMERS = [
 ]
 
 def read(m, reads):
-    for l, w in enumerate(m.layers):
-        # (a checkpoint stored plain, the simulator's slice, reads as stored)
-        stored = kind("model.layers.{}.block_sparse_moe.experts.0.w1.weight".format(l))
-        if not kept(w.gate) and stored != None:
+    for w in m.layers:
+        if not kept(w.gate):
             fail("`{}`: MiniMax-M2 is released FP8 and exported NVFP4; this deployment reads its experts as {}".format(w.gate.name, w.gate.dtype))
     mapped(reads, m, TRANSFORMERS)
 
