@@ -1192,12 +1192,20 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
 /// select's workgroup tables), which SwiftShader in Chrome takes minutes on;
 /// naga drops what the entry never reaches and writes the rest back. Native
 /// drivers strip it themselves, and serve the module as emitted faster.
+/// A native test takes the tab's forms with `PIE_TEST_GUEST_COMPACT` (this)
+/// and `PIE_TEST_GUEST_ROLLED` (the pivot finish rolled), to compare them.
 fn compacted(call: usize, source: &str) -> std::result::Result<String, String> {
-    if !cfg!(target_arch = "wasm32") {
-        return Ok(source.to_string());
-    }
     #[cfg(feature = "test-limits")]
-    if std::env::var_os("PIE_TEST_GUEST_WHOLE").is_some() {
+    let source = &if std::env::var_os("PIE_TEST_GUEST_ROLLED").is_some() {
+        eta_compiler::codegen::wgsl::roll_pivot(source)
+    } else {
+        source.to_string()
+    };
+    #[cfg(feature = "test-limits")]
+    let tab = cfg!(target_arch = "wasm32") || std::env::var_os("PIE_TEST_GUEST_COMPACT").is_some();
+    #[cfg(not(feature = "test-limits"))]
+    let tab = cfg!(target_arch = "wasm32");
+    if !tab {
         return Ok(source.to_string());
     }
     let mut module = naga::front::wgsl::parse_str(source).map_err(|e| {

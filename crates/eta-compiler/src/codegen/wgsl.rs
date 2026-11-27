@@ -41,12 +41,18 @@ const PIVOT_BLOCK_ROLLED: &str = "        for (var k : u32 = 0u; k < PIVOT_UNROL
         }
 ";
 
+/// `source` with the pivot finish's block rolled, as the tab's runtime has
+/// it: a native test compares the two forms through this.
+pub fn roll_pivot(source: &str) -> String {
+    source.replacen(&pivot_block_spelled(), PIVOT_BLOCK_ROLLED, 1)
+}
+
 /// The runtime a step's module carries on this target: [`RUNTIME`], but in
 /// the tab with the pivot finish's block rolled, which SwiftShader in Chrome
 /// otherwise grew past 11 GiB compiling. Native drivers take it as spelled.
 fn runtime() -> alloc::borrow::Cow<'static, str> {
     if cfg!(target_arch = "wasm32") {
-        alloc::borrow::Cow::Owned(RUNTIME.replacen(&pivot_block_spelled(), PIVOT_BLOCK_ROLLED, 1))
+        alloc::borrow::Cow::Owned(roll_pivot(RUNTIME))
     } else {
         alloc::borrow::Cow::Borrowed(RUNTIME)
     }
