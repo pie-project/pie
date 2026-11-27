@@ -1057,6 +1057,7 @@ where
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
         shell.programs_placed();
+        tracing::info!(engine = B::KIND, "after load phases: the bind walk begins");
         let started = crate::Instant::now();
         let walked = shell.walk_binds().map_err(fault)?;
         if walked > 0 {
@@ -1088,9 +1089,17 @@ where
         // second bind walk, and what it walked is the load's; where the
         // settle changed no pick, every shape binds what the first walk
         // built, and there is none.
+        tracing::info!(
+            engine = B::KIND,
+            "after load phases: the dense settle begins"
+        );
         let settling = crate::Instant::now();
         let picks = shell.dense_picks().clone();
         shell.settle_dense().map_err(fault)?;
+        tracing::info!(
+            engine = B::KIND,
+            "after load phases: the behind probe is laid"
+        );
         shell.lay_behind_probe().map_err(fault)?;
         tracing::info!(
             settle_ms = settling.elapsed().as_millis() as u64,

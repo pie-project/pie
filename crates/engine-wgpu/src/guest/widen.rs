@@ -121,6 +121,7 @@ impl Widen {
             });
         core.take_error("create_pipeline_layout")?;
 
+        tracing::info!("the readout widen's pipeline: creating");
         let pipeline = crate::guest::validated(&core, "create_compute_pipeline", || {
             let module = core
                 .device

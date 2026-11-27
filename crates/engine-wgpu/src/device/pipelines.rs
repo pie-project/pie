@@ -503,7 +503,21 @@ impl Pipelines {
         if let Some(pipeline) = self.built.borrow().get(key) {
             return Ok(Arc::clone(pipeline));
         }
-        let wgsl = module(file, key, device.core().one_segment())?;
+        let one = device.core().one_segment();
+        let wgsl = module(file, key, one)?;
+        // Said before the pipeline is made (in the tab, where a device lost
+        // mid-build says nothing else of what it was making).
+        #[cfg(target_arch = "wasm32")]
+        tracing::info!(
+            key,
+            form = if one && kernels_slang::wgsl_one_segment(key).is_some() {
+                "s1"
+            } else {
+                "4"
+            },
+            wgsl_bytes = wgsl.len(),
+            "a kernel's pipeline: creating"
+        );
         let pipeline = Arc::new(build(device.core(), &self.layouts, file, key, wgsl)?);
         self.order.borrow_mut().push(key);
         self.built.borrow_mut().insert(key, Arc::clone(&pipeline));

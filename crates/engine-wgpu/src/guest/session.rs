@@ -223,9 +223,23 @@ impl Library {
             });
         core.take_error("create_pipeline_layout")?;
         let started = crate::device::host::Instant::now();
-        let pipelines: Vec<_> = (0..engine_gpu::guest::step_calls())
-            .map(|call| build_call(&core, &layout, call))
+        let calls = engine_gpu::guest::step_calls();
+        tracing::info!(calls, "building every guest step's pipeline");
+        let pipelines: Vec<_> = (0..calls)
+            .map(|call| {
+                let at = crate::device::host::Instant::now();
+                let built = build_call(&core, &layout, call);
+                tracing::info!(
+                    call,
+                    of = calls,
+                    built = built.is_ok(),
+                    ms = at.elapsed().as_millis() as u64,
+                    "a guest step's pipeline"
+                );
+                built
+            })
             .collect();
+        tracing::info!("binding the guest steps' segment groups");
         let mut groups = std::collections::HashMap::with_capacity(segments.len().pow(2));
         for slots in segments {
             for heap in segments {
@@ -1182,6 +1196,13 @@ fn build_call(
     let source = widened(call, source)?;
     let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
         .map_err(|why| why.to_string())?;
+    // Said before the module is made, so the last line before a device's
+    // loss names what it was making.
+    tracing::info!(
+        call,
+        wgsl_bytes = source.len(),
+        "a guest step's pipeline: creating"
+    );
     crate::guest::validated(core, "create_compute_pipeline", || {
         let module = core
             .device

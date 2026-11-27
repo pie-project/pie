@@ -1806,6 +1806,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             // refused at registration). The buffers, and the widen's table,
             // are the shelf's: reserved before the pool was sized.
             let (outboxes, table) = &place.shelf.guest;
+            tracing::info!("after load phases: the guest library builds");
             let library = crate::guest::session::Library::build(
                 place.device,
                 outboxes.clone(),
@@ -1813,6 +1814,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             )
             .map_err(|why| Refusal::Program(format!("the guest pipelines did not build: {why}")))?;
             self.library = Some(Arc::new(library));
+            tracing::info!("after load phases: the readout widen builds");
             let widen = crate::guest::widen::Widen::new(
                 place.device,
                 table.clone(),
@@ -1823,6 +1825,7 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             )
             .map_err(|why| Refusal::Program(format!("the readout widen did not build: {why}")))?;
             self.widen = Some(Arc::new(widen));
+            tracing::info!("after load phases: the guest library and the widen built");
         }
         // A build with no device builds nothing, and binds no instance.
         #[cfg(not(feature = "wgpu"))]
