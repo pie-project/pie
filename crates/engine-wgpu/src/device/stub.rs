@@ -435,6 +435,7 @@ pub struct Pipeline {
     pub uniform: Option<u32>,
     pub push_bytes: u32,
     pub local: [u32; 3],
+    pub one_segment: bool,
 }
 
 #[derive(Default, Debug)]

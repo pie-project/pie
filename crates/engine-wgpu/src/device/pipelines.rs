@@ -23,6 +23,11 @@ pub struct Pipeline {
     pub push_bytes: u32,
     pub local: [u32; 3],
 
+    /// Built on a device laying the pool in one segment: a pool kernel's
+    /// one-segment form, which declares none of the three segment
+    /// arguments past the first (they are passed, and not bound).
+    pub one_segment: bool,
+
     /// The bytes one element of each storage binding's array steps, `0`
     /// where the binding is no runtime-sized array: the unit a rebased
     /// view's offset is counted in ([`Rebased`]).
@@ -745,6 +750,7 @@ fn build(
         uniform: declared.uniform,
         push_bytes: declared.push_bytes,
         local: declared.local,
+        one_segment: core.one_segment(),
         stride: declared.stride,
         rebased: std::sync::OnceLock::new(),
         wgsl,

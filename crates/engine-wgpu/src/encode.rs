@@ -449,7 +449,9 @@ impl Sink<'_> {
         }
         for (at, view) in views.iter().enumerate() {
             if at >= declared {
-                if view.3 {
+                // A one-segment form's undeclared segments are passed and
+                // not bound: the pool lies whole in the first.
+                if view.3 && !pipeline.one_segment {
                     return Err(Sink::backend(
                         fire,
                         format!(
