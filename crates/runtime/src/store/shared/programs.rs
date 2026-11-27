@@ -957,9 +957,14 @@ pub async fn fund_span(
         let Some(goal) = goal else {
             // The engine holds a rung the terms no longer fit: the walk
             // brings it down, and tells the rung.
+            crate::rt::tab_step(
+                "no rung fits: asks the walk, waits for the rung",
+                "a bind's fire span",
+            );
             super::ask_walk(engine);
             let _parked = crate::inferlet::process::parks_here();
             watch.await;
+            crate::rt::tab_step("the rung changed", "a bind's fire span");
             continue;
         };
         if short == 0 && !copying && cut {
@@ -968,11 +973,20 @@ pub async fn fund_span(
         if copying || short == 0 {
             // A raise's copy is the engine's to take, or the walk is to cut
             // fires to the widest rung that fits: either tells the rung.
+            crate::rt::tab_step(
+                if copying {
+                    "a raise copies: waits for the rung"
+                } else {
+                    "no chunks short, fires not cut: asks the walk, waits for the rung"
+                },
+                "a bind's fire span",
+            );
             if !cut {
                 super::ask_walk(engine);
             }
             let _parked = crate::inferlet::process::parks_here();
             watch.await;
+            crate::rt::tab_step("the rung changed", "a bind's fire span");
             continue;
         }
         let pages = shared.lock().unwrap().raise_short(goal).1;
@@ -982,7 +996,10 @@ pub async fn fund_span(
                 goal,
                 "a program's fire term asks the planner for room"
             );
-            if !funder.fund(pages).await? {
+            crate::rt::tab_step("asks the planner for room", "a bind's fire span");
+            let funded = funder.fund(pages).await?;
+            crate::rt::tab_step("the planner answered", "a bind's fire span");
+            if !funded {
                 // Quoted again: the planner's answer is the event.
                 continue;
             }

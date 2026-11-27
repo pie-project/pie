@@ -69,6 +69,7 @@ impl SchedulerHandle {
         program: ProgramRegistration,
     ) -> Result<::engine::ProgramId> {
         let hash = program.program_hash;
+        crate::rt::tab_step("its host codegen", "a program's registration");
         let program = match self.inner.codegen_backend.clone() {
             Some(backend) => crate::rt::spawn_blocking(move || {
                 let coded = match crate::pipeline::program::with_host_codegen(
@@ -84,6 +85,7 @@ impl SchedulerHandle {
             .map_err(|e| anyhow!("program 0x{hash:016x}: its host codegen did not finish: {e}"))?,
             None => program,
         };
+        crate::rt::tab_step("asks the lane to prepare it", "a program's registration");
         let compile = self
             .request(|response| SchedulerItem::PrepareProgram {
                 program: Box::new(program),
@@ -91,9 +93,11 @@ impl SchedulerHandle {
             })
             .await?
             .map_err(|e| anyhow!("program 0x{hash:016x}: {e:#}"))?;
+        crate::rt::tab_step("compiles it", "a program's registration");
         let prepared = crate::rt::spawn_blocking(compile)
             .await
             .map_err(|e| anyhow!("program 0x{hash:016x}: its compile did not finish: {e}"))?;
+        crate::rt::tab_step("asks the lane to finish it", "a program's registration");
         self.request(|response| SchedulerItem::FinishProgram { prepared, response })
             .await?
             .map_err(|e| anyhow!("program 0x{hash:016x}: {e:#}"))
@@ -156,6 +160,7 @@ impl SchedulerHandle {
                 }
             }
         };
+        crate::rt::tab_step("waits for its registration's answer", "a bind's program");
         let answered = crate::inferlet::process::said(
             "bind: register the program",
             pid,
@@ -223,9 +228,11 @@ impl SchedulerHandle {
         program: ProgramRegistration,
         mut bind: InstanceBindingPlan,
     ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
+        crate::rt::tab_step("registers its program", "a bind");
         let program_id = self
             .program_id(pipeline_id.unwrap_or_default(), program)
             .await?;
+        crate::rt::tab_step("its program registered", "a bind");
         bind.binding.program = program_id;
         // The fire term of the program at these extents counts while the
         // bind is under way, and the activation the fires may take holds it
@@ -240,9 +247,11 @@ impl SchedulerHandle {
                     extents: bind.binding.extents,
                 };
                 if !shared.lock().unwrap().knows_fire(&key) {
+                    crate::rt::tab_step("asks the lane its fire facts", "a bind");
                     self.request(|response| SchedulerItem::FireFacts { key, response })
                         .await??;
                 }
+                crate::rt::tab_step("asks the lane its standing bytes", "a bind");
                 // What the bind adds to the engine's standing guest bytes,
                 // asked on the lane before anything is bound: held with the
                 // term, refused with it by name, and backed with it below
@@ -259,6 +268,7 @@ impl SchedulerHandle {
                     crate::store::shared::programs::ProgramOpen::new(&shared, key, standing)
                 }
                 .map_err(|why| anyhow!("pipeline: {why}"))?;
+                crate::rt::tab_step("funds its fire span", "a bind");
                 let engine = bind.engine_id;
                 let pid = pipeline_id.unwrap_or_default();
                 crate::inferlet::process::said(
@@ -278,6 +288,7 @@ impl SchedulerHandle {
                 .map_err(|why| {
                     anyhow!("pipeline: a program's fires need a wider activation span: {why}")
                 })?;
+                crate::rt::tab_step("its fire span funded", "a bind");
                 Some(open)
             }
             None => None,
@@ -286,6 +297,7 @@ impl SchedulerHandle {
         let lane_bind = || {
             let (plans, bind) = (plans.clone(), bind.clone());
             async move {
+                crate::rt::tab_step("asks the lane to bind", "a bind");
                 crate::inferlet::process::said(
                     "bind: the lane's bind",
                     pid,
