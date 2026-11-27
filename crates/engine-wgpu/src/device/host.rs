@@ -22,17 +22,34 @@ pub(crate) fn can_block() -> bool {
 
 static PARKED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
-/// In the tab, the first of each wait a frame passes through, said by name
-/// (`what`, at `at`): where a first fire that never lands stops. Elsewhere,
-/// and past the first few hundred, nothing.
+/// The waits [`tab_wait`] says: the boot's first, and again from ready
+/// ([`tab_wait_from_ready`]), so a serving fire that never lands names where
+/// it stops.
+#[cfg(target_arch = "wasm32")]
+static TAB_WAITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "wasm32")]
+const TAB_WAITS_SAID: u32 = 600;
+
+/// In the tab, a wait a frame passes through, said by name (`what`, at
+/// `at`), the first [`TAB_WAITS_SAID`] from the boot and again from ready.
+/// Elsewhere nothing.
 #[allow(unused_variables)]
 pub(crate) fn tab_wait(what: &'static str, at: &'static str) {
     #[cfg(target_arch = "wasm32")]
     {
-        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
-            tracing::info!(target: "pie_tab_wait", what, at, "a frame's wait");
+        let n = TAB_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < TAB_WAITS_SAID {
+            tracing::info!(target: "pie_tab_wait", n, what, at, "a frame's wait");
         }
+    }
+}
+
+/// The runtime is ready: [`tab_wait`] says the next waits again.
+pub fn tab_wait_from_ready() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        TAB_WAITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(target: "pie_tab_wait", "ready: the waits from here are said");
     }
 }
 

@@ -63,7 +63,9 @@ fn read_seat(
     let end = tail.map_or(rows_end, |tail| {
         rows_end.max(tail.at + u64::from(tail.words) * 4)
     });
+    crate::device::host::tab_wait("reads its rows", "a fire's readout");
     seat.read_async(0, end, move |raw| {
+        crate::device::host::tab_wait("rows read", "a fire's readout");
         on_read(raw.map(|raw| {
             let words = tail.map_or_else(Vec::new, |tail| {
                 let from = usize::try_from(tail.at).unwrap_or(usize::MAX);
@@ -163,6 +165,7 @@ impl Landing {
             });
             post.waker.take()
         };
+        crate::device::host::tab_wait("posted", "a fire's landing to the mailbox");
         if let Some(waker) = parked {
             waker.wake();
         }
@@ -214,6 +217,7 @@ impl Runners {
                     let (tx, rx) = crate::device::host::channel::unbounded::<Runnable>();
                     crate::device::host::thread::spawn(format!("wgpu guest {at}"), move || {
                         while let Ok(run) = rx.recv() {
+                            crate::device::host::tab_wait("runs a pass", "a guest runner");
                             run();
                         }
                     })
@@ -319,6 +323,7 @@ impl Worker {
         let worker = self.clone();
         crate::device::host::thread::spawn("wgpu landing".into(), move || {
             while let Ok(mut landing) = rx.recv() {
+                crate::device::host::tab_wait("takes a landing", "the landing worker");
                 let fault = landing.run_guests(&worker);
                 landing.finish(fault);
                 worker.inner.lock().expect("lock poisoned").queued -= 1;

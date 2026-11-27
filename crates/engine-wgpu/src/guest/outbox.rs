@@ -102,7 +102,9 @@ impl Outbox {
             return Ok(collected);
         }
         let mut out = vec![0u8; self.used.load(Ordering::Relaxed) as usize];
+        crate::device::host::tab_wait("collects", "a guest outbox");
         self.buffer().read(0, &mut out)?;
+        crate::device::host::tab_wait("collected", "a guest outbox");
         Ok(self.collected.get_or_init(|| out))
     }
 
@@ -115,6 +117,7 @@ impl Outbox {
             return;
         }
         let outbox = Arc::clone(self);
+        crate::device::host::tab_wait("collects async", "a guest outbox");
         self.buffer().read_async(0, used, move |raw| match raw {
             Ok(raw) => {
                 let _ = outbox.collected.set(raw);
