@@ -142,6 +142,7 @@ fn voxels(extents: &[[i32; 3]]) -> usize {
 
 #[test]
 fn the_voxel_axis_answers_its_host_reference_every_case() {
+    let _device = crate::device_alone();
     every_grid_rule_maps_the_box_its_host_twin_maps();
     the_convolution_answers_the_tap_walk();
     the_spread_and_lone_channel_convolutions_answer_the_tap_walk();

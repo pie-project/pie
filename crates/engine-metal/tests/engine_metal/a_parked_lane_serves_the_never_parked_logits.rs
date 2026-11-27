@@ -306,6 +306,7 @@ fn check(model: &str) -> Vec<Kind> {
 /// A kv list, a window's ring and buffer, and a record beside a kv list: every kind parks.
 #[test]
 fn a_lane_parked_to_disk_serves_the_never_parked_logits() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
@@ -324,6 +325,7 @@ fn a_lane_parked_to_disk_serves_the_never_parked_logits() {
 /// load's own pipeline walk.
 #[test]
 fn a_ref_lane_stating_no_ring_is_refused() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

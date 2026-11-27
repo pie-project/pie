@@ -127,6 +127,7 @@ fn check(
 
 #[test]
 fn the_partial_rope_turns_only_the_rotary_pairs() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

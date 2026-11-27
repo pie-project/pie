@@ -10,6 +10,7 @@ use crate::common::{bf16, noise};
 
 #[test]
 fn every_prefill_row_answers_an_exact_affine_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };

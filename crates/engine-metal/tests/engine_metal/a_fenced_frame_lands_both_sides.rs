@@ -32,6 +32,7 @@ fn f32_floats(bytes: &[u8]) -> Vec<f32> {
 
 #[test]
 fn a_fenced_frame_lands_both_sides() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
@@ -88,6 +89,7 @@ fn a_fenced_frame_lands_both_sides() {
 
 #[test]
 fn an_encode_without_a_handoff_refuses_to_fence() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

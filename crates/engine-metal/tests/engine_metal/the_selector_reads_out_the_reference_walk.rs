@@ -83,6 +83,7 @@ impl Dev {
 
 #[test]
 fn the_selector_reads_out_the_reference_walk_every_case() {
+    let _device = crate::device_alone();
     topk_answers_the_host_sort_with_ties_low_and_nans_never();
     the_walk_picks_what_the_reference_picks();
 }

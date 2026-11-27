@@ -234,6 +234,7 @@ fn gated_delta(gpu: &Gpu, dim: u32, tuning: &kernels_metal::Tuning, what: &str) 
 
 #[test]
 fn a_prompt_scan_lands_its_snapshots() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

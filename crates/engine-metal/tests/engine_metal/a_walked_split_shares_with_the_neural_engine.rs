@@ -97,6 +97,7 @@ fn a_split_load(model: &str, mlp: bool, rows: &[u32]) {
 
 #[test]
 fn a_walked_split_shares_with_the_neural_engine() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() || kernels_metal::ane::available().is_err() {
         eprintln!("skipping: no Metal device or Neural Engine");
         return;

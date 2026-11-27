@@ -13,6 +13,7 @@ const LUT: [f32; 16] = [
 
 #[test]
 fn every_routed_row_answers_its_experts_exact_mxfp4_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };

@@ -58,6 +58,7 @@ impl Rig {
 
 #[test]
 fn a_gate_and_an_up_apart_land_what_they_land_packed() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

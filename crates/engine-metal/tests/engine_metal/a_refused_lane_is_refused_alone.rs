@@ -129,6 +129,7 @@ fn reads(table: &[f32], token: u32, values: &[f32]) {
 
 #[test]
 fn a_refused_lane_is_refused_alone() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

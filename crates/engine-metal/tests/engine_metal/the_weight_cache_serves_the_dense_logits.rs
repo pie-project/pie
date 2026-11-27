@@ -369,11 +369,13 @@ fn check_fixture(model: &str, fixture: &Fixture) {
 
 #[test]
 fn a_row_streamed_per_layer_table_serves_the_dense_logits() {
+    let _device = crate::device_alone();
     check("gemma4-e4b-mini-l1");
 }
 
 #[test]
 fn a_row_streamed_embedding_serves_the_dense_logits() {
+    let _device = crate::device_alone();
     check("dsv4-flash-mini");
 }
 
@@ -381,6 +383,7 @@ fn a_row_streamed_embedding_serves_the_dense_logits() {
 /// holds a block of each, table after table.
 #[test]
 fn row_streamed_tables_gathered_alike_serve_the_dense_logits() {
+    let _device = crate::device_alone();
     check("gemma4-e4b-mini-l6");
 }
 
@@ -418,28 +421,33 @@ fn experts(model: &str) {
 /// buffers none in an rs list (as the recipe keeps none).
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_nemotron() {
+    let _device = crate::device_alone();
     experts("nemotron3-nano-mini");
 }
 
 /// A gated-delta hybrid with a conv no deferred recurrence reads.
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_qwen38_flash_next() {
+    let _device = crate::device_alone();
     experts("qwen38-flash-next-mini");
 }
 
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_minimax() {
+    let _device = crate::device_alone();
     experts("minimax-m3-mini");
 }
 
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_qwen3() {
+    let _device = crate::device_alone();
     experts("qwen3-30b-a3b-mini");
 }
 
 /// Experts the recipe cuts into 27 pieces on their output axis.
 #[test]
 fn a_mixtures_dense_experts_serve_the_dense_logits_dsv4() {
+    let _device = crate::device_alone();
     experts("dsv4-flash-mini");
 }
 
@@ -470,18 +478,21 @@ fn quantized(name: &str, kind: WeightKind) {
 /// Affine u4/64 experts (and dense planes).
 #[test]
 fn a_mixtures_quantized_experts_serve_the_whole_logits_affine() {
+    let _device = crate::device_alone();
     quantized("qwen3-30b-a3b-mini-u4g64-kv-bf16", WeightKind::Expert);
 }
 
 /// MXFP4 experts (bf16 dense planes).
 #[test]
 fn a_mixtures_quantized_experts_serve_the_whole_logits_mxfp4() {
+    let _device = crate::device_alone();
     quantized("dsv41-flash-mini-bf16-mxfp4-kv-bf16", WeightKind::Expert);
 }
 
 /// Affine 4-bit per-layer tables, their rows a block at a time.
 #[test]
 fn quantized_per_layer_tables_serve_the_whole_logits() {
+    let _device = crate::device_alone();
     quantized("gemma4-e4b-mini-l6-u4g64-kv-bf16", WeightKind::Rows);
 }
 
@@ -489,6 +500,7 @@ fn quantized_per_layer_tables_serve_the_whole_logits() {
 /// planes).
 #[test]
 fn a_mixtures_quantized_experts_serve_the_whole_logits_affine_u2() {
+    let _device = crate::device_alone();
     quantized(
         "qwen38-flash-next-mini-u4g64-u2g128-kv-bf16",
         WeightKind::Expert,

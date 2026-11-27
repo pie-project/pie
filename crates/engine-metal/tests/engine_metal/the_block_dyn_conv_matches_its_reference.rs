@@ -27,6 +27,7 @@ fn unit(at: u64) -> f32 {
 
 #[test]
 fn the_convolution_matches_the_reference_on_both_sides() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

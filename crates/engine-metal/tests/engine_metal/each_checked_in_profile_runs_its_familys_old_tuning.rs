@@ -230,6 +230,7 @@ fn assert_old_tuning(
 
 #[test]
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
+    let _device = crate::device_alone();
     for &(family, device, cores) in CHIPS {
         assert_old_tuning(device, family, cores, 512, None, None, old_tile);
     }
@@ -237,6 +238,7 @@ fn each_checked_in_profile_runs_its_familys_old_tuning() {
 
 #[test]
 fn the_m4_pro_runs_its_family_and_names_no_measured_decision() {
+    let _device = crate::device_alone();
     assert_old_tuning(
         "Apple M4 Pro",
         9,
@@ -254,6 +256,7 @@ fn the_m4_pro_runs_its_family_and_names_no_measured_decision() {
 
 #[test]
 fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
+    let _device = crate::device_alone();
     let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, Some(40), 10, true), None);
     let wide = Tuning::new(profile, true, Some(40));
     assert!(!wide.fp16_gemm_format(4, 64));
@@ -272,6 +275,7 @@ fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
 
 #[test]
 fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
+    let _device = crate::device_alone();
     let (profile, report) =
         chip::resolve("Apple M5 Max", &chip::facts(10, Some(40), 10, false), None);
     assert_eq!(report.used, Source::Seeded("apple10.toml".into()));
@@ -287,6 +291,7 @@ fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
 
 #[test]
 fn a_device_file_applies_only_within_its_family() {
+    let _device = crate::device_alone();
     let (profile, report) =
         chip::resolve("Apple M4 Pro", &chip::facts(10, Some(40), 10, true), None);
     assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);

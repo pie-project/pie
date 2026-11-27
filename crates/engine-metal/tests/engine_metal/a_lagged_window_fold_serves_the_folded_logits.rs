@@ -30,6 +30,7 @@ const LAG: u32 = 7;
 
 #[test]
 fn a_lagged_window_fold_serves_the_folded_logits() {
+    let _device = crate::device_alone();
     // One case at a time, its fixture built under the lock too: each takes
     // much of the device beside the host memory its checkpoint holds.
     let _heavy = crate::common::one_heavy_load();
@@ -40,6 +41,7 @@ fn a_lagged_window_fold_serves_the_folded_logits() {
 /// window from the prompt on.
 #[test]
 fn a_lagged_window_fold_of_small_slots_serves_the_folded_logits() {
+    let _device = crate::device_alone();
     // One case at a time, its fixture built under the lock too: each takes
     // much of the device beside the host memory its checkpoint holds.
     let _heavy = crate::common::one_heavy_load();
@@ -55,6 +57,7 @@ fn a_lagged_window_fold_of_small_slots_serves_the_folded_logits() {
 /// compressor reads the windowed rows where they lie.
 #[test]
 fn a_lagged_window_fold_beside_a_compressed_kv_list_serves_the_folded_logits() {
+    let _device = crate::device_alone();
     // One case at a time, its fixture built under the lock too: each takes
     // much of the device beside the host memory its checkpoint holds.
     let _heavy = crate::common::one_heavy_load();
@@ -67,6 +70,7 @@ fn a_lagged_window_fold_beside_a_compressed_kv_list_serves_the_folded_logits() {
 /// layer's reads bound by its own window.
 #[test]
 fn a_lagged_window_fold_over_two_windows_serves_the_folded_logits() {
+    let _device = crate::device_alone();
     // One case at a time, its fixture built under the lock too: each takes
     // much of the device beside the host memory its checkpoint holds.
     let _heavy = crate::common::one_heavy_load();

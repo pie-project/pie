@@ -368,6 +368,7 @@ fn assert_same_state(got: &[u8], want: &[u8], what: &str, planes: &Planes, scale
 
 #[test]
 fn a_buffered_fold_is_the_fold_it_replaces() {
+    let _device = crate::device_alone();
     if let Some(shell) = ready() {
         holds_the_contract(shell);
     }
@@ -377,6 +378,7 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
 /// conv and scan rows replay as the fold they defer.
 #[test]
 fn a_gdn_buffered_fold_is_the_fold_it_replaces() {
+    let _device = crate::device_alone();
     if let Some(shell) = ready_gdn() {
         holds_the_contract(shell);
     }
@@ -390,6 +392,7 @@ fn a_gdn_buffered_fold_is_the_fold_it_replaces() {
 /// golden_logits state it).
 #[test]
 fn a_replaying_lane_beside_a_folding_lane_answers_as_alone() {
+    let _device = crate::device_alone();
     if let Some(shell) = ready_gdn() {
         replays_beside_a_fold(shell);
     }

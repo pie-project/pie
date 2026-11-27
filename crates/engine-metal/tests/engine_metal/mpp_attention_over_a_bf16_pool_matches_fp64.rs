@@ -7,6 +7,7 @@ use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
 #[test]
 fn mpp_attention_over_a_bf16_pool_matches_fp64() {
+    let _device = crate::device_alone();
     let Ok(dev) = Context::bind() else {
         return;
     };

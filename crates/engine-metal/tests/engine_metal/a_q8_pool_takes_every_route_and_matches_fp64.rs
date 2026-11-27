@@ -7,12 +7,14 @@ use crate::common::{bytes, f32s, mask_words, u32s, vals};
 
 #[test]
 fn stored_q8_and_all_attention_routes_match_fp64() {
+    let _device = crate::device_alone();
     routes(true);
 }
 /// A bf16 pool through the same routes, its verify rows through the split kernel
 /// (`kernel.sdpa.split_bf16`), as Splash runs its verify attention.
 #[test]
 fn a_bf16_pool_takes_every_route_and_the_split_one_matches_fp64() {
+    let _device = crate::device_alone();
     routes(false);
 }
 fn routes(q8: bool) {

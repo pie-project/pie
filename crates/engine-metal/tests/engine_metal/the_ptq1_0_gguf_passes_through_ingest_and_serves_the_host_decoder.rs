@@ -234,6 +234,7 @@ fn the_fixture_blocks_are_the_fork_oracle() {
 
 #[test]
 fn the_ptq1_0_gguf_passes_through_ingest_and_serves_the_host_decoder_every_case() {
+    let _device = crate::device_alone();
     the_fixture_blocks_are_the_fork_oracle();
 
     // A few real tensors under their GGUF names (attn_q, ffn_down, token_embd),

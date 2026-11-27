@@ -1,5 +1,33 @@
 //! engine-metal's integration tests, one binary: each module was a test file.
 
+
+/// The device one test holds at a time ([`device_alone`]): each shell's
+/// room is the device less every other live use, so tests sharing it in
+/// one process see each other's pools and load into none, and two loads'
+/// logits differ in their last bits while another runs beside them.
+static DEVICE_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The device held by this test until the guard drops (on a panic too).
+pub(crate) struct DeviceAlone;
+
+impl Drop for DeviceAlone {
+    fn drop(&mut self) {
+        DEVICE_HELD.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Waits for the device, every other test of this binary off it.
+pub(crate) fn device_alone() -> DeviceAlone {
+    use std::sync::atomic::Ordering;
+    while DEVICE_HELD
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    DeviceAlone
+}
+
 mod common;
 mod a_lagged_window_fold_serves_the_folded_logits;
 mod a_guest_over_two_lanes_reads_each_lanes_own_row;

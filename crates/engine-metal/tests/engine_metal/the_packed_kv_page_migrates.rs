@@ -151,6 +151,7 @@ fn seats(rig: &mut Rig) -> Seats {
 
 #[test]
 fn the_packed_kv_page_migrates() {
+    let _device = crate::device_alone();
     let Some(mut rig) = Rig::open() else {
         eprintln!("skipping: this machine publishes no Metal device");
         return;

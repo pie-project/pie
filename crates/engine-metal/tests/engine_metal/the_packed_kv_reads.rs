@@ -543,6 +543,7 @@ fn tiled_case(
 
 #[test]
 fn the_packed_kv_tiled_reads() {
+    let _device = crate::device_alone();
     let Some(mut rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
         return;
@@ -775,6 +776,7 @@ fn decode_case(
 
 #[test]
 fn the_packed_kv_decode_reads() {
+    let _device = crate::device_alone();
     let Some(mut rig) = Rig::open() else {
         eprintln!("not asked: no Metal device");
         return;
