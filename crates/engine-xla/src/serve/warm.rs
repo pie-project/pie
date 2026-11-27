@@ -614,7 +614,22 @@ impl Shell {
             for (at, shape) in shapes.iter().enumerate() {
                 let before = self.deferred.as_ref().map_or(0, Vec::len);
                 let fired_part = warm_part(&parts, at);
+                self.ladder_keys = Some(Vec::new());
                 let r = self.warm_fire(shape);
+                // the stated shape whose fire this is, by the programs it took
+                let treatment = if shape.iter().any(|w| w.buffers) {
+                    engine::Treatment::Buffers
+                } else {
+                    engine::Treatment::Folds
+                };
+                let stated = (self.steps.as_ref())
+                    .and_then(|steps| steps.shape_of(&composition(shape, treatment)))
+                    .and_then(|at| u32::try_from(at).ok());
+                for key in self.ladder_keys.take().unwrap_or_default() {
+                    if let Some(at) = stated {
+                        self.shape_programs.entry(key).or_default().insert(at);
+                    }
+                }
                 // each program it traced, in the order serving meets them:
                 // decode first, by lanes, then drafts, mixed and prompts, and
                 // a masked fire's after every plain one's
@@ -684,6 +699,161 @@ impl Shell {
         );
         self.laddered = fired > 0;
         Ok(fired)
+    }
+
+    /// The sizing pass's measure (`crate::room`): compiles the ladder's
+    /// fires that bind what XLA places beside the pool, by their shape
+    /// alone: in each part of the ladder, every shape whose lanes' rows sum
+    /// to that part's widest, at every lane count it lays (a fire's temp is
+    /// not monotonic in its lanes; v6e Qwen3.5's 2736-row prompts held the
+    /// largest at 63, 33 and 32 lanes alike). Answers the largest temp, code
+    /// and unaliased output of those fires, the temp and code of every
+    /// program compiled so far beside them (the maintenance programs'), and
+    /// how many this pass compiled. The
+    /// programs are kept as the ladder keeps them: one traced against the
+    /// pool the load serves is the ladder's own.
+    pub fn size_outside(&mut self) -> Result<crate::room::Outside> {
+        let Some((parts, shapes)) = self.ladder()? else {
+            return Ok(crate::room::Outside::of(self.device.memories().values()));
+        };
+        let rows = |shape: &Vec<Want>| shape.iter().map(|w| u64::from(w.rows)).sum::<u64>();
+        let mut widest: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+        for (at, shape) in shapes.iter().enumerate() {
+            let part = warm_part(&parts, at);
+            let w = widest.entry(part).or_insert(0);
+            *w = (*w).max(rows(shape));
+        }
+        let binding: Vec<&Vec<Want>> = (shapes.iter().enumerate())
+            .filter(|(at, shape)| widest.get(warm_part(&parts, *at)) == Some(&rows(shape)))
+            .map(|(_, shape)| shape)
+            .collect();
+        self.trace_scope = Some(self.trace_scope());
+        self.deferred = Some(Vec::new());
+        let passes = if self.streams_experts() { 2 } else { 1 };
+        let mut traced = Ok(());
+        'passes: for pass in 0..passes {
+            self.stage_all = pass == 1;
+            for shape in &binding {
+                traced = self.warm_fire(shape);
+                if traced.is_err() {
+                    break 'passes;
+                }
+            }
+        }
+        self.stage_all = false;
+        let deferred = self.deferred.take().unwrap_or_default();
+        traced?;
+        let compiled = deferred.len();
+        let codes: Vec<(crate::device::Code, crate::trace::Signature)> = deferred
+            .iter()
+            .map(|d| (d.code.clone(), d.sig.clone()))
+            .collect();
+        let hashes: Vec<[u8; 32]> = codes.iter().map(|(code, _)| code.hash()).collect();
+        self.compile_deferred(deferred)?;
+        // one the disk cache held already is not built: loaded to read its
+        // compiled memory, and parked again
+        for (code, sig) in codes {
+            if self.device.memories().contains_key(&code.hash()) {
+                continue;
+            }
+            let held = self.device.holds_key(&code.hash());
+            let loaded = match code.text() {
+                Some(text) => self.device.load_parked(text, sig)?,
+                None => self.device.load_behind(&code, sig)?,
+            };
+            if loaded.is_some() && !held {
+                drop(self.device.take_key(&code.hash()));
+            }
+        }
+        // the fires' terms, and the temp and code of every program compiled
+        // so far (the maintenance programs': their outputs are the pool's
+        // own buffers, not beside it)
+        let memories = self.device.memories();
+        let fires = crate::room::Outside::of(hashes.iter().filter_map(|h| memories.get(h)));
+        let all = crate::room::Outside::of(memories.values());
+        Ok(crate::room::Outside {
+            temp: fires.temp.max(all.temp),
+            code: fires.code.max(all.code),
+            unaliased: fires.unaliased,
+            programs: compiled,
+        })
+    }
+
+    /// Reads the compiled memory of every ladder program not measured yet
+    /// (one the disk cache held, parked unloaded): loaded, and parked again.
+    /// A load measuring its outside does, so every fire is held against it
+    /// (`Shell::unservable_shapes`); answers how many it loaded.
+    pub fn measure_parked(&mut self) -> Result<usize> {
+        let memories = self.device.memories();
+        let unmeasured: Vec<(crate::device::Code, crate::trace::Signature)> =
+            (self.parked.values())
+                .filter(|p| !memories.contains_key(&p.code.hash()))
+                .map(|p| (p.code.clone(), p.sig.clone()))
+                .collect();
+        for (code, sig) in &unmeasured {
+            let held = self.device.holds_key(&code.hash());
+            let loaded = match code.text() {
+                Some(text) => self.device.load_parked(text, sig.clone())?,
+                None => self.device.load_behind(code, sig.clone())?,
+            };
+            if loaded.is_some() && !held {
+                drop(self.device.take_key(&code.hash()));
+            }
+        }
+        Ok(unmeasured.len())
+    }
+
+    /// The stated step shapes a fire of which takes a program past
+    /// `outside` (`Shell::past_outside`), ascending, each with that
+    /// program's bytes: what the load states unservable
+    /// (`engine::StatedSteps::unservable`).
+    #[must_use]
+    pub fn unservable_shapes(&self, outside: u64) -> Vec<(u32, u64)> {
+        let memories = self.device.memories();
+        let mut worst: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for (key, shapes) in &self.shape_programs {
+            let bytes = (self
+                .parked
+                .get(key)
+                .and_then(|p| memories.get(&p.code.hash())))
+            .map(|m| crate::room::Outside::of([m]).bytes())
+            .or_else(|| {
+                self.traced
+                    .get(key)
+                    .map(|p| crate::room::Outside::of([&p.memory]).bytes())
+            })
+            .unwrap_or(0);
+            if bytes > outside {
+                for &at in shapes {
+                    let w = worst.entry(at).or_insert(0);
+                    *w = (*w).max(bytes);
+                }
+            }
+        }
+        worst.into_iter().collect()
+    }
+
+    /// The ladder's fires whose measured outside (temp, code and unaliased
+    /// output, `crate::room::Outside::of`) passes `outside`, what the load
+    /// was sized with: each by its order (masked, part rank, lanes, rows)
+    /// and bytes, widest first. Over the programs measured so far.
+    #[must_use]
+    pub fn past_outside(&self, outside: u64) -> Vec<((bool, u8, u32, u32), u64)> {
+        let memories = self.device.memories();
+        let mut past: Vec<((bool, u8, u32, u32), u64)> = (self.parked.values())
+            .filter_map(|p| {
+                let bytes = crate::room::Outside::of(memories.get(&p.code.hash())).bytes();
+                (bytes > outside).then_some((p.order, bytes))
+            })
+            .collect();
+        // those held as traced (no disk cache to park them in): their order
+        // unknown, said as 0 lanes
+        past.extend(self.traced.values().filter_map(|p| {
+            let bytes = crate::room::Outside::of([&p.memory]).bytes();
+            (bytes > outside).then_some(((false, 0, 0, 0), bytes))
+        }));
+        past.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+        past
     }
 
     /// Runs a beam group's head (`crate::store::beam`) before its fire.
@@ -1001,11 +1171,16 @@ impl Shell {
     fn log_outside_pool(&self) {
         use std::collections::HashSet;
         let memories = self.device.memories();
-        let keys_of = |programs: &mut dyn Iterator<Item = &std::sync::Arc<crate::device::Program>>| {
-            programs.filter_map(|p| self.device.key_of(p)).collect::<HashSet<_>>()
-        };
+        let keys_of =
+            |programs: &mut dyn Iterator<Item = &std::sync::Arc<crate::device::Program>>| {
+                programs
+                    .filter_map(|p| self.device.key_of(p))
+                    .collect::<HashSet<_>>()
+            };
         let mut fires: HashSet<[u8; 32]> = self.parked.values().map(|p| p.code.hash()).collect();
-        fires.extend(keys_of(&mut self.traced.values().chain(self.shaped.values())));
+        fires.extend(keys_of(
+            &mut self.traced.values().chain(self.shaped.values()),
+        ));
         let gathers = keys_of(&mut self.gathers.values());
         let readouts = keys_of(&mut self.readout_programs.values());
         let rest: HashSet<[u8; 32]> = (memories.keys())
@@ -1018,8 +1193,10 @@ impl Shell {
             ("readouts", &readouts),
             ("others", &rest),
         ] {
-            let measured: Vec<crate::pjrt::CompiledMemory> =
-                keys.iter().filter_map(|k| memories.get(k).copied()).collect();
+            let measured: Vec<crate::pjrt::CompiledMemory> = keys
+                .iter()
+                .filter_map(|k| memories.get(k).copied())
+                .collect();
             let unaliased = |m: &crate::pjrt::CompiledMemory| m.output.saturating_sub(m.alias);
             let mut temps: Vec<u64> = measured.iter().map(|m| m.temp).collect();
             temps.sort_unstable();

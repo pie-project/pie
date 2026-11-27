@@ -62,9 +62,12 @@ pub struct DeviceBoot {
     /// (the host cover), by name.
     pub measure: bool,
 
-    /// Device bytes the load leaves past its weights and pool for XLA's
-    /// scratch; `None` takes the chip's (`chip::Tpu::headroom`).
-    pub headroom: Option<u64>,
+    /// Device bytes the load leaves past its weights and pool for what XLA
+    /// places beside them, measured from the compiled programs (the largest
+    /// temp, code and unaliased outputs: `crate::room`); `None` before it is
+    /// measured (the sizing pass's first round). The safety floor is kept
+    /// under it either way.
+    pub outside: Option<u64>,
 
     /// The tokens a hybrid's state slot is balanced against the kv pages
     /// for (a sequence's expected prompt and output); `None`: the context.
@@ -92,7 +95,7 @@ impl Default for DeviceBoot {
             ordinal: 0,
             profiles: None,
             measure: true,
-            headroom: None,
+            outside: None,
             seat_tokens: None,
             stream_weights: false,
             pool_extra_chunks: 0,
@@ -549,40 +552,167 @@ impl Engine for Xla {
             budgets.max_lanes,
         );
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let shell = Shell::load_with(
-            Boot {
-                patches,
-                trace,
-                contract: &contract,
-                checkpoint: &path,
-                budget: bake_budgets(&budgets),
-                page_size: budgets.page_size,
-                context: budgets.max_context,
-                slots,
-                kv_budget: residency.device_kv_budget,
-                allowance: residency.device,
-                device: &boot,
-                steps: Some(&steps),
-            },
-            voxels,
-        )
-        .map_err(fault)?;
-        let mut shell = shell;
-        shell.set_host_programs(residency.host_programs);
-        shell.set_host_bound(residency.host_kv_budget);
-        // Every maintenance program a fire, a fork or a park runs later, one
-        // a slot size, compiled now whether or not the ladder runs: none is
-        // built after the load.
-        shell.warm_maintenance().map_err(fault)?;
-        // The step compositions the runtime's builder forms over this load's
-        // facts, computed before the warm ladder, which lays
-        // the buffered treatment for exactly the shapes the set states so.
-        let stated = shell.stated_steps(&steps);
-        shell.set_steps(stated.shapes.clone());
+        // One shell sized with `outside` beside its weights and pool (`None`:
+        // the record's, else none), its maintenance programs built and its
+        // step set laid.
+        let open = |outside: Option<u64>| -> EngineResult<(Shell, engine::StatedSteps)> {
+            let device = DeviceBoot {
+                outside,
+                ..boot.clone()
+            };
+            let mut shell = Shell::load_with(
+                Boot {
+                    patches: patches.clone(),
+                    trace: trace.clone(),
+                    contract: &contract,
+                    checkpoint: &path,
+                    budget: bake_budgets(&budgets),
+                    page_size: budgets.page_size,
+                    context: budgets.max_context,
+                    slots,
+                    kv_budget: residency.device_kv_budget,
+                    allowance: residency.device,
+                    device: &device,
+                    steps: Some(&steps),
+                },
+                voxels.clone(),
+            )
+            .map_err(fault)?;
+            shell.set_host_programs(residency.host_programs);
+            shell.set_host_bound(residency.host_kv_budget);
+            // Every maintenance program a fire, a fork or a park runs later,
+            // one a slot size, compiled now whether or not the ladder runs:
+            // none is built after the load.
+            shell.warm_maintenance().map_err(fault)?;
+            // The step compositions the runtime's builder forms over this
+            // load's facts, computed before the warm ladder, which lays the
+            // buffered treatment for exactly the shapes the set states so.
+            let stated = shell.stated_steps(&steps);
+            shell.set_steps(stated.shapes.clone());
+            Ok((shell, stated))
+        };
+        let (mut shell, mut stated) = open(None)?;
+        // What XLA places beside the weights and the pool, measured where no
+        // record holds it (`crate::room`): the fires that bind it compiled
+        // against the pool sized without it (T0), then against the pool T0
+        // leaves (T1, the ladder's own programs); the larger sizes the load.
+        // A pool a budget fixes, or a dry device, takes none.
+        // the outside measured now, kept with the shapes it leaves unservable
+        // once the ladder is laid
+        let mut fresh = None;
+        if shell.outside().is_none()
+            && residency.device_kv_budget.is_none()
+            && !shell.device().is_dry()
+        {
+            let started = std::time::Instant::now();
+            let (_, before_pool) = shell.footprint();
+            let t0 = shell.size_outside().map_err(fault)?;
+            drop(shell);
+            (shell, stated) = open(Some(t0.bytes()))?;
+            let t1 = shell.size_outside().map_err(fault)?;
+            // the one the load is sized with, and kept: T0, which sized this
+            // shell, unless T1 takes more (not monotonic), which sizes it
+            // once again
+            let again = t1.bytes() > t0.bytes();
+            let measured = crate::room::Outside {
+                programs: t0.programs + t1.programs,
+                ..if again { t1 } else { t0 }
+            };
+            if again {
+                drop(shell);
+                (shell, stated) = open(Some(measured.bytes()))?;
+            }
+            fresh = Some(measured);
+            let (_, pool) = shell.footprint();
+            tracing::info!(
+                programs = measured.programs,
+                t0_mib = t0.bytes() >> 20,
+                t1_mib = t1.bytes() >> 20,
+                temp_mib = measured.temp >> 20,
+                code_mib = measured.code >> 20,
+                unaliased_mib = measured.unaliased >> 20,
+                pool_unmeasured_mib = before_pool >> 20,
+                pool_mib = pool >> 20,
+                sized_again = again,
+                s = started.elapsed().as_secs(),
+                "xla outside the pool measured: the fires that bind it compiled against the pool sized without it, then against the one it leaves"
+            );
+        } else if let Some(outside) = shell.outside() {
+            tracing::info!(
+                outside_mib = outside.bytes() >> 20,
+                pool_mib = shell.footprint().1 >> 20,
+                "xla outside the pool read from its record: the sizing pass compiled nothing"
+            );
+        }
         // The warm ladder, every fire shape the load serves, built before
         // ready: none is built after it (a fire outside it is a ladder miss,
         // named with its shape).
         shell.prewarm().map_err(fault)?;
+        // A step shape a fire of which takes more beside the pool than the
+        // load was sized with (the fires the sizing pass compiled bind it by
+        // their shape, not every one: XLA's memory-space assignment moves a
+        // fire's temp) is stated unservable, the builder forming none, its
+        // work formed in the shapes below; each said with its bytes
+        if let Some(outside) = shell.outside() {
+            // measured now (a load measuring its outside measures every fire;
+            // a warm one only those it loads), and those the record states
+            if fresh.is_some() {
+                let started = std::time::Instant::now();
+                let loaded = shell.measure_parked().map_err(fault)?;
+                tracing::info!(
+                    loaded,
+                    s = started.elapsed().as_secs(),
+                    "xla ladder programs the disk cache held, loaded to read their compiled memory"
+                );
+            }
+            let mut unservable = shell.unservable_shapes(outside.bytes());
+            for at in shell.recorded_unservable() {
+                if !unservable.iter().any(|&(u, _)| u == at) {
+                    unservable.push((at, 0));
+                }
+            }
+            unservable.sort_unstable();
+            for &(at, bytes) in &unservable {
+                if let Some(shape) = stated.shapes.shapes.get(at as usize) {
+                    tracing::info!(
+                        shape = at,
+                        rung = shape.rung,
+                        kind = %shape.kind,
+                        treatment = %shape.treatment,
+                        decode_lanes = ?shape.decode_lanes,
+                        prompt_lanes = ?shape.prompt_lanes,
+                        rows = ?shape.rows,
+                        mib = bytes >> 20,
+                        outside_mib = outside.bytes() >> 20,
+                        "xla step shape stated unservable: a fire of it takes more beside the pool than the load measured"
+                    );
+                }
+            }
+            stated.unservable = unservable.iter().map(|&(at, _)| at).collect();
+            if let Some(measured) = fresh {
+                shell.keep_outside(measured, &stated.unservable);
+            }
+            let past = shell.past_outside(outside.bytes());
+            if !past.is_empty() {
+                tracing::info!(
+                    fires = past.len(),
+                    shapes = stated.unservable.len(),
+                    outside_mib = outside.bytes() >> 20,
+                    widest = ?past.iter().take(4).map(|((masked, rank, lanes, rows), b)| format!("rank {rank} lanes {lanes} rows {rows}{} {} MiB", if *masked { " masked" } else { "" }, b >> 20)).collect::<Vec<_>>(),
+                    "xla ladder fires past the measured outside, their step shapes stated unservable"
+                );
+                for ((masked, rank, lanes, rows), bytes) in &past {
+                    tracing::debug!(
+                        masked,
+                        rank,
+                        lanes,
+                        rows,
+                        mib = bytes >> 20,
+                        "xla a ladder fire past the measured outside"
+                    );
+                }
+            }
+        }
         // A beam group's head program a width rung (BEAM-PAGE-LISTS): a
         // group's bind, after ready, builds none.
         shell.lay_beam_heads().map_err(fault)?;

@@ -41,10 +41,7 @@ fn device_boot(doc: &toml::Table) -> Result<DeviceBoot, String> {
         stream_weights: false,
         pool_extra_chunks: 0,
         staging_slots: DeviceBoot::default().staging_slots,
-        headroom: t
-            .and_then(|t| t.get("headroom"))
-            .and_then(toml::Value::as_integer)
-            .and_then(|v| u64::try_from(v).ok()),
+        outside: None,
         seat_tokens: t
             .and_then(|t| t.get("seat_tokens"))
             .and_then(toml::Value::as_integer)

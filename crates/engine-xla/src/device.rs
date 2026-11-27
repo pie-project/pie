@@ -247,6 +247,12 @@ impl Device {
         self.limit
     }
 
+    /// The disk cache's folder, where the device keeps one.
+    #[must_use]
+    pub fn disk_dir(&self) -> Option<&std::path::Path> {
+        self.disk.as_deref()
+    }
+
     /// Device memory in use when it opened, before this load landed
     /// anything (zero when the plugin reports none).
     #[must_use]
@@ -422,6 +428,12 @@ impl Device {
                 .as_ref()
                 .and_then(|e| e.compiled_memory().ok())
                 .unwrap_or_default();
+            if exe.is_some() {
+                self.memories
+                    .lock()
+                    .expect("memories lock poisoned")
+                    .insert(key, memory);
+            }
             let program = Arc::new(Program {
                 exe,
                 sig,
@@ -928,6 +940,10 @@ impl Device {
             "xla loaded a parked program for the first fire of its shape"
         );
         let memory = exe.compiled_memory().unwrap_or_default();
+        self.memories
+            .lock()
+            .expect("memories lock poisoned")
+            .insert(key, memory);
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
@@ -1015,14 +1031,20 @@ impl Device {
     /// text's hash.
     #[must_use]
     pub fn memories(&self) -> HashMap<[u8; 32], crate::pjrt::CompiledMemory> {
-        self.memories.lock().expect("memories lock poisoned").clone()
+        self.memories
+            .lock()
+            .expect("memories lock poisoned")
+            .clone()
     }
 
     /// The text hash `program` is held under, where the cache holds it.
     #[must_use]
     pub fn key_of(&self, program: &Arc<Program>) -> Option<[u8; 32]> {
         let cache = self.cache.lock().expect("cache lock poisoned");
-        cache.iter().find(|(_, p)| Arc::ptr_eq(p, program)).map(|(k, _)| *k)
+        cache
+            .iter()
+            .find(|(_, p)| Arc::ptr_eq(p, program))
+            .map(|(k, _)| *k)
     }
 
     /// The device's memory in use now (PJRT's `bytes_in_use`), where it

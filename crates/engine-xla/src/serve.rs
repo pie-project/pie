@@ -128,26 +128,16 @@ pub struct PatchSeat {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-/// The share of a device's memory an XLA load takes for itself; the rest is
-/// left to what XLA allocates beside it (compiled programs, scratch it
-/// plans none of). XLA's own, and provisional: it stands until that term
-/// is measured. No other engine reads it.
-const XLA_DEVICE_SHARE: f64 = 0.9;
-
 /// What an XLA load may take of a device of `total` bytes, `held` of which
-/// are taken already: [`XLA_DEVICE_SHARE`] of it less those, and no more
-/// than the `allowance`'s stated budget.
-fn share_room(allowance: engine::Allowance, total: u64, held: u64) -> u64 {
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a device's byte count is far inside f64's exact integer range, and \
-                  the product is floored back into u64 deliberately"
-    )]
-    let share = (total as f64 * XLA_DEVICE_SHARE) as u64;
-    let room = share.saturating_sub(held);
-    allowance.budget.map_or(room, |budget| room.min(budget))
+/// are taken already: the device, or the `allowance`'s stated budget where
+/// it is less (the worker's whole, what the driver holds in it), less
+/// those. What XLA places beside the load is measured, not a share of it
+/// (`DeviceBoot::outside`).
+fn capacity_room(allowance: engine::Allowance, total: u64, held: u64) -> u64 {
+    allowance
+        .budget
+        .map_or(total, |budget| budget.min(total))
+        .saturating_sub(held)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -431,6 +421,16 @@ pub struct Shell {
     /// The scope this load's traced fires' records lie in (`trace_scope`),
     /// set as the warm ladder starts; `None`: none kept or read.
     trace_scope: Option<String>,
+    /// What the load was sized with beside its weights and pool, measured
+    /// (`crate::room`): read from the record, or stated by the sizing pass;
+    /// `None` where nothing was measured (the pass's first round, a pool a
+    /// budget fixes, a dry device). With the key its record is kept under.
+    outside: (Option<crate::room::Outside>, String),
+    /// While the ladder traces a shape: each program key its fire took
+    /// (`Shell::prewarm`). And, by program key, the stated step shapes
+    /// whose ladder fires took it (`Shell::unservable_shapes`).
+    ladder_keys: Option<Vec<[u8; 32]>>,
+    shape_programs: std::collections::HashMap<[u8; 32], std::collections::BTreeSet<u32>>,
     /// The step compositions the runtime's builder forms over this load
     /// (`engine::StepShapes`), set before the warm ladder:
     /// it lays a fire's buffered treatment where the set states it.
@@ -693,7 +693,23 @@ impl Shell {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
         }
         let tpu = crate::chip::Tpu::of(device.kind());
-        let headroom = boot.device.headroom.unwrap_or_else(|| tpu.headroom());
+        // what XLA places beside the weights and the pool, measured: stated
+        // (the sizing pass), else read from the record a load of the same
+        // keys kept (`crate::room`); and the safety floor under it
+        let room_key = Shell::room_key(&boot, &staging, &device);
+        let recorded = match boot.device.outside {
+            Some(bytes) => Some(crate::room::Outside {
+                temp: bytes,
+                ..crate::room::Outside::default()
+            }),
+            None if sized && !device.is_dry() && boot.kv_budget.is_none() => device
+                .disk_dir()
+                .and_then(|dir| crate::room::recorded(dir, &room_key)),
+            None => None,
+        };
+        let outside = recorded
+            .map_or(0, |o| o.bytes())
+            .saturating_add(engine::memory::SAFETY_FLOOR_BYTES);
         if !tpu.known() {
             tracing::warn!(
                 "TPU kind {:?} is not one pie knows: running untuned, sized as a v6e",
@@ -753,17 +769,13 @@ impl Shell {
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;
+        // the voxels' and frame slots' room: with the tied product's copy
+        // counted (the pool, sized after, decides whether it lands)
         let tied_extra = crate::weights::tied_gemm_bytes(&boot.trace, &engine)?;
-        let weight_floor = if weight_floor + tied_extra < tpu.hbm_bytes() / 8 * 5 {
-            weight_floor + tied_extra
-        } else {
-            weight_floor
-        };
         let room = device.memory().map_or(u64::MAX, |bytes| {
-            share_room(boot.allowance, bytes, device.held())
-                .saturating_sub(weight_floor)
-                .saturating_sub(headroom)
-                / 2
+            capacity_room(boot.allowance, bytes, device.held())
+                .saturating_sub(weight_floor + tied_extra)
+                .saturating_sub(outside)
         });
         let mut budgets = poem_compiler::fit_voxels(&boot.trace, budgets, &profile, room);
         if boot.slots == 0 {
@@ -954,29 +966,23 @@ impl Shell {
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
         // the share leaves past what others held at open, the weights (at
-        // their smallest landing) and the headroom XLA's scratch takes,
+        // their smallest landing) and what XLA places beside them, measured,
         // since it plans none of its own.
         let working = device
             .memory()
-            .map(|bytes| share_room(boot.allowance, bytes, device.held()));
-        let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
+            .map(|bytes| capacity_room(boot.allowance, bytes, device.held()));
+        let base_weights = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;
         let tied_extra = crate::weights::tied_gemm_bytes(&boot.trace, &engine)?;
-        let weight_floor = if weight_floor + tied_extra < tpu.hbm_bytes() / 8 * 5 {
-            weight_floor + tied_extra
-        } else {
-            weight_floor
-        };
         let room_at = |floor: u64| {
             working.map_or(u64::MAX, |working| {
                 working
                     .saturating_sub(floor)
-                    .saturating_sub(headroom)
+                    .saturating_sub(outside)
                     .saturating_sub(reserved)
             })
         };
-        let room = room_at(weight_floor);
         // An mxfp4 bank lands pre-scaled where the weights leave room for it
         // (under 5/8 of the HBM, as a dry device of this size decides), but
         // the pool sized first took that room: every bank landed as codes,
@@ -985,8 +991,6 @@ impl Shell {
         // Its doubled codes are held back from the pool when the pool keeps
         // a whole context of pages beside them.
         let prescale = crate::weights::prescale_bytes(&boot.trace, &engine)?;
-        let held_back = (prescale > 0 && weight_floor < tpu.hbm_bytes() / 8 * 5)
-            .then(|| room_at(weight_floor.saturating_add(prescale)));
         let least = u64::from(boot.context.div_ceil(boot.page_size.max(1)));
         // A plane's cells are addressed by a 32-bit word, and a device with
         // no limit fills to `FILL_PAGES` when no budget is stated.
@@ -1003,9 +1007,20 @@ impl Shell {
                 .and_then(|paging| crate::store::pool_demand(&boot.trace, paging))
                 .unwrap_or(u64::MAX)
         };
-        let room = match held_back {
-            Some(rest) if boot.kv_budget.is_none() && demand(least, boot.slots) <= rest => rest,
-            _ => room,
+        // The tied product's copy, and an mxfp4 bank's prescaled codes,
+        // land where the pool still holds one sequence at the context beside
+        // them; else the bytes go to pages.
+        let fits = |floor: u64| demand(least, boot.slots) <= room_at(floor);
+        let weight_floor = if tied_extra > 0 && fits(base_weights + tied_extra) {
+            base_weights + tied_extra
+        } else {
+            base_weights
+        };
+        let prescaled = prescale > 0 && fits(weight_floor.saturating_add(prescale));
+        let room = if prescaled {
+            room_at(weight_floor.saturating_add(prescale))
+        } else {
+            room_at(weight_floor)
         };
         // A hybrid's state slots balance against the pages a seat takes: at
         // the tokens a sequence is expected to hold where the operator says
@@ -1048,7 +1063,7 @@ impl Shell {
             working
                 .saturating_sub(demand(fit, slots))
                 .saturating_sub(reserved)
-                .saturating_sub(headroom)
+                .saturating_sub(outside)
         });
         // A load told its weights are held streams nothing: every plane
         // lands as the base build lands it, and its programs are the base
@@ -1072,12 +1087,7 @@ impl Shell {
             // A device of the target's size would pre-scale an mxfp4 bank
             // when the weights leave room for it: under 5/8 of its HBM (20 of
             // a v6e's 32 GiB).
-            Weights::dry(
-                &handles,
-                &boot.trace,
-                weight_floor < tpu.hbm_bytes() / 8 * 5,
-                &engine,
-            )?
+            Weights::dry(&handles, &boot.trace, prescaled, &engine)?
         } else {
             Weights::resident(
                 &device,
@@ -1345,6 +1355,9 @@ impl Shell {
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
             trace_scope: None,
+            outside: (recorded, room_key),
+            ladder_keys: None,
+            shape_programs: std::collections::HashMap::new(),
             steps: None,
             load_width,
             record_checked: false,
@@ -3800,6 +3813,9 @@ impl Shell {
             let at = shape_key
                 .and_then(|k| self.parked_shapes.get(&k).copied())
                 .or(key);
+            if let (Some(keys), Some(at)) = (self.ladder_keys.as_mut(), at) {
+                keys.push(at);
+            }
             if let Some(entry) = at.and_then(|at| self.evictable.get_mut(&at)) {
                 entry.2 = self.fires;
             }
@@ -3885,6 +3901,9 @@ impl Shell {
                     (crate::device::Code::Text(text), sig, probed)
                 }
             };
+            if let Some(keys) = self.ladder_keys.as_mut() {
+                keys.push(full);
+            }
             if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
                     key: full,
@@ -5527,6 +5546,73 @@ impl Shell {
     #[must_use]
     pub fn trace_records_dir(&self) -> Option<std::path::PathBuf> {
         self.device.trace_records_dir(self.trace_scope.as_deref()?)
+    }
+
+    /// The key a load's measured outside is kept under (`crate::room`):
+    /// what sizes the load bar its pool, which the outside sizes.
+    fn room_key(boot: &Boot<'_>, staging: &crate::store::Staging, device: &Device) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(b"room-1|");
+        h.update(env!("XLA_LOWERING_FINGERPRINT").as_bytes());
+        h.update(format!("{:?}", boot.trace).as_bytes());
+        h.update(format!("{:?}|{:?}", boot.budget, boot.patches).as_bytes());
+        h.update(
+            format!(
+                "{}|{}|{}|{:?}|{:?}",
+                boot.page_size,
+                boot.context,
+                boot.slots,
+                boot.allowance.budget,
+                // the boot bar the outside it states (the sizing pass's rounds)
+                crate::api::DeviceBoot {
+                    outside: None,
+                    ..boot.device.clone()
+                }
+            )
+            .as_bytes(),
+        );
+        h.update(format!("{}|{}|{:?}", staging.rows, staging.slots, staging.rungs).as_bytes());
+        h.update(
+            format!(
+                "{}|{}|{:?}",
+                device.kind(),
+                device.platform(),
+                device.memory()
+            )
+            .as_bytes(),
+        );
+        for var in crate::device::COMPILER_ENV {
+            h.update(b"|");
+            h.update(std::env::var_os(var).unwrap_or_default().as_encoded_bytes());
+        }
+        h.finalize().to_hex().to_string()
+    }
+
+    /// What the load was sized with beside its weights and pool, where it
+    /// was measured: from the record a load of the same keys kept, or
+    /// stated (`DeviceBoot::outside`, as bytes of temp).
+    #[must_use]
+    pub fn outside(&self) -> Option<crate::room::Outside> {
+        self.outside.0
+    }
+
+    /// Keeps `outside` as this load's record (`crate::room`), with the step
+    /// shapes it states unservable, where the device keeps a disk cache.
+    pub fn keep_outside(&self, outside: crate::room::Outside, unservable: &[u32]) {
+        if let Some(dir) = self.device.disk_dir() {
+            crate::room::keep(dir, &self.outside.1, outside, unservable);
+        }
+    }
+
+    /// The step shapes the record states unservable (read with the
+    /// outside, `Shell::outside`); empty where none was read.
+    #[must_use]
+    pub fn recorded_unservable(&self) -> Vec<u32> {
+        (self.outside.0.is_some())
+            .then(|| self.device.disk_dir())
+            .flatten()
+            .and_then(|dir| crate::room::recorded_unservable(dir, &self.outside.1))
+            .unwrap_or_default()
     }
 
     pub(crate) fn trace_scope(&self) -> String {

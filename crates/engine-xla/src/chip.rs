@@ -115,12 +115,6 @@ impl Tpu {
     pub fn fp8_native(&self) -> bool {
         self.generation >= 7
     }
-
-    /// Device memory a load leaves free past its weights and pool.
-    #[must_use]
-    pub fn headroom(&self) -> u64 {
-        self.hbm_bytes() / 16
-    }
 }
 
 /// Whether an mxfp4 bank lands pre-scaled to e5m2 (twice the bytes, an
@@ -457,8 +451,6 @@ mod tests {
 
     #[test]
     fn sizes_scale_with_the_chip() {
-        assert_eq!(Tpu::V6E.headroom(), 2 << 30);
-        assert_eq!(Tpu::of("TPU v5 lite").headroom(), 1 << 30);
         assert!(!Tpu::V6E.fp8_native());
         let v4 = kernels_xla::tuning::Tuning {
             vmem_bytes: Tpu::of("TPU v4").vmem_bytes(),
@@ -468,8 +460,6 @@ mod tests {
 
         let v7 = Tpu::V7;
         assert!(v7.fp8_native());
-        assert_eq!(v7.headroom(), 6 << 30);
-        assert_eq!(v7.hbm_bytes() / 8 * 5, 60 << 30, "the dry prescale bound");
         let (profile, _) = resolve("TPU7x", None);
         let tuning = kernels_xla::tuning::Tuning::on(&profile, v7.vmem_bytes());
         assert_eq!(
