@@ -27,6 +27,12 @@ pub struct Shelf {
     #[cfg(feature = "wgpu")]
     pub(crate) guest: (std::sync::Arc<crate::guest::outbox::Pool>, Buffer),
 
+    /// The guest's status and step-record mirrors, where its one-segment
+    /// form binds them (`guest::session::Mirrors`): reserved here with the
+    /// rest, before the pool is sized; taken once, at the plane's load.
+    #[cfg(feature = "wgpu")]
+    pub(crate) guest_mirrors: std::sync::Mutex<Option<crate::guest::session::Mirrors>>,
+
     mailbox: crate::landing::Mailbox,
 
     worker: crate::landing::Worker,
@@ -369,6 +375,12 @@ impl Serve for Api {
                     crate::device::Memory::Device,
                     engine_gpu::books::owners::GUEST,
                 )?,
+            ),
+            #[cfg(feature = "wgpu")]
+            guest_mirrors: std::sync::Mutex::new(
+                crate::device::pipelines::exact_guest(device.core().one_segment())
+                    .then(|| crate::guest::session::Mirrors::new(device))
+                    .transpose()?,
             ),
             fed: readout
                 .iter()

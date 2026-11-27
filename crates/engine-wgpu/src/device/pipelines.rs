@@ -338,6 +338,14 @@ pub(crate) fn exact_views(one_segment: bool) -> bool {
     cfg!(target_arch = "wasm32") || (cfg!(feature = "test-limits") && one_segment)
 }
 
+/// Whether the guest binds its status and step records from buffers of
+/// their own and reads its tables through its heap's binding
+/// (`guest::session::Mirrors`): where no two bindings may overlap and the
+/// pool is one segment, so tables and heap lie in one buffer.
+pub(crate) fn exact_guest(one_segment: bool) -> bool {
+    one_segment && exact_views(one_segment)
+}
+
 /// WebGPU's writable storage binding aliasing rule, which the browser's
 /// implementation enforces and native wgpu does not: no two writable
 /// bindings of one group overlap in one buffer. Every kernel binding is

@@ -1807,10 +1807,17 @@ impl engine_gpu::program::Programs<crate::device::Api> for Plane {
             // are the shelf's: reserved before the pool was sized.
             let (outboxes, table) = &place.shelf.guest;
             tracing::info!("after load phases: the guest library builds");
+            let mirrors = place
+                .shelf
+                .guest_mirrors
+                .lock()
+                .expect("the shelf's mirrors lock poisoned")
+                .take();
             let library = crate::guest::session::Library::build(
                 place.device,
                 outboxes.clone(),
                 &place.pools.segment_buffers(),
+                mirrors,
             )
             .map_err(|why| Refusal::Program(format!("the guest pipelines did not build: {why}")))?;
             self.library = Some(Arc::new(library));

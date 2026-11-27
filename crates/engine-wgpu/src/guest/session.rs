@@ -178,6 +178,155 @@ fn values_in_heap(
 /// every session: a program registered while serving dispatches these and
 /// builds none. One a bind finds missing it builds then and counts
 /// ([`Library::built_serving`]).
+///
+/// Where no two bindings of a buffer may overlap and the pool is one
+/// segment (the tab: `pipelines::exact_guest`), the status and the step
+/// records cannot share the pool's buffer with the heap, which binds it
+/// whole: each lies in a buffer of its own here, made at load and entered
+/// in the books by name (`owners::GUEST_MIRRORS`), and the tables, in the
+/// same buffer as the heap, are read through the heap's binding (the step
+/// modules' merged form, [`merged`]). The instance's slots still hold the
+/// tables, and its status and records' places there go unused. One group
+/// binds all three, made at load; a session takes a status word and its
+/// stages' records here at its bind, and a park or an evacuation rewrites
+/// its records, never a group.
+pub struct Mirrors {
+    status: Buffer,
+    records: Buffer,
+    group: Option<wgpu::BindGroup>,
+    /// The places taken: status words by index, records by byte span.
+    taken: std::sync::Mutex<MirrorTaken>,
+}
+
+#[derive(Default)]
+struct MirrorTaken {
+    status: Vec<bool>,
+    records: Vec<(u64, u64)>,
+}
+
+/// A status word's stride in its mirror, and a stage's records' alignment:
+/// a dynamic offset's.
+const MIRROR_ALIGN: u64 = 256;
+
+impl Mirrors {
+    /// The status words' and step records' bytes the tab's mirrors hold.
+    pub const STATUS_BYTES: u64 = 1 << 20;
+    pub const RECORD_BYTES: u64 = 4 << 20;
+
+    /// The two buffers, entered in the books by name.
+    pub fn new(device: &Context) -> Result<Mirrors> {
+        let made = |bytes| {
+            Buffer::with(
+                device,
+                bytes,
+                crate::device::Memory::Device,
+                engine_gpu::books::owners::GUEST_MIRRORS,
+            )
+        };
+        let mirrors = Mirrors {
+            status: made(Self::STATUS_BYTES)?,
+            records: made(Self::RECORD_BYTES)?,
+            group: None,
+            taken: std::sync::Mutex::new(MirrorTaken {
+                status: vec![false; (Self::STATUS_BYTES / MIRROR_ALIGN) as usize],
+                records: Vec::new(),
+            }),
+        };
+        tracing::info!(
+            status_bytes = Self::STATUS_BYTES,
+            record_bytes = Self::RECORD_BYTES,
+            "the guest's status and step records lie in mirrors of their own (one-segment \
+             form: no two bindings of the pool's buffer overlap), entered as \
+             `guest status / step records mirrors (one-segment form)`"
+        );
+        Ok(mirrors)
+    }
+
+    /// A status word's first byte and each of `stages`' records' (their
+    /// bytes), taken; refused by name where the mirrors are full.
+    fn take(&self, stages: &[u64]) -> Result<Mirror> {
+        let mut taken = self.taken.lock().expect("mirror lock poisoned");
+        let full = |what: &str| Fault::Ceiling {
+            what: if what == "status" {
+                "status words of the tab's guest status mirror"
+            } else {
+                "bytes of the tab's guest step-record mirror"
+            },
+            need: 1,
+            have: 0,
+        };
+        let word = taken
+            .status
+            .iter()
+            .position(|held| !held)
+            .ok_or_else(|| full("status"))?;
+        let mut records = Vec::with_capacity(stages.len());
+        let mut placed: Vec<(u64, u64)> = Vec::with_capacity(stages.len());
+        for &bytes in stages {
+            let bytes = bytes.max(1).next_multiple_of(MIRROR_ALIGN);
+            let mut spans = taken.records.clone();
+            spans.extend(placed.iter().copied());
+            spans.sort_unstable();
+            let mut at = 0;
+            for &(from, to) in &spans {
+                if from >= at + bytes {
+                    break;
+                }
+                at = at.max(to);
+            }
+            if at + bytes > Self::RECORD_BYTES {
+                return Err(full("records"));
+            }
+            placed.push((at, at + bytes));
+            records.push(at);
+        }
+        taken.status[word] = true;
+        taken.records.extend(placed);
+        Ok(Mirror {
+            status: word as u64 * MIRROR_ALIGN,
+            records,
+        })
+    }
+
+    fn give_back(&self, mirror: &Mirror) {
+        let mut taken = self.taken.lock().expect("mirror lock poisoned");
+        if let Some(held) = taken
+            .status
+            .get_mut((mirror.status / MIRROR_ALIGN) as usize)
+        {
+            *held = false;
+        }
+        taken
+            .records
+            .retain(|(from, _)| !mirror.records.contains(from));
+    }
+}
+
+/// A session's places in the [`Mirrors`]: its status word's first byte and
+/// each stage's records'.
+#[derive(Debug, Clone)]
+struct Mirror {
+    status: u64,
+    records: Vec<u64>,
+}
+
+/// `source` in the one-segment form ([`Mirrors`]): the tables read through
+/// the heap's binding, which spans the same buffer from the same byte, at
+/// the same word; the tables' binding declared no more.
+fn merged(call: usize, source: String) -> std::result::Result<String, String> {
+    const DECL: &str = "@group(0) @binding(1) var<storage, read_write> tables  : array<u32>;";
+    let Some(at) = source.find(DECL) else {
+        return Err(format!(
+            "guest step call {call}'s module declares no `{DECL}`, which the one-segment form \
+             reads through the heap"
+        ));
+    };
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..at]);
+    out.push_str(&source[at + DECL.len()..]);
+    Ok(out.replace("tables[", "heap["))
+}
+
 pub struct Library {
     core: Arc<Core>,
     /// One group for each pair of the pool's segments: the one an
@@ -186,6 +335,8 @@ pub struct Library {
     /// with every segment; a dispatch picks its instance's and binds its
     /// step's record at a dynamic offset.
     groups: std::collections::HashMap<(u64, u64), wgpu::BindGroup>,
+    /// The one-segment form's ([`Mirrors`]), where the library binds it.
+    mirrors: Option<Mirrors>,
     /// Where every live instance's slots and heap lie ([`Claims`]).
     claims: Claims,
     layout: wgpu::PipelineLayout,
@@ -211,10 +362,25 @@ impl Library {
     /// The guest pipelines, reading back through `outboxes` (which the
     /// load's shelf reserved), and a bind group for each pair of the pool's
     /// `segments`.
-    pub fn build(device: &Context, outboxes: Arc<Pool>, segments: &[&Buffer]) -> Result<Library> {
+    pub fn build(
+        device: &Context,
+        outboxes: Arc<Pool>,
+        segments: &[&Buffer],
+        mirrors: Option<Mirrors>,
+    ) -> Result<Library> {
         let began = crate::device::host::Instant::now();
         let core = device.core().clone();
-        let binds = bind_layout(&core);
+        let one = mirrors.is_some();
+        if one && segments.len() != 1 {
+            return Err(Fault::Program {
+                at: "guest::session",
+                why: format!(
+                    "the guest's one-segment form binds one segment and the pool has {}",
+                    segments.len()
+                ),
+            });
+        }
+        let binds = bind_layout(&core, one);
         let layout = core
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -229,7 +395,7 @@ impl Library {
         let pipelines: Vec<_> = (0..calls)
             .map(|call| {
                 let at = crate::device::host::Instant::now();
-                let built = build_call(&core, &layout, call);
+                let built = build_call(&core, &layout, call, one);
                 tracing::info!(
                     call,
                     of = calls,
@@ -242,17 +408,26 @@ impl Library {
             .collect();
         tracing::info!("binding the guest steps' segment groups");
         let mut groups = std::collections::HashMap::with_capacity(segments.len().pow(2));
-        for slots in segments {
-            for heap in segments {
-                groups.insert(
-                    (slots.slab_id(), heap.slab_id()),
-                    segment_group(&core, &binds, slots, heap)?,
-                );
+        let mut mirrors = mirrors;
+        match (&mut mirrors, segments) {
+            (Some(mirrors), [segment]) => {
+                mirrors.group = Some(mirror_group(&core, &binds, segment, mirrors)?);
+            }
+            _ => {
+                for slots in segments {
+                    for heap in segments {
+                        groups.insert(
+                            (slots.slab_id(), heap.slab_id()),
+                            segment_group(&core, &binds, slots, heap)?,
+                        );
+                    }
+                }
             }
         }
         let library = Library {
             core: core.clone(),
             groups,
+            mirrors,
             claims: Claims::default(),
             layout,
             pipelines: std::sync::Mutex::new(pipelines),
@@ -359,7 +534,12 @@ impl Library {
         if let Ok(pipeline) = slot {
             return Ok(pipeline.clone());
         }
-        let built = build_call(&self.core, &self.layout, call as usize);
+        let built = build_call(
+            &self.core,
+            &self.layout,
+            call as usize,
+            self.mirrors.is_some(),
+        );
         self.serving
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         tracing::error!(
@@ -482,6 +662,9 @@ pub struct Rebound {
 pub struct Session {
     /// The status word the stages share, in the instance's `Instance` slots.
     status: Held,
+    /// Its places in the library's [`Mirrors`], where it binds them: its
+    /// status and records are read and written there.
+    mirror: Option<Mirror>,
     stages: Vec<Stage>,
     /// The `Instance` slots the stages' tables lie in: one run.
     slots: Vec<u32>,
@@ -522,6 +705,9 @@ impl Drop for Session {
         // Its passes on the queue land before its slots go back.
         let _ = self.settle();
         self.library.claims.release(self.claim);
+        if let (Some(mirrors), Some(mirror)) = (&self.library.mirrors, &self.mirror) {
+            mirrors.give_back(mirror);
+        }
     }
 }
 
@@ -644,9 +830,22 @@ impl Session {
             )?);
         }
 
+        let mirror = library
+            .mirrors
+            .as_ref()
+            .map(|mirrors| {
+                mirrors.take(
+                    &stages
+                        .iter()
+                        .map(|stage| stage.steps.len().max(1) as u64 * stage.stride)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?;
         let claim = library.claims.instance();
         let session = Session {
             status,
+            mirror,
             stages,
             slots: tables.slots.to_vec(),
             slot_bytes: tables.pools.slot_bytes(INSTANCE)?,
@@ -679,15 +878,27 @@ impl Session {
         let places = [&self.instance, &self.pair];
         let mut records = Vec::with_capacity(self.stages.len());
         for stage in &self.stages {
-            let bases = bases(
+            let mut bases = bases(
                 &self.status,
                 &stage.tables,
                 &stage.args,
                 heap_span(places, stage.heap)?,
                 self.slot_bytes,
             )?;
-            self.library
-                .group(self.status.buffer(), heap_span(places, stage.heap)?.0)?;
+            match &self.mirror {
+                // The status word in its mirror, which the status binds whole.
+                Some(mirror) => {
+                    bases.status =
+                        u32::try_from(mirror.status / 4).map_err(|_| Fault::Program {
+                            at: "guest::session",
+                            why: "a status word lies past the words a kernel indexes".into(),
+                        })?;
+                }
+                None => {
+                    self.library
+                        .group(self.status.buffer(), heap_span(places, stage.heap)?.0)?;
+                }
+            }
             records.push(step_records(
                 &stage.lowered,
                 &stage.areas,
@@ -700,6 +911,12 @@ impl Session {
 
     /// Writes each stage's step records ([`Self::records`]).
     fn write_records(&self, records: &[Vec<u8>]) -> Result<()> {
+        if let (Some(mirrors), Some(mirror)) = (&self.library.mirrors, &self.mirror) {
+            for (&at, records) in mirror.records.iter().zip(records) {
+                mirrors.records.write_shared(at, records)?;
+            }
+            return Ok(());
+        }
         for (stage, records) in self.stages.iter().zip(records) {
             stage.args.write(0, records)?;
         }
@@ -1006,17 +1223,31 @@ impl Session {
             at: "guest::session",
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
-        let heap = heap_span([&self.instance, &self.pair], stage.heap)?.0;
-        let group = self.library.group(self.status.buffer(), heap)?;
+        let (group, records) = match (&self.library.mirrors, &self.mirror) {
+            (Some(mirrors), Some(mirror)) => (
+                mirrors.group.as_ref().ok_or_else(|| Fault::Program {
+                    at: "guest::session",
+                    why: "the guest's mirrors are bound at the library's build".into(),
+                })?,
+                mirror.records[at],
+            ),
+            _ => {
+                let heap = heap_span([&self.instance, &self.pair], stage.heap)?.0;
+                (
+                    self.library.group(self.status.buffer(), heap)?,
+                    stage.args.offset(),
+                )
+            }
+        };
         for (step, pipeline) in stage.steps.iter().enumerate() {
-            // The step's record, at its own offset in the slots' segment.
-            let offset =
-                u32::try_from(stage.args.offset() + step as u64 * stage.stride).map_err(|_| {
-                    Fault::Program {
-                        at: "guest::session",
-                        why: "a step's record lies past a dynamic offset's reach".into(),
-                    }
-                })?;
+            // The step's record, at its own offset in the slots' segment
+            // (or the records mirror).
+            let offset = u32::try_from(records + step as u64 * stage.stride).map_err(|_| {
+                Fault::Program {
+                    at: "guest::session",
+                    why: "a step's record lies past a dynamic offset's reach".into(),
+                }
+            })?;
             frame.dispatch_at(
                 "guest",
                 pipeline,
@@ -1048,14 +1279,11 @@ impl Session {
         let heap = heap.clone();
         let outbox = frame.guest_outbox(&self.library.outboxes);
         let into = outbox.reserve(cursor)?;
-        let status = &self.status;
-        frame.copy(
-            status.buffer(),
-            status.offset(),
-            outbox.buffer(),
-            into,
-            STATUS_SPAN,
-        )?;
+        let (status, status_at) = match (&self.library.mirrors, &self.mirror) {
+            (Some(mirrors), Some(mirror)) => (&mirrors.status, mirror.status),
+            _ => (self.status.buffer(), self.status.offset()),
+        };
+        frame.copy(status, status_at, outbox.buffer(), into, STATUS_SPAN)?;
         for &(_, at, from, len) in &layout {
             frame.copy(&heap, base + at, outbox.buffer(), into + from, len)?;
         }
@@ -1153,13 +1381,18 @@ impl Session {
     }
 
     pub fn clear_status(&mut self) -> Result<()> {
+        if let (Some(mirrors), Some(mirror)) = (&self.library.mirrors, &self.mirror) {
+            return mirrors
+                .status
+                .write_shared(mirror.status, &[0u8; eta_exec::STATUS_BYTES]);
+        }
         self.status
             .buffer()
             .write_shared(self.status.offset(), &[0u8; eta_exec::STATUS_BYTES])
     }
 }
 
-fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
+fn bind_layout(core: &Core, one: bool) -> wgpu::BindGroupLayout {
     let storage = |binding: u32, dynamic: bool| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -1175,15 +1408,21 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         },
         count: None,
     };
+    let entries = [
+        storage(STATUS_BINDING, false),
+        storage(TABLES_BINDING, false),
+        storage(HEAP_BINDING, false),
+        storage(STEP_BINDING, true),
+    ];
+    // The one-segment form reads its tables through the heap ([`merged`]).
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| !one || entry.binding != TABLES_BINDING)
+        .collect();
     core.device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pie guest"),
-            entries: &[
-                storage(STATUS_BINDING, false),
-                storage(TABLES_BINDING, false),
-                storage(HEAP_BINDING, false),
-                storage(STEP_BINDING, true),
-            ],
+            entries: &entries,
         })
 }
 
@@ -1230,12 +1469,14 @@ fn build_call(
     core: &Arc<Core>,
     pipeline_layout: &wgpu::PipelineLayout,
     call: usize,
+    one: bool,
 ) -> std::result::Result<wgpu::ComputePipeline, String> {
     let source =
         engine_gpu::guest::step_module(call).ok_or_else(|| format!("no step call {call}"))?;
     let source = widened(call, source)?;
     let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
         .map_err(|why| why.to_string())?;
+    let source = if one { merged(call, source)? } else { source };
     let source = compacted(call, &source)?;
     // Said before the module is made, so the last line before a device's
     // loss names what it was making.
@@ -1321,6 +1562,70 @@ fn segment_group(
                 binding: STEP_BINDING,
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &slots.slab().buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(u64::from(
+                        eta_compiler::codegen::wgsl::STEP_BYTES,
+                    )),
+                }),
+            },
+        ],
+    });
+    core.take_error("create_bind_group")?;
+    Ok(group)
+}
+
+/// The one-segment form's group ([`Mirrors`]): the status mirror whole, the
+/// pool's one segment whole as the heap (the tables read through it), and
+/// a step's record in the records mirror at the dynamic offset its
+/// dispatch names. No two of them share a buffer.
+fn mirror_group(
+    core: &Arc<Core>,
+    binds: &wgpu::BindGroupLayout,
+    segment: &Buffer,
+    mirrors: &Mirrors,
+) -> Result<wgpu::BindGroup> {
+    fn whole(buffer: &Buffer) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &buffer.slab().buffer,
+            offset: 0,
+            size: std::num::NonZeroU64::new(buffer.bytes()),
+        })
+    }
+    fn bound(binding: u32, buffer: &Buffer, size: u64) -> crate::device::pipelines::Bound<'_> {
+        crate::device::pipelines::Bound {
+            binding,
+            buffer: &buffer.slab().buffer,
+            offset: 0,
+            size: std::num::NonZeroU64::new(size),
+            writable: true,
+            dynamic: binding == STEP_BINDING,
+        }
+    }
+    crate::device::pipelines::aliased(
+        "pie guest",
+        &[
+            bound(STATUS_BINDING, &mirrors.status, mirrors.status.bytes()),
+            bound(HEAP_BINDING, segment, segment.bytes()),
+            bound(STEP_BINDING, &mirrors.records, mirrors.records.bytes()),
+        ],
+        core.one_segment(),
+    )?;
+    let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("pie guest"),
+        layout: binds,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: STATUS_BINDING,
+                resource: whole(&mirrors.status),
+            },
+            wgpu::BindGroupEntry {
+                binding: HEAP_BINDING,
+                resource: whole(segment),
+            },
+            wgpu::BindGroupEntry {
+                binding: STEP_BINDING,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &mirrors.records.slab().buffer,
                     offset: 0,
                     size: std::num::NonZeroU64::new(u64::from(
                         eta_compiler::codegen::wgsl::STEP_BYTES,
@@ -1505,7 +1810,8 @@ mod tests {
         )
         .unwrap();
         let mut segment = Buffer::zeroed(&device, 8192, owner).unwrap();
-        let library = Library::build(&device, super::Pool::new(vec![outbox]), &[&segment]).unwrap();
+        let library =
+            Library::build(&device, super::Pool::new(vec![outbox]), &[&segment], None).unwrap();
         let call = eta_compiler::codegen::wgsl::step_calls()
             .iter()
             .position(|text| text.contains("op_copy("))
@@ -1618,5 +1924,148 @@ mod tests {
                 .all(|&w| w == SENTINEL),
             "nothing else written: {heaps:x?}"
         );
+    }
+
+    /// Guest bounds in the one-segment form ([`super::Mirrors`]): the tables
+    /// read through the heap's binding, the status and records in their
+    /// mirrors. A's heap ends where B's tables start; A copies past its
+    /// heap's end onto B's first table word. A faults OUT_OF_BOUNDS and
+    /// writes nothing: B's tables stand byte-identical, and B runs clean,
+    /// its copy landing in its own heap.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_guest_write_past_its_heap_in_the_one_segment_form_leaves_every_table_word() {
+        use super::{Library, Mirrors};
+        use crate::device::{Buffer, Context, present};
+        use eta_compiler::codegen::steps::{Bases, StepUniform};
+        if !present() {
+            return;
+        }
+        let allowance = engine::Allowance {
+            budget: Some(1 << 30),
+        };
+        let device = Context::bind(&crate::api::DeviceBoot::default(), allowance).unwrap();
+        let owner = engine_gpu::books::owners::TEST;
+        let outbox = Buffer::with(
+            &device,
+            4096,
+            crate::device::alloc::Memory::Readback,
+            engine_gpu::books::owners::GUEST,
+        )
+        .unwrap();
+        let mut segment = Buffer::zeroed(&device, 8192, owner).unwrap();
+        let mirrors = Mirrors::new(&device).unwrap();
+        let library = Library::build(
+            &device,
+            super::Pool::new(vec![outbox]),
+            &[&segment],
+            Some(mirrors),
+        )
+        .unwrap();
+        let call = eta_compiler::codegen::wgsl::step_calls()
+            .iter()
+            .position(|text| text.contains("op_copy("))
+            .expect("a copy step");
+        let pipeline = library.pipeline(u32::try_from(call).unwrap()).unwrap();
+        let mirrors = library.mirrors.as_ref().expect("the one-segment form");
+
+        let words =
+            |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        const HEAP: u64 = 64;
+        const SENTINEL: u32 = 0xdead_beef;
+        let f32_tag =
+            u32::from(eta_ir::types::to_wire(eta_ir::Dtype::F32).expect("f32 has a wire tag"));
+        let desc = |len: u32| [len, 1, len, 1, f32_tag, len, 1, 1, 1];
+        let heap_words = u32::try_from(HEAP / 4).unwrap();
+        let word = |byte: u64| u32::try_from(byte / 4).unwrap();
+        // An instance's tables from `at`; its status word `status` bytes
+        // into the status mirror, its record `record` into the records'.
+        let mut lay = |at: u64, o_at: u32, heap_at: u64, status: u64, record: u64| {
+            let mut op = [0u32; 16];
+            op[1] = 0; // a
+            op[4] = 1; // o
+            for (from, bytes) in [
+                (at, words(&[desc(4), desc(4)].concat())),
+                (at + 128, words(&op)),
+                (at + 256, words(&[0, o_at])),
+                (
+                    at + 320,
+                    eta_exec::tables::Cfg {
+                        value_count: 2,
+                        heap_words,
+                        op_count: 1,
+                        ..eta_exec::tables::Cfg::default()
+                    }
+                    .to_le_bytes(),
+                ),
+            ] {
+                segment.write(from, &bytes).unwrap();
+            }
+            let bases = Bases {
+                status: word(status),
+                descs: word(at),
+                params: word(at + 128),
+                offs: word(at + 256),
+                cfg: word(at + 320),
+                heap: word(heap_at),
+            };
+            mirrors
+                .records
+                .write_shared(record, &StepUniform::default().bytes(bases))
+                .unwrap();
+        };
+        // A's heap is the 64 bytes under B's tables; its `o` at its end is
+        // B's first descriptor word. B's heap and `o` are its own.
+        lay(0, u32::try_from(HEAP).unwrap(), 1024 - HEAP, 0, 0);
+        lay(1024, 16, 4096, 256, 256);
+        let values = |x: f32| [x, x + 1.0, x + 2.0, x + 3.0].map(f32::to_bits);
+        segment.write(1024 - HEAP, &words(&values(1.0))).unwrap();
+        let mut heap = vec![SENTINEL; HEAP as usize / 4];
+        heap[..4].copy_from_slice(&values(5.0));
+        segment.write(4096, &words(&heap)).unwrap();
+        mirrors.status.write_shared(0, &[0u8; 512]).unwrap();
+
+        let read = |buffer: &Buffer, at: u64, n: usize| -> Vec<u32> {
+            let mut bytes = vec![0u8; n * 4];
+            buffer.read(at, &mut bytes).unwrap();
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect()
+        };
+        let b_tables = read(&segment, 1024, 96);
+        let group = mirrors.group.as_ref().expect("bound at the build");
+        let frame = device.frame().unwrap();
+        for record in [0u32, 256] {
+            frame
+                .dispatch_at(
+                    "one-segment bounds test",
+                    &pipeline,
+                    group,
+                    &[record],
+                    [1, 1, 1],
+                )
+                .unwrap();
+        }
+        frame.commit().unwrap();
+
+        let a_status = read(&mirrors.status, 0, 4);
+        assert_eq!(a_status[0], 3, "A faulted: {a_status:x?}");
+        assert_eq!(
+            a_status[1],
+            eta_compiler::codegen::fault::OUT_OF_BOUNDS,
+            "{a_status:x?}"
+        );
+        assert_eq!(read(&mirrors.status, 256, 4)[0], 0, "B ran clean");
+        assert_eq!(
+            read(&segment, 1024, 96),
+            b_tables,
+            "B's tables stand: A wrote no table word"
+        );
+        let heap = read(&segment, 4096, HEAP as usize / 4);
+        assert_eq!(heap[..8], [values(5.0), values(5.0)].concat(), "{heap:x?}");
+        assert!(heap[8..].iter().all(|&w| w == SENTINEL), "{heap:x?}");
     }
 }

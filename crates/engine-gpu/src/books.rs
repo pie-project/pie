@@ -79,6 +79,11 @@ pub mod owners {
     pub const FRAME_SCRATCH: Owner = Owner::fire("frame scratch");
     pub const TIMESTAMPS: Owner = Owner::fire("timestamps");
     pub const GUEST: Owner = Owner::fire("guest");
+    /// The guest's status words and step records outside the pool, where
+    /// no two bindings of a buffer may overlap and the pool is one segment
+    /// (the tab): one of the named exceptions to the one pool.
+    pub const GUEST_MIRRORS: Owner =
+        Owner::fire("guest status / step records mirrors (one-segment form)");
     pub const COLLECTIVE: Owner = Owner::fire("collective");
     pub const TUNING: Owner = Owner::fire("tuning");
 }
