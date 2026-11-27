@@ -1526,6 +1526,7 @@ pub struct Shell<B: Serve> {
     /// the segment buffer of the score room they lie in, and each one's
     /// source lane and the bytes its key row, and its page row where it has
     /// one, start at there.
+    #[allow(clippy::type_complexity)]
     last_capture: Option<(B::Buffer, Vec<(u32, u64, Option<u64>)>)>,
 
     rs_buffers: Option<crate::rs::Buffers>,
@@ -2569,6 +2570,7 @@ impl<B: Serve> Shell<B> {
         // estimate reads at the widest rung it serves (`crate::rates::
         // for_bound`, single fires, milliseconds), said by name, kept in the
         // bound alone (no other choice reads it) and stored nowhere.
+        #[allow(clippy::type_complexity)]
         let mut bound_prefixed: Option<Vec<(u32, Vec<(u32, f64)>)>> = None;
         let mut bound_timed = false;
         if unweighed
@@ -5953,6 +5955,7 @@ impl<B: Serve> Shell<B> {
     /// Where `slots` lays each capturing lane's rows: the segment buffer
     /// of the score room they lie in, and each one's source lane and the
     /// bytes of that buffer its key row and page row start at.
+    #[allow(clippy::type_complexity)]
     fn capture_rows(
         &self,
         composition: &Composition,
@@ -5995,6 +5998,7 @@ impl<B: Serve> Shell<B> {
     /// once every fire has landed: each one's source lane, key row and page
     /// row (empty where its program reads no pages). None where no lane of
     /// it captured; a later fire lays its own over them.
+    #[allow(clippy::type_complexity)]
     pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
         self.drain()?;
         let (Some(rows), Some((buffer, laid))) = (self.span.capture(), &self.last_capture) else {
@@ -6260,6 +6264,8 @@ impl<B: Serve> Shell<B> {
 
     /// Plans the fire's beam groups over its staged tables
     /// ([`crate::beam::plan`]).
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn plan_beams<'a, 'r>(
         &self,
         arm: usize,
@@ -7067,7 +7073,6 @@ impl<B: Serve> Shell<B> {
 
     /// Reads token seat row `row` of arm `arm`, as a fed check does once
     /// the fire there landed.
-    #[must_use]
     pub fn token_row_reader(&self, arm: usize) -> crate::settle::ReadRow {
         let (store, tokens) = self.inputs[arm].token_seat();
         let store = store.clone();
@@ -10925,6 +10930,7 @@ impl<B: Serve> Shell<B> {
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
+        #[allow(clippy::type_complexity)]
         let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, u8)> = shapes
             .into_iter()
             .flat_map(|lanes| {
@@ -11000,7 +11006,11 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, u8), usize)> = shapes
+                #[allow(clippy::type_complexity)]
+                let mut tagged: Vec<(
+                    (Vec<(usize, u32)>, bool, Buffering, u8),
+                    usize,
+                )> = shapes
                     .into_iter()
                     .filter_map(|entry| {
                         let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);
