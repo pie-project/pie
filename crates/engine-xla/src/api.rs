@@ -658,11 +658,12 @@ impl Engine for Xla {
             // a warm one only those it loads), and those the record states
             if fresh.is_some() {
                 let started = std::time::Instant::now();
-                let loaded = shell.measure_parked().map_err(fault)?;
+                let (read, loaded) = shell.measure_parked().map_err(fault)?;
                 tracing::info!(
+                    read,
                     loaded,
                     s = started.elapsed().as_secs(),
-                    "xla ladder programs the disk cache held, loaded to read their compiled memory"
+                    "xla ladder programs the disk cache held, their compiled memory read beside their files or loaded"
                 );
             }
             let mut unservable = shell.unservable_shapes(outside.bytes());

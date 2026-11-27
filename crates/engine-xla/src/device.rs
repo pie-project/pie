@@ -518,10 +518,7 @@ impl Device {
         let memory = exe.compiled_memory().unwrap_or_default();
         self.temp_max
             .fetch_max(memory.temp, std::sync::atomic::Ordering::Relaxed);
-        self.memories
-            .lock()
-            .expect("memories lock poisoned")
-            .insert(key, memory);
+        self.note_memory(key, memory, file.as_deref());
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
@@ -666,10 +663,7 @@ impl Device {
         let memory = exe.compiled_memory().unwrap_or_default();
         self.temp_max
             .fetch_max(memory.temp, std::sync::atomic::Ordering::Relaxed);
-        self.memories
-            .lock()
-            .expect("memories lock poisoned")
-            .insert(*hash, memory);
+        self.note_memory(*hash, memory, Some(&file));
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
@@ -940,10 +934,7 @@ impl Device {
             "xla loaded a parked program for the first fire of its shape"
         );
         let memory = exe.compiled_memory().unwrap_or_default();
-        self.memories
-            .lock()
-            .expect("memories lock poisoned")
-            .insert(key, memory);
+        self.note_memory(key, memory, Some(&file));
         let program = Arc::new(Program {
             exe: Some(exe),
             sig,
@@ -1025,6 +1016,65 @@ impl Device {
         );
         self.sealed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Notes a program's compiled memory under its text's `key`, and
+    /// beside its disk cache `file` where there is one and none is kept
+    /// yet: a load measuring its outside reads it there rather than loading
+    /// the program (`Device::memory_on_disk`).
+    fn note_memory(
+        &self,
+        key: [u8; 32],
+        memory: crate::pjrt::CompiledMemory,
+        file: Option<&std::path::Path>,
+    ) {
+        self.memories
+            .lock()
+            .expect("memories lock poisoned")
+            .insert(key, memory);
+        if let Some(file) = file {
+            let kept = file.with_extension("mem");
+            if !kept.exists() {
+                let m = memory;
+                let _ = std::fs::write(
+                    kept,
+                    format!(
+                        "{} {} {} {} {} {}",
+                        m.argument, m.output, m.alias, m.temp, m.code, m.peak
+                    ),
+                );
+            }
+        }
+    }
+
+    /// `code`'s compiled memory as kept beside its disk cache file
+    /// (`Device::note_memory`), noted as measured; `None` where none is kept.
+    pub fn memory_on_disk(&self, code: &Code) -> Option<crate::pjrt::CompiledMemory> {
+        let file = match code {
+            Code::Text(text) => self.cache_file(self.client().ok()?, text)?,
+            Code::Cached { name, .. } => self.disk.as_ref()?.join(name),
+        };
+        let text = std::fs::read_to_string(file.with_extension("mem")).ok()?;
+        let n: Vec<u64> = text
+            .split_whitespace()
+            .map(|w| w.parse().ok())
+            .collect::<Option<_>>()?;
+        let [argument, output, alias, temp, code_bytes, peak] = n[..] else {
+            return None;
+        };
+        let memory = crate::pjrt::CompiledMemory {
+            argument,
+            output,
+            alias,
+            temp,
+            code: code_bytes,
+            peak,
+        };
+        self.memories
+            .lock()
+            .expect("memories lock poisoned")
+            .insert(code.hash(), memory);
+        Some(memory)
     }
 
     /// Every program's compiled memory built or loaded so far, by its

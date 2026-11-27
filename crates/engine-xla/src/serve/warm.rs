@@ -753,7 +753,9 @@ impl Shell {
         // one the disk cache held already is not built: loaded to read its
         // compiled memory, and parked again
         for (code, sig) in codes {
-            if self.device.memories().contains_key(&code.hash()) {
+            if self.device.memories().contains_key(&code.hash())
+                || self.device.memory_on_disk(&code).is_some()
+            {
                 continue;
             }
             let held = self.device.holds_key(&code.hash());
@@ -782,15 +784,23 @@ impl Shell {
     /// Reads the compiled memory of every ladder program not measured yet
     /// (one the disk cache held, parked unloaded): loaded, and parked again.
     /// A load measuring its outside does, so every fire is held against it
-    /// (`Shell::unservable_shapes`); answers how many it loaded.
-    pub fn measure_parked(&mut self) -> Result<usize> {
+    /// (`Shell::unservable_shapes`). One whose memory is kept beside its
+    /// disk cache file is read there, not loaded. Answers how many it read
+    /// and how many it loaded.
+    pub fn measure_parked(&mut self) -> Result<(usize, usize)> {
         let memories = self.device.memories();
         let unmeasured: Vec<(crate::device::Code, crate::trace::Signature)> =
             (self.parked.values())
                 .filter(|p| !memories.contains_key(&p.code.hash()))
                 .map(|p| (p.code.clone(), p.sig.clone()))
                 .collect();
+        let mut read = 0;
         for (code, sig) in &unmeasured {
+            // kept beside its file when it was built or loaded
+            if self.device.memory_on_disk(code).is_some() {
+                read += 1;
+                continue;
+            }
             let held = self.device.holds_key(&code.hash());
             let loaded = match code.text() {
                 Some(text) => self.device.load_parked(text, sig.clone())?,
@@ -800,7 +810,7 @@ impl Shell {
                 drop(self.device.take_key(&code.hash()));
             }
         }
-        Ok(unmeasured.len())
+        Ok((read, unmeasured.len() - read))
     }
 
     /// The stated step shapes a fire of which takes a program past
