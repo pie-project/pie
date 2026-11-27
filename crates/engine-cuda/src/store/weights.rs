@@ -700,6 +700,30 @@ impl Pools {
         chunks.saturating_mul(self.chunks.layout().chunk_bytes)
     }
 
+    /// The chunks [`Self::preseat_plan`] weighs: those the fit leaves the
+    /// weights (past the pool's first, which seats none), and those the
+    /// weights take, each shape's atoms from a chunk of their own. A plan
+    /// is laid where the first exceeds the second.
+    #[must_use]
+    pub fn preseat_chunks(&self) -> (u32, u32) {
+        let need = self
+            .row_caches
+            .iter()
+            .map(|cache| (cache.shape.per_chunk, cache.slots.len()))
+            .chain(
+                self.expert_caches
+                    .iter()
+                    .map(|cache| (cache.shape.per_chunk, cache.slots.len())),
+            )
+            .map(|(per_chunk, atoms)| {
+                u32::try_from(atoms)
+                    .unwrap_or(u32::MAX)
+                    .div_ceil(per_chunk.max(1))
+            })
+            .fold(0u32, u32::saturating_add);
+        (self.fitted_chunks().saturating_sub(1), need)
+    }
+
     /// The residency a load seats its weights by before the runtime names
     /// any slot: every atom of every shape, each shape's in chunks of its
     /// own from the pool's first on. `None` where the pool cannot hold them
