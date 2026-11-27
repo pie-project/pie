@@ -166,3 +166,18 @@ pub mod test_clock {
         }
     }
 }
+
+/// In the tab, a step of the runtime's side of a landing said by name
+/// (`what`, at `at`), the first 600: where a step told by the engine stops
+/// short of its lane, its process or its channels. Elsewhere nothing.
+#[allow(unused_variables)]
+pub fn tab_step(what: &'static str, at: &'static str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 600 {
+            tracing::info!(target: "pie_tab_wait", n, what, at, "the runtime's step");
+        }
+    }
+}

@@ -1262,7 +1262,9 @@ impl Lane {
             let mut select = crate::rt::channel::Select::new();
             select.recv(launch_rx);
             select.recv(control_rx);
+            crate::rt::tab_step("sleeps", "the lane");
             select.ready();
+            crate::rt::tab_step("wakes", "the lane");
         }
     }
 
@@ -1420,6 +1422,7 @@ impl Lane {
                         crate::pipeline::fire::record_beam_common(std::mem::take(
                             &mut outcome.beam_common,
                         ));
+                        crate::rt::tab_step("sends Landed", "the engine's completion sink");
                         let _ = landed_tx.send(LaneRequest::Landed {
                             frame: at.frame,
                             step: at.step,
@@ -1619,6 +1622,7 @@ impl Lane {
                     step,
                     outcome,
                 } => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::rt::tab_step("takes Landed", "the lane");
                     if step == 0
                         && let Some(at) = SUBMITTED_AT.lock().unwrap().remove(&frame.0)
                     {
@@ -1654,7 +1658,9 @@ impl Lane {
                         roles.lock().unwrap().landed(&reads);
                     }
                     tracing::debug!(frame = frame.0, step, "channels pumped out after landing");
+                    crate::rt::tab_step("pumped its channels; settles", "the lane's Landed");
                     settlements.settled(frame, step as usize, &outcome, &broker);
+                    crate::rt::tab_step("settled", "the lane's Landed");
 
                 }))
                 .is_err(),
