@@ -42,6 +42,7 @@ impl Pool {
         let mut free = self.free.lock().expect("outbox pool lock poisoned");
         loop {
             if let Some(buffer) = free.pop() {
+                crate::device::host::tab_wait("takes", "a guest outbox");
                 return Arc::new(Outbox {
                     buffer: Some(buffer),
                     pool: Arc::clone(self),
@@ -49,6 +50,7 @@ impl Pool {
                     collected: OnceLock::new(),
                 });
             }
+            crate::device::host::tab_wait("waits for a free one", "a guest outbox");
             free = self.given.wait(free).expect("outbox pool lock poisoned");
         }
     }
@@ -58,6 +60,7 @@ impl Pool {
             .lock()
             .expect("outbox pool lock poisoned")
             .push(buffer);
+        crate::device::host::tab_wait("gives back", "a guest outbox");
         self.given.notify_all();
     }
 }

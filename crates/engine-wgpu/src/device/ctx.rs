@@ -1772,6 +1772,14 @@ impl Frame {
         self.inner.core.queue.on_submitted_work_done(move || {
             let _poke = crate::device::host::Poke;
             let refused = inner.core.take_error("submission").err();
+            super::host::tab_wait(
+                if refused.is_some() {
+                    "refused at its work done"
+                } else {
+                    "runs its on_done"
+                },
+                "a watched frame",
+            );
             on_done(refused.map(|fault| fault.to_string()));
         });
         self.inner.core.kick();

@@ -190,6 +190,7 @@ impl Raw {
                             Ok(view[skip..skip + take].to_vec())
                         });
                     mapped.unmap();
+                    crate::device::host::tab_wait("unmapped", "a readback");
                     on_read(read);
                 });
             self.core.kick();
@@ -226,6 +227,7 @@ impl Raw {
                         Ok(view[skip..skip + take].to_vec())
                     });
                 mapped.unmap();
+                crate::device::host::tab_wait("unmapped", "a staged read");
                 core.spend(mapped);
                 on_read(read);
             });

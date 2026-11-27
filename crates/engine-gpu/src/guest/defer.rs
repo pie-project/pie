@@ -739,6 +739,7 @@ where
     let held = Arc::new(Mutex::new(recorded));
     let landing = Arc::clone(&held);
     let on_done = move |refused: Option<String>| {
+        crate::tab_step("work done", "a deferred guest frame");
         let passes: Vec<Recorded<P>> = landing
             .lock()
             .expect("passes lock poisoned")
@@ -750,6 +751,7 @@ where
         let lost = refused.clone();
         let refused_now = lost.is_some();
         let report = move |passes: Vec<Recorded<P>>, unread: Option<String>| {
+            crate::tab_step("reports its passes", "a deferred guest frame");
             let mut faults = faults;
             let why = refused.or(unread);
             for pass in passes {
@@ -799,7 +801,9 @@ where
 /// Tells `done`'s sink the step once its forward's fed ids are checked, the
 /// lanes `faults` names faulted beside what the forward says.
 fn tell_settled(done: crate::settle::Done, faults: Vec<HostFault>) {
+    crate::tab_step("waits for its fed check", "a deferred guest frame's step");
     done.when_settled(move |done, mut outcome| {
+        crate::tab_step("tells its step", "a deferred guest frame's step");
         for (lanes, instance, why) in &faults {
             outcome.fault_lanes(lanes.clone(), Some(*instance), why);
         }
