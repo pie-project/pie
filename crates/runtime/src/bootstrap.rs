@@ -248,9 +248,17 @@ pub struct EngineConfig {
 
 /// The budget a guest program binds within on every engine of the model
 /// ([`model::guest_budget`]): the least room of theirs. A model served by
-/// no engine, or by one stating no state room, binds no guest program, and
-/// is refused by name here rather than refuse each registration.
+/// one stating no state room binds no guest program, and is refused by name
+/// here rather than refuse each registration. A runtime with no engine
+/// (`engine = false`) runs no forward pass: its budget is no room, so a
+/// guest program's registration is refused by its own stages.
 fn guest_budget(engines: &[EngineConfig]) -> Result<eta_ir::validate::Budget> {
+    if engines.is_empty() {
+        return Ok(eta_ir::validate::Budget {
+            room_bytes: 0,
+            submit: None,
+        });
+    }
     let budgets = engines
         .iter()
         .map(|engine| model::guest_budget(&engine.chunks, &engine.guest_cost))
@@ -872,12 +880,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 .flat_map(|d| d.engine_backend.committed_covers().iter().copied())
                 .collect(),
         });
-    // Every engine skips measuring (`[engine] measure = false`): the host
-    // cover no layer states is taken by its estimate, not warm runs.
-    let cover_skipped = !engine_configs.is_empty()
-        && engine_configs
-            .iter()
-            .all(|d| d.engine_backend.skips_measuring());
+    // Every engine skips measuring (`[engine] measure = false`), or there is
+    // none to run a warm run on (`engine = false`): the host cover no layer
+    // states is taken by its estimate, not warm runs.
+    let cover_skipped = engine_configs
+        .iter()
+        .all(|d| d.engine_backend.skips_measuring());
     let readers: Vec<Option<::engine::HostRoom>> = engine_configs
         .iter()
         .map(|d| d.engine_backend.host_room())
