@@ -1190,7 +1190,6 @@ impl FrameSettlements {
                     "settled before its frame was booked"
                 );
                 book.early.entry(frame).or_default().push((step, faults));
-                crate::rt::tab_step("held early: its frame is not booked", "a step's settlement");
                 return;
             };
             let landed = pending.land(step, Landing::Lanes(faults));
@@ -1200,9 +1199,7 @@ impl FrameSettlements {
             }
             landed
         };
-        crate::rt::tab_step("publishes", "a step's settlement");
         landed.publish(broker);
-        crate::rt::tab_step("published", "a step's settlement");
     }
 
     pub fn close_all(&self, broker: &CompletionBroker) {

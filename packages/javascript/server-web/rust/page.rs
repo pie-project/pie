@@ -34,13 +34,7 @@ pub fn pie_init(log_filter: Option<String>) {
     // SAFETY: called once, before any other export runs.
     unsafe { __wasm_call_ctors() };
     console_error_panic_hook::set_once();
-    // The guest's host imports, each call and return (runtime's and WASI's
-    // `wit-bindgen import` spans), beside whatever the page asks.
-    let filter = format!(
-        "{},runtime::inferlet::host=trace,wasmtime_wasi=trace,wasmtime_wasi_http=trace",
-        log_filter.as_deref().unwrap_or("info")
-    );
-    crate::log::install(&filter);
+    crate::log::install(log_filter.as_deref().unwrap_or("info"));
     web_std::time::set_clock(clock_ms);
     web_std::time::set_wall_clock(js_sys::Date::now);
     web_std::executor::set_wake_hook(wake);
@@ -53,24 +47,6 @@ pub fn pie_init(log_filter: Option<String>) {
 pub extern "C" fn pie_tick() -> f64 {
     wasmtime_web::fire_due_timers();
     let next = web_std::tick(100_000);
-    // Once a second at most: the ticks, the pokes and the busiest tasks (the
-    // tab's stall trace: which task a spinning page spends itself on).
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SAID_AT: AtomicU64 = AtomicU64::new(0);
-        let now_ms = clock_ms() as u64;
-        if now_ms >= SAID_AT.load(Ordering::Relaxed) + 1000 {
-            SAID_AT.store(now_ms, Ordering::Relaxed);
-            let (ticks, pokes, polls) = web_std::executor::take_stats();
-            tracing::info!(
-                target: "pie_tab_wait",
-                ticks,
-                pokes,
-                busiest = ?polls,
-                "the page's executor this second"
-            );
-        }
-    }
     // Read after the tick: a guest the tick ran may have set a timer (a WASI
     // clock wait), which the page must wake for; read before it, that timer
     // went unseen and the page slept with no tick to come.

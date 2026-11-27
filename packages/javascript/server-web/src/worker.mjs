@@ -53,19 +53,10 @@ function scheduleTick(delayMs = 0) {
       return;
     }
     tickRunning = true;
-    const began = performance.now();
-    // A tick that does not return in seconds holds the page: say which
-    // fibers it switched through, every 5 s it stays (the tab's stall trace).
-    const watch = setInterval(() => {
-      const held = ((performance.now() - began) / 1000).toFixed(0);
-      const { switches, parked } = platform.fiberState();
-      console.warn(`pie: a tick has run ${held} s without returning; fibers parked: ${parked.join(" ")}; last switches:\n${switches.join("\n")}`);
-    }, 5000);
     let next;
     try {
       next = await tick();
     } finally {
-      clearInterval(watch);
       tickRunning = false;
     }
     if (tickScheduled) {

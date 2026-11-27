@@ -255,18 +255,6 @@ impl Linker {
         let process_ctx = ProcessCtx::new(process_id, output, &policy, main.script).await?;
         let mut store = Store::new(&engine, process_ctx);
         store.limiter(|ctx| ctx.limits());
-        // In the tab, the guest's crossings to and from the host said (the
-        // runtime's step trace): where a guest that took its value stops.
-        #[cfg(target_arch = "wasm32")]
-        store.call_hook(|_, hook| {
-            crate::rt::tab_crossing(match hook {
-                wasmtime::CallHook::CallingWasm => "enters the guest",
-                wasmtime::CallHook::ReturningFromWasm => "leaves the guest",
-                wasmtime::CallHook::CallingHost => "calls the host",
-                wasmtime::CallHook::ReturningFromHost => "returns to the guest",
-            });
-            Ok(())
-        });
 
         let pre = Self::pre(
             &engine,

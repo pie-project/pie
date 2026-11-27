@@ -51,7 +51,6 @@ impl Pool {
         let mut free = self.free.lock().expect("outbox pool lock poisoned");
         loop {
             if let Some(buffer) = free.pop() {
-                crate::device::host::tab_wait("takes", "a guest outbox");
                 return Ok(Arc::new(Outbox {
                     buffer: Some(buffer),
                     pool: Arc::clone(self),
@@ -71,7 +70,6 @@ impl Pool {
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
-                crate::device::host::tab_wait("waits for a free one", "a guest outbox");
                 free = self.given.wait(free).expect("outbox pool lock poisoned");
             }
         }
@@ -82,7 +80,6 @@ impl Pool {
             .lock()
             .expect("outbox pool lock poisoned")
             .push(buffer);
-        crate::device::host::tab_wait("gives back", "a guest outbox");
         self.given.notify_all();
     }
 }
@@ -127,9 +124,7 @@ impl Outbox {
             return Ok(collected);
         }
         let mut out = vec![0u8; self.used.load(Ordering::Relaxed) as usize];
-        crate::device::host::tab_wait("collects", "a guest outbox");
         self.buffer().read(0, &mut out)?;
-        crate::device::host::tab_wait("collected", "a guest outbox");
         Ok(self.collected.get_or_init(|| out))
     }
 
@@ -142,7 +137,6 @@ impl Outbox {
             return;
         }
         let outbox = Arc::clone(self);
-        crate::device::host::tab_wait("collects async", "a guest outbox");
         self.buffer().read_async(0, used, move |raw| match raw {
             Ok(raw) => {
                 let _ = outbox.collected.set(raw);

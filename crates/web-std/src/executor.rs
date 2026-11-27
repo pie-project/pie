@@ -16,7 +16,6 @@ static WAKE_HOOK: OnceLock<WakeHook> = OnceLock::new();
 /// Asks the page for a tick, whether or not a task was woken: a callback
 /// that changed state some waiter reads on its next poll calls it.
 pub fn poke() {
-    STATS.with(|stats| stats.borrow_mut().pokes += 1);
     if let Some(hook) = WAKE_HOOK.get() {
         hook();
     }
@@ -63,34 +62,6 @@ impl Wake for TaskWaker {
 struct Slot {
     task: Option<Task>,
     waker: Arc<TaskWaker>,
-    /// Where it was spawned, or the green thread it drives: what a tick's
-    /// summary names it by ([`take_stats`]).
-    label: String,
-}
-
-/// Each task's polls, the ticks and the pokes since the last
-/// [`take_stats`]: which task a busy page spends its ticks on.
-#[derive(Default)]
-struct Stats {
-    ticks: u64,
-    pokes: u64,
-    polls: std::collections::HashMap<String, u64>,
-}
-
-thread_local! {
-    static STATS: RefCell<Stats> = RefCell::new(Stats::default());
-}
-
-/// The ticks, the pokes and the five most-polled tasks (by where they were
-/// spawned) since the last call, counted again from zero.
-pub fn take_stats() -> (u64, u64, Vec<(String, u64)>) {
-    STATS.with(|stats| {
-        let stats = std::mem::take(&mut *stats.borrow_mut());
-        let mut polls: Vec<(String, u64)> = stats.polls.into_iter().collect();
-        polls.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-        polls.truncate(5);
-        (stats.ticks, stats.pokes, polls)
-    })
 }
 
 struct Executor {
@@ -155,17 +126,7 @@ impl<T> Future for JoinHandle<T> {
     }
 }
 
-#[track_caller]
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-where
-    F: Future + 'static,
-    F::Output: 'static,
-{
-    let at = std::panic::Location::caller();
-    spawn_labelled(future, format!("{}:{}", at.file(), at.line()))
-}
-
-pub(crate) fn spawn_labelled<F>(future: F, label: String) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
@@ -213,14 +174,12 @@ where
         entry.insert(Slot {
             task: Some(task),
             waker: Arc::clone(&waker),
-            label,
         });
         waker.wake_by_ref();
     });
     JoinHandle { state }
 }
 
-#[track_caller]
 pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + 'static,
@@ -244,7 +203,6 @@ pub async fn yield_now() {
 }
 
 pub fn tick(budget: usize) -> Option<Duration> {
-    STATS.with(|stats| stats.borrow_mut().ticks += 1);
     let shared = EXECUTOR.with(|e| Arc::clone(&e.borrow().shared));
     let mut polls = 0;
     loop {
@@ -258,13 +216,6 @@ pub fn tick(budget: usize) -> Option<Duration> {
                 let mut e = e.borrow_mut();
                 e.slots.get_mut(id).and_then(|slot| {
                     slot.waker.queued.store(false, Ordering::Release);
-                    STATS.with(|stats| {
-                        *stats
-                            .borrow_mut()
-                            .polls
-                            .entry(slot.label.clone())
-                            .or_default() += 1;
-                    });
                     slot.task.take().map(|task| (task, Arc::clone(&slot.waker)))
                 })
             });

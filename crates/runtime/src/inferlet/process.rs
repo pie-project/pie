@@ -1131,26 +1131,8 @@ impl Process {
             };
 
             let wasm_run_start = Instant::now();
-            // In the tab, each poll of the guest's run said (the runtime's
-            // step trace): Pending here is the guest's host call suspended
-            // back out of its fiber, the page's tick free again.
-            let called = {
-                let mut call = Box::pin(run_func.call_async(&mut store, (&input,)));
-                std::future::poll_fn(move |cx| {
-                    crate::rt::tab_step("polled", "the guest's run");
-                    let polled = call.as_mut().poll(cx);
-                    crate::rt::tab_step(
-                        if polled.is_pending() {
-                            "pending: suspended out of its fiber"
-                        } else {
-                            "ready"
-                        },
-                        "the guest's run",
-                    );
-                    polled
-                })
-                .await
-            };
+            let call = run_func.call_async(&mut store, (&input,));
+            let called = call.await;
             let result = match called {
                 Ok((Ok(output),)) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());

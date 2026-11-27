@@ -234,7 +234,6 @@ impl BatchScheduler {
             }
             _ => {}
         }
-        crate::rt::tab_step("posts a control to the lane", "the scheduler");
         replies.post_control(id, engine_loop.control(item));
     }
 

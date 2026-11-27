@@ -1057,9 +1057,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // Ready: what an engine left to measure behind serving runs from here,
     // where its lane idles.
     crate::scheduler::open_behind();
-    // The tab's wait trace says the serving fires' waits from here.
-    #[cfg(feature = "wgpu")]
-    engine_wgpu::device::host::tab_wait_from_ready();
     Ok(BootstrapHandle {
         port: bound_port,
         shutdown: Some(RuntimeShutdown {

@@ -1466,10 +1466,7 @@ impl BatchScheduler {
                 // the scheduler sleeps.
                 batch_want.release();
                 lane.parks().parking();
-                crate::rt::tab_step("sleeps on its mailbox", "the scheduler");
-                let received = rx.recv().await;
-                crate::rt::tab_step("woke on its mailbox", "the scheduler");
-                match received {
+                match rx.recv().await {
                     Some(item) => Some(item),
                     None => {
                         stopping = true;
@@ -1514,7 +1511,6 @@ impl BatchScheduler {
                 // The lane stays awake for this turn's launches only until
                 // the scheduler parks (`Lane::next_request`).
                 lane.parks().parking();
-                crate::rt::tab_step("parks on its mailbox, settles and replies", "the scheduler");
                 let parked = {
                     let settle_wait = async {
                         match front_launch {
@@ -1547,14 +1543,6 @@ impl BatchScheduler {
                         }
                     }
                 };
-                crate::rt::tab_step(
-                    match &parked {
-                        Err(_) => "woke on its backstop",
-                        Ok(_) if reply_answer.is_some() => "woke on a lane reply",
-                        Ok(_) => "woke on its mailbox or a settle",
-                    },
-                    "the scheduler",
-                );
                 if let Some(reply) = reply_answer {
                     Self::apply_lane_reply(
                         reply,

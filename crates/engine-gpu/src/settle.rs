@@ -110,9 +110,7 @@ impl Done {
             Some(fed) => {
                 // Told once the landing read the groups' common slots too.
                 let read = fed.clone();
-                crate::tab_step("waits", "a step's fed check");
                 fed.then(move |faults| {
-                    crate::tab_step("landed", "a step's fed check");
                     let outcome = engine::StepOutcome {
                         beam_common: read.commons(),
                         ..merged(outcome, faults)

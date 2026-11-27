@@ -287,21 +287,14 @@ async fn materialize_channel(
                 fires: Some(fires), ..
             }
             | ChannelPoll::AwaitCompletion(fires) => {
-                crate::rt::tab_step("awaits its finalize gate", "a guest's channel read");
                 let _finalize_guard = fires.finalize_guard().await;
-                crate::rt::tab_step("has its finalize gate", "a guest's channel read");
                 let state = accessor.with(|mut access| {
                     poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
                 match state {
                     ChannelPoll::AwaitCompletion(fires) => {
                         crate::pipeline::fire::tell_front_awaited(Some(&fires));
-                        crate::rt::tab_step(
-                            "awaits its front's completion",
-                            "a guest's channel read",
-                        );
                         fires.await_front_completion().await;
-                        crate::rt::tab_step("its front completed", "a guest's channel read");
                         continue;
                     }
                     ChannelPoll::Finalize(op) => {
@@ -320,8 +313,6 @@ async fn materialize_channel(
 
         match state {
             ChannelPoll::Ready(value) => {
-                crate::rt::tab_step("ready: the guest takes it", "a guest's channel read");
-                crate::rt::tab_crossings_from_here();
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
@@ -329,11 +320,9 @@ async fn materialize_channel(
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
                 crate::pipeline::fire::tell_front_awaited(fires.as_ref());
-                crate::rt::tab_step("awaits channel progress", "a guest's channel read");
-                let progressed =
-                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await;
-                crate::rt::tab_step("channel progressed", "a guest's channel read");
-                if let Err(error) = progressed {
+                if let Err(error) =
+                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
+                {
                     return Ok(Err(error));
                 }
             }
@@ -354,19 +343,12 @@ pub(crate) async fn materialize_channel_blocking(
                 fires: Some(fires), ..
             }
             | ChannelPoll::AwaitCompletion(fires) => {
-                crate::rt::tab_step("awaits its finalize gate", "a guest's channel read");
                 let _finalize_guard = fires.finalize_guard().await;
-                crate::rt::tab_step("has its finalize gate", "a guest's channel read");
                 let state = poll_channel(ctx, &this, mode, true, settle_ready_take)?;
                 match state {
                     ChannelPoll::AwaitCompletion(fires) => {
                         crate::pipeline::fire::tell_front_awaited(Some(&fires));
-                        crate::rt::tab_step(
-                            "awaits its front's completion",
-                            "a guest's channel read",
-                        );
                         fires.await_front_completion().await;
-                        crate::rt::tab_step("its front completed", "a guest's channel read");
                         continue;
                     }
                     ChannelPoll::Finalize(op) => {
@@ -383,8 +365,6 @@ pub(crate) async fn materialize_channel_blocking(
 
         match state {
             ChannelPoll::Ready(value) => {
-                crate::rt::tab_step("ready: the guest takes it", "a guest's channel read");
-                crate::rt::tab_crossings_from_here();
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
@@ -392,11 +372,9 @@ pub(crate) async fn materialize_channel_blocking(
             ChannelPoll::Pending { cell, fires, .. } => {
                 settle_ready_take = true;
                 crate::pipeline::fire::tell_front_awaited(fires.as_ref());
-                crate::rt::tab_step("awaits channel progress", "a guest's channel read");
-                let progressed =
-                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await;
-                crate::rt::tab_step("channel progressed", "a guest's channel read");
-                if let Err(error) = progressed {
+                if let Err(error) =
+                    crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
+                {
                     return Ok(Err(error));
                 }
             }
@@ -420,11 +398,8 @@ impl ProcessCtx {
             let fwd: Resource<ForwardPass> = Resource::new_borrow(*rep);
             let _ = self.ctx().table.get(&fwd)?;
         }
-        crate::rt::tab_step("asks to submit", "a guest's forward");
         crate::inferlet::process::ensure_execution_admitted(self).await;
-        crate::rt::tab_step("admitted; residency gate", "a guest's forward");
         crate::inferlet::process::gate::residency_gate(self).await?;
-        crate::rt::tab_step("past its residency gate; submits", "a guest's forward");
         let pipeline = self.ctx().table.get(&on)?;
         if !pipeline.scope.is_closed() {
             pipeline.set_active(true);

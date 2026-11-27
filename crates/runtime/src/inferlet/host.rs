@@ -37,37 +37,6 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
     }
 }
 
-// The tab's bindings trace each import's call and return (`wit-bindgen
-// import` spans, at trace), which its log filter takes: where a guest's
-// host call that never returns names itself. Native ones trace nothing.
-#[cfg(target_arch = "wasm32")]
-wasmtime::component::bindgen!({
-    path: "../inferlet/wit",
-    world: "inferlet",
-    anyhow: true,
-    with: {
-        "wasi:http": wasmtime_wasi_http::p3::bindings::http,
-        "wasi:clocks": wasmtime_wasi::p3::bindings::clocks,
-        "wasi:filesystem": wasmtime_wasi::p3::bindings::filesystem,
-        "pie:inferlet/working-set.working-set": working_set::WorkingSet,
-        "pie:inferlet/grammar.grammar": grammar::Grammar,
-        "pie:inferlet/grammar.matcher": grammar::Matcher,
-        "pie:inferlet/channel.channel": forward::Channel,
-        "pie:inferlet/forward.forward-pass": forward::ForwardPass,
-        "pie:inferlet/pipeline.pipeline": pipeline::Pipeline,
-        "pie:inferlet/media.image": media::Image,
-        "pie:inferlet/media.video": media::Video,
-        "pie:inferlet/media.audio": media::Audio,
-        "pie:inferlet/frames.frames": frames::Frames,
-        "pie:inferlet/frames.pcm": frames::Pcm,
-        "pie:inferlet/chat.decoder": chat::Decoder,
-        "pie:inferlet/tools.decoder": tools::Decoder,
-        "pie:inferlet/reasoning.decoder": reasoning::Decoder,
-    },
-    imports: { default: async | trappable | tracing },
-    exports: { default: async },
-});
-#[cfg(not(target_arch = "wasm32"))]
 wasmtime::component::bindgen!({
     path: "../inferlet/wit",
     world: "inferlet",

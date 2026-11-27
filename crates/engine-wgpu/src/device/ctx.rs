@@ -348,7 +348,6 @@ impl Core {
         let landed = done.clone();
         self.queue.on_submitted_work_done(move || {
             let _poke = crate::device::host::Poke;
-            let _poke = crate::device::host::Poke;
             landed.notify(());
         });
         self.kick();
@@ -1648,10 +1647,8 @@ impl Frame {
         // its walk, each submitted before the next is opened.
         self.inner.release();
         let inner = Arc::clone(&self.inner);
-        super::host::tab_queue(true);
         core.queue.on_submitted_work_done(move || {
             let _poke = crate::device::host::Poke;
-            super::host::tab_queue(false);
             inner.done.store(true, Ordering::Release);
         });
         core.kick();
@@ -1775,14 +1772,6 @@ impl Frame {
         self.inner.core.queue.on_submitted_work_done(move || {
             let _poke = crate::device::host::Poke;
             let refused = inner.core.take_error("submission").err();
-            super::host::tab_wait(
-                if refused.is_some() {
-                    "refused at its work done"
-                } else {
-                    "runs its on_done"
-                },
-                "a watched frame",
-            );
             on_done(refused.map(|fault| fault.to_string()));
         });
         self.inner.core.kick();
@@ -1868,7 +1857,6 @@ impl Pending {
             let done = Signal::new();
             let landed = done.clone();
             self.inner.core.queue.on_submitted_work_done(move || {
-                let _poke = crate::device::host::Poke;
                 let _poke = crate::device::host::Poke;
                 landed.notify(());
             });

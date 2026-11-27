@@ -36,76 +36,6 @@ impl Drop for Poke {
     }
 }
 
-/// The waits [`tab_wait`] says: the boot's first, and again from ready
-/// ([`tab_wait_from_ready`]), so a serving fire that never lands names where
-/// it stops.
-#[cfg(target_arch = "wasm32")]
-static TAB_WAITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[cfg(target_arch = "wasm32")]
-const TAB_WAITS_SAID: u32 = 600;
-
-/// In the tab, a wait a frame passes through, said by name (`what`, at
-/// `at`), the first [`TAB_WAITS_SAID`] from the boot and again from ready.
-/// Elsewhere nothing.
-#[allow(unused_variables)]
-pub(crate) fn tab_wait(what: &'static str, at: &'static str) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let n = TAB_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < TAB_WAITS_SAID {
-            tracing::info!(target: "pie_tab_wait", n, what, at, "a frame's wait");
-        }
-    }
-}
-
-/// In the tab, a frame's submission and its work's completion counted, not
-/// said each: one line a second at most, the frames submitted and done since
-/// the boot and how many are on the queue, so the waits [`tab_wait`] says
-/// cover the steps around them. Elsewhere nothing.
-#[allow(unused_variables)]
-pub(crate) fn tab_queue(submitted: bool) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SUBMITTED: AtomicU64 = AtomicU64::new(0);
-        static DONE: AtomicU64 = AtomicU64::new(0);
-        static SAID_AT_MS: AtomicU64 = AtomicU64::new(0);
-        if submitted {
-            SUBMITTED.fetch_add(1, Ordering::Relaxed);
-        } else {
-            DONE.fetch_add(1, Ordering::Relaxed);
-        }
-        let now = Instant::now().elapsed_since_origin_ms() as u64;
-        let said = SAID_AT_MS.load(Ordering::Relaxed);
-        if now >= said + 1000
-            && SAID_AT_MS
-                .compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            let (submitted, done) = (
-                SUBMITTED.load(Ordering::Relaxed),
-                DONE.load(Ordering::Relaxed),
-            );
-            tracing::info!(
-                target: "pie_tab_wait",
-                submitted,
-                done,
-                queued = submitted.saturating_sub(done),
-                "the queue: frames submitted and their work done"
-            );
-        }
-    }
-}
-
-/// The runtime is ready: [`tab_wait`] says the next waits again.
-pub fn tab_wait_from_ready() {
-    #[cfg(target_arch = "wasm32")]
-    {
-        TAB_WAITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(target: "pie_tab_wait", "ready: the waits from here are said");
-    }
-}
-
 pub fn parked() -> Vec<&'static str> {
     PARKED.lock().expect("parked lock poisoned").clone()
 }
@@ -184,7 +114,6 @@ impl<T> Signal<T> {
     }
 
     pub(crate) fn notify(&self, value: T) {
-        tab_wait("notified", "a signal");
         let waker = {
             let mut slot = self.inner.lock().expect("lock poisoned");
             slot.0 = Some(value);
@@ -197,8 +126,7 @@ impl<T> Signal<T> {
 
     pub(crate) fn park(&self, call: &'static str) -> Result<T> {
         let inner = Arc::clone(&self.inner);
-        tab_wait("parks", call);
-        let woke = block_on_poll(call, |cx| {
+        block_on_poll(call, |cx| {
             let mut slot = inner.lock().expect("lock poisoned");
             match slot.0.take() {
                 Some(value) => Poll::Ready(value),
@@ -207,9 +135,7 @@ impl<T> Signal<T> {
                     Poll::Pending
                 }
             }
-        });
-        tab_wait("woke", call);
-        woke
+        })
     }
 }
 

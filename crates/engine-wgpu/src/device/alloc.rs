@@ -171,7 +171,6 @@ impl Raw {
         let span = end - start;
         let skip = (offset - start) as usize;
         let take = len as usize;
-        crate::device::host::tab_wait("maps", "a readback");
         if self.kind == Memory::Readback {
             let mapped = self.buffer.clone();
             let core = Arc::clone(core);
@@ -179,7 +178,6 @@ impl Raw {
                 .slice(start..end)
                 .map_async(wgpu::MapMode::Read, move |result| {
                     let _poke = crate::device::host::Poke;
-                    crate::device::host::tab_wait("mapped", "a readback");
                     let read = result
                         .map_err(|e| core.fault("map_async", e))
                         .and_then(|()| {
@@ -190,7 +188,6 @@ impl Raw {
                             Ok(view[skip..skip + take].to_vec())
                         });
                     mapped.unmap();
-                    crate::device::host::tab_wait("unmapped", "a readback");
                     on_read(read);
                 });
             self.core.kick();
@@ -216,7 +213,6 @@ impl Raw {
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _poke = crate::device::host::Poke;
-                crate::device::host::tab_wait("mapped", "a readback");
                 let read = result
                     .map_err(|e| core.fault("map_async", e))
                     .and_then(|()| {
@@ -227,7 +223,6 @@ impl Raw {
                         Ok(view[skip..skip + take].to_vec())
                     });
                 mapped.unmap();
-                crate::device::host::tab_wait("unmapped", "a staged read");
                 core.spend(mapped);
                 on_read(read);
             });

@@ -57,21 +57,6 @@ pub use error::{Fault, Result, kernel, storage_buffers, workgroups};
 pub use handles::{Binding, Handles, NIL};
 pub use settle::{Airborne, Arms, Done};
 
-/// In the tab, a step of a fire's landing said by name (`what`, at `at`),
-/// the first 600: where a landing that never tells its step stops. The
-/// browser's engine counts its own waits beside these. Elsewhere nothing.
-#[allow(unused_variables)]
-pub fn tab_step(what: &'static str, at: &'static str) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 600 {
-            tracing::info!(target: "pie_tab_wait", n, what, at, "a landing's step");
-        }
-    }
-}
-
 /// In the tab, a turn given up while a wait's condition does not hold: the
 /// green thread waiting yields to the page's other tasks (one of which makes
 /// it hold) and is polled again, where natively the waiter blocks on its
