@@ -664,7 +664,13 @@ fn a_fold_lands_folded_rows_in_the_ring_and_unfolded_ones_in_the_buffer() {
         let staged = stage(&mut gpu, &g, &lanes, &laid, &to);
         // Past 8 GiB of the pool's words, as the fire's own slots lie at a
         // big pool's top.
-        let mut pool = high(&staged.pool);
+        // On a device of one segment the pool is that segment: past 8 GiB
+        // of words is no place in it.
+        let mut pool = if gpu.one_segment() {
+            staged.pool
+        } else {
+            high(&staged.pool)
+        };
         let at = pool.ring.as_mut().expect("the pool holds a ring");
         at.rows = rows as u32;
         let at = *at;

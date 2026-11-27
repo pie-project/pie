@@ -2,7 +2,7 @@
 //! keys and values written into their pages, and the shared form that writes
 //! the keys to landed.
 
-use kernels_slang::{KvPool, Tensor};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, landed, noise};
@@ -36,8 +36,10 @@ fn the_kv_append_answers_the_reference() {
         want_k[slot * row..][..row].copy_from_slice(&kr[i * row..][..row]);
         want_v[slot * row..][..row].copy_from_slice(&vr[i * row..][..row]);
     }
+    let one = gpu.one_segment();
     let pool = |keys: u32, values: u32| {
-        KvPool::planes(
+        crate::gpu::kv_planes(
+            one,
             Tensor::new(keys, slots as u32, row as u32, Dtype::Bf16),
             Tensor::new(values, slots as u32, row as u32, Dtype::Bf16),
             u(wp),
@@ -53,10 +55,8 @@ fn the_kv_append_answers_the_reference() {
         &mut gpu,
         "kv append",
         &|g| {
-            vec![
-                (g.zeros(slots * row), slots * row, false),
-                (g.zeros(slots * row), slots * row, false),
-            ]
+            let (keys, values) = g.zeros_planes(slots * row, slots * row);
+            vec![(keys, slots * row, false), (values, slots * row, false)]
         },
         &[want_k.clone(), want_v],
         &|g, o| {
@@ -77,10 +77,8 @@ fn the_kv_append_answers_the_reference() {
         &mut gpu,
         "kv append shared",
         &|g| {
-            vec![
-                (g.zeros(slots * row), slots * row, false),
-                (g.zeros(slots * row), slots * row, false),
-            ]
+            let (keys, values) = g.zeros_planes(slots * row, slots * row);
+            vec![(keys, slots * row, false), (values, slots * row, false)]
         },
         &[want_k.clone(), want_k],
         &|g, o| {

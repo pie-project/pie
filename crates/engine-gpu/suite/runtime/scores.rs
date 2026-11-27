@@ -422,7 +422,10 @@ fn an_idle_capture_needs_no_chunk() {
     // it) has no such segment: the chunk moves to the first free chunk past
     // the seats' segments, and the run's stays backed.
     let fixed = facts.growth == engine::chunk::Growth::Fixed;
-    let to = if fixed {
+    let to = if fixed && facts.max == 1 {
+        // One segment (the tab's form): the first chunk past the seats.
+        1 + shell.pool_layout().seat_chunks()
+    } else if fixed {
         (1 + shell.pool_layout().seat_chunks()).div_ceil(segment) * segment
     } else {
         shell

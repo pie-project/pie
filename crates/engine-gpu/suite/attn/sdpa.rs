@@ -9,8 +9,8 @@
 //! workgroup (the few-rows arm), with and without its LSE, its second
 //! request masked past a boundary.
 
+use kernels_slang::Tensor;
 use kernels_slang::attn::sdpa;
-use kernels_slang::{KvPool, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, close, noise};
@@ -190,10 +190,14 @@ fn paged_attention_answers_the_reference() {
     let narrow = gpu.subgroup() < 32;
     for hd in [64usize, 128] {
         let scale = 1.0 / (hd as f64).sqrt();
-        let (keys, kr) = gpu.up(&noise(hd as u64, slots * KVH * hd));
-        let (values, vr) = gpu.up(&noise(hd as u64 + 1, slots * KVH * hd));
+        let one = gpu.one_segment();
+        let ((keys, kr), (values, vr)) = gpu.up_planes(
+            &noise(hd as u64, slots * KVH * hd),
+            &noise(hd as u64 + 1, slots * KVH * hd),
+        );
         let (kr, vr) = (f64s(&kr), f64s(&vr));
-        let pool = KvPool::planes(
+        let pool = crate::gpu::kv_planes(
+            one,
             t(keys, slots, KVH * hd, Dtype::Bf16),
             t(values, slots, KVH * hd, Dtype::Bf16),
             t(pi, PAGES.len(), 1, Dtype::U32),
@@ -202,15 +206,22 @@ fn paged_attention_answers_the_reference() {
             (KVH * hd) as u64,
             hd as u64,
         );
-        let spool = kernels_slang::KvPool::planes(
-            pool.keys,
-            pool.values,
-            pool.page_indices,
-            pool.page_indptr,
-            pool.page_size,
-            pool.seq_stride,
-            pool.head_stride,
-        );
+        // Packed (one segment), the pool is its own copy: its values plane
+        // names the keys' buffer at a word past them.
+        let spool = if one {
+            pool
+        } else {
+            crate::gpu::kv_planes(
+                one,
+                pool.keys,
+                pool.values,
+                pool.page_indices,
+                pool.page_indptr,
+                pool.page_size,
+                pool.seq_stride,
+                pool.head_stride,
+            )
+        };
         for (what, batch, prefilling) in [("decode", &decode, false), ("prefill", &prefill, true)] {
             let rows = batch.positions.len();
             let (q, qr) = gpu.up(&noise(hd as u64 + rows as u64, rows * QH * hd));

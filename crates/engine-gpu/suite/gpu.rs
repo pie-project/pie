@@ -371,6 +371,47 @@ impl Gpu {
         handle
     }
 
+    /// Whether this device lays its pool in one segment: a pool of planes
+    /// of their own is then one buffer ([`kernels_slang::KvPool::packed`]).
+    pub fn one_segment(&self) -> bool {
+        engine_gpu::backend::Context::pool_segments(&self.device) == 1
+    }
+
+    /// `n` bf16 elements of `handle`'s buffer from element `skip`: a window
+    /// a test reads back on its own.
+    pub fn window(&mut self, handle: u32, skip: usize, n: usize) -> u32 {
+        self.handles
+            .window(handle, (skip * 2) as u64, (n * 2) as u64)
+            .expect("a window")
+    }
+
+    /// A pool's two planes of `keys` and `values` bf16 zeros: two buffers,
+    /// or on a device of one segment one, the values a window past the keys
+    /// ([`kv_planes`]).
+    pub fn zeros_planes(&mut self, keys: usize, values: usize) -> (u32, u32) {
+        if !self.one_segment() {
+            return (self.zeros(keys), self.zeros(values));
+        }
+        let both = self.zeros(keys + values);
+        (both, self.window(both, keys, values))
+    }
+
+    /// [`Gpu::zeros_planes`] holding `keys` and `values`, each as [`Gpu::up`]
+    /// rounds it.
+    pub fn up_planes(
+        &mut self,
+        keys: &[f32],
+        values: &[f32],
+    ) -> ((u32, Vec<f32>), (u32, Vec<f32>)) {
+        if !self.one_segment() {
+            return (self.up(keys), self.up(values));
+        }
+        let (both, rounded) = self.up(&[keys, values].concat());
+        let window = self.window(both, keys.len(), values.len());
+        let (k, v) = rounded.split_at(keys.len());
+        ((both, k.to_vec()), (window, v.to_vec()))
+    }
+
     pub fn zeros(&mut self, n: usize) -> u32 {
         let buf = Buffer::zeroed(
             &self.device,
@@ -586,5 +627,44 @@ pub fn landed(
             gpu.down(*buf, *n)
         };
         close(&got, want, what);
+    }
+}
+
+/// A paged pool of two planes as this device holds them: two buffers
+/// ([`kernels_slang::KvPool::planes`]), or, on a device of one segment, one
+/// ([`kernels_slang::KvPool::packed`]) laid by [`Gpu::zeros_planes`] /
+/// [`Gpu::up_planes`], the values past the keys.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_planes(
+    one_segment: bool,
+    keys: kernels_slang::Tensor,
+    values: kernels_slang::Tensor,
+    page_indices: kernels_slang::Tensor,
+    page_indptr: kernels_slang::Tensor,
+    page_size: i32,
+    seq_stride: u64,
+    head_stride: u64,
+) -> kernels_slang::KvPool {
+    if one_segment && keys.buf != values.buf {
+        kernels_slang::KvPool::packed(
+            keys,
+            values,
+            kernels_slang::words_of(keys),
+            page_indices,
+            page_indptr,
+            page_size,
+            seq_stride,
+            head_stride,
+        )
+    } else {
+        kernels_slang::KvPool::planes(
+            keys,
+            values,
+            page_indices,
+            page_indptr,
+            page_size,
+            seq_stride,
+            head_stride,
+        )
     }
 }

@@ -9,7 +9,13 @@
 // keys from word `k_origin + p * k_page_stride`, its values likewise.
 
 [[vk::binding(0)]] StructuredBuffer<uint> k_new;
+#if defined(PIE_KV_SHARED)
+// One plane written as both (`kv_append_shared`): read through its one
+// binding, where a host refuses two views of a buffer that overlap.
+#define v_new k_new
+#else
 [[vk::binding(1)]] StructuredBuffer<uint> v_new;
+#endif
 [[vk::binding(2)]] StructuredBuffer<uint> w_page;
 [[vk::binding(3)]] StructuredBuffer<uint> w_off;
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 4)
@@ -56,3 +62,5 @@ void main(uint3 gid : SV_DispatchThreadID) {
 }
 
 // pie:instantiate attn_kv_append_bf16 PIE_GROUP_X=64
+// The shared form, for the tab (`Encode::binds_overlap` false there).
+// pie:instantiate attn_kv_append_shared_bf16 PIE_GROUP_X=64 PIE_KV_SHARED=1 PIE_TARGET=wgsl

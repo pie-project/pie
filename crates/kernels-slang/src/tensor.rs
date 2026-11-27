@@ -211,6 +211,42 @@ impl KvPool {
             ring: None,
         }
     }
+
+    /// [`KvPool::planes`] laid in one buffer, as a pool of one segment
+    /// holds them: `keys` (bound over both planes, from the keys' first
+    /// word) and `values` the plane's shape, its first word `values_at`
+    /// words past the keys'.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "`planes`' seven and where the values start"
+    )]
+    pub fn packed(
+        keys: Tensor,
+        values: Tensor,
+        values_at: u32,
+        page_indices: Tensor,
+        page_indptr: Tensor,
+        page_size: i32,
+        seq_stride: u64,
+        head_stride: u64,
+    ) -> Self {
+        let mut pool = Self::planes(
+            keys,
+            Tensor {
+                buf: keys.buf,
+                ..values
+            },
+            page_indices,
+            page_indptr,
+            page_size,
+            seq_stride,
+            head_stride,
+        );
+        pool.origin[1] = values_at;
+        pool.pool = Segments::one(keys.buf, values_at.saturating_add(words_of(values)).max(1));
+        pool
+    }
 }
 
 /// A communicator as a device's collectives see it: this rank, the ranks,

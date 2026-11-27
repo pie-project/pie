@@ -17,6 +17,10 @@ const TOKENS: u32 = 256;
 
 #[test]
 fn a_load_with_no_measurement_under_a_stated_bound_runs_no_frame_past_it() {
+    // Alone on the device: its fresh profile directory times the rates
+    // against the bound, and another test's fires beside them would count
+    // as its own (as settle_bound's).
+    crate::gpu::sole();
     // Tight enough to bite (the warm-up cube's fires run 52 ms on an RTX PRO
     // 4500), save on wgpu, where the bandwidth's copy of 256 MiB, one fire
     // nothing cuts, is estimated at 34.2 ms there: 105 ms.

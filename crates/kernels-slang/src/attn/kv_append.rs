@@ -60,6 +60,14 @@ fn append(
     rows: Rows,
 ) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, k.dtype, { Bf16 => "attn_kv_append_bf16" });
+    // One plane at both, where the host refuses two overlapping views: the
+    // form reading it through one binding.
+    let shared = k == v && !ctx.binds_overlap();
+    let entry = if shared {
+        "attn_kv_append_shared_bf16"
+    } else {
+        entry
+    };
     if pool.page_size <= 0 {
         return Err(refuse(op, "the kv page size is zero"));
     }
@@ -76,7 +84,12 @@ fn append(
     ctx.fire(
         Fire::at(KV_APPEND, entry).apply(Grid::of(lanes, [64, 1, 1])),
         &[
-            &[k.arg(), v.arg(), write_page.arg(), write_offset.arg()][..],
+            &[
+                k.arg(),
+                if shared { ctx.absent()? } else { v.arg() },
+                write_page.arg(),
+                write_offset.arg(),
+            ][..],
             &pool.pool.args(true),
             &[
                 stated(op, head_dim)?.arg(),
