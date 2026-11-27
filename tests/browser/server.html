@@ -12,7 +12,7 @@
   const finish = (status) => window.__pie_done?.(status);
   const params = new URLSearchParams(location.search);
   const model = params.get("model") ?? "models/tiny.wgpu.zt";
-  const config = { budget_device: params.get("budget_device") ?? "1GiB" };
+  const config = { budget_device: "1GiB", measure: params.get("measure") !== "false" };
 
   try {
     // What `import "@pie-project/language-python"` does.

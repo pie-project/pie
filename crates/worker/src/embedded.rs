@@ -35,6 +35,9 @@ pub struct Settings {
     pub frame_size: u32,
     /// See [`crate::config::RuntimeConfig::frame_dispatch_depth`].
     pub frame_dispatch_depth: u32,
+    /// See [`crate::config::EngineConfig::measure`]: `false` times nothing
+    /// at load, each rate served by the estimate, named in the log.
+    pub measure: bool,
     pub verbose: bool,
 }
 
@@ -49,6 +52,7 @@ impl Default for Settings {
             max_concurrent_processes: None,
             frame_size: u32::from(Runahead::STEPS_MAX),
             frame_dispatch_depth: 2,
+            measure: true,
             verbose: false,
         }
     }
@@ -92,6 +96,7 @@ impl Settings {
 
         config.engine.options = self.engine_options(kind, home);
         config.engine.max_context = Some(self.max_context);
+        config.engine.measure = self.measure;
         config.engine.memory.budget_device = self.budget_device;
         config.engine.memory.yield_share = self.yield_share;
         config.engine.memory.yields()?;

@@ -332,16 +332,16 @@ jobs:
           ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
-          # The tab's device budget, derived as scripts/ci/lavapipe.sh's: the
-          # model's bytes, the rates step's 1792 MiB (`engine::rates::step_bytes()`:
-          # "measuring them needs 1792 MiB of device memory") and the 64 MiB floor.
-          budget=$(( $(stat -c %s tests/browser/models/tiny.wgpu.zt) + (1792 << 20) + (64 << 20) ))
+          # SwiftShader is too slow to time the roofline rates on (a measuring
+          # tab ran past the 900 s timeout): the tabs measure nothing
+          # (`measure = false`, each rate served by the estimate), so their
+          # budget holds only the model and its pools, as before.
           # The pages are independent, and each spends minutes in SwiftShader
           # on one core: they open side by side.
           node tests/browser/tools/headless.mjs . --timeout 900000 \
             "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" \
-            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=budget_device%20%3D%20%22${budget}B%22" \
-            "tests/browser/server.html?model=models/tiny.wgpu.zt&budget_device=${budget}B"
+            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=budget_device%20%3D%20%221GiB%22%2C%20measure%20%3D%20false" \
+            "tests/browser/server.html?model=models/tiny.wgpu.zt&measure=false"
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 
