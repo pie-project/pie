@@ -185,7 +185,7 @@ pub(crate) async fn before_pass(
         && let Some(directory) = super::directory::directory()
         && let Some(remote) = super::directory::remote()
     {
-        let started = std::time::Instant::now();
+        let started = crate::rt::wall::Instant::now();
         match fetch_held(stores, engine, &mut pass, &*directory, &*remote).await {
             Ok(0) => {}
             Ok(pages) => tracing::info!(
@@ -220,7 +220,7 @@ pub(crate) async fn before_pass(
         "a pass that may go to a peer"
     );
     for (executor, peer) in candidates {
-        let started = std::time::Instant::now();
+        let started = crate::rt::wall::Instant::now();
         match take(pid, stores, engine, peer, &pass).await {
             Ok(pages) => {
                 tracing::info!(
@@ -385,7 +385,7 @@ async fn take(
     peer: Arc<dyn PrefillPeer>,
     pass: &Pass,
 ) -> Result<usize> {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let pages = peer
         .prefill(
             pass.domain,
@@ -583,7 +583,7 @@ async fn land(
         (Some(from), Some(to)) if from != to => Some((from.clone(), to.clone())),
         _ => None,
     };
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let (list, host) = staging(stores, n);
     let host = host.ok_or_else(|| anyhow!("no room in the host tier for {n} pages"))?;
     let ids: Vec<u32> = host.iter().map(|slot| slot.0).collect();
@@ -664,7 +664,7 @@ pub(super) const LEASE_TTL: Duration = Duration::from_secs(60);
 struct Lease {
     kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
     pin: crate::store::kv::ReaderPin,
-    since: std::time::Instant,
+    since: crate::rt::wall::Instant,
 }
 
 /// Pages this executor holds for askers to read in place, by lease.
@@ -719,7 +719,7 @@ fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
         Lease {
             kv: stores.kv.clone(),
             pin,
-            since: std::time::Instant::now(),
+            since: crate::rt::wall::Instant::now(),
         },
     );
     Some(Held {
@@ -759,7 +759,7 @@ pub async fn serve(
             held: None,
         });
     }
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let have = with_kv_lock(&stores.kv, "offload-serve", |kv| {
         kv.cached_run_any_tier(&keys[..from as usize]).len()
     });
@@ -928,7 +928,7 @@ async fn export(
     let layout = crate::scheduler::host_kv_layout(engine).await;
     // One read: a round trip through the engine's lane per chunk costs more
     // than the chunks save. The link and the asker's landing go by chunks.
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let read = read_chunk(engine, list, &device, &slots).await;
     with_kv_lock(&stores.kv, "offload-export", |kv| {
         kv.free_host_slots(staging)
@@ -983,7 +983,7 @@ async fn read_chunk(
     device: &[crate::store::kv::page_table::PhysicalKvPageId],
     slots: &[u32],
 ) -> Result<Vec<u8>> {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let slots = slots[..device.len()].to_vec();
     let device: Vec<u32> = device.iter().map(|id| id.0).collect();
     let n = device.len();

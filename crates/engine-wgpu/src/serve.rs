@@ -137,7 +137,7 @@ impl Serve for Api {
         rows: u32,
     ) -> Result<Vec<Vec<f64>>> {
         let timer = |frame: crate::device::Frame| {
-            let started = std::time::Instant::now();
+            let started = crate::device::host::Instant::now();
             let span = frame.commit_spanned()?;
             Ok((
                 span.filter(|&ns| ns > 0),
@@ -157,7 +157,7 @@ impl Serve for Api {
         at: &engine_gpu::rates::ForBound,
     ) -> Result<engine_gpu::rates::BoundTimes> {
         let timer = |frame: crate::device::Frame| {
-            let started = std::time::Instant::now();
+            let started = crate::device::host::Instant::now();
             let span = frame.commit_spanned()?;
             Ok((
                 span.filter(|&ns| ns > 0),

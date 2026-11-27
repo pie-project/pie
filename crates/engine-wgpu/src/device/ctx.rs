@@ -1712,7 +1712,7 @@ impl Frame {
             })?;
         }
         let wall = self.inner.wall.load(Ordering::Acquire);
-        let submitted = std::time::Instant::now();
+        let submitted = crate::device::host::Instant::now();
         self.submit()?;
         if let Some(span) = span {
             let (core, time) = (Arc::clone(&self.inner.core), self.inner.time.clone());

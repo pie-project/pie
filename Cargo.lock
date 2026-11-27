@@ -591,6 +591,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizer",
+ "web-std",
 ]
 
 [[package]]

@@ -968,6 +968,13 @@ impl Walk<'_, '_> {
     }
 
     /// Reads `out.len()` bytes of file `file_id` at `offset` into `out`.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(
+            clippy::disallowed_methods,
+            reason = "a file path: the tab has no file system, so its open fails before the clock"
+        )
+    )]
     fn read_file_into(
         &self,
         file_id: u32,

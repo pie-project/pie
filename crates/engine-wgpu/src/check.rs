@@ -1,8 +1,8 @@
 //! `pie tune wgpu --check-estimate` and `--rates`: the check's loads of a
 //! model ([`engine_gpu::check::Bench`]) and the rates step alone.
 
+use crate::device::host::Instant;
 use std::path::Path;
-use std::time::Instant;
 
 use crate::device::{Api, Context};
 

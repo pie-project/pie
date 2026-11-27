@@ -153,7 +153,7 @@ pub fn shapes_at_load(
     // timestamps): the host's wait swings a frame more than the kernels it
     // weighs apart.
     let timer = |frame: Frame| {
-        let started = std::time::Instant::now();
+        let started = crate::device::host::Instant::now();
         let span = frame.commit_spanned()?;
         Ok((
             span.filter(|&ns| ns > 0),

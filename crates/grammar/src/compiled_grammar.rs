@@ -239,6 +239,13 @@ fn bitmask_cache_capacity(vocab_size: usize) -> NonZeroUsize {
     NonZeroUsize::new(entries).unwrap()
 }
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::disallowed_methods,
+        reason = "the deadline is never armed on wasm32 (`started_now`), so the clock is never read there"
+    )
+)]
 fn check_deadline(deadline: Option<Instant>) -> Result<()> {
     if deadline.is_some_and(|deadline| Instant::now() > deadline) {
         bail!("grammar compilation deadline exceeded");

@@ -1451,9 +1451,12 @@ pub fn build_commit() -> String {
 
 /// Today's date in UTC, `YYYY-MM-DD`.
 fn today() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    #[cfg(target_arch = "wasm32")]
+    let secs = web_std::time::since_epoch().as_secs();
     let (y, m, d) = civil(i64::try_from(secs / 86_400).unwrap_or(0));
     format!("{y:04}-{m:02}-{d:02}")
 }

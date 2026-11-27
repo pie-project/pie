@@ -36,6 +36,7 @@ pub fn pie_init(log_filter: Option<String>) {
     console_error_panic_hook::set_once();
     crate::log::install(log_filter.as_deref().unwrap_or("info"));
     web_std::time::set_clock(clock_ms);
+    web_std::time::set_wall_clock(js_sys::Date::now);
     web_std::executor::set_wake_hook(wake);
     wasmtime_web::set_clock(clock_ns);
     tracing::info!("pie web host initialised");

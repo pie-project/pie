@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::rt::wall::Instant;
 
 use anyhow::Result;
 use tokio::sync::mpsc;

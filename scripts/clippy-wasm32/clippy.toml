@@ -1,0 +1,13 @@
+# The tab's lint (scripts/browser-check.sh points CLIPPY_CONF_DIR here for its
+# wasm32 runs): the workspace's clippy.toml, plus std's clocks, which panic
+# in a browser ("time not implemented on this platform"). Code the tab
+# compiles reads the crate's web-safe Instant (engine_gpu::Instant,
+# engine-wgpu's device::host::Instant, runtime's rt::Instant / rt::wall) or
+# web_std::time. Keep the first entry as the workspace file has it.
+disallowed-methods = [
+    { path = "std::sync::PoisonError::into_inner", reason = "a poisoned lock's state is not to be trusted; `.expect(\"… poisoned\")` instead" },
+    { path = "std::time::Instant::now", reason = "panics in the tab; the crate's web-safe Instant instead" },
+    { path = "std::time::Instant::elapsed", reason = "panics in the tab; the crate's web-safe Instant instead" },
+    { path = "std::time::SystemTime::now", reason = "panics in the tab; web_std's clock, or cfg the path off wasm32" },
+    { path = "std::time::SystemTime::elapsed", reason = "panics in the tab; web_std's clock, or cfg the path off wasm32" },
+]
