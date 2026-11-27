@@ -157,6 +157,7 @@ const LANE_OF_ROW: [i32; ROWS as usize] = [0, 0, 1, 2, 1, 2, 2];
 
 #[test]
 fn the_conditioning_ops_answer_their_host_reference_every_case() {
+    let _device = crate::device_alone();
     the_pointwise_arms_answer_the_reference_at_both_elements();
     a_modulation_reads_its_vector_per_lane_and_per_token();
     the_gated_residual_folds_what_the_reference_folds();

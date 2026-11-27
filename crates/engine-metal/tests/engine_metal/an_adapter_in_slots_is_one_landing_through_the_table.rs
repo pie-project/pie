@@ -69,6 +69,7 @@ fn logits(shell: &mut Shell, fixture: &Fixture, slot: u32, adapter: Option<u32>)
 
 #[test]
 fn the_adapter_key_is_cudas_digest_of_the_sink() {
+    let _device = crate::device_alone();
     // A fixed sink (site word 5) and seeds: the vector CUDA pins the same.
     let a: Vec<u8> = (0u8..16).collect();
     let b: Vec<u8> = (100u8..124).collect();
@@ -87,6 +88,7 @@ const PINNED: u128 = 0x48d3_ea2e_650c_f1e9_8eff_b3e0_9bc8_eb41;
 
 #[test]
 fn an_adapter_in_slots_is_one_landing_through_the_table() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

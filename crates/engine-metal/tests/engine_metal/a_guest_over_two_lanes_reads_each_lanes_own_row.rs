@@ -132,6 +132,7 @@ fn bind(shell: &mut Shell, program: engine::ProgramId, rows: u32) -> engine::Ins
 
 #[test]
 fn a_guest_over_two_lanes_reads_each_lanes_own_row() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

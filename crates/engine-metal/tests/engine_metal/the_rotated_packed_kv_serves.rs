@@ -372,6 +372,7 @@ fn kv_cache_bytes(deployment: Deployment, head_dim: u32, paging: Paging) -> u64 
 
 #[test]
 fn the_rotated_packed_kv_serves() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: this machine publishes no Metal device");
         return;

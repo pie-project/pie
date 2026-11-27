@@ -326,6 +326,7 @@ fn argmaxes(fixture: &Fixture, airborne: bool) -> Vec<Vec<u8>> {
 
 #[test]
 fn an_airborne_pass_samples_its_own_row() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

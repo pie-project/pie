@@ -332,6 +332,7 @@ fn deviation(off: &[Vec<f32>], on: &[Vec<f32>]) -> (f32, f32, f32) {
 
 #[test]
 fn the_kv_rotation_is_the_unrotated_forward() {
+    let _device = crate::device_alone();
     // ---- Non-regression / structural check (no device needed): the default
     // path emits NOT ONE Hadamard, so every shipped deployment is byte-unchanged; the
     // rotated path emits exactly four per attention layer (q, k, v, o).

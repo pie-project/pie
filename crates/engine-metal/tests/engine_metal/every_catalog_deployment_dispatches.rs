@@ -65,6 +65,7 @@ fn stopped() -> BTreeMap<String, BTreeSet<String>> {
 
 #[test]
 fn every_catalog_deployment_dispatches_every_case() {
+    let _device = crate::device_alone();
     every_catalog_deployment_dispatches();
     every_refusal_is_still_carried();
     every_catalog_deployment_traces();

@@ -51,6 +51,7 @@ fn bf16_at(bytes: &[u8], i: usize) -> f32 {
 
 #[test]
 fn a_ternary_decode_in_dot_answers_the_host_decoder_every_case() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

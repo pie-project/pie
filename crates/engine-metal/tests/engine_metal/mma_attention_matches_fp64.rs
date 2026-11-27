@@ -7,6 +7,7 @@ use poem_ir::Dtype;
 
 #[test]
 fn mma_attention_matches_fp64() {
+    let _device = crate::device_alone();
     let Ok(dev) = Context::bind() else {
         return;
     };

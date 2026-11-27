@@ -167,6 +167,8 @@ const PAGES: u64 = 1;
 
 #[test]
 fn the_kv_write_round_trips() {
+    let _device = crate::device_alone();
+
     // ---- (A) allocation at head_dim 256 (the shipping flagship) -------------
     // The packed cache is sized per head from the head_dim the trace row now
     // carries (a head packs to `head_dim/2 + 2` bytes), not `width * element`.
@@ -360,6 +362,7 @@ fn write_case(rig: &mut Rig, head_dim: usize) {
 /// loads correctly.
 #[test]
 fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
+    let _device = crate::device_alone();
     use engine_metal::store::Rows;
     use engine_metal::store::kv::{Facts, SpaceFacts};
 

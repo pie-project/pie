@@ -69,6 +69,7 @@ fn reference(
 
 #[test]
 fn every_prompt_row_and_carried_state_answers_a_running_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };

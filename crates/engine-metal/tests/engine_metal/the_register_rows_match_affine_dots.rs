@@ -9,6 +9,7 @@ use poem_ir::Dtype;
 
 #[test]
 fn every_register_row_answers_an_affine_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -195,6 +196,7 @@ fn bank_of(device: &Context, handles: &Handles, k: u32, n: u32, seed: u64) -> (B
 /// lands over a table of its own, whether it splits wider or narrower.
 #[test]
 fn a_table_one_matmul_laid_feeds_the_next() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -292,6 +294,7 @@ fn a_table_one_matmul_laid_feeds_the_next() {
 /// counters of its split zeroed and the rows past the norm's left empty.
 #[test]
 fn a_norm_lays_the_table_its_projections_read() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -426,6 +429,7 @@ fn a_norm_lays_the_table_its_projections_read() {
 /// them, byte for byte, its split's counters zeroed.
 #[test]
 fn a_swiglu_lays_the_table_its_down_reads() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -576,6 +580,7 @@ fn own_table(
 /// over them, byte for byte, the counters zeroed.
 #[test]
 fn a_gate_lays_the_table_its_out_projection_reads() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -650,6 +655,7 @@ fn a_gate_lays_the_table_its_out_projection_reads() {
 /// register tile's input table lands the rows the plain norm lands and the table its projections lay, the counters zeroed.
 #[test]
 fn a_plain_norm_lays_the_table_its_projections_read() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };

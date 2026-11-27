@@ -138,6 +138,7 @@ fn axis_of(compiled: &CompiledModel, region: usize) -> RowAxis {
 
 #[test]
 fn a_tower_region_reads_the_patch_window_every_case() {
+    let _device = crate::device_alone();
     each_region_is_cut_at_its_own_axis_s_window();
     a_fire_with_no_image_gets_the_token_windows_it_always_had();
     a_patch_rectangle_is_carved_at_the_compositions_own_patch_rows();

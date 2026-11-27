@@ -197,6 +197,7 @@ fn spread(want: &[f32], got: &[f32]) -> f32 {
 
 #[test]
 fn the_register_routed_mlp_answers_the_per_route_path() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
@@ -550,6 +551,7 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
 /// predictor's heads, a route a row) against f64.
 #[test]
 fn the_eight_bit_routed_select_answers_f64() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

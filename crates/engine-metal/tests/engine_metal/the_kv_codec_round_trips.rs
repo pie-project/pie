@@ -268,6 +268,7 @@ impl Rig<'_> {
 
 #[test]
 fn the_kv_codec_round_trips() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

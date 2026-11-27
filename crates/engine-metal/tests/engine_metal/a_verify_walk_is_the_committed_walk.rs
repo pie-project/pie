@@ -663,6 +663,7 @@ fn cases() -> Vec<Case> {
 
 #[test]
 fn a_verify_walk_is_the_committed_walk() {
+    let _device = crate::device_alone();
     let Some(bench) = Bench::new() else {
         eprintln!("not asked: no Metal device");
         return;

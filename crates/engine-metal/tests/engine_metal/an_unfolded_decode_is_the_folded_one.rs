@@ -24,6 +24,7 @@ fn spread(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn an_unfolded_decode_is_the_folded_one() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         return;
     }

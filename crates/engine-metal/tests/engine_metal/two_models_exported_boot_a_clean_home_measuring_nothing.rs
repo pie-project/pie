@@ -36,6 +36,7 @@ fn stored_file(dir: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 fn two_models_exported_boot_a_clean_home_measuring_nothing() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

@@ -13,6 +13,7 @@ use super::a_scattered_pool_serves_the_same_logits::{fixture_of, load_with, word
 
 #[test]
 fn a_load_walks_every_readout_tier_its_set_states() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

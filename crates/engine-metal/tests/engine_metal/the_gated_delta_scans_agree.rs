@@ -87,12 +87,14 @@ fn compare(want: &[f32], got: &[f32]) -> (f64, f64) {
 
 #[test]
 fn the_scans_agree() {
+    let _device = crate::device_alone();
     scans_agree("");
 }
 
 /// The staged scan, as an Apple10 profile picks it.
 #[test]
 fn the_staged_scans_agree() {
+    let _device = crate::device_alone();
     scans_agree("[kernel]\ngdn.scan = \"staged\"");
 }
 

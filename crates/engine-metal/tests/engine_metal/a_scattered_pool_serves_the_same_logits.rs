@@ -851,6 +851,7 @@ fn check_near(model: &str, hybrid: bool, chunk: Option<u64>, profiles: &Profiles
 /// at the refs they lay in, the seats' logits bit for bit.
 #[test]
 fn a_refused_evacuation_moves_nothing() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
@@ -921,16 +922,19 @@ fn a_refused_evacuation_moves_nothing() {
 
 #[test]
 fn a_scattered_dense_pool_serves_the_same_logits() {
+    let _device = crate::device_alone();
     check("qwen3-micro-text", false);
 }
 
 #[test]
 fn a_scattered_windowed_pool_serves_the_same_logits() {
+    let _device = crate::device_alone();
     check("gemma4-e4b-mini-l1", false);
 }
 
 #[test]
 fn a_scattered_hybrid_pool_serves_the_same_logits() {
+    let _device = crate::device_alone();
     check("qwen35-tiny", true);
 }
 
@@ -956,6 +960,7 @@ impl Drop for OverBuffers {
 /// buffer's place from the first, give the seats' logits.
 #[test]
 fn a_pool_over_buffers_serves_the_same_logits() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         return;
     }
@@ -971,6 +976,7 @@ fn a_pool_over_buffers_serves_the_same_logits() {
 /// whole record's under the profile's own chunk.
 #[test]
 fn a_record_in_pieces_serves_the_whole_records_logits() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;
@@ -1000,6 +1006,7 @@ fn a_record_in_pieces_serves_the_whole_records_logits() {
 #[test]
 #[allow(unsafe_code)]
 fn a_reserved_hybrid_pool_states_shared_chunks() {
+    let _device = crate::device_alone();
     use engine_metal::store::layout::Layout;
     use engine_metal::store::{Pools, Rows};
 

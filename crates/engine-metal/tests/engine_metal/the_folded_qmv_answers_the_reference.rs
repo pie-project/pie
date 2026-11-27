@@ -77,6 +77,7 @@ fn rungs(packs: i32, bits: i32) -> &'static [i32] {
 
 #[test]
 fn the_folded_qmv_answers_the_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

@@ -24,6 +24,7 @@ fn load(fixture: &Fixture) -> Result<Shell, String> {
 
 #[test]
 fn a_load_measuring_nothing_admits_its_own_pool() {
+    let _device = crate::device_alone();
     if !engine_metal::device::present() {
         eprintln!("skipping: no Metal device");
         return;

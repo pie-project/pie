@@ -145,6 +145,7 @@ fn bank(
 
 #[test]
 fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
@@ -247,6 +248,7 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
 
 #[test]
 fn the_leading_output_columns_land_in_place() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

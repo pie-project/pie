@@ -9,6 +9,7 @@ use poem_ir::Dtype;
 
 #[test]
 fn every_routed_row_answers_its_experts_exact_affine_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };

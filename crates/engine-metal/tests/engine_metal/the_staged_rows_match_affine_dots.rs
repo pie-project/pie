@@ -19,6 +19,7 @@ fn apple10() -> Option<Context> {
 
 #[test]
 fn every_staged_row_answers_an_affine_reference() {
+    let _device = crate::device_alone();
     let Some(device) = apple10() else {
         return;
     };
@@ -158,6 +159,7 @@ fn every_staged_row_answers_an_affine_reference() {
 
 #[test]
 fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
+    let _device = crate::device_alone();
     let Some(device) = apple10() else {
         return;
     };
@@ -259,6 +261,7 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
 
 #[test]
 fn the_coop_segments_are_their_matmuls() {
+    let _device = crate::device_alone();
     let Some(device) = apple10() else {
         return;
     };

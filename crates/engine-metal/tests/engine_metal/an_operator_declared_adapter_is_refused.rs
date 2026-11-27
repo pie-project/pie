@@ -7,6 +7,7 @@ use engine_metal::{DeviceBoot, Metal};
 
 #[test]
 fn an_operator_declared_adapter_is_refused() {
+    let _device = crate::device_alone();
     let mut metal = Metal::new(
         DeviceBoot {
             profiles: None,

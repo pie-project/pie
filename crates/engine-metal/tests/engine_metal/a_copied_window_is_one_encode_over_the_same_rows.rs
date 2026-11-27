@@ -130,6 +130,7 @@ fn withdrawn(compiled: &CompiledModel) -> Vec<(u32, ClassSet)> {
 
 #[test]
 fn a_copied_window_is_one_encode_over_the_same_rows_every_case() {
+    let _device = crate::device_alone();
     the_bake_writes_a_copy_row_below_the_crossover();
     a_withdrawn_window_splits_when_the_shell_does_not_copy();
     the_same_window_is_one_encode_when_it_does();

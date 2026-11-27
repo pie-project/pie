@@ -42,6 +42,7 @@ fn shrink(buffer: &mut elastic::Elastic, bytes: u64) -> engine_metal::Result<()>
 
 #[test]
 fn the_kv_pool_grows_in_place() {
+    let _device = crate::device_alone();
     let Some((device, sparse)) = sparse() else {
         return;
     };
