@@ -474,8 +474,12 @@ impl Bound {
                 .expect("the channel reads")
                 .expect("the channel holds a cell")
         };
-        let ids = i32::from_le_bytes(take(0).try_into().expect("one i32"));
-        let stack = take(1)
+        let ids_cell = take(0);
+        let stack_cell = take(1);
+        super::guest_dump("outputs-ids", &ids_cell);
+        super::guest_dump("outputs-stack", &stack_cell);
+        let ids = i32::from_le_bytes(ids_cell.try_into().expect("one i32"));
+        let stack = stack_cell
             .as_chunks::<4>()
             .0
             .iter()

@@ -147,6 +147,7 @@ impl Bound {
             let cell = engine::Channels::take(&mut self.engine, self.instance, dense)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("channel {dense} holds no cell"))?;
+            super::guest_dump(&format!("roles-{dense}"), &cell);
             let first = i32::from_le_bytes(cell[..4].try_into().expect("an i32"));
             if !cell
                 .as_chunks::<4>()
