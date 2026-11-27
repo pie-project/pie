@@ -34,7 +34,13 @@ pub fn pie_init(log_filter: Option<String>) {
     // SAFETY: called once, before any other export runs.
     unsafe { __wasm_call_ctors() };
     console_error_panic_hook::set_once();
-    crate::log::install(log_filter.as_deref().unwrap_or("info"));
+    // The guest's host imports, each call and return (runtime's and WASI's
+    // `wit-bindgen import` spans), beside whatever the page asks.
+    let filter = format!(
+        "{},runtime::inferlet::host=trace,wasmtime_wasi=trace,wasmtime_wasi_http=trace",
+        log_filter.as_deref().unwrap_or("info")
+    );
+    crate::log::install(&filter);
     web_std::time::set_clock(clock_ms);
     web_std::time::set_wall_clock(js_sys::Date::now);
     web_std::executor::set_wake_hook(wake);
