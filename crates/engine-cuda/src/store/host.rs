@@ -903,6 +903,10 @@ mod tests {
     fn a_slow_disk_move_never_holds_the_engine_thread() {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
+        if !crate::device::present() {
+            eprintln!("skipping: no CUDA device on this machine");
+            return;
+        }
         let (_device, mut tier, file, dir) = tier_and_file("slow");
         let io = std::sync::Arc::default();
         tier.slice(0, 4096).unwrap().fill(0x5a);
@@ -974,6 +978,10 @@ mod tests {
     #[cfg(feature = "device")]
     #[test]
     fn a_disk_move_that_faults_is_told_failed() {
+        if !crate::device::present() {
+            eprintln!("skipping: no CUDA device on this machine");
+            return;
+        }
         let (_device, mut tier, file, dir) = tier_and_file("fault");
         let (tx, rx) = std::sync::mpsc::channel();
         tier.disk(super::DiskMove {
