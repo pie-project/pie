@@ -162,11 +162,13 @@ pub fn launched_nodes(plan: &crate::codegen::launch::LaunchStagePlan) -> Vec<u32
         .collect()
 }
 
-// Native drivers recompile everything an entry point reaches per pipeline, so
-// naming the op cuts a stage's build from minutes to seconds; Dawn reuses the
-// compile of the shared switch instead, and specialising defeats that.
+// A compiler builds everything an entry point reaches, per pipeline, so each
+// step names its op rather than calling the shared switch: natively that cuts
+// a stage's build from minutes to seconds, and SwiftShader in Chrome compiled
+// the shared switch per pipeline too, its GPU process growing to 11 GiB on
+// the first before it was killed.
 fn specialize() -> bool {
-    !cfg!(target_arch = "wasm32")
+    true
 }
 
 fn step_call(at: usize, tag: u8) -> String {
