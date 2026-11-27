@@ -100,4 +100,5 @@ mod no_shell_reads_the_environment;
 mod routed_experts_stream;
 mod the_operators_fraction_sizes_the_pool;
 mod a_buffer_asked_after_ready_is_refused_by_name;
+mod a_second_load_on_a_serving_thread_lays_its_own;
 mod the_score_rows_are_the_oracles;

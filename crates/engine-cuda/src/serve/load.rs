@@ -38,6 +38,11 @@ const CODE_DIR: &str = kernels_cuda::disk::CUBINS;
 const CODE_DIR: &str = kernels_cuda::disk::CODE_OBJECTS;
 
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
+    // A load lays its own buffers from its first, whatever this thread
+    // served before: a second load on a thread that served (a worker
+    // loading another model) measures its rates (`rates::ensure`) and binds
+    // its context before anything else it lays.
+    crate::device::alloc::loading_from_here();
     super::diag::publish(&boot.knobs.diagnostics);
     if let Some(guard) = super::diag::on().sync_guard {
         crate::device::guard::arm()?;
@@ -771,8 +776,6 @@ impl Shell {
             crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
         crate::device::held::heap_mark();
-        // A load lays its own buffers, whatever this thread served before.
-        crate::device::alloc::loading_from_here();
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the card's room before the
         // weights land; `Pools::fit_the_card` sizes it within that.
