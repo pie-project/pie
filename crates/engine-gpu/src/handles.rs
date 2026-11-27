@@ -14,6 +14,11 @@ pub struct Binding<B: Backend> {
     /// The first byte of the value this binding is a window of
     /// ([`Handles::window`]), its own offset where it is a value whole.
     origin: u64,
+
+    /// The byte past that value's last: a backend that binds no two views
+    /// of one buffer overlapping binds the value to here, not to its slab's
+    /// end ([`Binding::end`]).
+    end: u64,
 }
 
 impl<B: Backend> Clone for Binding<B> {
@@ -23,6 +28,7 @@ impl<B: Backend> Clone for Binding<B> {
             offset: self.offset,
             extent: self.extent,
             origin: self.origin,
+            end: self.end,
         }
     }
 }
@@ -65,6 +71,13 @@ impl<B: Backend> Binding<B> {
     #[must_use]
     pub fn extent(&self) -> u64 {
         self.extent
+    }
+
+    /// The byte past the last of the value this binding is a window of
+    /// (its own end where it is a value whole).
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.end
     }
 
     #[must_use]
@@ -131,6 +144,7 @@ impl<B: Backend> Handles<B> {
             offset,
             extent: len,
             origin: offset,
+            end: offset + len,
         });
         Ok(at as u32)
     }
@@ -155,12 +169,12 @@ impl<B: Backend> Handles<B> {
     }
 
     fn cut_of(&self, handle: u32, skip: u64, len: u64, window: bool) -> Result<u32> {
-        let (buffer, offset, origin) = {
+        let (buffer, offset, origin, end) = {
             let rows = self.rows.borrow();
             let row = rows.get(handle as usize).ok_or_else(|| Fault::Unbound {
                 what: format!("handle {handle}, which this load minted no row for"),
             })?;
-            (row.buffer.clone(), row.offset, row.origin)
+            (row.buffer.clone(), row.offset, row.origin, row.end)
         };
         let at_offset = offset.checked_add(skip).ok_or(Fault::Ceiling {
             what: "bytes of a device reservation",
@@ -192,6 +206,7 @@ impl<B: Backend> Handles<B> {
             offset: at_offset,
             extent: len,
             origin: if window { origin } else { at_offset },
+            end: if window { end } else { at_offset + len },
         });
         Ok(at as u32)
     }

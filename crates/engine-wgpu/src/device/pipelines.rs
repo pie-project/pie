@@ -330,6 +330,14 @@ impl Bound<'_> {
     }
 }
 
+/// Whether no two bindings of a group may overlap in one buffer
+/// ([`aliased`] refuses them): in the tab, and in a test-limits build of one
+/// segment, which stands in for it natively. There each view ends where its
+/// value does; natively it runs to its slab's end, as it serves today.
+pub(crate) fn exact_views(one_segment: bool) -> bool {
+    cfg!(target_arch = "wasm32") || (cfg!(feature = "test-limits") && one_segment)
+}
+
 /// WebGPU's writable storage binding aliasing rule, which the browser's
 /// implementation enforces and native wgpu does not: no two writable
 /// bindings of one group overlap in one buffer. Every kernel binding is
@@ -344,7 +352,7 @@ impl Bound<'_> {
 /// Natively it only says each, at debug: native serves its four segments'
 /// overlaps, which wgpu does not check.
 pub(crate) fn aliased(group: &str, bound: &[Bound<'_>], one_segment: bool) -> Result<()> {
-    let refuses = cfg!(target_arch = "wasm32") || (cfg!(feature = "test-limits") && one_segment);
+    let refuses = exact_views(one_segment);
     #[cfg(feature = "test-limits")]
     let refuses = refuses && std::env::var("PIE_TEST_ALIASING").as_deref() != Ok("log");
     for (i, a) in bound.iter().enumerate() {

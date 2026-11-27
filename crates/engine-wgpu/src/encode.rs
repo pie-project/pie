@@ -299,6 +299,7 @@ impl Sink<'_> {
         .map_err(|fault| Sink::refuse(fire, fault))?;
         let storage_align = u64::from(limits.min_storage_buffer_offset_alignment);
         let max_binding = limits.max_storage_buffer_binding_size;
+        let exact_views = crate::device::pipelines::exact_views(core.one_segment());
 
         let mut views: Vec<(wgpu::Buffer, u64, u64, bool)> = Vec::with_capacity(args.len());
 
@@ -356,8 +357,16 @@ impl Sink<'_> {
                     // how many rows a fire's window cuts of it, so the load's
                     // walk builds the one every fire over it binds.
                     let slab_bytes = binding.buffer().slab().size;
+                    // Where no two views of a buffer may overlap (the tab's
+                    // WebGPU, `pipelines::aliased`), a view ends where its
+                    // value does: still one group for every window of it.
+                    let value_end = if exact_views {
+                        binding.end().next_multiple_of(4).min(slab_bytes)
+                    } else {
+                        slab_bytes
+                    };
                     let whole = |from: u64, need: u64| {
-                        let to_end = (slab_bytes.saturating_sub(from) & !3).min(max_binding & !3);
+                        let to_end = (value_end.saturating_sub(from) & !3).min(max_binding & !3);
                         to_end.max(need)
                     };
                     // A window of a value (a class region's rows of it) binds
