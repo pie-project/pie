@@ -507,8 +507,13 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;
 
     // The frames the engines keep in flight: the one number the scheduler
-    // dispatches by and a beam group's pool is sized with.
-    let engine_frames = frames_in_flight(&engine_configs)?;
+    // dispatches by and a beam group's pool is sized with. A runtime with no
+    // engine (`engine = false`) fires nothing: the configured depth stands.
+    let engine_frames = if engine_configs.is_empty() {
+        scheduler.frame_dispatch_depth.max(1)
+    } else {
+        frames_in_flight(&engine_configs)?
+    };
     // the warm run that measures the host cover stays within every engine's
     // context (`measure_host_cover`)
     let warm_context = engine_configs
