@@ -8702,8 +8702,14 @@ impl<B: Serve> Shell<B> {
                     &self.handles,
                     layout,
                     buffers,
-                    self.pools
-                        .segments_below(&self.handles, self.carve_below(rung)?)?,
+                    [
+                        self.pools
+                            .segments_below(&self.handles, self.carve_below(rung)?)?,
+                        self.pools.segments(&self.handles)?,
+                    ],
+                    (self.device.pool_segments() == 1)
+                        .then(|| self.pools.segment_buffers().first().map(|b| b.slab_id()))
+                        .flatten(),
                     held,
                     rs_plans,
                     rs_carried,

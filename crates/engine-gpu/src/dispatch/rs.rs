@@ -161,6 +161,50 @@ impl<B: Backend> Run<'_, B> {
             return Ok(());
         };
         let (b_slab, b) = arenas.bound.get(1).copied().unwrap_or((first, a));
+        // A pool of one segment, whose buffer an arena may be (the rs
+        // planes' room in the activation span): that arena's runs read and
+        // write the pool's binding, bound whole from the same first byte, at
+        // the same words, and the arena binds nothing, as a second view of
+        // the pool's buffer would overlap it. An arena named twice (one
+        // buffer only) binds once.
+        if let Some(pool) = seat.one_buffer {
+            let nil = kernels_slang::Tensor::new(kernels_slang::ABSENT, 1, 1, poem_ir::Dtype::U32);
+            let in_pool = |slab: u64| slab == pool;
+            let remap = |space: Space| match space {
+                Space::ArenaA if in_pool(first) => Space::Segment(0),
+                Space::ArenaB if in_pool(b_slab) => Space::Segment(0),
+                Space::ArenaB if b_slab == first && arenas.bound.len() < 2 => {
+                    if in_pool(first) {
+                        Space::Segment(0)
+                    } else {
+                        Space::ArenaA
+                    }
+                }
+                other => other,
+            };
+            let runs: Vec<_> = runs
+                .iter()
+                .map(|run| kernels_slang::gather::rows::CopyRun {
+                    from: (remap(run.from.0), run.from.1),
+                    to: (remap(run.to.0), run.to.1),
+                    words: run.words,
+                })
+                .collect();
+            let a = if in_pool(first) { nil } else { a };
+            let b = if in_pool(b_slab) || arenas.bound.len() < 2 {
+                nil
+            } else {
+                b
+            };
+            return kernels_slang::gather::rows::copy_runs(
+                self.ctx,
+                a,
+                b,
+                seat.pool_whole,
+                &runs,
+                seat.run_most,
+            );
+        }
         // The arenas in their buffers' order, whatever run named one first:
         // the binding a buffer takes is the same on every fire.
         if b_slab < first {
@@ -181,12 +225,12 @@ impl<B: Backend> Run<'_, B> {
                 self.ctx,
                 b,
                 a,
-                seat.pool,
+                seat.pool_whole,
                 &runs,
                 seat.run_most,
             );
         }
-        kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool, runs, seat.run_most)
+        kernels_slang::gather::rows::copy_runs(self.ctx, a, b, seat.pool_whole, runs, seat.run_most)
     }
 
     fn kernel(fault: crate::error::Fault, op: &'static str) -> Error {

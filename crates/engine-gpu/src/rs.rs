@@ -534,6 +534,14 @@ pub struct Seat {
 
     /// The chunk pool the rs pages lie in.
     pub pool: Segments,
+    /// The pool bound whole, past a fire's carve too: what the copies of
+    /// runs between the pool and the planes bind, where in a pool of one
+    /// segment the planes lie in the pool's buffer and are read through its
+    /// binding (`kernels/gather/rows.slang`'s one-segment form).
+    pub pool_whole: Segments,
+    /// In a pool of one segment, its buffer's slab: the only one the
+    /// copies' arenas may be, as the one-segment form reads them there.
+    pub one_buffer: Option<u64>,
     pub layout: Arc<Layout>,
     pub plane_at: Vec<u64>,
     pub page_tokens: u32,
@@ -677,7 +685,8 @@ impl Seat {
         handles: &Handles<B>,
         layout: &Arc<Layout>,
         buffers: &Buffers,
-        pool: Segments,
+        [pool, pool_whole]: [Segments; 2],
+        one_buffer: Option<u64>,
         held: &Reservation<B>,
         lanes: Vec<LanePlan>,
         carried: Vec<bool>,
@@ -746,6 +755,8 @@ impl Seat {
             carry,
             slots,
             pool,
+            pool_whole,
+            one_buffer,
             layout: Arc::clone(layout),
             plane_at: buffers.plane_at.clone(),
             page_tokens: buffers.page_tokens,

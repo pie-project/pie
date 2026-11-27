@@ -59,6 +59,10 @@ pub fn present() -> bool {
 /// The buffer bound where a binding has nothing: one binding's alignment.
 pub(crate) const DUMMY_BYTES: u64 = 256;
 
+/// The windows of [`DUMMY_BYTES`] the dummy holds where no two views of a
+/// buffer may overlap: the most arguments one dispatch names none of.
+pub(crate) const DUMMY_WINDOWS: u64 = 16;
+
 /// One frame's dispatch uniforms: 4096 dispatches at the 256-byte
 /// uniform-offset alignment; a frame past it is refused by name.
 const UNIFORM_CHUNK: u64 = 1 << 20;
@@ -763,9 +767,16 @@ impl Context {
             whose_memory,
             bound,
         });
+        // Where no two views of a buffer may overlap (the tab), each argument
+        // a dispatch names none of binds a window of its own
+        // (`encode`, `pipelines::exact_views`).
         let dummy = Raw::new(
             &core,
-            DUMMY_BYTES,
+            if super::pipelines::exact_views(core.one_segment()) {
+                DUMMY_BYTES * DUMMY_WINDOWS
+            } else {
+                DUMMY_BYTES
+            },
             Memory::Device,
             engine_gpu::books::owners::DUMMY,
         )?;

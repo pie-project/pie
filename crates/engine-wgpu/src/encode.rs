@@ -278,6 +278,20 @@ impl Encode for Sink<'_> {
 
 #[cfg(feature = "wgpu")]
 impl Sink<'_> {
+    /// The view an argument that names no buffer binds: the dummy whole,
+    /// or, where no two views may overlap (`exact`), the `nils`th window of
+    /// it, so a dispatch with several binds no window twice.
+    fn dummy_view(&self, exact: bool, nils: &mut u64) -> (wgpu::Buffer, u64, u64, bool) {
+        let dummy = &self.device.dummy;
+        if !exact {
+            return (dummy.buffer.clone(), 0, dummy.size, false);
+        }
+        let at = *nils % crate::device::ctx::DUMMY_WINDOWS;
+        *nils += 1;
+        let bytes = crate::device::ctx::DUMMY_BYTES;
+        (dummy.buffer.clone(), at * bytes, bytes, false)
+    }
+
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let name = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
             Sink::backend(
@@ -300,6 +314,9 @@ impl Sink<'_> {
         let storage_align = u64::from(limits.min_storage_buffer_offset_alignment);
         let max_binding = limits.max_storage_buffer_binding_size;
         let exact_views = crate::device::pipelines::exact_views(core.one_segment());
+        // Arguments that name no buffer, as many as seen: each its own
+        // window of the dummy where no two views may overlap.
+        let mut nils = 0u64;
 
         let mut views: Vec<(wgpu::Buffer, u64, u64, bool)> = Vec::with_capacity(args.len());
 
@@ -314,8 +331,7 @@ impl Sink<'_> {
                 ArgValue::Buffer(handle) | ArgValue::BufferMut(handle) => {
                     let mutable = matches!(arg, ArgValue::BufferMut(_));
                     if handle == NIL {
-                        let dummy = &self.device.dummy;
-                        views.push((dummy.buffer.clone(), 0, dummy.size, false));
+                        views.push(self.dummy_view(exact_views, &mut nils));
                         continue;
                     }
                     let binding = self.handles.get(handle).ok_or_else(|| {
@@ -337,8 +353,7 @@ impl Sink<'_> {
                                 format!("argument {} writes an empty view", views.len()),
                             ));
                         }
-                        let dummy = &self.device.dummy;
-                        views.push((dummy.buffer.clone(), 0, dummy.size, false));
+                        views.push(self.dummy_view(exact_views, &mut nils));
                         continue;
                     }
                     let view = remaining.next_multiple_of(4).min(
