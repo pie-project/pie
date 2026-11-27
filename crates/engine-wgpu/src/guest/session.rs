@@ -1187,12 +1187,15 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         })
 }
 
-/// Call `call`'s module with only what its entry reaches: every step's
-/// module carries the whole guest runtime (154 functions, the select's
-/// workgroup tables), which a compiler that does not strip it first takes
-/// minutes on (SwiftShader in Chrome trapped inside the first); naga drops
-/// what the entry never reaches and writes the rest back.
+/// Call `call`'s module with only what its entry reaches, in the tab: every
+/// step's module carries the whole guest runtime (154 functions, the
+/// select's workgroup tables), which SwiftShader in Chrome takes minutes on;
+/// naga drops what the entry never reaches and writes the rest back. Native
+/// drivers strip it themselves, and serve the module as emitted faster.
 fn compacted(call: usize, source: &str) -> std::result::Result<String, String> {
+    if !cfg!(target_arch = "wasm32") {
+        return Ok(source.to_string());
+    }
     #[cfg(feature = "test-limits")]
     if std::env::var_os("PIE_TEST_GUEST_WHOLE").is_some() {
         return Ok(source.to_string());

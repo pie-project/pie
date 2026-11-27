@@ -12,6 +12,46 @@ use crate::plan::{CompiledStage, Region};
 
 pub const RUNTIME: &str = include_str!("../../runtime/wgsl/ptir_runtime.wgsl");
 
+/// The pivot finish's 32-element block as [`RUNTIME`] spells it: its loads
+/// then its stores, one line each.
+fn pivot_block_spelled() -> String {
+    let mut out = String::new();
+    for k in 0..32 {
+        let _ = writeln!(
+            out,
+            "        let v{k} = bitcast<f32>(hld(vals + t + {k}u));"
+        );
+    }
+    for k in 0..32 {
+        let _ = writeln!(
+            out,
+            "        hst(flags + t + {k}u, select(0u, 1u, excl < cut));"
+        );
+        let _ = writeln!(out, "        excl = excl + v{k};");
+    }
+    out
+}
+
+/// The same block as a loop: each element loaded, its flag stored and its
+/// mass added in turn, the same additions in the same order.
+const PIVOT_BLOCK_ROLLED: &str = "        for (var k : u32 = 0u; k < PIVOT_UNROLL; k = k + 1u) {
+          let v = bitcast<f32>(hld(vals + t + k));
+          hst(flags + t + k, select(0u, 1u, excl < cut));
+          excl = excl + v;
+        }
+";
+
+/// The runtime a step's module carries on this target: [`RUNTIME`], but in
+/// the tab with the pivot finish's block rolled, which SwiftShader in Chrome
+/// otherwise grew past 11 GiB compiling. Native drivers take it as spelled.
+fn runtime() -> alloc::borrow::Cow<'static, str> {
+    if cfg!(target_arch = "wasm32") {
+        alloc::borrow::Cow::Owned(RUNTIME.replacen(&pivot_block_spelled(), PIVOT_BLOCK_ROLLED, 1))
+    } else {
+        alloc::borrow::Cow::Borrowed(RUNTIME)
+    }
+}
+
 pub const WORKGROUP: u32 = 256;
 
 /// Words the runtime's one-row select keeps just below the temporary area
@@ -265,8 +305,9 @@ fn emit_op(body: &mut String, at: usize, tag: u8, rounds: u32, levels: u32) {
 pub const ENTRY_MARKER: &str = "// ---- the entry point ----";
 
 fn wrap(entry_name: &str, body: &str) -> String {
-    let mut source = String::with_capacity(RUNTIME.len() + body.len() + 256);
-    source.push_str(RUNTIME);
+    let runtime = runtime();
+    let mut source = String::with_capacity(runtime.len() + body.len() + 256);
+    source.push_str(&runtime);
     source.push('\n');
     source.push_str(ENTRY_MARKER);
     source.push_str("\n\n@compute @workgroup_size(");
@@ -573,8 +614,9 @@ pub fn step_calls() -> Vec<String> {
 /// whole grid.
 #[must_use]
 pub fn step_module(entry: &str, call: &str) -> String {
-    let mut source = String::with_capacity(RUNTIME.len() + 1024);
-    source.push_str(RUNTIME);
+    let runtime = runtime();
+    let mut source = String::with_capacity(runtime.len() + 1024);
+    source.push_str(&runtime);
     source.push('\n');
     // The words [`StepUniform::bytes`] lays.
     source.push_str(
@@ -714,6 +756,17 @@ mod tests {
             "the runtime folds {declared} rungs and the emitter spells {}",
             super::REDUCE_LEVELS
         );
+    }
+
+    /// The block the tab rolls is the runtime's as spelled, once, and the
+    /// rolled runtime holds the loop instead.
+    #[test]
+    fn the_pivot_block_the_tab_rolls_is_the_runtimes() {
+        let spelled = super::pivot_block_spelled();
+        assert_eq!(RUNTIME.matches(&spelled).count(), 1);
+        let rolled = RUNTIME.replacen(&spelled, super::PIVOT_BLOCK_ROLLED, 1);
+        assert!(!rolled.contains("let v31 ="));
+        assert_eq!(rolled.matches(super::PIVOT_BLOCK_ROLLED).count(), 1);
     }
 
     fn every_arm_of_the_runtime_switch_is_spelled_directly() {
