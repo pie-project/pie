@@ -1637,7 +1637,9 @@ impl Frame {
         // its walk, each submitted before the next is opened.
         self.inner.release();
         let inner = Arc::clone(&self.inner);
+        super::host::tab_wait("submitted", "Frame::submit");
         core.queue.on_submitted_work_done(move || {
+            super::host::tab_wait("work done", "Frame::submit's callback");
             inner.done.store(true, Ordering::Release);
         });
         core.kick();

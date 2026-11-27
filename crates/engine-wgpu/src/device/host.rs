@@ -22,6 +22,20 @@ pub(crate) fn can_block() -> bool {
 
 static PARKED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
+/// In the tab, the first of each wait a frame passes through, said by name
+/// (`what`, at `at`): where a first fire that never lands stops. Elsewhere,
+/// and past the first few hundred, nothing.
+#[allow(unused_variables)]
+pub(crate) fn tab_wait(what: &'static str, at: &'static str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+            tracing::info!(target: "pie_tab_wait", what, at, "a frame's wait");
+        }
+    }
+}
+
 pub fn parked() -> Vec<&'static str> {
     PARKED.lock().expect("parked lock poisoned").clone()
 }
@@ -100,6 +114,7 @@ impl<T> Signal<T> {
     }
 
     pub(crate) fn notify(&self, value: T) {
+        tab_wait("notified", "a signal");
         let waker = {
             let mut slot = self.inner.lock().expect("lock poisoned");
             slot.0 = Some(value);
@@ -112,7 +127,8 @@ impl<T> Signal<T> {
 
     pub(crate) fn park(&self, call: &'static str) -> Result<T> {
         let inner = Arc::clone(&self.inner);
-        block_on_poll(call, |cx| {
+        tab_wait("parks", call);
+        let woke = block_on_poll(call, |cx| {
             let mut slot = inner.lock().expect("lock poisoned");
             match slot.0.take() {
                 Some(value) => Poll::Ready(value),
@@ -121,7 +137,9 @@ impl<T> Signal<T> {
                     Poll::Pending
                 }
             }
-        })
+        });
+        tab_wait("woke", call);
+        woke
     }
 }
 

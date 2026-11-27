@@ -171,12 +171,14 @@ impl Raw {
         let span = end - start;
         let skip = (offset - start) as usize;
         let take = len as usize;
+        crate::device::host::tab_wait("maps", "a readback");
         if self.kind == Memory::Readback {
             let mapped = self.buffer.clone();
             let core = Arc::clone(core);
             self.buffer
                 .slice(start..end)
                 .map_async(wgpu::MapMode::Read, move |result| {
+                    crate::device::host::tab_wait("mapped", "a readback");
                     let read = result
                         .map_err(|e| core.fault("map_async", e))
                         .and_then(|()| {
@@ -211,6 +213,7 @@ impl Raw {
         staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
+                crate::device::host::tab_wait("mapped", "a readback");
                 let read = result
                     .map_err(|e| core.fault("map_async", e))
                     .and_then(|()| {
