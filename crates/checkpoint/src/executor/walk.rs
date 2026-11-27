@@ -1892,6 +1892,13 @@ impl Walk<'_, '_> {
         Ok(out)
     }
 
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(
+            clippy::disallowed_methods,
+            reason = "available_parallelism is Err on wasm32, so one worker: the serial branch returns before the scope"
+        )
+    )]
     fn decode_bytes(
         &self,
         output: Option<BufferId>,

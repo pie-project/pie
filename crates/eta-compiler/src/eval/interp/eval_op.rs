@@ -871,6 +871,13 @@ pub(super) fn broadcast_value(value: &Value, src_shape: Shape, target: Shape) ->
 /// `n` draws of `kind` from the stream `seed_eff`, lane `j` the stream's
 /// `j`th: the same lanes however they are split, a long run's chunks on
 /// threads of their own.
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::disallowed_methods,
+        reason = "available_parallelism is Err on wasm32, so one worker: the serial branch returns before the scope"
+    )
+)]
 pub(super) fn rng_lanes(seed_eff: u64, n: usize, kind: RngKind) -> Vec<f32> {
     const SPLIT_ABOVE: usize = 1 << 15;
     let lane = |j: usize| {

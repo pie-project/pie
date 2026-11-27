@@ -689,47 +689,48 @@ impl<B: Backend> RowCaches<B> {
         let threads = fill_threads().min(seats.len()).max(1);
         let chunk = seats.len().div_ceil(threads);
         let map = host.map();
+        // One chunk's seats laid; the tab, which spawns no thread, lays
+        // its one chunk ([`fill_threads`] is 1 there) in place.
+        let lay_chunk = |seats: &mut [(&mut [u8], usize, u32)]| -> Result<()> {
+            for (image, cache, block) in seats.iter_mut() {
+                let shape = &self.caches[*cache].shape;
+                let block = *block;
+                let whole = u64::from(block + 1) * u64::from(shape.block_rows) <= shape.rows
+                    && shape.tables.iter().map(|t| t.row_bytes).sum::<u64>() == shape.atom_bytes
+                    && u64::from(shape.block_rows) * shape.atom_bytes == shape.slot_bytes;
+                if !whole {
+                    image.fill(0);
+                }
+                for k in 0..u64::from(shape.block_rows) {
+                    let id = u64::from(block) * u64::from(shape.block_rows) + k;
+                    if id >= shape.rows {
+                        break;
+                    }
+                    for table in &shape.tables {
+                        let plane = planes.get(&table.param).ok_or_else(|| Fault::Unbound {
+                            what: format!(
+                                "row table param {}, which the host tier does \
+                                     not hold",
+                                table.param
+                            ),
+                        })?;
+                        let from = usize::try_from(k * shape.atom_bytes + table.origin)
+                            .unwrap_or(usize::MAX);
+                        let len = usize::try_from(table.row_bytes).unwrap_or(0);
+                        plane.row_into(map, id, &mut image[from..from + len])?;
+                    }
+                }
+            }
+            Ok(())
+        };
+        #[cfg(target_arch = "wasm32")]
+        let laid: Vec<Result<()>> = seats.chunks_mut(chunk).map(lay_chunk).collect();
+        #[cfg(not(target_arch = "wasm32"))]
         let laid: Vec<Result<()>> = std::thread::scope(|scope| {
+            let lay_chunk = &lay_chunk;
             seats
                 .chunks_mut(chunk)
-                .map(|seats| {
-                    scope.spawn(move || {
-                        for (image, cache, block) in seats.iter_mut() {
-                            let shape = &self.caches[*cache].shape;
-                            let block = *block;
-                            let whole = u64::from(block + 1) * u64::from(shape.block_rows)
-                                <= shape.rows
-                                && shape.tables.iter().map(|t| t.row_bytes).sum::<u64>()
-                                    == shape.atom_bytes
-                                && u64::from(shape.block_rows) * shape.atom_bytes
-                                    == shape.slot_bytes;
-                            if !whole {
-                                image.fill(0);
-                            }
-                            for k in 0..u64::from(shape.block_rows) {
-                                let id = u64::from(block) * u64::from(shape.block_rows) + k;
-                                if id >= shape.rows {
-                                    break;
-                                }
-                                for table in &shape.tables {
-                                    let plane =
-                                        planes.get(&table.param).ok_or_else(|| Fault::Unbound {
-                                            what: format!(
-                                                "row table param {}, which the host tier does \
-                                                 not hold",
-                                                table.param
-                                            ),
-                                        })?;
-                                    let from = usize::try_from(k * shape.atom_bytes + table.origin)
-                                        .unwrap_or(usize::MAX);
-                                    let len = usize::try_from(table.row_bytes).unwrap_or(0);
-                                    plane.row_into(map, id, &mut image[from..from + len])?;
-                                }
-                            }
-                        }
-                        Ok(())
-                    })
-                })
+                .map(|seats| scope.spawn(move || lay_chunk(seats)))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .map(|worker| worker.join().expect("a fill worker does not panic"))

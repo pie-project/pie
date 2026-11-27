@@ -150,10 +150,24 @@ pub struct Prewarmed {
 pub fn prewarm(registrations: &[ProgramRegistration]) -> Result<Prewarmed, Refusal> {
     use std::hash::{Hash, Hasher};
 
+    // The tab spawns no thread: each adopted in turn, in the same order.
+    #[cfg(target_arch = "wasm32")]
+    let mut adopted: Vec<(usize, Prepared, std::time::Duration)> = registrations
+        .iter()
+        .enumerate()
+        .map(|(at, registration)| {
+            let started = crate::Instant::now();
+            let prepared = adopt(registration);
+            (at, prepared, started.elapsed())
+        })
+        .collect();
+    #[cfg(not(target_arch = "wasm32"))]
     let next = std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(not(target_arch = "wasm32"))]
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .clamp(1, registrations.len().max(1));
+    #[cfg(not(target_arch = "wasm32"))]
     let mut adopted: Vec<(usize, Prepared, std::time::Duration)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {

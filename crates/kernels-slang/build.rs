@@ -158,6 +158,10 @@ fn main() {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a build script runs on the host, not in the tab"
+)]
 fn compile_all(
     slangc: &Path,
     kernels: &Path,
