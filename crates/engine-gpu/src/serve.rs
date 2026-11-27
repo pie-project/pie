@@ -626,23 +626,6 @@ pub enum CheckRungs {
 /// budgets and profile the fit left. One fit serves the naming load and the
 /// real one, each of which compiles from it at the top its device binds
 /// ([`Shell::raise`]), so neither can pick a rung the other does not.
-/// The pool's room the rungs were weighed by, and what made it up: the
-/// device's room less the weights it would hold, the reservations and the
-/// driver's share then ([`FIRST_ROOM`]).
-#[derive(Clone, Copy)]
-struct FirstRoom {
-    room: u64,
-    reserved: u64,
-    outside: u64,
-    weights: u64,
-}
-
-thread_local! {
-    /// The load's first weighing of the pool's room, said beside the room
-    /// it is sized to once every load-time reservation is up.
-    static FIRST_ROOM: std::cell::Cell<Option<FirstRoom>> = const { std::cell::Cell::new(None) };
-}
-
 struct Fitted<B: Serve> {
     device: B::Context,
     tuning: B::Tuning,
@@ -1543,7 +1526,6 @@ pub struct Shell<B: Serve> {
     /// the segment buffer of the score room they lie in, and each one's
     /// source lane and the bytes its key row, and its page row where it has
     /// one, start at there.
-    #[allow(clippy::type_complexity)]
     last_capture: Option<(B::Buffer, Vec<(u32, u64, Option<u64>)>)>,
 
     rs_buffers: Option<crate::rs::Buffers>,
@@ -1989,17 +1971,10 @@ impl<B: Serve> Shell<B> {
                 .filter(|(at, _)| !streamed.contains(at))
                 .map(|(_, bytes)| *bytes)
                 .sum();
-            let left = device
+            device
                 .left()
                 .saturating_sub(held)
-                .saturating_sub(crate::weights::derived_bytes(&boot.trace));
-            FIRST_ROOM.set(Some(FirstRoom {
-                room: left,
-                reserved: device.books().device(),
-                outside: device.outside(),
-                weights: held.saturating_add(crate::weights::derived_bytes(&boot.trace)),
-            }));
-            left
+                .saturating_sub(crate::weights::derived_bytes(&boot.trace))
         };
         // The roofline the device's rates state (`engine::roofline`): where
         // the profile states them all, the top rung is the estimate's pick
@@ -2594,7 +2569,6 @@ impl<B: Serve> Shell<B> {
         // estimate reads at the widest rung it serves (`crate::rates::
         // for_bound`, single fires, milliseconds), said by name, kept in the
         // bound alone (no other choice reads it) and stored nowhere.
-        #[allow(clippy::type_complexity)]
         let mut bound_prefixed: Option<Vec<(u32, Vec<(u32, f64)>)>> = None;
         let mut bound_timed = false;
         if unweighed
@@ -3129,18 +3103,9 @@ impl<B: Serve> Shell<B> {
 
         // The ledger's capacity is what the device has, measured once the
         // context, the weights and every load-time reservation beside the
-        // pool are up; what the driver holds by then is its own entry. The
-        // safety floor stays out of it beside the driver's share: a device
-        // whose room is read of the host's has the floor taken off there
-        // (`host_memory::room`), any other here.
+        // pool are up; what the driver holds by then is its own entry.
         device.books().outside("driver", device.outside());
-        let capacity = device.capacity();
-        let capacity = if device.host_room().is_some() {
-            capacity
-        } else {
-            capacity.saturating_sub(engine::SAFETY_FLOOR_BYTES)
-        };
-        device.books().settle(chunk, capacity);
+        device.books().settle(chunk, device.capacity());
 
         // The pool takes the bytes `[model] device_kv_budget` states, or all
         // the weights and the working set leave of the share, in whole
@@ -3152,37 +3117,6 @@ impl<B: Serve> Shell<B> {
         // bytes the device leaves would hold up to a chunk a class past what
         // the device has.
         let left = device.left().min(device.books().ledger().room());
-        if let Some(first) = FIRST_ROOM.take() {
-            let mib = |bytes: u64| bytes >> 20;
-            let reserved = device.books().device().saturating_sub(first.reserved);
-            let driver = device.outside().saturating_sub(first.outside);
-            let weights = device.books().ledger().bytes(engine::memory::Class::Model);
-            // The room the first weighing left, less what was reserved past
-            // the weights it estimated and what the driver took since: the
-            // rest is what the ledger keeps (each class in whole chunks, the
-            // capacity it settled to).
-            let kept = first
-                .room
-                .saturating_add(first.weights)
-                .saturating_sub(reserved)
-                .saturating_sub(driver)
-                .saturating_sub(left);
-            tracing::info!(
-                "the pool's room: {} MiB, against the {} MiB the rungs were weighed by: since, the \
-                 load reserved {} MiB ({} MiB of it the weights, estimated at {} MiB then), the \
-                 driver came to hold {} MiB more (pipelines, the shelf's buffers), and the ledger \
-                 keeps {} MiB (every class in whole chunks of {} MiB, under the capacity it \
-                 settled to)",
-                mib(left),
-                mib(first.room),
-                mib(reserved),
-                mib(weights),
-                mib(first.weights),
-                mib(driver),
-                mib(kept),
-                mib(chunk),
-            );
-        }
         if let Some(budget) = kv_budget
             && budget > left
         {
@@ -4780,50 +4714,6 @@ impl<B: Serve> Shell<B> {
         self.unplaced = false;
     }
 
-    /// What this process holds of the device past every reservation,
-    /// settled once the load has armed: each step kind (a decode step, then
-    /// a prompt) fired once more on seat 0, the driver's count read before
-    /// and after each ([`Context::outside`]). Two readings a fire apart
-    /// within one of the pool's chunks (what the ledger counts every class
-    /// in) settle it; else the largest stands, said so
-    /// ([`engine::memory::Outside::settle`]). `None`, said by name, where
-    /// the device does not report what this process holds, or the load
-    /// seats no slot to fire on.
-    pub fn settle_outside(&mut self) -> Result<Option<engine::memory::Outside>> {
-        if let Some(why) = self.device.outside_unmeasured() {
-            tracing::info!(
-                "outside: unmeasured: {why}; budget_device bounds what the load reserves alone"
-            );
-            return Ok(None);
-        }
-        if self.held.is_empty() {
-            tracing::info!("outside: unmeasured: no slot to fire on");
-            return Ok(None);
-        }
-        let token = |i: u32| 100 + (i * 7919) % 5000;
-        let prompt: Vec<u32> = (0..32).map(token).collect();
-        let decode = [token(1)];
-        let mut readings = vec![self.device.outside()];
-        for tokens in [&decode[..], &prompt[..]] {
-            self.open(0)?;
-            let word = self
-                .trace
-                .facts
-                .word(&poem_ir::Request::new(tokens.len() as u32, false));
-            self.fire(&[Lane {
-                slot: 0,
-                word,
-                tokens,
-            }])?;
-            readings.push(self.device.outside());
-        }
-        self.open(0)?;
-        Ok(engine::memory::Outside::settle(
-            &readings,
-            self.pools.chunk_bytes().max(1),
-        ))
-    }
-
     /// Opens seat `slot` for a direct fire: its record zeroed on the queue,
     /// nothing held.
     pub fn open(&mut self, slot: u32) -> Result<()> {
@@ -6063,7 +5953,6 @@ impl<B: Serve> Shell<B> {
     /// Where `slots` lays each capturing lane's rows: the segment buffer
     /// of the score room they lie in, and each one's source lane and the
     /// bytes of that buffer its key row and page row start at.
-    #[allow(clippy::type_complexity)]
     fn capture_rows(
         &self,
         composition: &Composition,
@@ -6106,7 +5995,6 @@ impl<B: Serve> Shell<B> {
     /// once every fire has landed: each one's source lane, key row and page
     /// row (empty where its program reads no pages). None where no lane of
     /// it captured; a later fire lays its own over them.
-    #[allow(clippy::type_complexity)]
     pub fn score_rows(&mut self) -> Result<Vec<(u32, Vec<f32>, Vec<f32>)>> {
         self.drain()?;
         let (Some(rows), Some((buffer, laid))) = (self.span.capture(), &self.last_capture) else {
@@ -6372,8 +6260,6 @@ impl<B: Serve> Shell<B> {
 
     /// Plans the fire's beam groups over its staged tables
     /// ([`crate::beam::plan`]).
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)]
     fn plan_beams<'a, 'r>(
         &self,
         arm: usize,
@@ -7181,6 +7067,7 @@ impl<B: Serve> Shell<B> {
 
     /// Reads token seat row `row` of arm `arm`, as a fed check does once
     /// the fire there landed.
+    #[must_use]
     pub fn token_row_reader(&self, arm: usize) -> crate::settle::ReadRow {
         let (store, tokens) = self.inputs[arm].token_seat();
         let store = store.clone();
@@ -11038,7 +10925,6 @@ impl<B: Serve> Shell<B> {
         // carried forms, another body. Each shape carrying decode lanes is
         // recorded so too.
         let carried_too = self.rs_buffers.is_some() && self.rs_layout.is_some();
-        #[allow(clippy::type_complexity)]
         let shapes: Vec<(Vec<(usize, u32)>, bool, Buffering, u8)> = shapes
             .into_iter()
             .flat_map(|lanes| {
@@ -11114,11 +11000,7 @@ impl<B: Serve> Shell<B> {
                 };
                 let attachments: Vec<engine::Attachments> =
                     (0..decoding.len()).map(carries).collect();
-                #[allow(clippy::type_complexity)]
-                let mut tagged: Vec<(
-                    (Vec<(usize, u32)>, bool, Buffering, u8),
-                    usize,
-                )> = shapes
+                let mut tagged: Vec<((Vec<(usize, u32)>, bool, Buffering, u8), usize)> = shapes
                     .into_iter()
                     .filter_map(|entry| {
                         let step = step_of(&entry.0, entry.2 != Buffering::None, &attachments);

@@ -61,7 +61,7 @@ impl Context {
     }
 
     #[must_use]
-    pub fn outside_unmeasured(&self) -> Option<String> {
+    pub fn measures_outside(&self) -> bool {
         match self.never {}
     }
 

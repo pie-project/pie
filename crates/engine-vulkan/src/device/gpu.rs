@@ -107,14 +107,6 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::outside(self)
     }
 
-    fn outside_unmeasured(&self) -> Option<String> {
-        Context::outside_unmeasured(self)
-    }
-
-    fn outside_unseen(&self) -> Option<&'static str> {
-        Context::outside_unseen(self)
-    }
-
     fn host_room(&self) -> Option<engine::HostRoom> {
         Context::host_room(self)
     }

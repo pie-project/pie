@@ -45,24 +45,9 @@ impl Integrated {
 /// figures are then the runtime's.
 static STATED: AtomicBool = AtomicBool::new(false);
 
-/// The operator's stated budget, in bytes; `u64::MAX` where none is.
-static BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
 /// Records whether the load's allowance states a device budget.
 pub fn stated(budget: Option<u64>) {
     STATED.store(budget.is_some(), Ordering::Relaxed);
-    BUDGET.store(budget.unwrap_or(u64::MAX), Ordering::Relaxed);
-}
-
-/// The device budget the load's allowance states, where it does: what this
-/// worker's whole use of the device (its context and driver among it) may
-/// come to ([`crate::device::elastic::room_now`]).
-#[must_use]
-pub fn budget() -> Option<u64> {
-    match BUDGET.load(Ordering::Relaxed) {
-        u64::MAX => None,
-        bytes => Some(bytes),
-    }
 }
 
 /// What bounds the load's room on the bound device, as a refusal names it:
