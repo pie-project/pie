@@ -334,7 +334,25 @@ fn register_operator_adapters(
     Ok(())
 }
 
-#[cfg(feature = "engine-cuda")]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn metal_context(
+    stated: Option<u32>,
+    snapshot_dir: &Path,
+    overrides: &runtime::engine::load::Overrides,
+) -> (u32, bool) {
+    if let Some(context) = stated {
+        return (context, false);
+    }
+    declared_context(snapshot_dir, overrides).map_or_else(
+        || (engine::Budgets::default().max_context, false),
+        |context| (context, true),
+    )
+}
+
+#[cfg(any(
+    feature = "engine-cuda",
+    all(feature = "metal", target_vendor = "apple")
+))]
 /// The context the model at `snapshot_dir` declares, stretched by the yarn
 /// factor a deployment turns at past the config.
 fn declared_context(
@@ -628,9 +646,8 @@ pub(crate) fn create_engine_backend(
                 Ok,
             )?;
             let page_size = opts.kv_page_size.unwrap_or(METAL_PAGE_SIZE).max(1);
-            let max_context = opts
-                .max_model_len
-                .unwrap_or_else(|| engine::Budgets::default().max_context);
+            let (max_context, context_declared) =
+                metal_context(opts.max_model_len, snapshot_dir, overrides);
             let (max_lanes, max_tokens) =
                 METAL_FIRE.or(opts.max_forward_requests, opts.max_forward_tokens);
             (
@@ -642,7 +659,7 @@ pub(crate) fn create_engine_backend(
                     max_adapters: adapters.seats(),
                     page_size,
                     max_context,
-                    context_declared: false,
+                    context_declared,
                     slots: 0,
                     max_patches: patch_ceilings.0,
                     max_images: patch_ceilings.1,
@@ -939,6 +956,19 @@ mod tests {
         the_pool_budget_seats_by_state_slots_not_pages();
         an_engine_takes_an_artifact_or_a_snapshot_and_nothing_else();
         an_engine_without_a_disk_tier_is_handed_no_default_dir();
+    }
+
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    #[test]
+    fn metal_uses_the_declared_context_when_length_is_omitted() {
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::write(
+            snapshot.path().join("config.json"),
+            r#"{"max_position_embeddings":262144}"#,
+        )
+        .unwrap();
+        let context = metal_context(None, snapshot.path(), &Default::default());
+        assert_eq!(context, (262_144, true));
     }
 
     fn an_engine_without_a_disk_tier_is_handed_no_default_dir() {
