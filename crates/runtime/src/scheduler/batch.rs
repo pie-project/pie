@@ -1316,6 +1316,92 @@ mod tests {
         assert!(buffered_steps > 0, "buffered steps were formed");
     }
 
+    /// The steps the builder forms of `n` decodes on a load of rungs 4, 16
+    /// and 64 stating unservable the decode shapes that hold `unservable`
+    /// lane counts: each step's lane count, and its shape's index.
+    fn decode_steps_beside_unservable(n: usize, unservable: &[usize]) -> Vec<(usize, usize)> {
+        let base = SchedulerLimits {
+            max_forward_requests: 64,
+            ..limits()
+        };
+        let rules = ::engine::StepRules::runtime();
+        let facts = facts(base, &[4, 16, 64], false);
+        let mut stated = ::engine::StatedSteps::of(&rules, &facts);
+        let lanes = |k: usize| {
+            let wave: Vec<Box<PendingRequest>> = (0..k)
+                .map(|at| pending(decode(1, 1), InstanceId(at as u64 + 1)))
+                .collect();
+            ::engine::StepComposition::of(
+                wave.iter()
+                    .flat_map(|r| r.request.lanes.iter().map(|lane| &lane.lane)),
+            )
+        };
+        stated.unservable = unservable
+            .iter()
+            .map(|&k| stated.shapes.holds(&lanes(k)).unwrap() as u32)
+            .collect();
+        stated.unservable.sort_unstable();
+        stated.agrees(&rules, &facts).unwrap();
+        let served = stated.served();
+        let limits = holding(base, served.clone());
+        let wave: Vec<Box<PendingRequest>> = (0..n)
+            .map(|at| pending(decode(1, 1), InstanceId(at as u64 + 1)))
+            .collect();
+        let (frame, _) = build_frame_submission(vec![wave], limits, 16, &SchedulerStats::default());
+        let steps: Vec<(usize, usize)> = compositions(&frame)
+            .iter()
+            .map(|step| {
+                (
+                    step.decode_lanes as usize,
+                    stated.shapes.holds(step).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            steps.iter().map(|s| s.0).sum::<usize>(),
+            n,
+            "every lane is served"
+        );
+        for &(_, at) in &steps {
+            assert!(
+                !stated.unservable.contains(&(at as u32)),
+                "a step formed of unservable shape {at}"
+            );
+        }
+        steps
+    }
+
+    /// A decode shape the load states unservable forms no step: its decodes
+    /// form in the shape below, as members whose joining would leave the set.
+    #[test]
+    fn an_unservable_shape_forms_no_step_its_work_forms_below() {
+        let steps = decode_steps_beside_unservable(9, &[9]);
+        assert!(
+            steps.iter().all(|s| s.0 <= 4),
+            "the r16 decodes formed at r4: {steps:?}"
+        );
+    }
+
+    /// The widest decode shape unservable: thirty decodes form at the one
+    /// below it, sixteen at most a step.
+    #[test]
+    fn an_unservable_widest_shape_forms_its_work_at_the_one_below() {
+        let steps = decode_steps_beside_unservable(30, &[30]);
+        assert!(steps.iter().all(|s| s.0 <= 16), "{steps:?}");
+        assert!(
+            steps.iter().any(|s| s.0 > 4),
+            "the r16 shape serves: {steps:?}"
+        );
+    }
+
+    /// Every decode shape but the smallest unservable: the decodes all form
+    /// in the smallest.
+    #[test]
+    fn every_shape_of_a_kind_but_the_smallest_unservable_forms_in_the_smallest() {
+        let steps = decode_steps_beside_unservable(30, &[9, 30]);
+        assert!(steps.iter().all(|s| s.0 <= 4), "{steps:?}");
+    }
+
     /// A load stating no buffered step: a buffered decode is deferred from a
     /// folded step and, alone outside the set, refused at admission by name.
     #[test]

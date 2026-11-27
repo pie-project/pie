@@ -505,11 +505,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             tracing::info!(
                 engine = d.engine_backend.kind(),
                 eager = d.steps.eager.len(),
+                unservable = d.steps.unservable.len(),
                 "the step builder forms {}; each is armed before ready or stated eager",
                 d.steps.shapes.census()
             );
-            // One set a load, shared by every step it builds for its life.
-            d.limits.shapes = Some(Box::leak(Box::new(d.steps.shapes.clone())));
+            for &at in &d.steps.unservable {
+                if let Some(shape) = d.steps.shapes.shapes.get(at as usize) {
+                    tracing::info!(
+                        engine = d.engine_backend.kind(),
+                        shape = at,
+                        "the step builder forms no step of [{shape}]: the engine states it unservable, its work formed in the shapes below"
+                    );
+                }
+            }
+            // One set a load, shared by every step it builds for its life:
+            // the unservable shapes formed by none.
+            d.limits.shapes = Some(Box::leak(Box::new(d.steps.served())));
             Ok(facts)
         })
         .collect::<Result<Vec<::engine::ReadoutFacts>>>()?;

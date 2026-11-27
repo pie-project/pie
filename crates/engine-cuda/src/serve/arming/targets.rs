@@ -593,7 +593,11 @@ impl Shell {
                 "the arm walk runs at the starting weight residency: what it \
                  leaves eager is named then"
             );
-            return engine::StatedSteps { shapes, eager };
+            return engine::StatedSteps {
+                shapes,
+                eager,
+                unservable: Vec::new(),
+            };
         }
         for (at, shape) in shapes.shapes.iter().enumerate() {
             let missing: Vec<u32> = self
@@ -609,7 +613,11 @@ impl Shell {
                 eager.push(u32::try_from(at).unwrap_or(u32::MAX));
             }
         }
-        engine::StatedSteps { shapes, eager }
+        engine::StatedSteps {
+            shapes,
+            eager,
+            unservable: Vec::new(),
+        }
     }
 }
 

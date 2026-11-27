@@ -681,6 +681,15 @@ impl StepFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepShapes {
     pub shapes: Vec<StepShape>,
+    /// The shapes the builder forms no step of (indices into `shapes`,
+    /// ascending): those the load states unservable
+    /// ([`StatedSteps::unservable`]), set on the runtime's copy of the set
+    /// ([`StatedSteps::served`]). A member whose joining would form one goes
+    /// in a later step, as one whose joining leaves the set does; a lone
+    /// member only one holds is refused at admission by name. Empty as the
+    /// rules form the set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unservable: Vec<u32>,
 }
 
 impl StepShapes {
@@ -819,7 +828,10 @@ impl StepShapes {
             }
         }
         shapes.sort_by_key(|shape| (shape.rung, shape.kind, shape.treatment));
-        StepShapes { shapes }
+        StepShapes {
+            shapes,
+            unservable: Vec::new(),
+        }
     }
 
     #[must_use]
@@ -832,10 +844,14 @@ impl StepShapes {
         self.shapes.is_empty()
     }
 
-    /// The first shape (in the set's order) holding `step`, by its index.
+    /// The first shape (in the set's order) holding `step`, by its index;
+    /// none past an unservable one ([`StepShapes::unservable`]).
     #[must_use]
     pub fn shape_of(&self, step: &StepComposition) -> Option<usize> {
-        self.shapes.iter().position(|shape| shape.holds(step))
+        let at = self.shapes.iter().position(|shape| shape.holds(step))?;
+        let unservable =
+            u32::try_from(at).is_ok_and(|at| self.unservable.binary_search(&at).is_ok());
+        (!unservable).then_some(at)
     }
 
     /// Whether the set holds `step`; else the gap, named with the step and
@@ -1004,6 +1020,14 @@ pub struct StatedSteps {
     pub shapes: StepShapes,
     #[serde(default)]
     pub eager: Vec<u32>,
+    /// The shapes the load cannot serve (indices into `shapes`, ascending):
+    /// a fire of one would take more of the device than the load measured
+    /// beside its pool, so the builder forms none ([`StatedSteps::served`]),
+    /// its work forming in the shapes below. None is eager, and the smallest
+    /// shape of a kind and treatment never is one (no shape below to form
+    /// its work in). An engine that serves every shape states none.
+    #[serde(default)]
+    pub unservable: Vec<u32>,
 }
 
 impl StatedSteps {
@@ -1013,6 +1037,18 @@ impl StatedSteps {
         StatedSteps {
             shapes: StepShapes::of(rules, facts),
             eager: Vec::new(),
+            unservable: Vec::new(),
+        }
+    }
+
+    /// The set as the step builder forms it: the stated shapes, the
+    /// unservable ones formed by none ([`StepShapes::unservable`]). Shape
+    /// indices are the stated set's.
+    #[must_use]
+    pub fn served(&self) -> StepShapes {
+        StepShapes {
+            shapes: self.shapes.shapes.clone(),
+            unservable: self.unservable.clone(),
         }
     }
 
@@ -1047,6 +1083,34 @@ impl StatedSteps {
                 "the engine states shape {past} eager of the {} it states",
                 self.shapes.len()
             ));
+        }
+        if self.unservable.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("the engine's unservable shapes are not ascending".into());
+        }
+        for &at in &self.unservable {
+            let Some(shape) = self.shapes.shapes.get(at as usize) else {
+                return Err(format!(
+                    "the engine states shape {at} unservable of the {} it states",
+                    self.shapes.len()
+                ));
+            };
+            if self.eager.contains(&at) {
+                return Err(format!(
+                    "the engine states shape {at} ({shape}) both eager and unservable"
+                ));
+            }
+            let smallest = self
+                .shapes
+                .shapes
+                .iter()
+                .position(|s| s.kind == shape.kind && s.treatment == shape.treatment);
+            if smallest == Some(at as usize) {
+                return Err(format!(
+                    "the engine states shape {at} ({shape}) unservable, the smallest {} {} \
+                     shape: no shape below it forms its work",
+                    shape.treatment, shape.kind
+                ));
+            }
         }
         Ok(())
     }
@@ -1186,6 +1250,69 @@ mod tests {
         let said = gap.to_string();
         assert!(said.contains("mixed ~rs rows 5"), "{said}");
         assert!(said.contains("r8 mixed folds"), "{said}");
+    }
+
+    /// A shape the load states unservable holds no step the builder forms;
+    /// the rest of the set still does, at their own indices.
+    #[test]
+    fn an_unservable_shape_holds_no_step() {
+        let rules = StepRules::runtime();
+        let facts = facts(&[8, 64], false);
+        let wide = StepComposition::of(&vec![lane(1, false); 9]);
+        let narrow = StepComposition::of(&vec![lane(1, false); 3]);
+        let mut stated = StatedSteps::of(&rules, &facts);
+        let at = stated.shapes.holds(&wide).unwrap();
+        let below = stated.shapes.holds(&narrow).unwrap();
+        stated.unservable = vec![u32::try_from(at).unwrap()];
+        stated.agrees(&rules, &facts).unwrap();
+        let served = stated.served();
+        assert_eq!(
+            served.shape_of(&wide),
+            None,
+            "the unservable shape forms none"
+        );
+        assert_eq!(
+            served.shape_of(&narrow),
+            Some(below),
+            "the rest keep their indices"
+        );
+        assert!(
+            served.holds(&wide).is_err(),
+            "a lone member only it holds is refused"
+        );
+    }
+
+    /// The unservable shapes are refused by name where they are out of the
+    /// set, out of order, eager too, or the smallest of their kind.
+    #[test]
+    fn an_unservable_shape_is_checked_by_name() {
+        let rules = StepRules::runtime();
+        let facts = facts(&[8, 64], false);
+        let base = StatedSteps::of(&rules, &facts);
+        let wide = base
+            .shapes
+            .holds(&StepComposition::of(&vec![lane(1, false); 9]))
+            .unwrap() as u32;
+        let smallest = base
+            .shapes
+            .shapes
+            .iter()
+            .position(|s| s.kind == StepKind::Decode)
+            .unwrap() as u32;
+        let said = |unservable: Vec<u32>, eager: Vec<u32>| {
+            StatedSteps {
+                unservable,
+                eager,
+                ..base.clone()
+            }
+            .agrees(&rules, &facts)
+            .unwrap_err()
+        };
+        let past = base.shapes.len() as u32;
+        assert!(said(vec![past], vec![]).contains("unservable of the"));
+        assert!(said(vec![wide, wide], vec![]).contains("not ascending"));
+        assert!(said(vec![wide], vec![wide]).contains("both eager and unservable"));
+        assert!(said(vec![smallest], vec![]).contains("the smallest folds decode shape"));
     }
 
     #[test]
