@@ -212,6 +212,7 @@ impl Library {
     /// load's shelf reserved), and a bind group for each pair of the pool's
     /// `segments`.
     pub fn build(device: &Context, outboxes: Arc<Pool>, segments: &[&Buffer]) -> Result<Library> {
+        let began = crate::device::host::Instant::now();
         let core = device.core().clone();
         let binds = bind_layout(&core);
         let layout = core
@@ -272,6 +273,7 @@ impl Library {
             calls = engine_gpu::guest::step_calls(),
             built = library.built(),
             ms = started.elapsed().as_millis() as u64,
+            total_ms = began.elapsed().as_millis() as u64,
             "every guest step's pipeline is built"
         );
         Ok(library)
@@ -1185,6 +1187,33 @@ fn bind_layout(core: &Core) -> wgpu::BindGroupLayout {
         })
 }
 
+/// Call `call`'s module with only what its entry reaches: every step's
+/// module carries the whole guest runtime (154 functions, the select's
+/// workgroup tables), which a compiler that does not strip it first takes
+/// minutes on (SwiftShader in Chrome trapped inside the first); naga drops
+/// what the entry never reaches and writes the rest back.
+fn compacted(call: usize, source: &str) -> std::result::Result<String, String> {
+    #[cfg(feature = "test-limits")]
+    if std::env::var_os("PIE_TEST_GUEST_WHOLE").is_some() {
+        return Ok(source.to_string());
+    }
+    let mut module = naga::front::wgsl::parse_str(source).map_err(|e| {
+        format!(
+            "guest step call {call} does not parse: {}",
+            e.emit_to_string(source)
+        )
+    })?;
+    naga::compact::compact(&mut module, naga::compact::KeepUnused::No);
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .map_err(|e| format!("guest step call {call} compacted does not validate: {e}"))?;
+    naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+        .map_err(|e| format!("guest step call {call} compacted does not write: {e}"))
+}
+
 /// Builds call `call`'s pipeline from its own module.
 fn build_call(
     core: &Arc<Core>,
@@ -1196,6 +1225,7 @@ fn build_call(
     let source = widened(call, source)?;
     let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
         .map_err(|why| why.to_string())?;
+    let source = compacted(call, &source)?;
     // Said before the module is made, so the last line before a device's
     // loss names what it was making.
     tracing::info!(

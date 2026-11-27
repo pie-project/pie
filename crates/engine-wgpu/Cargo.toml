@@ -28,7 +28,7 @@ eta-compiler = { path = "../eta-compiler" }
 checkpoint = { path = "../checkpoint" }
 tracing = "0.1"
 
-naga = { version = "30", default-features = false, features = ["wgsl-in"], optional = true }
+naga = { version = "30", default-features = false, features = ["wgsl-in", "wgsl-out"], optional = true }
 
 # Native builds run on wgpu's Vulkan backend off Apple and DX12 on Windows;
 # each backend's native handles state the device memory. macOS has no wgpu
