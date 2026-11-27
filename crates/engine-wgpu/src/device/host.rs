@@ -44,6 +44,45 @@ pub(crate) fn tab_wait(what: &'static str, at: &'static str) {
     }
 }
 
+/// In the tab, a frame's submission and its work's completion counted, not
+/// said each: one line a second at most, the frames submitted and done since
+/// the boot and how many are on the queue, so the waits [`tab_wait`] says
+/// cover the steps around them. Elsewhere nothing.
+#[allow(unused_variables)]
+pub(crate) fn tab_queue(submitted: bool) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+        static DONE: AtomicU64 = AtomicU64::new(0);
+        static SAID_AT_MS: AtomicU64 = AtomicU64::new(0);
+        if submitted {
+            SUBMITTED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DONE.fetch_add(1, Ordering::Relaxed);
+        }
+        let now = Instant::now().elapsed_since_origin_ms() as u64;
+        let said = SAID_AT_MS.load(Ordering::Relaxed);
+        if now >= said + 1000
+            && SAID_AT_MS
+                .compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let (submitted, done) = (
+                SUBMITTED.load(Ordering::Relaxed),
+                DONE.load(Ordering::Relaxed),
+            );
+            tracing::info!(
+                target: "pie_tab_wait",
+                submitted,
+                done,
+                queued = submitted.saturating_sub(done),
+                "the queue: frames submitted and their work done"
+            );
+        }
+    }
+}
+
 /// The runtime is ready: [`tab_wait`] says the next waits again.
 pub fn tab_wait_from_ready() {
     #[cfg(target_arch = "wasm32")]
