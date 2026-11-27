@@ -47,7 +47,11 @@ fn nql(l: u16) u16 { return Qh * dcl(l) + (if (SH == 1) 0 else if (isg(l) and KE
 const NC: u16 = if (!ON or AROW == 2) 0 else if (SH == 1) 2 else K;
 fn cg(c: u16) bool { return if (SH == 1) c == 1 else isg(c); }
 fn cne(c: u16) u16 { return if (cg(c)) NEG else NES; } //-seats
-fn cne(c: u16) u16 { return NEG; }   // (seats: every cache the pool's entries, a seat's window of them) //+seats
+fn cne(c: u16) u16 { return if (cg(c)) NEG else SNE; }   // (seats: a global cache the pool's entries, a seat's window of them) //+seats
+// (seats) a sliding cache: a ring of NES a seat where SEATS of them take fewer than the pool's //+seats
+// entries (FIX), else each seat's ring within its window's entries //+seats
+const FIX: bool = SEATS * NES < NEG; //+seats
+const SNE: u16 = if (FIX) SEATS * NES else NEG; //+seats
 fn cdc(c: u16) u16 { return if (cg(c)) DcG else DcS; }
 fn ckw(c: u16) u16 { return cdc(c) * cne(c); }
 fn cvw(c: u16) u16 { return cne(c) * (cdc(c) + 1); }
@@ -81,6 +85,7 @@ var mrefs = @zeros([if (NC == 0) 1 else SEATS * K * Qh]f32);   // a reference a 
 var mref: [*]f32 = &mrefs;   // the pass's seat's //+seats
 var wb = @zeros([SEATS]u16);   // each seat's window's first entry, learnt at its position 0 //+seats
 var cw0: u16 = 0;   // the pass's seat's //+seats
+var crb: u16 = 0;   // (FIX) its sliding ring's first entry //+seats
 var pv = @zeros([NC1 * DcG]f32);      // the pending entry's raw v a cache
 var pks = @zeros([NC1]f32);           // its |k|^2, |v|^2 partials (this column's)
 var pvs = @zeros([NC1]f32);
@@ -173,7 +178,7 @@ fn posq(pos: u32) void {
 fn cslot(c: u16, pos: u32) u16 {
   posq(pos);
   return if (cg(c)) q_ent else q_ent % NES; //-seats
-  return if (cg(c)) q_ent else cw0 + (q_ent - cw0) % NES;   // (seats: a ring within the seat's window) //+seats
+  return if (cg(c)) q_ent else (if (FIX) crb else cw0) + (q_ent - cw0) % NES;   // (seats: the seat's ring) //+seats
 }
 fn cache_reset(c: u16) void {
   var i: u16 = 0;
@@ -305,6 +310,8 @@ fn attm(l: u16, comptime g: u16) void {
   if (reset) { wb[st] = q_ent; } //+seats
   const w0: u16 = wb[st]; //+seats
   cw0 = w0; //+seats
+  if (FIX) { crb = st * NES; } //+seats
+  const b0: u16 = if (FIX and !cg(c)) crb else w0;   // the cache's first entry of the seat's //+seats
   mref = @ptrcast([*]f32, &mrefs[st * K * Qh]); //+seats
   const mine = q_row == pe.myrow;
   if (pos == 0) { //-seats
@@ -331,7 +338,7 @@ fn attm(l: u16, comptime g: u16) void {
   const kb = koff(c);
   const vb = voff(c);
   const e0 = eoff(c); //-seats
-  const e0 = eoff(c) + w0; //+seats
+  const e0 = eoff(c) + b0; //+seats
   var apass: u16 = 0;
   while (apass < 8) : (apass += 1) {
     var h: u16 = 0;
@@ -340,7 +347,7 @@ fn attm(l: u16, comptime g: u16) void {
       if (!FR) {
         @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
                @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne), f32), NEl)); //-seats
-               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne + w0), f32), NEl)); //+seats
+               @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * ne + b0), f32), NEl)); //+seats
       }
       sx[Qh * NEl + h] = ab[QD + 2 * dc + 1 + h];
     }
@@ -363,7 +370,7 @@ fn attm(l: u16, comptime g: u16) void {
     }
     if (WIN > 0 and !cg(c)) {   // entries out of the window (or unwritten) score -1e30
       const so = soff(c); //-seats
-      const so = soff(c) + w0; //+seats
+      const so = soff(c) + b0; //+seats
       var e: u16 = 0;
       while (e < NEl) : (e += 1) {
         const sp = spos[so + e];
@@ -383,7 +390,7 @@ fn attm(l: u16, comptime g: u16) void {
     }
     h = 0;
     while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, dc + 1, h * NEl, h * (dc + 1)); } //-seats
-    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb + w0 * (dc + 1)]), NEl, dc + 1, h * NEl, h * (dc + 1)); } //+seats
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb + b0 * (dc + 1)]), NEl, dc + 1, h * NEl, h * (dc + 1)); } //+seats
     pe.send_y(Qh * (dc + 1));
     @fs2h(@set_dsd_length(xh_d, QD), fab.fin(pe.q_ym, QD));
     @fmovs(@set_dsd_length(sx_d, 1 + Qh), fab.fin(pe.q_ym, 1 + Qh));

@@ -122,9 +122,12 @@ fn cache_entries(plan: &Plan, kind: LayerKind) -> Option<f64> {
     let e = &plan.partition.kv_entries;
     match kind {
         LayerKind::Gdn | LayerKind::SharedKv { .. } => None,
-        // (a ring: each seat's sliding ring within its window, the cache the pool's entries)
+        // (a ring: a ring a seat, or each seat's within its window where those take fewer)
         LayerKind::Sliding { .. } if plan.seats > 1 => {
-            Some(f64::from(e.global.unwrap_or(e.per_row)))
+            let pool = e.global.unwrap_or(e.per_row);
+            Some(f64::from(
+                e.sliding.map_or(pool, |n| (n * plan.seats).min(pool)),
+            ))
         }
         LayerKind::Sliding { .. } => Some(f64::from(e.sliding.unwrap_or(e.per_row))),
         LayerKind::Global => Some(f64::from(e.global.unwrap_or(e.per_row))),

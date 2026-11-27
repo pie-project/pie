@@ -89,11 +89,28 @@ const SHARED: &[Code] = &[
     },
 ];
 
+/// A ring of seats whose sliding rings, a seat's each, take fewer entries than the pool's.
+fn fixed_rings(p: &Plan) -> bool {
+    let e = &p.partition.kv_entries;
+    p.seats > 1
+        && e.sliding
+            .is_some_and(|n| n * p.seats < e.global.unwrap_or(e.per_row))
+}
+
 /// The windowed rows' weight image (`kv.csl`): a ring of seats' code past what its attention
-/// rows' moving bytes give (the 12B links at 2 seats and 13 entries a row: 168 B).
-const WINDOWS: &[Code] = &[Code {
-    what: "a ring of seats",
-    on: |p: &Plan| p.seats > 1,
-    anchor: false,
-    bytes: 168.0,
-}];
+/// rows' moving bytes give (the 12B links at 2 seats and 13 entries a row: 168 B), and its
+/// sliding rings a seat's (the shared kernels' measure: 120 B).
+const WINDOWS: &[Code] = &[
+    Code {
+        what: "a ring of seats",
+        on: |p: &Plan| p.seats > 1,
+        anchor: false,
+        bytes: 168.0,
+    },
+    Code {
+        what: "sliding rings a seat",
+        on: fixed_rings,
+        anchor: false,
+        bytes: 120.0,
+    },
+];
