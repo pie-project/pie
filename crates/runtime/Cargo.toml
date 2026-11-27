@@ -121,6 +121,7 @@ wasmtime = { version = "49.0.2", default-features = false, features = [
     "component-model-async",
     "custom-fiber",
     "custom-virtual-memory",
+    "call-hook",
 ] }
 uuid = { version = "1.24.0", features = ["serde", "v4", "js"] }
 wgpu = { version = "30", default-features = false, features = [

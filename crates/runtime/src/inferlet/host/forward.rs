@@ -321,6 +321,7 @@ async fn materialize_channel(
         match state {
             ChannelPoll::Ready(value) => {
                 crate::rt::tab_step("ready: the guest takes it", "a guest's channel read");
+                crate::rt::tab_crossings_from_here();
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
@@ -383,6 +384,7 @@ pub(crate) async fn materialize_channel_blocking(
         match state {
             ChannelPoll::Ready(value) => {
                 crate::rt::tab_step("ready: the guest takes it", "a guest's channel read");
+                crate::rt::tab_crossings_from_here();
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),

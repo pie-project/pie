@@ -181,3 +181,26 @@ pub fn tab_step(what: &'static str, at: &'static str) {
         }
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+static TAB_CROSSINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// In the tab, a guest's crossing to or from the host said, the first 200
+/// since the last value a guest took ([`tab_crossings_from_here`]): what it
+/// does after taking it. Elsewhere nothing.
+#[allow(unused_variables)]
+pub fn tab_crossing(what: &'static str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let n = TAB_CROSSINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 200 {
+            tracing::info!(target: "pie_tab_wait", n, what, "a guest's host crossing");
+        }
+    }
+}
+
+/// A guest took a value: its crossings from here are said again.
+pub fn tab_crossings_from_here() {
+    #[cfg(target_arch = "wasm32")]
+    TAB_CROSSINGS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
