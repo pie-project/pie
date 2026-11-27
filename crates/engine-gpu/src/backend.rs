@@ -133,6 +133,13 @@ pub trait Context<B: Backend> {
         kernels_slang::SEGMENTS as u32
     }
 
+    /// Whether two arguments of one dispatch may bind overlapping views of
+    /// a buffer ([`kernels_slang::Encode::binds_overlap`]): false where the
+    /// device's API refuses them (a browser's WebGPU).
+    fn binds_overlap(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str;
 
     fn cores(&self) -> u32;

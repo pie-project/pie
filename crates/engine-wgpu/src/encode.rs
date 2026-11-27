@@ -274,6 +274,10 @@ impl Encode for Sink<'_> {
     fn target(&self) -> Target {
         Target::Wgsl
     }
+
+    fn binds_overlap(&self) -> bool {
+        !crate::device::pipelines::exact_views(self.device.core().one_segment())
+    }
 }
 
 #[cfg(feature = "wgpu")]

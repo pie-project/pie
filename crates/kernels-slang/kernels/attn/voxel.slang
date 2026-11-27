@@ -16,8 +16,15 @@
 #define VPT (PIE_C_MAX / LANES)
 
 [[vk::binding(0)]] StructuredBuffer<uint> q;
+#if defined(PIE_VOXEL_SELF)
+// Self-attention over one view (`q`, `k` and `v` one value): read through
+// its one binding, where a host refuses two views of a buffer that overlap.
+#define k q
+#define v q
+#else
 [[vk::binding(1)]] StructuredBuffer<uint> k;
 [[vk::binding(2)]] StructuredBuffer<uint> v;
+#endif
 [[vk::binding(3)]] RWStructuredBuffer<uint> y;
 [[vk::binding(4)]] StructuredBuffer<int> grid;
 
@@ -166,3 +173,6 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // WGSL's workgroup memory (16 KiB by default) holds four 1024-wide strips
 // of accumulators but not the query beside them.
 // pie:instantiate attn_voxel_bf16_c_1024 PIE_C_MAX=1024 PIE_TARGET=spirv
+// The self forms, for the tab (`Encode::binds_overlap` false there).
+// pie:instantiate attn_voxel_self_bf16_c_256 PIE_C_MAX=256 PIE_VOXEL_SELF=1 PIE_TARGET=wgsl
+// pie:instantiate attn_voxel_self_bf16_c_512 PIE_C_MAX=512 PIE_VOXEL_SELF=1 PIE_TARGET=wgsl

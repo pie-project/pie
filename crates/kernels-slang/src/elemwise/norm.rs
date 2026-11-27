@@ -433,12 +433,18 @@ pub fn res_blend(
     let lanes = rows
         .checked_mul(GROUP)
         .ok_or_else(|| refuse(OP, format!("the grid will not launch: {rows} rows")))?;
-    let stack = blocks.first().copied().unwrap_or(prefix);
+    // No blocks: the stack is never read; where two views of a buffer may
+    // not overlap it binds none rather than the prefix again.
+    let stack = match blocks.first() {
+        Some(stack) => stack.arg(),
+        None if !ctx.binds_overlap() => ctx.absent()?,
+        None => prefix.arg(),
+    };
     ctx.fire(
         Fire::at(NORM, entry).apply(Grid::of([lanes, 1, 1], [GROUP, 1, 1])),
         &[
             prefix.arg(),
-            stack.arg(),
+            stack,
             weight.arg(),
             proj.arg(),
             y.arg_mut(),

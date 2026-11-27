@@ -65,6 +65,10 @@ pub struct Facts {
     table_align: u64,
     tier: kernels_slang::Tier,
     books: Arc<Books>,
+    /// The device's pool's segments and whether it binds overlapping views:
+    /// the kernels a walk names follow both.
+    pool_segments: u32,
+    binds_overlap: bool,
 }
 
 impl Facts {
@@ -81,6 +85,8 @@ impl Facts {
             table_align: B::table_align(device),
             tier: B::tier(device),
             books: Arc::new(Books::apart()),
+            pool_segments: device.pool_segments(),
+            binds_overlap: device.binds_overlap(),
         }
     }
 }
@@ -101,6 +107,14 @@ impl<B: Serve> Context<Named<B>> for Facts {
 
     fn max_buffer(&self) -> u64 {
         self.max_buffer
+    }
+
+    fn pool_segments(&self) -> u32 {
+        self.pool_segments
+    }
+
+    fn binds_overlap(&self) -> bool {
+        self.binds_overlap
     }
 
     fn name(&self) -> &str {
@@ -397,6 +411,10 @@ impl kernels_slang::Encode for Naming<'_> {
     fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
         self.0.naming()
     }
+
+    fn binds_overlap(&self) -> bool {
+        self.0.binds_overlap()
+    }
 }
 
 impl<B: Serve> Serve for Named<B> {
@@ -534,11 +552,12 @@ impl<B: Serve> Serve for Named<B> {
     }
 
     fn sink<'f>(
-        _device: &'f Facts,
+        device: &'f Facts,
         frame: &'f NoFrame,
         pipelines: &'f Asked<B>,
         _handles: &'f Handles<Named<B>>,
     ) -> Naming<'f> {
+        pipelines.0.binds_overlap.set(device.binds_overlap);
         Naming(
             &pipelines.0,
             crate::probe::set_frame(std::ptr::from_ref(frame)),

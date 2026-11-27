@@ -737,6 +737,10 @@ impl kernels_slang::Encode for Recording<'_, '_> {
         self.inner.target()
     }
 
+    fn binds_overlap(&self) -> bool {
+        self.inner.binds_overlap()
+    }
+
     fn comm(
         &self,
         op: &'static str,

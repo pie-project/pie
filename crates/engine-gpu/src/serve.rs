@@ -9975,6 +9975,10 @@ impl<S: kernels_slang::Encode> kernels_slang::Encode for Encoded<S> {
     fn fixed_rows(&self) -> bool {
         self.0.fixed_rows()
     }
+
+    fn binds_overlap(&self) -> bool {
+        self.0.binds_overlap()
+    }
 }
 
 /// An f32 cell lands in a bf16 seat rounded; any other as it is.

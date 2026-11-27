@@ -300,10 +300,17 @@ pub fn kv_append(
     let width = width.div_ceil(2);
 
     let values = usize::from(k_pe.width != 0);
+    // No rope tail: never read; where two views of a buffer may not overlap
+    // it binds none rather than the latent's view again.
+    let k_pe_arg = if k_pe.width == 0 && k_pe.buf == kv_c.buf && !ctx.binds_overlap() {
+        ctx.absent()?
+    } else {
+        k_pe.arg()
+    };
     ctx.fire(
         Fire::at(MLA, entry).apply(Grid::of([width, rows, 1], [256, 1, 1])),
         &[
-            &[kv_c.arg(), k_pe.arg(), write_page.arg(), write_offset.arg()][..],
+            &[kv_c.arg(), k_pe_arg, write_page.arg(), write_offset.arg()][..],
             &pool.pool.args(true),
             &[
                 pool.pool.words.arg(),

@@ -55,6 +55,9 @@ pub struct Names {
     named: RefCell<Named>,
     /// The most rows a fire of the load may bring ([`Names::bound_rows`]).
     most_rows: std::cell::Cell<u32>,
+    /// Whether the device the walk names for binds overlapping views
+    /// ([`kernels_slang::Encode::binds_overlap`]), its sink states it.
+    pub(crate) binds_overlap: std::cell::Cell<bool>,
 }
 
 impl Names {
@@ -64,6 +67,7 @@ impl Names {
             target,
             named: RefCell::new(Named::default()),
             most_rows: std::cell::Cell::new(0),
+            binds_overlap: std::cell::Cell::new(true),
         }
     }
 
@@ -150,6 +154,10 @@ impl kernels_slang::Encode for Names {
 
     fn naming(&self) -> Option<&dyn kernels_slang::Naming> {
         Some(self)
+    }
+
+    fn binds_overlap(&self) -> bool {
+        self.binds_overlap.get()
     }
 }
 

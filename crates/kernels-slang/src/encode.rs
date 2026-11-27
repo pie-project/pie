@@ -128,6 +128,14 @@ pub trait Encode {
         true
     }
 
+    /// Whether two arguments of one fire may bind overlapping views of a
+    /// buffer: false where the host's API refuses them (a browser's
+    /// WebGPU), where a kernel reading one value at two arguments takes
+    /// its form that reads it through one binding.
+    fn binds_overlap(&self) -> bool {
+        true
+    }
+
     /// The sink's naming side, where it names kernels and fires none: a
     /// host that picks its kernel by the rows of a fire then states every
     /// kernel its widths allow ([`Naming::either`]) and fires nothing.

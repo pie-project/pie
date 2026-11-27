@@ -367,22 +367,36 @@ impl<B: Backend> Run<'_, B> {
                 segment,
                 sm_scale,
                 o,
-            } => kernels_slang::attn::voxel::attention(
-                self.ctx,
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*v),
-                self.tensor(*grid),
-                match segment {
-                    poem_ir::VoxelSegment::Clip => kernels_slang::attn::voxel::Segment::Clip,
-                    poem_ir::VoxelSegment::Frames(n) => {
-                        kernels_slang::attn::voxel::Segment::Frames(*n)
-                    }
-                },
-                *sm_scale,
-                self.tensor(*o),
-                self.grid_base(*grid, *q),
-            ),
+            } => {
+                // One value at several of the three is one tensor, so the
+                // kernel can read it through one binding where the host
+                // refuses overlapping views (`Encode::binds_overlap`).
+                let tq = self.tensor(*q);
+                let tk = if k == q { tq } else { self.tensor(*k) };
+                let tv = if v == q {
+                    tq
+                } else if v == k {
+                    tk
+                } else {
+                    self.tensor(*v)
+                };
+                kernels_slang::attn::voxel::attention(
+                    self.ctx,
+                    tq,
+                    tk,
+                    tv,
+                    self.tensor(*grid),
+                    match segment {
+                        poem_ir::VoxelSegment::Clip => kernels_slang::attn::voxel::Segment::Clip,
+                        poem_ir::VoxelSegment::Frames(n) => {
+                            kernels_slang::attn::voxel::Segment::Frames(*n)
+                        }
+                    },
+                    *sm_scale,
+                    self.tensor(*o),
+                    self.grid_base(*grid, *q),
+                )
+            }
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,

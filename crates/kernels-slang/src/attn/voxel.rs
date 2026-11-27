@@ -94,7 +94,23 @@ pub fn attention(
     if q.rows == 0 {
         return Ok(());
     }
-    let entry = entry(channels)?;
+    // One value at all three, where the host binds no two overlapping
+    // views of a buffer: the form reading it through one binding.
+    let one_view = q == k && k == v && !ctx.binds_overlap();
+    let entry = match (one_view, entry(channels)?) {
+        (true, "attn_voxel_bf16_c_256") => "attn_voxel_self_bf16_c_256",
+        (true, "attn_voxel_bf16_c_512") => "attn_voxel_self_bf16_c_512",
+        (true, other) => {
+            return Err(refuse(
+                OP,
+                format!(
+                    "one value at the query, key and value of a {channels}-wide head, which \
+                     `{other}` reads through three views this host refuses to overlap"
+                ),
+            ));
+        }
+        (false, entry) => entry,
+    };
     let (shape, span) = row_grid(THREADS, q.rows, THREADS);
     ctx.fire(
         Fire::at(VOXEL, entry).apply(shape),

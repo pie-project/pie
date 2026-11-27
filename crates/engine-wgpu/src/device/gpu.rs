@@ -81,6 +81,10 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::pool_segments(self)
     }
 
+    fn binds_overlap(&self) -> bool {
+        !crate::device::pipelines::exact_views(self.core().one_segment())
+    }
+
     fn name(&self) -> &str {
         Context::name(self)
     }
