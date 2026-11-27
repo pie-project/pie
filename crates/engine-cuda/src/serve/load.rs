@@ -769,6 +769,7 @@ impl Shell {
             (boot.page_size, boot.context, boot.slots),
             &boot.kv_budget,
             boot.knobs.weight_pin(),
+            boot.knobs.weights_held,
         );
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
