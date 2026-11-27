@@ -1057,7 +1057,7 @@ where
         .map_err(fault)?;
         self.programs.load(&place(&shell)).map_err(refusal)?;
         shell.programs_placed();
-        let started = std::time::Instant::now();
+        let started = crate::Instant::now();
         let walked = shell.walk_binds().map_err(fault)?;
         if walked > 0 {
             tracing::info!(
@@ -1088,7 +1088,7 @@ where
         // second bind walk, and what it walked is the load's; where the
         // settle changed no pick, every shape binds what the first walk
         // built, and there is none.
-        let settling = std::time::Instant::now();
+        let settling = crate::Instant::now();
         let picks = shell.dense_picks().clone();
         shell.settle_dense().map_err(fault)?;
         shell.lay_behind_probe().map_err(fault)?;
@@ -1237,7 +1237,7 @@ where
         shell.steps = Some(caps.steps.shapes.clone());
         // The bodies are armed last, once every kernel a fire takes is
         // settled: a body records the kernels its fires walk.
-        let started = std::time::Instant::now();
+        let started = crate::Instant::now();
         let bodies = shell
             .record_bodies(Some(&caps.steps.shapes))
             .map_err(fault)?;
@@ -1619,7 +1619,7 @@ where
                 "the standard samplers prewarmed before load".to_owned(),
             ));
         }
-        let started = std::time::Instant::now();
+        let started = crate::Instant::now();
         let prewarmed = crate::program::prewarm(registrations).map_err(refusal)?;
         for &call in &prewarmed.calls {
             if let Some(why) = self.programs.unbuilt(call) {

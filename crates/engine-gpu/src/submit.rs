@@ -395,7 +395,7 @@ impl<B: Serve> Probe<B> {
     /// timestamps, else the host's clock around the submit and the wait. A
     /// backend that keeps recordings replays the one laid at load.
     pub fn fire(&self, device: &B::Context) -> crate::error::Result<f64> {
-        let started = std::time::Instant::now();
+        let started = crate::Instant::now();
         let work = (self.tactic, self.act, self.weight, self.out);
         let span = B::replay_probe(device, &self.probed, &|frame| {
             Self::encode(
@@ -558,20 +558,20 @@ impl DeviceTime {
 /// clock across shapes.
 #[derive(Debug, Clone, Default)]
 pub struct Measured {
-    landed: std::collections::VecDeque<(std::time::Instant, u32, f64)>,
+    landed: std::collections::VecDeque<(crate::Instant, u32, f64)>,
 }
 
 impl Measured {
     /// A fire under rung `rung` landed at `at`, its measured ratio `ratio`
     /// (at full clock where its clock is known).
-    pub fn landed(&mut self, at: std::time::Instant, rung: u32, ratio: f64) {
+    pub fn landed(&mut self, at: crate::Instant, rung: u32, ratio: f64) {
         if ratio.is_finite() && ratio > 0.0 {
             self.landed.push_back((at, rung, ratio));
         }
     }
 
     /// Drops what landed before `since`.
-    pub fn since(&mut self, since: std::time::Instant) {
+    pub fn since(&mut self, since: crate::Instant) {
         while self.landed.front().is_some_and(|&(at, ..)| at < since) {
             self.landed.pop_front();
         }
@@ -782,7 +782,7 @@ impl SubmitBound {
     /// It ran `rows` rows: kept under their rung ([`Measured`]).
     pub fn landed(
         &mut self,
-        at: std::time::Instant,
+        at: crate::Instant,
         rows: u32,
         estimate_ns: f64,
         device_ns: u64,
@@ -824,7 +824,7 @@ impl SubmitBound {
 
     /// Drops the measured fires that landed more than one bound before
     /// `now`.
-    pub fn age(&mut self, now: std::time::Instant) {
+    pub fn age(&mut self, now: crate::Instant) {
         if let Some(since) = now.checked_sub(std::time::Duration::from_nanos(self.bound_ns as u64))
         {
             self.measured.since(since);
@@ -1467,7 +1467,7 @@ mod tests {
         };
         assert!(matches!(b.admit(step), Admitted::Whole { .. }));
         assert_eq!(b.ratio_now(), worst);
-        let t0 = std::time::Instant::now();
+        let t0 = crate::Instant::now();
         let ms = |n: u64| std::time::Duration::from_millis(n);
         let fire = 100.0 * MS;
         let mut read = Vec::new();

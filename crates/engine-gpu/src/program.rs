@@ -164,7 +164,7 @@ pub fn prewarm(registrations: &[ProgramRegistration]) -> Result<Prewarmed, Refus
                         let Some(registration) = registrations.get(at) else {
                             return mine;
                         };
-                        let started = std::time::Instant::now();
+                        let started = crate::Instant::now();
                         let prepared = adopt(registration);
                         mine.push((at, prepared, started.elapsed()));
                     }

@@ -26,7 +26,7 @@ use crate::policy::share::ShareAs;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use crate::rt::wall::Instant;
 
 use client_api::props::{self, Props};
 

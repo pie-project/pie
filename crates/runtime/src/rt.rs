@@ -55,6 +55,15 @@ mod imp {
 
 pub use imp::*;
 
+/// The wall clock, never the test clock: std's, or on wasm32, where std's
+/// panics, the page's.
+pub mod wall {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use std::time::Instant;
+    #[cfg(target_arch = "wasm32")]
+    pub use web_std::time::Instant;
+}
+
 /// The clock the runtime's `Instant` reads under test: the wall clock, or,
 /// on a thread that turned it on ([`test_clock::start`]), a virtual clock
 /// the test advances itself ([`test_clock::advance`]), so a seeded

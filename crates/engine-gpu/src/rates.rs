@@ -1125,7 +1125,7 @@ impl<'a, B: Serve> Rig<'a, B> {
             // one another unawaited; the last, `then` on it, timed; the
             // queue's time the host's from the first commit to the last
             // landing (the adapter's span would time the last frame alone).
-            let started = std::time::Instant::now();
+            let started = crate::Instant::now();
             let mut pending = std::collections::VecDeque::with_capacity(QUEUED);
             for _ in 1..count {
                 // No more than [`QUEUED`] frames in flight: the oldest
@@ -1135,7 +1135,7 @@ impl<'a, B: Serve> Rig<'a, B> {
                 {
                     crate::backend::Pending::wait(&oldest)?;
                 }
-                let laying = std::time::Instant::now();
+                let laying = crate::Instant::now();
                 let f = self.device.frame()?;
                 {
                     let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
@@ -1147,7 +1147,7 @@ impl<'a, B: Serve> Rig<'a, B> {
                 pending.push_back(crate::backend::Frame::commit_async(f, None)?);
                 host_ns += laying.elapsed().as_nanos() as u64;
             }
-            let laying = std::time::Instant::now();
+            let laying = crate::Instant::now();
             let mut f = self.device.spanned()?;
             {
                 let sink = B::sink(self.device, &f, &self.pipelines, &self.handles);
@@ -3950,7 +3950,7 @@ pub fn resident_for_skip<B: Serve, T: Tactics + ?Sized>(
     timer: Timer<'_, B>,
     max_submit: Option<std::time::Duration>,
 ) -> Result<(f64, u128)> {
-    let started = std::time::Instant::now();
+    let started = crate::Instant::now();
     let mut rig = Rig::<B>::new(device, max_submit);
     rig.quick = true;
     // Both matmuls compute-bound at their depth: a plane read warm or cold

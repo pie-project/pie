@@ -29,7 +29,7 @@ pub fn none_active() -> bool {
 static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When the last active pipeline parked or closed (none active since).
-static IDLE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static IDLE_AT: Mutex<Option<crate::rt::wall::Instant>> = Mutex::new(None);
 
 /// How many pipelines have opened so far ([`OPENED`]).
 #[must_use]
@@ -113,7 +113,7 @@ impl Pipeline {
                 // engines measure behind serving starts once a grace of one
                 // served step has passed with none opening (a back-to-back
                 // request opens inside it and pays nothing).
-                *IDLE_AT.lock().unwrap() = Some(std::time::Instant::now());
+                *IDLE_AT.lock().unwrap() = Some(crate::rt::wall::Instant::now());
                 crate::scheduler::lane::turn_behind_after();
             }
         }

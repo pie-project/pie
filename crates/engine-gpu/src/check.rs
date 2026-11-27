@@ -4,8 +4,8 @@
 //! timed to its landing, and a walked fire dissected by the backend's
 //! per-dispatch device timestamps.
 
+use crate::Instant;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use engine::load::CheckFire;
 use engine::load::check::{Dissection, Fired, Run, Shell as CheckShell, Weighed};

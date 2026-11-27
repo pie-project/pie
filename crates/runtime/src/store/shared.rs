@@ -111,7 +111,7 @@ struct RungGate {
     /// What the pool's walker awaits now and since when (a lane op's reply:
     /// a segment move, an evacuation, a rung's notice), `None` between: a
     /// stall's dump says it ([`walk_waiting`]).
-    walk_waiting: Mutex<Option<(String, std::time::Instant)>>,
+    walk_waiting: Mutex<Option<(String, crate::rt::wall::Instant)>>,
 }
 
 /// What `engine`'s walker awaits now and for how long, for a stall's dump:
@@ -128,7 +128,7 @@ pub fn walk_waiting(engine: usize) -> Option<(String, std::time::Duration)> {
 
 /// Marks `engine`'s walker awaiting `what` until the guard drops.
 pub(crate) fn walk_awaits(engine: usize, what: String) -> WalkAwait {
-    *rung_gate(engine).walk_waiting.lock().unwrap() = Some((what, std::time::Instant::now()));
+    *rung_gate(engine).walk_waiting.lock().unwrap() = Some((what, crate::rt::wall::Instant::now()));
     WalkAwait(engine)
 }
 

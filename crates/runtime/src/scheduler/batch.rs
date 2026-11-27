@@ -770,7 +770,7 @@ mod tests {
 
     fn pending(request: FireRequest, instance_id: InstanceId) -> Box<PendingRequest> {
         Box::new(PendingRequest {
-            queued: std::time::Instant::now(),
+            queued: crate::rt::wall::Instant::now(),
             lora_program: false,
             logical_fire_id: 1,
             request,

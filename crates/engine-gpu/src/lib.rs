@@ -2,6 +2,13 @@
 //! over a [`Backend`]: the API half (buffers, frames, kernel encoding) stays
 //! in each backend crate, which instantiates these types with its own.
 
+/// The clock this crate reads: std's, or on wasm32, where std's panics, the
+/// page's (`web_std`), as engine-wgpu's and the runtime's are.
+#[cfg(not(target_arch = "wasm32"))]
+pub type Instant = std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+pub type Instant = web_std::time::Instant;
+
 pub mod adapter;
 pub mod api;
 pub mod arena;

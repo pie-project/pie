@@ -247,7 +247,7 @@ pub struct FireBindings {
 struct Split {
     layer: Option<u32>,
     step: Option<engine::StepDone>,
-    since: std::time::Instant,
+    since: crate::Instant,
     /// The layers a submission takes, and the layers begun since the last.
     each: u32,
     begun: u32,
@@ -390,7 +390,7 @@ impl<'c, B: Backend> Run<'c, B> {
         self.split = Some(Split {
             layer: None,
             step,
-            since: std::time::Instant::now(),
+            since: crate::Instant::now(),
             each: each.max(1),
             begun: 0,
         });
@@ -418,9 +418,9 @@ impl<'c, B: Backend> Run<'c, B> {
                 split.begun % split.each == 0
             }
         {
-            let at = std::time::Instant::now();
+            let at = crate::Instant::now();
             let flushed = B::submit_recording();
-            let done = std::time::Instant::now();
+            let done = crate::Instant::now();
             // Each layer's submission said where the platform's bound is
             // held (`crate::submit`): the wall from the last submission's
             // return to this one's (the host's encoding of the layer, or

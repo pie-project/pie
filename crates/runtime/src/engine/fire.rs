@@ -166,7 +166,7 @@ pub struct StepFire {
     pub instances: Vec<::engine::InstanceId>,
     /// Each fire's logical id and when its request was handed to the
     /// scheduler, where known (a debug check names a stale request by them).
-    pub fire_stamps: Vec<(u64, std::time::Instant)>,
+    pub fire_stamps: Vec<(u64, crate::rt::wall::Instant)>,
     /// Each lane's kv set, in lane order, where known.
     pub lane_sets: Vec<Option<crate::store::kv::page_table::WorkingSetId>>,
     /// The load's stated step set the step's shape (`submission.shape`) is

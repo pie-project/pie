@@ -181,7 +181,7 @@ pub(crate) struct PendingRequest {
     /// When it was handed to the scheduler: a request's lanes name the
     /// slots its stores held then (a debug check at the engine says how
     /// long ago).
-    pub(crate) queued: std::time::Instant,
+    pub(crate) queued: crate::rt::wall::Instant,
     pub(crate) request: crate::engine::FireRequest,
     pub(crate) instance_id: ::engine::InstanceId,
     pub(crate) completion: WorkItemCompletion,
@@ -215,7 +215,7 @@ impl PendingRequest {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             logical_fire_id,
-            queued: std::time::Instant::now(),
+            queued: crate::rt::wall::Instant::now(),
             request,
             instance_id,
             completion,

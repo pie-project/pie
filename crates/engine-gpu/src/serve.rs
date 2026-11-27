@@ -1562,7 +1562,7 @@ impl<B: Serve> Shell<B> {
     pub fn load(boot: Boot<'_, B>) -> Result<Shell<B>> {
         // Each phase's time, said once the load stands: what a boot that
         // measures nothing still spends, by name.
-        let started = std::time::Instant::now();
+        let started = crate::Instant::now();
         let (boot, mut fitted) = Shell::fit(boot)?;
         let opened = started.elapsed();
         let mut asks = Shell::name(&boot, &fitted, None)?;
@@ -1574,7 +1574,7 @@ impl<B: Serve> Shell<B> {
         // kernels the curves pick.
         let top = asks.rungs.iter().copied().max().unwrap_or(1);
         if Shell::rate_shapes(&boot, &mut fitted, top)? {
-            let started = std::time::Instant::now();
+            let started = crate::Instant::now();
             asks = Shell::name(&boot, &fitted, None)?;
             tracing::info!(
                 top,
@@ -2621,7 +2621,7 @@ impl<B: Serve> Shell<B> {
                     .then_some(counts_of_rates.attn_head_dim),
                 recurrent: counts_of_rates.state_elements_per_row > 0,
             };
-            let started = std::time::Instant::now();
+            let started = crate::Instant::now();
             let times = B::time_for_bound(&device, &tuning, tier, bound, &at)?;
             // What a layer states stands; the timed fill the rest.
             let rates = device_profile.rates().over(times.rates(&at));
@@ -3890,7 +3890,7 @@ impl<B: Serve> Shell<B> {
             self.behind = Some(behind);
             return Ok(false);
         }
-        let began = std::time::Instant::now();
+        let began = crate::Instant::now();
         // What serving counts of its fires is serving's alone.
         let counts = (
             self.recorded,
@@ -4426,13 +4426,13 @@ impl<B: Serve> Shell<B> {
         let submitted = others();
         self.drain()?;
         self.spans = Some(Vec::new());
-        let began = std::time::Instant::now();
+        let began = crate::Instant::now();
         self.fire_seated(&seated)?;
         let host = began.elapsed().as_secs_f64() * 1e9;
         let spans = self.spans.take().unwrap_or_default();
         // The device's times, filled once its steps landed (a backend may
         // fill one a moment after it saw the landing).
-        let read = std::time::Instant::now();
+        let read = crate::Instant::now();
         while spans.iter().any(|time| time.get().is_none())
             && read.elapsed() < std::time::Duration::from_secs(1)
         {
@@ -7117,7 +7117,7 @@ impl<B: Serve> Shell<B> {
         let Some(held) = self.submit_bound.as_mut() else {
             return;
         };
-        let now = std::time::Instant::now();
+        let now = crate::Instant::now();
         let last = &mut self.last_landed;
         self.timing.retain(|(estimate, time)| match time.get() {
             None => true,
@@ -8926,7 +8926,7 @@ impl<B: Serve> Shell<B> {
         let Some(frame) = B::lay_frame(&self.device, prepared.arm)? else {
             return Ok(false);
         };
-        let at = std::time::Instant::now();
+        let at = crate::Instant::now();
         // What the pass mints goes again after it; the fire's own staged
         // rows stand, for a walk of it the pass fills no family for.
         let mark = self.handles.len();
