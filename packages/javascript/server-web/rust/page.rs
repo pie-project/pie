@@ -51,8 +51,12 @@ pub fn pie_init(log_filter: Option<String>) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pie_tick() -> f64 {
-    let wasi_next = wasmtime_web::fire_due_timers();
+    wasmtime_web::fire_due_timers();
     let next = web_std::tick(100_000);
+    // Read after the tick: a guest the tick ran may have set a timer (a WASI
+    // clock wait), which the page must wake for; read before it, that timer
+    // went unseen and the page slept with no tick to come.
+    let wasi_next = wasmtime_web::next_timer();
     let now = wasmtime_web::now();
     let wasi_ms = wasi_next.map(|deadline| deadline.saturating_sub(now) as f64 / 1_000_000.0);
     let rt_ms = next.map(|d| d.as_secs_f64() * 1000.0);
