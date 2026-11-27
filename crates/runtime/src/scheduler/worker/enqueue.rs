@@ -179,6 +179,7 @@ impl BatchScheduler {
                 frame_policy.on_lane_park(lane, seq);
             }
             SchedulerItem::PrepareProgram { program, response } => {
+                crate::rt::tab_step("queues PrepareProgram", "the scheduler");
                 pending.push_back(QueuedItem::PrepareProgram { program, response });
             }
             SchedulerItem::FinishProgram { prepared, response } => {

@@ -1592,6 +1592,7 @@ impl Lane {
                     panicked
                 }
                 LaneRequest::Control { item, reply } => {
+                    crate::rt::tab_step("takes a control", "the lane");
                     let _in = InCall::new(engine_idx, control_call(&item));
                     let on_panic = Self::commit_on_failure(&item, LANE_PANICKED);
                     // A control call may put work on the device (a copy, an
