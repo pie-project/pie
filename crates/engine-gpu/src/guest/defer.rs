@@ -63,7 +63,16 @@ impl Owed {
     pub fn wait(&self, cell: (u32, u64), faulted: &AtomicBool) {
         let mut cells = self.cells.lock().expect("landing lock poisoned");
         while cells.contains(&cell) && !faulted.load(Ordering::Acquire) {
-            cells = self.landed.wait(cells).expect("landing lock poisoned");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                cells = self.landed.wait(cells).expect("landing lock poisoned");
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                drop(cells);
+                crate::yield_turn("a channel cell's landing");
+                cells = self.cells.lock().expect("landing lock poisoned");
+            }
         }
     }
 }

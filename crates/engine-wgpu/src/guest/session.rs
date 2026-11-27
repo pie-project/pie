@@ -1277,7 +1277,7 @@ impl Session {
         }
         let (heap, base, _) = self.heap_at(stage)?;
         let heap = heap.clone();
-        let outbox = frame.guest_outbox(&self.library.outboxes);
+        let outbox = frame.guest_outbox(&self.library.outboxes)?;
         let into = outbox.reserve(cursor)?;
         let (status, status_at) = match (&self.library.mirrors, &self.mirror) {
             (Some(mirrors), Some(mirror)) => (&mirrors.status, mirror.status),

@@ -81,7 +81,16 @@ impl<T> Ring<T> {
                     bytes: want,
                 });
             }
-            taken = self.given.wait(taken).expect("ring lock poisoned");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                taken = self.given.wait(taken).expect("ring lock poisoned");
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                drop(taken);
+                crate::yield_turn("room in a guest ring");
+                taken = self.taken.lock().expect("ring lock poisoned");
+            }
         }
     }
 

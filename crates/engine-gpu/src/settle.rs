@@ -432,7 +432,16 @@ impl FedCheck {
         let fed = &*self.inner;
         let mut state = fed.faults.lock().expect("fed lock poisoned");
         while state.faults.is_none() {
-            state = fed.ready.wait(state).expect("fed lock poisoned");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                state = fed.ready.wait(state).expect("fed lock poisoned");
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                drop(state);
+                crate::yield_turn("a fed check's faults");
+                state = fed.faults.lock().expect("fed lock poisoned");
+            }
         }
         state.faults.clone().unwrap_or_default()
     }

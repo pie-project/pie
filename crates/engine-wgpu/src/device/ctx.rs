@@ -1196,9 +1196,12 @@ impl Frame {
     pub(crate) fn guest_outbox(
         &self,
         pool: &Arc<crate::guest::outbox::Pool>,
-    ) -> Arc<crate::guest::outbox::Outbox> {
+    ) -> Result<Arc<crate::guest::outbox::Outbox>> {
         let mut guest = self.inner.guest.lock().expect("guest lock poisoned");
-        Arc::clone(guest.outbox.get_or_insert_with(|| pool.take()))
+        if guest.outbox.is_none() {
+            guest.outbox = Some(pool.take()?);
+        }
+        Ok(Arc::clone(guest.outbox.as_ref().expect("just taken")))
     }
 
     /// Where `bytes` of a widen's rows go in the widen's table region, past

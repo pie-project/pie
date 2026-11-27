@@ -187,9 +187,15 @@ fn requote_on_drift(
 /// settle runs where it is asked.
 fn settled_off_lane(settle: impl FnOnce() + Send + 'static) {
     type Settle = Box<dyn FnOnce() + Send>;
-    static SETTLER: std::sync::LazyLock<std::sync::Mutex<std::sync::mpsc::Sender<Settle>>> =
+    // In the tab the queue is web_std's: its recv parks the settle green
+    // thread, where std's spin-waits on the page's only thread.
+    #[cfg(target_arch = "wasm32")]
+    use crate::rt::channel::{Sender, unbounded as channel};
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::mpsc::{Sender, channel};
+    static SETTLER: std::sync::LazyLock<std::sync::Mutex<Sender<Settle>>> =
         std::sync::LazyLock::new(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<Settle>();
+            let (tx, rx) = channel::<Settle>();
             crate::rt::thread::Builder::new()
                 .name("pie-kv-settle".to_string())
                 .spawn(move || {
@@ -203,9 +209,8 @@ fn settled_off_lane(settle: impl FnOnce() + Send + 'static) {
     if !crate::scheduler::lane::on_engine_lane() {
         return settle();
     }
-    if let Err(std::sync::mpsc::SendError(settle)) = SETTLER.lock().unwrap().send(Box::new(settle))
-    {
-        settle();
+    if let Err(error) = SETTLER.lock().unwrap().send(Box::new(settle)) {
+        (error.0)();
     }
 }
 

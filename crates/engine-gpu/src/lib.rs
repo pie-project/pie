@@ -71,3 +71,17 @@ pub fn tab_step(what: &'static str, at: &'static str) {
         }
     }
 }
+
+/// In the tab, a turn given up while a wait's condition does not hold: the
+/// green thread waiting yields to the page's other tasks (one of which makes
+/// it hold) and is polled again, where natively the waiter blocks on its
+/// Condvar. Off a green thread there is no turn to give: refused by name
+/// rather than spun on the page's only thread.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn yield_turn(what: &'static str) {
+    assert!(
+        web_std::thread::in_green_thread(),
+        "{what} would wait on the tab's only thread off a green thread"
+    );
+    web_std::thread::yield_now();
+}

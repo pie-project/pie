@@ -37,21 +37,43 @@ impl Pool {
         self.bytes
     }
 
-    /// A buffer for a frame's passes, once one is free.
-    pub fn take(self: &Arc<Self>) -> Arc<Outbox> {
+    /// A free readback buffer, waited for where every one is held by a
+    /// frame not yet collected; in the tab, where no wait blocks the page's
+    /// one thread, refused by name instead.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(
+            clippy::never_loop,
+            reason = "the tab refuses where natively it waits and loops"
+        )
+    )]
+    pub fn take(self: &Arc<Self>) -> Result<Arc<Outbox>> {
         let mut free = self.free.lock().expect("outbox pool lock poisoned");
         loop {
             if let Some(buffer) = free.pop() {
                 crate::device::host::tab_wait("takes", "a guest outbox");
-                return Arc::new(Outbox {
+                return Ok(Arc::new(Outbox {
                     buffer: Some(buffer),
                     pool: Arc::clone(self),
                     used: AtomicU64::new(0),
                     collected: OnceLock::new(),
+                }));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                drop(free);
+                return Err(Fault::Ceiling {
+                    what: "free guest readback buffers (every one a frame not yet collected \
+                           holds; the tab waits on none)",
+                    need: 1,
+                    have: 0,
                 });
             }
-            crate::device::host::tab_wait("waits for a free one", "a guest outbox");
-            free = self.given.wait(free).expect("outbox pool lock poisoned");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                crate::device::host::tab_wait("waits for a free one", "a guest outbox");
+                free = self.given.wait(free).expect("outbox pool lock poisoned");
+            }
         }
     }
 

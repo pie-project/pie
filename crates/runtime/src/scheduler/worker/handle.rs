@@ -36,6 +36,14 @@ impl SchedulerHandle {
         }
     }
 
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(
+            clippy::disallowed_methods,
+            reason = "a send finishes within its call on the tab's one thread: no sender is \
+                      active here, so the wait never waits"
+        )
+    )]
     pub(super) fn begin_shutdown(&self) {
         if !self.inner.accepting.swap(false, Ordering::SeqCst) {
             return;
