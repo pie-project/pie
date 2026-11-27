@@ -69,6 +69,7 @@ mod a_ring_page_id_reaches_its_address;
 mod a_row_placed_below_its_floor_is_refused;
 mod a_schedule_is_carved_where_it_is_launched;
 mod a_second_fire_reads_the_input_cells_it_was_handed;
+mod a_second_load_on_a_serving_thread_lays_its_own;
 mod a_served_models_lanes_answer_as_each_lane_alone;
 mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
