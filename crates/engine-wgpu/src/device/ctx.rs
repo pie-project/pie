@@ -124,7 +124,10 @@ impl Timing {
         let slice = self.readback.slice(0..bytes);
         let mapped = Signal::new();
         let deliver = mapped.clone();
-        slice.map_async(wgpu::MapMode::Read, move |r| deliver.notify(r));
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _poke = crate::device::host::Poke;
+            deliver.notify(r);
+        });
         core.kick();
         if !matches!(mapped.park("timestamps"), Ok(Ok(()))) {
             return;
@@ -327,6 +330,7 @@ impl Core {
         let index = self.queue.submit(std::iter::once(buffer));
         let in_flight = Arc::clone(&self.in_flight);
         self.queue.on_submitted_work_done(move || {
+            let _poke = crate::device::host::Poke;
             in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         });
         self.kick();
@@ -342,7 +346,11 @@ impl Core {
     pub(crate) fn wait_for(&self, _index: &wgpu::SubmissionIndex) -> Result<()> {
         let done = Signal::new();
         let landed = done.clone();
-        self.queue.on_submitted_work_done(move || landed.notify(()));
+        self.queue.on_submitted_work_done(move || {
+            let _poke = crate::device::host::Poke;
+            let _poke = crate::device::host::Poke;
+            landed.notify(());
+        });
         self.kick();
         done.park("Device::poll")?;
         self.take_error("submission")
@@ -1639,6 +1647,7 @@ impl Frame {
         let inner = Arc::clone(&self.inner);
         super::host::tab_queue(true);
         core.queue.on_submitted_work_done(move || {
+            let _poke = crate::device::host::Poke;
             super::host::tab_queue(false);
             inner.done.store(true, Ordering::Release);
         });
@@ -1690,7 +1699,10 @@ impl Frame {
         let slice = span.readback.slice(0..16);
         let mapped = Signal::new();
         let deliver = mapped.clone();
-        slice.map_async(wgpu::MapMode::Read, move |r| deliver.notify(r));
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _poke = crate::device::host::Poke;
+            deliver.notify(r);
+        });
         core.kick();
         mapped.park("span readback")?.map_err(|e| Fault::Device {
             call: "span readback",
@@ -1734,12 +1746,14 @@ impl Frame {
         if let Some(span) = span {
             let (core, time) = (Arc::clone(&self.inner.core), self.inner.time.clone());
             self.inner.core.queue.on_submitted_work_done(move || {
+                let _poke = crate::device::host::Poke;
                 read_span(core, span, time);
             });
             self.inner.core.kick();
         } else if wall {
             let time = self.inner.time.clone();
             self.inner.core.queue.on_submitted_work_done(move || {
+                let _poke = crate::device::host::Poke;
                 time.set(submitted.elapsed().as_nanos() as u64);
             });
             self.inner.core.kick();
@@ -1756,6 +1770,7 @@ impl Frame {
     fn watch(&self, on_done: OnDone) {
         let inner = Arc::clone(&self.inner);
         self.inner.core.queue.on_submitted_work_done(move || {
+            let _poke = crate::device::host::Poke;
             let refused = inner.core.take_error("submission").err();
             on_done(refused.map(|fault| fault.to_string()));
         });
@@ -1774,6 +1789,7 @@ fn read_span(core: Arc<Core>, span: Arc<Span>, time: engine_gpu::submit::DeviceT
     readback
         .slice(0..16)
         .map_async(wgpu::MapMode::Read, move |mapped| {
+            let _poke = crate::device::host::Poke;
             if mapped.is_err() {
                 span.busy.store(false, Ordering::Release);
                 time.unread();
@@ -1840,10 +1856,11 @@ impl Pending {
         if !self.inner.done.load(Ordering::Acquire) {
             let done = Signal::new();
             let landed = done.clone();
-            self.inner
-                .core
-                .queue
-                .on_submitted_work_done(move || landed.notify(()));
+            self.inner.core.queue.on_submitted_work_done(move || {
+                let _poke = crate::device::host::Poke;
+                let _poke = crate::device::host::Poke;
+                landed.notify(());
+            });
             self.inner.core.kick();
             done.park("Pending::wait")?;
         }

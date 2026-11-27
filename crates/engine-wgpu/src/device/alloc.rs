@@ -178,6 +178,7 @@ impl Raw {
             self.buffer
                 .slice(start..end)
                 .map_async(wgpu::MapMode::Read, move |result| {
+                    let _poke = crate::device::host::Poke;
                     crate::device::host::tab_wait("mapped", "a readback");
                     let read = result
                         .map_err(|e| core.fault("map_async", e))
@@ -213,6 +214,7 @@ impl Raw {
         staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
+                let _poke = crate::device::host::Poke;
                 crate::device::host::tab_wait("mapped", "a readback");
                 let read = result
                     .map_err(|e| core.fault("map_async", e))

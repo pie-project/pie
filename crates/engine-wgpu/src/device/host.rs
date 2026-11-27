@@ -22,6 +22,20 @@ pub(crate) fn can_block() -> bool {
 
 static PARKED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
+/// Held by every callback WebGPU resolves for the engine (a submission's
+/// work done, a buffer mapped): in the tab, its drop asks the page for a
+/// tick (`web_std::executor::poke`), so a waiter reading what the callback
+/// changed polls again after it, woken or not. Natively nothing: waiters
+/// poll the device there.
+pub(crate) struct Poke;
+
+impl Drop for Poke {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        web_std::executor::poke();
+    }
+}
+
 /// The waits [`tab_wait`] says: the boot's first, and again from ready
 /// ([`tab_wait_from_ready`]), so a serving fire that never lands names where
 /// it stops.
