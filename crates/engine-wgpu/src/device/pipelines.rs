@@ -307,6 +307,97 @@ fn rebase_wgsl(
 
 pub(crate) type View = (wgpu::Buffer, u64, u64);
 
+/// One storage binding of a group as [`aliased`] weighs it: its buffer, its
+/// first byte, its bytes (`None`: to the buffer's end), whether the layout
+/// binds it writable, and whether a dispatch moves it by a dynamic offset
+/// (then it may reach anywhere from its first byte to the buffer's end).
+pub(crate) struct Bound<'a> {
+    pub binding: u32,
+    pub buffer: &'a wgpu::Buffer,
+    pub offset: u64,
+    pub size: Option<std::num::NonZeroU64>,
+    pub writable: bool,
+    pub dynamic: bool,
+}
+
+impl Bound<'_> {
+    fn range(&self) -> (u64, u64) {
+        let end = match self.size {
+            Some(size) if !self.dynamic => self.offset + size.get(),
+            _ => self.buffer.size(),
+        };
+        (self.offset, end)
+    }
+}
+
+/// WebGPU's writable storage binding aliasing rule, which the browser's
+/// implementation enforces and native wgpu does not: no two writable
+/// bindings of one group overlap in one buffer. Every kernel binding is
+/// writable here (`promote_storage`), so any two views of a buffer that
+/// overlap are refused, by `group`'s name, both bindings, their first bytes
+/// and their bytes.
+///
+/// Where it refuses: in the tab, and in a test-limits build whose adapter
+/// takes the one-segment forms (`PIE_TEST_STORAGE_BUFFERS`), so a native
+/// suite finds what the tab would refuse; there `PIE_TEST_ALIASING=log`
+/// says every overlap and refuses none, for a whole list in one run.
+/// Natively it only says each, at debug: native serves its four segments'
+/// overlaps, which wgpu does not check.
+pub(crate) fn aliased(group: &str, bound: &[Bound<'_>], one_segment: bool) -> Result<()> {
+    let refuses = cfg!(target_arch = "wasm32") || (cfg!(feature = "test-limits") && one_segment);
+    #[cfg(feature = "test-limits")]
+    let refuses = refuses && std::env::var("PIE_TEST_ALIASING").as_deref() != Ok("log");
+    for (i, a) in bound.iter().enumerate() {
+        for b in &bound[i + 1..] {
+            if !(a.writable && b.writable) || a.buffer != b.buffer {
+                continue;
+            }
+            let ((a0, a1), (b0, b1)) = (a.range(), b.range());
+            if a0 >= b1 || b0 >= a1 {
+                continue;
+            }
+            let why = format!(
+                "bind group {group:?}: writable bindings {} and {} overlap in one buffer of {} \
+                 bytes: binding {} at {a0} for {} bytes{}, binding {} at {b0} for {} bytes{}",
+                a.binding,
+                b.binding,
+                a.buffer.size(),
+                a.binding,
+                a1 - a0,
+                if a.size.is_none() {
+                    " (to the buffer's end)"
+                } else {
+                    ""
+                },
+                b.binding,
+                b1 - b0,
+                if b.size.is_none() {
+                    " (to the buffer's end)"
+                } else {
+                    ""
+                },
+            );
+            if refuses {
+                return Err(Fault::Device {
+                    call: "create_bind_group",
+                    why,
+                });
+            }
+            // The suites install no subscriber: a listing run reads stderr.
+            #[cfg(feature = "test-limits")]
+            if one_segment {
+                eprintln!("pie_aliasing: {why}");
+            }
+            if one_segment || cfg!(target_arch = "wasm32") {
+                tracing::warn!(target: "pie_aliasing", "{why}");
+            } else {
+                tracing::debug!(target: "pie_aliasing", "{why}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A group by its layout, not its pipeline: kernels of one layout (the
 /// variants of a kernel, by the rows they take) share what a dispatch binds
 /// over the same views, at the same uniform size. One layout serves kernels
@@ -363,6 +454,20 @@ pub(crate) fn group_of(
             }),
         });
     }
+    let bound: Vec<Bound<'_>> = views
+        .iter()
+        .enumerate()
+        .filter(|&(at, _)| at < pipeline.used.len() && pipeline.used[at])
+        .map(|(at, (buffer, offset, size))| Bound {
+            binding: at as u32,
+            buffer,
+            offset: *offset,
+            size: std::num::NonZeroU64::new(*size),
+            writable: !pipeline.read_only[at],
+            dynamic: false,
+        })
+        .collect();
+    aliased(pipeline.name, &bound, pipeline.one_segment)?;
     let layout = match rebased {
         Some(rebased) => {
             let buffer = core.uniform_buffer.get().ok_or_else(|| Fault::Device {

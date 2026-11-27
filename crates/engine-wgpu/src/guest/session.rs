@@ -1281,6 +1281,26 @@ fn segment_group(
             size: std::num::NonZeroU64::new(segment.bytes()),
         })
     }
+    fn bound(binding: u32, segment: &Buffer, dynamic: bool) -> crate::device::pipelines::Bound<'_> {
+        crate::device::pipelines::Bound {
+            binding,
+            buffer: &segment.slab().buffer,
+            offset: 0,
+            size: std::num::NonZeroU64::new(segment.bytes()),
+            writable: true,
+            dynamic,
+        }
+    }
+    crate::device::pipelines::aliased(
+        "pie guest",
+        &[
+            bound(STATUS_BINDING, slots, false),
+            bound(TABLES_BINDING, slots, false),
+            bound(HEAP_BINDING, heap, false),
+            bound(STEP_BINDING, slots, true),
+        ],
+        core.one_segment(),
+    )?;
     let group = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pie guest"),
         layout: binds,
