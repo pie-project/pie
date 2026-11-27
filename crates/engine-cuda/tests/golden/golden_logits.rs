@@ -3250,9 +3250,9 @@ fn golden_held_small() {
 /// `PIE_GOLDEN_KV_MIB`, 256 by default) cannot seat them seats none
 /// (`WeightShape::seated` is `None`: the load's "told held, but the pool's
 /// fitted chunks hold N of M weight chunks" line) and serves from its
-/// pinned host copy, each bank's select on its host-read arm: what it serves
-/// is held to a load of the same fixture with every expert cached in the
-/// pool, every step within [`TOLERANCE`] of that step's spread and the same
+/// pinned host copy, each bank's select on its host-read arm, its residency
+/// seating no expert: what it serves is held to a load of the same fixture
+/// with every expert cached in the pool, every step within [`TOLERANCE`] of that step's spread and the same
 /// greedy token (the cached load's argmax), its distance printed.
 #[test]
 #[ignore = "a probe run by hand: see the module's doc"]
@@ -3283,9 +3283,14 @@ fn golden_held_small_against_cached() {
         let cached = served_experts(&fixture, &cache, Rows::Cached);
         let serving = fixture_as(&model, &cache, true);
         // `served_experts_as` asserts, under the small pool, that the told
-        // load seated none of its weights.
+        // load seated none of its weights. The residency it then names seats
+        // no expert either (`Rows::Host`), as a runtime reading the pool's
+        // chunk facts would: a pool that cannot seat the weights at the load
+        // cannot hold every expert for the runtime, and a residency naming
+        // them all is refused by its slots past the pool's backed range
+        // (`Arena::span`, a refusal of that request, not of the load).
         SMALL_POOL.store(pool, std::sync::atomic::Ordering::Relaxed);
-        let small = served_experts_as(&serving, &cache, Rows::Cached, true);
+        let small = served_experts_as(&serving, &cache, Rows::Host, true);
         SMALL_POOL.store(0, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(small.len(), cached.len(), "{model}: the same steps");
         let (mut worst, mut share, mut picks) = (0f32, 0f32, Vec::new());
