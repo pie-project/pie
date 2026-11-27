@@ -1279,7 +1279,13 @@ impl<B: Backend> Pools<B> {
 
     /// The pool as kernels bind it.
     pub fn segments(&self, handles: &Handles<B>) -> Result<Segments> {
-        self.pool.bind(handles)
+        self.pool.bind(handles, None)
+    }
+
+    /// The pool as a fire's kernels bind it, below its rung's carve where
+    /// `below` states it ([`pool::Pool::bind`]).
+    pub fn segments_below(&self, handles: &Handles<B>, below: Option<u64>) -> Result<Segments> {
+        self.pool.bind(handles, below)
     }
 
     /// The pool is laid whole: its device cannot rebind what a recording
@@ -1419,8 +1425,13 @@ impl<B: Backend> Pools<B> {
     }
 
     /// The cache table one fire binds.
-    pub fn table(&self, handles: &Handles<B>, seats: &Seats) -> Result<CacheTable> {
-        let segments = self.pool.bind(handles)?;
+    pub fn table(
+        &self,
+        handles: &Handles<B>,
+        seats: &Seats,
+        below: Option<u64>,
+    ) -> Result<CacheTable> {
+        let segments = self.pool.bind(handles, below)?;
         let cells = u32::try_from(self.paging.pages() * u64::from(self.paging.page_size))
             .unwrap_or(u32::MAX);
         let fixed_unit = self.unit(FIXED).unwrap_or(4);

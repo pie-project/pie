@@ -344,8 +344,20 @@ fn answers_the_host_path(frames: u8) {
             .expect("the shell stands")
             .pool_layout()
             .seat_chunks();
-        let first = seats.div_ceil(segment) * segment;
-        (first, (first + 3).div_ceil(segment))
+        if facts.segments.max == 1 {
+            // One segment (the tab's form): the test's chunks right past the
+            // seats, below the activation span.
+            let span = facts.act_chunks.iter().map(|&(_, c)| c).max().unwrap_or(0);
+            assert!(
+                seats + 3 <= facts.total_chunks - span,
+                "the test's 3 chunks past {seats} seats lie past the {} below the span",
+                facts.total_chunks - span
+            );
+            (seats, 1)
+        } else {
+            let first = seats.div_ceil(segment) * segment;
+            (first, (first + 3).div_ceil(segment))
+        }
     } else {
         let first = facts.segments.committed * segment;
         (first, facts.segments.committed + 3u32.div_ceil(segment))

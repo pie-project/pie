@@ -469,6 +469,23 @@ impl Sink<'_> {
                         ),
                     ));
                 }
+                // Only where it is none, or the first again: a pool of
+                // planes of their own (`KvPool::planes`) is not one segment,
+                // and the form reads the first in its place.
+                if pipeline.one_segment
+                    && declared > 0
+                    && view.0 != self.device.dummy.buffer
+                    && view.0 != views[declared - 1].0
+                {
+                    return Err(Sink::backend(
+                        fire,
+                        format!(
+                            "argument {at} is a pool segment in a buffer of its own (a pool of \
+                             planes of their own), and the kernel's one-segment form binds the \
+                             pool in one buffer"
+                        ),
+                    ));
+                }
             } else if pipeline.used[at] && view.3 && pipeline.read_only[at] {
                 return Err(Sink::backend(
                     fire,

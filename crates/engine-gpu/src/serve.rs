@@ -2196,6 +2196,7 @@ impl<B: Serve> Shell<B> {
                     budgets.tokens.max_lanes,
                     buffer.bytes,
                     crate::store::layout::gcd(rows.chunk_bytes, buffer.bytes),
+                    device.pool_segments() == 1,
                 );
                 tracing::info!(
                     slot_bytes = buffer.bytes,
@@ -8551,9 +8552,11 @@ impl<B: Serve> Shell<B> {
             .span
             .slots(&self.handles, rung, fire_rows, scored, room)?;
         self.last_capture = self.capture_rows(&composition, &slots);
+        let below = self.carve_below(rung)?;
         let caches = self.pools.table(
             &self.handles,
             &self.inputs[arm].seats(&self.handles, &bound, pages, rows, lane_count),
+            below,
         )?;
 
         let mut geometry = Vec::with_capacity(self.page_tables);
@@ -8699,7 +8702,8 @@ impl<B: Serve> Shell<B> {
                     &self.handles,
                     layout,
                     buffers,
-                    self.pools.segments(&self.handles)?,
+                    self.pools
+                        .segments_below(&self.handles, self.carve_below(rung)?)?,
                     held,
                     rs_plans,
                     rs_carried,
@@ -8819,6 +8823,21 @@ impl<B: Serve> Shell<B> {
             })
             .collect();
         crate::ring::stage(&lanes, tokens, rows, &self.pools.windows()).map(Some)
+    }
+
+    /// Where a fire at rung `rung` binds the pool's last segment up to: its
+    /// carve's start past its fire slots (which lie first there,
+    /// `Span::with_fire_slots`), on a device whose pool is one segment, so the pool's
+    /// binding holds the state and none of the fire's activations (a
+    /// browser's WebGPU refuses two views of one buffer that overlap); the
+    /// whole segment elsewhere, as it serves.
+    fn carve_below(&self, rung: usize) -> Result<Option<u64>> {
+        use crate::backend::Context as _;
+        if self.device.pool_segments() == 1 {
+            self.span.arena_start(rung).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn walk_once(&self, p: &Prepared<'_, B>, keep: bool, split: bool) -> Result<Walked<B>> {
@@ -9035,7 +9054,8 @@ impl<B: Serve> Shell<B> {
                 self.weights.cached_planes(|at| {
                     self.row_caches.streams(at) || self.expert_caches.streams(at)
                 }),
-                self.pools.segments(&self.handles)?,
+                self.pools
+                    .segments_below(&self.handles, self.carve_below(p.rung)?)?,
             );
             if split {
                 run.flush_between_layers(p.done.as_ref().map(|done| done.at), self.split_layers);

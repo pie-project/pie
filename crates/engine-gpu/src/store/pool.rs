@@ -473,12 +473,21 @@ impl<B: Backend> Pool<B> {
     }
 
     /// The pool as kernels bind it: every committed segment, the rest
-    /// their stand-ins (absent before the first commit).
-    pub fn bind(&self, handles: &Handles<B>) -> Result<Segments> {
+    /// their stand-ins (absent before the first commit). Where `below` is
+    /// stated (a fire's rung's carve start in the last segment, on a device
+    /// whose pool is one segment), the last segment is bound up to it: the
+    /// fire's activations lie past it, in their own bindings, and the
+    /// state below it, so no two views of the buffer overlap.
+    pub fn bind(&self, handles: &Handles<B>, below: Option<u64>) -> Result<Segments> {
         let mut bufs = [kernels_slang::ABSENT; SEGMENTS];
+        let last = self.segments.len().saturating_sub(1);
         for (at, segment) in self.segments.iter().enumerate() {
             if let Some(buffer) = segment.as_ref().or(self.stand_ins.get(at)) {
-                bufs[at] = handles.bind(buffer, 0, buffer.bytes())?;
+                let bytes = match below {
+                    Some(below) if at == last && segment.is_some() => below.min(buffer.bytes()),
+                    _ => buffer.bytes(),
+                };
+                bufs[at] = handles.bind(buffer, 0, bytes)?;
             }
         }
         Ok(Segments {

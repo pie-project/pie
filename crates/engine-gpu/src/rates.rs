@@ -3304,7 +3304,13 @@ fn attention<B: Serve, T: Tactics + ?Sized>(
         .map(|_| {
             let q = rig.operand(s.rows, s.q_heads * s.head_dim, Dtype::Bf16)?;
             let keys = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
-            let values = rig.operand(s.keys, kv_width, Dtype::Bf16)?;
+            // A pool of one segment binds one buffer: there the values read
+            // the keys' plane, as one plane read twice times the same.
+            let values = if crate::backend::Context::pool_segments(rig.device) == 1 {
+                keys
+            } else {
+                rig.operand(s.keys, kv_width, Dtype::Bf16)?
+            };
             let pool = KvPool::planes(
                 keys,
                 values,

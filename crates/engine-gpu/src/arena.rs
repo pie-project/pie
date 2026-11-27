@@ -49,6 +49,9 @@ pub struct Rung {
     /// first slot on the next unit), and how many.
     fire_at: u64,
     fire_slots: u32,
+    /// Where the carve starts: past the fire slots where they lie first
+    /// ([`Span::with_fire_slots`]), else at the rung's first byte.
+    arena_at: u64,
     /// The carve and the rooms.
     bytes: u64,
 }
@@ -177,6 +180,7 @@ impl Rung {
             rooms_at,
             fire_at: bytes,
             fire_slots: 0,
+            arena_at: 0,
             bytes,
         })
     }
@@ -185,12 +189,30 @@ impl Rung {
     /// fire of its tokens and lanes takes, `slot_bytes` each, the first on
     /// a `unit` (CONTRACT-BC 19: a fire's activation holds its own folded
     /// rows' K/V for its reads).
-    fn with_fire_slots(&mut self, tokens_a_slot: u32, lanes: u32, slot_bytes: u64, unit: u64) {
+    fn with_fire_slots(
+        &mut self,
+        tokens_a_slot: u32,
+        lanes: u32,
+        slot_bytes: u64,
+        unit: u64,
+        first: bool,
+    ) {
         // A lane's rows from a slot's first row: one slot more a lane.
         let slots = self
             .tokens
             .div_ceil(tokens_a_slot.max(1))
             .saturating_add(self.tokens.min(lanes));
+        if first {
+            // Under the carve: the slots the pool's binding reaches, the
+            // carve and rooms past them, which it does not.
+            let lead = (u64::from(slots) * slot_bytes + unit).next_multiple_of(ALIGN);
+            self.fire_at = 0;
+            self.fire_slots = slots;
+            self.arena_at = lead;
+            self.rooms_at += lead;
+            self.bytes += lead;
+            return;
+        }
         let at = self.bytes.next_multiple_of(ALIGN);
         self.fire_at = at;
         self.fire_slots = slots;
@@ -375,11 +397,27 @@ impl<B: Backend> Span<B> {
     }
 
     /// Room in every rung for its fires' own windowed rows
-    /// ([`Rung::with_fire_slots`]); before the pool sizes the span.
-    pub fn with_fire_slots(&mut self, tokens_a_slot: u32, lanes: u32, slot_bytes: u64, unit: u64) {
+    /// ([`Rung::with_fire_slots`]); before the pool sizes the span. Where
+    /// `first` (a pool of one segment, which a fire binds up to the start of
+    /// its carve: `Shell::carve_below`), they lie under the carve, where
+    /// that binding reaches them; else past its rooms.
+    pub fn with_fire_slots(
+        &mut self,
+        tokens_a_slot: u32,
+        lanes: u32,
+        slot_bytes: u64,
+        unit: u64,
+        first: bool,
+    ) {
         for rung in &mut self.rungs {
-            rung.with_fire_slots(tokens_a_slot, lanes, slot_bytes, unit);
+            rung.with_fire_slots(tokens_a_slot, lanes, slot_bytes, unit, first);
         }
+    }
+
+    /// Where rung `rung`'s carve proper starts in the span's buffer: past
+    /// its fire slots where they lie first, else at its first byte.
+    pub fn arena_start(&self, rung: usize) -> Result<u64> {
+        Ok(self.base(rung)? + self.rungs[rung].arena_at)
     }
 
     /// Each rung's tokens and the bytes its fire slots take in its carve
@@ -505,7 +543,7 @@ impl<B: Backend> Span<B> {
                         });
                     }
                     Some(rect) => Some(Tensor::new(
-                        handles.bind(buffer, base + rect.offset, rect.room)?,
+                        handles.bind(buffer, base + at.arena_at + rect.offset, rect.room)?,
                         rect.rows,
                         rect.width,
                         rect.dtype,
