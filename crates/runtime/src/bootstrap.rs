@@ -1100,21 +1100,82 @@ async fn host_cover(
     cache: Option<&CoverCache>,
     skipped: bool,
 ) -> Result<(usize, bool)> {
-    let Some(cache) = cache else {
-        if skipped {
-            return Ok((cover_estimate("no engine keys the cover"), false));
+    // The key a stored cover is read under. Under `measure = false` a
+    // sampler that is not installed names no key (the tab's has none), and
+    // nothing is resolved further, launched or measured.
+    let keyed = match cache {
+        None => None,
+        Some(cache) => {
+            let reference = program::ProgramRef::parse("compat-openai")?;
+            match program::resolve(None, &reference).await {
+                Ok(built) => Some((cache, cover_key(cache, &built.hash, context))),
+                Err(why) if skipped => {
+                    tracing::info!(%why, "the host cover's sampler names no key: none is read");
+                    None
+                }
+                Err(why) => return Err(why),
+            }
         }
-        return measure_host_cover(model, context)
-            .await
-            .map(|(cover, ..)| (cover, true));
     };
-    let reference = program::ProgramRef::parse("compat-openai")?;
-    let built = program::resolve(None, &reference).await?;
+    let stored = keyed
+        .as_ref()
+        .and_then(|(cache, (key, path))| stored_cover(cache, key, path));
+    match cover_choice(skipped, keyed.is_some(), stored) {
+        CoverChoice::Stored(cover) => Ok((cover, false)),
+        CoverChoice::Estimate(why) => Ok((cover_estimate(why), false)),
+        CoverChoice::Measure => {
+            let (cover, frame_us, turnaround_us) = measure_host_cover(model, context).await?;
+            if let Some((cache, (key, path))) = &keyed {
+                let held = serde_json::json!({
+                    "key": key,
+                    "cover": cover,
+                    "frame_us": frame_us,
+                    "turnaround_us": turnaround_us,
+                });
+                if let Err(why) = std::fs::create_dir_all(path.parent().unwrap_or(&cache.dir))
+                    .and_then(|()| std::fs::write(path, held.to_string()))
+                {
+                    tracing::warn!(%why, path = %path.display(), "the host cover is not kept for the next boot");
+                }
+            }
+            Ok((cover, true))
+        }
+    }
+}
+
+/// What a boot's host cover is: a stored one wherever one is held under its
+/// key; else, under `measure = false` (`skipped`), the estimate, named;
+/// else measured.
+#[derive(Debug, PartialEq)]
+enum CoverChoice {
+    Stored(usize),
+    Estimate(&'static str),
+    Measure,
+}
+
+fn cover_choice(skipped: bool, keyed: bool, stored: Option<usize>) -> CoverChoice {
+    match (stored, skipped) {
+        (Some(cover), _) => CoverChoice::Stored(cover),
+        (None, true) if keyed => {
+            CoverChoice::Estimate("neither the home's cache nor a committed cover holds this key")
+        }
+        (None, true) => CoverChoice::Estimate("no engine or sampler keys the cover"),
+        (None, false) => CoverChoice::Measure,
+    }
+}
+
+/// The cover's key under `cache` for a sampler of `sampler` hash, and the
+/// home's file for it.
+fn cover_key(
+    cache: &CoverCache,
+    sampler: &program::ProgramHash,
+    context: usize,
+) -> (String, PathBuf) {
     // The sampler by what it was built from where it is the built-in (its
     // bytes differ tree to tree, its source does not), else by its hash.
     let sampler = match &cache.sampler_builtin {
-        Some((hash, source)) if *hash == built.hash => format!("source {source}"),
-        _ => built.hash.to_string(),
+        Some((hash, source)) if hash == sampler => format!("source {source}"),
+        _ => sampler.to_string(),
     };
     let key = format!(
         "{}|{}|sampler {sampler}|frame {}|depth {}|context {context}",
@@ -1127,10 +1188,16 @@ async fn host_cover(
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     });
     let path = cache.dir.join("cover").join(format!("{name:016x}.json"));
-    let read = std::fs::read_to_string(&path)
+    (key, path)
+}
+
+/// The cover held under `key`: the home's file at `path`, else one
+/// committed for the engines' devices.
+fn stored_cover(cache: &CoverCache, key: &str, path: &Path) -> Option<usize> {
+    let read = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .filter(|held| held.get("key").and_then(serde_json::Value::as_str) == Some(key.as_str()));
+        .filter(|held| held.get("key").and_then(serde_json::Value::as_str) == Some(key));
     if let Some(held) = read {
         let field = |name: &str| held.get(name).and_then(serde_json::Value::as_f64);
         if let (Some(cover), Some(frame_us), Some(turnaround_us)) =
@@ -1144,41 +1211,20 @@ async fn host_cover(
                 path = %path.display(),
                 "the host cover, read where an earlier boot measured it under this key"
             );
-            return Ok((cover, false));
+            return Some(cover);
         }
     }
-    if let Some(held) = cache
+    let held = cache
         .committed
         .iter()
-        .find_map(|text| committed_cover(text, &key))
-    {
-        tracing::info!(
-            cover = held.cover,
-            frame_us = held.frame_us,
-            turnaround_us = held.turnaround_us,
-            "the host cover, committed for the engines' devices under this key; nothing measured"
-        );
-        return Ok((held.cover, false));
-    }
-    if skipped {
-        return Ok((
-            cover_estimate("neither the home's cache nor a committed cover holds this key"),
-            false,
-        ));
-    }
-    let (cover, frame_us, turnaround_us) = measure_host_cover(model, context).await?;
-    let held = serde_json::json!({
-        "key": key,
-        "cover": cover,
-        "frame_us": frame_us,
-        "turnaround_us": turnaround_us,
-    });
-    if let Err(why) = std::fs::create_dir_all(path.parent().unwrap_or(&cache.dir))
-        .and_then(|()| std::fs::write(&path, held.to_string()))
-    {
-        tracing::warn!(%why, path = %path.display(), "the host cover is not kept for the next boot");
-    }
-    Ok((cover, true))
+        .find_map(|text| committed_cover(text, key))?;
+    tracing::info!(
+        cover = held.cover,
+        frame_us = held.frame_us,
+        turnaround_us = held.turnaround_us,
+        "the host cover, committed for the engines' devices under this key; nothing measured"
+    );
+    Some(held.cover)
 }
 
 /// Where the host cover is kept between boots, and what of the load its key
@@ -1718,6 +1764,56 @@ fn below_device(host: bool, disk: bool) -> &'static str {
 mod tests {
     use super::quieted;
     use crate::model::RsCaps;
+
+    #[test]
+    fn under_measure_false_a_stored_cover_serves_else_the_estimate_and_nothing_measures() {
+        use super::{CoverCache, CoverChoice, cover_choice, cover_key, stored_cover};
+        let dir = std::env::temp_dir().join(format!("pie-cover-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hash = crate::inferlet::program::ProgramHash::of(b"sampler");
+        let mut cache = CoverCache {
+            dir: dir.clone(),
+            engines: "Wgsl|wgpu BrowserWebGpu".to_string(),
+            deployment: "m".to_string(),
+            committed: Vec::new(),
+            sampler_builtin: None,
+        };
+        let (key, path) = cover_key(&cache, &hash, 64);
+        // No store: skipped takes the estimate, measuring does not.
+        assert_eq!(stored_cover(&cache, &key, &path), None);
+        assert!(matches!(
+            cover_choice(true, true, None),
+            CoverChoice::Estimate(_)
+        ));
+        assert!(matches!(
+            cover_choice(true, false, None),
+            CoverChoice::Estimate(_)
+        ));
+        assert_eq!(cover_choice(false, true, None), CoverChoice::Measure);
+        assert_eq!(cover_choice(false, false, None), CoverChoice::Measure);
+        // A committed cover under another fingerprint is no match.
+        let other = format!(
+            r#"[{{"key":"{}","cover":3,"frame_us":1.0,"turnaround_us":1.0}}]"#,
+            key.replace("BrowserWebGpu", "Native")
+        );
+        cache.committed = vec![Box::leak(other.into_boxed_str())];
+        assert_eq!(stored_cover(&cache, &key, &path), None);
+        // The home's file under this key serves, skipped or not.
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the cover dir");
+        let held =
+            serde_json::json!({"key": key, "cover": 5, "frame_us": 1.0, "turnaround_us": 2.0});
+        std::fs::write(&path, held.to_string()).expect("the cover writes");
+        let stored = stored_cover(&cache, &key, &path);
+        assert_eq!(stored, Some(5));
+        assert_eq!(cover_choice(true, true, stored), CoverChoice::Stored(5));
+        assert_eq!(cover_choice(false, true, stored), CoverChoice::Stored(5));
+        // A committed cover under this key serves where the home holds none.
+        std::fs::remove_file(&path).expect("the cover removes");
+        let mine = format!(r#"[{{"key":"{key}","cover":7,"frame_us":1.0,"turnaround_us":1.0}}]"#);
+        cache.committed.push(Box::leak(mine.into_boxed_str()));
+        assert_eq!(stored_cover(&cache, &key, &path), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_loud_base_quiets_naga_and_tarpc_and_never_makes_them_louder() {
