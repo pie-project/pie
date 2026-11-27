@@ -310,7 +310,19 @@ impl Shell {
                 self.pools.keep_clear(chunks);
                 self.pools.preseat_weights(self.device.stream(), &plan)?;
             }
-            None if filed || copied => self.pools.pin_weight_hosts()?,
+            None if filed || copied => {
+                // A load told its weights are held (`copied`: its held copy)
+                // whose pool cannot seat them serves them streamed: said.
+                if copied {
+                    let (have, need) = self.pools.preseat_chunks();
+                    tracing::info!(
+                        "{}: told held, but the pool's fitted chunks hold {have} of {need} \
+                         weight chunks: serving from a pinned host copy over the host link",
+                        self.device.name()
+                    );
+                }
+                self.pools.pin_weight_hosts()?;
+            }
             None => {}
         }
         self.device.synchronize()?;

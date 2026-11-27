@@ -3267,6 +3267,86 @@ fn golden_held_small() {
     }
 }
 
+/// A load told its weights are held whose pool (`kv_budget`,
+/// `PIE_GOLDEN_KV_MIB`, 256 by default) cannot seat them seats none
+/// (`WeightShape::seated` is `None`: the load's "told held, but the pool's
+/// fitted chunks hold N of M weight chunks" line) and serves from its
+/// pinned host copy, each bank's select on its host-read arm, its residency
+/// seating no expert: what it serves is held to a load of the same fixture
+/// with every expert cached in the pool, every step within [`TOLERANCE`] of that step's spread and the same
+/// greedy token (the cached load's argmax), its distance printed.
+#[test]
+#[ignore = "a probe run by hand: see the module's doc"]
+fn golden_held_small_against_cached() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let cache = cache_dir();
+    let models = std::env::var("PIE_GOLDEN_MODELS")
+        .map_or_else(|_| vec!["nemotron3-nano-mini".to_string()], |_| models());
+    let pool = std::env::var("PIE_GOLDEN_KV_MIB")
+        .ok()
+        .and_then(|mib| mib.parse::<u64>().ok())
+        .unwrap_or(256);
+    let argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .fold((0, f32::NEG_INFINITY), |best, (at, &v)| {
+                if v > best.1 { (at, v) } else { best }
+            })
+            .0
+    };
+    for model in models {
+        let fixture = fixture(&model, &cache);
+        // The warming serving: every product's algorithm picked and kept.
+        let _ = served_experts(&fixture, &cache, Rows::Cached);
+        let cached = served_experts(&fixture, &cache, Rows::Cached);
+        let serving = fixture_as(&model, &cache, true);
+        // `served_experts_as` asserts, under the small pool, that the told
+        // load seated none of its weights. The residency it then names seats
+        // no expert either (`Rows::Host`), as a runtime reading the pool's
+        // chunk facts would: a pool that cannot seat the weights at the load
+        // cannot hold every expert for the runtime, and a residency naming
+        // them all is refused by its slots past the pool's backed range
+        // (`Arena::span`, a refusal of that request, not of the load).
+        SMALL_POOL.store(pool, std::sync::atomic::Ordering::Relaxed);
+        let small = served_experts_as(&serving, &cache, Rows::Host, true);
+        SMALL_POOL.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(small.len(), cached.len(), "{model}: the same steps");
+        let (mut worst, mut share, mut picks) = (0f32, 0f32, Vec::new());
+        for (step, (a, b)) in small.iter().zip(&cached).enumerate() {
+            let lo = b.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let gap = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(gap);
+            share = share.max(gap / (hi - lo).max(f32::MIN_POSITIVE));
+            let (mine, theirs) = (argmax(a), argmax(b));
+            picks.push(mine);
+            assert_eq!(
+                mine, theirs,
+                "{model}: step {step}'s greedy token, told held in a {pool} MiB pool, against the \
+                 cached load's"
+            );
+        }
+        println!(
+            "golden {model} told held in a {pool} MiB pool against cached: max |delta| {worst:e}, \
+             {share:e} of a step's spread (TOLERANCE {TOLERANCE:e}) over {} steps; greedy ids \
+             {picks:?}",
+            small.len()
+        );
+        assert!(
+            share <= TOLERANCE,
+            "{model}: told held in a {pool} MiB pool, a step {share:e} of its spread from the \
+             cached load's, past {TOLERANCE:e}"
+        );
+    }
+}
+
 /// The expert-cache probe: `PIE_GOLDEN_MODELS` (the MoE miniatures whose
 /// banks stream; Nemotron's by default) served with every routed expert
 /// cached in the pool, read from the host copy, and half and half. The

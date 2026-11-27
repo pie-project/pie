@@ -94,11 +94,13 @@ fn content_hash(bytes: &[u8]) -> u64 {
 
 /// What shapes a deployment's bodies, beside the engine build [`path`]
 /// keys: the checkpoint, the trace, the profile, the pages, context and
-/// slots, the stated kv, and a test build's weight pin where it sets one
-/// (serving's is always the cache's, so its keys, and the committed
-/// records', are as before): a load whose routed banks are staged arms
-/// other bodies than one whose banks are resident, and never holds the
-/// other's record.
+/// slots, the stated kv, a test build's weight pin where it sets one
+/// (serving's is always the cache's), and whether the load was told its
+/// weights are held: a load whose routed banks are staged arms other bodies
+/// than one whose banks are resident, and a load told its weights are held
+/// (no host copy, armed at the residency) other bodies than one that
+/// streams them, so neither holds the other's record. A load stating
+/// neither keys as before, its records (and the committed ones) unmoved.
 #[must_use]
 pub(crate) fn bodies_shape(
     identity: &str,
@@ -107,12 +109,18 @@ pub(crate) fn bodies_shape(
     (page_size, context, slots): (u32, u32, u32),
     kv_budget: &dyn std::fmt::Debug,
     pin: super::boot::WeightPin,
+    weights_held: bool,
 ) -> String {
     let shape =
         format!("{identity}|{trace}|{profile:?}|{page_size}|{context}|{slots}|{kv_budget:?}");
-    match pin {
+    let shape = match pin {
         super::boot::WeightPin::Cached => shape,
         pin => format!("{shape}|{pin:?}"),
+    };
+    if weights_held {
+        format!("{shape}|held")
+    } else {
+        shape
     }
 }
 
@@ -287,6 +295,7 @@ mod tests {
                 (16, 4096, 8),
                 &None::<u32>,
                 pin,
+                false,
             );
             path(&dir, &shape)
         };
@@ -307,6 +316,39 @@ mod tests {
             "the staged load reads no resident record"
         );
         assert_eq!(read(&resident), Some(measured));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A load told its weights are held (no host copy, armed at the
+    /// residency) and one that streams them, alike in all else, key records
+    /// of their own: golden_experts' told-held load held the streaming
+    /// load's figure and armed 23 of 25 compositions.
+    #[test]
+    fn loads_differing_only_by_weights_held_key_their_own_records() {
+        let dir = std::env::temp_dir().join(format!("pie-bodies-held-{}", std::process::id()));
+        let at = |held| {
+            let shape = bodies_shape(
+                "zt:1",
+                "trace",
+                &"profile",
+                (16, 4096, 8),
+                &None::<u32>,
+                WeightPin::Cached,
+                held,
+            );
+            path(&dir, &shape)
+        };
+        let streaming = at(false);
+        let held = at(true);
+        assert_ne!(streaming, held, "weights_held is in the key");
+        let measured = Measured {
+            bytes: 404 << 20,
+            bodies: 161,
+            captured: 500 << 20,
+        };
+        write(&streaming, measured).expect("the record is written");
+        assert_eq!(read(&held), None, "the held load reads no streaming load's record");
+        assert_eq!(read(&streaming), Some(measured));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
