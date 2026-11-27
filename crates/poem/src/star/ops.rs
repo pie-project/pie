@@ -1021,7 +1021,7 @@ pub(crate) static OPS: &[Op] = &[
         call: |a, heap| {
             let q: Value = a.next()?;
             let inputs: Input = a.next()?;
-            let kv: String = a.next()?;
+            let kv: StateName = a.next()?;
             let q_heads: u32 = a.next()?;
             let kv_heads: u32 = a.next()?;
             let head_dim: u32 = a.next()?;
@@ -1031,7 +1031,7 @@ pub(crate) static OPS: &[Op] = &[
                 heap,
                 dsl("attn.capture_scores", || {
                     ops::attn::capture_scores(
-                        &q, &inputs, &kv, q_heads, kv_heads, head_dim, sm_scale, observe,
+                        &q, &inputs, &kv.0, q_heads, kv_heads, head_dim, sm_scale, observe,
                     )
                 })?,
             )
