@@ -20,11 +20,26 @@
 //
 // after which `k_pages[i]` reads virtual element `k_origin + i`.
 
+// `PIE_POOL_SEG_COUNT=1` (a WGSL form the build adds for an adapter that
+// binds a stage too few storage buffers for four): the pool is one segment
+// at `binding_`, the others name it, and the host lays the pool whole in it
+// (its segment words its whole length, so every comparison below picks 0).
+#ifndef PIE_POOL_SEG_COUNT
+#define PIE_POOL_SEG_COUNT 4
+#endif
+#if PIE_POOL_SEG_COUNT == 1
+#define PIE_POOL_SEGMENTS(access_, type_, binding_) \
+    [[vk::binding(binding_)]] access_<type_> pie_seg0;
+#define pie_seg1 pie_seg0
+#define pie_seg2 pie_seg0
+#define pie_seg3 pie_seg0
+#else
 #define PIE_POOL_SEGMENTS(access_, type_, binding_) \
     [[vk::binding(binding_)]] access_<type_> pie_seg0; \
     [[vk::binding(binding_ + 1)]] access_<type_> pie_seg1; \
     [[vk::binding(binding_ + 2)]] access_<type_> pie_seg2; \
     [[vk::binding(binding_ + 3)]] access_<type_> pie_seg3;
+#endif
 
 #define PIE_POOL_READ(type_, seg_) \
     type_ pie_pool_get(uint v) { \

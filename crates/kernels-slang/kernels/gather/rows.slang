@@ -58,9 +58,16 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(0)]] RWStructuredBuffer<uint> arena_a;
 [[vk::binding(1)]] RWStructuredBuffer<uint> arena_b;
 [[vk::binding(2)]] RWStructuredBuffer<uint> pie_seg0;
+#if defined(PIE_POOL_SEG_COUNT) && PIE_POOL_SEG_COUNT == 1
+// One segment (`prim/pool.slang`'s one-segment form): the others name it.
+#define pie_seg1 pie_seg0
+#define pie_seg2 pie_seg0
+#define pie_seg3 pie_seg0
+#else
 [[vk::binding(3)]] RWStructuredBuffer<uint> pie_seg1;
 [[vk::binding(4)]] RWStructuredBuffer<uint> pie_seg2;
 [[vk::binding(5)]] RWStructuredBuffer<uint> pie_seg3;
+#endif
 
 #ifndef PIE_RUNS
 #define PIE_RUNS 512
