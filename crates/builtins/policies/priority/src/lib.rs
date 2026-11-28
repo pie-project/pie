@@ -1,26 +1,40 @@
-//! Keys every process by `cluster/priority`, else its client's `priority`, else
-//! 0.
+//! Orders a worker's processes by the priority their client states, over
+//! what `default` does.
+//!
+//! - Hint `priority` (int): larger runs first. A process without one is 0.
+//!
+//! Starts that seat-to-end holds are let go in the same order.
 
-use policy::{Subject, SubjectKind, candidates, prop, worker};
+use plex::prelude::*;
+use worker_defaults::{Defaults, wake};
 
 #[derive(Default)]
-struct Priority;
+struct Priority {
+    defaults: Defaults,
+}
 
-impl worker::Policy for Priority {
-    fn plan(&mut self, _now_ms: u64) {
-        let entries: Vec<_> = candidates(SubjectKind::Process)
+fn key(process: &snapshot::Process) -> Option<i64> {
+    hint(&process.id, "priority").int()
+}
+
+impl Policy for Priority {
+    fn on_exited(&mut self, exit: &Exit, _now: Mark) {
+        self.defaults.cache.on_exited(exit);
+    }
+
+    fn on_retained(&mut self, retention: &Retention, _now: Mark) {
+        self.defaults.cache.on_retained(retention);
+    }
+
+    fn plan(&mut self, now: Mark) {
+        let rows: Vec<(ProcessId, i64)> = snapshot::get_processes()
             .into_iter()
-            .filter_map(|process| {
-                let of = Subject::Process(process.clone());
-                let key = prop(&of, "cluster/priority")
-                    .int()
-                    .or_else(|| prop(&of, "priority").int())?;
-                Some((process, key))
-            })
+            .filter_map(|process| key(&process).map(|key| (process.id, key)))
             .collect();
-        // Only an ungranted write is refused, and the manifest grants it.
-        worker::install_schedule(&entries, None);
+        schedule::priority::clear();
+        schedule::priority::set_list(&rows).ok();
+        wake([self.defaults.plan(now, |process| key(process).unwrap_or(0))]);
     }
 }
 
-policy::worker!(Priority);
+plex::export!(Priority);

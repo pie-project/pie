@@ -96,7 +96,6 @@ async fn main(input: Input) -> Result<String> {
 
     let vocab = model::output_vocab_size();
     let alpha = input.alpha;
-    let stop_tokens = chat::stop_tokens();
 
     // The amplified stream sees `c` followed by `x`; the contrast stream sees the
     // identical query `x` with the retrieved document removed. Everything else —
@@ -189,7 +188,7 @@ async fn main(input: Input) -> Result<String> {
         shifts += row[1] as u64;
         kl_total += row[2] as f64;
         scored += 1;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);

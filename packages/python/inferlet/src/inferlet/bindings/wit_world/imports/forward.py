@@ -19,9 +19,9 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import pipeline
 from ..imports import channel
 from ..imports import media
+from ..imports import pipeline
 from ..imports import working_set
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
@@ -61,11 +61,26 @@ class StateGeometry:
     - `fold`: per lane, how many more slots freeze after this fire;
       `u32::MAX` folds everything. Default: none. May be computed on the
       device; lanes sharing a working set fold by the first one's count.
+    - `parents`: `[lanes]` u32, a beam search's: lane `b` continues lane
+      `parents[b]` of the fire before. Every lane names the same working
+      set, whose reserve past its frozen full pages is a pool each lane
+      holds its own pages of; the engine keeps the lanes' page lists and
+      reorders them by the parents before each fire reads or appends.
+      Computed on the device by
+      the epilogue before; the first fire ignores it. A parent past the
+      lanes faults its lane. Default: none.
+      A search owns its set's state: the rows every live beam shares
+      (below the group's common ancestor) fold into the set as the search
+      runs, so a search left without adopting
+      a beam leaves the set folded past its prompt. A guest that wants the
+      prompt state back forks the set before the search.
     """
     positions: Optional[channel.Channel]
     slots: Optional[channel.Channel]
     kv_len: Optional[channel.Channel]
     fold: Optional[channel.Channel]
+    parents: Optional[channel.Channel]
+    parents_end: Optional[int]
 
 class ForwardPass:
     """
@@ -90,7 +105,27 @@ class ForwardPass:
     def checkpoints(self, slots: List[int]) -> None:
         """
         Slots at which a recurrent state is kept, so a later pass over the
-        same tokens resumes there. Nothing on a model without one.
+        same tokens resumes there: one in the scope its working set shares
+        in (`working-set.share`). Nothing on a model without one. Refused
+        on a lane whose set shares nothing, which no pass could resume.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def final_rows(self) -> None:
+        """
+        States that this pass's sampled rows are final: once a fire of it
+        samples a row, the program never retracts, truncates, rolls back
+        or rewinds the working sets it writes below that row. Its lanes
+        then fold every row at fire and carry none into the next.
+        Unstated a pass is not final: on a set with a
+        recurrent state or windows its run-ahead fires fold only what the
+        program has accepted, so a stop can take the rest back. The
+        runtime never infers this; only the statement counts. The SDKs
+        state it on every pass the program does not declare retractable
+        (`ForwardPass::retractable`), so final is the inferlet's default.
+        `pipeline.retract` over a final fire is refused by name. Set
+        before `program`; refused on a pass binding `parents`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -131,11 +166,28 @@ class ForwardPass:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
+    def adopt_beam(self, beam: int, end: int) -> None:
+        """
+        A beam search's finish: once the
+        pass's last fire has landed, its working set holds beam `beam`'s
+        hypothesis at its slots `[folded, end)` in its own order, as its
+        page list names them (its recurrent rows too, on a hybrid); the
+        other beams' pages are let go. Later passes bind the set as any
+        (no `parents`). The pass must bind `parents`.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
     def mask(self, rows: channel.Channel) -> None:
         """
-        `[rows, n]` bools: per row, the slots `[0, kv-len)` it attends when
-        lanes read kv, else its attention group's rows in lane order. Set
-        before `program`.
+        `[rows, n]` bools. Where lanes read kv: per row, which slots of its
+        working set's buffer and of the pass's own rows it attends. Column
+        `c` is slot `folded + c`, `folded` the set's frozen length when the
+        pass runs; `n` covers the buffer and the lane's rows. The frozen
+        part is not the mask's: every row attends it under the model's own
+        bounds. A row attends no row of its lane after it, whatever its
+        bits say. Where lanes read no kv: per row, its attention group's
+        rows in lane order. Set before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -222,18 +274,16 @@ def park(on: pipeline.Pipeline) -> None:
     
     A frame batches one slot per participating pipeline and does not
     dispatch until every member has submitted, so membership is a promise
-    to keep submitting. A pipeline that stops — it is blocked on a user
-    turn, waiting on a peer, or simply idle — would otherwise hold the
-    frame. `model.submit-deadline-us` bounds that promise: hold the
-    wait-set that long with nothing owed to you and the engine stops
-    waiting for you — the slot is dropped from the frame, work you already
-    submitted still runs, and your next submit rejoins. That costs you a
-    boundary, not your instance. Staying silent much longer than that
-    WITHOUT parking is a different matter: it reads as an abandoned
-    pipeline and the instance is terminated. `park` is how a pipeline
-    stops without breaking the promise — it states the intent the engine
-    cannot infer, leaves the wait-set, and stops that clock entirely, for
-    as long as you like.
+    to keep submitting. While its guest computes, or waits on its own
+    fires and channels, a pipeline is awaited: the frame holds for it.
+    While its guest waits on input from outside (a session receive, a
+    timer, an HTTP response), the host parks it, and its next submit
+    rejoins. `park` is how a pipeline that stops for any other reason
+    says so: it leaves the wait-set for as long as you like. A pipeline
+    whose guest computes without submitting is held for only while
+    another frame covers the device: once holding for it would leave the
+    device idle, the frame seals past it and its next submit rejoins. No
+    pipeline is terminated for being silent.
     
     Ordered against this pipeline's own submits, not against the call: it
     takes effect once every frame submitted before it has sealed, so it is

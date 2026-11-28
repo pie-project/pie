@@ -16,8 +16,10 @@ impl Knobs {
         worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).staging_depth()
     }
 
-    pub fn submit_depth(&self) -> usize {
-        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth()
+    /// The frames a lane may keep submitted on a load whose host cover is
+    /// `cover` (`runtime::scheduler::host_cover`).
+    pub fn submit_depth(&self, cover: usize) -> usize {
+        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth(cover)
     }
 
     pub fn admissible(&self) -> bool {
@@ -30,18 +32,14 @@ impl Knobs {
 
 impl std::fmt::Display for Knobs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "k={} dispatch={} (submit={})",
-            self.frame_size,
-            self.dispatch_depth,
-            self.submit_depth()
-        )
+        write!(f, "k={} dispatch={}", self.frame_size, self.dispatch_depth)
     }
 }
 
 pub struct Round {
     pub knobs: Knobs,
+    /// The host cover of the load the round was timed on.
+    pub cover: usize,
     pub throughput_tok_s: f64,
     pub throughput_rel_sigma: f64,
     pub lane_p95_us: u128,
@@ -51,6 +49,10 @@ pub struct Round {
 }
 
 impl Round {
+    pub fn submit_depth(&self) -> usize {
+        self.knobs.submit_depth(self.cover)
+    }
+
     pub fn is_measurement(&self) -> bool {
         self.failed_lanes == 0
     }
@@ -172,10 +174,11 @@ pub async fn measure(
     program: &str,
     inputs: &[String],
     knobs: Knobs,
+    cover: usize,
     repeats: usize,
 ) -> Result<Round> {
     Ok(
-        sweep_all(addr, program, inputs, &[knobs], repeats, |_, _| {})
+        sweep_all(addr, program, inputs, &[knobs], cover, repeats, |_, _| {})
             .await?
             .pop()
             .expect("one candidate in, one round out"),
@@ -187,6 +190,7 @@ pub async fn sweep_all(
     program: &str,
     inputs: &[String],
     candidates: &[Knobs],
+    cover: usize,
     repeats: usize,
     mut on_pass: impl FnMut(usize, usize),
 ) -> Result<Vec<Round>> {
@@ -197,7 +201,16 @@ pub async fn sweep_all(
 
     for pass in 0..repeats {
         for (index, knobs) in candidates.iter().enumerate() {
-            runtime::scheduler::reconfigure(knobs.frame_size, knobs.dispatch_depth)
+            // the depth is the loaded engine's: a candidate of another
+            // depth belongs to another load
+            let running = runtime::scheduler::configured_dispatch_depth();
+            if running != knobs.dispatch_depth {
+                anyhow::bail!(
+                    "{knobs} wants {} frames in flight and the loaded engine runs {running}",
+                    knobs.dispatch_depth
+                );
+            }
+            runtime::scheduler::reconfigure(knobs.frame_size)
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("apply {knobs}"))?;
             let run = fleet::run(addr, program, inputs).await;
@@ -217,6 +230,7 @@ pub async fn sweep_all(
             let (lane_p95, lane_p95_rel_sigma) = median_and_rel_sigma(&p95s[index]);
             Round {
                 knobs: *knobs,
+                cover,
                 throughput_tok_s,
                 throughput_rel_sigma,
                 lane_p95_us: lane_p95 as u128,
@@ -269,13 +283,17 @@ mod tests {
         assert!(!candidates.is_empty());
         for knobs in &candidates {
             assert!(knobs.admissible(), "{knobs} is a shape the runtime refuses");
-            assert!(knobs.submit_depth() >= 2, "{knobs} leaves nothing queued");
+            assert!(
+                knobs.submit_depth(1) >= 2,
+                "{knobs} leaves nothing queued under a host cover of 1"
+            );
         }
     }
 
     fn round(knobs: Knobs, tok_s: f64, rel_sigma: f64, failed: usize) -> Round {
         Round {
             knobs,
+            cover: 1,
             throughput_tok_s: tok_s,
             throughput_rel_sigma: rel_sigma,
             lane_p95_us: 1_000,

@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 
 /// Backend-specific option structs (typed views over `EngineConfig::options`).
 pub mod backend;
-/// Keys that are gone: each refuses a file that still states it, saying why.
-pub mod removed;
 /// The dotted-path schema `pie config set`/`get` walk.
 pub mod schema;
 
@@ -16,7 +14,6 @@ pub use backend::{
     CerebrasEngineOptions, CudaEngineOptions, MetalEngineOptions, VulkanEngineOptions,
     WgpuEngineOptions, XlaEngineOptions,
 };
-pub use removed::{Gone, Removed};
 pub use units::{ByteSize, Duration};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,18 +51,34 @@ impl Config {
     ///
     /// Pure: no file IO, no env, no clap.
     pub fn parse(s: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(s).map_err(|e| {
-            if s.contains("[[model]]") {
-                anyhow::anyhow!(
-                    "parse config: {e}\n\
-                     hint: pie serves exactly one model — use a single `[model]` table, \
-                     not a `[[model]]` list."
-                )
-            } else {
-                anyhow::anyhow!("parse config: {e}")
+        Self::parse_file(s, None)
+    }
+
+    /// [`Config::parse`] of the file at `path`: a key no section declares
+    /// is refused by the file, line and dotted key, to be deleted.
+    pub fn parse_file(s: &str, path: Option<&Path>) -> Result<Self> {
+        let at = |line: Option<usize>| {
+            let file = path.map_or_else(|| "config".to_string(), |p| p.display().to_string());
+            line.map_or(file.clone(), |line| format!("{file}:{line}"))
+        };
+        let cfg: Config = toml::from_str(s).map_err(|e| match unknown_field(e.message()) {
+            Some(field) => {
+                let start = e.span().map(|span| span.start);
+                let table = start.map(|start| table_at(s, start)).unwrap_or_default();
+                let line = start.map(|start| s[..start].matches('\n').count() + 1);
+                anyhow::anyhow!("{}: {}", at(line), unknown_key(&table, field))
             }
+            None => anyhow::anyhow!("{}: {e}", at(None)),
         })?;
-        cfg.validate()?;
+        cfg.validate()
+            .map_err(|e| match e.downcast_ref::<UnknownKey>() {
+                Some(UnknownKey { table, field }) => anyhow::anyhow!(
+                    "{}: {}",
+                    at(line_of(s, table, field)),
+                    unknown_key(table, field)
+                ),
+                None => e,
+            })?;
         Ok(cfg)
     }
 
@@ -81,6 +94,13 @@ impl Config {
     ///
     /// An engine flavor with no diagnostics record. A flag that quietly did
     /// nothing would be the same silence the typed record exists to end.
+    /// `pie serve --no-measure`: the load times nothing (`[engine] measure
+    /// = false`), refused by name on an engine that does not skip yet.
+    pub fn skip_measuring(&mut self) -> Result<()> {
+        self.engine.measure = false;
+        self.engine.validate()
+    }
+
     pub fn state_diagnostics(&mut self, words: &str) -> Result<()> {
         match self.engine.kind {
             EngineKind::Cuda | EngineKind::Metal => {
@@ -123,34 +143,29 @@ impl Config {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadConfig {
-    /// Shortest uncached suffix worth a peer's prefill; `0`: 2048 tokens.
+    /// Shortest uncached suffix worth a helper's prefill. Unset, this
+    /// worker's passes stay home whatever helpers the cluster names
+    /// (`placement/helpers`).
     #[serde(default)]
-    pub prefill_min_suffix_tokens: usize,
+    pub prefill_min_suffix_tokens: Option<usize>,
     /// How KV pages cross between workers — see [`OffloadTransfer`].
     #[serde(default)]
     pub transfer: OffloadTransfer,
     /// Where this worker serves other workers' passes (`host:port`); omit to
-    /// serve none.
+    /// serve none. The cluster reads it as the worker's `pie/prefill-listen`:
+    /// the default cluster policy names every such worker a helper. Which
+    /// workers prefill this one's passes, and which pools keep its runs, are
+    /// the cluster policy's (`placement/helpers`, `replication/workers`).
     #[serde(default)]
     pub listen: Option<String>,
-    /// Workers to prefill this worker's passes on, by their `listen`
-    /// address. The first that serves this model in this class is taken.
-    #[serde(default)]
-    pub peers: Vec<String>,
-    /// Pool workers (`pie-pool`) to send every run this worker keeps to, by
-    /// their bulk address.
-    #[serde(default)]
-    pub pools: Vec<String>,
 }
 
 impl Default for OffloadConfig {
     fn default() -> Self {
         Self {
-            prefill_min_suffix_tokens: 0,
+            prefill_min_suffix_tokens: None,
             transfer: OffloadTransfer::Auto,
             listen: None,
-            peers: Vec::new(),
-            pools: Vec::new(),
         }
     }
 }
@@ -191,11 +206,12 @@ pub enum OffloadTransfer {
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// The cluster-plane policies, run by the controller: each a built-in
-    /// policy's name or a component path, no two granted the same write;
-    /// omit to run none. Single-node only: a distributed worker's controller
-    /// states its own. The worker plane's is `[runtime] worker_policy`.
+    /// policy's name or a component path, no two granted the same write.
+    /// Omitted, `["default-cluster"]` ([`Self::policies`]); `[]` runs none.
+    /// Single-node only: a distributed worker's controller states its own.
+    /// The worker plane's is `[runtime] worker_policy`.
     #[serde(default)]
-    pub cluster_policies: Vec<String>,
+    pub cluster_policies: Option<Vec<String>>,
     /// Controller endpoint (`tcp://host:port`, a bare `host:port`, or
     /// `unix:/path`); set ⇒ this worker joins a distributed cluster.
     #[serde(default)]
@@ -209,6 +225,14 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// The cluster policies this file states, or the default.
+    #[must_use]
+    pub fn policies(&self) -> Vec<String> {
+        self.cluster_policies
+            .clone()
+            .unwrap_or_else(|| vec![DEFAULT_CLUSTER_POLICY.to_string()])
+    }
+
     fn validate(&self) -> Result<()> {
         if self.controller.is_some() {
             ensure!(
@@ -216,7 +240,7 @@ impl ClusterConfig {
                 "[cluster] role is required when controller is set"
             );
             ensure!(
-                self.cluster_policies.is_empty(),
+                self.cluster_policies.is_none(),
                 "[cluster] cluster_policies is the controller's to run: a worker that \
                  joins one (`controller` set) runs none, so state them in the \
                  controller's file"
@@ -352,9 +376,11 @@ pub struct SandboxConfig {
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
     /// Instances the wasmtime pooling allocator may hold. A ceiling on
-    /// concurrent inferlets, reserved up front.
-    #[serde(default = "default_max_instances")]
-    pub max_instances: u32,
+    /// concurrent inferlets, its address space reserved up front; unset,
+    /// what this process's address space fits. A count that does not fit
+    /// is refused at boot.
+    #[serde(default)]
+    pub max_instances: Option<u32>,
     /// Linear memory one instance may address.
     #[serde(default = "default_max_memory")]
     pub max_memory: ByteSize,
@@ -375,7 +401,7 @@ impl Default for SandboxConfig {
             scratch_dir: default_scratch_dir(),
             allow_network: true,
             network_allowed_hosts: default_network_allowed_hosts(),
-            max_instances: default_max_instances(),
+            max_instances: None,
             max_memory: default_max_memory(),
             warm_memory: default_warm_memory(),
             warm_slots: default_warm_slots(),
@@ -385,7 +411,10 @@ impl Default for SandboxConfig {
 
 impl SandboxConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(self.max_instances > 0, "sandbox.max_instances must be > 0");
+        ensure!(
+            self.max_instances != Some(0),
+            "sandbox.max_instances must be > 0"
+        );
         ensure!(
             self.max_memory.as_bytes() > 0,
             "sandbox.max_memory must be > 0"
@@ -394,9 +423,6 @@ impl SandboxConfig {
     }
 }
 
-fn default_max_instances() -> u32 {
-    2048
-}
 fn default_max_memory() -> ByteSize {
     ByteSize::from_mib(4096)
 }
@@ -419,12 +445,86 @@ fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+/// A key no section of the config declares: in `table` (dotted, empty at
+/// the top), named `field`.
+#[derive(Debug)]
+struct UnknownKey {
+    table: String,
+    field: String,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&unknown_key(&self.table, &self.field))
+    }
+}
+
+impl std::error::Error for UnknownKey {}
+
+/// The refusal of an unknown key, whatever key it is.
+fn unknown_key(table: &str, field: &str) -> String {
+    let key = if table.is_empty() {
+        field.to_string()
+    } else {
+        format!("{table}.{field}")
+    };
+    format!("unknown key `{key}`; delete it (it isn't a setting)")
+}
+
+/// The field a deserializer's "unknown field" error names.
+fn unknown_field(message: &str) -> Option<&str> {
+    message.strip_prefix("unknown field `")?.split('`').next()
+}
+
+/// The table (dotted) a TOML document's byte `at` lies in: the last header
+/// before it.
+fn table_at(text: &str, at: usize) -> String {
+    let mut table = String::new();
+    for line in text[..at.min(text.len())].lines() {
+        if let Some(header) = header(line) {
+            table = header;
+        }
+    }
+    table
+}
+
+/// The table a header line opens, `[a.b]` or `[[a.b]]`.
+fn header(line: &str) -> Option<String> {
+    let line = line.trim();
+    let inner = line
+        .strip_prefix("[[")
+        .and_then(|l| l.strip_suffix("]]"))
+        .or_else(|| line.strip_prefix('[').and_then(|l| l.strip_suffix(']')))?;
+    Some(
+        inner
+            .split('.')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+/// The line (from 1) where `field` is stated in `table`.
+fn line_of(text: &str, table: &str, field: &str) -> Option<usize> {
+    let mut current = String::new();
+    for (at, line) in text.lines().enumerate() {
+        if let Some(header) = header(line) {
+            current = header;
+            continue;
+        }
+        let stated = line.split('=').next().map(str::trim);
+        if current == table && stated == Some(field) {
+            return Some(at + 1);
+        }
+    }
+    None
+}
+
 /// `[model] rope_scaling`: the YaRN a deployment stretches its model's
 /// native context by.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RopeScalingConfig {
-    #[serde(alias = "type")]
     pub rope_type: String,
     pub factor: f64,
     #[serde(default)]
@@ -500,240 +600,16 @@ pub struct ModelConfig {
     /// artifact store at `$PIE_HOME/artifacts`).
     #[serde(default)]
     pub weight_cache_dir: String,
-    /// Where this deployment's shared adapters live, or empty to mount none.
-    /// A read-only directory with one subdirectory per adapter, each holding
-    /// an `adapter.toml` and the plane files it names.
-    #[serde(default)]
-    pub adapter_dir: String,
-    /// Dtype weights are materialized in. Separate from `activation_dtype`
-    /// (in `[engine]`, the dtype compute happens in) — narrower weights and
-    /// wider compute is a normal combination.
+    /// Dtype weights are materialized in.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
-    /// Removed: dense weights always live on the device.
-    #[serde(default, skip_serializing)]
-    pub device_weight_budget: Removed<removed::DeviceWeightBudget>,
-    /// Removed: dense weights always live on the device.
-    #[serde(default, skip_serializing)]
-    pub host_weight_budget: Removed<removed::HostWeightBudget>,
-    /// How much congestion the system may show before this gives memory
-    /// back: `dedicated` never does, then `aggressive`, `balanced`, `polite`.
-    /// All but `dedicated` also give back what demand stopped asking for.
-    #[serde(default)]
-    pub memory_tolerance: runtime::governor::Tolerance,
-    /// Whether the streamable weights (routed MoE experts, per-layer
-    /// embedding rows) may leave the device under memory pressure: `on`
-    /// sheds their cache down to the staging floor before any kv or state
-    /// gives way, `off` keeps every weight resident and lets the pressure
-    /// fall on kv and state, `auto` is off when the weights fit the
-    /// device at load and on when they do not.
-    #[serde(default)]
-    pub weight_streaming: runtime::store::weights::WeightStreaming,
-    /// How many device bytes the kv pages and recurrent-state slots take
-    /// (`"20GiB"`), per device. Omit to fill what `device_memory_share`
-    /// leaves once the weights and working set are down. A budget the device
-    /// does not hold refuses the load; it is never cut to fit.
-    #[serde(default)]
-    pub device_kv_budget: Option<ByteSize>,
-    /// The share of the device's memory this load may take: weights, working
-    /// set and kv pool. What other processes hold when the load begins comes
-    /// off it, as on a card another server shares.
-    #[serde(default = "default_device_memory_share")]
-    pub device_memory_share: f64,
-    /// How many pinned host bytes a preempted process's kv pages and
-    /// recurrent-state slots may be suspended into (`"32GiB"`), shared by
-    /// the tensor-parallel ranks: one rs row per device slot, then kv pages.
-    /// Omit for every seat at full context, at least one device pool and at
-    /// most four (cuda), up to half the host memory the load leaves free (so
-    /// workers sharing a host each find room); a stated budget is capped by
-    /// all of it. Pinned memory is slow to give back: a worker that dies
-    /// holds its host's other GPU processes ~0.2 s a GiB of it. The
-    /// container's cgroup limit (v1 or v2) counts as the host's. pie cannot
-    /// compute kv again, so this is where memory contention goes: it cannot
-    /// be turned off.
-    #[serde(default)]
-    pub host_kv_budget: Option<ByteSize>,
-    /// How many disk bytes suspended kv may spill into once host swap is
-    /// full (`"200GiB"`), shared by the ranks, each in its own slot file
-    /// under `disk_kv_dir` (default `$PIE_HOME/cache/kv/<checkpoint
-    /// digest>`), unlinked once open so it never outlives the server unless
-    /// `disk_kv_persistent`. Metal
-    /// and Vulkan keep no host tier, so there it is the only one, and
-    /// suspended rs slots go to it too. Omit for four host tiers' worth on
-    /// cuda, or every seat at full context elsewhere, within a quarter of
-    /// the free space there. The tier is always on: it is what keeps a
-    /// session when memory is taken back.
-    #[serde(default)]
-    pub disk_kv_budget: Option<ByteSize>,
-    /// Where the disk tier's slot files go. Omit for
-    /// `$PIE_HOME/cache/kv/<checkpoint digest>`.
-    #[serde(default)]
-    pub disk_kv_dir: Option<std::path::PathBuf>,
-    /// Keeps the disk tier for the next run: its slot files stay under
-    /// `disk_kv_dir` with a journal of the sealed pages they hold, and a
-    /// restart takes those pages back as cache. Swap and cache share
-    /// `disk_kv_budget`, suspended kv first. Off by default; cuda only, and
-    /// not for a model with recurrent state or a window.
-    #[serde(default)]
-    pub disk_kv_persistent: bool,
-    /// Removed: the engine tier it deferred is gone.
-    #[serde(default, skip_serializing)]
-    pub host_weight_deferred: Removed<removed::HostWeightDeferred>,
-    /// The most patch rows one fire may carry, over every image of every lane
-    /// in it. Omit it: a vision deployment derives a ceiling from the checkpoint's
-    /// own shapes, and a text-only deployment wants no ladder at all.
-    #[serde(default)]
-    pub max_patches: Option<u32>,
-    /// The patch axis's lane ceiling: the most images one fire may carry.
-    /// Omit it, as above; the default is derived from `max_patches`.
-    #[serde(default)]
-    pub max_images: Option<u32>,
-    /// The most rows the widest voxel value of one fire may hold: a
-    /// `vae.decode` pass is admitted at this over its growth in latents, a
-    /// `vae.encode` pass at this in pixels. Omit it and the engine fits it to
-    /// the working set its memory share leaves.
-    #[serde(default)]
-    pub max_voxels: Option<u32>,
-    /// The most clips one fire may carry, over every lane. Omit it and one
-    /// is derived from the lane ceiling.
-    #[serde(default)]
-    pub max_clips: Option<u32>,
-    /// How many adapter seats this deployment intends to use, and which
-    /// adapters to write into them at boot. Absent means zero seats.
-    #[serde(default)]
-    pub adapters: AdapterConfig,
-}
-
-fn default_device_memory_share() -> f64 {
-    engine::load::DEFAULT_DEVICE_MEMORY_SHARE
 }
 
 fn default_weight_dtype() -> String {
     "bfloat16".to_string()
 }
 
-/// What an operator states about LoRA adapters: a capacity and a roster.
-///
-/// The capacity is an intent, not a pool size: `seats` states how many the
-/// deployment intends to register, and a load whose intent exceeds what the
-/// model text seats is refused at compile.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AdapterConfig {
-    /// How many adapter rows this deployment intends to use. Omit to derive
-    /// it from [`registered`](AdapterConfig::registered); state it to reserve
-    /// room for adapters that arrive later.
-    /// The adapters to write into those seats at boot, in the order given.
-    #[serde(default)]
-    pub seats: Option<u32>,
-    #[serde(default)]
-    pub registered: Vec<RegisteredAdapter>,
-}
-
-/// One adapter, as an operator names it.
-///
-/// The planes are raw bytes and the padding is the caller's: a file here is
-/// one bank's slot, exactly, in the bank's declared dtype and layout. A file
-/// of the wrong length is refused by the engine, by name, with both numbers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RegisteredAdapter {
-    /// Which row of every named bank this fills — the id a lane routes to.
-    pub id: u32,
-    /// Bank name (the plan's own `Param` spelling) to the file holding one
-    /// slot of it. A bank this map omits keeps what it held.
-    #[serde(default)]
-    pub planes: std::collections::BTreeMap<String, String>,
-}
-
-impl AdapterConfig {
-    /// The capacity to bake against: what the operator stated, else what the
-    /// roster needs (a roster whose highest id is `n` needs `n + 1` seats).
-    /// Nothing to seat and nothing to register.
-    #[must_use]
-    pub fn seats(&self) -> u32 {
-        self.seats.unwrap_or_else(|| {
-            self.registered
-                .iter()
-                .map(|adapter| adapter.id.saturating_add(1))
-                .max()
-                .unwrap_or(0)
-        })
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.seats() == 0 && self.registered.is_empty()
-    }
-
-    /// Checks what this layer can answer without a device: whether the
-    /// roster fits the stated capacity, and every plane path is absolute.
-    fn validate(&self) -> Result<()> {
-        let seats = self.seats();
-        for adapter in &self.registered {
-            ensure!(
-                adapter.id < seats,
-                "model.adapters: adapter id {} is past the {seats} seat(s) this \
-                 deployment asks for; raise `[model.adapters] seats` or renumber it",
-                adapter.id
-            );
-            for (bank, path) in &adapter.planes {
-                ensure!(
-                    Path::new(path).is_absolute(),
-                    "model.adapters: the plane for bank {bank:?} of adapter {} must be \
-                     an absolute path (got {path:?})",
-                    adapter.id
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 impl ModelConfig {
-    /// The shared-adapter mount as the boot seam spells it: `Some(path)` when
-    /// the operator stated one, `None` (the feature off) for the empty
-    /// default.
-    pub fn adapter_mount(&self) -> Option<std::path::PathBuf> {
-        (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
-    }
-
-    /// The two weight budgets and the tier arm, in the form the engine's load
-    /// contract states them. Both budgets absent and the arm on is
-    /// [`engine::Residency::uncapped`].
-    /// The second row axis's two ceilings, in the form the engine's load
-    /// contract states them. Both absent derives a ladder from the loaded
-    /// text when the plan states a patch axis.
-    /// The THIRD row axis's two ceilings, in the same form. Both absent
-    /// derives a ladder from the loaded text when the plan states a voxel
-    /// axis.
-    #[must_use]
-    pub fn residency(&self) -> engine::Residency {
-        engine::Residency {
-            device_kv_budget: self.device_kv_budget.map(|b| b.as_bytes()),
-            device_memory_share: self.device_memory_share,
-            host_kv_budget: self.host_kv_budget.map(|b| b.as_bytes()),
-            kv_seats: None,
-            disk_kv_budget: self.disk_kv_budget.map(|b| b.as_bytes()),
-            disk_kv_dir: self.disk_kv_dir.clone(),
-            disk_kv_persistent: self.disk_kv_persistent,
-            kv_export: false,
-            // Unless told to stream, the weight cache holds every atom for
-            // the load's life.
-            weights_held: self.weight_streaming != runtime::store::weights::WeightStreaming::On,
-        }
-    }
-
-    #[must_use]
-    pub fn patch_ceilings(&self) -> (Option<u32>, Option<u32>) {
-        (self.max_patches, self.max_images)
-    }
-
-    #[must_use]
-    pub fn voxel_ceilings(&self) -> (Option<u32>, Option<u32>) {
-        (self.max_voxels, self.max_clips)
-    }
-
     /// What this config changes about the deployment its checkpoint states.
     ///
     /// # Errors
@@ -813,65 +689,17 @@ impl ModelConfig {
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
-        ensure!(
-            self.adapter_dir.is_empty() || Path::new(&self.adapter_dir).is_absolute(),
-            "model.adapter_dir must be an absolute path (got {:?}); \
-             leave it empty to mount no shared adapters at all",
-            self.adapter_dir
-        );
-        for (key, rows) in [
-            ("max_patches", self.max_patches),
-            ("max_images", self.max_images),
-        ] {
-            ensure!(
-                rows != Some(0),
-                "model.{key} = 0 admits no image at all; omit the key to let the engine \
-                 derive a ladder from the model text, or state a positive count"
-            );
-        }
-        ensure!(
-            self.device_memory_share.is_finite()
-                && self.device_memory_share > 0.0
-                && self.device_memory_share <= 1.0,
-            "model.device_memory_share must be finite and in (0.0, 1.0]"
-        );
-        ensure!(
-            self.device_kv_budget.is_none_or(|b| b.as_bytes() > 0),
-            "model.device_kv_budget is zero, and no load serves without a kv pool; \
-             state a real budget or omit the key to fill what device_memory_share leaves"
-        );
-        ensure!(
-            self.disk_kv_budget.is_none_or(|b| b.as_bytes() > 0),
-            "model.disk_kv_budget is zero, and the disk tier is what keeps a session when \
-             memory is taken back; state a real budget or omit the key"
-        );
-        ensure!(
-            self.host_kv_budget.is_none_or(|b| b.as_bytes() > 0),
-            "model.host_kv_budget is zero, but pie cannot compute kv again: under \
-             memory contention suspended kv has to go to host memory. State a real \
-             budget or omit the key for every seat at full context"
-        );
-        self.adapters.validate()?;
         Ok(())
     }
 }
 
+/// `[runtime]`. `runtime.submit_deadline` and `runtime.silence_timeout` were
+/// removed (no lane is dropped from a frame, and no process terminated, on
+/// a timer any more): a config that still carries either is refused at load
+/// as an unknown field. To migrate, delete the line.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    /// How long a pipeline hard-blocking a frame's seal may go without
-    /// submitting before the runtime stops waiting for it, in microseconds.
-    /// Does not fail the pipeline — the lane is dropped from the wait-set
-    /// (an involuntary `forward.park()`) so the boundary seals at once.
-    /// Exposed to guests verbatim as `model.submit-deadline-us()`.
-    #[serde(default = "default_submit_deadline")]
-    pub submit_deadline: Duration,
-    /// How long a lane may stay silent in total — through the leash above and
-    /// on past it — before the runtime terminates its process, in seconds.
-    /// A verdict, so it is generous: a lane that calls `forward.park()` is
-    /// never killed however long it stays away.
-    #[serde(default = "default_silence_timeout")]
-    pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
     /// before it runs. A deployment constant, fixed at runtime start like the
     /// KV page size. Bounded above by the CUDA engine — see [`Self::validate`].
@@ -884,17 +712,29 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_dispatch_depth: Option<u32>,
     /// Hard cap on inferlets admitted at once. Omit to derive it from the
-    /// engine's `max_forward_requests`, which is what fills a batch.
+    /// engine's fire lanes, which is what fills a batch.
     #[serde(default)]
     pub max_concurrent_processes: Option<usize>,
-    /// The worker-plane PLEX policy: a built-in policy's name (`noop`,
-    /// `priority`) or a component path; omit to run none. The cluster
-    /// plane's are `[cluster] cluster_policies`.
-    #[serde(default)]
-    pub worker_policy: Option<String>,
+    /// The worker-plane PLEX 1.1 policy: a built-in policy's name or a
+    /// component path. Omitted, `default`: idle cache a process left is kept
+    /// on the device alone, decoded tail before prompt; `noop` writes no
+    /// rows, so the columns' own defaults apply. The cluster plane's are
+    /// `[cluster] cluster_policies`.
+    #[serde(default = "default_worker_policy")]
+    pub worker_policy: String,
     /// What handle snapshots may take on disk; past it a save is refused.
     #[serde(default = "default_snapshot_budget")]
     pub snapshot_budget: ByteSize,
+}
+
+/// The policies a worker and a controller run when their configuration
+/// names none: `builtins`' names, said here too because a wasm32 worker (the
+/// tab's) links no `builtins`, which builds its components natively.
+const DEFAULT_WORKER_POLICY: &str = "default";
+const DEFAULT_CLUSTER_POLICY: &str = "default-cluster";
+
+fn default_worker_policy() -> String {
+    DEFAULT_WORKER_POLICY.to_string()
 }
 
 fn default_snapshot_budget() -> ByteSize {
@@ -904,12 +744,10 @@ fn default_snapshot_budget() -> ByteSize {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            submit_deadline: default_submit_deadline(),
-            silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
             frame_dispatch_depth: None,
             max_concurrent_processes: None,
-            worker_policy: None,
+            worker_policy: default_worker_policy(),
             snapshot_budget: default_snapshot_budget(),
         }
     }
@@ -928,19 +766,6 @@ impl RuntimeConfig {
     }
 
     fn validate(&self, max_frames: u8) -> Result<()> {
-        ensure!(
-            self.submit_deadline.as_micros() > 0,
-            "runtime.submit_deadline must be > 0"
-        );
-        ensure!(
-            self.silence_timeout.as_micros() > 0,
-            "runtime.silence_timeout must be > 0"
-        );
-        ensure!(
-            self.silence_timeout >= self.submit_deadline,
-            "runtime.silence_timeout must not be shorter than submit_deadline: \
-             a kill that lands before the leash would fail guests the leash exists to spare"
-        );
         ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
         let depth = self.dispatch_depth(0);
         ensure!(depth >= 1, "runtime.frame_dispatch_depth must be >= 1");
@@ -969,14 +794,6 @@ impl RuntimeConfig {
         }
         Ok(())
     }
-}
-
-fn default_submit_deadline() -> Duration {
-    Duration::from_millis(150)
-}
-
-fn default_silence_timeout() -> Duration {
-    Duration::from_secs(600)
 }
 
 fn default_frame_size() -> u32 {
@@ -1010,86 +827,239 @@ pub struct EngineConfig {
     /// experts, which the busiest experts' replicas fill.
     #[serde(default)]
     pub expert_replicas: u32,
-    /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
-    /// `weight_dtype`: a deployment can store weights narrower than it
-    /// computes.
-    #[serde(default = "default_activation_dtype")]
-    pub activation_dtype: String,
+    /// The longest sequence (prompt + output) one lane holds, in tokens: a
+    /// product limit, not a memory one. Omit for the model's own context,
+    /// shortened to what the device holds where one sequence at it would
+    /// not fit.
+    #[serde(default)]
+    pub max_context: Option<u32>,
+    /// Whether a load times the device measurements no stored or committed
+    /// profile states under a matching key (its rates, each dense kernel's
+    /// curve at the model's planes, the dense settle), and keeps them for
+    /// the next boot. `false` times nothing: each is served by the engine's
+    /// estimate, named in the load log, and nothing is stored (`pie serve
+    /// --no-measure`). Vulkan, wgpu, and a one-device cuda engine (CUDA or
+    /// ROCm); xla, whose load times nothing on the device, states it to the
+    /// runtime, which estimates the host cover rather than timing it.
+    #[serde(default = "default_measure")]
+    pub measure: bool,
+    /// `[engine.memory]`: the optional caps for sharing a machine.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Engine-specific knobs, written beside the common keys. Embedded
     /// engines parse this into typed option structs.
     #[serde(flatten)]
     pub options: toml::Table,
 }
 
+/// `[engine.memory]`: what a load may take of the machine. Memory sizing
+/// reads none of these by default: the engine measures the device and
+/// uses all of it, and how it is split between weights, state and fires
+/// follows demand at run time. An empty table is the best configuration
+/// for a dedicated machine; each key is a cap for sharing one.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// The most device memory this load takes (`"20GiB"`), per device, for
+    /// a device shared with another process. Omit to use the whole device.
+    pub budget_device: Option<ByteSize>,
+    /// The tokens of kv the device holds (`3248 * page size`), for a run
+    /// that must compare at a fixed cache: the device pool holds exactly
+    /// the pages they fill, beside the weights and the shapes it always
+    /// holds, and the load is refused where `budget_device` (or the whole
+    /// device) cannot hold that. Omit to size the cache by what the device
+    /// has. cuda only.
+    pub kv_device_tokens: Option<u64>,
+    /// The most pinned host memory suspended kv pages and state slots may
+    /// take (`"32GiB"`), shared by the tensor-parallel ranks. Omit for every
+    /// seat at full context, within half of what the host has free (so
+    /// workers sharing a host each find room). pie cannot compute kv again,
+    /// so this is where memory contention goes: it cannot be turned off.
+    pub budget_host: Option<ByteSize>,
+    /// The disk tier: the most disk suspended kv may spill into once the
+    /// host tier is full (`"200GiB"`), shared by the ranks, in slot files
+    /// under `disk_path`. Omitted: the engine derives it from what can be
+    /// parked (every seat's state and kv at the full context, and the guest
+    /// state the device holds live), within the free space under
+    /// `disk_path` less the OS's own low-storage reserve (Android's
+    /// low-storage threshold; elsewhere what the filesystem keeps from an
+    /// unprivileged process), named in the boot line. 0: no disk tier (the tiers are the device and, where
+    /// there is one, the host), so kv pressure on a device with no host
+    /// tier restarts processes.
+    pub budget_disk: Option<ByteSize>,
+    /// Where the disk tier's slot files go. Omit for
+    /// `$PIE_HOME/cache/kv/<checkpoint digest>`.
+    pub disk_path: Option<PathBuf>,
+    /// Keeps the disk tier for the next run: its slot files stay under
+    /// `disk_path` with a journal of the sealed pages they hold, and a
+    /// restart takes those pages back as cache. Off by default; cuda only,
+    /// and not for a model with recurrent state or a window.
+    pub disk_persistent: bool,
+    /// How much of the device budget this load gives back to the system's
+    /// memory pressure, in `[0, 1]`: the device target is
+    /// `floor + (budget - floor) * (1 - yield * pressure)`, with pressure
+    /// the OS's own reading in `0..1` (Linux and Android PSI, macOS's
+    /// available memory). `0` (a dedicated machine) holds the whole budget
+    /// and reads nothing; above 0, a load on a system whose pressure cannot
+    /// be read is refused by name. The floor is what the load promised: one
+    /// lane at the full `max_context`, the reserved chunks, the activation
+    /// span and the dense weights, so a long `max_context` raises the floor
+    /// and with it lowers how far yield can press. Once pressure goes, the
+    /// pool grows back only on demand, up to the target: nothing is
+    /// allocated for nobody. At `1` the pool trims under moderate pressure
+    /// too, by design; `0` never trims. Omitted, it is `1` where the engine
+    /// states unified memory (Metal, phones, DGX Spark: the pool and the
+    /// host share one RAM) and `0` on separate device memory.
+    ///
+    /// What a lower target gives back is the pool's free segments, and
+    /// segments whose chunks move into the room left in the rest. Short of
+    /// that room, the weight cache is shed, then idle cache goes, in
+    /// retention-priority, then least-recently-used, order: down a tier
+    /// only where a `retention/tiers` row or the policy's tiers default
+    /// names one, else dropped (idle cache no row keys, all of it under
+    /// `noop`, and what an exited process left under `default`). The
+    /// activation rung comes down last. Live, suspended and resting
+    /// state is never given up for it: what they hold stays held.
+    ///
+    /// Idle cache is not timed out by the runtime: it stays until a demand,
+    /// or a lower target, needs its room. How long it is kept past that is
+    /// the policy's to state.
+    #[serde(rename = "yield")]
+    pub yield_share: Option<f64>,
+}
+
+impl MemoryConfig {
+    /// What a load may take of the machine, in the form the engine's load
+    /// contract states it. The weights start held (every streamable atom
+    /// resident where the pool seats them all); live demand may take them
+    /// off the device later.
+    #[must_use]
+    pub fn residency(&self) -> engine::Residency {
+        engine::Residency {
+            device: engine::Allowance {
+                budget: self.budget_device.map(|b| b.as_bytes()),
+            },
+            device_kv_budget: None,
+            device_kv_tokens: self.kv_device_tokens,
+            host_kv_budget: self.budget_host.map(|b| b.as_bytes()),
+            kv_seats: None,
+            // Absent: the engine's derived tier; a stated 0: none.
+            disk_kv_budget: self.budget_disk.map(|b| b.as_bytes()),
+            disk_kv_dir: self.disk_path.clone(),
+            disk_kv_persistent: self.disk_persistent,
+            kv_export: false,
+            host_programs: None,
+            weights_held: true,
+        }
+    }
+
+    /// How much of the device budget this load gives back to the system's
+    /// memory pressure; `None` where the deployment states none, for the
+    /// load to resolve by the engines' memory.
+    ///
+    /// # Errors
+    ///
+    /// `yield` is outside `[0, 1]`, refused by name.
+    pub fn yields(&self) -> Result<Option<runtime::governor::Yield>> {
+        Ok(self
+            .yield_share
+            .map(runtime::governor::Yield::new)
+            .transpose()?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.yields()?;
+        ensure!(
+            self.kv_device_tokens != Some(0),
+            "engine.memory.kv_device_tokens = 0 holds no kv; state the tokens the device \
+             holds or omit the key"
+        );
+        let none = self.budget_disk.is_some_and(|b| b.as_bytes() == 0);
+        ensure!(
+            !none || (self.disk_path.is_none() && !self.disk_persistent),
+            "engine.memory.disk_path or disk_persistent names a disk tier, but budget_disk \
+             = 0 states none; omit budget_disk (a derived tier) or remove them"
+        );
+        for (key, budget) in [
+            ("budget_device", self.budget_device),
+            ("budget_host", self.budget_host),
+        ] {
+            ensure!(
+                budget.is_none_or(|b| b.as_bytes() > 0),
+                "engine.memory.{key} is zero, and a load needs some of every tier it \
+                 has; state a real budget or omit the key"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl EngineConfig {
+    /// The named engine's own keys as its options struct.
+    ///
+    /// # Errors
+    ///
+    /// A key the engine does not declare, or a value of the wrong type.
+    pub fn options_as<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        toml::Value::Table(self.options.clone())
+            .try_into()
+            .map_err(|e: toml::de::Error| match unknown_field(e.message()) {
+                Some(field) => anyhow::Error::new(UnknownKey {
+                    table: "engine".to_string(),
+                    field: field.to_string(),
+                }),
+                None => anyhow::anyhow!(
+                    "invalid [engine] options for engine type {:?}: {e}",
+                    self.kind,
+                ),
+            })
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(!self.device.is_empty(), "engine.device must be non-empty");
+        ensure!(
+            self.max_context != Some(0),
+            "engine.max_context = 0 holds no sequence; omit it for the model's own context"
+        );
+        self.memory.validate()?;
+        ensure!(
+            self.measure
+                || matches!(
+                    self.kind,
+                    EngineKind::Vulkan | EngineKind::Wgpu | EngineKind::Metal | EngineKind::Xla
+                )
+                || (self.kind == EngineKind::Cuda && self.device.len() == 1),
+            "engine.measure = false skips the measurements a load takes on the vulkan, wgpu, \
+             metal and xla engines and a one-device cuda engine; the {} engine{} still measures outside \
+             that path, so omit the key",
+            self.kind.as_str(),
+            if self.kind == EngineKind::Cuda {
+                " across devices"
+            } else {
+                ""
+            }
+        );
+        ensure!(
+            self.memory.kv_device_tokens.is_none() || self.kind == EngineKind::Cuda,
+            "engine.memory.kv_device_tokens sizes the cuda engine's device pool; the {} engine \
+             does not size its pool by tokens, so omit the key",
+            self.kind.as_str()
+        );
         match self.kind {
             EngineKind::Cuda => {
-                let opts: CudaEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid [engine] options for engine type {:?}: {e}",
-                        self.kind,
-                    )
-                })?;
-                opts.validate()?;
+                self.options_as::<CudaEngineOptions>()?;
             }
             EngineKind::Metal => {
-                let _: MetalEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
+                self.options_as::<MetalEngineOptions>()?;
             }
             EngineKind::Vulkan => {
-                let opts: VulkanEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                opts.validate()?;
+                self.options_as::<VulkanEngineOptions>()?;
             }
-            EngineKind::Wgpu => {
-                let opts: WgpuEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid [engine] options for engine type {:?}: {e}",
-                        self.kind,
-                    )
-                })?;
-                opts.validate()?;
-            }
+            EngineKind::Wgpu => self.options_as::<WgpuEngineOptions>()?.validate()?,
             EngineKind::Xla => {
-                let opts: XlaEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                opts.validate()?;
+                self.options_as::<XlaEngineOptions>()?;
             }
-            EngineKind::Cerebras => {
-                let opts: CerebrasEngineOptions = toml::Value::Table(self.options.clone())
-                    .try_into()
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid [engine] options for engine type {:?}: {e}",
-                            self.kind,
-                        )
-                    })?;
-                opts.validate()?;
-            }
+            EngineKind::Cerebras => self.options_as::<CerebrasEngineOptions>()?.validate()?,
         }
         Ok(())
     }
@@ -1097,8 +1067,7 @@ impl EngineConfig {
 
 /// Which engine `[engine] type` names.
 ///
-/// Every name here is now offered: `Vulkan` and `Wgpu` were named-not-hosted
-/// until their shells landed, and each is one `--features` flag away.
+/// Every name here is offered; each is one `--features` flag away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
@@ -1135,11 +1104,11 @@ impl EngineKind {
 fn default_tp_size() -> u32 {
     1
 }
+fn default_measure() -> bool {
+    true
+}
 fn default_ep_size() -> u32 {
     1
-}
-fn default_activation_dtype() -> String {
-    "bfloat16".to_string()
 }
 /// Accept either a single string or a list of strings.
 fn deserialize_string_or_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
@@ -1174,6 +1143,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The defaults said here are `builtins`' own.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_default_policies_are_the_builtins() {
+        assert_eq!(
+            super::DEFAULT_WORKER_POLICY,
+            builtins::DEFAULT_WORKER_POLICY
+        );
+        assert_eq!(
+            super::DEFAULT_CLUSTER_POLICY,
+            builtins::DEFAULT_CLUSTER_POLICY
+        );
+    }
+
     use super::*;
 
     const MINIMAL_METAL: &str = r#"
@@ -1186,83 +1169,54 @@ type = "metal"
 device = ["metal:0"]
 "#;
 
-    /// A key no section declares is refused by name, rather than read as
-    /// nothing.
-    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
-    /// diagnostics record says so instead of swallowing the flag.
-    /// The word list is the shell's, so this side keeps it whole rather than
-    /// parsing it — a config that states one is the string it stated.
-    /// Every engine kind's `as_str` is the word a config file spells it with;
-    /// `as_str` is a hand-written match and nothing ties it to serde's
-    /// `rename_all` if they drift.
-    /// `[model.adapters]` absent is the shape hard-coded before it existed:
-    /// zero seats, no roster, and the correction op never launches.
-    /// The capacity is stated once: either the operator says it, or the
-    /// roster does — one number, one owner.
-    /// The two refusals this layer can make without a device.
     #[test]
     fn config_every_case() {
         an_unknown_key_is_refused();
         a_distributed_worker_states_no_cluster_policies();
-        a_silence_timeout_under_the_submit_deadline_is_refused();
+        the_policies_default_to_the_built_in_defaults();
         the_diag_flag_states_the_engines_diagnostics_key();
+        measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere();
         an_engine_s_own_key_is_written_beside_the_common_ones();
         parses_minimal_metal_config();
         every_engine_kind_round_trips_through_its_config_string();
-        adapters_are_absent_by_default_and_that_is_zero_seats();
-        the_seat_count_is_stated_once_or_derived_from_the_roster();
-        an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name();
-        weight_streaming_is_auto_unless_stated();
-        a_removed_key_is_refused_with_why();
+        the_operator_adapter_keys_are_unknown_fields();
         the_dispatch_depth_is_bounded_by_the_engine_kind();
     }
 
-    fn a_removed_key_is_refused_with_why() {
-        let err = Config::parse(&MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\nhost_weight_deferred = false",
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("`host_weight_deferred` was removed"), "{err}");
-        for key in ["device_weight_budget", "host_weight_budget"] {
-            let toml = MINIMAL_METAL.replace(
-                "source = \"Qwen/Qwen3-0.6B\"",
-                &format!("source = \"Qwen/Qwen3-0.6B\"\n{key} = \"4GiB\""),
-            );
-            let err = Config::parse(&toml).unwrap_err().to_string();
-            assert!(
-                err.contains(&format!("`{key}` was removed"))
-                    && err.contains("dense weights always live in device memory"),
-                "{key}: {err}"
-            );
-        }
-        let err = toml::from_str::<backend::CudaEngineOptions>("max_state_slots = 16\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("`max_state_slots` was removed"), "{err}");
-        let err = toml::from_str::<backend::VulkanEngineOptions>("max_state_slots = 16\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("`max_state_slots` was removed"), "{err}");
-    }
-
-    fn weight_streaming_is_auto_unless_stated() {
-        use runtime::store::weights::WeightStreaming;
-        let cfg = Config::parse(MINIMAL_METAL).unwrap();
-        assert_eq!(cfg.model.weight_streaming, WeightStreaming::Auto);
-        for (word, mode) in [("on", WeightStreaming::On), ("off", WeightStreaming::Off)] {
-            let toml = MINIMAL_METAL.replace(
-                "source = \"Qwen/Qwen3-0.6B\"",
-                &format!("source = \"Qwen/Qwen3-0.6B\"\nweight_streaming = \"{word}\""),
-            );
-            assert_eq!(Config::parse(&toml).unwrap().model.weight_streaming, mode);
-        }
-        let bad = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\nweight_streaming = \"maybe\"",
+    /// A default home has a disk tier: `budget_disk` omitted leaves its size
+    /// to the engine (derived from what can be parked, within the free
+    /// disk), on unified and discrete devices alike, so kv pressure
+    /// suspends to disk rather than restarting processes. A stated 0 is no
+    /// disk tier, a positive budget is its size, and a disk path or
+    /// persistence beside a stated 0 is refused by name.
+    #[test]
+    fn a_default_home_has_a_disk_tier_and_0_states_none() {
+        let unset = Config::parse(MINIMAL_METAL).unwrap();
+        assert_eq!(
+            unset.engine.memory.residency().disk_kv_budget,
+            None,
+            "unstated: the engine derives the disk tier"
         );
-        assert!(Config::parse(&bad).is_err());
+        let zero = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"0B\"\n");
+        let cfg = Config::parse(&zero).expect("0 is no disk tier, not refused");
+        assert_eq!(
+            cfg.engine.memory.residency().disk_kv_budget,
+            Some(0),
+            "stated: none"
+        );
+        let sized = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"2GiB\"\n");
+        let cfg = Config::parse(&sized).unwrap();
+        assert_eq!(cfg.engine.memory.residency().disk_kv_budget, Some(2 << 30));
+        for stray in ["disk_path = \"/nvme/pie\"", "disk_persistent = true"] {
+            let derived = format!("{MINIMAL_METAL}\n[engine.memory]\n{stray}\n");
+            Config::parse(&derived).expect("a path or persistence for the derived tier");
+            let toml = format!("{MINIMAL_METAL}\n[engine.memory]\nbudget_disk = \"0B\"\n{stray}\n");
+            let refused = Config::parse(&toml).expect_err(stray);
+            assert!(
+                format!("{refused:#}").contains("budget_disk = 0 states none"),
+                "{stray}: {refused:#}"
+            );
+        }
     }
 
     /// A staged engine keeps the 64-bit ring's 15 frames; only the cerebras
@@ -1288,6 +1242,8 @@ device = ["metal:0"]
         }
     }
 
+    /// A key no section declares is refused by name, rather than read as
+    /// nothing.
     fn an_unknown_key_is_refused() {
         for (section, key) in [
             ("server", "host = \"127.0.0.1\""),
@@ -1306,28 +1262,42 @@ device = ["metal:0"]
     fn a_distributed_worker_states_no_cluster_policies() {
         let toml = format!(
             "{MINIMAL_METAL}\n[cluster]\ncontroller = \"10.0.0.1:7000\"\nrole = \"decode\"\n\
-             cluster_policies = [\"persist-prefix\"]\n"
+             cluster_policies = [\"my-policy\"]\n"
         );
         let err = Config::parse(&toml).unwrap_err().to_string();
         assert!(err.contains("the controller's to run"), "got: {err}");
-        let alone =
-            format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"persist-prefix\"]\n");
+        let alone = format!("{MINIMAL_METAL}\n[cluster]\ncluster_policies = [\"my-policy\"]\n");
         Config::parse(&alone).expect("single-node runs them in its own controller");
     }
 
-    fn a_silence_timeout_under_the_submit_deadline_is_refused() {
-        let toml = format!(
-            "{MINIMAL_METAL}\n[runtime]\n\
-             submit_deadline = \"5s\"\nsilence_timeout = \"1s\"\n"
+    /// Unstated, a worker runs `default` and its controller
+    /// `default-cluster`; `noop` and `[]` are how a file asks for no rows.
+    fn the_policies_default_to_the_built_in_defaults() {
+        let cfg = Config::parse(MINIMAL_METAL).unwrap();
+        assert_eq!(cfg.runtime.worker_policy, "default");
+        assert_eq!(cfg.cluster.policies(), ["default-cluster"]);
+        assert_eq!(
+            cfg.offload.prefill_min_suffix_tokens, None,
+            "passes stay home"
         );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("must not be shorter than submit_deadline"),
-            "got: {err}"
+        let none = format!(
+            "{MINIMAL_METAL}\n[runtime]\nworker_policy = \"noop\"\n\
+             [cluster]\ncluster_policies = []\n"
         );
+        let cfg = Config::parse(&none).unwrap();
+        assert_eq!(cfg.runtime.worker_policy, "noop");
+        assert!(cfg.cluster.policies().is_empty());
+        let distributed = format!(
+            "{MINIMAL_METAL}\n[cluster]\ncontroller = \"10.0.0.1:7000\"\nrole = \"decode\"\n"
+        );
+        Config::parse(&distributed)
+            .expect("a distributed worker states none, and takes no default");
     }
 
+    /// `--diag` writes `[engine] diagnostics`, and a flavor with no
+    /// diagnostics record says so instead of swallowing the flag. The word
+    /// list is the shell's, so this side keeps it whole rather than parsing
+    /// it: a config that states one is the string it stated.
     fn the_diag_flag_states_the_engines_diagnostics_key() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.state_diagnostics("tier-trace,kernel-profile=2")
@@ -1352,6 +1322,18 @@ device = ["metal:0"]
             why.to_string().contains("vulkan"),
             "and the refusal names the flavor: {why}"
         );
+    }
+
+    fn measuring_is_skipped_where_the_engine_skips_and_refused_elsewhere() {
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.skip_measuring().expect("metal skips");
+        assert!(!cfg.engine.measure);
+        let group = MINIMAL_METAL
+            .replace("type = \"metal\"", "type = \"cuda\"")
+            .replace("[\"metal:0\"]", "[\"cuda:0\", \"cuda:1\"]");
+        let mut cfg: Config = toml::from_str(&group).unwrap();
+        cfg.skip_measuring()
+            .expect_err("a cuda group measures outside the skip path");
     }
 
     fn an_engine_s_own_key_is_written_beside_the_common_ones() {
@@ -1379,6 +1361,9 @@ device = ["metal:0"]
         assert_eq!(cfg.server.listen.port(), 8080);
     }
 
+    /// Every engine kind's `as_str` is the word a config file spells it with;
+    /// `as_str` is a hand-written match and nothing ties it to serde's
+    /// `rename_all` if they drift.
     fn every_engine_kind_round_trips_through_its_config_string() {
         const KINDS: &[(EngineKind, &str)] = &[
             (EngineKind::Cuda, "cuda"),
@@ -1410,78 +1395,19 @@ device = ["metal:0"]
         );
     }
 
-    fn adapters_are_absent_by_default_and_that_is_zero_seats() {
-        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        cfg.validate().unwrap();
-        assert!(cfg.model.adapters.is_empty());
-        assert_eq!(cfg.model.adapters.seats(), 0);
-        assert!(cfg.model.adapters.registered.is_empty());
-    }
-
-    fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
-        let plane = if cfg!(windows) {
-            "C:/adapters/0/a.bin"
-        } else {
-            "/adapters/0/a.bin"
-        };
-        let toml = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            &format!(
-                "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-                 [[model.adapters.registered]]\n\
-                 id = 2\n\
-                 planes = {{ \"layer.0.lora_a\" = \"{plane}\" }}\n"
-            ),
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.model.adapters.seats(), 3);
-        assert_eq!(cfg.model.adapters.registered.len(), 1);
-        assert_eq!(
-            cfg.model.adapters.registered[0].planes["layer.0.lora_a"],
-            plane
-        );
-
-        let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");
-        let cfg: Config = toml::from_str(&stated).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.model.adapters.seats(), 8);
-    }
-
-    fn an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name() {
-        let past = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseats = 2\n\
-             [[model.adapters.registered]]\n\
-             id = 5\n",
-        );
-        let cfg: Config = toml::from_str(&past).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("adapter id 5 is past the 2 seat"),
-            "got: {err}"
-        );
-
-        let relative = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
-             [[model.adapters.registered]]\n\
-             id = 0\n\
-             planes = { \"layer.0.lora_a\" = \"a.bin\" }\n",
-        );
-        let cfg: Config = toml::from_str(&relative).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("must be \n             an absolute path")
-                || err.contains("absolute path"),
-            "got: {err}"
-        );
-
-        let typo = MINIMAL_METAL.replace(
-            "source = \"Qwen/Qwen3-0.6B\"",
-            "source = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseat = 2\n",
-        );
-        toml::from_str::<Config>(&typo)
-            .expect_err("a near-miss of `seats` must be refused by name");
+    /// An adapter comes through a program: `[model]` declares neither an
+    /// adapter directory nor a roster.
+    fn the_operator_adapter_keys_are_unknown_fields() {
+        for (key, line) in [
+            ("adapter_dir", "adapter_dir = \"/srv/adapters\""),
+            ("adapters", "[model.adapters]\nseats = 1"),
+        ] {
+            let toml = MINIMAL_METAL.replace(
+                "source = \"Qwen/Qwen3-0.6B\"",
+                &format!("source = \"Qwen/Qwen3-0.6B\"\n{line}"),
+            );
+            let err = toml::from_str::<Config>(&toml).unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown field `{key}`")), "{err}");
+        }
     }
 }

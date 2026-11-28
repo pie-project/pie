@@ -65,6 +65,9 @@ impl KeepAlive {
         let fire = Fire::at("runtime/keepalive.metal", "keepalive_spin")
             .apply(Grid::of([32, 1, 1], [32, 1, 1]));
         let pipeline = pipelines.at(device.device(), fire)?;
+        // One of the three tiny fixed buffers outside the pool (this, the
+        // warm-load bind placeholder, the shared empty buffer), left there by
+        // ruling: what the keepalive kernel writes nothing anyone reads into.
         let sink = crate::device::Buffer::zeroed(device, 256)?;
         let iters: u32 = crate::diag::on().keepalive_iters.unwrap_or(DEFAULT_ITERS);
         let (last_t, stop_t, busy_t) = (Arc::clone(&last), Arc::clone(&stop), Arc::clone(&busy));

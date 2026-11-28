@@ -666,8 +666,9 @@ fn checkpoint_stamp(checkpoint: &Path) -> R<String> {
     let entries: Vec<PathBuf> = if checkpoint.is_dir() {
         std::fs::read_dir(checkpoint)
             .map_err(io(checkpoint))?
-            .flatten()
-            .map(|e| e.path())
+            .map(|e| e.map(|e| e.path()).map_err(io(checkpoint)))
+            .collect::<R<Vec<PathBuf>>>()?
+            .into_iter()
             .filter(|p| p.is_file())
             .collect()
     } else {

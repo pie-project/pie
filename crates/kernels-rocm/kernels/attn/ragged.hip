@@ -20,10 +20,12 @@ constexpr int RAGGED_FULL = 0;
 constexpr int RAGGED_CUSTOM = 1;   // keep bit qo·kv_len + kv of group g's bits, from byte indptr[g]
 constexpr int RAGGED_BIAS = 2;     // logit · scale + bias[head][clamp(kv − qo + max_len − 1)]
 
-// An arm reads only its own operands; group g's `bits` start at byte `mask_indptr[g]`.
+// An arm reads only its own operands; group g's `bits` start at byte `mask_indptr[g]`,
+// a negative offset stating no mask (a group none of whose lanes states one:
+// every pair kept, no bit read).
 struct RaggedMaskArgs {
     const unsigned char* bits;
-    const i32* mask_indptr;
+    const long long* mask_indptr;
     const float* bias;
     int max_len;
 };
@@ -48,7 +50,8 @@ __device__ __forceinline__ bool ragged_keeps(const RaggedMaskArgs& m, int g, int
         const unsigned long long cell =
             static_cast<unsigned long long>(qo) * static_cast<unsigned long long>(kv_len) +
             static_cast<unsigned long long>(kv);
-        return (m.bits[m.mask_indptr[g] + static_cast<long long>(cell >> 3)] >> (cell & 7)) & 1;
+        const long long at = m.mask_indptr[g];
+        return at < 0 || ((m.bits[at + static_cast<long long>(cell >> 3)] >> (cell & 7)) & 1);
     } else {
         return true;
     }
@@ -59,7 +62,7 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     bf16* __restrict__ o, const i32* __restrict__ q_indptr, const i32* __restrict__ kv_indptr,
     int groups, int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int rows,
-    const unsigned char* __restrict__ bits, const i32* __restrict__ mask_indptr,
+    const unsigned char* __restrict__ bits, const long long* __restrict__ mask_indptr,
     const float* __restrict__ bias, int max_len) {
     static_assert(D % 16 == 0, "the stamp is whole 16-wide MFMA steps");
     constexpr int BC = 32, KT = BC / 16, KS = D / 16;

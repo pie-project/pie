@@ -5,17 +5,9 @@
 //! DMA through the pool reference bitcast to the element
 //! (`tpu.memref_bitcast`, the packed rows order) moves the bytes as they lie,
 //! HBM to HBM, one copy a block in flight together.
-//!
-//! `PIE_XLA_POOL_DMA=0` keeps blocks on the XLA path (off a TPU).
 
 use crate::hlo::{Built, Elem, Func, Val};
-use crate::mosaic::{Body, Grid, ICmp, Kernel, MTy, Operand, Sem, Space, V, Window};
-
-/// Whether pool blocks go by DMA.
-#[must_use]
-pub fn on() -> bool {
-    !std::env::var("PIE_XLA_POOL_DMA").is_ok_and(|v| v == "0")
-}
+use crate::mosaic::{Body, Grid, ICmp, Kernel, MTy, Operand, Sem, V, Window};
 
 /// Copies a step of a kernel's issue loop.
 const UNROLL: i64 = 8;
@@ -36,84 +28,20 @@ fn any(array: Vec<i64>, elem: Elem) -> Operand {
 /// Blocks `at` (`[B]` i32, each in range) of `nr` pool rows of `pool`
 /// (`u32 [R, 128]`) as `elem [B · nr · k, 128]` (`k` elements a word).
 pub fn gather(f: &mut Func, pool: Val, at: Val, nr: i64, elem: Elem) -> Built<Val> {
-    gather_with(f, pool, at, nr, elem, None)
-}
-
-/// The page id [`gather_paged`] reads as the sink's.
-pub const SINK: i32 = i32::MIN;
-
-/// A plane's pages mapped in the kernel ([`gather_paged`]).
-#[derive(Clone, Copy)]
-struct Paged {
-    map: crate::tensor::PageMap,
-    sink: i64,
-    hi: i64,
-}
-
-/// Pages of a pool plane by DMA, the plane's [`crate::tensor::PageMap`]
-/// applied in the kernel: page `at[b]` (unmapped, as every layer's plane
-/// reads it, so the ids are one computation a fire) lands block
-/// `clamp(map(at), 0, hi)` (a negative id, as `PageMap::apply` keeps it
-/// negative, clamps to 0; one past `map`'s range stays as it is), [`SINK`]
-/// block `sink`; blocks of `nr` pool rows. As `PageMap::apply` then a
-/// clamped gather, with no XLA op ahead of the call (each a launch).
-#[allow(clippy::too_many_arguments)]
-pub fn gather_paged(
-    f: &mut Func,
-    pool: Val,
-    at: Val,
-    nr: i64,
-    elem: Elem,
-    map: crate::tensor::PageMap,
-    sink: i64,
-    hi: i64,
-) -> Built<Val> {
-    gather_with(f, pool, at, nr, elem, Some(Paged { map, sink, hi }))
-}
-
-fn gather_with(
-    f: &mut Func,
-    pool: Val,
-    at: Val,
-    nr: i64,
-    elem: Elem,
-    paged: Option<Paged>,
-) -> Built<Val> {
-    Ok(gather_planes(f, pool, at, elem, &[(nr, paged)])?[0])
+    Ok(gather_planes(f, pool, at, elem, &[nr])?[0])
 }
 
 /// Several planes' blocks `at` in one kernel, each by its own rows a block
-/// and index (fewer calls: each is a launch and a boundary XLA schedules
-/// around).
-fn gather_planes(
-    f: &mut Func,
-    pool: Val,
-    at: Val,
-    elem: Elem,
-    planes: &[(i64, Option<Paged>)],
-) -> Built<Vec<Val>> {
+/// (fewer calls: each is a launch and a boundary XLA schedules around).
+fn gather_planes(f: &mut Func, pool: Val, at: Val, elem: Elem, planes: &[i64]) -> Built<Vec<Val>> {
     let rows = f.dims(pool)[0];
     let b = f.dims(at)[0];
     let k = i64::from(32 / elem.bits());
     // one wait for every byte holds where each copy is whole (8k, 128)
     // tiles of the element (a 2-row bf16 block hangs it)
-    let whole_tiles = planes.iter().all(|&(nr, _)| (nr * k) % (8 * k) == 0);
+    let whole_tiles = planes.iter().all(|&nr| (nr * k) % (8 * k) == 0);
     let np = planes.len() as i64;
-    // A sink page lands from a zeroed VMEM block: every absent page of a
-    // fire names the one sink page, and as many copies of one HBM page as
-    // there are absent pages serialize (v6e: a fresh prompt's 32 sink pages,
-    // 11.8 us a layer). A reader masks the sink's rows to weight 0, which
-    // any finite rows (the sink page's, or zeros) leave bit for bit alike.
-    let zero_rows = planes
-        .iter()
-        .filter(|(_, p)| p.is_some())
-        .map(|&(nr, _)| nr * k)
-        .max()
-        .filter(|_| elem.is_float());
-    let mut scratch = vec![MTy::Sem(vec![np])];
-    if let Some(r) = zero_rows {
-        scratch.push(MTy::Ref(vec![r, 128], elem, Space::Vmem));
-    }
+    let scratch = vec![MTy::Sem(vec![np])];
     let kern = Kernel {
         name: "pool_gather".into(),
         grid: vec![1],
@@ -122,24 +50,16 @@ fn gather_planes(
         ins: vec![any(vec![rows, 128], Elem::U32)],
         outs: planes
             .iter()
-            .map(|&(nr, _)| any(vec![b * nr * k, 128], elem))
+            .map(|&nr| any(vec![b * nr * k, 128], elem))
             .collect(),
         // DMA only: no VMEM of its own, so none held from XLA's placement
         // (the compiler's default scope would be)
-        vmem_limit: Some(VMEM + zero_rows.map_or(0, |r| u64::try_from(r * 128 * 4).unwrap_or(0))),
+        vmem_limit: Some(VMEM),
         scratch,
     };
     let c = kern.build(|bd, blk| {
         let ids = blk.grid.prefetch[0];
         let src = bd.ref_bitcast(blk.ins[0], elem)?;
-        let zeros = match zero_rows {
-            Some(r) => {
-                let z = bd.splat_f(&[r, 128], elem, 0.0)?;
-                bd.vstore_all(z, blk.scratch[1])?;
-                Some(blk.scratch[1])
-            }
-            None => None,
-        };
         let n = bd.i32(b);
         let one = bd.i32(1);
         let z = bd.i32(0);
@@ -150,31 +70,10 @@ fn gather_planes(
         };
         let copy = |bd: &mut Body, j: V, wait: bool| -> Built<()> {
             let raw = bd.load(ids, &[j])?;
-            for (x, &(nr, paged)) in planes.iter().enumerate() {
+            for (x, &nr) in planes.iter().enumerate() {
                 let er = nr * k;
                 let z = bd.i32(0);
-                let id = match paged {
-                    None => raw,
-                    Some(Paged { map, sink, hi }) => {
-                        // map(id) where it fits (else as it is), clamped to
-                        // the plane; the sentinel the sink
-                        let most = (i64::from(i32::MAX) - map.offset.abs()) / map.stride.max(1);
-                        let by = bd.i32(map.stride);
-                        let off = bd.i32(map.offset);
-                        let mapped = bd.muli(raw, by)?;
-                        let mapped = bd.addi(mapped, off)?;
-                        let top = bd.i32(most);
-                        let fits = bd.cmpi(ICmp::Sle, raw, top)?;
-                        let v = bd.select(fits, mapped, raw)?;
-                        let h = bd.i32(hi);
-                        let v = bd.maxsi(v, z)?;
-                        let v = bd.minsi(v, h)?;
-                        let sv = bd.i32(i64::from(SINK));
-                        let is_sink = bd.cmpi(ICmp::Eq, raw, sv)?;
-                        let sk = bd.i32(sink);
-                        bd.select(is_sink, sk, v)?
-                    }
-                };
+                let id = raw;
                 // into the pool, as a gather clamps
                 let top = bd.i32(rows / nr - 1);
                 let id = bd.maxsi(id, z)?;
@@ -192,20 +91,7 @@ fn gather_planes(
                         bd.dma_start(s, d, sem)
                     }
                 };
-                match (paged, zeros) {
-                    (Some(_), Some(zr)) => {
-                        let sv = bd.i32(i64::from(SINK));
-                        let sunk = bd.cmpi(ICmp::Eq, raw, sv)?;
-                        let real = bd.cmpi(ICmp::Ne, raw, sv)?;
-                        bd.when(real, |bd| go(bd, s))?;
-                        bd.when(sunk, |bd| {
-                            let z = bd.i32(0);
-                            let zs = bd.ref_slice(zr, &[z, z], &[er, 128])?;
-                            go(bd, zs)
-                        })?;
-                    }
-                    _ => go(bd, s)?,
-                }
+                go(bd, s)?;
             }
             Ok(())
         };
@@ -242,22 +128,6 @@ fn gather_planes(
         }
     })?;
     c.call(f, &[at, pool])
-}
-
-/// [`gather_paged`] of several planes of the pool in one kernel: each
-/// `(nr, map, sink, hi)`, the same unmapped ids.
-pub fn gather_paged_planes(
-    f: &mut Func,
-    pool: Val,
-    at: Val,
-    elem: Elem,
-    planes: &[(i64, crate::tensor::PageMap, i64, i64)],
-) -> Built<Vec<Val>> {
-    let planes: Vec<(i64, Option<Paged>)> = planes
-        .iter()
-        .map(|&(nr, map, sink, hi)| (nr, Some(Paged { map, sink, hi })))
-        .collect();
-    gather_planes(f, pool, at, elem, &planes)
 }
 
 /// `pool` with `ups` (`elem [B · nr · k, 128]`) landed as blocks `at` (`[B]`

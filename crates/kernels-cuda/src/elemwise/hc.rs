@@ -163,7 +163,7 @@ pub fn gates(
     if comb && fan * fan <= 32 {
         let hidden = nonzero(OP, "the hidden width", x.width)?;
         let want = 2 * ctx.multiprocessors().unwrap_or(132);
-        let vec8 = ctx.tuning().hc_tile && whole_runs(hidden, &[streams.ptr, x.ptr]);
+        let vec8 = ctx.tuning().hc_tile() && whole_runs(hidden, &[streams.ptr, x.ptr]);
         let columns = if vec8 { hidden / 8 } else { hidden };
         let slices = want.div_ceil(x.rows).clamp(1, columns.div_ceil(BLOCK));
         // Eight columns a thread: the pre-mix on `slices` blocks a row and the
@@ -287,7 +287,7 @@ fn gates_norm_launch(
                 held.is_some()
             ),
         ))
-        .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1]).programmatic(ctx.tuning().pdl)),
+        .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1]).programmatic(ctx.tuning().pdl())),
         &[
             mixes,
             gate.scale.arg(),
@@ -374,7 +374,7 @@ pub fn fold(
     // A prefill's rows of four streams a block a row (`hc_fold_rows4`, under
     // `kernel.elemwise.hc_mma`): the gates read once a thread, the same sums
     // in the same order.
-    if ctx.tuning().hc_mma
+    if ctx.tuning().hc_mma()
         && y.rows >= 128
         && fan == 4
         && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr])
@@ -398,7 +398,7 @@ pub fn fold(
     }
     // Eight columns a thread where the rows are whole 16-byte runs: the same
     // sums in the same order.
-    let vec8 = ctx.tuning().hc_tile && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr]);
+    let vec8 = ctx.tuning().hc_tile() && whole_runs(x.width, &[x.ptr, streams.ptr, y.ptr]);
     let (entry, width) = if vec8 {
         (format!("::pie::elemwise::hc_fold_vec8<{t}>"), x.width / 8)
     } else {
@@ -408,7 +408,7 @@ pub fn fold(
     ctx.fire(
         OP,
         Fire::at(kernel(HC, &entry))
-            .apply(elementwise_in(OP, y.rows, width)?.programmatic(ctx.tuning().pdl && vec8)),
+            .apply(elementwise_in(OP, y.rows, width)?.programmatic(ctx.tuning().pdl() && vec8)),
         &[
             x.arg(),
             streams.arg(),
@@ -805,7 +805,7 @@ fn fold_pre_fits(ctx: &Ctx, s: &Seam, folded: &Tensor, y: &Tensor) -> bool {
     let wide = 4 * hidden;
     crate::linear::gemm_sm100::supported()
         && y.rows != 0
-        && (ctx.tuning().hc_mega_from..=ctx.tuning().hc_mega_until).contains(&y.rows)
+        && (ctx.tuning().hc_mega_from()..=ctx.tuning().hc_mega_until()).contains(&y.rows)
         && s.stream_count == 4
         && hidden != 0
         && hidden.is_multiple_of(1024)
@@ -987,7 +987,7 @@ pub fn fold_pre(
             .apply(
                 Launch::grid([grid, 1, 1], [MEGA_THREADS, 1, 1])
                     .smem(MEGA_SMEM)
-                    .programmatic(ctx.tuning().pdl),
+                    .programmatic(ctx.tuning().pdl()),
             ),
             &[
                 ArgValue::of(&map_fn),

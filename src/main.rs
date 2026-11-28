@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Serve,
+    Serve(ServeArgs),
 
     Run(ops::run::RunArgs),
 
@@ -63,6 +63,16 @@ enum Command {
     Tune(ops::tune::TuneArgs),
 
     Doctor,
+}
+
+#[derive(clap::Args, Debug)]
+struct ServeArgs {
+    /// Time no device measurement at load (`[engine] measure = false`):
+    /// each rate, curve and settle no stored or committed profile states is
+    /// served by the engine's estimate, named in the load log, and nothing
+    /// is stored. Vulkan, wgpu, and a one-device cuda engine (CUDA or ROCm).
+    #[arg(long)]
+    no_measure: bool,
 }
 
 #[cfg(unix)]
@@ -107,8 +117,21 @@ fn report(error: &anyhow::Error) {
     }
 }
 
+fn main() -> ExitCode {
+    // A region's compile, asked of this program by itself: before anything
+    // else, and no subcommand of the command line.
+    #[cfg(feature = "rocm")]
+    {
+        if let Some(code) = runtime::engine::region_compiler::main_if_asked() {
+            return code;
+        }
+        runtime::engine::region_compiler::register();
+    }
+    command()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn command() -> ExitCode {
     die_quietly_on_closed_pipe();
     match run().await {
         Ok(code) => code,
@@ -122,14 +145,14 @@ async fn main() -> ExitCode {
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
-    if let Command::Serve = cli.command {
-        return serve(cli.global, cli.diag.as_deref()).await;
+    if let Command::Serve(args) = &cli.command {
+        return serve(cli.global, cli.diag.as_deref(), args.no_measure).await;
     }
 
     pie::daemon::init_command(&cli.global);
 
     let answer = match cli.command {
-        Command::Serve => unreachable!("serve returns before the op dispatch"),
+        Command::Serve(_) => unreachable!("serve returns before the op dispatch"),
 
         Command::Model { cmd } => {
             let global = cli.global.clone();
@@ -161,15 +184,22 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(code)
 }
 
-async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Result<ExitCode> {
+async fn serve(
+    global: pie::args::GlobalArgs,
+    diag: Option<&str>,
+    no_measure: bool,
+) -> anyhow::Result<ExitCode> {
     let ctx = pie::daemon::init(
         pie::daemon::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
     )?;
     let (controller, gateway, mut worker) =
-        worker::standalone::derive_standalone(ctx.config_str())?;
+        worker::standalone::derive_standalone(ctx.config_str(), Some(ctx.config_path()))?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
+    }
+    if no_measure {
+        worker.skip_measuring()?;
     }
     let handle =
         worker::standalone::run_standalone(controller, gateway, worker, &pie::paths::pie_home())
@@ -183,10 +213,12 @@ async fn serve(global: pie::args::GlobalArgs, diag: Option<&str>) -> anyhow::Res
     // SIGHUP swaps both planes' policies for the file's; nothing else in it
     // is read again.
     let reload = handle.policy_reload();
+    let path = ctx.config_path().to_path_buf();
     ctx.on_hangup(move |config| {
         let reload = reload.clone();
+        let path = path.clone();
         async move {
-            let config = match worker::standalone::derive_standalone(&config) {
+            let config = match worker::standalone::derive_standalone(&config, Some(&path)) {
                 Ok((_, _, worker)) => worker,
                 Err(e) => {
                     tracing::error!(

@@ -74,12 +74,40 @@ impl Deployment {
     }
 
     /// What the compiler decides of this deployment's weights that its
-    /// import stores so: nothing where it does not trace.
+    /// import stores so: nothing where it does not trace. It costs a trace
+    /// and follows from the deployment's description alone, so each is
+    /// lowered once a process, keyed by its package's content.
     pub fn lowering(&self, platform: Platform) -> poem::Lowering {
-        self.package
+        type Key = (String, String, Deploy, Platform);
+        static LOWERED: LazyLock<std::sync::Mutex<std::collections::HashMap<Key, poem::Lowering>>> =
+            LazyLock::new(Default::default);
+        let key = (
+            self.package.digest(),
+            self.model.id.clone(),
+            self.deploy.clone(),
+            platform,
+        );
+        if let Some(lowering) = LOWERED.lock().ok().and_then(|held| held.get(&key).cloned()) {
+            return lowering;
+        }
+        let lowering = self
+            .package
             .trace(&self.model.id, &self.deploy, &self.name, platform)
             .map(|trace| lowering_of(&trace, self.deploy.tp))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Ok(mut held) = LOWERED.lock() {
+            held.insert(key, lowering.clone());
+        }
+        lowering
+    }
+
+    /// Whether this deployment may read `src`: false only where
+    /// [`Deployment::contract`] refuses it, for no format of its package
+    /// takes the checkpoint by its header facts (`Package::may_read`).
+    #[must_use]
+    pub fn may_read(&self, src: &ztensor::Source, platform: Platform) -> bool {
+        self.package
+            .may_read(&self.model.id, &self.deploy, src, platform)
     }
 
     pub fn try_generative(&self) -> Result<Option<Generative>, Refused> {
@@ -134,6 +162,15 @@ impl Deployment {
     #[must_use]
     pub fn markers(&self) -> Vec<Vec<String>> {
         self.model.tokenizer.markers_for(&self.deploy.parts)
+    }
+}
+
+/// The refusal of a deployment no format of which takes a checkpoint by
+/// its header facts, which its contract is then not asked for.
+fn untaken(deployment: &Deployment) -> poem::import::Error {
+    poem::import::Error::Illegible {
+        name: deployment.model.id.clone(),
+        detail: "no format of it takes this checkpoint by its header facts".to_string(),
     }
 }
 
@@ -319,22 +356,40 @@ impl Catalog {
     pub fn splits(&self) -> impl Iterator<Item = &Deployment> {
         self.splits
             .get_or_init(|| {
-                self.deployments
-                    .iter()
-                    .flat_map(|whole| {
-                        RANKS.into_iter().filter_map(|tp| {
-                            let deploy = Deploy {
-                                tp,
-                                ..whole.deploy.clone()
-                            };
-                            let split =
-                                Deployment::of(Arc::clone(&whole.package), &whole.model, deploy);
-                            split.check(Platform::Cuda).is_ok().then_some(split)
-                        })
-                    })
+                self.split_candidates()
+                    .filter(|split| split.check(Platform::Cuda).is_ok())
                     .collect()
             })
             .iter()
+    }
+
+    /// Each split the model admits whose trace builds and shards on
+    /// `platform` (on CUDA, each of [`Catalog::splits`]), with that trace:
+    /// for a sweep that traces every split, tracing each once where
+    /// `splits` traced it to list it and the sweep would trace it again.
+    pub fn traced_splits(
+        &self,
+        platform: Platform,
+    ) -> impl Iterator<Item = (Deployment, Trace)> + '_ {
+        self.split_candidates().filter_map(move |split| {
+            split.model.admits(&split.deploy).ok()?;
+            let trace = split.try_trace(platform).ok()?;
+            Some((split, trace))
+        })
+    }
+
+    /// Each listed deployment at every count of [`RANKS`], whether or not
+    /// it shards across them.
+    fn split_candidates(&self) -> impl Iterator<Item = Deployment> + '_ {
+        self.deployments.iter().flat_map(|whole| {
+            RANKS.into_iter().map(|tp| {
+                let deploy = Deploy {
+                    tp,
+                    ..whole.deploy.clone()
+                };
+                Deployment::of(Arc::clone(&whole.package), &whole.model, deploy)
+            })
+        })
     }
 
     /// A listed deployment or one of its splits, by name.
@@ -458,7 +513,10 @@ impl Catalog {
         platform: Platform,
     ) -> impl Iterator<Item = (Deployment, Result<ModelContract, poem::import::Error>)> + 'a {
         self.candidates_of(src, platform).into_iter().map(move |d| {
-            let read = d.contract(src, platform);
+            let read = match d.may_read(src, platform) {
+                true => d.contract(src, platform),
+                false => Err(untaken(&d)),
+            };
             (d, read)
         })
     }
@@ -467,7 +525,11 @@ impl Catalog {
     pub fn identify(&self, src: &ztensor::Source, platform: Platform) -> Result<&str, Unmatched> {
         let mut misses: Vec<(String, String)> = Vec::new();
         for deployment in self.candidates() {
-            match deployment.contract(src, platform) {
+            let read = match deployment.may_read(src, platform) {
+                true => deployment.contract(src, platform),
+                false => Err(untaken(deployment)),
+            };
+            match read {
                 Ok(contract) => match requantizes(&contract) {
                     None => return Ok(&deployment.name),
                     Some(plane) => misses.push((
@@ -762,6 +824,10 @@ pub fn deployments() -> impl Iterator<Item = &'static Deployment> {
 
 pub fn splits() -> impl Iterator<Item = &'static Deployment> {
     repository().splits()
+}
+
+pub fn traced_splits(platform: Platform) -> impl Iterator<Item = (Deployment, Trace)> {
+    repository().traced_splits(platform)
 }
 
 #[must_use]

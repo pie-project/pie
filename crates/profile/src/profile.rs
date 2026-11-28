@@ -102,6 +102,11 @@ pub enum Source {
     /// A family or device file checked in with pie, by its path under the
     /// backend's `profiles/`.
     Seeded(String),
+    /// A measured profile checked in with pie (`<device>.measured.toml`
+    /// under the backend's `profiles/`, written by `pie tune export`), by
+    /// its path: a device's stored measurements, each keyed, taken entry by
+    /// entry where the user's file stores none under a matching key.
+    Committed(String),
     /// Built by the backend from the facts, for a device no family file
     /// applies to.
     Derived,
@@ -114,6 +119,7 @@ impl std::fmt::Display for Source {
         match self {
             Source::User(p) => write!(f, "user profile {p}"),
             Source::Seeded(p) => write!(f, "checked-in profile {p}"),
+            Source::Committed(p) => write!(f, "committed measured profile {p}"),
             Source::Derived => write!(f, "derived profile"),
             Source::Defaults => write!(f, "registry defaults"),
         }
@@ -138,6 +144,16 @@ pub struct Report {
     pub rejected: Vec<(Source, String)>,
     /// The decisions whose value a layer measured on this device.
     pub measured: Vec<&'static str>,
+    /// How the rates the profile runs were measured on this device, as the
+    /// layer stating them says (`[provenance] rates`); `None` where no layer
+    /// states rates measured on it.
+    pub rates_measured: Option<String>,
+    /// What a keyed resolve ([`Registry::resolve_keyed`]) said of the
+    /// stored measurements, the user's file's and a committed measured
+    /// profile's: each entry taken, by the layer that decides it and its
+    /// key, and each not taken (its key no longer matches this build on
+    /// this device) and why, a line each.
+    pub stored: Vec<String>,
 }
 
 impl Report {
@@ -146,6 +162,21 @@ impl Report {
     #[must_use]
     pub fn untuned(&self) -> bool {
         self.measured.is_empty() || !self.rejected.is_empty()
+    }
+
+    /// What was measured on the device, in words: its rates, its decisions,
+    /// each or neither.
+    #[must_use]
+    pub fn what_was_measured(&self) -> String {
+        let decisions = if self.measured.is_empty() {
+            "its kernel decisions untuned".to_string()
+        } else {
+            format!("{} decisions measured on it", self.measured.len())
+        };
+        match &self.rates_measured {
+            Some(how) => format!("rates measured on it ({how}); {decisions}"),
+            None => format!("no rates measured on it; {decisions}"),
+        }
     }
 
     /// The layers applied, topmost first.
@@ -185,9 +216,10 @@ struct Inner {
     entries: BTreeMap<&'static str, Entry>,
 }
 
-/// The resolved profile a load runs under. Cheap to clone.
+/// The resolved profile a load runs under, and the rates and fire times its
+/// layers state. Cheap to clone.
 #[derive(Clone)]
-pub struct Profile(Arc<Inner>);
+pub struct Profile(Arc<Inner>, Arc<crate::rates::Tuned>);
 
 impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,6 +249,24 @@ impl Profile {
     #[must_use]
     pub fn target(&self) -> &crate::registry::Target {
         &self.0.target
+    }
+
+    /// The rates the layers state ([`crate::fire`]).
+    #[must_use]
+    pub fn tuned(&self) -> &crate::rates::Tuned {
+        &self.1
+    }
+
+    /// The device's rates, each where a layer states it.
+    #[must_use]
+    pub fn rates(&self) -> crate::rates::Rates {
+        self.1.rates.clone()
+    }
+
+    /// This profile with the rates `tuned` states.
+    #[must_use]
+    pub fn with_tuned(&self, tuned: crate::rates::Tuned) -> Profile {
+        Profile(self.0.clone(), Arc::new(tuned))
     }
 
     fn entry(&self, id: &str) -> &Entry {
@@ -273,6 +323,21 @@ impl Profile {
     #[must_use]
     pub fn get<T: Decision<At = Anywhere>>(&self) -> &T {
         self.pick::<T>(&Anywhere)
+    }
+
+    /// The value a decision with no shape variables takes, `None` for a
+    /// flag that is off, without recording a read: for a backend that
+    /// resolves a load's values up front and raises [`Profile::mark`]
+    /// where a dispatch consults one.
+    #[must_use]
+    pub fn peek<T: Decision<At = Anywhere>>(&self) -> Option<&T> {
+        self.ladder::<T>().peek(&Anywhere)
+    }
+
+    /// The flag [`Profile::read`] reports `T` by.
+    #[must_use]
+    pub fn mark<T: Decision>(&self) -> crate::Mark {
+        self.ladder::<T>().mark_of()
     }
 
     /// The decisions a load has asked anything of so far: evaluated a
@@ -356,13 +421,16 @@ impl Registry {
                 )
             })
             .collect();
-        Profile(Arc::new(Inner {
-            backend: self.backend,
-            facts: self.facts,
-            source,
-            target,
-            entries,
-        }))
+        Profile(
+            Arc::new(Inner {
+                backend: self.backend,
+                facts: self.facts,
+                source,
+                target,
+                entries,
+            }),
+            Arc::default(),
+        )
     }
 
     /// Every decision at its registry default.
@@ -379,11 +447,13 @@ impl Registry {
     /// checking facts: for tests and tools that hold a known-good file.
     pub fn load(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
         let file = self.parse(text, origin, Strict::CheckedIn)?;
-        Ok(self.assemble(
-            &file.entries,
-            file.target,
-            Source::Seeded(origin.to_string()),
-        ))
+        Ok(self
+            .assemble(
+                &file.entries,
+                file.target,
+                Source::Seeded(origin.to_string()),
+            )
+            .with_tuned(file.tuned))
     }
 
     /// Read a partial file, filling what it leaves out from the registry,
@@ -391,7 +461,9 @@ impl Registry {
     /// exercise.
     pub fn load_user(&self, text: &str, origin: &str) -> Result<Profile, crate::registry::Refusal> {
         let file = self.parse(text, origin, Strict::User)?;
-        Ok(self.assemble(&file.entries, file.target, Source::User(origin.to_string())))
+        Ok(self
+            .assemble(&file.entries, file.target, Source::User(origin.to_string()))
+            .with_tuned(file.tuned))
     }
 
     /// The registry defaults with `overrides` (profile TOML after `api = 1`)
@@ -437,7 +509,9 @@ impl Registry {
         for (id, rungs) in over.entries {
             entries.insert(id, rungs);
         }
-        Ok(self.assemble(&entries, target, source))
+        let mut tuned = base.tuned().clone();
+        tuned.lay(&over.tuned);
+        Ok(self.assemble(&entries, target, source).with_tuned(tuned))
     }
 
     /// Admit a parsed layer on the device: every fact it assumes holds,
@@ -588,7 +662,20 @@ impl Registry {
     /// reported, and the layers below it stand.
     #[must_use]
     pub fn resolve(&self, layers: &[Candidate], facts: &Facts) -> (Profile, Report) {
-        self.resolve_with(layers, Some(facts))
+        self.resolve_with(layers, Some(facts), None)
+    }
+
+    /// [`Registry::resolve`], the user's file's measurements sifted by their
+    /// keys against `now` first ([`crate::rates::Rates::sift`]): one whose
+    /// key no longer matches is dropped, so the load measures it again.
+    #[must_use]
+    pub fn resolve_keyed(
+        &self,
+        layers: &[Candidate],
+        facts: &Facts,
+        now: &dyn crate::rates::Now,
+    ) -> (Profile, Report) {
+        self.resolve_with(layers, Some(facts), Some(now))
     }
 
     /// Resolve without a device to check facts against: every layer that
@@ -596,11 +683,30 @@ impl Registry {
     /// device name.
     #[must_use]
     pub fn read(&self, layers: &[Candidate]) -> (Profile, Report) {
-        self.resolve_with(layers, None)
+        self.resolve_with(layers, None, None)
     }
 
-    fn resolve_with(&self, layers: &[Candidate], facts: Option<&Facts>) -> (Profile, Report) {
+    fn resolve_with(
+        &self,
+        layers: &[Candidate],
+        facts: Option<&Facts>,
+        now: Option<&dyn crate::rates::Now>,
+    ) -> (Profile, Report) {
+        let mut stored: Vec<String> = Vec::new();
         let mut entries: BTreeMap<&'static str, Vec<Rung>> = BTreeMap::new();
+        let mut tuned = crate::rates::Tuned::default();
+        // The user's layer's rates (a load's measurement saved, or a `pie
+        // tune --rates`) lie under the checked-in layers': a checked-in
+        // profile's rate wins where it states one.
+        let mut user_tuned = crate::rates::Tuned::default();
+        // A committed measured profile's rates lie under the user's: an
+        // entry the user's file stores under a matching key is taken over
+        // the committed one, entry by entry.
+        let mut committed_tuned = crate::rates::Tuned::default();
+        let mut user_from = String::from("no user file");
+        let mut committed_from = String::from("no committed profile");
+        let mut rates_measured: Option<String> = None;
+        let mut user_rates_measured: Option<String> = None;
         let mut measured: BTreeMap<&'static str, bool> = BTreeMap::new();
         let mut target = crate::registry::Target::default();
         // What the checked-in layers below assume, which a checked-in
@@ -610,20 +716,44 @@ impl Registry {
         let mut rejected = Vec::new();
         for layer in layers {
             let seeded = matches!(layer.source, Source::Seeded(_));
+            let committed = matches!(layer.source, Source::Committed(_));
             let strict = if seeded {
                 Strict::CheckedIn
+            } else if committed {
+                Strict::Measured
             } else {
                 Strict::User
             };
             let origin = layer.source.to_string();
             let below: &[(usize, i64)] = if seeded { &inherited } else { &[] };
-            let file = match self.parse_over(&layer.text, &origin, strict, &entries, below) {
+            let mut file = match self.parse_over(&layer.text, &origin, strict, &entries, below) {
                 Ok(file) => file,
                 Err(refusal) => {
+                    // A checked-in file stating a rate this pie does not
+                    // read is no file to run without: the load refuses by it.
+                    if seeded && let Some(key) = refusal.stale_rates.first() {
+                        tuned
+                            .refused
+                            .get_or_insert_with(|| format!("{origin}: `[rates] {key}`"));
+                    }
                     rejected.push((layer.source.clone(), refusal.to_string()));
                     continue;
                 }
             };
+            if !file.skipped_rates.is_empty() {
+                tracing::warn!(
+                    "{origin}: skipped `[rates]` {}: each measured again, the rest of the file \
+                     read",
+                    file.skipped_rates.join(", ")
+                );
+            }
+            if !file.ignored_rates.is_empty() {
+                tracing::info!(
+                    "{origin}: ignored `[rates]` {}, which this pie no longer reads; the rest is \
+                     read and what it lacks is measured",
+                    file.ignored_rates.join(", ")
+                );
+            }
             let spelled = match facts {
                 Some(facts) => match self.admits(&file, facts) {
                     Ok(spelled) => spelled,
@@ -654,8 +784,82 @@ impl Registry {
             if !file.target.name_contains.is_empty() {
                 target.name_contains = file.target.name_contains;
             }
+            // A layer stating rates says how they were measured, or leaves
+            // the ones below standing as they were.
+            let how = (file.tuned.rates != crate::rates::Rates::default()).then(|| {
+                file.provenance
+                    .iter()
+                    .find(|(k, _)| k == "rates")
+                    .map(|(_, v)| v.trim_matches('"').to_string())
+            });
+            if seeded {
+                tuned.lay(&file.tuned);
+                if let Some(how) = how {
+                    rates_measured = how;
+                }
+            } else if committed {
+                if let Some(now) = now {
+                    stored.extend(
+                        file.tuned
+                            .rates
+                            .sift_as(now, "committed")
+                            .into_iter()
+                            .map(|line| format!("{origin}: {line}")),
+                    );
+                }
+                // The settle is checked by the settle itself, after the
+                // user's stored one ([`crate::rates::Tuned::committed_settle`]).
+                file.tuned.committed_settle = std::mem::take(&mut file.tuned.rates.dense_settled);
+                committed_from = origin.clone();
+                committed_tuned.lay(&file.tuned);
+                if let Some(how) = how {
+                    user_rates_measured = how;
+                }
+            } else {
+                if let Some(now) = now {
+                    stored.extend(
+                        file.tuned
+                            .rates
+                            .sift(now)
+                            .into_iter()
+                            .map(|line| format!("{origin}: {line}")),
+                    );
+                }
+                user_from = origin.clone();
+                user_tuned.lay(&file.tuned);
+                if let Some(how) = how {
+                    user_rates_measured = how;
+                }
+            }
             used.push(layer.source.clone());
         }
+        // The checked-in rates over the user's: theirs stand only where no
+        // checked-in layer states one.
+        if let Some(now) = now
+            && !layers
+                .iter()
+                .any(|l| matches!(l.source, Source::User(_) | Source::Committed(_)))
+        {
+            stored.push(format!(
+                "stored measurements: no user file and no committed measured profile for `{}`; \
+                 whatever no checked-in layer states is measured (or skipped)",
+                now.on()
+            ));
+        }
+        // Each entry the user's file and a committed profile state, by the
+        // layer that decides it (the user's over the committed).
+        let user_rates = user_tuned.rates.clone();
+        committed_tuned.lay(&user_tuned);
+        if now.is_some() {
+            stored.extend(
+                committed_tuned
+                    .rates
+                    .whence(&user_rates, &user_from, &committed_from),
+            );
+        }
+        rates_measured = rates_measured.or(user_rates_measured);
+        committed_tuned.lay(&tuned);
+        let tuned = committed_tuned;
         let top = used.last().cloned().unwrap_or(Source::Defaults);
         let report = Report {
             used: top.clone(),
@@ -666,8 +870,13 @@ impl Registry {
                 .filter(|(_, m)| *m)
                 .map(|(id, _)| id)
                 .collect(),
+            rates_measured,
+            stored,
         };
-        (self.assemble(&entries, target, top), report)
+        (
+            self.assemble(&entries, target, top).with_tuned(tuned),
+            report,
+        )
     }
 }
 

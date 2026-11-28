@@ -18,7 +18,7 @@ fn traced(forward: &str) -> poem_ir::Trace {
 /// made after the embedding rather than before it.
 const PLANS_LATER: &str = r#"
 def forward(m, inputs):
-    ([input_m, input_d], input_p) = inputs.partition([fact.has(fact.Mask), fact.single_token()])
+    ([input_d], input_p) = inputs.partition([fact.single_token()])
     mask = inputs.mask()
     positions = inputs.positions()
     scaling = rope_scaling({
@@ -32,7 +32,6 @@ def forward(m, inputs):
     plans = struct(
         p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
         d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
-        m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
     )
     routes = inputs.adapter_routes()
 
@@ -61,10 +60,9 @@ def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
 
     o = branch(q, [
-        (fact.has(fact.Mask), lambda q: ops.attn.prefill(q, plans.m, pages, None, d, m.kv_heads, m.sm_scale, mask = mask)),
-        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),
-    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale))
-    output("attn.scores", ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048))
+        (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale, mask = mask)),
+    ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, m.sm_scale, mask = mask))
+    ops.attn.capture_scores(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32)
     return ops.linear.matmul(o, w.o)
 "#;
 

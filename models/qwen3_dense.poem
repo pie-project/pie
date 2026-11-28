@@ -291,6 +291,7 @@ def draft_self(logits):
     proposal = logits.on(fact.drafts())
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal, proposal, proposal, proposal]))
+    draft_depth(1)
 
 def draft(m, inputs, fused, logits, scaling):
     mtp = m.mtp
@@ -316,3 +317,4 @@ def draft(m, inputs, fused, logits, scaling):
     proposal = ops.linear.lm_head(ops.gather.gather_rows(normed, input_mtp.readout_rows()), mtp.head)
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal] * mtp.depth))
+    draft_depth(1)

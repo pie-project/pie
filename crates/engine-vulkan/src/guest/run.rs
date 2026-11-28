@@ -2,10 +2,9 @@ use eta_compiler::codegen::launch::{LaunchPackage, LaunchValue, ValueOrigin};
 use eta_exec::{ExecPlan, StagePlan, StageRunner, Value};
 use eta_ir::Dtype;
 
-use super::session::Session;
+use super::session::{Pass, Session};
 use super::widen::Widen;
 use crate::device::Context;
-use crate::device::alloc::Buffer;
 use crate::device::ctx::Frame;
 use engine_gpu::error::{Fault, Result};
 
@@ -32,19 +31,17 @@ pub struct OnDevice<'a> {
 #[derive(Default)]
 pub struct Deferral {
     pub frame: Option<Frame>,
-    /// The read-back buffer the frame lands into, lent by the session.
-    pub landing: Option<Buffer>,
+    /// The pass's berth in the guest ring, which the frame lands its status
+    /// and the host's puts into.
+    pub pass: Option<Pass>,
     pub landings: Vec<Landing>,
+    /// The ports the host reads off the rings at the next fire
+    /// ([`engine_gpu::program::read_at_fire`]): their puts land.
+    pub reads: eta_ir::registry::PortMask,
 }
 
-/// A put the host reads, landing in the stage's read-back buffer.
-#[derive(Clone, Copy, Debug)]
-pub struct Landing {
-    pub channel: u32,
-    pub at: u64,
-    pub dtype: Dtype,
-    pub held: u64,
-}
+pub use engine_gpu::guest::defer::Landing;
+use engine_gpu::guest::defer::{host_reads_not, keeps};
 
 impl<'a> OnDevice<'a> {
     pub fn new(
@@ -73,11 +70,20 @@ impl<'a> OnDevice<'a> {
             .copied()
     }
 
-    /// Records the pass into a frame of its own for the caller to submit,
-    /// instead of running each stage to completion.
+    /// Records the pass for the caller to submit, instead of running each
+    /// stage to completion: into `frame`, which the step's earlier passes
+    /// recorded into, or a frame of its own.
     #[must_use]
-    pub fn deferred(mut self) -> OnDevice<'a> {
-        self.deferral = Some(Deferral::default());
+    pub fn deferred(
+        mut self,
+        frame: Option<Frame>,
+        reads: eta_ir::registry::PortMask,
+    ) -> OnDevice<'a> {
+        self.deferral = Some(Deferral {
+            frame,
+            reads,
+            ..Deferral::default()
+        });
         self
     }
 
@@ -99,7 +105,20 @@ impl<'a> OnDevice<'a> {
         vals: &mut [Value],
     ) -> Result<()> {
         let plan = &package.plans[at];
-        let deferring = self.deferral.is_some();
+        let deferring = self.deferral.as_ref().map(|deferral| deferral.reads);
+        if self
+            .deferral
+            .as_ref()
+            .is_some_and(|deferral| deferral.pass.is_some() || package.plans.len() != 1)
+        {
+            return Err(Fault::Program {
+                at: "guest::run",
+                why: "a pass recorded to land later runs one stage".into(),
+            });
+        }
+        // The pass's berth: each root the host may stage, its status, and
+        // each value the host may read back, each laid once.
+        let mut pass = self.session.pass(package, at, roots, wanted)?;
         let mut frame = match self.deferral.as_mut().and_then(|d| d.frame.take()) {
             Some(frame) => frame,
             None => self.device.frame()?,
@@ -111,29 +130,15 @@ impl<'a> OnDevice<'a> {
             };
             let root = &package.values[global as usize];
             if root.source == ValueOrigin::Output {
-                let seat = self.offered(root).ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!(
-                        "this pass reads output {:?} of lane {}, which the fire read out none of",
-                        root.output, root.lane
-                    ),
-                })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("the output root {local} is not stage {at}'s"),
                 })?;
                 let values = u32::try_from(held / 4).unwrap_or(0);
-                if values > seat.width {
-                    return Err(Fault::Program {
-                        at: "guest::run",
-                        why: format!(
-                            "this pass reads {values} values of output {:?} and the fire read \
-                             out {}",
-                            root.output, seat.width
-                        ),
-                    });
-                }
-                let heap = self.session.heap(at).ok_or_else(|| Fault::Program {
+                // Row `r` of a root read at lane `k` is lane `k + r`'s
+                // readout row, each through its own seat.
+                let rows = engine_gpu::guest::run::row_seats(&self.seats, root, values)?;
+                let (heap, base) = self.session.heap(at).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("stage {at} has no heap"),
                 })?;
@@ -141,12 +146,15 @@ impl<'a> OnDevice<'a> {
                     .session
                     .span(at, local)
                     .expect("the span was just read");
-                if seat.dtype != Dtype::Bf16 {
-                    let heap = heap.clone();
-                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
-                } else {
-                    self.widen
-                        .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                let mut into = base + into;
+                for (seat, values) in rows {
+                    if seat.dtype != Dtype::Bf16 {
+                        frame.copy(seat.seat, seat.at, heap, into, u64::from(values) * 4)?;
+                    } else {
+                        self.widen
+                            .encode(&frame, seat.seat, seat.at, heap, into, values)?;
+                    }
+                    into += u64::from(values) * 4;
                 }
                 continue;
             }
@@ -161,11 +169,12 @@ impl<'a> OnDevice<'a> {
                 &vals[global as usize],
                 self.session.span(at, local).map_or(0, |(_, l)| l),
             );
-            self.session.stage_in(at, local, &bytes)?;
+            self.session.stage_in(&mut pass, at, local, &bytes)?;
         }
 
-        self.session.flush(&mut frame, at)?;
+        self.session.flush(&mut frame, &pass, at)?;
         self.session.dispatch(&frame, at)?;
+        self.session.read_status(&mut frame, &mut pass)?;
         // A value is read back when any channel it goes to is one the
         // device does not keep.
         let mut landed: Vec<(u32, u32)> = Vec::new();
@@ -175,43 +184,24 @@ impl<'a> OnDevice<'a> {
             };
             let channel = put.channel;
             let bytes = self.session.span(at, local).map_or(0, |(_, l)| l);
-            let on_device = if deferring {
-                host_reads_not(package, channel)
-            } else {
-                keeps(package, channel, bytes)
+            let on_device = match deferring {
+                Some(reads) => host_reads_not(package, channel, reads),
+                None => keeps(package, channel, bytes),
             };
             if on_device {
-                self.session
-                    .keep(self.device, &mut frame, at, local, channel)?;
+                self.session.keep(&mut frame, at, local, channel)?;
             } else {
                 self.session.forget(channel);
                 landed.push((put.value, channel));
             }
         }
         let kept = |global: u32| !landed.iter().any(|&(value, _)| value == global);
-        let landing = match self.deferral.as_mut() {
-            Some(deferral) if deferral.landing.is_none() => {
-                if package.plans.len() != 1 {
-                    return Err(Fault::Program {
-                        at: "guest::run",
-                        why: "a pass recorded to land later runs one stage".into(),
-                    });
-                }
-                let lent = self.session.lend_landing(self.device, at)?;
-                Some(deferral.landing.insert(lent).clone())
-            }
-            Some(deferral) => deferral.landing.clone(),
-            None => None,
-        };
-        for &global in wanted {
-            if kept(global) {
+        for (index, &global) in wanted.iter().enumerate() {
+            if kept(global) || wanted[..index].contains(&global) {
                 continue;
             }
             if let Some(local) = local_of(package, at, global)? {
-                match landing.as_ref() {
-                    Some(into) => self.session.read_back_into(&mut frame, at, local, into)?,
-                    None => self.session.read_back(&mut frame, at, local)?,
-                }
+                self.session.read_back(&mut frame, &mut pass, at, local)?;
             }
         }
         if let Some(deferral) = self.deferral.as_mut() {
@@ -226,26 +216,27 @@ impl<'a> OnDevice<'a> {
                 // The ring takes an empty cell now; the host's own lands
                 // after the frame does.
                 vals[global as usize] = from_heap(&[], dtype, 0);
-                let (from, held) = self
+                let (_, held) = self
                     .session
                     .span(at, local)
                     .expect("a wanted value has a span");
                 for &(_, channel) in landed.iter().filter(|&&(value, _)| value == global) {
                     deferral.landings.push(Landing {
                         channel,
-                        at: from,
+                        value: local,
                         dtype,
                         held,
                     });
                 }
             }
             deferral.frame = Some(frame);
+            deferral.pass = Some(pass);
             self.ran.push(at);
             return Ok(());
         }
         frame.commit()?;
 
-        if let Some(code) = self.session.status()? {
+        if let Some(code) = pass.status()? {
             self.session.clear_status()?;
             return Err(Fault::Program {
                 at: "guest::run",
@@ -286,7 +277,7 @@ impl<'a> OnDevice<'a> {
                 .session
                 .span(at, local)
                 .expect("a wanted value has a span");
-            let raw = self.session.taken(at, local)?;
+            let raw = pass.value(local)?;
             vals[global as usize] = from_heap(&raw, dtype, held);
         }
         self.ran.push(at);
@@ -319,36 +310,18 @@ impl StageRunner for OnDevice<'_> {
     }
 }
 
-/// Cells at least this large stay on the device between fires when only the
-/// device reads them: a sampler's token histograms, a vocabulary wide each.
-const KEEP_BYTES: u64 = 64 << 10;
+impl engine_gpu::guest::defer::LandedPass for Pass {
+    fn status(&self) -> Result<Option<u32>> {
+        Pass::status(self)
+    }
 
-fn keeps(package: &LaunchPackage, channel: u32, bytes: u64) -> bool {
-    package.channels.get(channel as usize).is_some_and(|decl| {
-        decl.capacity == 1
-            && decl.host_role != eta_ir::container::HostRole::Reader
-            && bytes >= KEEP_BYTES
-    })
-}
-
-/// Whether a deferred pass keeps `channel`'s puts on the device: every one the
-/// host does not read.
-fn host_reads_not(package: &LaunchPackage, channel: u32) -> bool {
-    let read_at_fire = package.ports.iter().any(|binding| {
-        binding.channel == channel
-            && !binding.is_const
-            && binding.port == eta_ir::registry::Port::Fold
-    });
-    !read_at_fire
-        && package
-            .channels
-            .get(channel as usize)
-            .is_some_and(|decl| decl.host_role != eta_ir::container::HostRole::Reader)
-}
-
-/// The value a landed read-back holds.
-pub fn landed_value(landed: &Buffer, landing: &Landing) -> Result<Value> {
-    let mut raw = vec![0u8; landing.held as usize];
-    landed.read(landing.at, &mut raw)?;
-    Ok(from_heap(&raw, landing.dtype, landing.held))
+    /// The value the pass read back for `landing`.
+    fn value(&self, landing: &Landing) -> Result<Value> {
+        let (at, bytes) = self.read_at(landing.value).ok_or_else(|| Fault::Program {
+            at: "guest::run",
+            why: format!("value {} was not read back by its pass", landing.value),
+        })?;
+        let raw = self.read(at, bytes.min(landing.held))?;
+        Ok(from_heap(&raw, landing.dtype, landing.held))
+    }
 }

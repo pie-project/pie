@@ -276,12 +276,11 @@ struct FastDecodePass {
 }
 
 impl FastDecodePass {
-    fn new(vocab: u32, words: u32, ws: &WorkingSet, pow2_d: &Channel) -> Result<Self> {
+    fn new(words: u32, ws: &WorkingSet) -> Result<Self> {
         let token_in = Channel::new([1], dtype::i32);
         let grammar_mask = Channel::new([words], dtype::u32);
         let embed_indptr = Channel::from([0u32, 1]);
         let token_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
-        let pow2 = pow2_d.clone();
 
         let decode = ForwardPass::new();
         decode.embed(&token_in, &embed_indptr)?;
@@ -290,15 +289,8 @@ impl FastDecodePass {
         let grammar_mask_ep = grammar_mask.clone();
         decode.epilogue(move || {
             let packed = grammar_mask_ep.take();
-            let j = iota(vocab);
-            let word = gather(&packed, &j / Tensor::constant(32u32));
-            let p2 = gather(pow2.read(), &j % Tensor::constant(32u32));
-            let bit = (&word / &p2) % Tensor::constant(2u32);
-            let allowed = ne(&bit, Tensor::constant(0u32));
-            let token = reshape(
-                masked_argmax(intrinsics::output(0, "logits"), &allowed),
-                [1],
-            );
+            let allowed = mask_apply_packed(intrinsics::output(0, "logits"), &packed);
+            let token = reshape(reduce_argmax(&allowed), [1]);
             token_out_ep.put(&token);
         });
 
@@ -318,7 +310,6 @@ struct Target {
     computed: u32,
     folded: u32,
     written: u32,
-    pow2: Channel,
     pass_1: Option<FastDecodePass>,
 }
 
@@ -330,7 +321,6 @@ impl Target {
             computed: 0,
             folded: 0,
             written: 0,
-            pow2: Channel::from_iter((0..32u32).map(|b| 1u32 << b)),
             pass_1: None,
         }
     }
@@ -363,7 +353,7 @@ impl Target {
 
         if rows == 1 && len == 1 && self.folded == start && self.written == start {
             if self.pass_1.is_none() {
-                self.pass_1 = Some(FastDecodePass::new(vocab, words, &self.ws, &self.pow2)?);
+                self.pass_1 = Some(FastDecodePass::new(words, &self.ws)?);
             }
             let pass = self.pass_1.as_ref().unwrap();
             pass.token_in.put([window[0] as i32]);
@@ -384,10 +374,12 @@ impl Target {
         let slots = Channel::from_iter(start..start + len);
         let fold = Channel::from([fold_to - self.folded]);
         let allowed = Channel::new([rows * words], dtype::u32);
-        let pow2 = self.pow2.clone();
         let target_out = Channel::new([rows], dtype::i32);
 
         let fwd = ForwardPass::new();
+        // The next window writes the rejected draft rows' slots again: the
+        // verify takes rows back (CONTRACT-BC 25).
+        fwd.retractable()?;
         fwd.embed(&tokens, &embed_indptr)?;
         fwd.readout(&readout)?;
         fwd.state(
@@ -399,21 +391,17 @@ impl Target {
             },
         )?;
         fwd.epilogue(move || {
+            // Each row's own mask words over that row's logits.
             let packed = allowed.take();
-            let idx = iota(rows * vocab);
-            let r = &idx / Tensor::constant(vocab);
-            let c = &idx % Tensor::constant(vocab);
-            let w_idx = &r * Tensor::constant(words) + (&c / Tensor::constant(32u32));
-            let word = gather(&packed, &w_idx);
-            let p2 = gather(pow2.read(), &c % Tensor::constant(32u32));
-            let bit = (&word / &p2) % Tensor::constant(2u32);
-            let mask_bool = ne(&bit, Tensor::constant(0u32));
-            let mask_shaped = if rows == 1 {
-                mask_bool
-            } else {
-                reshape(&mask_bool, [rows, vocab])
-            };
-            target_out.put(masked_argmax(intrinsics::output(0, "logits"), &mask_shaped));
+            let logits = reshape(intrinsics::output(0, "logits"), [rows * vocab]);
+            let mut picks = broadcast(0i32, [rows]);
+            for r in 0..rows {
+                let row = gather(&logits, iota(vocab) + Tensor::constant(r * vocab));
+                let mask = gather(&packed, iota(words) + Tensor::constant(r * words));
+                let pick = reshape(reduce_argmax(mask_apply_packed(&row, &mask)), [1]);
+                picks = scatter_set(&picks, broadcast(r, [1]), &pick);
+            }
+            target_out.put(&picks);
         });
 
         allowed.put(masks.concat());

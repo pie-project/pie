@@ -25,8 +25,6 @@ struct Input {
     /// whole prompt served. The gate compares the two.
     #[serde(default = "default_evict")]
     evict: bool,
-    #[serde(default = "default_heads")]
-    heads: u32,
 }
 
 fn default_needle() -> String {
@@ -46,10 +44,6 @@ fn default_page_budget() -> u32 {
 }
 fn default_evict() -> bool {
     true
-}
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
 }
 
 #[derive(Serialize)]
@@ -73,8 +67,6 @@ struct Output {
     needle_pages: Vec<u32>,
     /// Per-page attention mass from the observation window, device-folded.
     page_mass: Vec<String>,
-    /// Attention layers folded into the row (`planes / heads`, declared).
-    layers_observed: u32,
     /// Total mass over the live prefix — one distribution per layer, so this
     /// must come out at `layers_observed`.
     score_mass: f32,
@@ -83,9 +75,6 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
@@ -94,19 +83,16 @@ async fn main(input: Input) -> Result<Output> {
     if !(0.0..=1.0).contains(&input.depth) {
         return Err("depth must be between 0.0 and 1.0".into());
     }
-    let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
-        return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
-        ));
-    }
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
+    let score_pages = model::lane_of(&[])?
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "attn.scores.pages")
+        .ok_or("this model reads out no page scores")?
+        .width;
 
     // Varied: one repeated sentence makes a small model predict the loop, not the content.
     const FILLER: [&str; 6] = [
@@ -169,29 +155,27 @@ async fn main(input: Input) -> Result<Output> {
     // Freezes the haystack but buffers the question's rows: the answer below writes them again.
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
-    let fold_p = Channel::from([ask_at]);
     let tok_out_p = Channel::new([1], dtype::i32);
     let page_mass_out = Channel::new([p_max], dtype::f32);
     let total_out = Channel::new([1], dtype::f32);
 
     let fwd_p = ForwardPass::new();
+    // The answer writes the question's slots again, below the row this
+    // pass samples: not final (CONTRACT-BC 25).
+    fwd_p.retractable()?;
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(
-        &[&ws],
-        StateGeometry {
-            fold: Fold::Count(&fold_p),
-            ..StateGeometry::default()
-        },
-    )?;
+    // The haystack stays unfolded: the question's mask hides the rows it does
+    // not keep, and a mask speaks only of the rows past the set's committed
+    // boundary (column `c` is slot `folded + c`). Unfolded, the boundary
+    // stays 0 and the columns are slots.
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let logits = intrinsics::output(0, "logits");
         tok_out_p.put(reduce_argmax(logits));
 
-        // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-        let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-        let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
+        let pages = reshape(intrinsics::output(0, "attn.scores.pages"), [score_pages]);
         // Exact: `kv_max = p_max * page_size`.
-        let per_page = reduce_sum(reshape(&folded, [p_max, page_size]));
+        let per_page = gather(&pages, iota(p_max));
         page_mass_out.put(&per_page);
         total_out.put(reshape(reduce_sum(&per_page), [1]));
     });
@@ -288,7 +272,6 @@ async fn main(input: Input) -> Result<Output> {
             .iter()
             .map(|m| format!("{m:.5}"))
             .collect(),
-        layers_observed: layers,
         score_mass,
         count: generated.len(),
     })

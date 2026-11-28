@@ -6,7 +6,7 @@ use poem_exec::fire::{Lane, compose};
 use poem_ir::Trace;
 
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512, false)
 }
 
 const DEPLOYMENT: &str = "qwen35-d0.8b-bf16-kv-bf16";

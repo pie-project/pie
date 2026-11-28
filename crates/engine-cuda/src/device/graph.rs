@@ -137,26 +137,6 @@ impl Graph {
         }
     }
 
-    /// Device bytes one instantiation of this graph holds, averaged over
-    /// `copies` held at once. Each is uploaded on this thread's own stream
-    /// (the legacy one would wait on, and invalidate, a capture another
-    /// thread makes on a blocking stream), landed before it is weighed.
-    pub fn instantiated_bytes(&self, copies: usize) -> Result<f64> {
-        #[cfg(feature = "device")]
-        let own = crate::device::alloc::OWN_STREAM;
-        #[cfg(not(feature = "device"))]
-        let own = core::ptr::null_mut();
-        let before = crate::device::free_bytes().unwrap_or(0);
-        let held = (0..copies)
-            .map(|_| self.instantiate(own))
-            .collect::<Result<Vec<_>>>()?;
-        #[cfg(feature = "device")]
-        crate::device::ctx::sync(own)?;
-        let after = crate::device::free_bytes().unwrap_or(0);
-        drop(held);
-        Ok(before.saturating_sub(after) as f64 / copies as f64)
-    }
-
     pub fn instantiate(&self, stream: *mut c_void) -> Result<GraphExec> {
         #[cfg(feature = "device")]
         {
@@ -269,6 +249,29 @@ impl Event {
                 crate::device::ctx::check(
                     "cudaEventCreateWithFlags",
                     rt::cudaEventCreateWithFlags(&raw mut raw, 2),
+                )?;
+            }
+            Ok(Event { raw: raw.cast() })
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
+    /// An event a host thread waits on asleep (blocking sync), not spinning a
+    /// core: what a waiter that only ever waits takes.
+    pub fn blocking() -> Result<Event> {
+        #[cfg(feature = "device")]
+        {
+            use crate::device::rt;
+            let mut raw: rt::cudaEvent_t = core::ptr::null_mut();
+            // SAFETY: `raw` is a live out-parameter and this thread bound the
+            // device. Flags: blocking sync (1) and no timing (2).
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaEventCreateWithFlags",
+                    rt::cudaEventCreateWithFlags(&raw mut raw, 3),
                 )?;
             }
             Ok(Event { raw: raw.cast() })

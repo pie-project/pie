@@ -5,11 +5,11 @@
 //! kernels) and 32-wide ones (the state walked in memory), at the baseline and (on SPIR-V) the subgroup tier.
 //! The f32 outputs and every slot's state are compared.
 
+use kernels_slang::Tensor;
 use kernels_slang::ssm::gdn_recurrent::Tactic;
-use kernels_slang::{RaggedTensor, Tensor};
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, landed, noise};
+use crate::gpu::{CSR_AT, Gpu, Out, committed_batches, csr_at, landed, lane_cuts, noise, row_cuts};
 
 const SLOTS: usize = 3;
 
@@ -167,35 +167,41 @@ fn the_gdn_recurrence_answers_the_reference() {
                 let s = s as usize;
                 sh.token(&qr, &gr, r, &mut want_s[s * slab..][..slab], &mut want_y);
             }
-            landed(
-                &mut gpu,
-                &what("step"),
-                &fresh(2, 0),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta(
-                            c,
-                            tactic,
-                            qkv,
-                            gates,
-                            &pool(o[1].0, sb, 2),
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            y(o[0].0, 2),
-                        )
-                    })
-                },
-            );
+            for spans in row_cuts(2) {
+                landed(
+                    &mut gpu,
+                    &format!("{} {} window(s)", what("step"), spans.len()),
+                    &fresh(2, 0),
+                    &[want_y.clone(), want_s.clone()],
+                    &|g, o| {
+                        g.run(|c| {
+                            for &span in &spans {
+                                kernels_slang::ssm::gdn_recurrent::gated_delta(
+                                    c,
+                                    tactic,
+                                    qkv,
+                                    gates,
+                                    &pool(o[1].0, sb, 2),
+                                    kh,
+                                    vh,
+                                    dk,
+                                    dv,
+                                    y(o[0].0, 2),
+                                    span,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    },
+                );
+            }
 
             // The chunked walk: requests of 3, 0 and 2 rows on slots 1 and 2.
             let indptr = [0i32, 3, 3, 5];
             let rows = 5;
             let slot_rows = [1u32, 1, 1, 2, 2];
             let (qkv, qr, gates, gr) = inputs(&mut gpu, 20, rows);
-            let (ib, sb) = (gpu.up_i32(&indptr), gpu.up_u32(&slot_rows));
+            let sb = gpu.up_u32(&slot_rows);
             let mut want_y = vec![0.0; y_n(rows)];
             let mut want_s = bank64.clone();
             for r in 0..3 {
@@ -204,35 +210,42 @@ fn the_gdn_recurrence_answers_the_reference() {
                     sh.token(&qr, &gr, row, &mut want_s[s * slab..][..slab], &mut want_y);
                 }
             }
-            let ragged = RaggedTensor {
-                data: qkv,
-                indptr: t(ib, 4, 1, Dtype::I32),
-            };
-            landed(
-                &mut gpu,
-                &what("chunked"),
-                &fresh(rows, 0),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-                            c,
-                            tactic,
-                            kernels_slang::RaggedTensor {
-                                data: ragged.data,
-                                indptr: ragged.indptr,
-                            },
-                            gates,
-                            &pool(o[1].0, sb, rows),
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-            );
+            for at in CSR_AT {
+                for cuts in lane_cuts(&indptr) {
+                    let windows = windows_of(&mut gpu, &cuts, at);
+                    landed(
+                        &mut gpu,
+                        &format!(
+                            "{} csr at {at}, {} window(s)",
+                            what("chunked"),
+                            windows.len()
+                        ),
+                        &fresh(rows, 0),
+                        &[want_y.clone(), want_s.clone()],
+                        &|g, o| {
+                            g.run(|c| {
+                                for &(span, csr, _) in &windows {
+                                    kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
+                                        c,
+                                        tactic,
+                                        qkv,
+                                        csr,
+                                        gates,
+                                        &pool(o[1].0, sb, rows),
+                                        kh,
+                                        vh,
+                                        dk,
+                                        dv,
+                                        y(o[0].0, rows),
+                                        span,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    );
+                }
+            }
 
             // The chunked walk landing a snapshot (CONTRACT-BC 16): request
             // 0 (lane 1 of the table) the state as of its row 2 into slot 0.
@@ -240,7 +253,7 @@ fn the_gdn_recurrence_answers_the_reference() {
             let rows = 5;
             let slot_rows = [1u32, 1, 1, 2, 2];
             let (qkv, qr, gates, gr) = inputs(&mut gpu, 40, rows);
-            let (ib, sb) = (gpu.up_i32(&indptr), gpu.up_u32(&slot_rows));
+            let sb = gpu.up_u32(&slot_rows);
             let max = kernels_slang::ssm::RS_SNAPSHOTS as usize;
             let mut table = vec![0i32; 4 * 2 * max];
             table[2 * max] = 2;
@@ -261,34 +274,50 @@ fn the_gdn_recurrence_answers_the_reference() {
                     }
                 }
             }
-            landed(
-                &mut gpu,
-                &what("chunked, a snapshot"),
-                &fresh(rows, 0),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
-                            c,
-                            tactic,
-                            kernels_slang::RaggedTensor {
-                                data: qkv,
-                                indptr: t(ib, 4, 1, Dtype::I32),
-                            },
-                            gates,
-                            &kernels_slang::ssm::StatePool {
-                                snapshots: Some(snaps),
-                                ..pool(o[1].0, sb, rows)
-                            },
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-            );
+            for at in CSR_AT {
+                for cuts in lane_cuts(&indptr) {
+                    let windows = windows_of(&mut gpu, &cuts, at);
+                    landed(
+                        &mut gpu,
+                        &format!(
+                            "{} csr at {at}, {} window(s)",
+                            what("chunked, a snapshot"),
+                            windows.len()
+                        ),
+                        &fresh(rows, 0),
+                        &[want_y.clone(), want_s.clone()],
+                        &|g, o| {
+                            g.run(|c| {
+                                for &(span, csr, lane) in &windows {
+                                    // A window's snapshots from its own first lane.
+                                    let snaps = kernels_slang::ssm::Snapshots {
+                                        lane0: snaps.lane0 + lane,
+                                        ..snaps
+                                    };
+                                    kernels_slang::ssm::gdn_recurrent::gated_delta_chunked(
+                                        c,
+                                        tactic,
+                                        qkv,
+                                        csr,
+                                        gates,
+                                        &kernels_slang::ssm::StatePool {
+                                            snapshots: Some(snaps),
+                                            ..pool(o[1].0, sb, rows)
+                                        },
+                                        kh,
+                                        vh,
+                                        dk,
+                                        dv,
+                                        y(o[0].0, rows),
+                                        span,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    );
+                }
+            }
 
             // The committed window, lanes 1..5: 2 own rows after 1 replayed,
             // kept as of row 2 on slot 2; 1 after 1, kept whole on slot 0; 1
@@ -300,7 +329,6 @@ fn the_gdn_recurrence_answers_the_reference() {
             let slots = [7i32, 2, 0, -1, 1];
             let rows = 7;
             let (qkv, qr, gates, gr) = inputs(&mut gpu, 30, rows);
-            let ib = gpu.up_i32(&indptr);
             let (rb, cb, sb) = (gpu.up_i32(&replay), gpu.up_i32(&commit), gpu.up_i32(&slots));
             let mut want_y = vec![0.0; y_n(rows)];
             let mut want_s = bank64.clone();
@@ -328,34 +356,94 @@ fn the_gdn_recurrence_answers_the_reference() {
                 slots: i32s(sb, 5),
                 lane0: lane0 as u32,
             };
-            let window = i32s(ib, 5);
+            // No lane lands a row in an rs buffer: each header's `at` is -1.
+            let header = kernels_slang::ssm::CARRY_HEADER as usize;
+            let mut table = vec![0i32; 5 * header];
+            for lane in 0..5 {
+                table[lane * header] = -1;
+            }
+            let carry = kernels_slang::ssm::Carry {
+                table: i32s(gpu.up_i32(&table), table.len()),
+                slots: i32s(sb, 5),
+                lane0: lane0 as u32,
+                page_tokens: 16,
+                stride_words: 0,
+            };
+            let unlanded = kernels_slang::ssm::CarryPlane { at: 0, row: 0 };
             let work = 5 * slab;
-            let work_t = |buf: u32| t(buf, 5, slab, Dtype::F32);
-            landed(
-                &mut gpu,
-                &what("committed"),
-                &fresh(rows, work),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::gdn_recurrent::gated_delta_committed(
-                            c,
-                            tactic,
-                            qkv,
-                            window,
-                            &committed,
-                            gates,
-                            &pool(o[1].0, sb, 5),
-                            work_t(o[2].0),
-                            kh,
-                            vh,
-                            dk,
-                            dv,
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-            );
+            // The window's 4 lanes in one dispatch, and in dispatches of a
+            // work plane holding 2 and 1 of them.
+            for at in CSR_AT {
+                for batch in [4u32, 2, 1] {
+                    let csr = csr_at(&mut gpu, &indptr, at);
+                    let batches = committed_batches(4, batch, &replay, lane0 as u32);
+                    landed(
+                        &mut gpu,
+                        &format!(
+                            "{} csr at {at}, {batch} lane(s) a dispatch",
+                            what("committed")
+                        ),
+                        &fresh(rows, work),
+                        &[want_y.clone(), want_s.clone()],
+                        &|g, o| {
+                            g.run(|c| {
+                                for &(first, lanes, row0) in &batches {
+                                    kernels_slang::ssm::gdn_recurrent::gated_delta_committed(
+                                        c,
+                                        tactic,
+                                        qkv,
+                                        kernels_slang::ssm::Csr {
+                                            at: csr.at + first,
+                                            lanes,
+                                            ..csr
+                                        },
+                                        &kernels_slang::ssm::Committed {
+                                            lane0: committed.lane0 + first,
+                                            ..committed
+                                        },
+                                        gates,
+                                        &pool(o[1].0, sb, 5),
+                                        t(o[2].0, batch as usize, slab, Dtype::F32),
+                                        kh,
+                                        vh,
+                                        dk,
+                                        dv,
+                                        y(o[0].0, rows),
+                                        row0,
+                                        &kernels_slang::ssm::Carry {
+                                            lane0: committed.lane0 + first,
+                                            ..carry
+                                        },
+                                        [unlanded, unlanded],
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    );
+                }
+            }
         }
     }
+}
+
+/// Each window of `cuts` as a chunked scan takes it: its rows, its CSR at
+/// int `at` of a table, and its first lane.
+fn windows_of(
+    gpu: &mut Gpu,
+    cuts: &[(u32, Vec<i32>)],
+    at: usize,
+) -> Vec<(kernels_slang::ssm::RowSpan, kernels_slang::ssm::Csr, u32)> {
+    let mut lane = 0u32;
+    cuts.iter()
+        .map(|(row0, indptr)| {
+            let span = kernels_slang::ssm::RowSpan {
+                row0: *row0,
+                rows: *indptr.last().expect("a CSR has a boundary") as u32,
+            };
+            let first = lane;
+            lane += indptr.len() as u32 - 1;
+            (span, csr_at(gpu, indptr, at), first)
+        })
+        .collect()
 }

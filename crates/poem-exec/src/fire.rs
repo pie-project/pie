@@ -157,6 +157,33 @@ pub enum Fault {
         tokens: u32,
         clips: u32,
     },
+    /// A fire's group masks pass the `int` byte offset a kernel reads a
+    /// group's bits from.
+    MaskBytes {
+        bytes: u64,
+    },
+}
+
+impl Fault {
+    /// The lane of the fire a fault refuses for its own sake, where one
+    /// does: what it states (its word, its media, its mask) is what this
+    /// fire cannot seat, and every other lane could be.
+    #[must_use]
+    pub const fn lane(&self) -> Option<u32> {
+        match self {
+            Self::UnknownWord { lane, .. }
+            | Self::EmptyLane { lane }
+            | Self::Towerless { lane }
+            | Self::NoPatchLadder { lane }
+            | Self::Vaeless { lane }
+            | Self::NoVoxelLadder { lane }
+            | Self::ClipGeometry { lane, .. }
+            | Self::PatchGeometry { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::MaskPatches { lane, .. } => Some(*lane),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Fault {
@@ -245,6 +272,12 @@ impl fmt::Display for Fault {
             Self::TooManyImages { images, max } => write!(
                 f,
                 "this fire assembles {images} images and the artifact was baked for {max}"
+            ),
+            Self::MaskBytes { bytes } => write!(
+                f,
+                "a fire's group masks take {bytes} bytes, past the {} a kernel's `int` \
+                 byte offset into them (`mask_indptr`) reaches",
+                i32::MAX
             ),
             Self::MaskRows { lane, stated, rows } => write!(
                 f,

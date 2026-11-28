@@ -37,7 +37,7 @@ struct BatchPrefillRaggedParams {
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
   IdType* kv_indptr;
-  IdType* maybe_mask_indptr;
+  int64_t* maybe_mask_indptr;
   IdType* maybe_q_rope_offset;
   IdType* maybe_k_rope_offset;
   DTypeO* o;
@@ -100,7 +100,7 @@ struct BatchPrefillPagedParams {
   paged_kv_t<DTypeKV, IdType> paged_kv;
   uint8_t* maybe_custom_mask;
   IdType* q_indptr;
-  IdType* maybe_mask_indptr;
+  int64_t* maybe_mask_indptr;
   IdType* maybe_q_rope_offset;
   DTypeO* o;
   float* lse;
@@ -139,6 +139,12 @@ struct BatchPrefillPagedParams {
   // PIE: each head's sink logit, applied as `sink_rescale` applies it where the
   // fire's rows are not split over kv chunks (null: none).
   DTypeO* maybe_sinks;
+  // PIE: per request, the committed boundary its mask speaks of the keys past
+  // (bits 0-30) and whether its rows read both ways (bit 31). A key below the
+  // boundary is read under the model's own bounds and no mask bit; the plane's
+  // column `c` is key `boundary + c`, rows of `kv_len - boundary` bits. Null:
+  // every boundary 0, every row wide (the mask's bits alone bound it).
+  uint32_t* maybe_mask_origin;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];

@@ -106,6 +106,26 @@ impl Recorder {
         made
     }
 
+    /// The value last carried under `key` ([`Recorder::carry`]), if one is.
+    pub(crate) fn carried(&self, key: &str) -> Option<Value> {
+        let (id, over, ty) = self.once.borrow().get(key).cloned()?;
+        Some(Value {
+            rec: self.clone(),
+            id,
+            over,
+            ty,
+        })
+    }
+
+    /// Carries `value` under `key`, in place of what was: a value each layer
+    /// adds to and the next reads.
+    pub(crate) fn carry(&self, key: &str, value: &Value) {
+        self.once.borrow_mut().insert(
+            key.to_string(),
+            (value.id, value.over.clone(), value.ty.clone()),
+        );
+    }
+
     /// The platform this trace is recorded for.
     #[must_use]
     pub fn platform(&self) -> Platform {
@@ -328,12 +348,36 @@ impl Recorder {
     }
 
     pub fn output(&self, name: &str, value: &Value, grid: Option<&Value>) {
+        self.output_in_planes(name, value, grid, &[]);
+    }
+
+    /// [`Recorder::output`], with how one entry's width factors
+    /// ([`poem_ir::Output::planes`]).
+    pub fn output_in_planes(
+        &self,
+        name: &str,
+        value: &Value,
+        grid: Option<&Value>,
+        planes: &[u32],
+    ) {
         self.inner.borrow_mut().outputs.push(Output {
             name: name.to_string(),
             value: value.id,
             layer: self.at.get(),
             grid: grid.map(|grid| grid.id),
+            planes: planes.to_vec(),
         });
+    }
+
+    /// States the draft head's chain depth; a text states it once.
+    pub fn draft_depth(&self, depth: u32) {
+        let mut inner = self.inner.borrow_mut();
+        match inner.facts.draft_depth {
+            Some(prior) if prior != depth => {
+                panic!("the text states two draft depths: {prior} and then {depth}")
+            }
+            _ => inner.facts.draft_depth = Some(depth),
+        }
     }
 
     pub fn declare_switch(&self, name: &str, values: &[&str]) {
@@ -358,6 +402,14 @@ impl Recorder {
     }
 
     pub fn finish(self) -> Trace {
+        // The score row the layers added into, read out by key and by page:
+        // the mass summed over the layers, averaged over the query heads.
+        if let Some(keys) = self.carried(crate::ops::attn::SCORE_ROW) {
+            let pages = crate::ops::attn::score_pages(&keys);
+            self.output("attn.scores", &keys, None);
+            self.output("attn.scores.pages", &pages, None);
+        }
+        self.once.borrow_mut().clear();
         let mut plan = Rc::try_unwrap(self.inner)
             .unwrap_or_else(|_| panic!("a Value outlived its trace"))
             .into_inner();
@@ -407,8 +459,9 @@ fn unguarded_read(plan: &Trace) -> Option<String> {
         ins.clear();
         node.op.inputs(&mut ins);
         for id in &ins {
+            // (The masks are per-lane data, a lane stating none among them:
+            // any rows read them.)
             let (builtin, what) = match &plan.values[id.0 as usize].def {
-                Def::Input(RuntimeInput::Mask) => (poem_ir::Builtin::Masked, "fact.has(fact.Mask)"),
                 Def::Input(RuntimeInput::AdapterRoutes) => {
                     (poem_ir::Builtin::Adapted, "fact.has(fact.Adapter)")
                 }

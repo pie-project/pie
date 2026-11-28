@@ -15,16 +15,24 @@ pub(crate) mod device {
     pub(crate) fn compute_capability_major() -> Option<u32> {
         None
     }
+
+    /// No slab is ever taken: a walk sizes nothing.
+    pub(crate) fn sizing_reset() {}
+
+    pub(crate) fn sizing_take() -> crate::sizing::Footprint {
+        crate::sizing::Footprint::default()
+    }
 }
 #[cfg(all(test, feature = "cuda"))]
 mod launches;
 #[cfg(feature = "cuda")]
 pub mod nvrtc;
 mod root;
+pub(crate) use root::FLOAT_CONTRACT;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{
-    Ctx, Fire, Launch, Pad, Slabs, count_fires, fire_counts, fires, kernels_strict, strict_kernels,
+    Ctx, Fire, Launch, PLACED_ALIGN, Pad, SlabKey, Slabs, count_fires, fire_counts, fires,
 };
 pub(crate) use kernel::generated;
 pub use kernel::{Kernel, kernel};
@@ -95,6 +103,26 @@ pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the kernel's int")))
 }
 
+/// A flat launch of `n` elements, a thread an element: its grid as wide as
+/// the grid's x extent lets (2^31 - 1 blocks), so an element count past 32
+/// bits launches whole; a kernel launched so takes `n` and indexes it as
+/// `i64` (an `i32` count wraps on a fire of 2^31 elements of one plane).
+pub(crate) fn flat_wide(op: &'static str, n: u64, block: u32) -> Result<Launch, Error> {
+    let blocks = n.div_ceil(u64::from(block.max(1)));
+    let blocks = u32::try_from(blocks)
+        .ok()
+        .filter(|&b| b <= i32::MAX as u32)
+        .ok_or_else(|| {
+            refuse(
+                op,
+                format!("{n} elements take more blocks than a grid holds"),
+            )
+        })?;
+    let mut launch = Launch::flat(0, block);
+    launch.grid = [blocks, 1, 1];
+    Ok(launch)
+}
+
 pub(crate) fn count(op: &'static str, axis: &'static str, v: u32) -> Result<i32, Error> {
     stated(op, nonzero(op, axis, v)?)
 }
@@ -118,16 +146,11 @@ pub(crate) enum Fault {
         unit: &'static str,
         log: String,
     },
-    Unwarmed {
+    /// A take past the slabs laid for its arena: a fire no walk sized.
+    Unplaced {
         name: &'static str,
         have: usize,
         need: usize,
-    },
-    Exhausted {
-        name: &'static str,
-        have: usize,
-        need: usize,
-        free: usize,
     },
 }
 
@@ -137,23 +160,11 @@ impl core::fmt::Display for Fault {
         match self {
             Self::Device { call, code } => write!(f, "`{call}` answered {code}"),
             Self::Compile { unit, log } => write!(f, "`{unit}` would not compile: {log}"),
-            Self::Unwarmed { name, have, need } => write!(
+            Self::Unplaced { name, have, need } => write!(
                 f,
-                "the `{name}` scratch holds {have} bytes and this capture needs {need}; \
-                 growing it mid-capture would poison the graph — warm it with an eager \
-                 fire before capturing"
-            ),
-            Self::Exhausted {
-                name,
-                have,
-                need,
-                free,
-            } => write!(
-                f,
-                "`cudaMalloc` answered cudaErrorMemoryAllocation growing the `{name}` scratch \
-                 from {have} to {need} bytes, with {free} bytes free on the device: this \
-                 fire's workspace lies outside the fitted pool, so the load left too little \
-                 beside the weights, the cache rows and the graph bodies for it"
+                "the `{name}` scratch is laid at {have} bytes and this launch needs {need}: \
+                 slabs are laid ahead from a size-only walk of the fires they serve, and \
+                 none grows, so this fire is one no walk sized"
             ),
         }
     }

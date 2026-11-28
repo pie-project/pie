@@ -122,4 +122,19 @@ fn the_token_regions_arm_while_the_voxel_regions_stay_eager() {
         after.tally.hits > stats.tally.hits,
         "no fire replayed a body: {after}"
     );
+    // How each serving fire was served is counted where the runtime reads
+    // it: one that walked with no body is never silent, and a fire that
+    // replayed its body counts nothing.
+    let live = rig.engine.live();
+    let unrecorded = live.tallied(engine::live::Tally::Unrecorded);
+    let compiled = live.tallied(engine::live::Tally::Compiled);
+    println!("[two-axis, live] unrecorded {unrecorded} compiled {compiled}");
+    assert!(
+        unrecorded >= after.tally.eager_unbodied,
+        "a fire walked with no body and the runtime was not told: {after}"
+    );
+    assert!(
+        unrecorded + compiled + (after.tally.hits - stats.tally.hits) >= 2,
+        "the two serving fires are each a replay, a capture or a walk: {after}"
+    );
 }

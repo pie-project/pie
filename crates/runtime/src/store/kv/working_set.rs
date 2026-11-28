@@ -212,7 +212,7 @@ impl KvWorkingSet {
     pub fn claim_pipeline_scope(
         &self,
         scope: &crate::store::PipelineScope,
-    ) -> Result<(), crate::store::PipelineScopeId> {
+    ) -> Result<(), crate::store::ScopeRefusal> {
         scope.claim(&self.lifecycle.pipeline_scope)
     }
 
@@ -284,5 +284,52 @@ mod pipeline_failure_tests {
         let unrelated = KvWorkingSet::new(model, 0, id, 16);
         unrelated.claim_pipeline_scope(&other).unwrap();
         assert_eq!(unrelated.pipeline_failure(), None, "it is not process-wide");
+    }
+
+    /// What a fire folds is frozen as the fire is prepared. A pipeline
+    /// that failed left sets holding folds whose fires never ran: such a
+    /// set, and a fork of it made before or after, joins no other
+    /// pipeline, and is told why. A pipeline that ended well hands its
+    /// sets on.
+    #[test]
+    fn a_set_whose_pipeline_failed_joins_no_other_nor_do_its_forks() {
+        use crate::store::ScopeRefusal;
+        let model = crate::store::registry::register_model(16, &[8], &[4]);
+        let stores = crate::store::registry::get(model, 0);
+        let fresh = || {
+            crate::store::registry::with_kv_lock(&stores.kv, "test", |kv| kv.create_working_set())
+        };
+        for failed in [false, true] {
+            let failure = crate::pipeline::fire::PipelineFailure::default();
+            let scope = PipelineScope::failing_as(failure.clone(), || true);
+            let ws = KvWorkingSet::new(model, 0, fresh(), 16);
+            ws.claim_pipeline_scope(&scope).unwrap();
+            let before = ws.forked(fresh());
+            if failed {
+                *failure.lock().unwrap() = Some("the fire failed".to_string());
+            }
+            // Its own pipeline keeps it, failed or not: that pipeline's
+            // fires are refused by the failure itself.
+            assert_eq!(ws.claim_pipeline_scope(&scope), Ok(()));
+            scope.close();
+            let after = ws.forked(fresh());
+            for set in [&ws, &before, &after] {
+                let next = PipelineScope::failing_as(Default::default(), || true);
+                let joined = set.claim_pipeline_scope(&next);
+                if failed {
+                    let refused = ScopeRefusal::Failed {
+                        owner: scope.id(),
+                        reason: "the fire failed".to_string(),
+                    };
+                    assert!(
+                        refused.to_string().contains("(the fire failed)"),
+                        "{refused}"
+                    );
+                    assert_eq!(joined, Err(refused));
+                } else {
+                    assert_eq!(joined, Ok(()));
+                }
+            }
+        }
     }
 }

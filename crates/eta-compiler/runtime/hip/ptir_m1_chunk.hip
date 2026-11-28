@@ -1,4 +1,11 @@
 
+// A call costs a CDNA kernel private memory: the caller's state it passes by
+// reference (a lane, a cut) leaves registers for the stack, and the callee
+// saves every vector register it uses past the calling convention's
+// caller-saved ones. So the shared runtime's callees are inlined here, and a
+// guest region holds no private segment.
+#define M1_INLINE_CALLS 1
+
 // The 32-lane chunk the reductions' numeric contract is written over (a
 // width-32 tree; see `canonical_reduce`). A CDNA wavefront is 64 lanes and
 // carries two chunks side by side: every shuffle stays within its chunk

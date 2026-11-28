@@ -45,6 +45,30 @@ pub(crate) fn check(
         .ok_or_else(|| refuse(op, format!("no point is stamped at {what} {v}")))
 }
 
+/// The most rows of a bank one tile of the quantized kernels reads.
+const TILE_ROWS_MAX: u64 = 64;
+
+/// A bank whose in-tile offsets the quantized kernels can form. A row's base
+/// is a 64-bit product in every kernel, but inside a tile they still step in
+/// `int`: up to a tile's rows of the row stride at up to 8 bytes a pack
+/// (`BROWS * src_ld * bytes_per_pack`, before the divide by the pack
+/// factor). A row stride past that is refused by name, not read wrapped.
+pub(crate) fn addressable(op: &'static str, ld: u32) -> Result<(), Error> {
+    let reach = TILE_ROWS_MAX * u64::from(ld) * 8;
+    if reach > i32::MAX as u64 {
+        return Err(refuse(
+            op,
+            format!(
+                "the bank's row stride is {ld} codes: a tile's {TILE_ROWS_MAX} rows of it \
+                 step {reach} bytes, past the {} a quantized kernel's in-tile `int` \
+                 offset reaches",
+                i32::MAX
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn symbol(name: &str) -> &'static str {
     static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut map = INTERNED
@@ -246,6 +270,7 @@ fn act_x_wt_over(
         ));
     }
     let ld = stated(op, w.ld)?;
+    addressable(op, w.ld)?;
     let fp16 = tuning.fp16_gemm_format(w.bits, w.group);
     let at = tuning.qmm_at(rows, columns, contraction, w.bits, w.group);
     // The profile's `kernel.qmm` rungs that fit this shape, in order: each

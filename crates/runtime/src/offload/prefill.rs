@@ -17,7 +17,7 @@
 //! same prefix on both. Their engines must lay a page out alike: v1 moves a
 //! page's bytes as they are.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -106,8 +106,11 @@ pub struct Held {
 pub trait PrefillPeer: Send + Sync {
     /// Prefills on the peer, its pages to come back as `delivery` says; held
     /// in place, they are read by [`PrefillPeer::read`].
+    /// The tokens are keyed under `domain`, the asking set's
+    /// ([`crate::policy::share`]).
     fn prefill(
         &self,
+        domain: Hash256,
         tokens: Vec<u32>,
         from_page: u32,
         delivery: Delivery,
@@ -131,21 +134,6 @@ pub trait PrefillPeer: Send + Sync {
     }
 }
 
-static PEER: RwLock<Option<Arc<dyn PrefillPeer>>> = RwLock::new(None);
-
-pub fn set_peer(peer: Option<Arc<dyn PrefillPeer>>) {
-    *PEER.write().unwrap() = peer;
-}
-
-/// The peer the worker's configuration dialed (`offload.peers`), if any.
-pub(crate) fn configured_peer() -> Option<Arc<dyn PrefillPeer>> {
-    PEER.read().unwrap().clone()
-}
-
-pub fn has_peer() -> bool {
-    PEER.read().unwrap().is_some()
-}
-
 /// Tokens per kv page on this worker's engine, once one serves a model.
 pub fn page_tokens() -> Option<u32> {
     crate::store::registry::try_get(0, 0).map(|stores| stores.kv_page_size)
@@ -158,6 +146,8 @@ struct Pass {
     first: u64,
     limit: u64,
     have: u64,
+    /// The asking set's domain, which its keys chain from.
+    domain: Hash256,
     tokens: Vec<u32>,
     keys: Vec<Hash256>,
     token_hashes: Vec<Vec<Option<Hash256>>>,
@@ -169,20 +159,24 @@ impl Pass {
     }
 }
 
-/// Before a keyed, single-lane pass, for what its rows reach that this
-/// worker holds nowhere: first the pages another worker holds, fetched by
-/// key where the directory names one; then, when enough is left, a peer's
-/// prefill of the rest. Any failure leaves the pass to run here.
+/// Before a keyed, single-lane pass of a set that shares, keyed under
+/// `domain`, for what its rows reach that this worker holds nowhere: first
+/// the pages another worker holds, fetched by key where the directory
+/// names one; then, when enough is left, a peer's prefill of the rest. Any
+/// failure leaves the pass to run here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn before_pass(
     pid: crate::inferlet::process::ProcessId,
     stores: &Stores,
     engine: usize,
+    domain: Hash256,
     ws: crate::store::kv::page_table::WorkingSetId,
     held: u64,
     rows: &[u32],
     slots: &[Hash256],
 ) {
-    let Some(mut pass) = plan(stores, ws, held, rows, slots) else {
+    let Some(mut pass) = plan(stores, domain, ws, held, rows, slots) else {
+        tracing::debug!(target: "pie::offload", %pid, held, rows = rows.len(), "a pass with nothing to send away");
         return;
     };
     // A run's keys name it from token 0: a pass that starts there can be
@@ -191,7 +185,7 @@ pub(crate) async fn before_pass(
         && let Some(directory) = super::directory::directory()
         && let Some(remote) = super::directory::remote()
     {
-        let started = std::time::Instant::now();
+        let started = crate::rt::wall::Instant::now();
         match fetch_held(stores, engine, &mut pass, &*directory, &*remote).await {
             Ok(0) => {}
             Ok(pages) => tracing::info!(
@@ -217,8 +211,16 @@ pub(crate) async fn before_pass(
     // Best first; one that cannot take the pass gives way to the next, and
     // when none can, it runs here.
     let mut last = None;
-    for (executor, peer) in super::executors::candidates(pid, &named).await {
-        let started = std::time::Instant::now();
+    let candidates = super::executors::candidates(pid, &named).await;
+    tracing::debug!(
+        target: "pie::offload",
+        %pid,
+        pages = pass.limit - pass.have,
+        executors = ?candidates.iter().map(|(w, _)| w).collect::<Vec<_>>(),
+        "a pass that may go to a peer"
+    );
+    for (executor, peer) in candidates {
+        let started = crate::rt::wall::Instant::now();
         match take(pid, stores, engine, peer, &pass).await {
             Ok(pages) => {
                 tracing::info!(
@@ -253,30 +255,18 @@ pub(crate) async fn before_pass(
     }
 }
 
-/// The fewest uncached tokens worth a peer's prefill, and the executors the
-/// worker policy names: its rule, else the configuration's; unstated, 2048.
-/// `None`: this process's passes stay home.
-fn rule(pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
-    use crate::policy::offload::Mode;
-    match crate::policy::offload::rule(pid) {
-        Some(None) => None,
-        Some(Some(rule)) => match rule.mode {
-            Mode::Never => None,
-            Mode::Always => Some((u64::from(rule.min_tokens).max(1), rule.executors)),
-            Mode::Cost => Some((u64::from(rule.min_tokens), rule.executors)),
-        },
-        None => Some((
-            match super::prefill_min_suffix_tokens() {
-                0 => 2048,
-                n => n as u64,
-            },
-            Vec::new(),
-        )),
-    }
+/// The fewest uncached tokens worth a helper's prefill, and the executors
+/// to try: the worker's configuration (PLEX 1.1 leaves the cutoff to the
+/// host; which helpers a process may use is the cluster's
+/// `placement/helpers`). `None`: unstated, so this process's passes stay
+/// home.
+fn rule(_pid: crate::inferlet::process::ProcessId) -> Option<(u64, Vec<String>)> {
+    Some((super::prefill_min_suffix_tokens()? as u64, Vec::new()))
 }
 
 fn plan(
     stores: &Stores,
+    domain: Hash256,
     ws: crate::store::kv::page_table::WorkingSetId,
     held: u64,
     rows: &[u32],
@@ -314,6 +304,7 @@ fn plan(
             first,
             limit,
             have,
+            domain,
             tokens,
             keys: keys[first as usize..limit as usize].to_vec(),
             token_hashes: (first..limit)
@@ -394,9 +385,10 @@ async fn take(
     peer: Arc<dyn PrefillPeer>,
     pass: &Pass,
 ) -> Result<usize> {
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let pages = peer
         .prefill(
+            pass.domain,
             pass.tokens.clone(),
             u32::try_from(pass.have)?,
             if peer.reads_in_place() {
@@ -489,10 +481,10 @@ async fn read_in_place(
         kv_pages: u32::try_from(n)?,
         ..crate::planner::Demand::default()
     };
-    let crate::planner::Acquired::Granted(mut grant) = planner
-        .acquire(pid, pid, demand)
-        .await
-        .map_err(|error| anyhow!("reserving pages to read a peer's into: {error}"))?
+    let crate::planner::Acquired::Granted(mut grant) =
+        planner.acquire(pid, pid, demand).await.map_err(|error| {
+            anyhow::Error::new(error).context("reserving pages to read a peer's into")
+        })?
     else {
         bail!("the planner asked the pass to yield before its pages were read");
     };
@@ -591,9 +583,9 @@ async fn land(
         (Some(from), Some(to)) if from != to => Some((from.clone(), to.clone())),
         _ => None,
     };
-    let t0 = std::time::Instant::now();
-    let host = with_kv_lock(&stores.kv, "offload-land", |kv| kv.alloc_host_slots(n))
-        .ok_or_else(|| anyhow!("no room in the host tier for {n} pages"))?;
+    let t0 = crate::rt::wall::Instant::now();
+    let (list, host) = staging(stores, n);
+    let host = host.ok_or_else(|| anyhow!("no room in the host tier for {n} pages"))?;
     let ids: Vec<u32> = host.iter().map(|slot| slot.0).collect();
     let written = async {
         let mut at = 0usize;
@@ -609,7 +601,13 @@ async fn land(
                 }
                 None => chunk,
             };
-            crate::scheduler::write_host_kv(engine, ids[at..at + k].to_vec(), data).await?;
+            let ids = ids[at..at + k].to_vec();
+            match list {
+                Some(list) => {
+                    crate::scheduler::write_tier_slots(engine, vec![(list, ids)], data).await?
+                }
+                None => crate::scheduler::write_host_kv(engine, ids, data).await?,
+            }
             at += k;
         }
         if at != n {
@@ -638,12 +636,16 @@ async fn land(
     Ok(())
 }
 
-/// Each whole page of `tokens` from token 0: its slots' hashes and its key.
-fn keyed_pages(stores: &Stores, tokens: &[u32]) -> (Vec<Vec<Option<Hash256>>>, Vec<Hash256>) {
+/// Each whole page of `tokens` from token 0, keyed under `domain`: its
+/// slots' hashes and its key.
+fn keyed_pages(
+    stores: &Stores,
+    domain: &Hash256,
+    tokens: &[u32],
+) -> (Vec<Vec<Option<Hash256>>>, Vec<Hash256>) {
     let page = stores.kv_page_size.max(1) as usize;
     let whole = tokens.len() / page * page;
-    let domain = with_kv_lock(&stores.kv, "offload-keys", |kv| kv.domain());
-    let slots = hash::chain_slots(&domain, None, 0, &tokens[..whole]);
+    let slots = hash::chain_slots(domain, None, 0, &tokens[..whole]);
     let token_hashes: Vec<Vec<Option<Hash256>>> = slots
         .chunks_exact(page)
         .map(|page| page.iter().map(|h| Some(*h)).collect())
@@ -662,7 +664,7 @@ pub(super) const LEASE_TTL: Duration = Duration::from_secs(60);
 struct Lease {
     kv: Arc<parking_lot::Mutex<crate::store::kv::KvStore>>,
     pin: crate::store::kv::ReaderPin,
-    since: std::time::Instant,
+    since: crate::rt::wall::Instant,
 }
 
 /// Pages this executor holds for askers to read in place, by lease.
@@ -717,7 +719,7 @@ fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
         Lease {
             kv: stores.kv.clone(),
             pin,
-            since: std::time::Instant::now(),
+            since: crate::rt::wall::Instant::now(),
         },
     );
     Some(Held {
@@ -726,13 +728,14 @@ fn hold(stores: &Stores, keys: &[Hash256], from: usize) -> Option<Held> {
     })
 }
 
-/// Prefills `tokens` here and hands the asker the pages from `from_page`
+/// Prefills `tokens`, keyed under the asker's `domain`, here and hands the asker the pages from `from_page`
 /// that the run fills completely, as `delivery` asks: kept for it to fetch,
 /// held on this device for it to read in place, or streamed a layer at a
 /// time as they are computed. Pages before `from_page` this worker holds
 /// nowhere are first fetched from `home`, which holds them, so only the
 /// rest is computed.
 pub async fn serve(
+    domain: Hash256,
     tokens: Vec<u32>,
     from_page: u32,
     home: Option<String>,
@@ -745,7 +748,7 @@ pub async fn serve(
     let engine = 0usize;
     let page = u64::from(stores.kv_page_size.max(1));
     let from = u64::from(from_page);
-    let (token_hashes, keys) = keyed_pages(&stores, &tokens);
+    let (token_hashes, keys) = keyed_pages(&stores, &domain, &tokens);
     let pages = keys.len() as u64;
     if from >= pages {
         return Ok(RemotePages {
@@ -756,7 +759,7 @@ pub async fn serve(
             held: None,
         });
     }
-    let t0 = std::time::Instant::now();
+    let t0 = crate::rt::wall::Instant::now();
     let have = with_kv_lock(&stores.kv, "offload-serve", |kv| {
         kv.cached_run_any_tier(&keys[..from as usize]).len()
     });
@@ -804,39 +807,61 @@ pub async fn serve(
     };
     let whole = tokens[..(pages * page) as usize].to_vec();
     // Streamed, the asker fetches the run as it is computed: its fires'
-    // layers go out as they land.
-    if delivery == Delivery::Streamed
-        && let Some(run) = super::stream::expect(&keys, from as usize).await
-    {
-        tokio::spawn(async move {
-            let ran = run_prefill(&whole).await;
-            super::stream::done(run, ran);
-        });
-        tracing::debug!(
-            target: "pie::offload",
-            have,
-            fetched,
-            fetch_ms = t_fetch.as_millis() as u64,
-            "streaming a prefill"
-        );
-        return Ok(answer);
+    // layers go out as they land. Where this engine cannot stream, the run
+    // goes whole, counted and said.
+    if delivery == Delivery::Streamed {
+        match super::stream::expect(&keys, from as usize).await {
+            Ok(run) => {
+                tokio::spawn(async move {
+                    let ran = run_prefill(domain, &whole).await.map(drop);
+                    super::stream::done(run, ran);
+                });
+                tracing::debug!(
+                    target: "pie::offload",
+                    have,
+                    fetched,
+                    fetch_ms = t_fetch.as_millis() as u64,
+                    "streaming a prefill"
+                );
+                return Ok(answer);
+            }
+            Err(why) => {
+                super::stream::count_unstreamed();
+                tracing::debug!(
+                    target: "pie::offload",
+                    %why,
+                    "a prefill asked for streamed goes whole"
+                );
+            }
+        }
     }
-    run_prefill(&whole).await?;
+    let departure = run_prefill(domain, &whole).await?;
     let t_run = t0.elapsed();
     // The program has exited; its working set's pages are kept as it is
-    // released, which may land just after.
-    let mut kept = false;
-    for _ in 0..50 {
-        kept = with_kv_lock(&stores.kv, "offload-serve", |kv| {
+    // released, which may land just after. Pages joining the cache and the
+    // program's full departure (every set released) are the events: once
+    // gone with the pages not all cached, they never will be.
+    let cached_event = with_kv_lock(&stores.kv, "offload-serve", |kv| kv.cached());
+    loop {
+        let joined = cached_event.notified();
+        let gone = crate::planner::DepartureWatch::next();
+        let mut joined = std::pin::pin!(joined);
+        let mut gone = std::pin::pin!(gone);
+        joined.as_mut().enable();
+        gone.as_mut().enable();
+        let kept = with_kv_lock(&stores.kv, "offload-serve", |kv| {
             kv.cached_run_any_tier(&keys).len() == keys.len()
         });
         if kept {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if !kept {
-        bail!("the prefill's pages are not all cached here");
+        if departure.gone() {
+            bail!("the prefill's pages are not all cached here");
+        }
+        tokio::select! {
+            () = &mut joined => {}
+            () = &mut gone => {}
+        }
     }
     tracing::debug!(
         target: "pie::offload",
@@ -863,44 +888,36 @@ pub async fn fetch(keys: Vec<Hash256>, from: u32) -> Result<PageStream> {
     }
     let stores = crate::store::registry::try_get(0, 0)
         .ok_or_else(|| anyhow!("no engine serves a model here"))?;
-    export(&stores, 0, &keys, from as usize, false).await
+    export(&stores, 0, &keys, from as usize).await
 }
 
 /// Reads out sealed pages `keys[from..]` a chunk at a time; all of `keys`
 /// must be found here as one run, and what is read must be on the device.
-/// They are held until the last chunk is read. With `wait`, gives a
-/// just-ended program's release a moment to keep them.
+/// They are held until the last chunk is read; refused at once where they
+/// are not.
 async fn export(
     stores: &Stores,
     engine: usize,
     keys: &[Hash256],
     from: usize,
-    wait: bool,
 ) -> Result<PageStream> {
-    let tries = if wait { 50 } else { 1 };
-    let mut held = None;
-    for _ in 0..tries {
-        held = with_kv_lock(&stores.kv, "offload-export", |kv| {
-            let run = kv.cached_run_any_tier(keys);
-            if run.len() != keys.len() || from >= run.len() {
-                return None;
-            }
-            let hashes = kv.run_slots(&run[from..]).unwrap_or_default();
-            kv.pin_resident(&run[from..])
-                .map(|(pin, device)| (pin, device, hashes))
-        });
-        if held.is_some() {
-            break;
+    let held = with_kv_lock(&stores.kv, "offload-export", |kv| {
+        let run = kv.cached_run_any_tier(keys);
+        if run.len() != keys.len() || from >= run.len() {
+            return None;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        let hashes = kv.run_slots(&run[from..]).unwrap_or_default();
+        kv.pin_resident(&run[from..])
+            .map(|(pin, device)| (pin, device, hashes))
+    });
     let (pin, device, hashes) =
         held.ok_or_else(|| anyhow!("those pages are not all cached on the device here"))?;
     let release = |stores: &Stores, pin| {
         with_kv_lock(&stores.kv, "offload-export", |kv| kv.release_reader(pin))
     };
     let n = device.len();
-    let staging = match with_kv_lock(&stores.kv, "offload-export", |kv| kv.alloc_host_slots(n)) {
+    let (list, staging) = staging(stores, n);
+    let staging = match staging {
         Some(staging) => staging,
         None => {
             release(stores, pin);
@@ -911,8 +928,8 @@ async fn export(
     let layout = crate::scheduler::host_kv_layout(engine).await;
     // One read: a round trip through the engine's lane per chunk costs more
     // than the chunks save. The link and the asker's landing go by chunks.
-    let t0 = std::time::Instant::now();
-    let read = read_chunk(engine, &device, &slots).await;
+    let t0 = crate::rt::wall::Instant::now();
+    let read = read_chunk(engine, list, &device, &slots).await;
     with_kv_lock(&stores.kv, "offload-export", |kv| {
         kv.free_host_slots(staging)
     });
@@ -942,30 +959,58 @@ async fn export(
     })
 }
 
-/// Device pages `device`, copied to host `slots` and read.
+/// Host slots for `n` pages to pass through, and the list shape they are
+/// slots of on a shared pool (whose host tier is read and written by slot
+/// refs, CONTRACT-BC 22); `None` slots when the host tier has no room.
+fn staging(
+    stores: &Stores,
+    n: usize,
+) -> (
+    Option<::engine::chunk::ShapeId>,
+    Option<Vec<crate::store::kv::page_table::HostKvSlotId>>,
+) {
+    with_kv_lock(&stores.kv, "offload-stage", |kv| match kv.shared_list() {
+        Some(list) => (Some(list), kv.alloc_tier_slots(n)),
+        None => (None, kv.alloc_host_slots(n)),
+    })
+}
+
+/// Device pages `device`, copied to host `slots` and read: on a shared pool
+/// (`list`) by the engine's tier copy and the slots' refs.
 async fn read_chunk(
     engine: usize,
+    list: Option<::engine::chunk::ShapeId>,
     device: &[crate::store::kv::page_table::PhysicalKvPageId],
     slots: &[u32],
 ) -> Result<Vec<u8>> {
-    let t0 = std::time::Instant::now();
-    let bytes = crate::scheduler::read_device_kv(
-        engine,
-        device.iter().map(|id| id.0).collect(),
-        slots[..device.len()].to_vec(),
-    )
-    .await?;
+    let t0 = crate::rt::wall::Instant::now();
+    let slots = slots[..device.len()].to_vec();
+    let device: Vec<u32> = device.iter().map(|id| id.0).collect();
+    let n = device.len();
+    let bytes = match list {
+        Some(list) => {
+            let copy = crate::scheduler::TierMove {
+                kind: crate::scheduler::TierKind::KvSlots(list),
+                tier: ::engine::MemoryDomain::HostPinned,
+                out: true,
+                device,
+                slots: slots.clone(),
+                source: None,
+            };
+            crate::scheduler::copy_tier_tracked(engine, &copy)?
+                .wait()
+                .await?;
+            crate::scheduler::read_tier_slots(engine, vec![(list, slots)]).await?
+        }
+        None => crate::scheduler::read_device_kv(engine, device, slots).await?,
+    };
     tracing::debug!(
         target: "pie::offload",
         ms = t0.elapsed().as_millis() as u64,
         "read a chunk"
     );
-    if bytes.is_empty() || bytes.len() % device.len() != 0 {
-        bail!(
-            "{} bytes do not split into {} pages",
-            bytes.len(),
-            device.len()
-        );
+    if bytes.is_empty() || bytes.len() % n != 0 {
+        bail!("{} bytes do not split into {n} pages", bytes.len());
     }
     Ok(bytes)
 }
@@ -973,7 +1018,11 @@ async fn read_chunk(
 /// The built-in program [`serve`] runs; no HTTP route serves it.
 pub const PROGRAM: &str = "prefill";
 
-async fn run_prefill(tokens: &[u32]) -> Result<()> {
+/// Runs the built-in prefill program over `tokens`; answers a watch on its
+/// full departure, taken while it runs.
+/// Runs the built-in `prefill` program over `tokens`, its set keyed under
+/// the asker's `domain` (whatever scope the program asks).
+async fn run_prefill(domain: Hash256, tokens: &[u32]) -> Result<crate::planner::DepartureWatch> {
     use crate::inferlet::program;
     let reference = program::ProgramRef::parse(PROGRAM)?;
     let name = program::resolve(None, &reference)
@@ -982,7 +1031,7 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
     program::load(&name).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let input = serde_json::json!({ "tokens": tokens }).to_string();
-    crate::inferlet::process::spawn(
+    let (_, departure) = crate::inferlet::process::spawn_watched(
         "pie".into(),
         name,
         input,
@@ -991,11 +1040,14 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
         false,
         Some(tx),
         None,
-        crate::policy::Arrival::default(),
+        crate::policy::Arrival {
+            keys_under: Some(domain),
+            ..Default::default()
+        },
         Vec::new(),
     )?;
     rx.await
         .map_err(|_| anyhow!("the prefill program went away"))?
         .map_err(|why| anyhow!("the prefill program failed: {why}"))?;
-    Ok(())
+    Ok(departure)
 }

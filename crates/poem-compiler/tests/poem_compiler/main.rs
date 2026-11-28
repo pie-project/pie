@@ -1,5 +1,6 @@
 //! poem-compiler's integration tests, one binary: each module was a test file.
 
+mod a_score_output_states_its_heads_and_keys;
 mod common;
 mod flux_2_dims;
 mod hunyuan_image_3_dims;
@@ -12,10 +13,12 @@ mod z_image_dims;
 mod a_banded_head_gathers_the_logits_it_holds_a_band_of;
 mod a_dag_schedule_orders_every_wait_after_its_close;
 mod a_deployment_stretched_by_yarn_turns_at_the_scaled_frequencies;
+mod a_draft_head_states_its_chain;
 mod a_fold_and_the_next_pre_mix_land_as_one_op;
 mod a_fused_kernel_replaces_what_its_pattern_matches;
 mod a_kv_head_is_held_by_a_group_of_ranks;
 mod a_matmul_and_its_epilogue_fold_into_one_anchored_region;
+mod a_miniature_cut_short_of_its_shared_tail_traces;
 mod a_miniature_cut_to_other_counts_is_read_at_them;
 mod a_named_run_lowers_to_its_region;
 mod a_ptq1_0_trunk_traces_and_places;
@@ -65,3 +68,4 @@ mod the_z_image_import_reads_the_diffusers_pipeline;
 mod the_z_image_rows_bake;
 mod the_z_image_vae_bakes;
 mod the_zt_contract_states_the_cut;
+mod windowed_layers_pack_as_ring_and_buffer;

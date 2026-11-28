@@ -1,6 +1,6 @@
-//! Every chip of a family resolves to what `DeviceTuning::of(family)` gave
-//! it before profiles existed, but what was measured on it since; the
-//! functions below are that table, frozen.
+//! Every chip of a family resolves to its family's base tuning, but where
+//! its own profile states a measured value; the functions below are that
+//! base table, frozen.
 
 use engine_metal::chip::{self, AneMlp, AneProjections, WeightsLayout};
 use kernels_metal::Tuning;
@@ -18,8 +18,7 @@ fn old(family: u32) -> (i64, u32, bool, bool, GdnScan) {
     }
 }
 
-/// The old routed tile choice, but the 64-row tile an Apple10 GPU measured
-/// since.
+/// The family's routed tile choice, the 64-row tile on Apple10.
 fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     if experts == 0 || pairs < experts * 2 {
         return 1;
@@ -36,13 +35,13 @@ fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     }
 }
 
-/// The M4 Pro's measured routed tile: 16 rows wherever the old choice was
-/// wider (two simdgroups multiply a 16-row tile side by side, #1034).
+/// The M4 Pro's measured routed tile: 16 rows wherever the family's choice
+/// is wider (two simdgroups multiply a 16-row tile side by side).
 fn m4_pro_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     old_tile(family, pairs, experts).min(16)
 }
 
-/// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
+/// The kernel the family's base tuning runs a dense matmul on.
 fn old_qmm(family: u32, at: &QmmAt) -> Qmm {
     let (fp16_from, crossover_tg, mpp, ..) = old(family);
     if family == 10
@@ -211,7 +210,9 @@ fn assert_old_tuning(
     assert_eq!(
         poem_compiler::DeviceProfile::of(&profile, chip::pricing_cores(&profile, cores), &[], &[]),
         poem_compiler::DeviceProfile {
-            sms: cores.unwrap_or(32),
+            // A device that states no cores is measured as it opens
+            // (`CoresFrom::Probe`); unmeasured, it prices at one.
+            sms: cores.unwrap_or(1),
             side_streams: 0,
             ..poem_compiler::DeviceProfile::default()
         },
@@ -229,13 +230,15 @@ fn assert_old_tuning(
 
 #[test]
 fn each_checked_in_profile_runs_its_familys_old_tuning() {
+    let _device = crate::device_alone();
     for &(family, device, cores) in CHIPS {
         assert_old_tuning(device, family, cores, 512, None, None, old_tile);
     }
 }
 
 #[test]
-fn the_m4_pro_runs_its_family_and_the_three_values_it_measured() {
+fn the_m4_pro_runs_its_family_and_names_no_measured_decision() {
+    let _device = crate::device_alone();
     assert_old_tuning(
         "Apple M4 Pro",
         9,
@@ -246,18 +249,14 @@ fn the_m4_pro_runs_its_family_and_the_three_values_it_measured() {
         m4_pro_tile,
     );
     let (_, report) = chip::resolve("Apple M4 Pro", &chip::facts(9, Some(20), 10, true), None);
-    assert_eq!(
-        report.measured,
-        [
-            "kernel.ane.mlp",
-            "kernel.moe.tile_rows",
-            "kernel.qmm_splitk"
-        ]
-    );
+    // Its file states the three values its tune picked, and names none
+    // measured: no check model it was tuned with reads them.
+    assert!(report.measured.is_empty(), "{:?}", report.measured);
 }
 
 #[test]
 fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
+    let _device = crate::device_alone();
     let (profile, _) = chip::resolve("Apple M4 Max", &chip::facts(9, Some(40), 10, true), None);
     let wide = Tuning::new(profile, true, Some(40));
     assert!(!wide.fp16_gemm_format(4, 64));
@@ -276,6 +275,7 @@ fn a_wide_range_model_leaves_the_fp16_format_on_any_chip() {
 
 #[test]
 fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
+    let _device = crate::device_alone();
     let (profile, report) =
         chip::resolve("Apple M5 Max", &chip::facts(10, Some(40), 10, false), None);
     assert_eq!(report.used, Source::Seeded("apple10.toml".into()));
@@ -291,6 +291,7 @@ fn a_mac_whose_bridge_does_not_load_runs_its_family_on_the_gpu() {
 
 #[test]
 fn a_device_file_applies_only_within_its_family() {
+    let _device = crate::device_alone();
     let (profile, report) =
         chip::resolve("Apple M4 Pro", &chip::facts(10, Some(40), 10, true), None);
     assert_eq!(report.layers, [Source::Seeded("apple10.toml".into())]);

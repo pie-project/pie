@@ -1,16 +1,16 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2a — the low-bit KV codec's pack/unpack Metal kernels, in ISOLATION.
+//! The low-bit KV codec's pack/unpack Metal kernels, in ISOLATION.
 //!
-//! This drives the real `kv_codec::pack` / `kv_codec::unpack` ops (the LOCKED v1
+//! This drives the real `kv_codec::pack` / `kv_codec::unpack` ops (the KvU4
 //! format: 4-bit symmetric absmax, block = 256, one fp16 scale per block, no
-//! bias) directly from a test, the same way the C0 test drives
+//! bias) directly from a test, as `the_hadamard_transform_agrees` drives
 //! `pointwise::hadamard`. Nothing here touches the cache, the allocator or the
 //! forward path — it is the codec MATH only.
 //!
 //! The KEY correctness check is a round-trip against a pure HOST reference that
-//! is exactly the per-block symmetric absmax quantize/dequant the C0 test uses
-//! (`quantize_rowmajor`, here pinned at block = 256). We prove three things:
+//! is exactly the per-block symmetric absmax quantize/dequant
+//! (`quantize_rowmajor`, here at block = 256). We prove three things:
 //!   1. Nibble/quantize math is bit-exact vs host codes (converter-free — this
 //!      is what catches a wrong signed-nibble convention).
 //!   2. Metal's reconstruction matches the host `quantize_rowmajor` recon within
@@ -22,6 +22,7 @@
 //! Signed-nibble convention under test: OFFSET-BINARY (store q+8 -> [1..15],
 //! unpack (nibble-8)*scale).
 
+use crate::common::{bf16_bits_to_f32, f32_to_bf16_bits};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -30,7 +31,7 @@ use poem_ir::Dtype;
 
 const BLOCK: usize = 256;
 
-// --- deterministic data (same mixer as the C0 / hadamard tests) --------------
+// --- deterministic data (same mixer as the `the_hadamard_transform_agrees` / hadamard tests) --------------
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
@@ -95,17 +96,6 @@ fn f32_floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// bf16 store/load: bf16 is the top 16 bits of f32 with round-to-nearest-even.
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
-}
-
-fn bf16_bits_to_f32(bits: u16) -> f32 {
-    f32::from_bits(u32::from(bits) << 16)
-}
-
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
         .flat_map(|&f| f32_to_bf16_bits(f).to_le_bytes())
@@ -143,7 +133,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 // --- the host reference: quantize_rowmajor, pinned at block = 256 ------------
 
 /// Per-`block`-block symmetric absmax 4-bit quantize/dequant, in pure host f32 —
-/// the same scheme the C0 test's `quantize_rowmajor` implements. Returns the
+/// the same scheme the `the_hadamard_transform_agrees` test's `quantize_rowmajor` implements. Returns the
 /// integer codes in [-7, 7], the f32-scale reconstruction, and the per-block
 /// scale.
 fn host_quantize(data: &[f32], block: usize) -> (Vec<i32>, Vec<f32>, Vec<f32>) {
@@ -278,6 +268,7 @@ impl Rig<'_> {
 
 #[test]
 fn the_kv_codec_round_trips() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
@@ -291,9 +282,6 @@ fn the_kv_codec_round_trips() {
     };
 
     const ROWS: usize = 64;
-
-    eprintln!("=== C2a: 4-bit symmetric KV codec (block=256) round-trip ===");
-    eprintln!("    convention: offset-binary nibble (store q+8, unpack (n-8)*scale)");
 
     // (1)+(2): round-trip vs the host quantize_rowmajor reference, f32. The codec
     // block IS the head_dim — each row is one whole block — so this proves the
@@ -372,13 +360,9 @@ fn the_kv_codec_round_trips() {
             // (2) reconstruction vs the host quantize_rowmajor recon. Codes are
             // identical, so the only gap is the fp16-rounded scale:
             // |q| * |fp16(scale) - scale| <= global_absmax * 2^-11.
-            let (mse_host, max_host) = errors(&host_recon, &recon);
+            let (_, max_host) = errors(&host_recon, &recon);
             let gabs = f64::from(global_absmax(&data));
             let bound = gabs * 1.0e-3; // 2^-11 ~= 4.9e-4, with margin
-            eprintln!(
-                "[{label}] head_dim={head_dim:>3} | codes exact | scale rel-dev {max_scale_rel:.2e} \
-                 | Metal-vs-host recon: max={max_host:.3e} mean-sq={mse_host:.3e} (bound {bound:.3e})"
-            );
             assert!(
                 max_host <= bound,
                 "{label} head_dim={head_dim}: Metal recon deviates {max_host:.3e} from the host \
@@ -387,10 +371,7 @@ fn the_kv_codec_round_trips() {
 
             // (3) reconstruction error vs the ORIGINAL — a sanity that this is a
             // sane 4-bit absmax quantizer.
-            let (mse_orig, max_orig) = errors(&data, &recon);
-            eprintln!(
-                "           pack->unpack vs original: MSE={mse_orig:.5e} max-abs={max_orig:.4}"
-            );
+            let (_, _) = errors(&data, &recon);
             assert!(
                 recon.iter().all(|v| v.is_finite()),
                 "{label} head_dim={head_dim}: reconstruction has a non-finite value"
@@ -408,10 +389,7 @@ fn the_kv_codec_round_trips() {
         let bf_view = bf16_floats(&bf_in); // what the kernel actually sees
         let packed = rig.pack(&bf_in, Dtype::Bf16, data.len(), block);
         let recon = bf16_floats(&rig.unpack(&packed, Dtype::Bf16, data.len(), block));
-        let (mse, max) = errors(&bf_view, &recon);
-        eprintln!(
-            "[bf16   ] head_dim={block:>3} | pack->unpack vs bf16 input: MSE={mse:.5e} max-abs={max:.4}"
-        );
+        let (mse, _) = errors(&bf_view, &recon);
         assert!(
             recon.iter().all(|v| v.is_finite()),
             "bf16 reconstruction has a non-finite value"
@@ -454,9 +432,6 @@ fn the_kv_codec_round_trips() {
                 "all-zero block: fp16 scale high byte"
             );
         }
-        eprintln!(
-            "[edge   ] all-zero block (block={block}): scale 0, codes 0x88, recon zeros, no NaN — OK"
-        );
     }
 
     // (edge) a width that is not a multiple of 256 must be REJECTED, not padded.
@@ -478,11 +453,5 @@ fn the_kv_codec_round_trips() {
             refused.is_err(),
             "a 300-element (non-multiple-of-256) tensor must be refused by the codec"
         );
-        eprintln!(
-            "[edge   ] ragged width 300 rejected: {}",
-            refused.unwrap_err()
-        );
     }
-
-    eprintln!("=== C2a done: Metal KV codec reproduces the host quantize_rowmajor exactly ===");
 }

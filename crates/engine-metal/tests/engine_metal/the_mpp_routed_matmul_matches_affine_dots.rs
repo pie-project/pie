@@ -1,32 +1,19 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::linear::moe::{self, RoutedScratch};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
-
 #[test]
 fn every_routed_row_answers_its_experts_exact_affine_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
     // MPP ships with Metal 4, which is what the elastic pool asks of the device too.
-    if !device.supports_elastic() {
-        return;
-    }
     let handles = Handles::new();
     let pipelines = Pipelines::new();
     // Every pair count sorts, so a lone pair per expert still takes the
@@ -44,7 +31,6 @@ moe.tile_rows = [
 "#,
         false,
     );
-    let mut checked = 0;
     // (experts, tokens, fan-out, K, N): row tiles of 16, 64 (which an affine bank runs
     // at 32), 32 and 8.
     let cases = [
@@ -199,11 +185,9 @@ moe.tile_rows = [
                                 "random experts={experts} token={token} slot={slot} col={col}: {actual_f32} vs {want}"
                             );
                         }
-                        checked += 1;
                     }
                 }
             }
         }
     }
-    eprintln!("checked {checked} routed outputs against exact and random affine dots");
 }

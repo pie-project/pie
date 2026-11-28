@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::attn::plan::{Built, DecodePlanInfo, Live, Toggles};
+use crate::attn::plan::{Built, DecodePlanInfo, Live};
 use crate::attn::sched::{AlignedAllocator, Staging, at, narrow, narrow_all, spans};
 use crate::jit::refuse;
 
@@ -269,50 +269,6 @@ pub fn plan(
         float_bytes,
     )?;
     let int_upload = stage(op, &sched, req.page_size, &laid)?;
-    Ok(Built {
-        info: laid.info,
-        int_upload,
-        int_bytes: laid.int_bytes,
-        float_bytes: laid.float_bytes,
-    })
-}
-
-#[must_use]
-pub fn can_use_static_nonsplit(
-    num_requests: u32,
-    enable_cuda_graph: bool,
-    toggles: Toggles,
-) -> bool {
-    !enable_cuda_graph && num_requests <= toggles.static_max_requests
-}
-
-pub fn static_nonsplit(
-    op: &'static str,
-    num_requests: u32,
-    live: Live,
-    page_size: u32,
-    enable_cuda_graph: bool,
-    int_bytes: usize,
-) -> Result<Built<DecodePlanInfo>, Error> {
-    let n = narrow(op, "batch_decode_request_indices", i64::from(num_requests))?;
-    let live_n = narrow(op, "batch_decode_request_indices", i64::from(live.requests))?;
-    let first = narrow(
-        op,
-        "batch_decode_request_indices",
-        i64::from(live.lane_offset),
-    )?;
-    let sched = Schedule {
-        split_kv: false,
-        enable_cuda_graph,
-        kv_chunk_size_in_pages: 1,
-        new_batch_size: live.requests,
-        padded_batch_size: n as usize,
-        request_indices: (first..first + live_n).collect(),
-        kv_tile_indices: vec![0; live.requests as usize],
-        o_indptr: (0..=live_n).collect(),
-    };
-    let laid = layout(op, 0, 0, &sched, int_bytes, usize::MAX)?;
-    let int_upload = stage(op, &sched, page_size, &laid)?;
     Ok(Built {
         info: laid.info,
         int_upload,

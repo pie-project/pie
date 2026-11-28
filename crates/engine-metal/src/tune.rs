@@ -1,6 +1,8 @@
-//! `pie tune` on Metal: a kernel bench fits `kernel.qmm` and
-//! `kernel.qmm_fp16`; the other searchable decisions are searched end to end
-//! on the served models.
+//! `pie tune` on Metal: kernel benches fit `kernel.qmm`, `kernel.qmm_fp16`
+//! and `kernel.dense` ([`dense`]); the other searchable decisions are
+//! searched end to end on the served models.
+
+pub(crate) mod dense;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -251,6 +253,9 @@ struct Point {
     times: Vec<Option<f64>>,
     /// The candidate today's profile runs here.
     baseline: Option<usize>,
+    /// The timed candidates' median errors pooled, relative
+    /// ([`profile::tune::Sample::spread`]).
+    spread: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -279,7 +284,7 @@ impl Measured {
                 .collect();
             let _ = writeln!(
                 out,
-                "point {} {} {} {} {} {} {} {}",
+                "point {} {} {} {} {} {} {} {} {:e}",
                 p.rows,
                 p.n,
                 p.k,
@@ -288,7 +293,8 @@ impl Measured {
                 u8::from(p.bank.fp16),
                 p.baseline
                     .map_or_else(|| "-".to_string(), |b| b.to_string()),
-                times.join(",")
+                times.join(","),
+                p.spread
             );
         }
         out
@@ -337,6 +343,9 @@ impl Measured {
                     },
                     baseline: f.get(6).and_then(|b| b.parse().ok()),
                     times,
+                    spread: f.get(8).and_then(|v| v.parse().ok()).ok_or(format!(
+                        "`{line}` states no spread (measured by an older pie); measure again"
+                    ))?,
                 });
             }
         }
@@ -354,6 +363,7 @@ impl Measured {
 const SEARCH_SKIPS: &[&str] = &[
     "kernel.qmm",
     "kernel.qmm_fp16",
+    "kernel.dense",
     "compiler.side_streams",
     "compiler.cost.collective_us",
 ];
@@ -403,6 +413,7 @@ fn fit(
                 emulated_cost / fp16_cost.min(emulated_cost),
             )
         },
+        measured: emulated_cost != 0.0,
     });
     let fp16 = (QmmFp16::spec().id.to_string(), fp16_on.to_string());
 
@@ -412,6 +423,7 @@ fn fit(
             id: spec.id,
             text: "not searched: the device does not say its GPU cores, so `fill` is unknown"
                 .to_string(),
+            measured: false,
         });
         return Ok((vec![fp16], lines));
     };
@@ -439,6 +451,7 @@ fn fit(
             ],
             weight: weight(grid, p.rows, p.n, p.k, p.bank, fp16_on),
             times: p.times.clone(),
+            spread: p.spread,
         })
         .collect();
     let baseline: Vec<Option<usize>> = measured.points.iter().map(|p| p.baseline).collect();
@@ -453,7 +466,11 @@ fn fit(
     if let Some(b) = fit.baseline {
         let _ = write!(text, "; today's ladder runs at {:.3}x", b / fit.floor);
     }
-    lines.push(Line { id: spec.id, text });
+    lines.push(Line {
+        id: spec.id,
+        text,
+        measured: true,
+    });
     let entries = vec![(spec.id.to_string(), ladder), fp16];
     Ok((entries, lines))
 }
@@ -474,6 +491,65 @@ fn assemble(
         provenance,
         &["family", "ane"],
     )
+}
+
+/// The user's file of `device` under `profiles`, less what this pie no
+/// longer reads: where loads store what they measure, each under its key.
+fn user_file(profiles: Option<&Path>, device: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::chip::user_path(profiles?, device)).ok()?;
+    Some(crate::chip::registry().prune(&text).0)
+}
+
+/// `pie tune metal --rates`: this device's `[rates]` measured through
+/// Metal's own kernels ([`crate::rates::measure`]) at the shapes every
+/// backend times, keyed and saved over the user's file as a load saves what
+/// it measures (`engine::rates::saved_text`).
+pub fn rates(
+    profiles: Option<&Path>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let began = Instant::now();
+    let device = Context::bind().map_err(|e| e.to_string())?;
+    let name = device.name().to_string();
+    let facts = crate::chip::measured(&device, crate::chip::perf_cores());
+    let (base, report) = crate::chip::resolve(&name, &facts, profiles);
+    say(&format!(
+        "{name}: measuring the rates, starting from {}",
+        report.used
+    ));
+    let rates = crate::rates::measure(&device, base.clone(), say)?;
+    let tuned = engine::rates::tuned(&rates);
+    let seconds = began.elapsed().as_secs_f64();
+    let provenance = [
+        (
+            "source",
+            "\"pie tune metal --rates on this machine\"".to_string(),
+        ),
+        crate::rates::provenance(&name),
+        ("from", format!("\"{}\"", report.used)),
+        ("pie", format!("\"{}\"", env!("CARGO_PKG_VERSION"))),
+        ("seconds", format!("{seconds:.0}")),
+    ];
+    let file = engine::rates::saved_text(
+        user_file(profiles, &name).as_deref(),
+        &rates,
+        &crate::rates::provenance(&name),
+    );
+    let block = format!(
+        "{}\n[provenance]\n{}\n",
+        tuned.trim_end(),
+        provenance
+            .iter()
+            .map(|(key, value)| format!("rates.{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(engine::rates::Rated {
+        device: name,
+        file,
+        block,
+        seconds,
+    })
 }
 
 pub struct Outcome {
@@ -516,12 +592,16 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         context: CONTEXT,
         slots,
         kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        allowance: engine::Allowance::WHOLE,
         runahead: engine::runahead::Runahead::F1,
         profiles: Some(dir.clone()),
         residency: crate::ResidencyPlan::default(),
+        top: crate::Top::EveryRung,
+        measure: engine::rates::Measuring::Time,
     })
     .map_err(|e| e.to_string())?;
+    // No runtime raises the rung here: the widest carve is backed.
+    shell.raise_whole().map_err(|e| e.to_string())?;
     // Time the load as it serves, not the GPU-alone stretch before the
     // Neural Engine's programs compile.
     let mut refused = None;
@@ -603,6 +683,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         readout,
         read,
         refused,
+        layers: trace.decoder_layers(),
     })
 }
 
@@ -655,9 +736,18 @@ struct Metal<'a> {
     base: &'a Profile,
     facts: &'a profile::Facts,
     cores: Option<u32>,
+    mix: search::Mix,
 }
 
 impl Bench for Metal<'_> {
+    fn mix(&self) -> search::Mix {
+        self.mix
+    }
+
+    fn agreement(&self) -> f64 {
+        engine::rates::AGREEMENT
+    }
+
     fn models(&self) -> Vec<String> {
         self.models.iter().map(|(_, d)| d.clone()).collect()
     }
@@ -826,6 +916,7 @@ pub fn run(
     cache: &Path,
     refit: bool,
     models: &[(PathBuf, String)],
+    mix: search::Mix,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
@@ -861,7 +952,24 @@ pub fn run(
         say(&format!("measurements kept in {}", kept.display()));
         m
     };
-    let (fitted, mut lines) = fit(&measured, &grid, cores)?;
+    let (mut fitted, mut lines) = fit(&measured, &grid, cores)?;
+    // `kernel.dense`: its own bench, kept beside the quantised one's.
+    let kept_dense = cache
+        .join(profile::id_of(&name))
+        .join(format!("dense-{}.txt", depth.word()));
+    let dense_measured = if refit {
+        let text = std::fs::read_to_string(&kept_dense)
+            .map_err(|e| format!("no measurements at {}: {e}", kept_dense.display()))?;
+        dense::Measured::from_text(&text, device.family())?
+    } else {
+        let m = dense::measure(&device, &base, cores, depth, say)?;
+        std::fs::write(&kept_dense, m.to_text(&name)).map_err(|e| e.to_string())?;
+        say(&format!("measurements kept in {}", kept_dense.display()));
+        m
+    };
+    let (dense_entry, dense_line) = dense::fit(&dense_measured, depth)?;
+    fitted.push(dense_entry);
+    lines.push(dense_line);
     // The fitted matmul must also win on the served models to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
@@ -888,16 +996,18 @@ pub fn run(
         base: &base,
         facts: &facts,
         cores,
+        mix,
     };
     if models.is_empty() {
         chosen = fitted;
         for k in knobs
             .iter()
-            .filter(|k| k.id != "kernel.qmm" && k.id != "kernel.qmm_fp16")
+            .filter(|k| !["kernel.qmm", "kernel.qmm_fp16", "kernel.dense"].contains(&k.id))
         {
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                measured: false,
             });
         }
     } else {
@@ -912,8 +1022,12 @@ pub fn run(
         lines.extend(searched);
     }
     let tuned = search::render_overrides(&chosen);
+    // Only what the run measured (`search::Line::measured`): a decision no
+    // check model reads, or one whose bar the noise pushed past the
+    // agreement tolerance, keeps its line in the report but is not called
+    // measured.
     let mut tuned_ids: Vec<String> = Vec::new();
-    for l in lines.iter().filter(|l| !l.text.starts_with("not searched")) {
+    for l in lines.iter().filter(|l| l.measured) {
         let id = format!("\"{}\"", l.id);
         if !tuned_ids.contains(&id) {
             tuned_ids.push(id);
@@ -969,6 +1083,11 @@ pub fn run(
         ("checked", format!("\"{}\"", checked.replace('"', "'"))),
     ]);
     let file = assemble(&base, &name, &facts, &tuned, &provenance)?;
+    let file = engine::rates::keeping_stored(
+        crate::chip::registry(),
+        file,
+        user_file(profiles, &name).as_deref(),
+    );
     Ok(Outcome {
         device: name,
         file,
@@ -976,6 +1095,7 @@ pub fn run(
         wrong: measured
             .wrong
             .iter()
+            .chain(&dense_measured.wrong)
             .map(|(body, n, first)| format!("{body}: wrong at {n} points; first at {first}"))
             .collect(),
         checks,
@@ -1133,9 +1253,10 @@ fn measure(
                     launch(sink, &forced[c][format], copy)
                 })?;
                 let mut row = vec![None; candidates.len()];
-                for (c, t) in live.iter().zip(times) {
-                    row[*c] = Some(t);
+                for (c, (t, _)) in live.iter().zip(&times) {
+                    row[*c] = Some(*t);
                 }
+                let spread = profile::tune::pooled(times.iter().map(|&(_, e)| e));
                 // Today's ladder: the first of its rungs that ran.
                 let at = today[format].qmm_at(m, n, k, bank.bits, bank.group);
                 let baseline = today[format]
@@ -1150,6 +1271,7 @@ fn measure(
                     bank: *bank,
                     times: row,
                     baseline,
+                    spread,
                 });
             }
             say(&format!(
@@ -1204,15 +1326,43 @@ fn wrong(
 }
 
 /// Seconds per launch for each of `live`, timed round-robin so drift lands
-/// on every candidate alike.
+/// on every candidate alike, each with its median's relative error.
 fn time(
     device: &Context,
     pipelines: &Pipelines,
     handles: &Handles,
     live: &[usize],
     launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
-) -> Result<Vec<f64>, String> {
-    const ROUNDS: usize = 7;
+) -> Result<Vec<(f64, f64)>, String> {
+    Ok(time_spread(device, pipelines, handles, live, launch)?
+        .into_iter()
+        .map(|(median, .., error)| (median, error))
+        .collect())
+}
+
+/// [`time`]'s medians with the fastest and slowest of each candidate's
+/// rounds (what a dense curve states as its spread) and the median's
+/// relative error ([`profile::tune::median_and_error`]).
+fn time_spread(
+    device: &Context,
+    pipelines: &Pipelines,
+    handles: &Handles,
+    live: &[usize],
+    launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
+) -> Result<Vec<(f64, f64, f64, f64)>, String> {
+    time_rounds(device, pipelines, handles, live, 7, launch)
+}
+
+/// [`time_spread`] over `rounds` timed rounds (at least 3).
+fn time_rounds(
+    device: &Context,
+    pipelines: &Pipelines,
+    handles: &Handles,
+    live: &[usize],
+    rounds: usize,
+    launch: impl Fn(&dyn Encode, usize, usize) -> Result<(), Error>,
+) -> Result<Vec<(f64, f64, f64, f64)>, String> {
+    let rounds = rounds.max(3);
     const FRAME_S: f64 = 0.002;
     const SLOWER: f64 = 3.0;
     let frame = |c: usize, batch: usize| -> Result<f64, String> {
@@ -1239,7 +1389,7 @@ fn time(
     let mut seen: Vec<Vec<f64>> = (0..live.len())
         .map(|i| if timed[i] { Vec::new() } else { vec![once[i]] })
         .collect();
-    for _ in 0..ROUNDS {
+    for _ in 0..rounds {
         for (i, &c) in live.iter().enumerate() {
             if timed[i] {
                 seen[i].push(frame(c, batch[i])? / batch[i] as f64);
@@ -1249,15 +1399,283 @@ fn time(
     Ok(seen
         .into_iter()
         .map(|mut s| {
+            let (median, error) = profile::tune::median_and_error(&s);
             s.sort_by(f64::total_cmp);
-            s[s.len() / 2]
+            (median, s[0], s[s.len() - 1], error)
         })
         .collect())
+}
+
+/// Metal's loads of one model for the check of the estimate
+/// (`engine::load::check`): `pie tune metal --check-estimate`.
+pub struct CheckBench<'a> {
+    artifact: &'a Path,
+    profiles: Option<&'a Path>,
+    trace: poem::Trace,
+    contract: checkpoint::contract::ModelContract,
+    model: String,
+    /// The served load's pool layout, once the check weighed it: what a
+    /// shell's seats take is laid out as that pool lays it.
+    layout: Option<crate::store::layout::Layout>,
+}
+
+/// The check bench of the model `deployment` names, its weights in
+/// `artifact`, under the user's profiles in `profiles`.
+///
+/// # Errors
+///
+/// No catalog row of that name, or an artifact that does not read.
+pub fn check_bench<'a>(
+    profiles: Option<&'a Path>,
+    artifact: &'a Path,
+    deployment: &str,
+) -> Result<CheckBench<'a>, String> {
+    use poem::Platform;
+    let row = poem_compiler::catalog::deployment(deployment)
+        .ok_or_else(|| format!("no catalog row `{deployment}`"))?;
+    let trace = row.trace(Platform::Metal);
+    let model = engine::load::model_class(&trace).to_owned();
+    let source = ztensor_compat::index(artifact).map_err(|e| e.to_string())?;
+    let contract = poem::import::own_contract(&source, &trace.params, 1, Platform::Metal)
+        .map_err(|e| e.to_string())?;
+    Ok(CheckBench {
+        artifact,
+        profiles,
+        trace,
+        contract,
+        model,
+        layout: None,
+    })
+}
+
+impl engine::load::check::Bench for CheckBench<'_> {
+    /// `None`: the shape a served load is asked (the fire size `FIRE`, the
+    /// pool its capacity), whose weighing alone gives the rungs, the
+    /// estimate, the live range and the fire top; it fires nothing.
+    /// `Some(shell)`: `slots` seats of `context` each, every rung to `rows`
+    /// laid (`Top::EveryRung`), the pool holding those seats' runs and the
+    /// widest fire's rows, raised to the widest rung for the check's fires.
+    fn load(
+        &mut self,
+        run: engine::load::check::Run,
+        shell: Option<engine::load::check::Shell>,
+    ) -> Result<Box<dyn engine::load::check::Loaded + '_>, String> {
+        let page = 16u32;
+        let (lanes, tokens) = crate::FIRE;
+        // A served shape takes the fire size's lanes and the room the device
+        // leaves. A shell the check fires takes its own slots, the most lanes
+        // one of its fires has, and a pool of what its seats hold: each
+        // seat's run of its context's pages and its record's pieces, and the
+        // widest fire's rows landing past them, laid out as the served
+        // load's pool lays them (`Layout::shell_room`, the layout learned
+        // from the weighing load, which the check takes first).
+        let (slots, context, rows, kv_budget) = match shell {
+            None => (lanes, tokens, tokens, None),
+            Some(shell) => {
+                let layout = self.layout.ok_or_else(|| {
+                    "the check fired a shell before it weighed the served load".to_string()
+                })?;
+                let room = layout.shell_room(
+                    shell.slots,
+                    u64::from(shell.context.div_ceil(page)),
+                    u64::from(shell.rows.div_ceil(page)),
+                );
+                (shell.slots, shell.context, shell.rows, Some(room))
+            }
+        };
+        let mut loaded = crate::Shell::load(crate::Boot {
+            voxels: None,
+            trace: self.trace.clone(),
+            contract: &self.contract,
+            checkpoint: self.artifact,
+            budget: poem_compiler::Budget::new(slots, rows),
+            patches: patch_ladder(&self.trace),
+            profile: None,
+            page_size: page,
+            context,
+            slots,
+            kv_budget,
+            allowance: engine::Allowance::WHOLE,
+            runahead: engine::runahead::Runahead::F1,
+            profiles: self.profiles.map(Path::to_path_buf),
+            residency: crate::ResidencyPlan::default(),
+            top: crate::Top::EveryRung,
+            measure: engine::rates::Measuring::Time,
+        })
+        .map_err(|e| e.to_string())?;
+        if shell.is_some() {
+            // No runtime raises the rung here: the check fires the shell
+            // itself, at its widest.
+            loaded.raise_whole().map_err(|e| e.to_string())?;
+            loaded.back_seats().map_err(|e| e.to_string())?;
+        } else {
+            self.layout = Some(loaded.pool_layout());
+        }
+        Ok(Box::new(CheckLoad {
+            shell: loaded,
+            trace: &self.trace,
+            model: &self.model,
+            run,
+        }))
+    }
+}
+
+/// One load of a [`CheckBench`].
+struct CheckLoad<'a> {
+    shell: crate::Shell,
+    trace: &'a poem::Trace,
+    model: &'a str,
+    run: engine::load::check::Run,
+}
+
+impl CheckLoad<'_> {
+    /// `fire`'s lanes, each on a fresh slot, and the fire timed to its
+    /// landing (ns).
+    fn fire_once(&mut self, fire: engine::load::rung::CheckFire) -> Result<f64, String> {
+        use poem::Request;
+        let tokens: Vec<Vec<u32>> = (0..fire.lanes)
+            .map(|lane| {
+                (0..fire.tokens_per_lane)
+                    .map(|i| 100 + (lane * 131 + i) * 7919 % 5000)
+                    .collect()
+            })
+            .collect();
+        for slot in 0..fire.lanes {
+            self.shell.open(slot).map_err(|e| e.to_string())?;
+        }
+        let word = self
+            .trace
+            .facts
+            .word(&Request::new(fire.tokens_per_lane, false));
+        let held = fire.keys_per_lane.saturating_sub(fire.tokens_per_lane);
+        let lanes: Vec<crate::Seated<'_>> = (0..fire.lanes)
+            .map(|slot| crate::Seated {
+                replay_stated: None,
+                held: Some(held),
+                ..crate::Seated::of(crate::Lane {
+                    slot,
+                    word,
+                    tokens: &tokens[slot as usize],
+                })
+            })
+            .collect();
+        let began = Instant::now();
+        self.shell.fire_seated(&lanes).map_err(|e| e.to_string())?;
+        Ok(began.elapsed().as_nanos() as f64)
+    }
+}
+
+impl engine::load::check::Loaded for CheckLoad<'_> {
+    fn weighed(&self) -> Result<engine::load::check::Weighed, String> {
+        let weighed = self.shell.weighed().ok_or_else(|| {
+            format!(
+                "{} has no [rates] in its profile to estimate by: run `pie tune --rates`",
+                self.model
+            )
+        })?;
+        Ok(engine::load::check::Weighed {
+            model: self.model.to_owned(),
+            rungs: weighed.rungs.clone(),
+            estimate: weighed.estimate.clone(),
+            live: weighed.live,
+            fire_top: weighed.fire_top,
+            laid: weighed.rungs.iter().map(|r| r.tokens).max().unwrap_or(0),
+        })
+    }
+
+    /// Metal records no body: every serving fire encodes its own dispatch,
+    /// so a fire of a load run as serving runs it is what serving runs.
+    fn fire(
+        &mut self,
+        fire: engine::load::rung::CheckFire,
+    ) -> Result<engine::load::check::Fired, String> {
+        let ns = self.fire_once(fire)?;
+        Ok(engine::load::check::Fired {
+            ns,
+            replayed: self.run == engine::load::check::Run::Replayed,
+        })
+    }
+
+    /// Each dispatch committed and timed alone by the GPU's own clock
+    /// (`crate::encode::profile_kernels`), told by its kernel: a dispatch's
+    /// time holds no drain, so none is taken off.
+    fn dissect(
+        &mut self,
+        fire: engine::load::rung::CheckFire,
+    ) -> Result<engine::load::check::Dissection, String> {
+        crate::encode::reset_kernel_profile();
+        crate::encode::profile_kernels(true);
+        let fired = self.fire_once(fire);
+        crate::encode::profile_kernels(false);
+        let wall_ns = fired?;
+        let ops = crate::encode::kernel_profile()
+            .into_iter()
+            .map(|(name, ns, n)| (name, ns as f64, u32::try_from(n).unwrap_or(u32::MAX)))
+            .collect();
+        crate::encode::reset_kernel_profile();
+        Ok(engine::load::check::Dissection {
+            wall_ns,
+            ops,
+            drain_ns: 0.0,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keyed rates a load stored are still taken by the next load after a
+    /// tune, and the tuned decision stands beside them.
+    #[test]
+    fn a_tune_keeps_the_stored_rates() {
+        const DEVICE: &str = "Apple M1 Max";
+        let home = std::env::temp_dir().join(format!("pie-tune-keeps-{}", std::process::id()));
+        let path = crate::chip::user_path(&home, DEVICE);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the user's directory");
+        let keyed = profile::rates::Rates {
+            launch_ns: Some(4321),
+            measured_on: Some(crate::stored::measured_on(DEVICE)),
+            measured_by: Some(vec![(
+                "launch_ns".to_string(),
+                crate::stored::by("launch_ns", &["ssm/conv1d.metal"]),
+            )]),
+            ..Default::default()
+        };
+        let how = crate::rates::provenance(DEVICE);
+        std::fs::write(&path, engine::rates::saved_text(None, &keyed, &how)).unwrap();
+        let facts = crate::chip::facts(7, Some(32), 8, true);
+        let takes = |said: &str| {
+            let (chip, report) = crate::chip::resolve_keyed(DEVICE, &facts, Some(&home));
+            assert!(
+                report
+                    .stored
+                    .iter()
+                    .any(|line| line.starts_with("`launch_ns`: stored (user")),
+                "{said}: {:#?}",
+                report.stored
+            );
+            assert_eq!(chip.tuned().rates.launch_ns, Some(4321), "{said}");
+            chip
+        };
+        let base = takes("a load's own save");
+
+        let tuned = "[kernel]\nqmm = [{ use = \"tiled\", crossover_tg = 120 }, \"qmv\"]\n";
+        let file = assemble(&base, DEVICE, &facts, tuned, &[]).expect("the tuned file");
+        let file = engine::rates::keeping_stored(
+            crate::chip::registry(),
+            file,
+            user_file(Some(&home), DEVICE).as_deref(),
+        );
+        std::fs::write(&path, file).unwrap();
+        let chip = takes("a tune");
+        assert_eq!(
+            chip.ladder::<kernels_metal::tuning::Qmm>().values().next(),
+            Some(&kernels_metal::tuning::Qmm::Tiled { crossover_tg: 120 }),
+            "the tuned decision is there"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn the_standard_mix_weighs_one_over_the_grid() {
@@ -1328,6 +1746,7 @@ mod tests {
                         bank: *bank,
                         times,
                         baseline: Some(1),
+                        spread: 0.005,
                     });
                 }
             }
@@ -1433,6 +1852,7 @@ mod tests {
                 },
                 times,
                 baseline: Some(3),
+                spread: 0.005,
             }],
             wrong: vec![(
                 "use = \"qmv\", rows_max = 8, packs = 2, crossover_tg = 160".into(),

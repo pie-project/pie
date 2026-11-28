@@ -101,9 +101,14 @@ jobs:
       # them one after another. It tests the package set the build above
       # built, so it links what is already compiled rather than unifying
       # features anew. inferlet holds the workspace's one doctest.
+      # Left out: engine-xla's a_masked_prompt_runs_the_ladders_programs lays
+      # every ladder program of a 0.8B hybrid over a dry device, 14.7 GB
+      # resident at its peak, past what a 16 GB runner holds beside the other
+      # binaries (it lost the runner); the TPU gate runs it.
       - name: cargo test
         run: |
-          cargo nextest run --workspace --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda --no-fail-fast
+          cargo nextest run --workspace --exclude pie-server-py --exclude pie-server-node --exclude engine-cuda --no-fail-fast \
+            -E 'not (package(engine-xla) & test(=a_prompt_length_reuses_its_programs::a_masked_prompt_runs_the_ladders_programs))'
           cargo test --doc -p inferlet
       # The C library from C: its header compiles warning-free, its version
       # matches the library's, and a refused boot reports why.
@@ -327,12 +332,16 @@ jobs:
           ./packages/javascript/server-web/build.sh release
           for l in python javascript; do tar xzf "$RUNNER_TEMP/languages/pie-language-$l.tar.gz" -C "$RUNNER_TEMP/home"; done
           PIE_HOME="$RUNNER_TEMP/home" ./tests/browser/tools/inferlets.sh
+          # SwiftShader is too slow to time the roofline rates on (a measuring
+          # tab ran past the 900 s timeout): the tabs measure nothing
+          # (`measure = false`, each rate served by the estimate), so their
+          # budget holds only the model and its pools, as before.
           # The pages are independent, and each spends minutes in SwiftShader
           # on one core: they open side by side.
           node tests/browser/tools/headless.mjs . --timeout 900000 \
             "tests/browser/transport.html?n=20&model=models/tiny.wgpu.zt" \
-            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=device_kv_budget%20%3D%20%22256MiB%22,max_forward_tokens%20%3D%201024,max_forward_requests%20%3D%208" \
-            "tests/browser/server.html?model=models/tiny.wgpu.zt"
+            "tests/browser/index.html?auto&max_tokens=4&model=models/tiny.wgpu.zt&config=budget_device%20%3D%20%221GiB%22%2C%20measure%20%3D%20false" \
+            "tests/browser/server.html?model=models/tiny.wgpu.zt&measure=false"
         env:
           PIE_CHROME_ARGS: --use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader
 

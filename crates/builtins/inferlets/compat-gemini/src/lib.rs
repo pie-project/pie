@@ -313,6 +313,7 @@ fn finish_reason(finish: Finish) -> &'static str {
     match finish {
         Finish::Stop | Finish::StopSequence | Finish::ToolCalls => "STOP",
         Finish::Length => "MAX_TOKENS",
+        Finish::Abort => "OTHER",
     }
 }
 

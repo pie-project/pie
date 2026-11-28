@@ -62,7 +62,6 @@ def _make_model() -> types.ModuleType:
     m.SwitchDecl = SwitchDeclStub
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
-    m.submit_deadline_us = lambda: 50_000
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
     m.frame_size = lambda: 1
@@ -71,6 +70,7 @@ def _make_model() -> types.ModuleType:
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
     m.draft_block = lambda: None
+    m.draft_depth = lambda: 0
     m.switches = lambda: [SwitchDeclStub("mode", ["encode", "denoise"])]
     m.lane = _lane
     return m
@@ -117,6 +117,7 @@ class OutputDeclStub:
     layers: int
     max_rows: int
     readout: bool
+    planes: list[int]
 
 
 @dataclass
@@ -130,7 +131,7 @@ class LaneDeclStub:
 def _lane(switches) -> LaneDeclStub:
     denoise = ("mode", "denoise") in switches
     inputs = [InputDeclStub("self_cond_ids", InputAxis.ROW, 4, "i32", None)] if denoise else []
-    logits = OutputDeclStub("logits", InputAxis.ROW, 151936, Dtype.F32, 0, 256, True)
+    logits = OutputDeclStub("logits", InputAxis.ROW, 151936, Dtype.F32, 0, 256, True, [])
     return LaneDeclStub(inputs, True, True, [logits])
 
 
@@ -425,6 +426,9 @@ class PipelineStub:
     def close(self) -> None:
         self.closed = True
 
+    def retract(self, fires: int) -> None:
+        pass
+
 
 def _make_pipeline() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.pipeline")
@@ -442,6 +446,9 @@ class WorkingSetStub:
     def fork(self, on):
         return WorkingSetStub()
 
+    def share(self, scope) -> None:
+        pass
+
 
 def _make_working_set() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.working_set")
@@ -455,6 +462,8 @@ class StateGeometry:
     slots: object
     kv_len: object
     fold: object
+    parents: object
+    parents_end: object
 
 
 class ForwardPassStub:
@@ -469,6 +478,7 @@ class ForwardPassStub:
         self.program_bytes: bytes | None = None
         self.program_channels: list | None = None
         self.switches: list[tuple[int, str, str]] = []
+        self.final_stated = 0
 
     def embed(self, tokens, indptr) -> None:
         self.embedded = (tokens, indptr)
@@ -481,6 +491,13 @@ class ForwardPassStub:
 
     def checkpoints(self, slots) -> None:
         self.checkpoint_slots = list(slots)
+
+    final_refusal: str | None = None
+
+    def final_rows(self) -> None:
+        if self.final_refusal:
+            raise WitErr(self.final_refusal)
+        self.final_stated += 1
 
     def media(self, lane: int, spans) -> None:
         self.spans = (lane, spans)

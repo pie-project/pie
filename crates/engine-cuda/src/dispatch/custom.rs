@@ -22,6 +22,8 @@ pub(crate) fn refuses(op: &Fused) -> bool {
         | Fused::MatmulBias { .. }
         | Fused::MatmulSoftcap { .. }
         | Fused::MatmulGlu { .. }
+        | Fused::ResidualAddRmsnormMatmul { .. }
+        | Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. }
         | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend { .. }
         | Fused::RopeYarnAppend { .. }
@@ -58,6 +60,8 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulBias { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulGlu { .. }
+            | Fused::ResidualAddRmsnormMatmul { .. }
+            | Fused::ResidualAddRmsnormMatmulSwigluMatmul { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend { .. }
             | Fused::RopeYarnAppend { .. }
@@ -170,7 +174,7 @@ impl Run<'_> {
             },
         ) = (&**fold, &**norm, &**project, &**gates, &**rmsnorm)
             && let tuning = self.ctx().tuning()
-            && (tuning.hc_mega_from..=tuning.hc_mega_until).contains(&self.tensor(*y).rows)
+            && (tuning.hc_mega_from()..=tuning.hc_mega_until()).contains(&self.tensor(*y).rows)
         {
             let emits = self.tensor(*y).width.is_multiple_of(256);
             let held = self.hc_pre_held(*y, emits)?;
@@ -239,7 +243,7 @@ impl Run<'_> {
         // A prefill's rows: the one-pass projection, then the gates and the
         // norm apart, whose 16-byte forms stream a long fire faster than the
         // block-a-row pre-mix.
-        if self.ctx().tuning().hc_tile
+        if self.ctx().tuning().hc_tile()
             && let poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. } = norm
             && let poem_ir::Elemwise::HcProject {
                 weight,
@@ -262,7 +266,7 @@ impl Run<'_> {
             // GEMMs that read it next, where the profile says
             // (`kernel.elemwise.norm_emit`).
             #[cfg(feature = "cuda")]
-            if self.ctx().tuning().norm_emit
+            if self.ctx().tuning().norm_emit()
                 && let poem_ir::Elemwise::Rmsnorm {
                     x,
                     weight: NormWeight::Scale(weight),
@@ -287,7 +291,7 @@ impl Run<'_> {
             }
             return self.elemwise(rmsnorm);
         }
-        if self.ctx().tuning().hc_tile
+        if self.ctx().tuning().hc_tile()
             && let (
                 poem_ir::Elemwise::HcRmsnormF32 {
                     streams,
@@ -425,7 +429,7 @@ impl Run<'_> {
                 ..
             },
         ) = (&**blend, &**norm)
-            && self.ctx().tuning().attn_res_fused_norm
+            && self.ctx().tuning().attn_res_fused_norm()
         {
             let blocks: Vec<kernels_cuda::tensor::Tensor> =
                 blocks.iter().map(|b| self.tensor(*b)).collect();
@@ -478,7 +482,7 @@ impl Run<'_> {
             self.elemwise(gates)?;
             return self.elemwise(norm);
         };
-        if self.ctx().tuning().hc_tile {
+        if self.ctx().tuning().hc_tile() {
             let landed = kernels_cuda::elemwise::hc::gates_norm(
                 self.ctx(),
                 self.tensor(*normed),
@@ -523,7 +527,7 @@ impl Run<'_> {
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
-        if self.ctx().tuning().hc_tile {
+        if self.ctx().tuning().hc_tile() {
             let landed = kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
                 self.tensor(*streams),
@@ -589,7 +593,8 @@ impl Run<'_> {
                 rope: q_pe_t.width / (*heads).max(1),
                 v: *v_head_dim,
             };
-            if out.rows >= self.ctx().tuning().mla_expanded_from && mla::expand::expanded_takes(&h)
+            if out.rows >= self.ctx().tuning().mla_expanded_from()
+                && mla::expand::expanded_takes(&h)
             {
                 let queries = match split.as_deref() {
                     Some(poem_ir::Attn::MlaSplitQB { q_b, .. }) => {
@@ -715,7 +720,7 @@ impl Run<'_> {
         };
         // A window held above a replay floor the profile may raise
         // (`kernel.sdpa.compressed_replay`): only the fused kernels read the floor.
-        let floored = self.ctx().tuning().compressed_replay
+        let floored = self.ctx().tuning().compressed_replay()
             && matches!(
                 **window,
                 poem_ir::Attn::Prefill {
@@ -732,7 +737,7 @@ impl Run<'_> {
         // V4.1's FP4 cache from the rows the profile says
         // (`kernel.sdpa.compressed_fp4_pass_from`): the tcgen05 pass.
         let fp4_pass = self.fp4_pass(window, rows);
-        if rows <= self.ctx().tuning().compressed_decode_until
+        if rows <= self.ctx().tuning().compressed_decode_until()
             && !fp4_pass
             && let Some(landed) = self.compressed_decode(window, Some(pool), *sink, *o_out, turn)
         {
@@ -776,7 +781,7 @@ impl Run<'_> {
         ) = (&**window, &**pool)
         {
             use kernels_cuda::attn::compressed::prefill::{self, Pooled};
-            let from = self.ctx().tuning().compressed_prefill_from;
+            let from = self.ctx().tuning().compressed_prefill_from();
             let mut out = self.tensor(*o_out);
             // Its request ids index the whole fire's page tables too.
             if (fp4_pass || from > 0 && out.rows >= from)
@@ -888,7 +893,7 @@ impl Run<'_> {
     /// Whether `window` reads V4.1's FP4 cache at `rows` the profile sends
     /// to the tcgen05 pass (`kernel.sdpa.compressed_fp4_pass_from`).
     fn fp4_pass(&self, window: &poem_ir::Attn, rows: u32) -> bool {
-        let from = self.ctx().tuning().compressed_fp4_pass_from;
+        let from = self.ctx().tuning().compressed_fp4_pass_from();
         from > 0
             && rows >= from
             && matches!(*window, poem_ir::Attn::Prefill { cache, mask: None, selection: None, bias: None, lse: Some(_), .. }
@@ -1050,7 +1055,7 @@ impl Run<'_> {
         else {
             return None;
         };
-        let from = self.ctx().tuning().compressed_prefill_from;
+        let from = self.ctx().tuning().compressed_prefill_from();
         let mut out = self.tensor(o_out);
         if from == 0 || out.rows < from {
             return None;
@@ -1112,7 +1117,7 @@ impl Run<'_> {
                     .unwrap_or_else(|| Err(fp8_unread(op.name())));
             }
             let rows = self.tensor(*o_out).rows;
-            if rows <= self.ctx().tuning().compressed_decode_until
+            if rows <= self.ctx().tuning().compressed_decode_until()
                 && let Some(landed) = self.compressed_decode(attn, None, *sink, *o_out, None)
             {
                 return landed;
@@ -1121,6 +1126,7 @@ impl Run<'_> {
         let sinks = self.tensor(*sink);
         match **attn {
             poem_ir::Attn::Decode {
+                mask,
                 q,
                 plan,
                 cache,
@@ -1144,6 +1150,7 @@ impl Run<'_> {
                 &mut self.tensor(*o_out),
                 &mut self.tensor(lse),
                 sinks,
+                self.applied_masks(mask),
             ),
             poem_ir::Attn::Prefill {
                 q,
@@ -1157,7 +1164,7 @@ impl Run<'_> {
                 lse: Some(lse),
                 // (A floored window is no `lse_sink`'s: the rule takes none.)
                 floor: _,
-                mask: None,
+                mask,
                 selection: None,
                 bias: None,
                 causal: true,
@@ -1175,6 +1182,7 @@ impl Run<'_> {
                 &mut self.tensor(*o_out),
                 &mut self.tensor(lse),
                 sinks,
+                self.applied_masks(mask),
             ),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }

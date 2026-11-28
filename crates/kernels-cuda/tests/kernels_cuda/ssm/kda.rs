@@ -87,23 +87,25 @@ fn fire(gpu: &mut Gpu, rows: &Rows, slab: &[f32], asks: &[Ask]) -> (Vec<f32>, Ve
             snapshots: kernels_cuda::Snapshots::NONE,
         };
         let mut y = Tensor::new(y_at, n as u32, WIDE as u32, Dtype::F32);
-        ssm::kda_chunked(
-            &gpu.ctx(),
-            RaggedTensor {
-                data: Tensor::new(rows.mixed, n as u32, 3 * WIDE as u32, Dtype::Bf16),
-                indptr: Tensor::new(indptr_at, indptr.len() as u32, 1, Dtype::I32),
-            },
-            Tensor::new(rows.f, n as u32, WIDE as u32, Dtype::Bf16),
-            Tensor::new(rows.b, n as u32, HEADS, Dtype::Bf16),
-            Tensor::new(rows.dt_bias, 1, WIDE as u32, Dtype::F32),
-            Tensor::new(rows.a_log, 1, HEADS, Dtype::F32),
-            &pool,
-            HEADS,
-            HEAD_DIM,
-            1e-6,
-            0.0,
-            &mut y,
-        )
+        gpu.laid(&gpu.ctx(), |ctx| {
+            ssm::kda_chunked(
+                ctx,
+                RaggedTensor {
+                    data: Tensor::new(rows.mixed, n as u32, 3 * WIDE as u32, Dtype::Bf16),
+                    indptr: Tensor::new(indptr_at, indptr.len() as u32, 1, Dtype::I32),
+                },
+                Tensor::new(rows.f, n as u32, WIDE as u32, Dtype::Bf16),
+                Tensor::new(rows.b, n as u32, HEADS, Dtype::Bf16),
+                Tensor::new(rows.dt_bias, 1, WIDE as u32, Dtype::F32),
+                Tensor::new(rows.a_log, 1, HEADS, Dtype::F32),
+                &pool,
+                HEADS,
+                HEAD_DIM,
+                1e-6,
+                0.0,
+                &mut y,
+            )
+        })
         .expect("the KDA scan fires");
     }
     gpu.sync();
@@ -266,23 +268,25 @@ fn the_tensor_core_kda_lands_the_serial_walk() {
         };
         let tuning = crate::common::attn_ref::tuned(|t| t.ssm_kda_chunked = chunked);
         let mut y = Tensor::new(y_at, n as u32, wide as u32, Dtype::F32);
-        ssm::kda_chunked(
-            &gpu.ctx().with_tuning(tuning),
-            RaggedTensor {
-                data: Tensor::new(mixed, n as u32, 3 * wide as u32, Dtype::Bf16),
-                indptr: Tensor::new(indptr_at, indptr.len() as u32, 1, Dtype::I32),
-            },
-            Tensor::new(f, n as u32, wide as u32, Dtype::Bf16),
-            Tensor::new(b, n as u32, H, Dtype::Bf16),
-            Tensor::new(dt_bias, 1, wide as u32, Dtype::F32),
-            Tensor::new(a_log, 1, H, Dtype::F32),
-            &pool,
-            H,
-            D,
-            1e-6,
-            floor,
-            &mut y,
-        )
+        gpu.laid(&gpu.ctx().with_tuning(tuning), |ctx| {
+            ssm::kda_chunked(
+                ctx,
+                RaggedTensor {
+                    data: Tensor::new(mixed, n as u32, 3 * wide as u32, Dtype::Bf16),
+                    indptr: Tensor::new(indptr_at, indptr.len() as u32, 1, Dtype::I32),
+                },
+                Tensor::new(f, n as u32, wide as u32, Dtype::Bf16),
+                Tensor::new(b, n as u32, H, Dtype::Bf16),
+                Tensor::new(dt_bias, 1, wide as u32, Dtype::F32),
+                Tensor::new(a_log, 1, H, Dtype::F32),
+                &pool,
+                H,
+                D,
+                1e-6,
+                floor,
+                &mut y,
+            )
+        })
         .expect("the KDA scan fires");
         gpu.sync();
         let y: Vec<f32> = gpu.down(y_at, n * wide);
@@ -365,9 +369,11 @@ fn the_kda_decode_step_lands_the_serial_walk() {
                 data: mixed_t,
                 indptr: Tensor::new(indptr_at, 4, 1, Dtype::I32),
             };
-            ssm::kda_chunked(
-                &ctx, data, f_t, b_t, dt_t, a_t, &pool, H, D, 1e-6, 0.0, &mut y,
-            )
+            gpu.laid(&ctx, |ctx| {
+                ssm::kda_chunked(
+                    ctx, data, f_t, b_t, dt_t, a_t, &pool, H, D, 1e-6, 0.0, &mut y,
+                )
+            })
             .expect("the KDA scan fires");
         }
         gpu.sync();

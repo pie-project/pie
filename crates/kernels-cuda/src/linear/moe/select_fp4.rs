@@ -26,15 +26,15 @@ pub(crate) fn affine_u4_group(x: Tensor, codes: Tensor, scales: Tensor, n: u32) 
 #[cfg(feature = "cuda")]
 pub(super) fn mxfp4_mma_spans(ctx: &Ctx, routes: u32, experts: u32) -> bool {
     let t = ctx.tuning();
-    t.mxfp4_mma_from <= routes
-        && routes <= t.mxfp4_mma_until
-        && routes.div_ceil(experts.clamp(1, EXPERT_CAP)) >= t.mxfp4_mma_per_from
+    t.mxfp4_mma_from() <= routes
+        && routes <= t.mxfp4_mma_until()
+        && routes.div_ceil(experts.clamp(1, EXPERT_CAP)) >= t.mxfp4_mma_per_from()
 }
 
 #[cfg(feature = "cuda")]
 pub(super) fn nvfp4_mma_spans(ctx: &Ctx, routes: u32) -> bool {
     let t = ctx.tuning();
-    t.nvfp4_mma_from <= routes && routes <= t.nvfp4_mma_until
+    t.nvfp4_mma_from() <= routes && routes <= t.nvfp4_mma_until()
 }
 
 /// Whether a routed NVFP4 select of bf16 activations (W4A16) runs the
@@ -186,8 +186,9 @@ pub(super) fn select_mxfp4_mma(
     const THREADS: u32 = 128;
     // The converts read e8m0 scales a 32 codes and no tensor scale, so an
     // NVFP4 bank (e4m3 a 16 codes, a tensor scale a row) keeps the bf16 path.
-    let cvt =
-        ctx.tuning().mxfp4_cvt && crate::linear::gemm_sm100::supported() && tensor_scales.is_none();
+    let cvt = ctx.tuning().mxfp4_cvt()
+        && crate::linear::gemm_sm100::supported()
+        && tensor_scales.is_none();
     if scale_atoms && !cvt {
         return Err(refuse(
             op,
@@ -213,15 +214,15 @@ pub(super) fn select_mxfp4_mma(
         && crate::jit::cache::arch() == Some("sm_89")
         && x.width.is_multiple_of(64);
     let staged_from = if ada_run {
-        ctx.tuning().mxfp4_run_until
+        ctx.tuning().mxfp4_run_until()
     } else {
-        ctx.tuning().mxfp4_staged_from
+        ctx.tuning().mxfp4_staged_from()
     };
     let staged = !cvt
         && (per > staged_from
             || (hopper_wgmma() && per >= WGMMA_FROM && x.width.is_multiple_of(64)));
     let run = ada_run && !staged;
-    let nvfp4_wide_from = ctx.tuning().nvfp4_wide_from;
+    let nvfp4_wide_from = ctx.tuning().nvfp4_wide_from();
     let wide = staged
         && hopper_wgmma()
         && x.width.is_multiple_of(64)
@@ -231,7 +232,7 @@ pub(super) fn select_mxfp4_mma(
         };
     let nb: u32 = match per {
         _ if wide => 16,
-        _ if staged && per <= ctx.tuning().mxfp4_staged_narrow_until => 4,
+        _ if staged && per <= ctx.tuning().mxfp4_staged_narrow_until() => 4,
         _ if staged => 8,
         _ if run => 4,
         0..=4 => 1,
@@ -273,7 +274,7 @@ pub(super) fn select_mxfp4_mma(
     )?;
     // A fire of a few routes splits K across a cluster of two CTAs
     // (`kernel.moe.mxfp4_cvt_ksplit_until`), each streaming half the codes.
-    let ksplit = if cvt && fan.route_count <= ctx.tuning().mxfp4_cvt_ksplit_until {
+    let ksplit = if cvt && fan.route_count <= ctx.tuning().mxfp4_cvt_ksplit_until() {
         2
     } else {
         1
@@ -429,7 +430,7 @@ pub(super) fn select_mxfp4_mma(
 /// of `routes` (`kernel.moe.mxfp4_w4a8_from`): bf16 rows, `k` whole 128s.
 #[cfg(feature = "cuda")]
 fn w4a8_takes(ctx: &Ctx, x: Tensor, routes: Tensor) -> bool {
-    let from = ctx.tuning().mxfp4_w4a8_from;
+    let from = ctx.tuning().mxfp4_w4a8_from();
     from > 0
         && routes.rows * routes.width >= from
         && x.dtype == Dtype::Bf16
@@ -477,7 +478,7 @@ pub fn select_mxfp4_w4a8(
     // stages. A table's entries are 16-aligned (the pool's planes); `codes`
     // is then the bank's host copy, which no kernel reads, wherever its file
     // lays it.
-    if ctx.tuning().mxfp4_w4a8_tma
+    if ctx.tuning().mxfp4_w4a8_tma()
         && (table.tabled() || codes.ptr.is_multiple_of(16))
         && ctx.smem_fits(W4A8_TMA_SMEM)
     {
@@ -596,7 +597,7 @@ pub fn select_nvfp4_w4a4(
     table: ExpertTable,
 ) -> Result<bool, Error> {
     const OP: &str = "linear.moe_select_nvfp4_w4a4";
-    let from = ctx.tuning().nvfp4_w4a4_from;
+    let from = ctx.tuning().nvfp4_w4a4_from();
     if from == 0
         || routes.rows * routes.width < from
         || x.dtype != Dtype::Bf16
@@ -737,7 +738,7 @@ fn select_mxfp4_w4a8_tma(
         },
     )?;
     let (count, kw) = (fan.route_count as usize, x.width as usize);
-    let ws = ctx.tuning().mxfp4_w4a8_ws
+    let ws = ctx.tuning().mxfp4_w4a8_ws()
         && x.width.is_multiple_of(256)
         && y.width.is_multiple_of(8)
         && ctx.smem_fits(W4A8_TMA_SMEM);
@@ -846,10 +847,10 @@ fn select_mxfp4_w4a8_tma(
 pub fn select_mxfp4_atoms_takes(ctx: &Ctx, routes: Tensor, x: Tensor) -> bool {
     let t = ctx.tuning();
     let count = routes.rows * routes.width;
-    t.mxfp4_cvt
+    t.mxfp4_cvt()
         && crate::linear::gemm_sm100::supported()
-        && t.mxfp4_a8_from <= count
-        && count <= t.mxfp4_a8_until
+        && t.mxfp4_a8_from() <= count
+        && count <= t.mxfp4_a8_until()
         && x.width > 0
         && x.width.is_multiple_of(32)
 }
@@ -953,7 +954,7 @@ pub(super) fn matmul_select_mxfp4(
     let k = stated(op, x.width)?;
     let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
     // A lean select (`kernel.moe.mxfp4_select_lean`) runs blocks of two warps.
-    let lean = ctx.tuning().mxfp4_select_lean;
+    let lean = ctx.tuning().mxfp4_select_lean();
     let block = if lean { 2 * WARP } else { DECODE_BLOCK };
     let tile = (block / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
@@ -961,14 +962,16 @@ pub(super) fn matmul_select_mxfp4(
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     // Grouping pays once an expert serves more than
     // `kernel.moe.mxfp4_grouped_reuse` routes on average.
-    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts && ctx.tuning().mxfp4_grouped {
+    if fan.route_count > ctx.tuning().mxfp4_grouped_reuse() * experts
+        && ctx.tuning().mxfp4_grouped()
+    {
         let RouteOrder {
             order,
             offsets,
             work,
             work_cap,
         } = route_order(ctx, op, routes, &fan, experts)?;
-        let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma;
+        let wmma = x.dtype == Dtype::Bf16 && ctx.tuning().mxfp4_wmma();
         let entry = if wmma {
             "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
         } else {
@@ -1007,7 +1010,7 @@ pub(super) fn matmul_select_mxfp4(
     // The tcgen05 Blackwells widen the codes with their e2m1 converts: the
     // same bits at fewer ALU slots a code.
     #[cfg(feature = "cuda")]
-    let cvt = (!lean && ctx.tuning().mxfp4_cvt && crate::linear::gemm_sm100::supported())
+    let cvt = (!lean && ctx.tuning().mxfp4_cvt() && crate::linear::gemm_sm100::supported())
         .then_some(SELECT_FP4_SM100);
     #[cfg(not(feature = "cuda"))]
     let cvt: Option<&'static str> = None;
@@ -1155,7 +1158,7 @@ pub(super) fn matmul_select_mlxu4(
 
     let experts = codes.rows.clamp(1, EXPERT_CAP);
     let tuning = ctx.tuning();
-    if tuning.affine_grouped && fan.route_count >= tuning.affine_grouped_from {
+    if tuning.affine_grouped() && fan.route_count >= tuning.affine_grouped_from() {
         let RouteOrder {
             order,
             offsets,
@@ -1165,7 +1168,8 @@ pub(super) fn matmul_select_mlxu4(
         // The WMMA kernel widens a quad of code words (four u32s) under one
         // factor: a group of fewer codes (2-bit codes in groups of 32) takes
         // the CUDA-core kernel.
-        let wmma = x.dtype == Dtype::Bf16 && tuning.affine_wmma && group.is_multiple_of(128 / bits);
+        let wmma =
+            x.dtype == Dtype::Bf16 && tuning.affine_wmma() && group.is_multiple_of(128 / bits);
         let entry = if wmma {
             format!(
                 "::pie::linear::moe_matmul_select_mlxu4_wmma<::pie::i32({bits}), ::pie::i32({group})>"
@@ -1302,8 +1306,7 @@ pub fn select_nvfp4(
         )
     {
         use crate::linear::gemm_sm100;
-        // A tcgen05 launch that fails falls back to the arm below.
-        if crate::linear::moe::select_tc5(
+        return crate::linear::moe::select_tc5(
             ctx,
             OP,
             x,
@@ -1315,11 +1318,7 @@ pub fn select_nvfp4(
                 weight_scale: tensor_scales.ptr,
                 ..gemm_sm100::Epilogue::STORE
             },
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
+        );
     }
     nonzero(OP, "N, the bank's output width", n)?;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
@@ -1328,8 +1327,8 @@ pub fn select_nvfp4(
     // knob says, the same trade at the same width of code.
     if x.dtype == Dtype::Bf16
         && k.is_multiple_of(NVFP4_TILE_K)
-        && ctx.tuning().mxfp4_grouped
-        && fan.route_count > ctx.tuning().mxfp4_grouped_reuse * experts
+        && ctx.tuning().mxfp4_grouped()
+        && fan.route_count > ctx.tuning().mxfp4_grouped_reuse() * experts
     {
         return select_nvfp4_grouped(
             ctx,
@@ -1434,7 +1433,7 @@ pub(crate) fn select_nvfp4_routed(
     act_div: i32,
 ) -> Result<(), Error> {
     // A lean select (`kernel.moe.mxfp4_select_lean`) runs blocks of two warps.
-    let lean = ctx.tuning().mxfp4_select_lean;
+    let lean = ctx.tuning().mxfp4_select_lean();
     let block = if lean {
         2 * NVFP4_WARP
     } else {
@@ -1447,7 +1446,7 @@ pub(crate) fn select_nvfp4_routed(
     // The tcgen05 Blackwells widen the codes with their e2m1 converts, as
     // the MXFP4 select does: the same bits.
     #[cfg(feature = "cuda")]
-    let cvt = (!lean && ctx.tuning().mxfp4_cvt && crate::linear::gemm_sm100::supported())
+    let cvt = (!lean && ctx.tuning().mxfp4_cvt() && crate::linear::gemm_sm100::supported())
         .then_some(SELECT_FP4_SM100);
     #[cfg(not(feature = "cuda"))]
     let cvt: Option<&'static str> = None;

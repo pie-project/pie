@@ -12,7 +12,7 @@ use crate::store::slots::SlotPool;
 use crate::store::weights::port::EnginePort;
 use crate::store::weights::{SlotAccess, WeightFirst};
 
-use super::{Demand, Growth, PoolTarget, Retarget, Signal};
+use super::{Growth, Mapped, PoolTarget, Retarget, Signal};
 
 /// Today's pools of one engine, and the slots its weight shapes take; or
 /// the shared pool an engine that states one runs on, the weight shapes'
@@ -61,6 +61,27 @@ impl EnginePool {
     pub const fn locus(&self) -> (usize, usize) {
         (self.model, self.engine)
     }
+
+    /// What the shared pool's floor is made of; `None` on a pinned pool.
+    #[must_use]
+    pub fn floor_parts(&self) -> Option<crate::store::shared::FloorParts> {
+        self.shared
+            .as_ref()
+            .map(|grow| grow.shared().lock().unwrap().floor_parts())
+    }
+
+    /// See [`SharedGrow::held_back`]; a pinned pool holds nothing back.
+    #[must_use]
+    pub fn held_back(&self, held: u64) -> Option<u32> {
+        self.shared.as_ref().and_then(|grow| grow.held_back(held))
+    }
+
+    /// See [`SharedGrow::backed`].
+    pub fn backed(&self, prefix: u32) {
+        if let Some(grow) = &self.shared {
+            grow.backed(prefix);
+        }
+    }
 }
 
 impl SlotAccess for EnginePool {
@@ -99,11 +120,6 @@ impl EnginePool {
 }
 
 impl PoolTarget for EnginePool {
-    fn demand(&mut self) -> Demand {
-        self.target_mut()
-            .map_or(Demand { wanted: 0, live: 0 }, PoolTarget::demand)
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.target().map_or(1, PoolTarget::segment_bytes)
     }
@@ -112,12 +128,34 @@ impl PoolTarget for EnginePool {
         self.target().map_or(0, PoolTarget::floor)
     }
 
+    fn least_mapped(&self) -> u64 {
+        self.target().map_or(0, PoolTarget::least_mapped)
+    }
+
+    /// What the pool may map where the engine holds part of its range back
+    /// for fires and bodies ([`::engine::chunk::ChunkFacts::held_bytes`],
+    /// the span directly under the activation): the prefix segments wholly
+    /// under it and the top span
+    /// ([`crate::store::shared::SharedPool::bound_bytes`]), the segments the
+    /// walker commits ([`crate::store::slots::SlotPool::backs`]); never
+    /// under the floor. Fixed once the load returned, as what is held back
+    /// is ([`Shared::<Steered>::boot`] reads the last word on it). The range
+    /// stated at load already leaves out what the driver holds (`outside`,
+    /// a ledger term the policy reads).
     fn hard_limit(&self) -> u64 {
-        self.target().map_or(0, PoolTarget::hard_limit)
+        self.shared.as_ref().map_or(0, |shared| {
+            let bound = shared.shared().lock().unwrap().bound_bytes();
+            bound.max(shared.floor())
+        })
     }
 
     fn held(&self) -> u64 {
         self.target().map_or(0, PoolTarget::held)
+    }
+
+    fn mapped(&self) -> Mapped {
+        self.target()
+            .map_or_else(Mapped::default, PoolTarget::mapped)
     }
 
     fn growth(&self) -> Growth {
@@ -148,10 +186,18 @@ impl Shared<Steered> {
     /// took it: what the load does before a fire can be submitted, so none
     /// reads from the host a row the cache holds.
     ///
+    /// The engine answers what it holds back of its range from then on
+    /// (`WeightCache::set_residency`): one that armed there settled its fit
+    /// and holds less than its load stated. The pool's hold-back takes the
+    /// answer, and the segments that opens are backed here, so the load
+    /// returns with the pool a load that armed before its last fit has.
+    /// No later answer is read: nothing arms or refits while serving.
+    ///
     /// # Errors
     ///
-    /// The engine refused it, or its lane closed first. An engine that does
-    /// not stream (it answers unsupported) is no error.
+    /// The engine refused it, would not back what it no longer holds, or
+    /// its lane closed first. An engine that does not stream (it answers
+    /// unsupported) is no error.
     pub async fn boot(&self) -> anyhow::Result<()> {
         // The segments the weights were committed into past the load's
         // own: the engine backs them before it is told where the weights
@@ -177,7 +223,28 @@ impl Shared<Steered> {
             let answer = answer
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the engine's lane closed")));
-            self.with(|pool| pool.port_mut().answered(answer))?;
+            let opened = self.with(|pool| -> anyhow::Result<_> {
+                let held = pool.port_mut().answered(answer)?;
+                Ok(held.and_then(|held| pool.inner().held_back(held)))
+            })?;
+            let Some(prefix) = opened else { continue };
+            crate::scheduler::pool(
+                engine,
+                crate::scheduler::worker::PoolOp::CommitSegments(prefix),
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "the engine did not back the {prefix} segments it holds back no more: \
+                     {error}"
+                )
+            })?;
+            self.with(|pool| pool.inner().backed(prefix));
+            tracing::debug!(
+                engine,
+                committed = prefix,
+                "the engine backs the segments it holds back no more"
+            );
         }
         Ok(())
     }
@@ -204,16 +271,11 @@ impl<P> Shared<P> {
 }
 
 impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<WeightFirst<P, W>> {
-    /// The planner's hook: sheds the weight cache to its floor (nothing
-    /// while it does not stream); the slots given back.
+    /// The planner's hook: sheds the weight cache to its floor (held, it
+    /// offers the engine the streaming set first, and gives nothing back
+    /// until the engine took it); the slots given back.
     pub fn shed(&self) -> u64 {
-        self.with(|pool| {
-            if pool.cache().streaming() {
-                pool.shed()
-            } else {
-                0
-            }
-        })
+        self.with(WeightFirst::shed)
     }
 
     /// [`Self::shed`] as the planner takes it.
@@ -228,10 +290,6 @@ impl<P: PoolTarget + SlotAccess, W: crate::store::weights::WeightPort> Shared<We
 }
 
 impl<P: PoolTarget> PoolTarget for Shared<P> {
-    fn demand(&mut self) -> Demand {
-        self.0.lock().demand()
-    }
-
     fn segment_bytes(&self) -> u64 {
         self.0.lock().segment_bytes()
     }
@@ -240,12 +298,20 @@ impl<P: PoolTarget> PoolTarget for Shared<P> {
         self.0.lock().floor()
     }
 
+    fn least_mapped(&self) -> u64 {
+        self.0.lock().least_mapped()
+    }
+
     fn hard_limit(&self) -> u64 {
         self.0.lock().hard_limit()
     }
 
     fn held(&self) -> u64 {
         self.0.lock().held()
+    }
+
+    fn mapped(&self) -> Mapped {
+        self.0.lock().mapped()
     }
 
     fn growth(&self) -> Growth {
@@ -297,9 +363,14 @@ pub fn tell(engine: usize, signal: Signal, raise: &mut impl FnMut(Tier, usize, u
     }
 }
 
-/// [`tell`], to the policy's gauge.
+/// [`tell`], to the policy's gauge; and the stores answer the shortfall:
+/// the engine's planner lets idle cache go for it, down the tiers its
+/// retention rows name or dropped where they name none
+/// ([`crate::planner::ResidencyPlanner::yield_idle`]). No runtime responder
+/// chooses what goes.
 pub fn signal(engine: usize, signal: Signal) {
     tracing::debug!(engine, ?signal, "governor pool short of its target");
+    let short = short_bytes(signal);
     tell(engine, signal, &mut |tier, from, bytes| {
         if bytes == 0 {
             pressure::relieve(tier, from);
@@ -307,4 +378,10 @@ pub fn signal(engine: usize, signal: Signal) {
             pressure::raise(tier, from, bytes);
         }
     });
+    if short > 0
+        && let Some(planner) = crate::planner::planner_for(0, engine)
+    {
+        let page = pressure::scale_of(engine).kv_page_bytes.max(1);
+        planner.yield_idle(u32::try_from(short.div_ceil(page)).unwrap_or(u32::MAX));
+    }
 }

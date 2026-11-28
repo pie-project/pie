@@ -249,6 +249,7 @@ fn still(h: u32, w: u32) -> Rgb8 {
 
 #[test]
 fn the_tower_reads_pixels_as_the_host_cut_them() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

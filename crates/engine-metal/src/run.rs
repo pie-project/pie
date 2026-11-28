@@ -12,6 +12,17 @@ use crate::dispatch::copy::CopyPlan;
 use crate::scratch::Scratch;
 use crate::window::{Window, Windows};
 
+/// What a run's accessor answers: a value it cannot resolve refuses the
+/// fire by name (`kernels_metal::Error::Backend`), never panics.
+pub(crate) type Ran<T> = std::result::Result<T, kernels_metal::Error>;
+
+/// A refusal of the fire from the run's accessors. A predicate that only
+/// chooses a fused path reads values with `.ok()?`: one that does not
+/// resolve declines the fusion, and the plain path refuses it by name.
+pub(crate) fn run_fault(detail: String) -> kernels_metal::Error {
+    kernels_metal::Error::Backend { op: "run", detail }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightRow {
     Dense(Tensor),
@@ -98,7 +109,13 @@ pub type PoolSlabs = kernels_metal::attn::pool::PoolState;
 pub struct FireBindings {
     pub tokens: Tensor,
 
+    /// Each row's cache row: the causal bound its attention reads, by row
+    /// order whatever position the lane states.
     pub positions: Tensor,
+
+    /// Each row's stated position: what its rotation reads
+    /// (`RuntimeInput::Positions`).
+    pub rotations: Tensor,
 
     pub adapter_routes: Option<Tensor>,
 
@@ -144,6 +161,22 @@ pub struct FireBindings {
     /// Each band's snapshot table (`crate::store::Pools::bands`), when a lane
     /// of the fire snapshots.
     pub rs_snap_bands: Vec<Tensor>,
+    /// Where the fire's capturing lanes add their scores, when a lane of it
+    /// captures.
+    pub capture: Option<CaptureSeat>,
+}
+
+/// A fire's capturing lanes' rows, as its score kernels read them: each
+/// fire lane's key row and page row, f32 at its GPU address (its reader
+/// instance's rows, wherever they lie this fire; 0 for a lane that captures
+/// nothing). A row is `keys` keys, or `pages` pages of `page_size`.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureSeat {
+    pub keys_at: Tensor,
+    pub pages_at: Tensor,
+    pub keys: u32,
+    pub pages: u32,
+    pub page_size: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,6 +219,8 @@ pub struct Run<'c> {
     /// The Neural Engine's share of this load, when a live encode may hand
     /// it work.
     ane: Option<&'c crate::ane::Ane>,
+    /// The encode's frame is dropped: its splits hand nothing over.
+    dry: bool,
 
     /// The chip profile and model facts this load's kernels run under.
     tuning: &'c kernels_metal::Tuning,
@@ -205,6 +240,12 @@ pub struct Run<'c> {
 
     /// The outputs a segment launch landed ahead of the nodes that write them.
     landed: std::cell::Cell<Option<Landed>>,
+
+    /// A room a kernel's callback asked for and that did not mint
+    /// ([`Run::precast_for`], [`Run::partials_for`]): the callback answers an
+    /// `Option`, so the fault waits here and refuses the node once the kernel
+    /// returns ([`Run::settled`]).
+    deferred: std::cell::Cell<Option<kernels_metal::Error>>,
 
     /// The compiled regions the walk's place indexes, when the encode names
     /// them: a segment launch takes only nodes of the region it runs in.
@@ -356,12 +397,14 @@ impl<'c> Run<'c> {
             copy: CopyPlan::default(),
             scratch,
             ane: None,
+            dry: false,
             tuning,
             chain: std::cell::Cell::new(None),
             tiles: std::cell::Cell::new(None),
             readers: std::cell::OnceCell::new(),
             table: std::cell::Cell::new(None),
             landed: std::cell::Cell::new(None),
+            deferred: std::cell::Cell::new(None),
             regions: None,
         }
     }
@@ -423,14 +466,16 @@ impl<'c> Run<'c> {
                         logits: true,
                         ..
                     },
-                ) if *act == value => self.register_counters(value, *w, self.tensor(*y).width),
+                ) if *act == value => {
+                    self.register_counters(value, *w, self.tensor(*y).ok()?.width)
+                }
                 Operation::Fused(Fused::MatmulSwigluMatmul {
                     act,
                     gate_up,
                     packed,
                     ..
                 }) if *act == value => {
-                    self.register_counters(value, *gate_up, self.tensor(*packed).width)
+                    self.register_counters(value, *gate_up, self.tensor(*packed).ok()?.width)
                 }
                 _ => None,
             })
@@ -475,7 +520,7 @@ impl<'c> Run<'c> {
             return None;
         }
         let span = |v: ValueId| {
-            let t = self.tensor(v);
+            let t = self.tensor(v).ok()?;
             (t.dtype == poem_ir::Dtype::Bf16)
                 .then(|| self.address(t.buf))
                 .flatten()
@@ -497,7 +542,7 @@ impl<'c> Run<'c> {
             matches!(&decl.def, poem_ir::Def::Merge(arms) if arms.iter().any(|(v, _)| *v == value))
         })?;
         let merged = ValueId(u32::try_from(at).ok()?);
-        let (arm, whole) = (self.tensor(value), self.tensor(merged));
+        let (arm, whole) = (self.tensor(value).ok()?, self.tensor(merged).ok()?);
         (arm.rows == whole.rows
             && arm.width == whole.width
             && arm.dtype == whole.dtype
@@ -508,7 +553,7 @@ impl<'c> Run<'c> {
     /// When the projection of `act` by bank `w` into `columns` columns runs on
     /// the register tile, the arrival counters its split takes.
     pub(crate) fn register_counters(&self, act: ValueId, w: ValueId, columns: u32) -> Option<u32> {
-        let x = self.tensor(act);
+        let x = self.tensor(act).ok()?;
         if !self.tuning.qmm_register()
             || x.dtype != poem_ir::Dtype::Bf16
             || x.rows == 0
@@ -518,7 +563,7 @@ impl<'c> Run<'c> {
         {
             return None;
         }
-        let bank = self.banked(w)?;
+        let bank = self.banked(w).ok().flatten()?;
         if bank.bits != 4 || bank.group != 64 || bank.biases.is_none() {
             return None;
         }
@@ -550,7 +595,7 @@ impl<'c> Run<'c> {
         bank: ValueId,
         routes: ValueId,
         y: ValueId,
-    ) -> kernels_metal::linear::moe::Sorted {
+    ) -> Ran<kernels_metal::linear::moe::Sorted> {
         use kernels_metal::linear::moe::Sorted;
         use poem_ir::{Linear, Operation};
         if let Some(chain) = self.chain.get()
@@ -563,11 +608,11 @@ impl<'c> Run<'c> {
                 step: ChainStep::Down,
                 ..chain
             }));
-            return Sorted {
+            return Ok(Sorted {
                 input: true,
                 output: true,
                 sums: chain.sums,
-            };
+            });
         }
         self.chain.set(None);
         let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
@@ -600,7 +645,7 @@ impl<'c> Run<'c> {
                     ..
                 },
             )) => (packed, hidden),
-            _ => return Sorted::default(),
+            _ => return Ok(Sorted::default()),
         };
         let Some(Operation::Linear(Linear::MoeSelect {
             x: down_x,
@@ -613,7 +658,7 @@ impl<'c> Run<'c> {
             ..
         })) = self.sole_reader(*hidden).map(|n| &n.op)
         else {
-            return Sorted::default();
+            return Ok(Sorted::default());
         };
         let Some(Operation::Linear(Linear::MoeCombine {
             routed: folded,
@@ -622,37 +667,38 @@ impl<'c> Run<'c> {
             ..
         })) = self.sole_reader(*routed).map(|n| &n.op)
         else {
-            return Sorted::default();
+            return Ok(Sorted::default());
         };
         if *packed != y || down_x != hidden || *down_routes != routes || folded != routed {
-            return Sorted::default();
+            return Ok(Sorted::default());
         }
-        let stack = |x, bank, y| {
-            kernels_metal::linear::moe::sorted_stack(
-                self.tensor(x),
-                self.planes(bank),
-                self.tensor(y),
+        let stack = |x: ValueId, bank: ValueId, y: ValueId| -> Ran<Option<(u32, u32)>> {
+            Ok(kernels_metal::linear::moe::sorted_stack(
+                self.tensor(x)?,
+                self.planes(bank)?,
+                self.tensor(y)?,
                 self.experts(routes),
                 self.tuning,
-            )
+            ))
         };
         // The down reads the gate-up's sorted rows, so both passes sort alike.
-        let Some((padded, tile)) = stack(x, bank, y) else {
-            return Sorted::default();
+        let Some((padded, tile)) = stack(x, bank, y)? else {
+            return Ok(Sorted::default());
         };
-        if stack(*hidden, *down_bank, *routed) != Some((padded, tile)) {
-            return Sorted::default();
+        if stack(*hidden, *down_bank, *routed)? != Some((padded, tile)) {
+            return Ok(Sorted::default());
         }
-        let sums_tile = self.routed_scratch().and_then(|scratch| {
-            kernels_metal::linear::moe::mpp_sums_tile(
-                self.tensor(*hidden),
-                self.planes(*down_bank),
-                self.tensor(*routed),
+        let sums_tile = match self.routed_scratch()? {
+            Some(scratch) => kernels_metal::linear::moe::mpp_sums_tile(
+                self.tensor(*hidden)?,
+                self.planes(*down_bank)?,
+                self.tensor(*routed)?,
                 self.experts(routes),
                 scratch.sums,
                 self.tuning,
-            )
-        });
+            ),
+            None => None,
+        };
         self.chain.set(Some(Chain {
             step: ChainStep::GateUp,
             routes,
@@ -663,11 +709,11 @@ impl<'c> Run<'c> {
             sums_tile,
             sums: false,
         }));
-        Sorted {
+        Ok(Sorted {
             input: false,
             output: true,
             sums: false,
-        }
+        })
     }
 
     /// The sorted gate-up rows, where their swiglu lands and which rows are
@@ -676,69 +722,81 @@ impl<'c> Run<'c> {
         &self,
         packed: ValueId,
         hidden: ValueId,
-    ) -> Option<(Tensor, Tensor, Tensor)> {
-        let chain = self.chain.get()?;
+    ) -> Ran<Option<(Tensor, Tensor, Tensor)>> {
+        let Some(chain) = self.chain.get() else {
+            return Ok(None);
+        };
         if chain.step != ChainStep::GateUp || chain.packed != packed || chain.hidden != hidden {
             self.chain.set(None);
-            return None;
+            return Ok(None);
         }
-        let scratch = self.routed_scratch()?;
-        let (up, inter) = (self.tensor(packed).width, self.tensor(hidden).width);
+        let Some(scratch) = self.routed_scratch()? else {
+            return Ok(None);
+        };
+        let (up, inter) = (self.tensor(packed)?.width, self.tensor(hidden)?.width);
         self.chain.set(Some(Chain {
             step: ChainStep::Swiglu,
             ..chain
         }));
-        Some((
+        Ok(Some((
             Tensor::new(scratch.y.buf, chain.padded, up, poem_ir::Dtype::Bf16),
             Tensor::new(scratch.x.buf, chain.padded, inter, poem_ir::Dtype::Bf16),
             scratch.perm,
-        ))
+        )))
     }
 
     /// Where the chain's activation lands the down's input sums and at which
     /// row tile, when the down's MPP kernel reads them; the down then skips its
     /// sums pass. Only an activation that writes them asks.
-    pub(crate) fn chain_sums(&self) -> Option<(Tensor, u32)> {
-        let chain = self.chain.get()?;
-        if chain.step != ChainStep::Swiglu {
-            return None;
-        }
-        let tile = chain.sums_tile?;
-        let scratch = self.routed_scratch()?;
+    pub(crate) fn chain_sums(&self) -> Ran<Option<(Tensor, u32)>> {
+        let Some(chain) = self.chain.get() else {
+            return Ok(None);
+        };
+        let (ChainStep::Swiglu, Some(tile)) = (chain.step, chain.sums_tile) else {
+            return Ok(None);
+        };
+        let Some(scratch) = self.routed_scratch()? else {
+            return Ok(None);
+        };
         self.chain.set(Some(Chain {
             sums: true,
             ..chain
         }));
-        Some((scratch.sums, tile))
+        Ok(Some((scratch.sums, tile)))
     }
 
     /// The sorted down rows, the route-to-row map and the fan-out, when
     /// `routed` is the chain's down output; the chain ends here.
-    pub(crate) fn chain_combine(&self, routed: ValueId) -> Option<(Tensor, Tensor, u32)> {
-        let chain = self.chain.take()?;
+    pub(crate) fn chain_combine(&self, routed: ValueId) -> Ran<Option<(Tensor, Tensor, u32)>> {
+        let Some(chain) = self.chain.take() else {
+            return Ok(None);
+        };
         if chain.step != ChainStep::Down || chain.routed != routed {
-            return None;
+            return Ok(None);
         }
-        let scratch = self.routed_scratch()?;
-        let routes = self.tensor(chain.routes);
-        let width = self.tensor(routed).width;
-        Some((
+        let Some(scratch) = self.routed_scratch()? else {
+            return Ok(None);
+        };
+        let routes = self.tensor(chain.routes)?;
+        let width = self.tensor(routed)?.width;
+        Ok(Some((
             Tensor::new(scratch.y.buf, chain.padded, width, poem_ir::Dtype::Bf16),
             scratch.inv,
             routes.width,
-        ))
+        )))
     }
 
     /// The register expert tiles' rooms, which overlap the precast room.
-    pub(crate) fn register_rooms(&self) -> Option<kernels_metal::linear::moe::RegisterRooms> {
+    pub(crate) fn register_rooms(&self) -> Ran<Option<kernels_metal::linear::moe::RegisterRooms>> {
         self.table.set(None);
-        Some(
-            self.scratch
-                .register(self.handles)?
-                .unwrap_or_else(|fault| {
-                    panic!("the register expert rooms this load reserved do not mint: {fault}")
-                }),
-        )
+        self.scratch
+            .register(self.handles)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the register expert rooms this load reserved do not mint: {fault}"
+                ))
+            })
     }
 
     /// Whether the routed gate-up of `x` by `bank` over `routes` into `y`
@@ -762,7 +820,7 @@ impl<'c> Run<'c> {
         if !self.tuning.moe_register() {
             return Ok(false);
         }
-        let (xt, rt) = (self.tensor(x), self.tensor(routes));
+        let (xt, rt) = (self.tensor(x)?, self.tensor(routes)?);
         if rt.rows < 2
             || rt.rows > moe::REGISTER_TOKENS
             || rt.width > moe::REGISTER_FAN_OUT
@@ -816,9 +874,9 @@ impl<'c> Run<'c> {
             return Ok(false);
         }
         let inter = *intermediate;
-        let (gate_up, down) = (self.planes(bank), self.planes(*down_bank));
-        let columns = self.tensor(*routed).width;
-        if self.tensor(y).width != 2 * inter
+        let (gate_up, down) = (self.planes(bank)?, self.planes(*down_bank)?);
+        let columns = self.tensor(*routed)?.width;
+        if self.tensor(y)?.width != 2 * inter
             || !moe::register_cuts(inter, columns, moe::REGISTER_CUT)
             || !moe::register_bank(gate_up, xt.width, 2 * inter)
             || !moe::register_bank(down, inter, columns)
@@ -831,7 +889,7 @@ impl<'c> Run<'c> {
         }
         let shared = self.shared_tile(x, fold_at, fold, *folded, inter, columns);
         let tiles = moe::register_tiles(rt.rows, rt.width, experts, shared.is_some());
-        let Some(rooms) = self.register_rooms() else {
+        let Some(rooms) = self.register_rooms()? else {
             return Ok(false);
         };
         if rooms.tiles.width <= tiles
@@ -843,10 +901,14 @@ impl<'c> Run<'c> {
         {
             return Ok(false);
         }
-        let gate = shared.map(|s| moe::RegisterGate {
-            weights: self.tensor(*weights),
-            gate: s.gate_bank,
-        });
+        let gate = shared
+            .map(|s| -> Ran<moe::RegisterGate> {
+                Ok(moe::RegisterGate {
+                    weights: self.tensor(*weights)?,
+                    gate: s.gate_bank,
+                })
+            })
+            .transpose()?;
         moe::register_group(
             self.ctx(),
             xt,
@@ -954,13 +1016,13 @@ impl<'c> Run<'c> {
         {
             return None;
         }
-        let (gate_up, down) = (self.banked(*gate_up)?, self.banked(*down)?);
-        let gate_bank = self.banked(*gate_w)?;
-        let width = self.tensor(x).width;
-        let rows = self.tensor(*out);
-        (self.tensor(*y).width == columns
+        let bank = |w: ValueId| self.banked(w).ok().flatten();
+        let (gate_up, down, gate_bank) = (bank(*gate_up)?, bank(*down)?, bank(*gate_w)?);
+        let width = self.tensor(x).ok()?.width;
+        let rows = self.tensor(*out).ok()?;
+        (self.tensor(*y).ok()?.width == columns
             && rows.width == columns
-            && rows.rows == self.tensor(x).rows
+            && rows.rows == self.tensor(x).ok()?.rows
             && moe::register_bank(gate_up, width, 2 * inter)
             && moe::register_bank(down, inter, columns)
             && moe::register_gate_bank(gate_bank, width))
@@ -998,7 +1060,9 @@ impl<'c> Run<'c> {
             {
                 return false;
             }
-            let window = self.windows.at(index, 0);
+            let Some(window) = self.windows.at(index, 0) else {
+                return false;
+            };
             if window.gathered.is_some()
                 || window.span.rows == 0
                 || *rows.get_or_insert(window.span.rows) != window.span.rows
@@ -1038,19 +1102,22 @@ impl<'c> Run<'c> {
         }) {
             return Ok(false);
         }
-        let tiled = self.tiles.get().expect("the chain is at its down");
-        let rooms = self
-            .register_rooms()
-            .expect("the register chain began over the rooms the load reserved");
+        let tiled = self
+            .tiles
+            .get()
+            .ok_or_else(|| run_fault("the register chain is not at its down".into()))?;
+        let rooms = self.register_rooms()?.ok_or_else(|| {
+            run_fault("the register chain began over no rooms the load reserved".into())
+        })?;
         let table = self.bank_table(bank);
-        self.count_bank(table, self.tensor(routes))?;
+        self.count_bank(table, self.tensor(routes)?)?;
         kernels_metal::linear::moe::register_down(
             self.ctx(),
-            self.planes(bank),
+            self.planes(bank)?,
             table,
             tiled.shared.map(|s| s.down),
-            self.tensor(x).width,
-            self.tensor(y).width,
+            self.tensor(x)?.width,
+            self.tensor(y)?.width,
             tiled.tiles,
             self.experts(routes),
             rooms,
@@ -1063,29 +1130,31 @@ impl<'c> Run<'c> {
     /// The fold of `routed`, when it is the register chain's down's output:
     /// deferred to the gated add where the shared expert rides along, else
     /// the sorted fold of the tiles' rows (eight a tile), which ends the chain.
-    pub(crate) fn tiles_fold(&self, routed: ValueId) -> Option<TiledFold> {
+    pub(crate) fn tiles_fold(&self, routed: ValueId) -> Ran<Option<TiledFold>> {
         if !self.tiles_at(TiledStep::Down, |t| t.routed == routed) {
-            return None;
+            return Ok(None);
         }
-        let tiled = self.tiles.get()?;
+        let Some(tiled) = self.tiles.get() else {
+            return Ok(None);
+        };
         if tiled.shared.is_some() {
             self.tiles_step(TiledStep::Folded);
-            return Some(TiledFold::Deferred);
+            return Ok(Some(TiledFold::Deferred));
         }
         self.tiles.set(None);
-        let rooms = self
-            .register_rooms()
-            .expect("the register chain began over the rooms the load reserved");
-        Some(TiledFold::Sorted(
+        let rooms = self.register_rooms()?.ok_or_else(|| {
+            run_fault("the register chain began over no rooms the load reserved".into())
+        })?;
+        Ok(Some(TiledFold::Sorted(
             Tensor::new(
                 rooms.y.buf,
                 tiled.tiles * 8,
-                self.tensor(routed).width,
+                self.tensor(routed)?.width,
                 poem_ir::Dtype::Bf16,
             ),
             rooms.inv,
-            self.tensor(tiled.routes).width,
-        ))
+            self.tensor(tiled.routes)?.width,
+        )))
     }
 
     /// Whether the fused MLP landing `y` is the shared expert that rides
@@ -1114,17 +1183,20 @@ impl<'c> Run<'c> {
         if !self.tiles_at(TiledStep::Gated, |t| t.shared.is_some_and(|s| s.out == y)) {
             return Ok(false);
         }
-        let tiled = self.tiles.get().expect("the chain is at its gated add");
+        let tiled = self
+            .tiles
+            .get()
+            .ok_or_else(|| run_fault("the register chain is not at its gated add".into()))?;
         self.tiles.set(None);
-        let rooms = self
-            .register_rooms()
-            .expect("the register chain began over the rooms the load reserved");
+        let rooms = self.register_rooms()?.ok_or_else(|| {
+            run_fault("the register chain began over no rooms the load reserved".into())
+        })?;
         kernels_metal::linear::moe::register_combine(
             self.ctx(),
             rooms,
             tiled.tiles,
-            self.tensor(tiled.routes).width,
-            self.tensor(y),
+            self.tensor(tiled.routes)?.width,
+            self.tensor(y)?,
         )?;
         Ok(true)
     }
@@ -1172,8 +1244,9 @@ impl<'c> Run<'c> {
     }
 
     #[must_use]
-    pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>) -> Self {
+    pub(crate) fn with_ane(mut self, ane: Option<&'c crate::ane::Ane>, dry: bool) -> Self {
         self.ane = ane;
+        self.dry = dry;
         self
     }
 
@@ -1189,7 +1262,7 @@ impl<'c> Run<'c> {
     /// it reads the same rows: `None` where the encode names no regions.
     pub(crate) fn region_nodes(&self) -> Option<(std::ops::Range<u32>, bool)> {
         let region = self.regions?.get(self.place.region.get() as usize)?;
-        let window = self.window();
+        let window = self.window().ok()?;
         Some((region.nodes.clone(), window.gathered.is_none()))
     }
 
@@ -1197,33 +1270,68 @@ impl<'c> Run<'c> {
         self.ane
     }
 
-    pub(crate) fn window(&self) -> &'c Window {
-        self.windows
-            .at(self.place.region.get(), self.place.run.get())
+    pub(crate) fn dry(&self) -> bool {
+        self.dry
+    }
+
+    pub(crate) fn window(&self) -> Ran<&'c Window> {
+        let (region, run) = (self.place.region.get(), self.place.run.get());
+        self.windows.at(region, run).ok_or_else(|| {
+            run_fault(format!(
+                "region {region} has no run {run}; this fire cut it into {} over a template of {}",
+                self.windows.runs(region),
+                self.windows.regions()
+            ))
+        })
     }
 
     fn struct_at(&self, id: ValueId) -> usize {
         self.place.run.get() as usize * self.values_wide + id.0 as usize
     }
 
-    pub(crate) fn qo_indptr(&self) -> Tensor {
-        self.window().indptr
+    pub(crate) fn qo_indptr(&self) -> Ran<Tensor> {
+        Ok(self.window()?.indptr)
     }
 
-    pub(crate) fn qo_indptr_host(&self) -> &'c [i32] {
-        &self.window().indptr_host
+    pub(crate) fn qo_indptr_host(&self) -> Ran<&'c [i32]> {
+        Ok(&self.window()?.indptr_host)
     }
 
-    pub(crate) fn cut_rows(&self, handle: Tensor) -> Tensor {
-        if let Some(gathered) = &self.window().gathered {
+    pub(crate) fn cut_rows(&self, handle: Tensor) -> Ran<Tensor> {
+        if let Some(gathered) = &self.window()?.gathered {
             if handle.buf == self.fire.positions.buf {
-                return gathered.positions;
+                return Ok(gathered.positions);
+            }
+            if handle.buf == self.fire.rotations.buf {
+                return Ok(gathered.rotations);
             }
             if handle.buf == self.fire.tables.request_of_token.buf {
-                return gathered.request_of_token;
+                return Ok(gathered.request_of_token);
+            }
+            // The fire's mask rows, gathered by the copy as words
+            // (`dispatch::copy`): read as the fire's tables are typed.
+            if handle.buf == self.fire.tables.mask.buf
+                || handle.buf == self.fire.tables.mask_enabled.buf
+            {
+                let tight = self
+                    .address(handle.buf)
+                    .and_then(|key| self.copy.tight(key))
+                    .ok_or_else(|| {
+                        run_fault(
+                            "a copied window reads the fire's masks and its copy carries none; \
+                             `dispatch::copy` gathers them wherever the fire stages any"
+                                .to_string(),
+                        )
+                    })?;
+                return Ok(Tensor::new(
+                    tight.buf,
+                    tight.rows,
+                    handle.width,
+                    handle.dtype,
+                ));
             }
         }
-        let span = self.window().span;
+        let span = self.window()?.span;
         self.slice(handle, span.row_offset, span.rows)
     }
 
@@ -1243,39 +1351,43 @@ impl<'c> Run<'c> {
         self.place.run.get()
     }
 
-    fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
-        self.fire.voxels.unwrap_or_else(|| {
-            panic!("value {at} reads the voxel axis, and no lane of this fire submitted a clip")
+    fn voxel_seat(&self, at: usize) -> Ran<crate::inputs::VoxelHandles> {
+        self.fire.voxels.ok_or_else(|| {
+            run_fault(format!(
+                "value {at} reads the voxel axis, and no lane of this fire submitted a clip"
+            ))
         })
     }
 
-    fn guest(&self, at: usize, id: u32) -> Tensor {
+    fn guest(&self, at: usize, id: u32) -> Ran<Tensor> {
         self.fire
             .inputs
             .iter()
             .find(|(have, _)| *have == id)
             .map(|(_, plane)| *plane)
-            .unwrap_or_else(|| {
-                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
+            .ok_or_else(|| {
+                run_fault(format!(
+                    "value {at} reads guest input {id}, which this load carved no rectangle for"
+                ))
             })
     }
 
-    fn packing(&self, at: usize, select: poem_ir::Selection) -> crate::inputs::PackingHandles {
+    fn packing(&self, at: usize, select: poem_ir::Selection) -> Ran<crate::inputs::PackingHandles> {
         self.fire
             .packings
             .iter()
             .find(|(have, _)| *have == select)
             .map(|(_, tables)| *tables)
-            .unwrap_or_else(|| {
-                panic!(
+            .ok_or_else(|| {
+                run_fault(format!(
                     "value {at} reads a packing table keyed by {select:?}, and this load \
                      carved {} selection(s)",
                     self.fire.packings.len()
-                )
+                ))
             })
     }
 
-    pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
+    pub(crate) fn uncut(&self, id: ValueId) -> Ran<Tensor> {
         self.whole(id)
     }
 
@@ -1308,19 +1420,24 @@ impl<'c> Run<'c> {
         self.copy = plan;
     }
 
+    pub(crate) fn fire_tables(&self) -> &FireTables {
+        &self.fire.tables
+    }
+
     pub(crate) fn staged_copy(&self) -> &CopyPlan {
         &self.copy
     }
 
-    pub(crate) fn copy_room(&self, offset: u64, bytes: u64) -> Option<u32> {
+    pub(crate) fn copy_room(&self, offset: u64, bytes: u64) -> Ran<Option<u32>> {
         self.table.set(None);
-        Some(
-            self.scratch
-                .copy(self.handles, offset, bytes)?
-                .unwrap_or_else(|fault| {
-                    panic!("the copy rectangle this load reserved does not mint: {fault}")
-                }),
-        )
+        self.scratch
+            .copy(self.handles, offset, bytes)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the copy rectangle this load reserved does not mint: {fault}"
+                ))
+            })
     }
 
     pub(crate) fn handles(&self) -> &'c Handles {
@@ -1335,20 +1452,22 @@ impl<'c> Run<'c> {
     /// lane, when a lane of the fire snapshots.
     /// The snapshot table of the state `state` reads: its band's, each
     /// snapshot naming the record's pieces that band holds.
-    pub(crate) fn rs_snapshots(&self, state: ValueId) -> Option<kernels_metal::ssm::Snapshots> {
+    pub(crate) fn rs_snapshots(
+        &self,
+        state: ValueId,
+    ) -> Ran<Option<kernels_metal::ssm::Snapshots>> {
+        let lane0 = self.window()?.span.lane_offset;
         let band = match &self.values[state.0 as usize].def {
             Def::Cache(row) => self.caches.band_of.get(*row as usize).copied().flatten(),
             _ => None,
         };
-        self.fire
+        Ok(self
+            .fire
             .rs_snap_bands
             .get(band.unwrap_or(0))
             .copied()
             .or(self.fire.rs_snaps)
-            .map(|table| kernels_metal::ssm::Snapshots {
-                table,
-                lane0: self.window().span.lane_offset,
-            })
+            .map(|table| kernels_metal::ssm::Snapshots { table, lane0 }))
     }
 
     pub(crate) fn ctx(&self) -> &'c Ctx<'c> {
@@ -1359,17 +1478,17 @@ impl<'c> Run<'c> {
         &self.fire
     }
 
-    pub(crate) fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Tensor {
+    pub(crate) fn slice(&self, handle: Tensor, skip: u32, keep: u32) -> Ran<Tensor> {
         if skip == 0 && keep >= handle.rows {
-            return handle;
+            return Ok(handle);
         }
         let stride = u64::from(handle.width)
-            * poem_compiler::arena::elem_bytes(handle.dtype).unwrap_or_else(|| {
-                panic!(
+            * poem_compiler::arena::elem_bytes(handle.dtype).ok_or_else(|| {
+                run_fault(format!(
                     "a {:?} rectangle has no element size and so no row to step by",
                     handle.dtype
-                )
-            });
+                ))
+            })?;
         let rows = keep.min(handle.rows.saturating_sub(skip));
         let cut = self
             .handles
@@ -1378,19 +1497,19 @@ impl<'c> Run<'c> {
                 u64::from(skip) * stride,
                 u64::from(rows) * stride,
             )
-            .unwrap_or_else(|fault| {
-                panic!(
+            .map_err(|fault| {
+                run_fault(format!(
                     "the window's cut of handle {} at row {skip} for {rows} rows does \
                      not land: {fault}",
                     handle.buf
-                )
-            });
-        Tensor::new(cut, rows, handle.width, handle.dtype)
+                ))
+            })?;
+        Ok(Tensor::new(cut, rows, handle.width, handle.dtype))
     }
 
-    fn cut(&self, id: ValueId, handle: Tensor) -> Tensor {
+    fn cut(&self, id: ValueId, handle: Tensor) -> Ran<Tensor> {
         let at = id.0 as usize;
-        if self.window().gathered.is_some() {
+        if self.window()?.gathered.is_some() {
             return self.compacted(id, handle);
         }
         if matches!(
@@ -1401,12 +1520,12 @@ impl<'c> Run<'c> {
                     ..
                 })
         ) {
-            return handle;
+            return Ok(handle);
         }
         let Ty::Tensor { shape, .. } = &self.values[at].ty else {
-            return handle;
+            return Ok(handle);
         };
-        let seated = self.window();
+        let seated = self.window()?;
         let window = seated.span;
         let patch = seated.patch;
         let (skip, keep) = match shape.first() {
@@ -1417,7 +1536,9 @@ impl<'c> Run<'c> {
             Some(Dim::Readouts) => {
                 readout_span(&self.fire.readout_indptr, window.lane_offset, window.lanes)
             }
-            Some(Dim::Const(_)) | None => return handle,
+            Some(Dim::Const(_)) | None => return Ok(handle),
+            // A capturing lane's row lies in its program's guest region, never cut here.
+            Some(Dim::Capturing | Dim::ContextTimes(_) | Dim::ContextPages) => return Ok(handle),
             Some(Dim::Patches) => (patch.row_offset, patch.rows),
             Some(Dim::Images) => (patch.lane_offset, patch.lanes),
             Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
@@ -1431,29 +1552,28 @@ impl<'c> Run<'c> {
         self.slice(handle, skip, keep)
     }
 
-    fn compacted(&self, id: ValueId, handle: Tensor) -> Tensor {
+    fn compacted(&self, id: ValueId, handle: Tensor) -> Ran<Tensor> {
         let at = id.0 as usize;
-        let gathered = self
-            .window()
-            .gathered
-            .as_ref()
-            .expect("`compacted` is reached only through a gathered window");
+        let gathered =
+            self.window()?.gathered.as_ref().ok_or_else(|| {
+                run_fault("`compacted` was reached outside a gathered window".into())
+            })?;
         if let Def::Input(RuntimeInput::Geometry { kind }) = &self.values[at].def {
             let Some(table) = gathered.page_tables.get(self.table_of(*kind)) else {
-                return handle;
+                return Ok(handle);
             };
-            return match kind {
+            return Ok(match kind {
                 GeomKind::Indptr => table.page_indptr,
                 GeomKind::Indices => table.page_indices,
                 GeomKind::LastPageLen => table.last_page_lens,
                 GeomKind::KvLen => table.kv_len,
                 _ => handle,
-            };
+            });
         }
         let Ty::Tensor { shape, .. } = &self.values[at].ty else {
-            return handle;
+            return Ok(handle);
         };
-        match shape.first() {
+        Ok(match shape.first() {
             Some(Dim::Tokens) => {
                 assert_eq!(
                     self.copy.region,
@@ -1463,23 +1583,23 @@ impl<'c> Run<'c> {
                      nodes and this is what says the bracket was lost",
                 );
                 let Some(key) = self.address(handle.buf) else {
-                    panic!(
+                    return Err(run_fault(format!(
                         "value {at} is row-shaped and its handle {} resolves to no \
                          binding; every operand of a copied region was minted by this \
                          same fire",
                         handle.buf
-                    )
+                    )));
                 };
-                self.copy.tight(key).unwrap_or_else(|| {
-                    panic!(
+                self.copy.tight(key).ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} is row-shaped and its column was not compacted; the \
                          copy plan is built from the same region's operands the walk is \
                          dispatching, so a miss is a plan and a template built apart"
-                    )
-                })
+                    ))
+                })?
             }
             _ => handle,
-        }
+        })
     }
 
     pub(crate) fn resolvable(&self, id: ValueId) -> bool {
@@ -1490,108 +1610,130 @@ impl<'c> Run<'c> {
     }
 
     /// The fire's clip slots cut to this window's clips, indexed as its grids index lanes.
-    pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        let slots = self.fire.voxels.map(|voxels| voxels.slots)?;
-        let seated = self.window();
+    pub(crate) fn clip_slots(&self) -> Ran<Option<Tensor>> {
+        let Some(slots) = self.fire.voxels.map(|voxels| voxels.slots) else {
+            return Ok(None);
+        };
+        let seated = self.window()?;
         if seated.gathered.is_some() {
-            return Some(slots);
+            return Ok(Some(slots));
         }
-        Some(self.slice(slots, seated.voxel.lane_offset, seated.voxel.lanes))
+        Ok(Some(self.slice(
+            slots,
+            seated.voxel.lane_offset,
+            seated.voxel.lanes,
+        )?))
     }
 
     /// `mask`'s bits, else the fire's for a non-causal prefill (its classes stage every key).
-    pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Tensor {
-        mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
+    pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Ran<Tensor> {
+        mask.map_or(Ok(self.fire.tables.mask), |mask| self.tensor(mask))
     }
 
-    pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
-        self.cut(id, self.whole(id))
+    /// Axis `axis` of `id`'s stated shape where it is a constant: a
+    /// registered bank's rank, read off its declaration.
+    pub(crate) fn const_dim(&self, id: ValueId, axis: usize) -> Option<u32> {
+        let Ty::Tensor { shape, .. } = &self.values[id.0 as usize].ty else {
+            return None;
+        };
+        match shape.get(axis) {
+            Some(poem_ir::Dim::Const(n)) => u32::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tensor(&self, id: ValueId) -> Ran<Tensor> {
+        self.cut(id, self.whole(id)?)
     }
 
     /// The row `grid` addresses `rows`' row 0 at: the fire's grids hold fire-wide rows, so the
     /// window's first row; a grid an op derived counts from the window's first clip, so 0.
-    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
-        let seated = self.window();
+    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> Ran<u32> {
+        let seated = self.window()?;
         if seated.gathered.is_some()
             || !matches!(
                 self.values[grid.0 as usize].def,
                 Def::Input(RuntimeInput::Grid | RuntimeInput::TokenGrid { .. })
             )
         {
-            return 0;
+            return Ok(0);
         }
         let Ty::Tensor { shape, .. } = &self.values[rows.0 as usize].ty else {
-            return 0;
+            return Ok(0);
         };
-        match shape.first() {
+        Ok(match shape.first() {
             Some(Dim::Tokens) => seated.span.row_offset,
             Some(Dim::Voxels) => seated.voxel.row_offset,
             _ => 0,
-        }
+        })
     }
 
-    fn whole(&self, id: ValueId) -> Tensor {
+    fn whole(&self, id: ValueId) -> Ran<Tensor> {
         let at = id.0 as usize;
-        match &self.values[at].def {
+        Ok(match &self.values[at].def {
             Def::Input(RuntimeInput::Tokens) => self.fire.tokens,
             Def::Input(RuntimeInput::ReadoutRows) => self.fire.readout_rows,
-            Def::Input(RuntimeInput::Positions) => self.fire.positions,
+            Def::Input(RuntimeInput::Positions) => self.fire.rotations,
             Def::Input(RuntimeInput::Mask) => self.fire.tables.mask,
             Def::Input(RuntimeInput::AdapterRoutes) => {
-                self.fire.adapter_routes.unwrap_or_else(|| {
-                    panic!(
+                self.fire.adapter_routes.ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} reads this fire's adapter ids, which no lane of it \
                          carried"
-                    )
-                })
+                    ))
+                })?
             }
-            Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
-                panic!("value {at} reads this fire's patch rows, which no lane of it submitted")
-            }),
+            Def::Input(RuntimeInput::Patches) => self.fire.patches.ok_or_else(|| {
+                run_fault(format!(
+                    "value {at} reads this fire's patch rows, which no lane of it submitted"
+                ))
+            })?,
             Def::Input(RuntimeInput::PatchSegments) => {
-                self.fire.patch_segments.unwrap_or_else(|| {
-                    panic!(
+                self.fire.patch_segments.ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} reads this fire's image boundaries, which no lane of \
                          it submitted"
-                    )
-                })
+                    ))
+                })?
             }
-            Def::Input(RuntimeInput::PatchRoutes) => self.fire.patch_routes.unwrap_or_else(|| {
-                panic!(
+            Def::Input(RuntimeInput::PatchRoutes) => self.fire.patch_routes.ok_or_else(|| {
+                run_fault(format!(
                     "value {at} reads where this fire's tower rows land, which no lane \
                      of it submitted"
-                )
-            }),
+                ))
+            })?,
             Def::Input(RuntimeInput::PatchPositions) => {
-                self.fire.patch_positions.unwrap_or_else(|| {
-                    panic!(
+                self.fire.patch_positions.ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} reads this fire's patch grid positions, which no lane \
                          of it submitted"
-                    )
-                })
+                    ))
+                })?
             }
-            Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
-                panic!("value {at} reads this fire's image grids, which no lane of it submitted")
-            }),
+            Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.ok_or_else(|| {
+                run_fault(format!(
+                    "value {at} reads this fire's image grids, which no lane of it submitted"
+                ))
+            })?,
             Def::Input(RuntimeInput::MropePositions) => {
-                self.fire.mrope_positions.unwrap_or_else(|| {
-                    panic!(
+                self.fire.mrope_positions.ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} reads the fire's (t, h, w) token positions, and this \
                          load reserved no triple — the plan declares no multimodal rotation"
-                    )
-                })
+                    ))
+                })?
             }
             Def::Input(RuntimeInput::RowPermutation { select }) => {
-                self.packing(at, *select).permutation
+                self.packing(at, *select)?.permutation
             }
-            Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
+            Def::Input(RuntimeInput::Grid) => self.voxel_seat(at)?.grid,
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
-                self.voxel_seat(at).token_grid.unwrap_or_else(|| {
-                    panic!(
+                self.voxel_seat(at)?.token_grid.ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} reads the token side of the patchify pair, which this \
                          load carved none of"
-                    )
-                })
+                    ))
+                })?
             }
             // The seat is as wide as the widest voxel input; each is fed at
             // its own width.
@@ -1601,67 +1743,79 @@ impl<'c> Run<'c> {
                 ..
             }) => Tensor {
                 width: *width,
-                ..self.voxel_seat(at).payload
+                ..self.voxel_seat(at)?.payload
             },
-            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id)?,
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupOfLane,
                 ..
-            }) => self.fire.group_of_lane.unwrap_or_else(|| {
-                panic!("value {at} reads the group-of-lane table, which this load carved none of")
-            }),
+            }) => self.fire.group_of_lane.ok_or_else(|| {
+                run_fault(format!(
+                    "value {at} reads the group-of-lane table, which this load carved none of"
+                ))
+            })?,
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupIndptr { select },
                 ..
-            }) => self.packing(at, *select).group_indptr,
+            }) => self.packing(at, *select)?.group_indptr,
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::LaneIndptr { select },
                 ..
-            }) => self.packing(at, *select).lane_indptr,
+            }) => self.packing(at, *select)?.lane_indptr,
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::RequestOfToken,
                 ..
             }) => self.fire.tables.request_of_token,
             Def::Input(RuntimeInput::Geometry { kind }) => {
-                self.geometry_of(at, *kind, self.table_of(*kind))
+                self.geometry_of(at, *kind, self.table_of(*kind))?
             }
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
                     Some(WeightRow::Dense(handle)) => handle,
-                    Some(WeightRow::Planes(_)) => panic!(
-                        "value {at} is weight {row}, a split-plane bank; it resolves \
+                    Some(WeightRow::Planes(_)) => {
+                        return Err(run_fault(format!(
+                            "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
-                    ),
-                    None => panic!("value {at} is weight {row}, which the shell has not bound"),
+                        )));
+                    }
+                    None => {
+                        return Err(run_fault(format!(
+                            "value {at} is weight {row}, which the shell has not bound"
+                        )));
+                    }
                 }
             }
             Def::Op(_) | Def::Merge(_) => {
-                self.arena.0.get(at).copied().flatten().unwrap_or_else(|| {
-                    panic!("value {at} has no arena slot, which the compiler should have cut")
-                })
+                self.arena.0.get(at).copied().flatten().ok_or_else(|| {
+                    run_fault(format!(
+                        "value {at} has no arena slot, which the compiler should have cut"
+                    ))
+                })?
             }
-            Def::Cache(_) => panic!(
-                "value {at} is a cache row; it resolves to a pool through `Run::pool`, \
+            Def::Cache(_) => {
+                return Err(run_fault(format!(
+                    "value {at} is a cache row; it resolves to a pool through `Run::pool`, \
                  never to a tensor"
-            ),
-        }
+                )));
+            }
+        })
     }
 
-    pub(crate) fn ragged(&self, id: ValueId) -> RaggedTensor {
-        RaggedTensor {
-            data: self.tensor(id),
-            indptr: self.qo_indptr(),
-        }
+    pub(crate) fn ragged(&self, id: ValueId) -> Ran<RaggedTensor> {
+        Ok(RaggedTensor {
+            data: self.tensor(id)?,
+            indptr: self.qo_indptr()?,
+        })
     }
 
-    pub(crate) fn planes(&self, id: ValueId) -> Bank {
-        self.banked(id).unwrap_or_else(|| {
-            panic!(
+    pub(crate) fn planes(&self, id: ValueId) -> Ran<Bank> {
+        self.banked(id)?.ok_or_else(|| {
+            run_fault(format!(
                 "value {} is bound as one dense handle, and this op reads a split-plane \
                  bank",
                 id.0
-            )
+            ))
         })
     }
 
@@ -1724,16 +1878,20 @@ impl<'c> Run<'c> {
         self.weights.1.get(*w as usize).copied().flatten()
     }
 
-    pub(crate) fn banked(&self, id: ValueId) -> Option<Bank> {
+    pub(crate) fn banked(&self, id: ValueId) -> Ran<Option<Bank>> {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
-            panic!("value {at} is not a weight, and split-plane banks live in the weight table");
+            return Err(run_fault(format!(
+                "value {at} is not a weight, and split-plane banks live in the weight table"
+            )));
         };
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
-            Some(WeightRow::Planes(bank)) => Some(bank),
-            Some(WeightRow::Dense(_)) => None,
-            None => panic!("value {at} is weight {row}, which the shell has not bound"),
+            Some(WeightRow::Planes(bank)) => Ok(Some(bank)),
+            Some(WeightRow::Dense(_)) => Ok(None),
+            None => Err(run_fault(format!(
+                "value {at} is weight {row}, which the shell has not bound"
+            ))),
         }
     }
 
@@ -1741,17 +1899,22 @@ impl<'c> Run<'c> {
         self.scratch.experts(routes)
     }
 
-    pub(crate) fn routed_scratch(&self) -> Option<RoutedScratch> {
+    pub(crate) fn routed_scratch(&self) -> Ran<Option<RoutedScratch>> {
         self.table.set(None);
         self.routed_rooms()
     }
 
     /// The routed scratch, for a pass that may yet decline it: one that runs
     /// over it knocks the register table down itself ([`Run::knock_table`]).
-    pub(crate) fn routed_rooms(&self) -> Option<RoutedScratch> {
-        Some(self.scratch.routed(self.handles)?.unwrap_or_else(|fault| {
-            panic!("the routed scratch this load reserved does not mint: {fault}")
-        }))
+    pub(crate) fn routed_rooms(&self) -> Ran<Option<RoutedScratch>> {
+        self.scratch
+            .routed(self.handles)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the routed scratch this load reserved does not mint: {fault}"
+                ))
+            })
     }
 
     /// Forgets the register table: a pass wrote a scratch room the precast
@@ -1760,15 +1923,16 @@ impl<'c> Run<'c> {
         self.table.set(None);
     }
 
-    pub(crate) fn index_scores(&self) -> Option<Tensor> {
+    pub(crate) fn index_scores(&self) -> Ran<Option<Tensor>> {
         self.table.set(None);
-        Some(
-            self.scratch
-                .index_scores(self.handles)?
-                .unwrap_or_else(|fault| {
-                    panic!("the index score slab this load reserved does not mint: {fault}")
-                }),
-        )
+        self.scratch
+            .index_scores(self.handles)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the index score slab this load reserved does not mint: {fault}"
+                ))
+            })
     }
 
     /// The page table of the fire's that geometry input `kind` reads: the
@@ -1787,14 +1951,14 @@ impl<'c> Run<'c> {
     }
 
     /// Geometry input `at` (of `kind`) as page table `table` states it.
-    fn geometry_of(&self, at: usize, kind: GeomKind, table: usize) -> Tensor {
-        let seat = self.fire.geometry.get(table).unwrap_or_else(|| {
-            panic!(
+    fn geometry_of(&self, at: usize, kind: GeomKind, table: usize) -> Ran<Tensor> {
+        let seat = self.fire.geometry.get(table).ok_or_else(|| {
+            run_fault(format!(
                 "value {at} reads page table {table}, and this fire binds {} \
                  page tables",
                 self.fire.geometry.len()
-            )
-        });
+            ))
+        })?;
         let bound = match kind {
             GeomKind::Indptr => seat.indptr,
             GeomKind::Indices => seat.indices,
@@ -1809,11 +1973,11 @@ impl<'c> Run<'c> {
             | GeomKind::GroupIndptr { .. }
             | GeomKind::LaneIndptr { .. } => None,
         };
-        bound.unwrap_or_else(|| {
-            panic!(
+        bound.ok_or_else(|| {
+            run_fault(format!(
                 "value {at} reads {kind:?} of page table {table}, which this \
                  fire left unbound"
-            )
+            ))
         })
     }
 
@@ -1821,44 +1985,47 @@ impl<'c> Run<'c> {
     /// lengths are the ones `cache`'s own page table states. A plan reads
     /// the All axis's table (the kv list's), and a window list whose slot is
     /// smaller than the kv page counts another last page.
-    pub(crate) fn prefill_plan_over(&self, plan: ValueId, cache: ValueId) -> PrefillPlan {
-        let built = *self.prefill_plan(plan);
+    pub(crate) fn prefill_plan_over(&self, plan: ValueId, cache: ValueId) -> Ran<PrefillPlan> {
+        let built = *self.prefill_plan(plan)?;
         let Some(Def::Cache(row)) = self.values.get(cache.0 as usize).map(|v| &v.def) else {
-            return built;
+            return Ok(built);
         };
         let Some(table) = self.caches.tables.get(*row as usize).copied().flatten() else {
-            return built;
+            return Ok(built);
         };
         if table == 0 {
-            return built;
+            return Ok(built);
         }
-        let last_page_len = match &self.window().gathered {
+        let last_page_len = match &self.window()?.gathered {
             Some(gathered) => gathered
                 .page_tables
                 .get(table)
                 .map_or(built.last_page_len, |seat| seat.last_page_lens),
             None => {
-                let lens = self.geometry_of(cache.0 as usize, GeomKind::LastPageLen, table);
-                let span = self.window().span;
-                self.slice(lens, span.lane_offset, span.lanes)
+                let lens = self.geometry_of(cache.0 as usize, GeomKind::LastPageLen, table)?;
+                let span = self.window()?.span;
+                self.slice(lens, span.lane_offset, span.lanes)?
             }
         };
-        PrefillPlan {
+        Ok(PrefillPlan {
             last_page_len,
             ..built
-        }
+        })
     }
 
-    pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
+    pub(crate) fn pool_state(&self, pages: ValueId) -> Ran<Option<PoolSlabs>> {
         let at = pages.0 as usize;
         let Some(Def::Cache(row)) = self.values.get(at).map(|v| &v.def) else {
-            panic!("value {at} is not a cache row; the pooled state is keyed by one")
+            return Err(run_fault(format!(
+                "value {at} is not a cache row; the pooled state is keyed by one"
+            )));
         };
-        self.caches
+        Ok(self
+            .caches
             .compressed
             .iter()
             .find(|(held, _)| *held == *row)
-            .map(|&(_, slabs)| slabs)
+            .map(|&(_, slabs)| slabs))
     }
 
     pub(crate) fn ple_hash(
@@ -1866,40 +2033,43 @@ impl<'c> Run<'c> {
         mults: &[u64],
         primes: &[u64],
         offsets: &[u64],
-    ) -> Option<Tensor> {
-        Some(
-            self.scratch
-                .ple_hash(self.handles, mults, primes, offsets)?
-                .unwrap_or_else(|fault| {
-                    panic!("the PLE hash plane this load wrote does not mint: {fault}")
-                }),
-        )
+    ) -> Ran<Option<Tensor>> {
+        self.scratch
+            .ple_hash(self.handles, mults, primes, offsets)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the PLE hash plane this load wrote does not mint: {fault}"
+                ))
+            })
     }
 
     pub(crate) fn capacity(&self, id: ValueId) -> u32 {
         self.scratch.capacity(id)
     }
 
-    pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
+    pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Ran<Option<Tensor>> {
         self.table.set(None);
-        Some(
-            self.scratch
-                .precast(self.handles, rows, contraction)?
-                .unwrap_or_else(|fault| {
-                    panic!("the precast plane this load reserved does not mint: {fault}")
-                }),
-        )
+        self.scratch
+            .precast(self.handles, rows, contraction)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the precast plane this load reserved does not mint: {fault}"
+                ))
+            })
     }
 
-    pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Option<(Tensor, Tensor)> {
+    pub(crate) fn spatial_moments(&self, clips: u32, groups: u32) -> Ran<Option<(Tensor, Tensor)>> {
         self.table.set(None);
-        Some(
-            self.scratch
-                .spatial_moments(self.handles, clips, groups)?
-                .unwrap_or_else(|fault| {
-                    panic!("the moment planes this load reserved do not mint: {fault}")
-                }),
-        )
+        self.scratch
+            .spatial_moments(self.handles, clips, groups)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the moment planes this load reserved do not mint: {fault}"
+                ))
+            })
     }
 
     /// The register tile's input table for `act` in the precast room, and
@@ -1914,14 +2084,16 @@ impl<'c> Run<'c> {
         rows: u32,
         contraction: u32,
         counters: u32,
-    ) -> Option<(Tensor, bool)> {
-        let room = self
-            .scratch
-            .precast(self.handles, rows, contraction)?
-            .unwrap_or_else(|fault| {
-                panic!("the precast plane this load reserved does not mint: {fault}")
-            });
-        let rows = self.rows_here();
+    ) -> Ran<Option<(Tensor, bool)>> {
+        let Some(room) = self.scratch.precast(self.handles, rows, contraction) else {
+            return Ok(None);
+        };
+        let room = room.map_err(|fault| {
+            run_fault(format!(
+                "the precast plane this load reserved does not mint: {fault}"
+            ))
+        })?;
+        let rows = self.rows_here()?;
         let standing = self.table.get().is_some_and(|laid| {
             laid.act == act
                 && laid.rows == rows
@@ -1936,13 +2108,42 @@ impl<'c> Run<'c> {
                 counters,
             }));
         }
-        Some((room, standing))
+        Ok(Some((room, standing)))
     }
 
     /// The rows of a value the walk's place reads ([`Rows`]).
-    fn rows_here(&self) -> Rows {
-        let window = self.window();
-        if window.gathered.is_some() {
+    /// [`Run::precast`] for a kernel's callback: a room that does not mint
+    /// answers `None` and is kept for [`Run::settled`].
+    pub(crate) fn precast_for(&self, rows: u32, contraction: u32) -> Option<Tensor> {
+        self.noted(self.precast(rows, contraction))
+    }
+
+    /// [`Run::partials`] for a kernel's callback, as [`Run::precast_for`].
+    pub(crate) fn partials_for(&self, rows: u32, width: u32) -> Option<Tensor> {
+        self.noted(self.partials(rows, width))
+    }
+
+    /// A callback's answer: a fault is kept for [`Run::settled`], `None` given.
+    pub(crate) fn noted<T>(&self, ran: Ran<Option<T>>) -> Option<T> {
+        ran.unwrap_or_else(|fault| {
+            let first = self.deferred.take().unwrap_or(fault);
+            self.deferred.set(Some(first));
+            None
+        })
+    }
+
+    /// A node's outcome with the first room its kernel's callbacks could not
+    /// mint: that refusal, else `ran`.
+    pub(crate) fn settled(&self, ran: Ran<()>) -> Ran<()> {
+        match self.deferred.take() {
+            Some(fault) => Err(fault),
+            None => ran,
+        }
+    }
+
+    fn rows_here(&self) -> Ran<Rows> {
+        let window = self.window()?;
+        Ok(if window.gathered.is_some() {
             Rows::Region(
                 self.place.region.get(),
                 self.place.run.get(),
@@ -1953,17 +2154,18 @@ impl<'c> Run<'c> {
                 [window.span, window.patch, window.voxel],
                 self.place.tail.get(),
             )
-        }
+        })
     }
 
     /// Records that a segment launch here landed `ys` ahead of the nodes that
     /// write them.
-    pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 3]) {
+    pub(crate) fn land_ahead(&self, ys: [Option<ValueId>; 3]) -> Ran<()> {
         self.landed.set(Some(Landed {
             ys,
             region: self.place.region.get(),
-            rows: self.rows_here(),
+            rows: self.rows_here()?,
         }));
+        Ok(())
     }
 
     /// Whether a segment launch at this place already landed `y`; it is then
@@ -1973,7 +2175,7 @@ impl<'c> Run<'c> {
         let Some(mut landed) = self.landed.get() else {
             return false;
         };
-        if landed.region != self.place.region.get() || landed.rows != self.rows_here() {
+        if landed.region != self.place.region.get() || self.rows_here().ok() != Some(landed.rows) {
             self.landed.set(None);
             return false;
         }
@@ -1990,54 +2192,64 @@ impl<'c> Run<'c> {
     /// writes `value` (with the counters its widest register projection may
     /// take zeroed), when a projection of it runs on the register tile:
     /// recorded as standing, so the projections read it.
-    pub(crate) fn producer_table(&self, value: ValueId) -> Option<(Tensor, u32)> {
-        self.laid_table(value, self.register_readers(value)?)
+    pub(crate) fn producer_table(&self, value: ValueId) -> Ran<Option<(Tensor, u32)>> {
+        let Some(counters) = self.register_readers(value) else {
+            return Ok(None);
+        };
+        self.laid_table(value, counters)
     }
 
     /// [`Run::producer_table`] for a producer that knows its projection's
     /// counters (a fused MLP's swiglu, whose down the same node runs).
-    pub(crate) fn laid_table(&self, value: ValueId, counters: u32) -> Option<(Tensor, u32)> {
-        let width = self.tensor(value).width;
+    pub(crate) fn laid_table(&self, value: ValueId, counters: u32) -> Ran<Option<(Tensor, u32)>> {
+        let width = self.tensor(value)?.width;
         // The swiglu, gate and convolution producers stage at most 8192 of a row's inputs.
         if width > 8192 {
-            return None;
+            return Ok(None);
         }
         let rows = (17 * width + 4 * counters).div_ceil(2 * width);
-        let (table, _) = self.register_table(value, rows, width, counters)?;
-        Some((table, counters))
+        let Some((table, _)) = self.register_table(value, rows, width, counters)? else {
+            return Ok(None);
+        };
+        Ok(Some((table, counters)))
     }
 
-    pub(crate) fn partials(&self, rows: u32, width: u32) -> Option<Tensor> {
+    pub(crate) fn partials(&self, rows: u32, width: u32) -> Ran<Option<Tensor>> {
         if !self.scratch.partials_clear_of_precast() {
             self.table.set(None);
         }
-        Some(
-            self.scratch
-                .partials(self.handles, rows, width)?
-                .unwrap_or_else(|fault| {
-                    panic!("the partials plane this load reserved does not mint: {fault}")
-                }),
-        )
+        self.scratch
+            .partials(self.handles, rows, width)
+            .transpose()
+            .map_err(|fault| {
+                run_fault(format!(
+                    "the partials plane this load reserved does not mint: {fault}"
+                ))
+            })
     }
 
-    pub(crate) fn declared(&self, id: ValueId) -> StructKind {
-        match &self.values[id.0 as usize].ty {
+    pub(crate) fn declared(&self, id: ValueId) -> Ran<StructKind> {
+        Ok(match &self.values[id.0 as usize].ty {
             Ty::Struct(kind) => *kind,
-            Ty::Tensor { .. } => panic!(
-                "value {} declares a tensor, and a plan op defines a struct",
-                id.0
-            ),
-        }
+            Ty::Tensor { .. } => {
+                return Err(run_fault(format!(
+                    "value {} declares a tensor, and a plan op defines a struct",
+                    id.0
+                )));
+            }
+        })
     }
 
-    pub(crate) fn pool(&self, id: ValueId) -> &KvPool {
-        match self.cache(id) {
+    pub(crate) fn pool(&self, id: ValueId) -> Ran<&KvPool> {
+        Ok(match self.cache(id)? {
             CachePool::Kv(pool) => pool,
-            CachePool::Recurrent(_) => panic!(
-                "value {} is a recurrent state row, and this op walks a paged kv pool",
-                id.0
-            ),
-        }
+            CachePool::Recurrent(_) => {
+                return Err(run_fault(format!(
+                    "value {} is a recurrent state row, and this op walks a paged kv pool",
+                    id.0
+                )));
+            }
+        })
     }
 
     /// The lane table of record piece ids cache row `id`'s state reads.
@@ -2048,33 +2260,39 @@ impl<'c> Run<'c> {
         }
     }
 
-    pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {
-        match self.cache(id) {
+    pub(crate) fn recurrent(&self, id: ValueId) -> Ran<RecurrentPool> {
+        Ok(match self.cache(id)? {
             CachePool::Recurrent(pool) => RecurrentPool {
-                slots: self.cut_rows(pool.slots),
+                slots: self.cut_rows(pool.slots)?,
                 ..*pool
             },
-            CachePool::Kv(_) => panic!(
-                "value {} is a paged kv row, and this op scans a recurrent state pool",
-                id.0
-            ),
-        }
+            CachePool::Kv(_) => {
+                return Err(run_fault(format!(
+                    "value {} is a paged kv row, and this op scans a recurrent state pool",
+                    id.0
+                )));
+            }
+        })
     }
 
-    fn cache(&self, id: ValueId) -> &CachePool {
+    fn cache(&self, id: ValueId) -> Ran<&CachePool> {
         let at = id.0 as usize;
-        match &self.values[at].def {
+        Ok(match &self.values[at].def {
             Def::Cache(c) => {
                 let row = *c as usize;
-                self.caches.pools.get(row).unwrap_or_else(|| {
-                    panic!(
+                self.caches.pools.get(row).ok_or_else(|| {
+                    run_fault(format!(
                         "value {at} is cache row {row}, and the shell binds {} pools",
                         self.caches.pools.len()
-                    )
-                })
+                    ))
+                })?
             }
-            _ => panic!("value {at} is not a cache row; tensors resolve through `Run::tensor`"),
-        }
+            _ => {
+                return Err(run_fault(format!(
+                    "value {at} is not a cache row; tensors resolve through `Run::tensor`"
+                )));
+            }
+        })
     }
 
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
@@ -2082,27 +2300,31 @@ impl<'c> Run<'c> {
         self.structs[at] = Some(built);
     }
 
-    pub(crate) fn decode_plan(&self, id: ValueId) -> &DecodePlan {
-        match &self.structs[self.struct_at(id)] {
+    pub(crate) fn decode_plan(&self, id: ValueId) -> Ran<&DecodePlan> {
+        Ok(match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Decode(plan)) => plan,
-            Some(_) => panic!(
-                "value {} holds another plan kind, and this op consumes a decode plan",
-                id.0
-            ),
-            None => panic!(
-                "value {} holds no plan payload; its plan op has not fired, and the \
+            Some(_) => {
+                return Err(run_fault(format!(
+                    "value {} holds another plan kind, and this op consumes a decode plan",
+                    id.0
+                )));
+            }
+            None => {
+                return Err(run_fault(format!(
+                    "value {} holds no plan payload; its plan op has not fired, and the \
                  prepare phase runs first",
-                id.0
-            ),
-        }
+                    id.0
+                )));
+            }
+        })
     }
 
     /// The decode plan `id` as a query of readout rows reads it: each row
     /// attends as the token it reads out, its position, lane and mask flag
     /// those of that token, over this window's readouts.
-    pub(crate) fn readout_plan(&self, id: ValueId) -> DecodePlan {
-        let plan = *self.decode_plan(id);
-        let window = self.window();
+    pub(crate) fn readout_plan(&self, id: ValueId) -> Ran<DecodePlan> {
+        let plan = *self.decode_plan(id)?;
+        let window = self.window()?;
         assert!(
             window.gathered.is_none(),
             "a decode over readout rows runs in a window of whole lanes, and this one \
@@ -2114,12 +2336,12 @@ impl<'c> Run<'c> {
             window.span.lanes,
         );
         let t = &self.fire.tables;
-        DecodePlan {
-            positions: self.slice(t.readout_positions, skip, keep),
-            request_of_token: self.slice(t.readout_request_of_token, skip, keep),
-            mask_enabled: self.slice(t.readout_mask_enabled, skip, keep),
+        Ok(DecodePlan {
+            positions: self.slice(t.readout_positions, skip, keep)?,
+            request_of_token: self.slice(t.readout_request_of_token, skip, keep)?,
+            mask_enabled: self.slice(t.readout_mask_enabled, skip, keep)?,
             ..plan
-        }
+        })
     }
 
     /// Whether `id`'s rows are the fire's readouts rather than its tokens.
@@ -2130,19 +2352,23 @@ impl<'c> Run<'c> {
         )
     }
 
-    pub(crate) fn prefill_plan(&self, id: ValueId) -> &PrefillPlan {
-        match &self.structs[self.struct_at(id)] {
+    pub(crate) fn prefill_plan(&self, id: ValueId) -> Ran<&PrefillPlan> {
+        Ok(match &self.structs[self.struct_at(id)] {
             Some(StructSlot::Prefill(plan)) => plan,
-            Some(_) => panic!(
-                "value {} holds another plan kind, and this op consumes a prefill plan",
-                id.0
-            ),
-            None => panic!(
-                "value {} holds no plan payload; its plan op has not fired, and the \
+            Some(_) => {
+                return Err(run_fault(format!(
+                    "value {} holds another plan kind, and this op consumes a prefill plan",
+                    id.0
+                )));
+            }
+            None => {
+                return Err(run_fault(format!(
+                    "value {} holds no plan payload; its plan op has not fired, and the \
                  prepare phase runs first",
-                id.0
-            ),
-        }
+                    id.0
+                )));
+            }
+        })
     }
 }
 

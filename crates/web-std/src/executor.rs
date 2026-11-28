@@ -13,6 +13,14 @@ pub type WakeHook = fn();
 
 static WAKE_HOOK: OnceLock<WakeHook> = OnceLock::new();
 
+/// Asks the page for a tick, whether or not a task was woken: a callback
+/// that changed state some waiter reads on its next poll calls it.
+pub fn poke() {
+    if let Some(hook) = WAKE_HOOK.get() {
+        hook();
+    }
+}
+
 pub fn set_wake_hook(hook: WakeHook) {
     let _ = WAKE_HOOK.set(hook);
 }

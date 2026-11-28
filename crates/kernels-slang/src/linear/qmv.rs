@@ -5,7 +5,7 @@
 //! `lanes` subgroup lanes a column folding by shuffles, SPIR-V's subgroup
 //! tier).
 
-use crate::encode::{Arg, Ctx, Fire, Target, Tier, instantiated, refuse, stated};
+use crate::encode::{Fire, Target, Tier, instantiated, refuse};
 use crate::error::Error;
 use crate::linear::qmm::Bounds;
 
@@ -16,16 +16,22 @@ const QMV_ROW: &str = "linear/qmv_row.slang";
 /// Output columns a workgroup lands: four strips of two.
 const COLUMNS: u32 = 8;
 
-/// `y = dequant(w) x` over the bank `bounds` checked, `vecs` activation rows
-/// (1, 2, 4 or 8) a workgroup.
-pub(crate) fn fire(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, vecs: u32) -> Result<(), Error> {
+/// The kernel of `y = dequant(w) x` over the bank `bounds` checked, `vecs`
+/// activation rows (1, 2, 4 or 8) a workgroup; it takes the tiled rung's
+/// arguments.
+pub(crate) fn kernel(
+    target: Target,
+    op: &'static str,
+    b: &Bounds,
+    vecs: u32,
+) -> Result<Fire, Error> {
     if !matches!(vecs, 1 | 2 | 4 | 8) {
         return Err(refuse(
             op,
             format!("no vector point reads {vecs} rows a workgroup"),
         ));
     }
-    let chunk = if b.bits == 8 { 16 } else { 32 };
+    let chunk = chunk_codes(b.bits, vecs);
     if !b.k.is_multiple_of(chunk) {
         return Err(refuse(
             op,
@@ -36,7 +42,7 @@ pub(crate) fn fire(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, vecs: u32) -> Re
             ),
         ));
     }
-    if ctx.target() == Target::Wgsl && !b.n.is_multiple_of(2) {
+    if target == Target::Wgsl && !b.n.is_multiple_of(2) {
         return Err(refuse(
             op,
             format!(
@@ -58,21 +64,15 @@ pub(crate) fn fire(ctx: &Ctx<'_>, op: &'static str, b: &Bounds, vecs: u32) -> Re
             }
         ),
     )?;
-    ctx.fire(
-        Fire::at(QMV, entry)
-            .groups([b.n.div_ceil(COLUMNS), b.m.div_ceil(vecs), 1])
-            .group([32, 4, 1]),
-        &[
-            b.w.codes.arg(),
-            b.w.scales.arg(),
-            b.biases.arg(),
-            b.act.arg(),
-            b.y.arg_mut(),
-            stated(op, b.k)?.arg(),
-            stated(op, b.n)?.arg(),
-            stated(op, b.m)?.arg(),
-        ],
-    )
+    Ok(Fire::at(QMV, entry)
+        .groups([b.n.div_ceil(COLUMNS), b.m.div_ceil(vecs), 1])
+        .group([32, 4, 1]))
+}
+
+/// The codes a lane walks the contraction by: a lane holds `vecs` rows of
+/// them as floats, at most 128 (`qmv.slang`'s rule), so eight rows take 16.
+fn chunk_codes(bits: u32, vecs: u32) -> u32 {
+    if vecs == 8 || bits == 8 { 16 } else { 32 }
 }
 
 /// Whether the one-row point serves a bank: it loads 128 bits of codes at
@@ -82,15 +82,15 @@ pub fn row_fits(group: u32, bits: u32) -> bool {
     matches!(bits, 4 | 8) && 128 / bits <= group
 }
 
-/// `y = dequant(w) x` for one activation row: `lanes` (8, 16 or 32) subgroup
-/// lanes a column, `rows` (1 or 2) columns a lane.
-pub(crate) fn fire_row(
-    ctx: &Ctx<'_>,
+/// The kernel of `y = dequant(w) x` for one activation row: `lanes` (8, 16
+/// or 32) subgroup lanes a column, `rows` (1 or 2) columns a lane; it takes
+/// the tiled rung's arguments.
+pub(crate) fn row_kernel(
     op: &'static str,
     b: &Bounds,
     lanes: u32,
     rows: u32,
-) -> Result<(), Error> {
+) -> Result<Fire, Error> {
     if b.m != 1 {
         return Err(refuse(
             op,
@@ -128,20 +128,8 @@ pub(crate) fn fire_row(
         },
     )?;
     // 256 invocations land 256 / lanes columns, `rows` each.
-    ctx.fire(
-        Fire::at(QMV_ROW, entry)
-            .tier(Tier::Subgroup)
-            .groups([b.n.div_ceil(256 / lanes * rows), 1, 1])
-            .group([64, 4, 1]),
-        &[
-            b.w.codes.arg(),
-            b.w.scales.arg(),
-            b.biases.arg(),
-            b.act.arg(),
-            b.y.arg_mut(),
-            stated(op, b.k)?.arg(),
-            stated(op, b.n)?.arg(),
-            stated(op, b.m)?.arg(),
-        ],
-    )
+    Ok(Fire::at(QMV_ROW, entry)
+        .tier(Tier::Subgroup)
+        .groups([b.n.div_ceil(256 / lanes * rows), 1, 1])
+        .group([64, 4, 1]))
 }

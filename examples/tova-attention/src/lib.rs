@@ -1,6 +1,9 @@
 //! TOVA — Token Omission Via Attention (Oren et al., 2024), <https://arxiv.org/abs/2401.06104>.
 //!
-//! Observes only: nothing is masked, so the text must match `naive-baseline`'s.
+//! Observes only: nothing is masked, so given the same prompt, temperature,
+//! seed and `max_tokens` the text must match `naive-baseline`'s — it draws
+//! from `naive-baseline`'s streams, `seed` for the prefill and `seed ^ 0x5bd1`
+//! for the decode.
 
 use inferlet::eta::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -18,8 +21,6 @@ struct Input {
     /// KV positions TOVA would keep.
     #[serde(default = "default_cache_size")]
     cache_size: u32,
-    #[serde(default = "default_heads")]
-    heads: u32,
 }
 
 fn default_prompt() -> String {
@@ -37,10 +38,6 @@ fn default_seed() -> u32 {
 fn default_cache_size() -> u32 {
     16
 }
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
-}
 
 #[derive(Serialize)]
 struct Output {
@@ -51,7 +48,6 @@ struct Output {
     /// Live KV positions at the last observed step.
     kv_len: u32,
     cache_size: u32,
-    layers_observed: u32,
     /// Slots inside the live prefix that carry a finite, non-negative score.
     live_scored: usize,
     /// Slots past the live prefix. Every one of them must be exactly zero.
@@ -85,27 +81,15 @@ async fn main(input: Input) -> Result<Output> {
     if input.cache_size == 0 {
         return Err("cache_size must be at least 1".into());
     }
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
-    let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
-        return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
-        ));
-    }
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -139,6 +123,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let toks_p = Channel::from(&prompt_i32[..]);
     let embed_indptr_p = Channel::from([0u32, n]);
+    // `naive-baseline`'s streams, since the text is compared against it.
     let rng_p = Channel::from([input.seed, 0]);
     let tok_out_p = Channel::new([1], dtype::i32);
 
@@ -168,7 +153,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE LOOP (1-wide, run-ahead), with the TOVA tap. ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from([g0]);
-        let rng = Channel::from([input.seed ^ 0x70a, 0]);
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]);
         let tok_out = Channel::new([1], dtype::i32).capacity(channel_capacity() as u32);
         let lane1 = Channel::from([0u32, 1u32]);
         let scores_out = Channel::new([kv_max], dtype::f32).capacity(channel_capacity() as u32);
@@ -186,9 +171,7 @@ async fn main(input: Input) -> Result<Output> {
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
 
-            // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-            let folded = &reduce_sum(transpose(&rect)) / heads_f;
+            let folded = reshape(intrinsics::output(0, "attn.scores"), [score_kv]);
             scores_out.put(gather(&folded, iota(kv_max)));
         });
 
@@ -238,7 +221,6 @@ async fn main(input: Input) -> Result<Output> {
         kv_max,
         kv_len: last_kv_len,
         cache_size,
-        layers_observed: layers,
         live_scored: last_scores[..live]
             .iter()
             .filter(|s| s.is_finite() && **s >= 0.0)

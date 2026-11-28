@@ -10,6 +10,7 @@
 use std::fmt::{self, Write as _};
 
 mod view;
+pub use view::BankAt;
 pub use view::LANES as POOL_LANES;
 pub use view::Order as PoolOrder;
 
@@ -272,12 +273,17 @@ pub struct Func {
     /// Parameters laid out row-major (`pin_row_major`), and whether every
     /// result is.
     row_major: Vec<usize>,
+    /// Parameters that live in pinned host memory (`pin_host`).
+    host_params: Vec<usize>,
     row_major_results: bool,
     /// From this many rows a narrow-head rope turns the row as it lies
     /// (`tuning::RopeFlatRows`; 0 never).
     rope_flat_rows: i64,
     /// Views of the chunk pool ([`Func::pool_view`]): values with no text.
     views: std::collections::HashMap<u32, view::View>,
+    /// Banks whose experts lie in the pool ([`Func::bank_view`]): values
+    /// with no text.
+    banks: std::collections::HashMap<u32, view::BankAt>,
     /// What views were materialized for (each a copy of the pool).
     materialized: Vec<String>,
     /// Pool view reads by XLA's gather, not a DMA kernel call (see
@@ -286,6 +292,72 @@ pub struct Func {
     /// From this many rows a dot's wide activation is laid out before it
     /// (`tuning::DotBarrierRows`; 0 never).
     dot_barrier_rows: i64,
+    /// The values of the pure ops emitted at the body's top level, by their
+    /// text with the names they mint made canonical (`Func::shared`): an op
+    /// emitted again with the same operands is the value it already is.
+    shared: std::collections::HashMap<String, Vec<Val>>,
+    /// The in-place chains ([`Func::fence`]): each value descended from a
+    /// parameter by in-place writes and views, by the version it is of (the
+    /// parameter or the write that made it).
+    chain_of: std::collections::HashMap<u32, u32>,
+    /// Each version's top-level reads since it was made: the values of ops
+    /// that read it.
+    chain_reads: std::collections::HashMap<u32, Vec<Val>>,
+    /// The `(operand, result)` pairs the next `op_named` writes in place
+    /// (`custom_call_aliased`).
+    pending_writes: Vec<(usize, usize)>,
+    /// The versions ops inside a region read: reads of the top-level op the
+    /// region is in, credited when it is done.
+    region_reads: Vec<u32>,
+}
+
+/// `text` (an op the body emitted, `first` its own id) with every name it
+/// mints (`%N`, `%bN` with `N >= first`) made relative to `first`, and its
+/// locations cut: two emissions of one op over the same operands read the
+/// same.
+fn canonical(text: &str, first: u32) -> String {
+    let mut out = String::with_capacity(text.len());
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if text[i..].starts_with(" loc(\"") {
+            // a location ends at its closing quote and paren
+            if let Some(end) = text[i + 6..].find("\")") {
+                i += 6 + end + 2;
+                continue;
+            }
+        }
+        if b[i] == b'%' {
+            let mut j = i + 1;
+            let block = j < b.len() && b[j] == b'b';
+            if block {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start
+                && let Ok(n) = text[start..j].parse::<u32>()
+            {
+                out.push('%');
+                if block {
+                    out.push('b');
+                }
+                if n >= first {
+                    out.push('~');
+                    out.push_str(&(n - first).to_string());
+                } else {
+                    out.push_str(&n.to_string());
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn list<T: fmt::Display>(xs: &[T]) -> String {
@@ -395,12 +467,19 @@ impl Func {
             next: 0,
             scope: None,
             row_major: Vec::new(),
+            host_params: Vec::new(),
             row_major_results: false,
             rope_flat_rows: 0,
             views: std::collections::HashMap::new(),
+            banks: std::collections::HashMap::new(),
             materialized: Vec::new(),
             xla_reads: false,
             dot_barrier_rows: 0,
+            shared: std::collections::HashMap::new(),
+            chain_of: std::collections::HashMap::new(),
+            chain_reads: std::collections::HashMap::new(),
+            pending_writes: Vec::new(),
+            region_reads: Vec::new(),
         }
     }
 
@@ -508,7 +587,112 @@ impl Func {
         let name = format!("%arg{}", self.params.len());
         let v = self.fresh(name, ty);
         self.params.push((v, alias));
+        self.chain_of.insert(v.0, v.0);
+        self.chain_reads.insert(v.0, Vec::new());
         v
+    }
+
+    /// Before an op writes `operands[w]` in place (each `(w, _)` of
+    /// `writes`), at the top level: when that operand is a version of a
+    /// parameter some op has read, an `optimization_barrier` over it and
+    /// every such read, and the write takes the operand from the barrier. A
+    /// write of a buffer is then after every read of it the program made
+    /// before, in any schedule: XLA updates it in place rather than keeping
+    /// the version read later as a copy (v6e Qwen3.5-0.8B, 64 lanes of 1024
+    /// rows: a schedule reading the pool after a kernel wrote it kept a
+    /// second 22 GiB pool, 46.4 GB of temporaries for 31.2).
+    fn fence(&mut self, operands: &mut [Val], writes: &[(usize, usize)]) {
+        if self.depth != 1 {
+            return;
+        }
+        for &(w, _) in writes {
+            let Some(&x) = operands.get(w) else { continue };
+            let Some(&k) = self.chain_of.get(&x.0) else {
+                continue;
+            };
+            let reads = self
+                .chain_reads
+                .get_mut(&k)
+                .map(std::mem::take)
+                .unwrap_or_default();
+            if reads.is_empty() {
+                continue;
+            }
+            let mut ins = vec![x];
+            ins.extend(reads);
+            let id = self.next;
+            self.next += 1;
+            let tys: Vec<Ty> = ins.iter().map(|&v| self.ty(v).clone()).collect();
+            let text = format!(
+                "%{id}:{} = \"stablehlo.optimization_barrier\"({}) : ({}) -> ({})",
+                ins.len(),
+                self.names_of(&ins),
+                self.tys_of(&ins),
+                list(&tys)
+            );
+            self.line(&text);
+            let mut first = None;
+            for (i, ty) in tys.into_iter().enumerate() {
+                let v = self.fresh(format!("%{id}#{i}"), ty);
+                first.get_or_insert(v);
+            }
+            let fenced = first.expect("a barrier's first value");
+            self.chain_of.insert(fenced.0, k);
+            for o in operands.iter_mut() {
+                if *o == x {
+                    *o = fenced;
+                }
+            }
+        }
+    }
+
+    /// After a top-level op over `operands` made `results`: a write's
+    /// result starts a version of its own, a view of a version is that
+    /// version, and any other op over a version is a read of it.
+    fn chain_note(
+        &mut self,
+        op: &str,
+        operands: &[Val],
+        writes: &[(usize, usize)],
+        results: &[Val],
+    ) {
+        if self.depth != 1 {
+            for x in operands {
+                if let Some(&k) = self.chain_of.get(&x.0) {
+                    self.region_reads.push(k);
+                }
+            }
+            return;
+        }
+        for k in std::mem::take(&mut self.region_reads) {
+            if let Some(reads) = self.chain_reads.get_mut(&k) {
+                reads.extend_from_slice(results);
+            }
+        }
+        let mut written = Vec::new();
+        for &(w, r) in writes {
+            if let (Some(x), Some(&v)) = (operands.get(w), results.get(r))
+                && self.chain_of.contains_key(&x.0)
+            {
+                self.chain_of.insert(v.0, v.0);
+                self.chain_reads.insert(v.0, Vec::new());
+                written.push(w);
+            }
+        }
+        let view = matches!(op, "stablehlo.reshape" | "stablehlo.bitcast_convert");
+        for (i, x) in operands.iter().enumerate() {
+            if written.contains(&i) {
+                continue;
+            }
+            let Some(&k) = self.chain_of.get(&x.0) else {
+                continue;
+            };
+            if view && let [v] = results {
+                self.chain_of.insert(v.0, k);
+            } else if let Some(reads) = self.chain_reads.get_mut(&k) {
+                reads.extend_from_slice(results);
+            }
+        }
     }
 
     /// Lays parameter `v` out row-major, and the result it is donated to:
@@ -519,6 +703,26 @@ impl Func {
         if let Some(at) = self.params.iter().position(|(p, _)| *p == v) {
             self.row_major.push(at);
         }
+    }
+
+    /// Parameter `v` lives in pinned host memory: the program reads it
+    /// only through [`Func::to_device`] of slices of it.
+    pub fn pin_host(&mut self, v: Val) {
+        if let Some(at) = self.params.iter().position(|(p, _)| *p == v) {
+            self.host_params.push(at);
+        }
+    }
+
+    /// `x` (a slice of a host parameter) moved to the device.
+    pub fn to_device(&mut self, x: Val) -> Val {
+        let ty = self.ty(x).clone();
+        self.op_named(
+            "stablehlo.custom_call",
+            &[x],
+            "call_target_name = \"annotate_device_placement\", has_side_effect = true, \
+             mhlo.frontend_attributes = {_xla_buffer_placement = \"device\"}",
+            vec![ty],
+        )[0]
     }
 
     /// Lays every result out row-major.
@@ -536,22 +740,45 @@ impl Func {
 
     /// Emits `op` with generic syntax; one result.
     fn op(&mut self, op: &str, operands: &[Val], attrs: &str, out: Ty) -> Val {
-        let operands = &self.solid(operands, op);
-        let id = self.next;
-        self.next += 1;
-        let name = format!("%{id}");
+        let mut operands = self.solid(operands, op);
+        let writes: &[(usize, usize)] = if op == "dynamic_update_slice" {
+            &[(0, 0)]
+        } else {
+            &[]
+        };
+        self.fence(&mut operands, writes);
+        let v = self.op_solid(op, &operands, attrs, out);
+        self.chain_note(&format!("stablehlo.{op}"), &operands, writes, &[v]);
+        v
+    }
+
+    fn op_solid(&mut self, op: &str, operands: &[Val], attrs: &str, out: Ty) -> Val {
         let attrs = if attrs.is_empty() {
             String::new()
         } else {
             format!(" {{{attrs}}}")
         };
-        let text = format!(
-            "{name} = \"stablehlo.{op}\"({}){attrs} : ({}) -> {out}",
+        let rest = format!(
+            "\"stablehlo.{op}\"({}){attrs} : ({}) -> {out}",
             self.names_of(operands),
             self.tys_of(operands)
         );
-        self.line(&text);
-        self.fresh(name, out)
+        // A pure op at the top level over the same operands is the value it
+        // already is: a fire's values each layer derives alike (its tables'
+        // reads, a lane's ranges, the page lists) are derived once.
+        let top = self.depth == 1;
+        if top && let Some(v) = self.shared.get(&rest) {
+            return v[0];
+        }
+        let id = self.next;
+        self.next += 1;
+        let name = format!("%{id}");
+        self.line(&format!("{name} = {rest}"));
+        let v = self.fresh(name, out);
+        if top {
+            self.shared.insert(rest, vec![v]);
+        }
+        v
     }
 
     /// Emits an op of any dialect (`"chlo.ragged_dot"`) with generic
@@ -563,7 +790,21 @@ impl Func {
         attrs: &str,
         outs: Vec<Ty>,
     ) -> Vec<Val> {
-        let operands = &self.solid(operands, name);
+        let writes = std::mem::take(&mut self.pending_writes);
+        let mut operands = self.solid(operands, name);
+        self.fence(&mut operands, &writes);
+        let vs = self.op_named_solid(name, &operands, attrs, outs);
+        self.chain_note(name, &operands, &writes, &vs);
+        vs
+    }
+
+    fn op_named_solid(
+        &mut self,
+        name: &str,
+        operands: &[Val],
+        attrs: &str,
+        outs: Vec<Ty>,
+    ) -> Vec<Val> {
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -582,13 +823,19 @@ impl Func {
         } else {
             format!("({})", list(&outs))
         };
-        let text = format!(
-            "{head} = \"{name}\"({}){attrs} : ({}) -> {results}",
+        let rest = format!(
+            "\"{name}\"({}){attrs} : ({}) -> {results}",
             self.names_of(operands),
             self.tys_of(operands)
         );
-        self.line(&text);
-        outs.into_iter()
+        // A kernel call is never shared: it may write an operand in place.
+        let top = self.depth == 1 && name != "stablehlo.custom_call";
+        if top && let Some(vs) = self.shared.get(&rest) {
+            return vs.clone();
+        }
+        self.line(&format!("{head} = {rest}"));
+        let vs: Vec<Val> = outs
+            .into_iter()
             .enumerate()
             .map(|(i, ty)| {
                 let n = if single {
@@ -598,7 +845,11 @@ impl Func {
                 };
                 self.fresh(n, ty)
             })
-            .collect()
+            .collect();
+        if top {
+            self.shared.insert(rest, vs.clone());
+        }
+        vs
     }
 
     /// `stablehlo.custom_call @target` (API version 1) with a string
@@ -624,6 +875,14 @@ impl Func {
         outs: Vec<Ty>,
         aliases: &[(usize, usize)],
     ) -> Vec<Val> {
+        // An operand a result is written over in place is spent: a value
+        // shared by its op text (`Func::shared`) is no longer what that text
+        // makes, so a later emission of the text is its own value.
+        for &(_, operand) in aliases {
+            if let Some(&v) = operands.get(operand) {
+                self.shared.retain(|_, vs| !vs.contains(&v));
+            }
+        }
         let layout = |t: &Ty| {
             let r = t.rank();
             let order: Vec<i64> = (0..r as i64).rev().collect();
@@ -667,6 +926,10 @@ impl Func {
                 .collect();
             attrs.push_str(&format!(", output_operand_aliases = [{}]", list.join(", ")));
         }
+        self.pending_writes = aliases
+            .iter()
+            .map(|&(out, operand)| (operand, out))
+            .collect();
         self.op_named("stablehlo.custom_call", operands, &attrs, outs)
     }
 
@@ -679,7 +942,13 @@ impl Func {
                 .unwrap_or_else(|| Ty::scalar(Elem::F32));
             return vec![self.op(op, operands, attrs, out)];
         }
-        let operands = &self.solid(operands, op);
+        let operands = self.solid(operands, op);
+        let vs = self.op_n_solid(op, &operands, attrs, outs);
+        self.chain_note(&format!("stablehlo.{op}"), &operands, &[], &vs);
+        vs
+    }
+
+    fn op_n_solid(&mut self, op: &str, operands: &[Val], attrs: &str, outs: Vec<Ty>) -> Vec<Val> {
         let id = self.next;
         self.next += 1;
         let attrs = if attrs.is_empty() {
@@ -687,18 +956,27 @@ impl Func {
         } else {
             format!(" {{{attrs}}}")
         };
-        let text = format!(
-            "%{id}:{} = \"stablehlo.{op}\"({}){attrs} : ({}) -> ({})",
-            outs.len(),
+        let rest = format!(
+            "\"stablehlo.{op}\"({}){attrs} : ({}) -> ({})",
             self.names_of(operands),
             self.tys_of(operands),
             list(&outs)
         );
+        let top = self.depth == 1;
+        if top && let Some(vs) = self.shared.get(&rest) {
+            return vs.clone();
+        }
+        let text = format!("%{id}:{} = {rest}", outs.len());
         self.line(&text);
-        outs.into_iter()
+        let vs: Vec<Val> = outs
+            .into_iter()
             .enumerate()
             .map(|(i, ty)| self.fresh(format!("%{id}#{i}"), ty))
-            .collect()
+            .collect();
+        if top {
+            self.shared.insert(rest, vs.clone());
+        }
+        vs
     }
 
     /// Emits an op carrying one region. `region` receives the block arguments
@@ -712,9 +990,27 @@ impl Func {
         attrs: &str,
         outs: Vec<Ty>,
     ) -> Built<Vec<Val>> {
-        let operands = &self.solid(operands, op);
+        let mut operands = self.solid(operands, op);
+        let writes: &[(usize, usize)] = if op == "scatter" { &[(0, 0)] } else { &[] };
+        self.fence(&mut operands, writes);
+        let vs = self.op_region_solid(op, &operands, block, region, attrs, outs)?;
+        self.chain_note(&format!("stablehlo.{op}"), &operands, writes, &vs);
+        Ok(vs)
+    }
+
+    fn op_region_solid(
+        &mut self,
+        op: &str,
+        operands: &[Val],
+        block: &[Ty],
+        region: impl FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>>,
+        attrs: &str,
+        outs: Vec<Ty>,
+    ) -> Built<Vec<Val>> {
         let id = self.next;
         self.next += 1;
+        let top = self.depth == 1;
+        let from = self.body.len();
         let head = if outs.len() == 1 {
             format!("%{id}")
         } else {
@@ -738,8 +1034,16 @@ impl Func {
             list(&outs)
         );
         self.line(&text);
+        // The same op over the same operands, its region alike, emitted at
+        // the top level before: its values (the text just emitted is cut).
+        let key = top.then(|| canonical(&self.body[from..], id));
+        if let Some(vs) = key.as_ref().and_then(|k| self.shared.get(k)) {
+            let vs = vs.clone();
+            self.body.truncate(from);
+            return Ok(vs);
+        }
         let single = outs.len() == 1;
-        Ok(outs
+        let vs: Vec<Val> = outs
             .into_iter()
             .enumerate()
             .map(|(i, ty)| {
@@ -750,7 +1054,11 @@ impl Func {
                 };
                 self.fresh(name, ty)
             })
-            .collect())
+            .collect();
+        if let Some(k) = key {
+            self.shared.insert(k, vs.clone());
+        }
+        Ok(vs)
     }
 
     fn block(
@@ -796,6 +1104,10 @@ impl Func {
                 s.push_str(", ");
             }
             let _ = write!(s, "{}: {}", self.name(*v), self.ty(*v));
+            if self.host_params.contains(&i) {
+                s.push_str(" {mhlo.memory_kind = \"pinned_host\"}");
+                continue;
+            }
             let pinned = self.row_major.contains(&i);
             match (pinned, alias) {
                 (true, Some(out)) => {
@@ -1877,6 +2189,26 @@ impl Func {
         )
     }
 
+    /// The `k` largest of `x` along its last axis, descending, and their
+    /// indices (i32): `chlo.top_k`, equal elements in index order.
+    pub fn top_k(&mut self, x: Val, k: i64) -> Built<(Val, Val)> {
+        let mut dims = self.dims(x).to_vec();
+        let n = *dims.last().ok_or_else(|| Malformed {
+            op: "chlo.top_k",
+            detail: "a scalar has no last axis".into(),
+        })?;
+        if k < 1 || k > n {
+            return Err(Malformed {
+                op: "chlo.top_k",
+                detail: format!("top-{k} of {n}"),
+            });
+        }
+        *dims.last_mut().expect("a last axis") = k;
+        let outs = vec![Ty::new(self.elem(x), &dims), Ty::new(Elem::I32, &dims)];
+        let vs = self.op_named("chlo.top_k", &[x], &format!("k = {k} : i64"), outs);
+        Ok((vs[0], vs[1]))
+    }
+
     // ---------------------------------------------------------------- control
 
     /// `while` over loop-carried `inits`: `cond` yields an i1 scalar, `body`
@@ -1912,6 +2244,25 @@ impl Func {
     /// The `while` itself (no carried views).
     #[allow(clippy::type_complexity)]
     fn emit_while(
+        &mut self,
+        inits: &[Val],
+        cond: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Val> + '_>,
+        body: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Vec<Val>> + '_>,
+    ) -> Built<Vec<Val>> {
+        // a carried version is written: the loop yields its next one
+        let writes: Vec<(usize, usize)> = (0..inits.len())
+            .filter(|&i| self.chain_of.contains_key(&inits[i].0))
+            .map(|i| (i, i))
+            .collect();
+        let mut inits = inits.to_vec();
+        self.fence(&mut inits, &writes);
+        let vs = self.emit_while_solid(&inits, cond, body)?;
+        self.chain_note("stablehlo.while", &inits, &writes, &vs);
+        Ok(vs)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn emit_while_solid(
         &mut self,
         inits: &[Val],
         cond: Box<dyn FnOnce(&mut Self, &[Val]) -> Built<Val> + '_>,
@@ -2033,6 +2384,7 @@ impl Func {
                 self.fresh(name, ty.clone())
             })
             .collect();
+        self.chain_note("stablehlo.case", &[index], &[], &out);
         self.review(&out, &kinds)
     }
 

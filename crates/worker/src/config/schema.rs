@@ -17,12 +17,7 @@ pub struct Field {
 
 /// The tuning keys: each default measured, and part of what the runtime was
 /// tuned against.
-const TUNING: &[&str] = &[
-    "runtime.submit_deadline",
-    "runtime.silence_timeout",
-    "runtime.frame_size",
-    "runtime.frame_dispatch_depth",
-];
+const TUNING: &[&str] = &["runtime.frame_size", "runtime.frame_dispatch_depth"];
 
 struct Parsed {
     name: String,
@@ -97,9 +92,7 @@ fn parse_structs_in(source: &str) -> BTreeMap<String, Vec<Parsed>> {
                         .map(|s| s.as_str())
                         .collect::<Vec<_>>()
                         .join(" "),
-                    skip: attr_text.contains("skip)")
-                        || attr_text.contains("skip,")
-                        || ty.trim().starts_with("Removed<"),
+                    skip: attr_text.contains("skip)") || attr_text.contains("skip,"),
                     required: !struct_defaults_all && !attr_text.contains("default"),
                 });
             }
@@ -269,35 +262,6 @@ mod tests {
         the_summary_stops_at_the_blank_doc_line();
         a_derived_field_has_no_default_to_print();
         a_free_form_table_is_a_leaf_not_the_options_struct();
-        a_removed_key_is_not_listed();
-    }
-
-    fn a_removed_key_is_not_listed() {
-        let source = "pub struct Options {\n    \
-                      pub kept: Option<u32>,\n    \
-                      #[serde(default, skip_serializing)]\n    \
-                      pub old_knob: Removed<OldKnob>,\n}\n";
-        let parsed = parse_structs_in(source);
-        let options = &parsed["Options"];
-        let listed: Vec<(&str, bool)> = options.iter().map(|f| (f.name.as_str(), f.skip)).collect();
-        assert_eq!(listed, [("kept", false), ("old_knob", true)]);
-        for engine in [
-            EngineKind::Cuda,
-            EngineKind::Metal,
-            EngineKind::Vulkan,
-            EngineKind::Wgpu,
-            EngineKind::Xla,
-            EngineKind::Cerebras,
-        ] {
-            for field in fields(engine) {
-                assert!(
-                    crate::config::removed::refusal_for(&field.key).is_none(),
-                    "{} lists the removed key {}",
-                    engine.as_str(),
-                    field.key
-                );
-            }
-        }
     }
 
     fn a_free_form_table_is_a_leaf_not_the_options_struct() {
@@ -373,7 +337,12 @@ mod tests {
         let fields = fields(EngineKind::Cuda);
         let by_key = |k: &str| fields.iter().find(|f| f.key == k).expect(k);
         assert!(by_key("runtime.max_concurrent_processes").default.is_none());
-        assert!(by_key("engine.kv_page_size").default.is_none());
+        assert!(by_key("engine.max_context").default.is_none());
+        assert!(by_key("engine.memory.budget_device").default.is_none());
+        assert!(
+            by_key("engine.memory.yield").default.is_none(),
+            "the engine's memory decides it"
+        );
         assert_eq!(
             by_key("server.listen").default,
             Some(toml::Value::String("127.0.0.1:8080".into()))

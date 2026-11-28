@@ -5,13 +5,14 @@
 #include "prim/pool.slang"
 
 // Paged attention over a KV cache, bf16 two a word, causal (an optional
-// sliding window, an optional per-row byte mask). Decode reads one query row
-// a workgroup (per head): the workgroup's subgroups (the subgroup tier,
-// SPIR-V only) or 32-lane strips (the baseline, reduced through workgroup
-// memory) each walk a share of the keys with an online softmax and fold at
-// the end. The subgroup tier reads a bf16 value a lane and the mask a byte
-// at a time as 16- and 8-bit storage (the same bytes as the packed words),
-// one load a dim: engine-vulkan's decode, kept as it was measured.
+// sliding window, each row's byte mask from its lane's committed boundary on,
+// per-row data: a row stating none reads every key in the same kernel). Decode reads one query row a workgroup (per head): the
+// workgroup's subgroups (the subgroup tier, SPIR-V only) or 32-lane strips
+// (the baseline, reduced through workgroup memory) each walk a share of the
+// keys with an online softmax and fold at the end. The subgroup tier reads a
+// bf16 value a lane and the mask a byte at a time as 16- and 8-bit storage
+// (the same bytes as the packed words), one load a dim: engine-vulkan's
+// decode, kept as it was measured.
 // Variants: the row's base-2 LSE (`PIE_LSE`); the keys a block selection
 // names (`PIE_SELECTED`); one of `splits` key ranges a workgroup, landing f32
 // partials and their LSE for the fold (`PIE_SPLIT`, `PIE_SPLIT_LSE`).
@@ -62,8 +63,12 @@ struct Params {
     int n_rows;
     int q_heads;
     int head_dim;
+    // The fire row the window's row 0 is: `o` and the LSE are the fire's
+    // whole planes, the partials the window's own. Fired: it moves with the
+    // rows of the classes before the window.
+    uint row0;
 };
-PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 
 bool finite_(float x) {
     return abs(x) < 3.0e38;
@@ -77,19 +82,19 @@ void main(uint3 gid : SV_DispatchThreadID) {
     uint width = uint(params.q_heads) * hd;
     uint e = 2u * gid.x;
     uint row = gid.y;
-    if (e >= width || row >= uint(params.n_rows)) {
+    if (e >= width || row >= uint(PIE_FIRE(n_rows))) {
         return;
     }
     uint head = e / hd;
     uint d = e - head * hd;
-    uint rows = uint(params.n_rows);
+    uint rows = uint(PIE_FIRE(n_rows));
     uint heads = uint(params.q_heads);
     // A row one split covered whole was written by the walker already.
     if (part_lse[row * heads + head] > 3.0e38) {
         return;
     }
     float top = NEG_INF;
-    for (int s = 0; s < params.splits; s++) {
+    for (int s = 0; s < PIE_FIRE(splits); s++) {
         float l = part_lse[(uint(s) * rows + row) * heads + head];
         if (finite_(l)) {
             top = max(top, l);
@@ -98,7 +103,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
     float2 acc = float2(0.0, 0.0);
     float total = 0.0;
     if (finite_(top)) {
-        for (int s = 0; s < params.splits; s++) {
+        for (int s = 0; s < PIE_FIRE(splits); s++) {
             uint col = (uint(s) * rows + row) * heads + head;
             float l = part_lse[col];
             if (finite_(l)) {
@@ -109,10 +114,11 @@ void main(uint3 gid : SV_DispatchThreadID) {
         }
     }
     float2 v = total == 0.0 ? float2(0.0, 0.0) : acc / total;
-    o[(row * width + e) >> 1] = pack_bf16(v.x, v.y);
+    uint at = uint(PIE_FIRE(row0)) + row;
+    o[(at * width + e) >> 1] = pack_bf16(v.x, v.y);
 #if defined(PIE_LSE)
     if (d == 0u) {
-        lse_out[row * heads + head] = finite_(top) ? top + log2(total) : neg_inf();
+        lse_out[at * heads + head] = finite_(top) ? top + log2(total) : neg_inf();
     }
 #endif
 }
@@ -144,27 +150,23 @@ void main(uint3 gid : SV_DispatchThreadID) {
 [[vk::binding(3)]] StructuredBuffer<int> req_of_token;
 [[vk::binding(4)]] StructuredBuffer<uint> kv_page_indices;
 [[vk::binding(5)]] StructuredBuffer<uint> kv_page_indptr;
+// A row's mask entry, two words at `2 row`: the key its plane's column 0 is
+// (its lane's committed boundary; `MASK_NONE`, past every key, states no
+// mask), then the byte its columns start at in the plane, read only by a key
+// past the boundary.
+static const uint MASK_NONE = 0x7fffffffu;
+[[vk::binding(7)]] StructuredBuffer<uint> attention_mask_words;
 #if defined(SDPA_NARROW_STORAGE)
 [[vk::binding(6)]] StructuredBuffer<uint8_t> attention_mask;
-[[vk::binding(7)]] StructuredBuffer<uint8_t> attention_mask_enabled;
 
 uint mask_byte(uint i) {
     return uint(attention_mask[i]);
 }
-
-uint mask_enabled_byte(uint row) {
-    return uint(attention_mask_enabled[row]);
-}
 #else
 [[vk::binding(6)]] StructuredBuffer<uint> attention_mask;
-[[vk::binding(7)]] StructuredBuffer<uint> attention_mask_enabled;
 
 uint mask_byte(uint i) {
     return byte_at(attention_mask, i);
-}
-
-uint mask_enabled_byte(uint row) {
-    return byte_at(attention_mask_enabled, row);
 }
 #endif
 #if defined(PIE_SPLIT)
@@ -185,9 +187,31 @@ uint mask_enabled_byte(uint row) {
 #else
 #define SDPA_SEGMENTS_AT 8
 #endif
+#if defined(PIE_RING)
+#if defined(PIE_SELECTED)
+#error "a ring is a window's, and a selection is no window"
+#endif
+// A windowed layer as state + buffer (CONTRACT-BC 19, 21): a row's keys
+// below its lane's folded index lie in the ring in the lane's record, row
+// `kp` at ring place `kp % ring_rows`; keys from there to the lane's first
+// row of the fire in its window-buffer slots, entry `i` rows `[base + i T,
+// base + (i + 1) T)`; the fire's own rows in the fire's slots, laid as
+// buffer slots, the lane's first row of the fire at row 0 of its first.
+// `ring_lanes` holds, a lane, its folded index, its buffer base (a slot's
+// first row), its first row of the fire, its folded index after the fire
+// (the fold's), the buffered rows it does not read and the first slot of
+// its one run of buffered rows (its lineage, `ring_start`), then its
+// record's units, `pieces` of them. The page
+// table holds, a lane, its buffer slots of rows below its first row of the
+// fire, then its fire slots.
+[[vk::binding(SDPA_SEGMENTS_AT)]] StructuredBuffer<int> ring_lanes;
+#define SDPA_POOL_AT (SDPA_SEGMENTS_AT + 1)
+#else
+#define SDPA_POOL_AT SDPA_SEGMENTS_AT
+#endif
 // The kv pages, in the chunk pool's segments (`prim/pool.slang`).
-PIE_POOL_SEGMENTS(StructuredBuffer, SDPA_KV, SDPA_SEGMENTS_AT)
-#define PIE_PARAMS_AT (SDPA_SEGMENTS_AT + 4)
+PIE_POOL_SEGMENTS(StructuredBuffer, SDPA_KV, SDPA_POOL_AT)
+#define PIE_PARAMS_AT (SDPA_POOL_AT + 4)
 
 struct Params {
     uint seg_words;
@@ -198,9 +222,17 @@ struct Params {
     int page_size;
     int n_kv_heads;
     float scale;
-    uint attention_mask_stride;
     int window;
     int n_q_heads;
+    // The fire row the window's row 0 is: the queries, the output, the LSE,
+    // the tables and the selection are the fire's whole, bound once at load
+    // whatever window a fire cuts; a dispatch's `row` is the window's.
+    // Fired: it moves with the rows of the classes before the window.
+    uint row0;
+    // The row of the position, owner and mask-word tables the window's row
+    // 0 is (the tables bound whole too): `row0`, but for a query of the
+    // fire's readouts, whose rows are not the window's tokens. Fired.
+    uint table0;
 #if defined(PIE_SELECTED)
     int top_k;
     int ratio;
@@ -214,9 +246,40 @@ struct Params {
     int n_rows;
     int min_keys;
 #endif
+#if defined(PIE_RING)
+    // The rows the ring holds; the record's pieces the layer's ring keys
+    // and values lie in and the pieces a record takes; the ring's keys and
+    // values, in u32 words past their piece's first; u32 words a record
+    // unit.
+    uint ring_rows;
+    uint ring_piece;
+    uint ring_piece_v;
+    uint pieces;
+    uint ring_k;
+    uint ring_v;
+    uint slot_stride;
+#endif
 };
-PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 PIE_POOL_READ(SDPA_KV, SDPA_KV_SCALE * params.seg_words)
+
+// The window's first rows, read from the fire block once at the top of
+// `main` (`HOIST_FIRE`), ahead of the address math they feed.
+static uint fired_row0;
+static uint fired_table0;
+#define HOIST_FIRE() \
+    fired_row0 = uint(PIE_FIRE(row0)); \
+    fired_table0 = uint(PIE_FIRE(table0))
+
+// The fire row a window's row `row` is.
+uint fire_row(uint row) {
+    return fired_row0 + row;
+}
+
+// The tables' row a window's row `row` is.
+uint table_row(uint row) {
+    return fired_table0 + row;
+}
 
 // The bf16 element key `kp` of request `req` starts at in its plane: its
 // page, `page_stride` words a page, then the token's row in it.
@@ -226,27 +289,156 @@ uint page_row(int req, int kp) {
         + uint(kp % params.page_size) * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM);
 }
 
-bool keeps(uint row, int kp, int q_pos, int start) {
+// Where a row's keys lie: its lane's buffer base and first row of the
+// fire, and its ring's keys and values as u32 words of the pool.
+struct Keys {
+    int folded;
+    int base;
+    int first;
+    // The buffered rows the lane does not read (its lineage runs this many
+    // rows behind the set's slots), and the first slot of its one run of
+    // buffered rows.
+    int shift;
+    int run_at;
+    uint ring_k;
+    uint ring_v;
+    // A fire row's place in the lane's page table counted in rows: its
+    // buffer's whole pages, then its own (`kp + fire_at` from `first` on).
+    int fire_at;
+};
+
+Keys keys_of(int req) {
+    Keys at;
+#if defined(PIE_RING)
+    uint lane = (6u + params.pieces) * uint(req);
+    at.folded = ring_lanes[lane];
+    at.base = ring_lanes[lane + 1u];
+    at.first = ring_lanes[lane + 2u];
+    at.shift = ring_lanes[lane + 4u];
+    at.run_at = ring_lanes[lane + 5u];
+    uint rec_k = uint(ring_lanes[lane + 6u + params.ring_piece]) * params.slot_stride;
+    uint rec_v = uint(ring_lanes[lane + 6u + params.ring_piece_v]) * params.slot_stride;
+    at.ring_k = rec_k + params.ring_k;
+    at.ring_v = rec_v + params.ring_v;
+    int buffered = max(at.first - at.base + params.page_size - 1, 0) / params.page_size;
+    at.fire_at = buffered * params.page_size - at.first;
+#else
+    at.folded = 0;
+    at.base = 0;
+    at.first = 0x7fffffff;
+    at.shift = 0;
+    at.run_at = 0;
+    at.ring_k = 0u;
+    at.ring_v = 0u;
+    at.fire_at = 0;
+#endif
+    return at;
+}
+
+// The page-table entry of request `req` key `kp` and its row in that page
+// (`-1` where the key lies in the ring, `row` then its ring place).
+int key_page(Keys at, int kp, out uint row) {
+#if defined(PIE_RING)
+    if (kp < at.folded) {
+        row = uint(kp) % params.ring_rows;
+        return -1;
+    }
+    // The row's place in the table: past the buffer's rows, the fire's.
+    int idx = kp >= at.first ? kp + at.fire_at : kp - at.base;
+    int page = idx / params.page_size;
+    row = uint(idx - page * params.page_size);
+    return page;
+#else
+    row = uint(kp % params.page_size);
+    return kp / params.page_size;
+#endif
+}
+
+// The u32 word of the pool key `kp` of request `req` starts at, its key
+// then its value (the head's offset not added). Words, not bf16 elements:
+// a pool past 8 GiB (the fire's own slots lie at its top) passes a u32 of
+// elements.
+void key_at(int req, Keys at, int kp, out uint k_w, out uint v_w) {
+    uint row;
+    int page = key_page(at, kp, row);
+    uint cell = (row * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)) >> 1;
+    if (page < 0) {
+        k_w = at.ring_k + cell;
+        v_w = at.ring_v + cell;
+        return;
+    }
+    uint phys = kv_page_indices[kv_page_indptr[req] + uint(page)];
+    uint w = phys * params.page_stride + cell;
+    k_w = params.k_origin + w;
+    v_w = params.v_origin + w;
+}
+
+// The segment pool word `w` lies in and its index there as the kernel's
+// storage counts it (`SDPA_KV_SCALE` a word): `pie_pool_find` over words.
+void ring_find(uint w, out uint seg, out uint local) {
+    uint s = params.seg_words;
+    seg = 0u;
+    if (w >= s) {
+        w -= s;
+        seg = 1u;
+        if (w >= s) {
+            w -= s;
+            seg = 2u;
+            if (w >= s) {
+                w -= s;
+                seg = 3u;
+            }
+        }
+    }
+    local = SDPA_KV_SCALE * w;
+}
+
+// Row `row`'s boundary, read once a row: `MASK_NONE` where it states no mask.
+uint mask_origin(uint row) {
+    return attention_mask_words[2u * table_row(row)];
+}
+
+// Whether row `row`'s mask admits key `kp`, `origin` its boundary. A row's
+// mask speaks of the keys from its lane's committed boundary on: every key
+// below it is committed and read under the model's own bounds alone, and the
+// row's column `c` is key `origin + c`, which its causal bound keeps inside
+// the row's columns. Only a key past the boundary reads the row's offset and
+// its byte, so a row stating no mask touches no plane.
+bool mask_admits(uint row, uint origin, uint kp) {
+    if (kp < origin) {
+        return true;
+    }
+    return mask_byte(attention_mask_words[2u * table_row(row) + 1u] + (kp - origin)) != 0u;
+}
+
+bool keeps(uint row, uint origin, int kp, int q_pos, int start) {
     if (kp > q_pos || kp < start) {
         return false;
     }
-    if (mask_enabled_byte(row) != 0u) {
-        if (uint(kp) >= params.attention_mask_stride) {
-            return false;
-        }
-        if (mask_byte(row * params.attention_mask_stride + uint(kp)) == 0u) {
-            return false;
-        }
-    }
-    return true;
+    return mask_admits(row, origin, uint(kp));
 }
 
 int window_start(int q_pos) {
     return (params.window > 0 && q_pos >= params.window) ? q_pos - params.window + 1 : 0;
 }
 
+#if defined(PIE_RING)
+// A ring lane's row's first key: its window counted along its lineage (the
+// buffered rows it reads, then its own: `q_pos - shift`), mapped back to
+// the set's slots. Below the folded index the two agree; among its buffered
+// rows they lie in its one run from `run_at`; past them, among its own.
+int ring_start(Keys at, int q_pos) {
+    int s = window_start(q_pos - at.shift);
+    if (s >= at.folded) {
+        int admitted = at.first - at.folded - at.shift;
+        s = s >= at.folded + admitted ? s + at.shift : at.run_at + (s - at.folded);
+    }
+    return s;
+}
+#endif
+
 uint row_base(uint row, uint q_head) {
-    return (row * uint(params.n_q_heads) + q_head) * uint(PIE_HEAD_DIM);
+    return (fire_row(row) * uint(params.n_q_heads) + q_head) * uint(PIE_HEAD_DIM);
 }
 
 #if defined(PIE_TILED)
@@ -269,37 +461,57 @@ uint row_base(uint row, uint q_head) {
 groupshared float sdpa_part[PIE_TILE_ROWS][PIE_TILE_LANES];
 #endif
 groupshared int sdpa_last;
+groupshared int sdpa_first;
 
 [shader("compute")]
 [numthreads(PIE_TILE_LANES, PIE_TILE_ROWS, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint lane = local.x;
     uint slot_y = local.y;
     uint tile = group.y + uint(params.first_tile);
     uint row = tile * uint(PIE_TILE_ROWS) + slot_y;
-    bool live = row < uint(params.n_rows);
+    bool live = row < uint(PIE_FIRE(n_rows));
 
-    int req = live ? req_of_token[row] : 0;
-    int q_pos = live ? position_ids[row] : -1;
+    int req = live ? req_of_token[table_row(row)] : 0;
+#if defined(PIE_RING)
+    Keys ring = keys_of(req);
+#endif
+    int q_pos = live ? position_ids[table_row(row)] : -1;
+    uint origin = live ? mask_origin(row) : MASK_NONE;
+#if defined(PIE_RING)
+    int start = live ? ring_start(ring, q_pos) : 0;
+#else
     int start = window_start(q_pos);
+#endif
     uint q_base = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
-    // The tile's last position, read once and uniformly: it bounds the key
-    // loop, whose every step holds barriers.
+    // The tile's first and last keys, read once and uniformly: they bound
+    // the key loop, whose every step holds barriers. No row keeps a key
+    // below its window's first, so the loop starts at the earliest row's.
     if (lane == 0u && slot_y == 0u) {
         int last = -1;
+        int first = 0x7fffffff;
         for (uint r = 0u; r < uint(PIE_TILE_ROWS); r++) {
             uint at = tile * uint(PIE_TILE_ROWS) + r;
-            if (at < uint(params.n_rows)) {
-                last = max(last, position_ids[at]);
+            if (at < uint(PIE_FIRE(n_rows))) {
+                int pos = position_ids[table_row(at)];
+                last = max(last, pos);
+#if defined(PIE_RING)
+                first = min(first, ring_start(keys_of(req_of_token[table_row(at)]), pos));
+#else
+                first = min(first, window_start(pos));
+#endif
             }
         }
         sdpa_last = last;
+        sdpa_first = max(min(first, last + 1), 0);
     }
     GroupMemoryBarrierWithGroupSync();
     int last = workgroupUniformLoad(sdpa_last);
+    int first_key = workgroupUniformLoad(sdpa_first);
 
     float2 qv[PAIRS_PER_LANE];
     float2 acc[PAIRS_PER_LANE];
@@ -315,14 +527,43 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // there (a page lies in one segment): found once a page, not a key.
     int page_at = -1;
     uint k_seg = 0u, k_page = 0u, v_seg = 0u, v_page = 0u;
-    for (int kp = 0; kp <= last; kp++) {
-        bool take = live && keeps(row, kp, q_pos, start);
+#if defined(PIE_RING) && !defined(PIE_ONE_SEGMENT)
+    // The lane's ring lies in its record's one chunk, so in one segment:
+    // found once, its rows' words then past its first.
+    uint ring_k_seg = 0u, ring_k_at = 0u, ring_v_seg = 0u, ring_v_at = 0u;
+    pie_pool_at(SDPA_KV_SCALE * ring.ring_k, ring_k_seg, ring_k_at);
+    pie_pool_at(SDPA_KV_SCALE * ring.ring_v, ring_v_seg, ring_v_at);
+#endif
+    for (int kp = first_key; kp <= last; kp++) {
+        bool take = live && keeps(row, origin, kp, q_pos, start);
         float partial = 0.0;
         uint k_at = 0u, v_at = 0u;
         uint vw[PAIRS_PER_LANE];
         if (take) {
+#if defined(PIE_RING)
+            uint in_page;
+            int page = key_page(ring, kp, in_page);
+            if (page < 0) {
+                // A ring row: its keys and values lie in the record's one
+                // chunk, so in one segment; the page cache is left for the
+                // next table entry.
+                uint cell_words = (in_page * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)) >> 1;
+#if defined(PIE_ONE_SEGMENT)
+                k_page = SDPA_KV_SCALE * (ring.ring_k + cell_words);
+                v_page = SDPA_KV_SCALE * (ring.ring_v + cell_words);
+#else
+                k_seg = ring_k_seg;
+                v_seg = ring_v_seg;
+                k_page = ring_k_at + SDPA_KV_SCALE * cell_words;
+                v_page = ring_v_at + SDPA_KV_SCALE * cell_words;
+#endif
+                page_at = -1;
+                in_page = 0u;
+            } else if (page != page_at) {
+#else
             int page = kp / params.page_size;
             if (page != page_at) {
+#endif
                 uint phys = kv_page_indices[kv_page_indptr[req] + uint(page)];
 #if defined(PIE_ONE_SEGMENT)
                 k_page = SDPA_KV_SCALE * params.k_origin + phys * params.page_stride;
@@ -335,8 +576,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             }
             // The token's row in the page, then the head's: `page_row`'s
             // words past the page's first.
+#if defined(PIE_RING)
+            uint row_words = (in_page * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)
+                + uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1;
+#else
             uint row_words = (uint(kp % params.page_size) * uint(params.n_kv_heads) * uint(PIE_HEAD_DIM)
                 + uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1;
+#endif
             k_at = k_page + row_words;
             v_at = v_page + row_words;
             // The row's key and value words first, from their one segment (a
@@ -405,7 +651,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 #if defined(PIE_LSE)
     if (live && lane == 0u) {
-        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(max_score, sum_exp);
+        lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(max_score, sum_exp);
     }
 #endif
     if (live) {
@@ -445,7 +691,11 @@ float bf16_of(uint16_t h) {
 // `subgroups`-th step from its own and reduces within itself.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint subgroups) {
-    int req = req_of_token[row];
+    int req = req_of_token[table_row(row)];
+#if defined(PIE_RING)
+    Keys ring = keys_of(req);
+#endif
+    uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
@@ -486,7 +736,7 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #if defined(PIE_SELECTED)
             int kp;
             if (n < sel_end) {
-                int c = selection[row * uint(params.top_k) + uint(n / params.ratio)];
+                int c = selection[fire_row(row) * uint(params.top_k) + uint(n / params.ratio)];
                 if (c < 0 || c >= nblocks) {
                     continue;
                 }
@@ -497,13 +747,20 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #else
             int kp = k_lo + n;
 #endif
-            if (!keeps(row, kp, q_pos, start)) {
+            if (!keeps(row, origin, kp, q_pos, start)) {
                 continue;
             }
-            uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             uint k_seg, k_at, v_seg, v_at;
+#if defined(PIE_RING)
+            uint k_w, v_w;
+            key_at(req, ring, kp, k_w, v_w);
+            ring_find(k_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), k_seg, k_at);
+            ring_find(v_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), v_seg, v_at);
+#else
+            uint base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             pie_pool_find(SDPA_KV_SCALE * params.k_origin + base, k_seg, k_at);
             pie_pool_find(SDPA_KV_SCALE * params.v_origin + base, v_seg, v_at);
+#endif
             // The row's elements first, from its one segment; then the sum
             // as the pool view read it.
             uint16_t kh[DPL];
@@ -573,19 +830,24 @@ float decode_fold(uint d, float merged_max, uint subgroups) {
 [shader("compute")]
 [numthreads(PIE_DECODE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;
-    int q_pos = position_ids[row];
+    int q_pos = position_ids[table_row(row)];
+#if defined(PIE_RING)
+    int start = ring_start(keys_of(req_of_token[table_row(row)]), q_pos);
+#else
     int start = window_start(q_pos);
+#endif
     uint base_row = row_base(row, q_head);
     float merged_max, merged_sum;
     uint subgroups;
 #if defined(PIE_SPLIT)
     uint split = group.z;
     int keys = q_pos - start + 1;
-    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, params.splits);
-    uint slice = (split * uint(params.n_rows) + row) * uint(params.n_q_heads) + q_head;
+    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, PIE_FIRE(splits));
+    uint slice = (split * uint(PIE_FIRE(n_rows)) + row) * uint(params.n_q_heads) + q_head;
     if (int(split) >= usable) {
         if (tid == 0u) {
             part_lse[slice] = neg_inf();
@@ -601,7 +863,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (tid == 0u) {
             part_lse[slice] = pos_inf();
 #if defined(PIE_SPLIT_LSE)
-            lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+            lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
 #endif
         }
         for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
@@ -621,7 +883,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     decode_walk(row, q_head, tid, start, q_pos, q_pos, start, merged_max, merged_sum, subgroups);
 #if defined(PIE_LSE)
     if (tid == 0u) {
-        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+        lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
     }
 #endif
     for (uint d = tid; d < uint(PIE_HEAD_DIM); d += uint(PIE_DECODE_THREADS)) {
@@ -646,12 +908,19 @@ groupshared float sdpa_max[MAX_WALKERS];
 groupshared float sdpa_sum[MAX_WALKERS];
 groupshared float sdpa_fold[MAX_WALKERS][32];
 groupshared int sdpa_pos;
+#if defined(PIE_RING)
+groupshared int sdpa_start;
+#endif
 
 // The walkers' share of the row's keys: each 32-lane strip takes every
 // `walkers`-th step from its own.
 void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos, int start,
                  out float merged_max, out float merged_sum, out uint walkers) {
-    int req = req_of_token[row];
+    int req = req_of_token[table_row(row)];
+#if defined(PIE_RING)
+    Keys ring = keys_of(req);
+#endif
+    uint origin = mask_origin(row);
     uint base_row = row_base(row, q_head);
     int kv_head = int(q_head) / params.gqa_factor;
 
@@ -689,25 +958,32 @@ void decode_walk(uint row, uint q_head, uint tid, int k_lo, int k_hi, int q_pos,
 #if defined(PIE_SELECTED)
         int kp = -1;
         if (n < sel_end) {
-            int c = selection[row * uint(params.top_k) + uint(n / params.ratio)];
+            int c = selection[fire_row(row) * uint(params.top_k) + uint(n / params.ratio)];
             if (c >= 0 && c < nblocks) {
                 kp = c * params.ratio + (n % params.ratio);
             }
         } else {
             kp = nblocks * params.ratio + (n - sel_end);
         }
-        bool take = n < steps && kp >= 0 && keeps(row, kp, q_pos, start);
+        bool take = n < steps && kp >= 0 && keeps(row, origin, kp, q_pos, start);
 #else
         int kp = k_lo + n;
-        bool take = n < steps && keeps(row, kp, q_pos, start);
+        bool take = n < steps && keeps(row, origin, kp, q_pos, start);
 #endif
         uint base = 0u;
         float partial = 0.0;
         uint k_seg = 0u, k_at = 0u, v_seg = 0u, v_at = 0u;
         if (take) {
+#if defined(PIE_RING)
+            uint k_w, v_w;
+            key_at(req, ring, kp, k_w, v_w);
+            ring_find(k_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), k_seg, k_at);
+            ring_find(v_w + ((uint(kv_head) * uint(PIE_HEAD_DIM)) >> 1), v_seg, v_at);
+#else
             base = page_row(req, kp) + uint(kv_head) * uint(PIE_HEAD_DIM);
             pie_pool_find(SDPA_KV_SCALE * params.k_origin + (base >> 1), k_seg, k_at);
             pie_pool_find(SDPA_KV_SCALE * params.v_origin + (base >> 1), v_seg, v_at);
+#endif
             // The row's words first, from its one segment; then the sum as
             // the pool view read it.
             uint kw[PPL];
@@ -792,25 +1068,33 @@ float2 folded_pair(uint d, float merged_max, float merged_sum, uint walkers) {
 [shader("compute")]
 [numthreads(PIE_DECODE_THREADS, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
+    HOIST_FIRE();
     uint q_head = group.x;
     uint row = group.y;
     uint tid = local.x;
     // Every lane reads the same row; staged and read uniformly, as the key
     // bound below decides loops of barriers and an early return.
     if (tid == 0u) {
-        sdpa_pos = position_ids[row];
+        sdpa_pos = position_ids[table_row(row)];
+#if defined(PIE_RING)
+        sdpa_start = ring_start(keys_of(req_of_token[table_row(row)]), sdpa_pos);
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
     int q_pos = workgroupUniformLoad(sdpa_pos);
+#if defined(PIE_RING)
+    int start = workgroupUniformLoad(sdpa_start);
+#else
     int start = window_start(q_pos);
+#endif
     uint base_row = row_base(row, q_head);
     float merged_max, merged_sum;
     uint walkers;
 #if defined(PIE_SPLIT)
     uint split = group.z;
     int keys = q_pos - start + 1;
-    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, params.splits);
-    uint slice = (split * uint(params.n_rows) + row) * uint(params.n_q_heads) + q_head;
+    int usable = clamp((keys + params.min_keys - 1) / max(params.min_keys, 1), 1, PIE_FIRE(splits));
+    uint slice = (split * uint(PIE_FIRE(n_rows)) + row) * uint(params.n_q_heads) + q_head;
     // Uniform across the workgroup: every lane of it reads the same row.
     if (int(split) >= usable) {
         if (tid == 0u) {
@@ -827,7 +1111,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         if (tid == 0u) {
             part_lse[slice] = pos_inf();
 #if defined(PIE_SPLIT_LSE)
-            lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+            lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
 #endif
         }
         for (uint d = 2u * tid; d < uint(PIE_HEAD_DIM); d += 2u * uint(PIE_DECODE_THREADS)) {
@@ -847,7 +1131,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     decode_walk(row, q_head, tid, start, q_pos, q_pos, start, merged_max, merged_sum, walkers);
 #if defined(PIE_LSE)
     if (tid == 0u) {
-        lse_out[row * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
+        lse_out[fire_row(row) * uint(params.n_q_heads) + q_head] = lse_base2(merged_max, merged_sum);
     }
 #endif
     for (uint d = 2u * tid; d < uint(PIE_HEAD_DIM); d += 2u * uint(PIE_DECODE_THREADS)) {
@@ -1063,3 +1347,179 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_sdpa_tiled_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1
 // pie:instantiate attn_sdpa_tiled_lse_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_lanes_8_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_lanes_8_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_lanes_8_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_decode_lse_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_lanes_8_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_TIER=subgroup PIE_TARGET=spirv PIE_DECODE_THREADS=128 PIE_MIN_LANES=8 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_RING=1
+// pie:instantiate attn_sdpa_split_lse_ring_t128_bf16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1 PIE_SPLIT_LSE=1 PIE_DECODE_THREADS=128 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_r8_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=32 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_r8_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_ROWS=8 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_ring_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1
+// pie:instantiate attn_sdpa_tiled_lse_ring_l16_r16_seg1_bf16_d_512 PIE_HEAD_DIM=512 PIE_TILED=1 PIE_LSE=1 PIE_TILE_LANES=16 PIE_TILE_ROWS=16 PIE_TIER=subgroup PIE_TARGET=spirv PIE_ONE_SEGMENT=1 PIE_RING=1

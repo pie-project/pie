@@ -200,7 +200,7 @@ fn current_device() -> Result<i32> {
 }
 
 #[cfg(feature = "device")]
-fn new_stream() -> Result<*mut c_void> {
+pub(crate) fn new_stream() -> Result<*mut c_void> {
     use crate::device::rt;
 
     let mut stream: rt::cudaStream_t = core::ptr::null_mut();
@@ -212,6 +212,11 @@ fn new_stream() -> Result<*mut c_void> {
     Ok(stream.cast())
 }
 
+#[cfg(not(feature = "device"))]
+pub(crate) fn new_stream() -> Result<*mut c_void> {
+    Err(Fault::Runtimeless)
+}
+
 impl Drop for Lanes {
     fn drop(&mut self) {
         #[cfg(feature = "device")]
@@ -220,7 +225,7 @@ impl Drop for Lanes {
                 // SAFETY: handle from this module's own cudaStreamCreate,
                 // destroyed exactly once; every pump drained before returning.
                 unsafe {
-                    let _ = crate::device::rt::cudaStreamDestroy(lane.stream.cast());
+                    crate::device::held::destroy_unadopted_stream(lane.stream);
                 }
             }
         }

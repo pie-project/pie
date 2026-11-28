@@ -13,24 +13,30 @@
 
 struct Params {
     int v_heads;
+    // The fire row a window's row 0 is: `ba` and `gates` are the fire's
+    // whole, bound once whatever window a fire cuts.
+    uint row0;
 };
-PIE_PARAMS(4, Params, params);
+PIE_PARAMS_FIRED(4, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
+    // The fire block's read first, the loads it does not feed beside it.
+    uint t = PIE_FIRE(row0) + gid.y;
     uint h = gid.x;
-    uint t = gid.y;
     uint vh = uint(params.v_heads);
     if (h >= vh) {
         return;
     }
+    float decay = -exp(a_log[h]);
+    float bias = bf16_at(dt_bias, h);
     uint row = t * 2u * vh;
     float bv = bf16_at(ba, row + h);
     float av = bf16_at(ba, row + vh + h);
-    float z = av + bf16_at(dt_bias, h);
+    float z = av + bias;
     float sp = z > 20.0 ? z : log(1.0 + exp(z));
-    gates[row + h] = -exp(a_log[h]) * sp;
+    gates[row + h] = decay * sp;
     gates[row + vh + h] = 1.0 / (1.0 + exp(-bv));
 }
 

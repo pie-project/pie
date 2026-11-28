@@ -6,24 +6,22 @@ use poem_ir::{Def, Linear, Operation, ParamSource, Trace, ValueId};
 use crate::device::Pinned;
 use crate::error::{Fault, Result};
 
+pub mod staging;
+
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
 #[derive(Debug)]
-pub enum Spill {
-    Serving(crate::checkpoint_serving::Serving),
-}
+pub struct Spill(pub crate::checkpoint_serving::Serving);
 
 impl Spill {
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
-        let Spill::Serving(serving) = self;
-        serving.path()
+        self.0.path()
     }
 
     #[must_use]
     pub fn plane(&self, id: u32) -> Option<&[u8]> {
-        let Spill::Serving(serving) = self;
-        serving.plane(id)
+        self.0.plane(id)
     }
 
     fn remedy(&self) -> &'static str {
@@ -426,6 +424,20 @@ impl Plan {
         self.device_bytes
     }
 
+    /// The bytes of `trace`'s planes this plan leaves on the device's
+    /// weight tier: every plane but those it moves to the host or the
+    /// serving file and the routed banks the weight cache's pool takes.
+    /// Read from the planes, so a plan built up from the default one
+    /// counts what it moved as a cut plan does.
+    pub fn resident_bytes(&self, trace: &Trace) -> Result<u64> {
+        Ok(crate::weights::plane_bytes(trace)?
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !self.streamed_whole(*at) && !self.pooled.contains(at))
+            .map(|(_, bytes)| bytes.next_multiple_of(crate::weights::ALIGN))
+            .sum())
+    }
+
     #[must_use]
     pub fn host_demand(&self) -> u64 {
         self.host_bytes
@@ -757,8 +769,8 @@ impl Tier {
                 .iter()
                 .filter(|plane| plan.filed(plane.param))
                 .count();
-            eprintln!(
-                "engine-cuda: the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
+            tracing::info!(
+                "the MAPPED tier holds {groups} group(s), {} plane(s), {bytes} \
                  byte(s) left in {}: {filed} plane(s) the pool will hold, copied into their \
                  slots at the first weight residency and never read where they lie; the \
                  rest read in place, a GPU touch faulting the page in over HMM",
@@ -803,6 +815,13 @@ impl Tier {
             .map(|plane| plane.at)
     }
 
+    /// Whether `param` is left in the serving file ([`Plan::filed`]): its
+    /// copy is the file's read-only mapping.
+    #[must_use]
+    pub fn filed(&self, param: usize) -> bool {
+        self.plan.filed(param)
+    }
+
     #[must_use]
     pub fn offloaded_at(&self, param: usize) -> Option<u64> {
         self.pinned_at(param).or_else(|| self.mapped_at(param))
@@ -827,10 +846,6 @@ impl Tier {
         let bytes = self.host.bytes() as u64;
         self.host = Pinned::empty();
         bytes
-    }
-
-    pub fn zero_host(&self) {
-        self.host.zero();
     }
 
     #[must_use]

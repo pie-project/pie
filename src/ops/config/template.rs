@@ -35,13 +35,15 @@ pub fn default_config_content() -> Result<String> {
         _ => DEFAULT_FRAMES,
     };
     Ok(format!(
-        "{HEADER}{model_block}{engine_block}{RUNTIME}{frames}{TAIL}"
+        "{HEADER}{model_block}{engine_block}{MEMORY}{RUNTIME}{frames}{TAIL}"
     ))
 }
 
 #[cfg(test)]
 pub(crate) fn config_content_with_any_engine() -> String {
-    format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}")
+    format!(
+        "{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+    )
 }
 
 const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit freely.
@@ -66,30 +68,36 @@ const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
 source = "Qwen/Qwen3.5-0.8B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/cache/weights
-# weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
-                                 # is what the engine computes in, so that is
-                                 # an engine key and this is a model one.
-# Device memory, per device. The share is of the device's memory, less what
-# other processes hold when the engine starts; the kv pool fills what the
-# share leaves past the weights, unless its bytes are stated.
-# memory_tolerance     = "dedicated"  # or aggressive, balanced, polite: gives memory back
-                                       # under pressure and when demand falls
-# device_memory_share  = 0.90
-# device_kv_budget     = "20GiB"  # kv pages and state slots; refused if it does not fit
-# weight_streaming     = "auto"   # or on, off: MoE experts and PLE rows leave the
-                                  # device under pressure before kv does
-# Suspended kv goes to the host, then the disk.
-# host_kv_budget       = "32GiB"
-# disk_kv_budget       = "200GiB"  # the tier is always on
-# disk_kv_dir          = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
-# disk_kv_persistent   = false    # keep the disk tier as cache for the next run
+# weight_dtype     = "bfloat16"  # what the CHECKPOINT holds
+"#;
+
+const MEMORY: &str = r#"
+[engine.memory]
+# Nothing to set on a dedicated machine: the engine measures the device and
+# uses all of it, and the split between weights, kv and fires follows demand.
+# Each key is a cap for sharing the machine.
+# budget_device         = "20GiB"   # per device; omit for the whole device
+# kv_device_tokens      = 51968     # cuda: the device holds exactly this kv; omit to fill it
+# budget_host           = "32GiB"   # suspended kv goes to the host, then the disk
+# budget_disk           = "200GiB"  # the disk tier; omit to derive it, 0 for none
+# disk_path             = "/nvme/pie"  # omit for $PIE_HOME/cache/kv/<digest>
+# disk_persistent       = false     # keep the disk tier as cache for the next run
+# yield                 = 0.0       # in [0, 1]: device target = floor + (budget - floor)
+#                                   #   * (1 - yield * OS memory pressure); 0 holds the budget;
+#                                   #   above 0 the OS's pressure must be readable (PSI, macOS);
+#                                   #   floor = one lane at max_context + reserved + activation
+#                                   #   + dense weights: a long max_context raises it, so yield
+#                                   #   can press less
+# Idle cache has no time-based expiry: it stays until a demand needs its room.
+# Under the default worker policy, what a process left is then dropped (decoded
+# tail first, then least recently used); under `noop` it moves down a tier.
 "#;
 
 const RUNTIME: &str = r#"
 [runtime]
 # Batching and timeouts. Every default here is measured; `pie config list`
-# carries the reasoning.
-# submit_deadline          = "50ms"
+# carries the reasoning. `submit_deadline` was removed: a config that
+# still sets it is refused at load; delete the line.
 # silence_timeout          = "30s"
 "#;
 
@@ -107,8 +115,11 @@ const CEREBRAS_FRAMES: &str = r#"frame_size               = 4     # the most: ea
 # frame_dispatch_depth     = 127   # ahead; unstated: the engine's (127)
 "#;
 
-const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's max_forward_requests
-# worker_policy            = "noop"  # a PLEX worker policy: built-in name or .wasm path
+const TAIL: &str = r#"# max_concurrent_processes = 64    # omit: from the engine's fire lanes
+# worker_policy            = "default"  # a PLEX worker policy, one: a .wasm path, or
+#                                       # built-in "deadline", "fair", "priority" or
+#                                       # "keep-session", each over what "default" does;
+#                                       # "noop" writes no rows
 # snapshot_budget          = "64GiB"  # what handle snapshots may take on disk
 
 [sandbox]
@@ -119,14 +130,15 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
                                # in the host stack and bypasses this list
 # scratch_dir     = "/tmp/pie"
 # max_memory      = "4GiB"
-# max_instances   = 1000
+# max_instances   = 1000      # omit: what the address space fits
 # warm_memory     = "0B"
 # warm_slots      = 100
 
 # [cluster]
-# cluster_policies = []        # cluster policies: built-in names or .wasm paths,
-#                              # no two granted the same write (`publish`
-#                              # excepted: each writes under its own name).
+# cluster_policies = ["default-cluster"]  # .wasm paths, or built-in "pin",
+#                              # "drain-migrate", "rebalance" or "replicate", each
+#                              # over what "default-cluster" does; [] runs none.
+#                              # No two write one column, so no two of these.
 #                              # SIGHUP reloads this and `[runtime] worker_policy`.
 #                              # Single-node only: a distributed controller
 #                              # states its own.
@@ -137,15 +149,14 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 
 # [offload]
 # Other workers' part in this one's passes, and its in theirs. Omit to serve
-# and send none.
+# and send none. Which workers prefill this one's passes and which pools keep
+# its runs are the cluster policy's (`placement/helpers`, `replication/workers`;
+# `default-cluster` names every worker with a `listen`, and every pool).
 # listen = "10.0.0.1:7100"     # where this worker serves peers' passes; their
 #                              # pages' bytes ride one port above
-# peers  = ["10.0.0.2:7100"]   # workers to prefill this worker's passes on
-# pools  = ["10.0.0.3:7201"]   # pool workers (`pie-pool`) to keep its runs on,
-#                              # by their bulk address
 # transfer = "auto"            # the bulk link; "nixl" reads peers' kv in place
-# prefill_min_suffix_tokens = 0  # shortest uncached suffix worth a peer's
-#                                # prefill; 0: 2048 tokens
+# prefill_min_suffix_tokens = 2048  # shortest uncached suffix worth a helper's
+#                                   # prefill; unset, passes stay home
 "#;
 
 #[cfg(any(feature = "engine-cuda", test))]
@@ -157,9 +168,7 @@ const CUDA_ENGINE_BLOCK: &str = r#"
 type = "cuda"
 device = ["cuda:0"]
 tensor_parallel_size = 1
-activation_dtype = "bfloat16"
-# kv_page_size    = 32      # omit: the engine derives one
-# max_model_len   = 32768   # the most tokens one sequence may hold; omit for
+# max_context     = 32768   # the most tokens one sequence may hold; omit for
 #                           # the context the model's config.json declares,
 #                           # shortened where one sequence at it would take
 #                           # more than half the pool (4096 if it declares
@@ -174,11 +183,7 @@ const METAL_ENGINE_BLOCK: &str = r#"
 # for this engine — the Metal shell serves one device.
 type = "metal"
 device = ["metal:0"]
-activation_dtype = "bfloat16"
-# kv_page_size         = 32     # omit for the engine's own
-# max_forward_tokens   = 10240  # omit for the engine's own defaults
-# max_forward_requests = 512    # (max_concurrent_processes derives from this)
-# max_model_len        = 8192   # omit to keep the engine's KV-ring ceiling;
+# max_context          = 8192   # omit to keep the engine's KV-ring ceiling;
                                 # setting it only ever shrinks the ring
 "#;
 
@@ -190,9 +195,6 @@ const VULKAN_ENGINE_BLOCK: &str = r#"
 # for this engine — the Vulkan shell serves one device.
 type = "vulkan"
 device = ["vulkan:0"]       # vkEnumeratePhysicalDevices order; 0 is the first
-activation_dtype = "bfloat16"
-# max_forward_tokens   = 10240  # omit for the engine's own defaults
-# max_forward_requests = 512    # (max_concurrent_processes derives from this)
 # validation           = false  # VK_LAYER_KHRONOS_validation; diagnostic only
 # pipeline_cache       = "/path/to/pipeline.bin"  # omit for $PIE_HOME/cache/vulkan-pipelines.bin
 "#;
@@ -205,13 +207,8 @@ const WGPU_ENGINE_BLOCK: &str = r#"
 # for this engine — the wgpu shell serves one adapter.
 type = "wgpu"
 device = ["wgpu:0"]         # enumeration order among the reachable adapters
-activation_dtype = "bfloat16"
 # backends = "vulkan"           # omit for every backend this build carries
 # power_preference     = "high-performance"  # or "low-power", "none"
-# max_forward_tokens   = 10240  # omit for the engine's own defaults
-# max_forward_requests = 512    # (max_concurrent_processes derives from this)
-# device_memory        = "16GiB"  # omit unless the backend reports none
-# pipeline_cache       = "/path/to/pipeline.bin"  # omit for in-process only
 "#;
 
 #[cfg(any(feature = "xla", test))]
@@ -221,10 +218,7 @@ const XLA_ENGINE_BLOCK: &str = r#"
 # whatever the named engine accepts. The xla shell drives one PJRT device.
 type = "xla"
 device = ["tpu:0"]          # which of the plugin's addressable devices
-activation_dtype = "bfloat16"
 # plugin               = "/path/to/libtpu.so"  # omit: PIE_XLA_PLUGIN, TPU_LIBRARY_PATH, libtpu.so
-# max_forward_tokens   = 2048   # omit for the engine's own
-# max_forward_requests = 64
 "#;
 
 #[cfg(any(feature = "cerebras", test))]
@@ -235,12 +229,9 @@ const CEREBRAS_ENGINE_BLOCK: &str = r#"
 # the fabric simulator, or a CS system named by cmaddr.
 type = "cerebras"
 device = ["cerebras:0"]
-activation_dtype = "bfloat16"
 target = "wse3"             # the wafer generation: "wse2" or "wse3"
 num_threads = 16            # host threads for the simulator and staging
 # cmaddr               = "10.0.0.1:9000"  # omit to run the fabric simulator
-# max_forward_tokens   = 64     # omit for the engine's own
-# max_forward_requests = 4
 "#;
 
 #[cfg(test)]
@@ -250,47 +241,31 @@ mod tests {
     #[test]
     fn template_every_case() {
         default_config_is_parseable();
+        every_memory_line_uncommented_parses();
         the_vulkan_block_states_only_keys_the_engine_declares();
         the_wgpu_block_states_only_keys_the_engine_declares();
         the_xla_block_states_only_keys_the_engine_declares();
         the_cerebras_block_states_only_keys_the_engine_declares();
         a_binary_with_an_engine_writes_a_config_that_parses();
         it_names_the_engine_this_binary_actually_has();
-        no_block_names_a_removed_key();
     }
 
-    /// Not even commented out: an operator who uncomments a line the
-    /// template offers gets a file that parses.
-    fn no_block_names_a_removed_key() {
-        #[allow(unused_mut)]
-        let mut blocks = vec![
-            HEADER,
-            DEFAULT_MODEL_BLOCK,
-            CUDA_ENGINE_BLOCK,
-            VULKAN_ENGINE_BLOCK,
-            WGPU_ENGINE_BLOCK,
-            XLA_ENGINE_BLOCK,
-            CEREBRAS_ENGINE_BLOCK,
-            RUNTIME,
-            DEFAULT_FRAMES,
-            CEREBRAS_FRAMES,
-            TAIL,
-        ];
-        #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        blocks.push(METAL_ENGINE_BLOCK);
-        for block in blocks {
-            for line in block.lines() {
-                let stated = line.trim_start_matches(['#', ' ']);
-                let Some((key, _)) = stated.split_once('=') else {
-                    continue;
-                };
-                let key = key.trim();
-                assert!(
-                    worker::config::removed::refusal_for(key).is_none(),
-                    "the template offers the removed key {key}: {line}"
-                );
-            }
-        }
+    /// The `[engine.memory]` block, every line uncommented, is a config.
+    fn every_memory_line_uncommented_parses() {
+        let memory: String = MEMORY
+            .lines()
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .filter(|line| line.starts_with('[') || line.contains(" = "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let content = format!(
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_ENGINE_BLOCK}{memory}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+        );
+        let config = worker::Config::parse(&content).expect("the memory block must parse");
+        assert_eq!(
+            config.engine.memory.budget_device.map(|b| b.as_bytes()),
+            Some(20 << 30)
+        );
     }
 
     fn default_config_is_parseable() {
@@ -300,28 +275,28 @@ mod tests {
 
     fn the_vulkan_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{VULKAN_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
         );
         worker::Config::parse(&content).expect("the vulkan template must parse");
     }
 
     fn the_wgpu_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{WGPU_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
         );
         worker::Config::parse(&content).expect("the wgpu template must parse");
     }
 
     fn the_xla_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{XLA_ENGINE_BLOCK}{MEMORY}{RUNTIME}{DEFAULT_FRAMES}{TAIL}"
         );
         worker::Config::parse(&content).expect("the xla template must parse");
     }
 
     fn the_cerebras_block_states_only_keys_the_engine_declares() {
         let content = format!(
-            "{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{RUNTIME}{CEREBRAS_FRAMES}{TAIL}"
+            "{HEADER}{DEFAULT_MODEL_BLOCK}{CEREBRAS_ENGINE_BLOCK}{MEMORY}{RUNTIME}{CEREBRAS_FRAMES}{TAIL}"
         );
         let config = worker::Config::parse(&content).expect("the cerebras template must parse");
         // The runtime's most steps a frame (`Runahead::STEPS_MAX`), and the

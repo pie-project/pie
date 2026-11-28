@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
-const SHELLS: [&str; 4] = [
+const SHELLS: [&str; 5] = [
     "../engine-cuda/src",
+    "../engine-gpu/src",
     "../engine-metal/src",
     "../engine-vulkan/src",
     "../engine-wgpu/src",

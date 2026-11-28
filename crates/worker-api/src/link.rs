@@ -13,6 +13,20 @@ use crate::{
     WorkerControlRequest, WorkerControlResponse,
 };
 
+/// The largest frame either end of a worker–gateway link reads or writes:
+/// both ends set it, so a frame one end writes the other can read. A turn's
+/// pushed output (tokens, a media payload) rides one frame.
+pub const LINK_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// A call that waits as long as its link lives: it fails when the link goes,
+/// never on a timer. tarpc takes a deadline on every call, so this one is a
+/// year away, past any run and inside what its timer wheel holds (2 years).
+pub fn until_link_lost() -> tarpc::context::Context {
+    let mut ctx = tarpc::context::current();
+    ctx.deadline = std::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 60 * 60);
+    ctx
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum TwoWayMessage<Req, Resp> {
     Request(tarpc::ClientMessage<Req>),

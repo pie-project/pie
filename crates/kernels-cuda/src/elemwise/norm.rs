@@ -74,7 +74,7 @@ fn rms_row(
     };
     // A whole row's norm (no heads) in 16-byte runs a thread, read once.
     let runs = y.width.div_ceil(8 * BLOCK);
-    if ctx.tuning().rows_vec
+    if ctx.tuning().rows_vec()
         && per_head_dim == 0
         && y.width > 256
         && y.width.is_multiple_of(8)
@@ -90,7 +90,7 @@ fn rms_row(
                 NORM,
                 &format!("::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"),
             ))
-            .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl())),
             &[
                 x.arg(),
                 weight.arg(),
@@ -103,7 +103,7 @@ fn rms_row(
             ],
         );
     }
-    if ctx.tuning().rows_vec
+    if ctx.tuning().rows_vec()
         && (width == 128 || width == 256)
         && [x.ptr, weight.ptr, y.ptr].iter().all(|&at| aligned16(at))
     {
@@ -414,7 +414,7 @@ pub fn rmsnorm_no_scale(
     // runs (DeepSeek-V4's 512-wide q heads); 8 or 16 lanes a 64- or 128-wide
     // one (Muse Spark's).
     let lanes = (hidden / 8).min(32);
-    if ctx.tuning().rows_vec
+    if ctx.tuning().rows_vec()
         && hidden % (8 * lanes) == 0
         && matches!(lanes, 8 | 16 | 32)
         && (1..=4).contains(&(hidden / (8 * lanes)))
@@ -449,7 +449,7 @@ pub fn rmsnorm_no_scale(
     }
     // A warp a head, the block form's sums in its order, where the head is
     // whole 256-element runs.
-    if ctx.tuning().hc_tile
+    if ctx.tuning().hc_tile()
         && hidden % 256 == 0
         && (1..=4).contains(&(hidden / 256))
         && [x.ptr, y.ptr].iter().all(|&at| aligned16(at))
@@ -695,7 +695,7 @@ pub fn rmsnorm_gated_by(
         .checked_mul(heads)
         .ok_or_else(|| refuse(OP, "the rows' heads do not count"))?;
     // A warp's (row, head) pairs.
-    let per_warp: u32 = if ctx.tuning().rows_vec { 2 } else { 1 };
+    let per_warp: u32 = if ctx.tuning().rows_vec() { 2 } else { 1 };
     ctx.fire(
         OP,
         Fire::at(kernel(
@@ -704,7 +704,7 @@ pub fn rmsnorm_gated_by(
         ))
         .apply(
             Launch::grid([pairs.div_ceil(8 * per_warp), 1, 1], [256, 1, 1])
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
         ),
         &[
             x.arg(),

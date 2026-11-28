@@ -447,6 +447,35 @@ impl Package {
         Ok(contract)
     }
 
+    /// Whether `id`'s deployment `deploy` may read `src`: false only where
+    /// [`Package::import_lowered`] refuses it under any lowering, for no
+    /// format of it takes the checkpoint (or its layout, stated values or
+    /// formats do not evaluate). It runs what the import runs before it
+    /// reads, without the lowering, which costs a trace; a recognition that
+    /// reads the lowering keeps the deployment, as its verdict could differ.
+    #[must_use]
+    pub fn may_read(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> bool {
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                crate::star::formats::UNLOWERED.with(|u| u.set(None));
+            }
+        }
+        crate::star::formats::UNLOWERED.with(|u| u.set(Some(false)));
+        let _unset = Unset;
+        let takes = self.formats(id, deploy, src, platform, |built| {
+            crate::import::format::any_takes(src, &built)
+        });
+        let touched = crate::star::formats::UNLOWERED.with(std::cell::Cell::get) == Some(true);
+        touched || matches!(takes, Ok(true))
+    }
+
     /// `then` of the formats of `formats(m)`, each reading `src` into
     /// `id`'s deployment `deploy`.
     fn formats<R>(

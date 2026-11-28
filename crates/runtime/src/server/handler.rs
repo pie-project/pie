@@ -83,7 +83,86 @@ impl Session {
                         serde_json::Value::from(total),
                     );
 
+                    // Every way a fire was served other than by a body
+                    // the load captured, or refused, as the engines serving
+                    // the model counted it: summed, and each engine's.
+                    let lives = crate::engine::backend::lives();
+                    for tally in ::engine::live::Tally::ALL {
+                        let each: Vec<u64> = lives.iter().map(|live| live.tallied(tally)).collect();
+                        stats.insert(
+                            format!("{}.engine.{}", model_name, tally.name()),
+                            serde_json::Value::from(each.iter().sum::<u64>()),
+                        );
+                        stats.insert(
+                            format!("{}.engine.{}_by_engine", model_name, tally.name()),
+                            serde_json::Value::from(each),
+                        );
+                    }
+                    // Programs registered anew since boot (the standard
+                    // samplers' at load among them), and registrations that
+                    // found one held: a request of a kind already served
+                    // registers none, whatever its prompt's length.
+                    let (registered, found) = crate::pipeline::program::counts();
+                    stats.insert(
+                        format!("{}.programs.registered", model_name),
+                        serde_json::Value::from(registered),
+                    );
+                    stats.insert(
+                        format!("{}.programs.found", model_name),
+                        serde_json::Value::from(found),
+                    );
+                    // The rungs each engine stated eager at load: where an
+                    // `engine.eager` fire is as stated, and no bug.
+                    stats.insert(
+                        format!("{}.engine.eager_rungs_by_engine", model_name),
+                        serde_json::Value::from(crate::engine::backend::eager_rungs()),
+                    );
+
+                    // Fires whose geometry the host evaluated though it is
+                    // not host-derivable: the program's class, named at bind.
+                    // Summed, and split by the engine the pass bound on and
+                    // the program.
+                    let host_fires = crate::pipeline::fire::host_geometry::by();
+                    stats.insert(
+                        format!("{}.host_geometry_fires", model_name),
+                        serde_json::Value::from(crate::pipeline::fire::host_geometry::fires()),
+                    );
+                    stats.insert(
+                        format!("{}.host_geometry_fires_by", model_name),
+                        serde_json::Value::Array(
+                            host_fires
+                                .iter()
+                                .map(|(key, fires)| {
+                                    serde_json::json!({
+                                        "engine": key.engine,
+                                        "kind": key.kind,
+                                        "program": format!("{:016x}", key.program),
+                                        "fires": fires,
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+
+                    // Prefills a peer asked for streamed that went whole:
+                    // this engine streams no layer out as it computes.
+                    stats.insert(
+                        format!("{}.offload.prefill_unstreamed", model_name),
+                        serde_json::Value::from(crate::offload::stream::unstreamed()),
+                    );
+
                     let inf = crate::scheduler::get_stats().await;
+                    // How often the engine lanes slept between requests,
+                    // and stayed awake for work owed them instead.
+                    let (sleeps, awaits) = crate::scheduler::lane_waits();
+                    stats.insert(
+                        format!("{}.engine_lane_sleeps", model_name),
+                        serde_json::Value::from(sleeps),
+                    );
+                    stats.insert(
+                        format!("{}.engine_lane_awaits", model_name),
+                        serde_json::Value::from(awaits),
+                    );
                     stats.insert(
                         format!("{}.total_batches", model_name),
                         serde_json::Value::from(inf.total_batches),
@@ -117,60 +196,12 @@ impl Session {
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
                     stats.insert(
-                        format!("{}.fire.inter_fire_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_inter_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.post_dispatch_to_fire_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_post_dispatch_to_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.recv_block_wait_us", model_name),
-                        serde_json::Value::from(inf.fire.avg_recv_block_wait_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.inter_fire_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.inter_fire_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.post_dispatch_to_fire_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.post_dispatch_to_fire_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.recv_block_wait_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.recv_block_wait_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.accumulate.accum_loop_us", model_name),
-                        serde_json::Value::from(inf.fire.accumulate.avg_accum_loop_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.accumulate.accum_loop_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.accumulate.accum_loop_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.pre_dispatch.fire_prepare_us", model_name),
-                        serde_json::Value::from(inf.fire.pre_dispatch.avg_fire_prepare_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.pre_dispatch.fire_prepare_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.pre_dispatch.fire_prepare_us_sum),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.total_us", model_name),
-                        serde_json::Value::from(inf.fire.execute.avg_total_us),
-                    );
-                    stats.insert(
                         format!("{}.fire.execute.batch_build_us", model_name),
                         serde_json::Value::from(inf.fire.execute.avg_batch_build_us),
                     );
                     stats.insert(
                         format!("{}.fire.execute.engine_fire_us", model_name),
                         serde_json::Value::from(inf.fire.execute.avg_engine_fire_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.execute.total_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.execute.total_us_sum),
                     );
                     stats.insert(
                         format!("{}.fire.execute.batch_build_us_sum", model_name),
@@ -181,16 +212,8 @@ impl Session {
                         serde_json::Value::from(inf.fire.execute.engine_fire_us_sum),
                     );
                     stats.insert(
-                        format!("{}.fire.post_dispatch.context_tick_us", model_name),
-                        serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
-                    );
-                    stats.insert(
                         format!("{}.fire.post_dispatch.stats_update_us", model_name),
                         serde_json::Value::from(inf.fire.post_dispatch.avg_stats_update_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.post_dispatch.context_tick_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.post_dispatch.context_tick_us_sum),
                     );
                     stats.insert(
                         format!("{}.fire.post_dispatch.stats_update_us_sum", model_name),
@@ -263,6 +286,14 @@ impl Session {
                     stats.insert(
                         format!("{}.fire.quorum.dispatch_blocked_holds", model_name),
                         serde_json::Value::from(inf.fire.quorum.dispatch_blocked_holds),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.frames_parked_on_lane", model_name),
+                        serde_json::Value::from(inf.fire.quorum.frames_parked_on_lane),
+                    );
+                    stats.insert(
+                        format!("{}.fire.quorum.frames_past_waiting_lane", model_name),
+                        serde_json::Value::from(inf.fire.quorum.frames_past_waiting_lane),
                     );
                     stats.insert(
                         format!("{}.fire.quorum.device_idle_us", model_name),
@@ -545,6 +576,7 @@ impl Session {
                 tenant: self.tenant.clone(),
                 session,
                 props,
+                keys_under: None,
             },
             executors,
         ) {
@@ -570,8 +602,17 @@ impl Session {
     /// The program `inferlet` names for this session's tenant, compiled.
     async fn launchable(&self, inferlet: &str) -> anyhow::Result<program::Program> {
         let reference = ProgramRef::parse(inferlet)?;
+        let t0 = crate::rt::Instant::now();
         let program = program::resolve(Some(&self.tenant), &reference).await?;
+        let resolved = t0.elapsed();
         program::load(&program).await?;
+        tracing::debug!(
+            target: "pie::launch",
+            %program,
+            resolve_us = resolved.as_micros() as u64,
+            load_us = (t0.elapsed() - resolved).as_micros() as u64,
+            "launchable"
+        );
         Ok(program)
     }
 

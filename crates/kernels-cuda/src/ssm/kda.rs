@@ -138,7 +138,7 @@ impl Kda {
                         ],
                         [PREP_BLOCK, 1, 1],
                     )
-                    .programmatic(ctx.tuning().pdl),
+                    .programmatic(ctx.tuning().pdl()),
                 )
             } else {
                 Fire::at(kernel(KDA, "::pie::ssm::kda_qkv_prep<::pie::bf16, 128>"))
@@ -159,7 +159,7 @@ impl Kda {
         let gates = if self.head_dim.is_multiple_of(4) {
             Fire::at(kernel(KDA, "::pie::ssm::kda_gate_beta_rows<::pie::bf16>")).apply(
                 Launch::grid([self.n, self.width.div_ceil(1024), 1], [256, 1, 1])
-                    .programmatic(ctx.tuning().pdl),
+                    .programmatic(ctx.tuning().pdl()),
             )
         } else {
             Fire::at(kernel(KDA, "::pie::ssm::kda_gate_beta<::pie::bf16>")).apply(Launch::grid(
@@ -216,7 +216,7 @@ pub fn kda(
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
     seated(OP, state, "kda_step", true, false, false)?;
     let work = shape.work(ctx, OP, state, shape.n)?;
-    if ctx.tuning().ssm_kda_step_fused && matches!(shape.head_dim, 32 | 64 | 128) {
+    if ctx.tuning().ssm_kda_step_fused() && matches!(shape.head_dim, 32 | 64 | 128) {
         // Enough blocks to fill the device twice: each (row, head) split
         // over up to eight slices of its value rows.
         let sms = ctx.multiprocessors().unwrap_or(148);
@@ -270,7 +270,7 @@ pub fn kda(
                 [STEP_BLOCK / 2, 1, 1],
             )
             .smem(kda_shmem(shape.head_dim))
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         ),
         &[
             ArgValue::Ptr(staged.q_norm),
@@ -285,6 +285,169 @@ pub fn kda(
             state.write_state.arg(),
             state.write_state_mask.arg(),
             ArgValue::Ptr(work),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// [`kda`] over each lane's carried rows then its own ([`Carry`]), the
+/// carried rows read as a linear attention from the committed state: their
+/// forget and beta rows, keys and corrected values (planes 0 to 3) as
+/// decay-weighted dots against the own row's q and k; each head's state
+/// rows, a warp's four in registers, folded through the lane's commit
+/// length. The own row's forget, beta and corrected value land in the
+/// lane's buffer. Heads 32, 64 or 128 wide only.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_carried(
+    ctx: &Ctx,
+    mixed: Tensor,
+    f: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    y: &mut Tensor,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda";
+    /// Eight warps of four state rows each.
+    const STEP_BLOCK: u32 = 256;
+    const BLOCK_ROWS: u32 = 32;
+    dtype_dispatch!(OP, mixed.dtype, { Bf16 => () });
+    debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
+    let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
+    f32_state(OP, state)?;
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    seated(OP, state, "kda_step_carried", true, false, false)?;
+    if !matches!(shape.head_dim, 32 | 64 | 128) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a lane's carried rows step {}-wide heads in registers, and the step holds 32, \
+                 64 or 128",
+                shape.head_dim
+            ),
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            KDA,
+            &format!(
+                "::pie::ssm::kda_step_carried<::pie::bf16, {}>",
+                shape.head_dim / WARP
+            ),
+        ))
+        .apply(
+            Launch::grid(
+                [shape.n, shape.heads, shape.head_dim.div_ceil(BLOCK_ROWS)],
+                [STEP_BLOCK, 1, 1],
+            )
+            .smem(kda_shmem(shape.head_dim) + shape.head_dim * FLOAT),
+        ),
+        &[
+            mixed.arg(),
+            f.arg(),
+            b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gate_floor.arg(),
+            norm_eps.arg(),
+            rows.arg(),
+            y.arg(),
+            stated(OP, shape.heads)?.arg(),
+            stated(OP, shape.head_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            carry.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The rows a chunked KDA fire's lanes land in their buffer past their
+/// commit, made ready for a later decode ([`kda_carried`]): each row's keys
+/// and corrected value (planes 2 and 3; its forget and beta rows, planes 0
+/// and 1, the fire lands), stepped in order from the state the fire left.
+/// `mixed`, `f` and `b` are the fire's own rows by `qo_indptr`, or with
+/// `ext` its extended rows (row `RsLane::ext + j`).
+#[allow(clippy::too_many_arguments)]
+pub fn kda_tail(
+    ctx: &Ctx,
+    mixed: Tensor,
+    f: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    state: &RecurrentPool,
+    qo_indptr: Tensor,
+    ext: bool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    carry: &Carry,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda_chunked";
+    const STEP_BLOCK: u32 = 256;
+    const BLOCK_ROWS: u32 = 32;
+    if !carry.buffers() {
+        return Ok(());
+    }
+    dtype_dispatch!(OP, mixed.dtype, { Bf16 => () });
+    let lanes = qo_indptr.rows.saturating_sub(1);
+    if lanes == 0 {
+        return Ok(());
+    }
+    if !matches!(head_dim, 32 | 64 | 128) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a buffered row's corrected value steps {head_dim}-wide heads in registers, and \
+                 the step holds 32, 64 or 128"
+            ),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            KDA,
+            &format!(
+                "::pie::ssm::kda_tail_corrected<::pie::bf16, {}>",
+                head_dim / WARP
+            ),
+        ))
+        .apply(
+            Launch::grid(
+                [lanes, heads, head_dim.div_ceil(BLOCK_ROWS)],
+                [STEP_BLOCK, 1, 1],
+            )
+            .smem(kda_shmem(head_dim)),
+        ),
+        &[
+            mixed.arg(),
+            f.arg(),
+            b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gate_floor.arg(),
+            norm_eps.arg(),
+            rows.arg(),
+            qo_indptr.arg(),
+            ext.arg(),
+            stated(OP, heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            stated(OP, lanes)?.arg(),
+            carry.arg(),
             ctx.stage(),
         ],
     )
@@ -336,7 +499,7 @@ pub fn kda_chunked(
     f32_state(OP, state)?;
     seated(OP, state, "kda_chunked", true, true, true)?;
     let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
-    if ctx.tuning().ssm_kda_chunked && shape.head_dim == 128 {
+    if ctx.tuning().ssm_kda_chunked() && shape.head_dim == 128 {
         // The tensor-core prep reads the raw rows and forms the norms and
         // gates itself.
         let gates = KdaGates {
@@ -379,5 +542,70 @@ pub fn kda_chunked(
             ArgValue::Ptr(work),
             ctx.stage(),
         ],
+    )
+}
+
+/// Folds each beam group's fold rows (`carry`'s
+/// planes forget, beta, keys, `u`) into its KDA state, as a decode step
+/// folds a committed row, the rows stored once.
+/// The groups that fold lead `folds` (`groups` entries at most, the first of
+/// no rows ending them); a block folds each in turn, so a fire none of whose
+/// groups folds costs one read a block.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    heads: u32,
+    head_dim: u32,
+    norm_eps: f32,
+    gate_floor: f32,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.kda group fold";
+    const BLOCK: u32 = 256;
+    const BLOCK_ROWS: u32 = 32;
+    if groups == 0 {
+        return Ok(());
+    }
+    debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    f32_state(OP, state)?;
+    if !matches!(head_dim, 32 | 64 | 128) {
+        return Err(refuse(
+            OP,
+            format!("a fold holds 32-, 64- or 128-wide heads in registers, not {head_dim}"),
+        ));
+    }
+    let rows = state.rows(OP, state.slab, state.slot_stride_elems, heads)?;
+    ctx.fire(
+        OP,
+        Fire::at(fold_kernel(head_dim)).apply(Launch::grid(
+            [heads, 1, head_dim.div_ceil(BLOCK_ROWS)],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            rows.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gate_floor.arg(),
+            norm_eps.arg(),
+            stated(OP, heads)?.arg(),
+            stated(OP, head_dim)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}
+
+/// KDA's group fold kernel for heads `head_dim` wide ([`kda_fold`]).
+pub(super) fn fold_kernel(head_dim: u32) -> &'static crate::jit::Kernel {
+    kernel(
+        KDA,
+        &format!("::pie::ssm::kda_fold<::pie::bf16, {}>", head_dim / WARP),
     )
 }

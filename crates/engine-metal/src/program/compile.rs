@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
+use eta_compiler::codegen::metal::StepNodes;
 use eta_compiler::codegen::program::KernelKind;
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
@@ -115,12 +116,27 @@ impl Target {
     }
 }
 
+/// The step pipelines every region module has built ([`Module::build`]).
+static STEP_PIPELINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The step pipelines region modules have built so far, process-wide.
+#[must_use]
+pub fn step_pipelines_built() -> u64 {
+    STEP_PIPELINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Module {
+    /// Held for the life of the pipelines made from it, never read.
     #[cfg(target_vendor = "apple")]
     #[allow(dead_code)]
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     #[cfg(target_vendor = "apple")]
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// A streamed region's pipeline a step (`m4_fixed_step`): each keeps
+    /// its step's case alone, and with it only that case's registers and
+    /// threadgroup memory. Empty where the region is one dispatch.
+    #[cfg(target_vendor = "apple")]
+    steps: Vec<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     entry: String,
 }
 
@@ -148,6 +164,14 @@ impl Module {
         &self.pipeline
     }
 
+    /// Step `step`'s own pipeline, where it was built one.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn step_pipelines(
+        &self,
+    ) -> &[Retained<ProtocolObject<dyn MTLComputePipelineState>>] {
+        &self.steps
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(crate) fn max_threads(&self) -> usize {
         self.pipeline.maxTotalThreadsPerThreadgroup()
@@ -163,6 +187,8 @@ impl Module {
         device: &ProtocolObject<dyn MTLDevice>,
         source: &str,
         entry: &str,
+        steps: usize,
+        threads: &Threads,
     ) -> std::result::Result<Module, Failure> {
         let options = crate::device::ctx::compile_options();
         set_safe_math(&options);
@@ -170,44 +196,230 @@ impl Module {
             let path = dir.join(format!("{entry}.metal"));
             let _ = std::fs::write(path, source);
         }
+        crate::diag::made(&format!("guest library+pipeline {entry}"), 0);
         let text = crate::device::ctx::nsstring(source);
         let library = device
             .newLibraryWithSource_options_error(&text, Some(&options))
             .map_err(|error| classify(entry, &error))?;
-        let name = crate::device::ctx::nsstring(entry);
-        let function =
-            library
-                .newFunctionWithName(&name)
-                .ok_or_else(|| Failure::Deterministic {
+        // A streamed kernel declares its step as a function constant: the
+        // pipeline for every step leaves it undefined, a step's states it.
+        let pipeline_for = |library: &ProtocolObject<dyn MTLLibrary>, step: Option<u32>| {
+            let name = crate::device::ctx::nsstring(entry);
+            let constants = objc2_metal::MTLFunctionConstantValues::new();
+            if let Some(step) = step {
+                // SAFETY: a uint constant at this index, read from a live u32.
+                unsafe {
+                    constants.setConstantValue_type_atIndex(
+                        std::ptr::NonNull::from(&step).cast(),
+                        objc2_metal::MTLDataType::UInt,
+                        eta_compiler::codegen::metal::M4_STEP_CONSTANT,
+                    );
+                }
+            }
+            let function = library
+                .newFunctionWithName_constantValues_error(&name, &constants)
+                .map_err(|_| Failure::Deterministic {
                     reason: format!(
                         "the library compiled and holds no `{entry}`; the emitter and the \
-                     engine disagree about this region's entry name"
+                         engine disagree about this region's entry name"
                     ),
                 })?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|error| classify(entry, &error))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|error| classify(entry, &error))
+        };
+        let made = pipeline_for(&library, None).map(Made)?;
+        // Every step's pipeline is built here, with the region's library, as
+        // the registration compiles: none is built where a step fires.
+        let shared = Made(&*library);
+        let steps = in_parallel(threads, steps, |step| {
+            let shared = &shared;
+            pipeline_for(shared.0, Some(u32::try_from(step).unwrap_or(u32::MAX))).map(Made)
+        })
+        .into_iter()
+        .map(|made| made.map(|Made(pipeline)| pipeline))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+        STEP_PIPELINES.fetch_add(steps.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(Module {
+            pipeline: made.0,
             library,
-            pipeline,
+            steps,
             entry: entry.to_string(),
         })
     }
 }
 
+/// A library or a pipeline state, made on one thread and taken on another:
+/// `MTLLibrary` and `MTLComputePipelineState` are documented thread-safe.
+#[cfg(target_vendor = "apple")]
+struct Made<T>(T);
+// SAFETY: as stated above; `Made` holds nothing else.
+#[cfg(target_vendor = "apple")]
+unsafe impl<T> Send for Made<T> {}
+// SAFETY: as above.
+#[cfg(target_vendor = "apple")]
+unsafe impl<T> Sync for Made<T> {}
+
+/// The threads a prewarm may still start. Nested fans ([`in_parallel`]) share
+/// it, so however they nest no more run than the device compiles at once.
+pub struct Threads {
+    spare: std::sync::atomic::AtomicUsize,
+}
+
+impl Threads {
+    /// `count` threads in all, the calling one among them.
+    #[must_use]
+    pub fn of(count: usize) -> Threads {
+        Threads {
+            spare: std::sync::atomic::AtomicUsize::new(count.saturating_sub(1)),
+        }
+    }
+
+    fn take(&self) -> bool {
+        use std::sync::atomic::Ordering::AcqRel;
+        self.spare
+            .try_update(AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
+                n.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn give(&self) {
+        self.spare.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// One fan's work: the next index, its answers and what makes them.
+struct Fan<'a, T, F> {
+    threads: &'a Threads,
+    next: std::sync::atomic::AtomicUsize,
+    slots: Vec<std::sync::Mutex<Option<T>>>,
+    make: F,
+}
+
+impl<T: Send, F: Fn(usize) -> T + Sync> Fan<'_, T, F> {
+    /// Makes answers until none are left, starting another thread at each
+    /// while one is spare and work remains.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a slot is written whole after its compile; a compile that panicked is refused by name and the rest still serve"
+    )]
+    fn work<'s>(&'s self, scope: &'s std::thread::Scope<'s, '_>) {
+        loop {
+            let at = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(slot) = self.slots.get(at) else {
+                break;
+            };
+            if at + 1 < self.slots.len() && self.threads.take() {
+                scope.spawn(move || {
+                    self.work(scope);
+                    self.threads.give();
+                });
+            }
+            let made = pooled(|| (self.make)(at));
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
+        }
+    }
+}
+
+/// `run` in an autorelease pool of its own: what Metal autoreleases goes
+/// when it returns, not when the thread ends.
+fn pooled<T>(run: impl FnOnce() -> T) -> T {
+    #[cfg(target_vendor = "apple")]
+    {
+        objc2::rc::autoreleasepool(|_| run())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        run()
+    }
+}
+
+/// `make` of every index below `count`, on the calling thread and those
+/// `threads` has spare, answered in index order whatever order they ran in.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a slot is written whole after its compile; a compile that panicked is refused by name and the rest still serve"
+)]
+pub(crate) fn in_parallel<T: Send>(
+    threads: &Threads,
+    count: usize,
+    make: impl Fn(usize) -> T + Sync,
+) -> Vec<T> {
+    let fan = Fan {
+        threads,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        slots: (0..count).map(|_| std::sync::Mutex::new(None)).collect(),
+        make,
+    };
+    std::thread::scope(|scope| fan.work(scope));
+    fan.slots
+        .into_iter()
+        .filter_map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .collect()
+}
+
+/// The modules jobs run at once share, by text: each text is built by the
+/// first job to ask, and the others wait for it.
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+pub struct Sharing {
+    modules: std::sync::Mutex<std::collections::HashMap<u64, SharedModule>>,
+    pub(crate) threads: Threads,
+}
+
+type SharedModule = Arc<std::sync::OnceLock<std::result::Result<Arc<Module>, Failure>>>;
+
+#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+impl Sharing {
+    /// `threads`: the compiles the device runs at once.
+    #[must_use]
+    pub fn over(threads: usize) -> Sharing {
+        Sharing {
+            modules: std::sync::Mutex::default(),
+            threads: Threads::of(threads),
+        }
+    }
+
+    /// The module of `key`, and whether this call built it.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the table gains a module whole or not at all; a compile's panic must not take the loads beside it down"
+    )]
+    fn module(
+        &self,
+        key: u64,
+        build: impl FnOnce() -> std::result::Result<Arc<Module>, Failure>,
+    ) -> (std::result::Result<Arc<Module>, Failure>, bool) {
+        let slot = self
+            .modules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .clone();
+        let mut built = false;
+        let module = slot
+            .get_or_init(|| {
+                built = true;
+                build()
+            })
+            .clone();
+        (module, built)
+    }
+}
+
+/// Safe math and precise floating-point functions. Both options are macOS
+/// 15's; the engine runs on macOS 26 or newer only (Metal 4, which
+/// `Context::bind` refuses a device without), so no older form is set.
 #[cfg(target_vendor = "apple")]
 fn set_safe_math(options: &objc2_metal::MTLCompileOptions) {
-    use objc2::runtime::NSObjectProtocol as _;
-
-    if options.respondsToSelector(objc2::sel!(setMathMode:)) {
-        options.setMathMode(objc2_metal::MTLMathMode::Safe);
-    } else {
-        #[allow(deprecated)]
-        options.setFastMathEnabled(false);
-    }
-    if options.respondsToSelector(objc2::sel!(setMathFloatingPointFunctions:)) {
-        options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
-    }
+    options.setMathMode(objc2_metal::MTLMathMode::Safe);
+    options.setMathFloatingPointFunctions(objc2_metal::MTLMathFloatingPointFunctions::Precise);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -243,6 +455,11 @@ pub struct Region {
     pub steps: Arc<Vec<StreamedStep>>,
     pub form: Form,
     pub module: Arc<Module>,
+    /// A streamed region's nodes as its dispatches compute them, a list a
+    /// step, and the views no step computes (`launch::launches`); empty
+    /// where the emitter published no node lists or left a node out of
+    /// them, and the region is one launch.
+    pub launches: Arc<StepNodes>,
 }
 
 impl Region {
@@ -250,6 +467,175 @@ impl Region {
     pub(crate) fn pipeline(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         self.module.pipeline()
     }
+}
+
+/// The device a registration's compile builds its libraries and pipelines
+/// on, owned so the compile can run on any thread
+/// (`engine::Engine::prepare_program`): Metal states `MTLDevice` thread-safe
+/// for making libraries and pipeline states.
+pub struct CompileDevice {
+    #[cfg(target_vendor = "apple")]
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+}
+
+// SAFETY: the device is only asked to make libraries and pipeline states,
+// which Metal states safe from any thread.
+#[allow(unsafe_code)]
+unsafe impl Send for CompileDevice {}
+
+impl CompileDevice {
+    /// Has the device compile on as many threads as the OS lets it
+    /// (`on`), or as it does by default, and answers how many that is.
+    #[must_use]
+    pub fn compile_wide(&self, on: bool) -> usize {
+        #[cfg(target_vendor = "apple")]
+        {
+            self.device.setShouldMaximizeConcurrentCompilation(on);
+            self.device.maximumConcurrentCompilationTaskCount().max(1)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = on;
+            1
+        }
+    }
+
+    #[must_use]
+    pub fn of(context: &Context) -> CompileDevice {
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2::Message as _;
+            CompileDevice {
+                device: context.device().retain(),
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = context;
+            CompileDevice {}
+        }
+    }
+}
+
+/// What a registration still has to compile, planned on the engine's
+/// thread ([`Cache::plan`]): the stages the cache did not hold, built on
+/// any thread ([`Job::run`]), then committed on the engine's thread
+/// ([`Cache::finish`]).
+pub struct Job {
+    device: CompileDevice,
+    program_hash: u64,
+    program_key: u64,
+    plans: Vec<LaunchStagePlan>,
+    kinds: Vec<Attach>,
+    kernels: Vec<EmittedKernel>,
+    /// Each stage: the cache's (a hit) or `None` (to build), with its key,
+    /// its identity and whether the cache takes it once built.
+    slots: Vec<(Option<Stage>, u64, u64, bool)>,
+    /// The region modules the cache held when the job was planned, by text
+    /// ([`Cache::modules`]).
+    modules: std::collections::HashMap<u64, Arc<Module>>,
+}
+
+// SAFETY: the stages a job holds and builds are immutable libraries and
+// pipeline states (and their plans), which Metal states safe to use from
+// any thread; nothing in a job is touched by two threads at once.
+#[allow(unsafe_code)]
+unsafe impl Send for Job {}
+
+/// A job run ([`Job::run`]): its stages, or why they did not build.
+pub struct Built {
+    job: Job,
+    stages: std::result::Result<Vec<Stage>, Failure>,
+    compilations: u64,
+    memory_hits: u64,
+    /// The wall time its region compiles took, in nanoseconds.
+    compile_nanos: u64,
+    /// The region modules the job built, by text, for the cache.
+    made: std::collections::HashMap<u64, Arc<Module>>,
+}
+
+// SAFETY: as `Job`.
+#[allow(unsafe_code)]
+unsafe impl Send for Built {}
+
+/// A registration's compile, planned ([`Cache::plan`]): held already, or a
+/// job to run.
+pub enum Planned {
+    Held(Compiled),
+    Run(Job),
+}
+
+impl Job {
+    /// Builds every stage the cache did not hold: the libraries and
+    /// pipelines, on whatever thread runs it.
+    #[must_use]
+    pub fn run(self) -> Built {
+        self.run_sharing(&Sharing::over(1))
+    }
+
+    /// [`Job::run`], its modules shared with the jobs run beside it.
+    #[must_use]
+    pub fn run_sharing(self, sharing: &Sharing) -> Built {
+        let mut builder = Builder {
+            device: &self.device,
+            sharing,
+            modules: &self.modules,
+            made: std::collections::HashMap::new(),
+            compilations: 0,
+            memory_hits: 0,
+            compile_nanos: 0,
+        };
+        let stages = (|| {
+            let index =
+                Emitted::index(&self.kernels).map_err(|duplicate| Failure::Deterministic {
+                    reason: format!(
+                        "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
+                     an engine cannot know which of the two the host meant",
+                        duplicate.kind as u32, duplicate.stage, duplicate.region
+                    ),
+                })?;
+            let mut stages = Vec::with_capacity(self.slots.len());
+            for (at, (held, ..)) in self.slots.iter().enumerate() {
+                if let Some(stage) = held {
+                    stages.push(stage.clone());
+                    continue;
+                }
+                let stage_index = u32::try_from(at).map_err(|_| Failure::Deterministic {
+                    reason: "a program with more than four billion stages is not a program".into(),
+                })?;
+                stages.push(builder.build_stage(stage_index, &self.plans[at], &index)?);
+            }
+            Ok(stages)
+        })();
+        let Builder {
+            compilations,
+            memory_hits,
+            compile_nanos,
+            made,
+            ..
+        } = builder;
+        Built {
+            job: self,
+            stages,
+            compilations,
+            memory_hits,
+            compile_nanos,
+            made,
+        }
+    }
+}
+
+/// The region compiles a job runs, on the device it owns.
+struct Builder<'a> {
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    device: &'a CompileDevice,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    sharing: &'a Sharing,
+    modules: &'a std::collections::HashMap<u64, Arc<Module>>,
+    made: std::collections::HashMap<u64, Arc<Module>>,
+    compilations: u64,
+    memory_hits: u64,
+    compile_nanos: u64,
 }
 
 enum GroupedAnswer {
@@ -284,7 +670,15 @@ pub struct Cache {
     programs: Bounded<u64, Compiled>,
     stages: Stages<Stage>,
     negative: Bounded<u64, String>,
+    /// Each region's module by its source text: a program whose
+    /// stages differ from a built one's (another binding, another request
+    /// shape) and whose regions read the same reuses them, as the runtime's
+    /// prewarm of its standard samplers counts on (regions keyed by text).
+    modules: std::collections::HashMap<u64, Arc<Module>>,
     stats: CacheStats,
+    /// The wall time every region compile since load took, in nanoseconds:
+    /// a compile the OS's shader cache serves reads apart from a cold one.
+    compile_nanos: u64,
 }
 
 impl Default for Cache {
@@ -300,13 +694,21 @@ impl Cache {
             programs: Bounded::new(MAX_PROGRAM_ENTRIES),
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
+            modules: std::collections::HashMap::new(),
             stats: CacheStats::default(),
+            compile_nanos: 0,
         }
     }
 
     #[must_use]
     pub const fn stats(&self) -> CacheStats {
         self.stats
+    }
+
+    /// The wall time every region compile since load took, in nanoseconds.
+    #[must_use]
+    pub const fn compile_nanos(&self) -> u64 {
+        self.compile_nanos
     }
 
     pub fn compile(
@@ -318,9 +720,27 @@ impl Cache {
         versions: Versions,
         target: Target,
     ) -> std::result::Result<Compiled, Failure> {
+        match self.plan(context, program_hash, plan, kernels, versions, target)? {
+            Planned::Held(compiled) => Ok(compiled),
+            Planned::Run(job) => self.finish(job.run()),
+        }
+    }
+
+    /// The first half of [`Cache::compile`], on the engine's thread: the
+    /// program the cache holds already, a deterministic refusal it
+    /// remembers, or a job of the stages it does not hold.
+    pub fn plan(
+        &mut self,
+        context: &Context,
+        program_hash: u64,
+        plan: &ExecPlan,
+        kernels: &[EmittedKernel],
+        versions: Versions,
+        target: Target,
+    ) -> std::result::Result<Planned, Failure> {
         if let Some(compiled) = self.programs.get(&program_hash) {
             self.stats.memory_hits += 1;
-            return Ok(compiled.clone());
+            return Ok(Planned::Held(compiled.clone()));
         }
 
         let program_identity = cache_identity(
@@ -337,16 +757,67 @@ impl Cache {
             });
         }
 
-        match self.build(context, plan, kernels, versions, target) {
-            Ok(compiled) => {
+        let mut slots = Vec::with_capacity(plan.package.plans.len());
+        for stage_plan in &plan.package.plans {
+            let identity = cache_identity(
+                Backend::Metal,
+                target.device,
+                stage_plan.signature_hash,
+                versions,
+            );
+            let key = eta_ir::fnv1a64(identity.as_bytes());
+            let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
+            match (lookup, hit) {
+                (Lookup::Hit, Some(stage)) => {
+                    self.stats.memory_hits += 1;
+                    slots.push((Some(stage), key, stage_plan.identity, false));
+                }
+                (lookup, _) => {
+                    slots.push((None, key, stage_plan.identity, lookup == Lookup::Miss));
+                }
+            }
+        }
+        Ok(Planned::Run(Job {
+            device: CompileDevice::of(context),
+            program_hash,
+            program_key,
+            plans: plan.package.plans.clone(),
+            kinds: plan.package.stages.iter().map(|s| s.stage).collect(),
+            kernels: kernels.to_vec(),
+            slots,
+            modules: self.modules.clone(),
+        }))
+    }
+
+    /// The second half of [`Cache::compile`], on the engine's thread: a
+    /// built job's stages taken into the cache and its program held, or its
+    /// refusal remembered where it is deterministic.
+    pub fn finish(&mut self, built: Built) -> std::result::Result<Compiled, Failure> {
+        self.stats.compilations += built.compilations;
+        self.stats.memory_hits += built.memory_hits;
+        self.compile_nanos = self.compile_nanos.saturating_add(built.compile_nanos);
+        self.modules.extend(built.made);
+        let job = built.job;
+        match built.stages {
+            Ok(stages) => {
+                for ((held, key, identity, keep), stage) in job.slots.iter().zip(&stages) {
+                    if held.is_none() && *keep {
+                        self.stages.stage(*key, *identity, stage.clone());
+                    }
+                }
                 self.stages.commit();
-                self.programs.insert(program_hash, compiled.clone());
+                let compiled = Compiled {
+                    stages: Arc::new(stages),
+                    plans: Arc::new(job.plans),
+                    kinds: Arc::new(job.kinds),
+                };
+                self.programs.insert(job.program_hash, compiled.clone());
                 Ok(compiled)
             }
             Err(failure) => {
                 self.stages.abandon();
                 if let Failure::Deterministic { reason } = &failure {
-                    self.negative.insert(program_key, reason.clone());
+                    self.negative.insert(job.program_key, reason.clone());
                 }
                 Err(failure)
             }
@@ -356,64 +827,11 @@ impl Cache {
     pub fn forget(&mut self, program_hash: u64) {
         self.programs.remove(&program_hash);
     }
+}
 
-    fn build(
-        &mut self,
-        context: &Context,
-        plan: &ExecPlan,
-        kernels: &[EmittedKernel],
-        versions: Versions,
-        target: Target,
-    ) -> std::result::Result<Compiled, Failure> {
-        let index = Emitted::index(kernels).map_err(|duplicate| Failure::Deterministic {
-            reason: format!(
-                "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
-                 an engine cannot know which of the two the host meant",
-                duplicate.kind as u32, duplicate.stage, duplicate.region
-            ),
-        })?;
-
-        let mut stages = Vec::with_capacity(plan.package.plans.len());
-        for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
-            let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
-                reason: "a program with more than four billion stages is not a program".into(),
-            })?;
-            let identity = cache_identity(
-                Backend::Metal,
-                target.device,
-                stage_plan.signature_hash,
-                versions,
-            );
-            let key = eta_ir::fnv1a64(identity.as_bytes());
-            let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
-            match lookup {
-                Lookup::Hit => {
-                    self.stats.memory_hits += 1;
-                    if let Some(stage) = hit {
-                        stages.push(stage);
-                        continue;
-                    }
-                }
-                Lookup::Collided | Lookup::Miss => {}
-            }
-
-            let compiled = self.build_stage(context, stage_index, stage_plan, &index)?;
-            if lookup == Lookup::Miss {
-                self.stages
-                    .stage(key, stage_plan.identity, compiled.clone());
-            }
-            stages.push(compiled);
-        }
-        Ok(Compiled {
-            stages: Arc::new(stages),
-            plans: Arc::new(plan.package.plans.clone()),
-            kinds: Arc::new(plan.package.stages.iter().map(|s| s.stage).collect()),
-        })
-    }
-
+impl Builder<'_> {
     fn build_stage(
         &mut self,
-        context: &Context,
         stage_index: u32,
         plan: &LaunchStagePlan,
         index: &Emitted<'_>,
@@ -430,9 +848,7 @@ impl Cache {
             {
                 continue;
             }
-            if let Some(region) =
-                self.streamed_region(context, stage_index, region_index, plan, index)?
-            {
+            if let Some(region) = self.streamed_region(stage_index, region_index, plan, index)? {
                 if region_trace() {
                     eprintln!(
                         "region: stage {stage_index} region {region_index} takes the Streamed \
@@ -447,7 +863,7 @@ impl Cache {
                 continue;
             }
             let grouped_declined =
-                match self.grouped_region(context, stage_index, region_index, plan, index)? {
+                match self.grouped_region(stage_index, region_index, plan, index)? {
                     GroupedAnswer::Served(region) => {
                         if region_trace() {
                             eprintln!(
@@ -504,12 +920,13 @@ impl Cache {
                 }
             };
 
-            let module = self.region_module(context, entry, source)?;
+            let module = self.region_module(entry, source, 0)?;
             regions.push(Region {
                 region_index,
                 steps: Arc::new(Vec::new()),
                 form: Form::Fused,
                 module,
+                launches: Arc::default(),
             });
         }
         Ok(Stage {
@@ -520,7 +937,6 @@ impl Cache {
 
     fn grouped_region(
         &mut self,
-        context: &Context,
         stage_index: u32,
         region_index: u32,
         plan: &LaunchStagePlan,
@@ -606,7 +1022,7 @@ impl Cache {
                 )));
             }
         };
-        let module = self.region_module(context, entry, source)?;
+        let module = self.region_module(entry, source, 0)?;
         #[cfg(target_vendor = "apple")]
         if library && module.max_threads() < super::launch::LIBRARY_SAMPLER_THREADS {
             return Ok(GroupedAnswer::Declined(format!(
@@ -625,12 +1041,12 @@ impl Cache {
                 Form::Grouped
             },
             module,
+            launches: Arc::default(),
         }))
     }
 
     fn streamed_region(
         &mut self,
-        context: &Context,
         stage_index: u32,
         region_index: u32,
         plan: &LaunchStagePlan,
@@ -652,6 +1068,10 @@ impl Cache {
                 } => (source, entry, steps),
                 _ => return Ok(None),
             };
+        let (table, published) = eta_compiler::codegen::metal::step_node_table(table);
+        let launches = published
+            .map(|published| step_launches(published, &plan.fused[region_index as usize].nodes))
+            .unwrap_or_default();
         let mut steps = Vec::with_capacity(table.len());
         for &word in table {
             let value = eta_compiler::codegen::metal::step_value(word);
@@ -665,7 +1085,7 @@ impl Cache {
                 input: value,
             });
         }
-        let module = self.region_module(context, entry, source)?;
+        let module = self.region_module(entry, source, steps.len())?;
         #[cfg(target_vendor = "apple")]
         if module.execution_width() != 32 {
             if region_trace() {
@@ -682,25 +1102,52 @@ impl Cache {
             steps: Arc::new(steps),
             form: Form::Streamed,
             module,
+            launches: Arc::new(launches),
         }))
     }
 
     fn region_module(
         &mut self,
-        context: &Context,
         entry: &str,
         source: &str,
+        steps: usize,
     ) -> std::result::Result<Arc<Module>, Failure> {
         let expanded = expand(source);
+        // Keyed by its text under one symbol (each program names its
+        // regions' entries after itself), as the runtime's prewarm test
+        // compares them; a module keeps its own pipeline, whatever it is
+        // named.
+        let key = eta_ir::fnv1a64(expanded.replace(entry, "ptir_region").as_bytes());
+        if let Some(module) = self.modules.get(&key).or_else(|| self.made.get(&key)) {
+            self.memory_hits += 1;
+            return Ok(module.clone());
+        }
         #[cfg(target_vendor = "apple")]
         {
-            let module = Module::build(context.device(), &expanded, entry)?;
-            self.stats.compilations += 1;
-            Ok(Arc::new(module))
+            let began = std::time::Instant::now();
+            let (module, built) = self.sharing.module(key, || {
+                Module::build(
+                    &self.device.device,
+                    &expanded,
+                    entry,
+                    steps,
+                    &self.sharing.threads,
+                )
+                .map(Arc::new)
+            });
+            let module = module?;
+            if built {
+                self.compile_nanos += u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.compilations += 1;
+            } else {
+                self.memory_hits += 1;
+            }
+            self.made.insert(key, module.clone());
+            Ok(module)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (context, entry, expanded);
+            let _ = (entry, expanded, steps);
             Err(Failure::Retryable {
                 reason: "this build has no Metal in it: the target is not an Apple one".into(),
             })
@@ -708,9 +1155,30 @@ impl Cache {
     }
 }
 
+/// A streamed region's launches: each step a dispatch of its own, with the
+/// nodes it computes (a node a reduction dispatches in a partial step and
+/// finishes in a later one lies in both, its bytes live from the first to
+/// the last), and the views no step computes. Empty, and the region one
+/// launch, where a node of `region` is neither in a step's list nor a
+/// view: what the emitter did not account for gets no reuse.
+fn step_launches(published: StepNodes, region: &[u32]) -> StepNodes {
+    let accounted = |node: &u32| {
+        published.views.contains(node)
+            || published.folded.iter().any(|&(_, folded)| folded == *node)
+            || published.steps.iter().any(|nodes| nodes.contains(node))
+    };
+    if region.iter().all(accounted) {
+        published
+    } else {
+        StepNodes::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod sampler_scratch {}
 
     #[test]
     fn compile_every_case() {
@@ -760,5 +1228,64 @@ mod tests {
                 Versions::from_compiler(Emitter::Cuda.emitter_version()),
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel {
+    use super::*;
+
+    /// Answers come in index order, each index made once, at any thread
+    /// count; a text's failure is every asker's and is built once.
+    #[test]
+    fn parallel_builds_answer_in_order_and_build_a_text_once() {
+        for threads in [1, 2, 18] {
+            let made = std::sync::atomic::AtomicUsize::new(0);
+            let out = in_parallel(&Threads::of(threads), 40, |at| {
+                made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                at
+            });
+            assert_eq!(out, (0..40).collect::<Vec<_>>());
+            assert_eq!(made.into_inner(), 40);
+            let sharing = Sharing::over(threads);
+            let asked = in_parallel(&sharing.threads, 8, |_| {
+                sharing.module(7, || {
+                    Err(Failure::Deterministic {
+                        reason: "`e`: refused".into(),
+                    })
+                })
+            });
+            assert_eq!(asked.iter().filter(|(_, built)| *built).count(), 1);
+            for (module, _) in asked {
+                let refused = Failure::Deterministic {
+                    reason: "`e`: refused".into(),
+                };
+                assert_eq!(module.map(|_| ()), Err(refused));
+            }
+        }
+    }
+
+    /// Fans inside a fan run on no more threads than were stated, and give
+    /// back every one they took.
+    #[test]
+    fn nested_fans_share_their_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        for count in [1, 4, 18] {
+            let threads = Threads::of(count);
+            let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let sums = in_parallel(&threads, 30, |outer| {
+                in_parallel(&threads, 20, |inner| {
+                    most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    now.fetch_sub(1, SeqCst);
+                    outer * inner
+                })
+                .into_iter()
+                .sum::<usize>()
+            });
+            assert_eq!(sums, (0..30).map(|outer| outer * 190).collect::<Vec<_>>());
+            assert!(most.into_inner() <= count);
+            assert_eq!(threads.spare.into_inner(), count - 1);
+        }
     }
 }

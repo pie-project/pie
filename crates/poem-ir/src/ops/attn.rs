@@ -45,6 +45,9 @@ pub enum Attn {
     /// selection (`selection`, its run of blocks as `selected` lays them out)
     /// reads only those blocks; a relative bias (`bias`, as `rel` scales it)
     /// adds each key's learned offset; `lse` writes the rows' log-sum-exp.
+    /// `mask` is the fire's [`crate::RuntimeInput::Mask`]: per-lane data,
+    /// each lane's mask or its word stating none, read as
+    /// [`Attn::Prefill`]'s is.
     Decode {
         #[input]
         q: ValueId,
@@ -52,6 +55,8 @@ pub enum Attn {
         plan: ValueId,
         #[input(CACHE)]
         cache: ValueId,
+        #[input]
+        mask: Option<ValueId>,
         #[input(I32)]
         selection: Option<ValueId>,
         #[input(F32)]
@@ -66,7 +71,9 @@ pub enum Attn {
         #[output(F32)]
         lse: Option<ValueId>,
     },
-    /// Each row's query against its lane's paged keys, causal where `causal`, masked by `mask`. A
+    /// Each row's query against its lane's paged keys, causal where `causal`, masked by `mask`
+    /// (the fire's [`crate::RuntimeInput::Mask`], per-lane data: a lane stating no mask reads
+    /// every key its bounds give, in the same body as a lane stating one). A
     /// selection, a relative bias and `lse` as [`Attn::Decode`]'s; `floor`,
     /// each row's least window position (i32 a row, from
     /// `attn.replay_floor`), below which the window reads no key.
@@ -146,8 +153,12 @@ pub enum Attn {
         #[output]
         o: ValueId,
     },
-    /// Each lane's attention mass over its first `kv_max` keys, averaged
-    /// over its last `observe` query rows: a `kv_max` run per query head.
+    /// Each capturing lane's attention mass a key of the load's context
+    /// ([`crate::Dim::ContextTimes`]`(1)`), averaged over its last `observe`
+    /// query rows and over every query head, added to `into` (an earlier
+    /// layer's, the same row) or, with none, to a zeroed row: one row a
+    /// capturing lane ([`crate::Dim::Capturing`]). The last layer's is the
+    /// mass summed over the layers, a key.
     ScoreCapture {
         #[input]
         q: ValueId,
@@ -157,11 +168,23 @@ pub enum Attn {
         cache: ValueId,
         head_dim: u32,
         kv_heads: u32,
+        /// The model's query heads, every rank's: what the mass a key is
+        /// averaged over, where a rank attends only its share of them.
+        q_heads: u32,
         sm_scale: f32,
         observe: u32,
-        kv_max: u32,
+        #[input(F32)]
+        into: Option<ValueId>,
         #[output(F32)]
         scores: ValueId,
+    },
+    /// Each capturing lane's key row `keys` summed a kv page of the load's:
+    /// one row a capturing lane, a mass a page ([`crate::Dim::ContextPages`]).
+    ScorePages {
+        #[input(F32)]
+        keys: ValueId,
+        #[output(F32)]
+        pages: ValueId,
     },
     Sink {
         #[input]
@@ -570,21 +593,29 @@ pub enum IndexScore {
 pub enum RaggedMask {
     None,
     GroupBlockDiagonal,
-    RelativeBias { table: ValueId, max_len: u32 },
+    /// Each row attends rows of its own group, narrowed by the mask its lane
+    /// states (`forward.mask` on a kv-less lane), a lane stating none
+    /// attending its whole group. Only an attention the model states so reads
+    /// a lane's mask: a lane's mask over any other is refused.
+    Stated,
+    RelativeBias {
+        table: ValueId,
+        max_len: u32,
+    },
 }
 
 impl Part for RaggedMask {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
             RaggedMask::RelativeBias { table, .. } => sink.push(*table),
-            RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
+            RaggedMask::None | RaggedMask::GroupBlockDiagonal | RaggedMask::Stated => {}
         }
     }
     fn outputs(&self, _sink: &mut Vec<ValueId>) {}
     fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
         match self {
             RaggedMask::RelativeBias { table, .. } => sink.push(("table", *table, Expect::F32)),
-            RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
+            RaggedMask::None | RaggedMask::GroupBlockDiagonal | RaggedMask::Stated => {}
         }
     }
 }

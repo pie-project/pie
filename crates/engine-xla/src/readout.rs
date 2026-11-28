@@ -24,11 +24,14 @@ pub struct Plane {
     pub name: String,
     pub axis: InputAxis,
     pub readout: bool,
-    pub buffer: Buffer,
+    pub buffer: std::sync::Arc<Buffer>,
     pub rows: u32,
     pub width: u32,
     pub layers: u32,
     pub dtype: Dtype,
+    /// The plane holds no denormal: a matmul wrote every value of it
+    /// (`Shell::normal_exports`), set by the engine, never by a guest.
+    pub normal: bool,
     host: OnceLock<Result<Value, String>>,
 }
 
@@ -39,7 +42,7 @@ impl Plane {
         name: String,
         axis: InputAxis,
         readout: bool,
-        buffer: Buffer,
+        buffer: std::sync::Arc<Buffer>,
         rows: u32,
         width: u32,
         layers: u32,
@@ -54,8 +57,16 @@ impl Plane {
             width,
             layers,
             dtype,
+            normal: false,
             host: OnceLock::new(),
         }
+    }
+
+    /// The plane, stated free of denormals where `normal`.
+    #[must_use]
+    pub fn with_normal(mut self, normal: bool) -> Plane {
+        self.normal = normal;
+        self
     }
 
     fn on_host(&self) -> Result<&Value, String> {
@@ -186,8 +197,9 @@ pub struct Kept {
     pub readback: Vec<Option<(usize, Vec<u32>)>>,
     /// The output a decoder's pixels are, and each real lane's on the host.
     pub pixels: (String, Vec<Vec<f32>>),
-    /// The host-reading lanes' readout rows, when the fire gathered them.
-    pub host: Option<HostRows>,
+    /// The host-reading lanes' rows of each readout plane the fire gathered
+    /// them from.
+    pub host: Vec<HostRows>,
 }
 
 impl std::fmt::Debug for Kept {
@@ -203,10 +215,12 @@ impl std::fmt::Debug for Kept {
 }
 
 impl Kept {
-    /// The plane lane `lane` reads output `name` from, and its seat there
-    /// (coalescing consecutive lanes whose rows form one contiguous run).
+    /// The plane lane `lane` reads output `name` from, and its seat there,
+    /// coalescing the lanes after it, short of `end`, whose rows continue
+    /// one contiguous run: an attachment's own lanes, never the next
+    /// request's.
     #[must_use]
-    pub fn bound(&self, lane: usize, name: &str) -> Option<(usize, Seat)> {
+    pub fn bound(&self, lane: usize, end: usize, name: &str) -> Option<(usize, Seat)> {
         let seats = self.seats.get(lane)?;
         let (at, first_seat) = self
             .planes
@@ -215,7 +229,7 @@ impl Kept {
             .enumerate()
             .find_map(|(at, (plane, seat))| (plane.name == name).then_some((at, (*seat)?)))?;
         let mut count = first_seat.count;
-        for next_seats in &self.seats[lane + 1..] {
+        for next_seats in self.seats.iter().take(end).skip(lane + 1) {
             let Some(next) = next_seats.get(at).copied().flatten() else {
                 break;
             };
@@ -233,18 +247,6 @@ impl Kept {
         ))
     }
 
-    /// Lane `lane`'s rows of output `name` on the host, every layer's.
-    pub fn lane_value(&self, lane: usize, name: &str) -> Result<Option<Value>, String> {
-        let Some((at, seat)) = self.bound(lane, name) else {
-            let pixels =
-                (self.pixels.1.get(lane)).filter(|v| !v.is_empty() && self.pixels.0 == name);
-            return Ok(pixels.map(|values| Value::F32(values.clone())));
-        };
-        self.planes[at]
-            .rows_of(seat.first..seat.first + seat.count)
-            .map(Some)
-    }
-
     /// Lane `lane`'s read-back rows on the host: the output they are of, how
     /// many, and their values.
     pub fn lane_rows(&self, lane: usize) -> Result<Option<Rows<'_>>, String> {
@@ -252,7 +254,7 @@ impl Kept {
             return Ok(None);
         };
         let plane = &self.planes[*at];
-        if let Some(host) = self.host.as_ref().filter(|host| host.plane == *at)
+        if let Some(host) = self.host.iter().find(|host| host.plane == *at)
             && let Some(Some(start)) = host.at.get(lane)
             && plane.layers <= 1
         {
@@ -266,7 +268,13 @@ impl Kept {
         }
         let values = match plane.rows_of(rows.iter().copied())? {
             Value::F32(values) => values,
-            _ => return Ok(None),
+            other => {
+                return Err(format!(
+                    "lane {lane} reads back output `{}`, a {:?} plane; a lane's readout carries f32",
+                    plane.name,
+                    other.dtype()
+                ));
+            }
         };
         Ok(Some((plane.name.as_str(), rows.len() as u32, values)))
     }

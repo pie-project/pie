@@ -128,7 +128,8 @@ pub(crate) fn try_prefill(
     // says (`kernel.sdpa.prefill.wide_sliding`) and its window reaches past
     // two such tiles (MiMo's 128 reads fewer keys in 64s: 844 -> 767 us a
     // 4 x 4096 fire); without a window it always does.
-    let sliding_wide = window_left < 0 || (ctx.tuning().prefill_wide_sliding && window_left >= 256);
+    let sliding_wide =
+        window_left < 0 || (ctx.tuning().prefill_wide_sliding() && window_left >= 256);
     // A 64-wide head's block takes two tiles of 128 rows over 64-key tiles,
     // each its own S buffers, where the fire leaves a few such blocks an SM
     // and no short window has them on the IO path below (Muse's 4 x 4096
@@ -154,10 +155,11 @@ pub(crate) fn try_prefill(
     } else {
         tiling(head_dim, sliding_wide)
     };
-    // The profile's decision (`kernel.sdpa.prefill.tc5`, on for sm_100)
-    // and the device's capability both: elsewhere FA2 serves as before.
-    let fits = ctx.tuning().prefill_tc5
-        && supported()
+    // The device's capability and the profile's decision
+    // (`kernel.sdpa.prefill.tc5`, on for sm_100) both: elsewhere FA2 serves
+    // as before, and the decision is not read.
+    let fits = supported()
+        && ctx.tuning().prefill_tc5()
         && matches!(head_dim, 64 | 128 | 256 | 512)
         && requests > 0
         && (kv::native_bf16(pool) || kv::native_e4m3(pool))

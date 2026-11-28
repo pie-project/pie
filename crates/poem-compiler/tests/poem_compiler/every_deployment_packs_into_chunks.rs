@@ -275,12 +275,11 @@ fn row(name: &str, recipe: &ChunkRecipe) -> String {
     #[allow(clippy::cast_precision_loss)]
     let fixed = fixed as f64 / f64::from(1u32 << 20);
     format!(
-        "| {name} | {} | {} | {} | {fixed:.1} | {:.1} | {:.1} | {:.2} |",
+        "| {name} | {} | {} | {} | {fixed:.1} | {:.1} | {:.2} |",
         human(recipe.chunk_bytes),
         recipe.shapes(),
         per.join("/"),
         recipe.chunks_per_ws(),
-        recipe.cow_chunks(),
         recipe.waste.percent()
     )
 }
@@ -298,9 +297,7 @@ fn every_deployment_packs_into_chunks_on_both_presets() {
         let profile = on(chunk);
         let mut worst: Option<(f64, String)> = None;
         println!("\n## {preset}\n");
-        println!(
-            "| model | C | shapes | slots/chunk | fixed MiB/ws | chunks/ws | CoW chunks/pool | waste % |"
-        );
+        println!("| model | C | shapes | slots/chunk | fixed MiB/ws | chunks/ws | waste % |");
         println!("|---|---|---|---|---|---|---|---|");
         for (deployment, trace) in &traces {
             let recipe = match chunk::plan(trace, &budgets, &profile) {
@@ -345,6 +342,7 @@ fn name_of(trace: &Trace, row: RowId) -> &str {
         },
         RowId::Rs(_) => "rs",
         RowId::Pool(_) => "pool",
+        RowId::Ring => "ring",
     }
 }
 
@@ -411,8 +409,7 @@ fn fixed_overhead(recipe: &ChunkRecipe) -> f64 {
     else {
         panic!("no fixed record")
     };
-    let sets = u64::from(recipe.profile.concurrency) * u64::from(FIXED_SETS_PER_WS)
-        + u64::from(recipe.cow_sets());
+    let sets = u64::from(recipe.profile.concurrency) * u64::from(FIXED_SETS_PER_WS);
     let per = recipe.chunk_bytes / bytes;
     let slots = sets * u64::from(*pieces_per_ws);
     let held = slots as f64 * recipe.chunk_bytes as f64 / per as f64;
@@ -511,6 +508,31 @@ fn planned_on(name: &str, chunk: ChunkProfile) -> (Trace, ChunkRecipe) {
     (trace, recipe)
 }
 
+/// A fork's copy-on-write record is taken from the pool when the fork
+/// writes: how many lanes a fire may run sizes nothing of the pool, so a
+/// hybrid's recipe is the same at any fire width.
+#[test]
+fn a_hybrids_state_pool_is_sized_without_the_fire_width() {
+    let deployment =
+        catalog::deployment("qwen35-d0.8b-vision-mtp-bf16-kv-bf16").expect("the hybrid is listed");
+    let trace = deployment.trace(Platform::Cuda);
+    for (preset, chunk) in PRESETS {
+        let at = |max_lanes: u32| {
+            let budgets = Budgets::of(Budget {
+                max_lanes,
+                ..Budget::default()
+            });
+            chunk::plan(&trace, &budgets, &on(chunk)).unwrap()
+        };
+        let narrow = at(1);
+        assert!(
+            narrow.fixed().is_some(),
+            "{preset}: the hybrid keeps a record"
+        );
+        assert_eq!(narrow, at(512), "{preset}");
+    }
+}
+
 /// The rs list's runs.
 fn rs_runs(recipe: &ChunkRecipe) -> &[chunk::TokenRun] {
     let Some(SlotLayout::RsList { rows, .. }) = recipe.rs_list() else {
@@ -542,12 +564,23 @@ fn qwen35_vision_mtp_lays_its_rs_rows_in_an_rs_list_layer_major() {
             panic!("no fixed record")
         };
         assert!(rows.iter().all(|r| matches!(r.row, RowId::Cache(_))));
-        // Each row buffers the conv's input and `[b | a]`, committing into
-        // its layer's delta state.
+        // Each row buffers the conv's input and `[b | a]` (and, where the
+        // backend reads the rows as a linear attention, their keys and
+        // corrected values, then their per-head scalars where it reads
+        // them too), committing into its layer's delta state.
         for rs in recipe.rs.rows.values() {
             let state = name_of(&trace, RowId::Cache(rs.state.unwrap()));
             assert!(state.ends_with("gdn.delta_state"), "{state}");
-            assert_eq!(rs.planes.len(), 2);
+            let scalars = chunk.rs_corrected && chunk.rs_scalars;
+            let corrected = if chunk.rs_corrected { 2 } else { 0 };
+            assert_eq!(
+                rs.planes.len(),
+                2 + corrected + usize::from(scalars),
+                "{preset}"
+            );
+            if scalars {
+                assert_eq!(rs.planes[4].bytes % 8, 0, "two f32 a value head");
+            }
         }
     }
 }
@@ -571,8 +604,25 @@ fn qwen38_flash_next_mini_buffers_its_ngram_ids_as_an_rs_row_beside_the_others()
         assert_eq!(rs.planes.len(), 1);
         assert_eq!(rs.per_token(), 4);
         let runs = rs_runs(&recipe);
-        assert_eq!(runs.len(), 4, "{preset}: three delta layers and the ids");
+        assert_eq!(
+            runs.len(),
+            5,
+            "{preset}: three delta layers, the PLE conv and the ids"
+        );
         assert_eq!(recipe.rs.run(*id).unwrap().per_token, 4);
+        // The PLE conv commits only as a fold does: its input is an rs row of
+        // its own (`poem_compiler::rs::buffered_convs`, `Feeds::Alone`).
+        let conv: Vec<_> = recipe
+            .rs
+            .rows
+            .iter()
+            .filter(|(_, rs)| {
+                rs.state
+                    .is_some_and(|s| name_of(&trace, RowId::Cache(s)) == "ple.conv_state")
+            })
+            .collect();
+        assert_eq!(conv.len(), 1, "{preset}: the PLE conv's rs row");
+        assert_eq!(conv[0].1.planes.len(), 1, "{preset}: its input alone");
         println!("{preset}: rs list {}", recipe.shapes());
     }
 }

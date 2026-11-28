@@ -1,8 +1,6 @@
-// Tokenizer accessors for the single bound model.
-//
-// These used to be part of `pie:core/model`. The WIT split moved them to
-// their own `pie:inferlet/tokenizer` interface: `model` now carries identity
-// and memory-shaping capabilities only. Same functions, new module.
+// Tokenizer accessors for the single bound model, over the
+// `pie:inferlet/tokenizer` interface; `model` carries identity and
+// memory-shaping capabilities.
 
 import * as _tokenizer from 'pie:inferlet/tokenizer@0.3.0';
 

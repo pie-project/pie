@@ -178,7 +178,7 @@ pub fn prefill(
     // A pass a CUDA graph records (`graph_safe`) reads every quantized row
     // so, V4's too: the staged planes are sized by the page tables a fire
     // states, which a replay's fire outgrows.
-    let from = ctx.tuning().compressed_prefill_from;
+    let from = ctx.tuning().compressed_prefill_from();
     let wf = crate::attn::compressed::decode::rows_of(window_pool);
     if let Some(wf @ (Rows::Mx8 | Rows::Ds)) = wf
         && (graph_safe || wf == Rows::Mx8 && (from == 0 || rows < from))

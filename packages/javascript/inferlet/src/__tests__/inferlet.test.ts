@@ -12,7 +12,7 @@ import * as session from '../session.js';
 import * as chat from '../chat.js';
 import * as reasoning from '../reasoning.js';
 import * as inferlet from '../index.js';
-import { Channel, ForwardPass, Port, WorkingSet, dtype } from '../eta/index.js';
+import { Channel, ForwardPass, Pipeline, Port, WorkingSet, dtype } from '../eta/index.js';
 import { ForwardPassStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
 
 describe('package surface', () => {
@@ -258,5 +258,33 @@ describe('eta state binding', () => {
     const fwd = new ForwardPass();
     fwd.checkpoints([16, 32]);
     expect(stub(fwd).checkpointSlots).toEqual([16, 32]);
+  });
+});
+
+describe('final rows', () => {
+  const stub = (fwd: ForwardPass) => fwd.wit as unknown as ForwardPassStub;
+  const pass = () => {
+    const fwd = new ForwardPass();
+    fwd.state([new WorkingSet()], { fold: 'all' });
+    return fwd;
+  };
+
+  it('states a pass final at attach unless it is retractable', () => {
+    const fwd = pass();
+    expect(fwd.isFinal()).toBe(true);
+    fwd.attachProgram();
+    fwd.attachProgram();
+    expect(stub(fwd).finalStated).toBe(1);
+
+    const lagged = pass();
+    lagged.retractable();
+    expect(lagged.isFinal()).toBe(false);
+    lagged.attachProgram();
+    expect(stub(lagged).finalStated).toBe(0);
+    expect(() => lagged.retractable()).toThrow(/already attached/);
+
+    const beam = pass();
+    stub(beam).finalRefusal = 'a beam';
+    expect(() => beam.attachProgram()).toThrow(/final-rows: a beam .*ForwardPass\.retractable\(\)/);
   });
 });

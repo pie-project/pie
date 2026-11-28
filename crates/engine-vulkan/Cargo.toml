@@ -51,10 +51,16 @@ ash = { version = "0.38", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+engine-vulkan = { path = ".", features = ["test-limits"] }
+eta-compiler = { path = "../eta-compiler", features = ["contract"] }
+# The CPU oracle the score capture is held against.
+engine-cpu = { path = "../engine-cpu" }
 ztensor = { workspace = true }
 
 [features]
 default = []
+# A test's device that binds less (`DeviceBoot::max_buffer`): test builds only.
+test-limits = []
 vulkan = [
     "dep:ash",
     "dep:naga",

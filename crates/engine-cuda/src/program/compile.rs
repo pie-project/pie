@@ -1,11 +1,10 @@
 #![allow(unsafe_code)]
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::codegen::program::KernelKind;
@@ -20,13 +19,6 @@ use eta_ir::registry::Stage as Attach;
 
 const KERNEL_FUSED: KernelKind = KernelKind::Fused;
 
-#[cfg(not(feature = "rocm"))]
-const PARALLEL_COMPILES: usize = 16;
-#[cfg(feature = "rocm")]
-const PARALLEL_COMPILES: usize = 1;
-
-type Ahead = HashMap<(String, u32), Vec<u8>>;
-
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
 const DEFAULT_BLOCK_THREADS: u32 = 256;
 
@@ -34,7 +26,11 @@ const DEFAULT_BLOCK_THREADS: u32 = 256;
 const WARP: u32 = 32;
 
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
-const MAX_BLOCK_THREADS: u32 = 1024;
+pub(crate) const MAX_BLOCK_THREADS: u32 = 1024;
+
+/// The narrowest block a region is emitted for on ROCm: one wavefront.
+#[cfg(feature = "rocm")]
+const ROCM_WAVE: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -134,25 +130,74 @@ pub fn rtc_version() -> Result<(i32, i32)> {
 #[cfg(feature = "rocm")]
 const HIPRTC_OPTIONS: [&str; 3] = ["-std=c++17", "-O3", "-ffp-contract=off"];
 
+/// The options a region compiles under on CUDA, but the architecture:
+/// contraction and the fast divide and square root off, so a region rounds
+/// as the host evaluator does.
+#[cfg(feature = "cuda")]
+const NVRTC_OPTIONS: [&std::ffi::CStr; 5] = [
+    c"--std=c++17",
+    c"--fmad=false",
+    c"--prec-div=true",
+    c"--prec-sqrt=true",
+    c"--maxrregcount=64",
+];
+
+/// The options [`compile`] passes the runtime compiler, as bytes; none in
+/// a build with no runtime compiler, which compiles nothing.
+fn compile_options() -> Vec<&'static [u8]> {
+    #[cfg(feature = "rocm")]
+    return HIPRTC_OPTIONS
+        .iter()
+        .map(|option| option.as_bytes())
+        .collect();
+    #[cfg(feature = "cuda")]
+    return NVRTC_OPTIONS
+        .iter()
+        .map(|option| option.to_bytes())
+        .collect();
+    #[cfg(not(any(feature = "rocm", feature = "cuda")))]
+    Vec::new()
+}
+
 pub fn compile(source: &str, architecture: &str) -> std::result::Result<Vec<u8>, Failure> {
     #[cfg(feature = "rocm")]
     {
-        use kernels_cuda::hip::{self, CompileError};
-        match hip::compile(
-            "ptir_fused_region",
-            source,
-            architecture,
-            &HIPRTC_OPTIONS,
-            &[],
-        ) {
-            Ok(built) if built.code.is_empty() => Err(Failure::Retryable {
-                reason: "hiprtc produced an empty code object".into(),
-            }),
-            Ok(built) => Ok(built.code),
-            Err(CompileError::Rejected(log)) => Err(Failure::Deterministic {
-                reason: format!("hiprtc refused the emitted region: {log}"),
-            }),
-            Err(CompileError::Failed(reason)) => Err(Failure::Retryable { reason }),
+        use kernels_cuda::hip::{self, CompileError, code_object};
+        // A region states no launch bounds, so hiprtc emits it for the
+        // widest block and holds it to that block's registers; one that
+        // needs more spills, and its scratch is a buffer the runtime would
+        // allocate at its first launch (refused at load). As CUDA's driver
+        // narrows such a kernel's block, the region is emitted again for
+        // half the block till it needs none: the launch reads the width it
+        // was emitted for (`launch_width`). The narrowest is one wavefront.
+        let mut bound: Option<u32> = None;
+        loop {
+            let flag = bound.map(|threads| format!("--gpu-max-threads-per-block={threads}"));
+            let options: Vec<&str> = HIPRTC_OPTIONS
+                .iter()
+                .copied()
+                .chain(flag.as_deref())
+                .collect();
+            let code = match hip::compile("ptir_fused_region", source, architecture, &options, &[])
+            {
+                Ok(built) if built.code.is_empty() => {
+                    return Err(Failure::Retryable {
+                        reason: "hiprtc produced an empty code object".into(),
+                    });
+                }
+                Ok(built) => built.code,
+                Err(CompileError::Rejected(log)) => {
+                    return Err(Failure::Deterministic {
+                        reason: format!("hiprtc refused the emitted region: {log}"),
+                    });
+                }
+                Err(CompileError::Failed(reason)) => return Err(Failure::Retryable { reason }),
+            };
+            let narrower = bound.unwrap_or(MAX_BLOCK_THREADS) / 2;
+            if code_object::refuse_late_buffers(&code).is_ok() || narrower < ROCM_WAVE {
+                return Ok(code);
+            }
+            bound = Some(narrower);
         }
     }
     #[cfg(feature = "cuda")]
@@ -217,11 +262,11 @@ fn compile_into(
     };
     let options: [*const std::ffi::c_char; 6] = [
         arch.as_ptr(),
-        c"--std=c++17".as_ptr(),
-        c"--fmad=false".as_ptr(),
-        c"--prec-div=true".as_ptr(),
-        c"--prec-sqrt=true".as_ptr(),
-        c"--maxrregcount=64".as_ptr(),
+        NVRTC_OPTIONS[0].as_ptr(),
+        NVRTC_OPTIONS[1].as_ptr(),
+        NVRTC_OPTIONS[2].as_ptr(),
+        NVRTC_OPTIONS[3].as_ptr(),
+        NVRTC_OPTIONS[4].as_ptr(),
     ];
     // SAFETY: `program` is live; `options` is a six-element array of pointers
     // to C strings that outlive the call.
@@ -312,6 +357,9 @@ pub struct Module {
     block_threads: u32,
     /// The dynamic shared memory each launch hands it.
     dynamic_shared: u32,
+    /// The blocks of it one multiprocessor holds at once (its registers and
+    /// shared memory's occupancy).
+    resident: u32,
     entry_name: String,
 }
 
@@ -386,11 +434,32 @@ impl Module {
                     });
                 }
             }
+            let block_threads = launch_width(function);
+            let mut resident: core::ffi::c_int = 0;
+            // SAFETY: `function` was just resolved out of the loaded module;
+            // `resident` is a live out-parameter.
+            let code = unsafe {
+                dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &raw mut resident,
+                    function,
+                    i32::try_from(block_threads).unwrap_or(i32::MAX),
+                    dynamic_shared as usize,
+                )
+            };
+            if code != dr::CUresult::CUDA_SUCCESS {
+                // SAFETY: as above, no function of it is in flight.
+                unsafe { dr::cuModuleUnload(module) };
+                return Err(Fault::Device {
+                    call: "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+                    code: code as i32,
+                });
+            }
             Ok(Module {
                 module,
                 function,
-                block_threads: launch_width(function),
+                block_threads,
                 dynamic_shared,
+                resident: u32::try_from(resident).unwrap_or(0),
                 entry_name: entry_name.to_string(),
             })
         }
@@ -415,6 +484,12 @@ impl Module {
     #[must_use]
     pub const fn block_threads(&self) -> u32 {
         self.block_threads
+    }
+
+    /// The blocks of it one multiprocessor holds at once.
+    #[must_use]
+    pub const fn resident(&self) -> u32 {
+        self.resident
     }
 
     #[must_use]
@@ -469,9 +544,9 @@ fn round_down_to_power_of_two(max_threads: i32) -> u32 {
     width
 }
 
-const MAGIC: &[u8; 8] = b"PTRCUB01";
+const MAGIC: &[u8; 8] = b"PTRCUB02";
 
-const HEADER_BYTES: usize = 8 + 4 + 4 + 4 + 8;
+const HEADER_BYTES: usize = 8 + 4 + 4 + 8;
 
 const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -508,19 +583,19 @@ impl Disk {
     }
 
     #[must_use]
-    pub fn load(&self, key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
-        let path = self.path(key, region_index)?;
+    pub fn load(&self, key: &str, entry: &str) -> Option<Vec<u8>> {
+        let path = self.path(key)?;
         let bytes = fs::read(&path).ok()?;
-        match parse(&bytes, key, region_index, entry) {
+        match parse(&bytes, key, entry) {
             Some(cubin) => Some(cubin),
             None => {
-                self.invalidate(key, region_index);
+                self.invalidate(key);
                 None
             }
         }
     }
 
-    pub fn store(&self, key: &str, region_index: u32, entry: &str, cubin: &[u8]) {
+    pub fn store(&self, key: &str, entry: &str, cubin: &[u8]) {
         let Some(directory) = self.directory.as_ref() else {
             return;
         };
@@ -530,13 +605,12 @@ impl Disk {
         if fs::create_dir_all(directory).is_err() {
             return;
         }
-        let Some(destination) = self.path(key, region_index) else {
+        let Some(destination) = self.path(key) else {
             return;
         };
 
         let mut bytes = Vec::with_capacity(HEADER_BYTES + key.len() + entry.len() + cubin.len());
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&region_index.to_le_bytes());
         bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(entry.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(cubin.len() as u64).to_le_bytes());
@@ -556,45 +630,44 @@ impl Disk {
         }
     }
 
-    pub fn invalidate(&self, key: &str, region_index: u32) {
-        if let Some(path) = self.path(key, region_index) {
+    pub fn invalidate(&self, key: &str) {
+        if let Some(path) = self.path(key) {
             let _ = fs::remove_file(path);
         }
     }
 
-    fn path(&self, key: &str, region_index: u32) -> Option<PathBuf> {
+    fn path(&self, key: &str) -> Option<PathBuf> {
         let directory = self.directory.as_ref()?;
-        Some(directory.join(format!(
-            "{:016x}-{region_index}.cubin",
-            eta_ir::fnv1a64(key.as_bytes())
-        )))
+        Some(directory.join(format!("{:016x}.cubin", eta_ir::fnv1a64(key.as_bytes()))))
     }
 }
 
+/// What a region's code is keyed by, in memory and on disk: its text and
+/// what compiles it (the backend, the architecture, the runtime compiler's
+/// version and options), never the stage it sits in, so regions the same
+/// but for where they sit share one build.
 #[must_use]
-pub fn disk_key(identity: &str, source: &str) -> String {
-    let hash = eta_ir::fnv1a64(source.as_bytes());
-    let mut key = String::with_capacity(identity.len() + 16);
-    key.push_str(identity);
-    for byte in hash.to_le_bytes() {
-        let _ = write!(key, "{byte:02x}");
-    }
-    key
+pub fn region_key(target: &Target, source: &str) -> String {
+    let hash = fnv1a64_with(source.as_bytes(), &compile_options());
+    let (major, minor) = target.rtc;
+    format!(
+        "{BACKEND:?}-{}-rtc{major}.{minor}-{hash:016x}",
+        target.architecture()
+    )
 }
 
-fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<u8>> {
+fn parse(bytes: &[u8], key: &str, entry: &str) -> Option<Vec<u8>> {
     if bytes.len() < HEADER_BYTES || bytes.len() as u64 > MAX_ENTRY_BYTES {
         return None;
     }
     if &bytes[..8] != MAGIC {
         return None;
     }
-    let stored_region = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-    let key_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
-    let entry_size = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
-    let cubin_size = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+    let key_size = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let entry_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let cubin_size = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
 
-    if stored_region != region_index || key_size != key.len() || entry_size != entry.len() {
+    if key_size != key.len() || entry_size != entry.len() {
         return None;
     }
     let tail = bytes.len().checked_sub(HEADER_BYTES)?;
@@ -648,8 +721,19 @@ pub struct Cache {
     programs: Bounded<u64, Compiled>,
     stages: Stages<Stage>,
     negative: Bounded<u64, String>,
+    /// The code each region source built, by its key under the region
+    /// symbol: stages whose regions are the same text but for their entry
+    /// names (a sampler region in every stage that samples) build it once.
+    built: Bounded<String, Arc<Module>>,
+    /// The modules the load's prewarm ([`Cache::warm`]) built, by the same
+    /// key: held for the load's life, out of `built`'s bound, so a guest's
+    /// registrations never evict a standard sampler's code.
+    warmed: HashMap<String, Arc<Module>>,
+    /// The region modules a registration loaded or compiled because no
+    /// prewarm ([`Cache::warm`]) or earlier registration had: each one a
+    /// module built after ready.
+    late: u64,
     disk: Disk,
-    ahead: Arc<Mutex<Ahead>>,
     stats: CacheStats,
 }
 
@@ -666,15 +750,12 @@ impl Cache {
             programs: Bounded::new(MAX_PROGRAM_ENTRIES),
             stages: Stages::new(MAX_STAGE_ENTRIES),
             negative: Bounded::new(MAX_NEGATIVE_ENTRIES),
+            built: Bounded::new(MAX_STAGE_ENTRIES),
+            warmed: HashMap::new(),
+            late: 0,
             disk,
-            ahead: Arc::new(Mutex::new(Ahead::new())),
             stats: CacheStats::default(),
         }
-    }
-
-    #[must_use]
-    pub fn ahead(&self) -> (Disk, Arc<Mutex<Ahead>>) {
-        (self.disk.clone(), Arc::clone(&self.ahead))
     }
 
     #[must_use]
@@ -687,6 +768,8 @@ impl Cache {
         self.stats
     }
 
+    /// A program's registration, whole: [`Cache::plan`], the build, and
+    /// [`Cache::install`] on one thread.
     pub fn compile(
         &mut self,
         program_hash: u64,
@@ -695,9 +778,31 @@ impl Cache {
         versions: Versions,
         target: Target,
     ) -> std::result::Result<Compiled, Failure> {
+        match self.plan(program_hash, plan, kernels, versions, target)? {
+            Planned::Ready(compiled) => Ok(compiled),
+            Planned::Build(mut build) => {
+                let built = build.build();
+                self.install(build, built)
+            }
+        }
+    }
+
+    /// What a program's registration takes, on the engine's thread: the
+    /// program or its stages where this cache holds them, and the regions
+    /// it must build, each with its source and key. The build itself
+    /// ([`Build::build`]) holds nothing of the engine's and runs on any
+    /// thread.
+    pub fn plan(
+        &mut self,
+        program_hash: u64,
+        plan: &ExecPlan,
+        kernels: &[EmittedKernel],
+        versions: Versions,
+        target: Target,
+    ) -> std::result::Result<Planned, Failure> {
         if let Some(compiled) = self.programs.get(&program_hash) {
             self.stats.memory_hits += 1;
-            return Ok(compiled.clone());
+            return Ok(Planned::Ready(compiled.clone()));
         }
 
         let program_identity = cache_identity(
@@ -714,121 +819,69 @@ impl Cache {
             });
         }
 
-        match self.build(plan, kernels, versions, target) {
-            Ok(compiled) => {
-                self.stages.commit();
-                self.programs.insert(program_hash, compiled.clone());
-                Ok(compiled)
+        let refused = |failure: Failure, cache: &mut Cache| {
+            if let Failure::Deterministic { reason } = &failure {
+                cache.negative.insert(program_key, reason.clone());
             }
-            Err(failure) => {
-                self.stages.abandon();
-                if let Failure::Deterministic { reason } = &failure {
-                    self.negative.insert(program_key, reason.clone());
-                }
-                Err(failure)
+            failure
+        };
+        let index = match Emitted::index(kernels) {
+            Ok(index) => index,
+            Err(duplicate) => {
+                let failure = Failure::Deterministic {
+                    reason: format!(
+                        "the emitted kernel table names slot (kind {}, stage {}, region {}) \
+                         twice; an engine cannot know which of the two the host meant",
+                        duplicate.kind as u32, duplicate.stage, duplicate.region
+                    ),
+                };
+                return Err(refused(failure, self));
             }
-        }
-    }
-
-    pub fn forget(&mut self, program_hash: u64) {
-        self.programs.remove(&program_hash);
-    }
-
-    fn build(
-        &mut self,
-        plan: &ExecPlan,
-        kernels: &[EmittedKernel],
-        versions: Versions,
-        target: Target,
-    ) -> std::result::Result<Compiled, Failure> {
-        let index = Emitted::index(kernels).map_err(|duplicate| Failure::Deterministic {
-            reason: format!(
-                "the emitted kernel table names slot (kind {}, stage {}, region {}) twice; \
-                 an engine cannot know which of the two the host meant",
-                duplicate.kind as u32, duplicate.stage, duplicate.region
-            ),
-        })?;
-        let architecture = target.architecture();
-
-        let mut walk = Vec::with_capacity(plan.package.plans.len());
+        };
+        let mut stages = Vec::with_capacity(plan.package.plans.len());
         for (stage_index, stage_plan) in plan.package.plans.iter().enumerate() {
-            let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
-                reason: "a program with more than four billion stages is not a program".into(),
-            })?;
-            let identity =
-                cache_identity(BACKEND, target.device, stage_plan.signature_hash, versions);
-            let key = fnv1a64_with(
-                identity.as_bytes(),
-                &[
-                    target.rtc.0.to_le_bytes().as_slice(),
-                    target.rtc.1.to_le_bytes().as_slice(),
-                ],
-            );
-            let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
-            if lookup == Lookup::Hit {
-                self.stats.memory_hits += 1;
-                if let Some(stage) = hit {
-                    walk.push(Err(stage));
-                    continue;
-                }
-            }
-            walk.push(Ok((stage_index, stage_plan, identity, key, lookup)));
+            let planned = self.plan_stage(stage_index, stage_plan, &index, versions, &target);
+            stages.push(planned.map_err(|failure| refused(failure, self))?);
         }
-        let built = walk.iter().filter_map(|stage| stage.as_ref().ok());
-        let mut ahead = self.build_ahead(
-            built.map(|(at, plan, identity, _, _)| (*at, *plan, identity.as_str())),
-            &index,
-            &architecture,
-        );
-
-        let mut stages = Vec::with_capacity(walk.len());
-        for stage in walk {
-            let (stage_index, stage_plan, identity, key, lookup) = match stage {
-                Err(held) => {
-                    stages.push(held);
-                    continue;
-                }
-                Ok(build) => build,
-            };
-            let compiled = self.build_stage(
-                stage_index,
-                stage_plan,
-                &index,
-                &identity,
-                &architecture,
-                &mut ahead,
-            )?;
-            if lookup == Lookup::Miss {
-                self.stages
-                    .stage(key, stage_plan.identity, compiled.clone());
-            }
-            stages.push(compiled);
-        }
-        Ok(Compiled {
-            stages: Arc::new(stages),
+        Ok(Planned::Build(Build {
+            program_hash,
+            program_key,
+            architecture: target.architecture(),
+            stages,
             plans: Arc::new(plan.package.plans.clone()),
             kinds: Arc::new(plan.package.stages.iter().map(|s| s.stage).collect()),
-        })
+            disk: self.disk.clone(),
+            persistent_hits: 0,
+            compilations: 0,
+        }))
     }
 
-    fn build_ahead<'p>(
-        &self,
-        stages: impl Iterator<Item = (u32, &'p LaunchStagePlan, &'p str)>,
-        index: &Emitted<'_>,
-        architecture: &str,
-    ) -> Ahead {
-        side_by_side(&regions_to_build(stages, index, &self.disk), architecture)
-    }
-
-    fn build_stage(
+    fn plan_stage(
         &mut self,
-        stage_index: u32,
+        stage_index: usize,
         plan: &LaunchStagePlan,
         index: &Emitted<'_>,
-        identity: &str,
-        architecture: &str,
-        ahead: &mut Ahead,
-    ) -> std::result::Result<Stage, Failure> {
+        versions: Versions,
+        target: &Target,
+    ) -> std::result::Result<StageBuild, Failure> {
+        let stage_index = u32::try_from(stage_index).map_err(|_| Failure::Deterministic {
+            reason: "a program with more than four billion stages is not a program".into(),
+        })?;
+        let identity = cache_identity(BACKEND, target.device, plan.signature_hash, versions);
+        let key = fnv1a64_with(
+            identity.as_bytes(),
+            &[
+                target.rtc.0.to_le_bytes().as_slice(),
+                target.rtc.1.to_le_bytes().as_slice(),
+            ],
+        );
+        let (lookup, hit) = self.stages.lookup(key, plan.identity);
+        if lookup == Lookup::Hit {
+            self.stats.memory_hits += 1;
+            if let Some(stage) = hit {
+                return Ok(StageBuild::Held(stage));
+            }
+        }
         let mut regions = Vec::new();
         for region_index in 0..plan.fused.len() {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
@@ -870,177 +923,521 @@ impl Cache {
                     });
                 }
             };
-
-            let module =
-                self.region_module(identity, region_index, entry, source, architecture, ahead)?;
-            regions.push(Region {
-                region_index,
-                module,
-            });
+            let mut region = RegionBuild::new(target, region_index, entry, source);
+            region.module = self.module(&region.key);
+            if region.module.is_none() {
+                self.late += 1;
+            }
+            regions.push(region);
         }
-        Ok(Stage {
+        Ok(StageBuild::Regions {
+            key,
+            identity: plan.identity,
             signature_hash: plan.signature_hash,
-            regions: Arc::new(regions),
+            cached: lookup == Lookup::Miss,
+            regions,
         })
     }
 
+    /// The region modules registrations built that the load's prewarm had
+    /// not ([`Cache::warm`]).
+    #[must_use]
+    pub const fn built_late(&self) -> u64 {
+        self.late
+    }
+
+    /// Builds the region modules of `kernels` (a load's prewarm, before
+    /// ready): each region's text once, from the disk where it holds it,
+    /// the rest compiled side by side; a registration whose regions are the
+    /// same text then loads and compiles nothing.
+    pub fn warm(
+        &mut self,
+        target: &Target,
+        kernels: &[EmittedKernel],
+    ) -> std::result::Result<u64, Failure> {
+        let mut wanted: Vec<(String, String, u32)> = Vec::new();
+        for kernel in kernels {
+            if kernel.kind != KERNEL_FUSED || kernel.source.is_empty() {
+                continue;
+            }
+            let source = kernel.source.replace(&kernel.entry_name, REGION_SYMBOL);
+            let key = region_key(target, &source);
+            if let Some(module) = self.built.remove(&key) {
+                self.warmed.insert(key, module);
+                continue;
+            }
+            if self.warmed.contains_key(&key) || wanted.iter().any(|(seen, _, _)| *seen == key) {
+                continue;
+            }
+            wanted.push((key, source, kernel.region_index));
+        }
+        let mut cubins: Vec<Option<Vec<u8>>> = wanted
+            .iter()
+            .map(|(key, _, _)| {
+                let cubin = self.disk.load(key, REGION_SYMBOL)?;
+                late_memory(&cubin).ok()?;
+                self.stats.persistent_hits += 1;
+                Some(cubin)
+            })
+            .collect();
+        let architecture = target.architecture();
+        let missing: Vec<usize> = (0..wanted.len())
+            .filter(|&at| cubins[at].is_none())
+            .collect();
+        let compiled = ahead(&wanted, &missing, &architecture)?;
+        for (at, cubin) in missing.into_iter().zip(compiled) {
+            let (key, _, region_index) = &wanted[at];
+            self.stats.compilations += 1;
+            late_memory(&cubin).map_err(|why| Failure::Deterministic {
+                reason: format!("region {region_index}: {why}"),
+            })?;
+            self.disk.store(key, REGION_SYMBOL, &cubin);
+            cubins[at] = Some(cubin);
+        }
+        for ((key, source, _), cubin) in wanted.iter().zip(cubins) {
+            let Some(cubin) = cubin else { continue };
+            let module =
+                Module::load(&cubin, REGION_SYMBOL, cut_state_bytes(source)).map_err(|error| {
+                    Failure::Retryable {
+                        reason: format!("loading a prewarmed region: {error}"),
+                    }
+                })?;
+            self.warmed.insert(key.clone(), Arc::new(module));
+        }
+        Ok(wanted.len() as u64)
+    }
+
+    /// The module this cache holds for the region text under `key`: a
+    /// prewarmed one, else a registration's.
+    fn module(&mut self, key: &str) -> Option<Arc<Module>> {
+        self.warmed
+            .get(key)
+            .or_else(|| self.built.get(&key.to_owned()))
+            .cloned()
+    }
+
+    /// A program's build made modules, on the engine's thread (a module
+    /// loads into the context current there), and kept: its regions' code,
+    /// its stages and the program. A deterministic refusal is remembered.
+    pub fn install(
+        &mut self,
+        build: Build,
+        built: std::result::Result<(), Failure>,
+    ) -> std::result::Result<Compiled, Failure> {
+        self.stats.persistent_hits += build.persistent_hits;
+        self.stats.compilations += build.compilations;
+        if let Err(failure) = built {
+            if let Failure::Deterministic { reason } = &failure {
+                self.negative.insert(build.program_key, reason.clone());
+            }
+            return Err(failure);
+        }
+        if let Some(compiled) = self.programs.get(&build.program_hash) {
+            return Ok(compiled.clone());
+        }
+        let mut stages = Vec::with_capacity(build.stages.len());
+        for stage in build.stages {
+            match stage {
+                StageBuild::Held(stage) => stages.push(stage),
+                StageBuild::Regions {
+                    key,
+                    identity,
+                    signature_hash,
+                    cached,
+                    regions,
+                } => {
+                    let mut modules = Vec::with_capacity(regions.len());
+                    for region in regions {
+                        match self.load(&region, &build.disk) {
+                            Ok(module) => {
+                                modules.push(Region {
+                                    region_index: region.region_index,
+                                    module,
+                                });
+                            }
+                            Err(failure) => {
+                                self.stages.abandon();
+                                return Err(failure);
+                            }
+                        }
+                    }
+                    let stage = Stage {
+                        signature_hash,
+                        regions: Arc::new(modules),
+                    };
+                    if cached {
+                        self.stages.stage(key, identity, stage.clone());
+                    }
+                    stages.push(stage);
+                }
+            }
+        }
+        self.stages.commit();
+        let compiled = Compiled {
+            stages: Arc::new(stages),
+            plans: build.plans,
+            kinds: build.kinds,
+        };
+        self.programs.insert(build.program_hash, compiled.clone());
+        Ok(compiled)
+    }
+
+    pub fn forget(&mut self, program_hash: u64) {
+        self.programs.remove(&program_hash);
+    }
+
+    /// One region's module, built whole on this thread.
+    #[cfg(all(test, feature = "rocm"))]
     fn region_module(
         &mut self,
-        identity: &str,
+        target: &Target,
         region_index: u32,
         entry: &str,
         source: &str,
-        architecture: &str,
-        ahead: &mut Ahead,
     ) -> std::result::Result<Arc<Module>, Failure> {
-        let key = disk_key(identity, source);
-        // CUDA keeps the exact cut's state in dynamic shared memory; HIP's
-        // text keeps it static.
-        let dynamic = if !cfg!(feature = "rocm")
-            && source.contains(eta_compiler::codegen::cuda::CUT_STATE_MARK)
-        {
-            eta_compiler::codegen::cuda::CUT_STATE_BYTES
-        } else {
-            0
-        };
-        if let Some(cubin) = self.disk.load(&key, region_index, entry) {
-            match Module::load(&cubin, entry, dynamic) {
-                Ok(module) => {
-                    self.stats.persistent_hits += 1;
-                    return Ok(Arc::new(module));
-                }
-                Err(_) => self.disk.invalidate(&key, region_index),
-            }
+        let mut region = RegionBuild::new(target, region_index, entry, source);
+        region.module = self.module(&region.key);
+        if region.module.is_none() {
+            self.late += 1;
         }
-
-        let built = ahead.remove(&(key.clone(), region_index)).or_else(|| {
-            self.ahead
-                .lock()
-                .expect("ahead lock poisoned")
-                .remove(&(key.clone(), region_index))
-        });
-        let cubin = match built {
-            Some(cubin) => cubin,
-            None => compile(source, architecture)?,
+        let mut build = Build {
+            program_hash: 0,
+            program_key: 0,
+            architecture: target.architecture(),
+            stages: Vec::new(),
+            plans: Arc::new(Vec::new()),
+            kinds: Arc::new(Vec::new()),
+            disk: self.disk.clone(),
+            persistent_hits: 0,
+            compilations: 0,
         };
-        self.stats.compilations += 1;
-        let module = Module::load(&cubin, entry, dynamic).map_err(|error| Failure::Retryable {
-            reason: format!("loading `{entry}`: {error}"),
+        let built = build.build_regions(vec![&mut region]);
+        self.stats.persistent_hits += build.persistent_hits;
+        self.stats.compilations += build.compilations;
+        built?;
+        let disk = self.disk.clone();
+        self.load(&region, &disk)
+    }
+
+    /// `region`'s module: the one this cache holds for its text, else
+    /// loaded from the code its build made and kept under its key.
+    fn load(
+        &mut self,
+        region: &RegionBuild,
+        disk: &Disk,
+    ) -> std::result::Result<Arc<Module>, Failure> {
+        if let Some(module) = &region.module {
+            return Ok(Arc::clone(module));
+        }
+        if let Some(module) = self.module(&region.key) {
+            return Ok(module);
+        }
+        let module = region.load(disk)?;
+        self.built.insert(region.key.clone(), Arc::clone(&module));
+        Ok(module)
+    }
+}
+
+/// What [`Cache::plan`] found.
+#[derive(Debug)]
+pub enum Planned {
+    /// The program, as this cache holds it.
+    Ready(Compiled),
+    /// What its registration builds.
+    Build(Build),
+}
+
+/// A program's build: the regions [`Cache::plan`] found no code for in
+/// memory, compiled or read from disk by [`Build::build`] on any thread,
+/// then loaded and kept by [`Cache::install`] on the engine's.
+#[derive(Debug)]
+pub struct Build {
+    program_hash: u64,
+    program_key: u64,
+    architecture: String,
+    stages: Vec<StageBuild>,
+    plans: Arc<Vec<LaunchStagePlan>>,
+    kinds: Arc<Vec<Attach>>,
+    disk: Disk,
+    persistent_hits: u64,
+    compilations: u64,
+}
+
+#[derive(Debug)]
+enum StageBuild {
+    /// A stage this cache holds.
+    Held(Stage),
+    Regions {
+        key: u64,
+        identity: u64,
+        signature_hash: u64,
+        /// The stage cache had no entry at its key: the stage is kept.
+        cached: bool,
+        regions: Vec<RegionBuild>,
+    },
+}
+
+/// Where a region's code came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Memory,
+    Disk,
+    Compiled,
+}
+
+#[derive(Debug)]
+struct RegionBuild {
+    region_index: u32,
+    /// The region's own name.
+    entry: String,
+    /// Its source under [`REGION_SYMBOL`].
+    source: String,
+    key: String,
+    /// The dynamic shared memory each launch hands it.
+    dynamic: u32,
+    /// The module the cache holds for its text, where it holds one: the
+    /// region builds nothing.
+    module: Option<Arc<Module>>,
+    code: Option<(Arc<[u8]>, Origin)>,
+}
+
+impl RegionBuild {
+    fn new(target: &Target, region_index: u32, entry: &str, source: &str) -> RegionBuild {
+        // The region is built under one symbol, so its code is keyed by
+        // what it computes, never by the stage it sits in: stages whose
+        // regions are the same text share one module.
+        let source = source.replace(entry, REGION_SYMBOL);
+        let key = region_key(target, &source);
+        let dynamic = cut_state_bytes(&source);
+        RegionBuild {
+            region_index,
+            entry: entry.to_owned(),
+            source,
+            key,
+            dynamic,
+            module: None,
+            code: None,
+        }
+    }
+
+    /// Its module, loaded into the context current on this thread from
+    /// the code its build made. Code read from disk that does not load is
+    /// dropped from the disk, so the next registration compiles it.
+    fn load(&self, disk: &Disk) -> std::result::Result<Arc<Module>, Failure> {
+        let Some((code, origin)) = self.code.clone() else {
+            return Err(Failure::Retryable {
+                reason: format!("region `{}` was never built", self.entry),
+            });
+        };
+        let module = Module::load(&code, REGION_SYMBOL, self.dynamic).map_err(|error| {
+            if origin == Origin::Disk {
+                disk.invalidate(&self.key);
+            }
+            Failure::Retryable {
+                reason: format!("loading `{}`: {error}", self.entry),
+            }
         })?;
-        self.disk.store(&key, region_index, entry, &cubin);
         Ok(Arc::new(module))
     }
 }
 
-fn regions_to_build<'s, 'p>(
-    stages: impl Iterator<Item = (u32, &'p LaunchStagePlan, &'p str)>,
-    index: &Emitted<'s>,
-    disk: &Disk,
-) -> Vec<(String, u32, &'s str, &'s str)> {
-    let mut jobs: Vec<(String, u32, &str, &str)> = Vec::new();
-    for (stage_index, plan, identity) in stages {
-        for (region_index, region) in plan.fused.iter().enumerate() {
-            let Ok(region_index) = u32::try_from(region_index) else {
-                break;
-            };
-            if !super::launch::shell_launches(region) {
-                continue;
-            }
-            let Slot::Kernel { source, entry, .. } =
-                index.get(KERNEL_FUSED, stage_index, region_index)
-            else {
-                continue;
-            };
-            let key = disk_key(identity, source);
-            if jobs
-                .iter()
-                .any(|(held, at, _, _)| *held == key && *at == region_index)
-                || disk.load(&key, region_index, entry).is_some()
+impl Build {
+    /// Compiles, or reads from disk, every region's code the plan found
+    /// none for. It holds nothing of the engine's and needs no context, so
+    /// it runs on any thread while the engine fires on. Regions the same
+    /// but for their names build once; those the disk holds none for
+    /// compile side by side, a thread a core the process may run on.
+    pub fn build(&mut self) -> std::result::Result<(), Failure> {
+        let mut stages = std::mem::take(&mut self.stages);
+        let built = self.build_regions(
+            stages
+                .iter_mut()
+                .filter_map(|stage| match stage {
+                    StageBuild::Held(_) => None,
+                    StageBuild::Regions { regions, .. } => Some(regions.iter_mut()),
+                })
+                .flatten()
+                .filter(|region| region.module.is_none() && region.code.is_none())
+                .collect(),
+        );
+        self.stages = stages;
+        built
+    }
+
+    fn build_regions(
+        &mut self,
+        mut regions: Vec<&mut RegionBuild>,
+    ) -> std::result::Result<(), Failure> {
+        // Each text once: the disk's code where it holds code that loads
+        // late memory nowhere, else a compile.
+        let mut made: HashMap<String, (Arc<[u8]>, Origin)> = HashMap::new();
+        let mut compiles: Vec<(String, String, u32, String)> = Vec::new();
+        for region in &regions {
+            if made.contains_key(&region.key) || compiles.iter().any(|(key, ..)| *key == region.key)
             {
                 continue;
             }
-            jobs.push((key, region_index, source, entry));
-        }
-    }
-    jobs
-}
-
-fn side_by_side(jobs: &[(String, u32, &str, &str)], architecture: &str) -> Ahead {
-    let width = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(PARALLEL_COMPILES)
-        .min(jobs.len());
-    let built = Mutex::new(Ahead::with_capacity(jobs.len()));
-    let next = AtomicUsize::new(0);
-    let work = || {
-        while let Some((key, region_index, source, _)) =
-            jobs.get(next.fetch_add(1, Ordering::Relaxed))
-        {
-            if let Ok(cubin) = compile(source, architecture) {
-                built
-                    .lock()
-                    .expect("built lock poisoned")
-                    .insert((key.clone(), *region_index), cubin);
+            match self.disk.load(&region.key, REGION_SYMBOL) {
+                // One that asks for late memory was compiled before that was
+                // refused: compiled again, and refused below if it still asks.
+                Some(code) if late_memory(&code).is_ok() => {
+                    self.persistent_hits += 1;
+                    made.insert(region.key.clone(), (Arc::from(code), Origin::Disk));
+                }
+                stale => {
+                    if stale.is_some() {
+                        self.disk.invalidate(&region.key);
+                    }
+                    compiles.push((
+                        region.key.clone(),
+                        region.source.clone(),
+                        region.region_index,
+                        region.entry.clone(),
+                    ));
+                }
             }
         }
-    };
-    if width < 2 {
-        work();
-    } else {
-        std::thread::scope(|scope| {
-            for _ in 0..width {
-                scope.spawn(work);
-            }
-        });
+        let compiled = side_by_side(&compiles, &self.architecture);
+        for ((key, _, region_index, entry), code) in compiles.iter().zip(compiled) {
+            let code = code?;
+            self.compilations += 1;
+            late_memory(&code).map_err(|why| Failure::Deterministic {
+                reason: format!("region {region_index} (`{entry}`): {why}"),
+            })?;
+            self.disk.store(key, REGION_SYMBOL, &code);
+            made.insert(key.clone(), (Arc::from(code), Origin::Compiled));
+        }
+        let mut first = std::collections::HashSet::new();
+        for region in &mut regions {
+            let (code, origin) = &made[&region.key];
+            // A text's later regions take the code the first one made.
+            let origin = if first.insert(region.key.clone()) {
+                *origin
+            } else {
+                Origin::Memory
+            };
+            region.code = Some((Arc::clone(code), origin));
+        }
+        Ok(())
     }
-    built.into_inner().expect("built lock poisoned")
 }
 
-const MAX_AHEAD: usize = 4096;
-
-pub fn compile_ahead(
-    plan: &ExecPlan,
-    kernels: &[EmittedKernel],
-    versions: Versions,
-    target: Target,
-    (disk, ahead): (&Disk, &Mutex<Ahead>),
-) {
-    let Ok(index) = Emitted::index(kernels) else {
-        return;
-    };
-    let identities: Vec<String> = plan
-        .package
-        .plans
+/// The regions of `wanted` `(key, source, index)` at `missing`, compiled
+/// before ready, in `missing`'s order: on ROCm a process each where the host
+/// program answers ([`super::helper`]), else [`side_by_side`].
+fn ahead(
+    wanted: &[(String, String, u32)],
+    missing: &[usize],
+    architecture: &str,
+) -> std::result::Result<Vec<Vec<u8>>, Failure> {
+    #[cfg(feature = "rocm")]
+    if super::helper::registered() {
+        let jobs: Vec<(u32, &str)> = missing
+            .iter()
+            .map(|&at| (wanted[at].2, wanted[at].1.as_str()))
+            .collect();
+        return super::helper::compile_all(&jobs, architecture);
+    }
+    let compiles: Vec<(String, String, u32, String)> = missing
         .iter()
-        .map(|stage| cache_identity(BACKEND, target.device, stage.signature_hash, versions))
+        .map(|&at| {
+            let (key, source, index) = &wanted[at];
+            (key.clone(), source.clone(), *index, String::new())
+        })
         .collect();
-    let stages = plan
-        .package
-        .plans
+    side_by_side(&compiles, architecture).into_iter().collect()
+}
+
+/// HIP's runtime compiler runs one compile at a time; elsewhere a build
+/// takes every core the process may run on (its CPU quota, which
+/// `available_parallelism` reads).
+#[cfg(feature = "rocm")]
+const SERIAL_COMPILER: bool = true;
+#[cfg(not(feature = "rocm"))]
+const SERIAL_COMPILER: bool = false;
+
+/// Each of `compiles`' sources `(key, source, ..)` compiled, in their
+/// order, side by side, a thread a core the process may run on.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a slot is written whole after its compile; a compile that panicked is refused by name below and the rest still serve"
+)]
+fn side_by_side(
+    compiles: &[(String, String, u32, String)],
+    architecture: &str,
+) -> Vec<std::result::Result<Vec<u8>, Failure>> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let width = if SERIAL_COMPILER { 1 } else { cores }.min(compiles.len());
+    if width < 2 {
+        return compiles
+            .iter()
+            .map(|(_, source, ..)| compile(source, architecture))
+            .collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    #[allow(clippy::type_complexity)]
+    let out: Vec<std::sync::Mutex<Option<std::result::Result<Vec<u8>, Failure>>>> = compiles
         .iter()
-        .zip(&identities)
-        .enumerate()
-        .filter_map(|(at, (stage, identity))| {
-            Some((u32::try_from(at).ok()?, stage, identity.as_str()))
-        });
-    let jobs = regions_to_build(stages, &index, disk);
-    if jobs.is_empty() {
-        return;
-    }
-    let mut built = side_by_side(&jobs, &target.architecture());
-    if disk.is_enabled() {
-        for (key, region_index, _, entry) in &jobs {
-            if let Some(cubin) = built.remove(&(key.clone(), *region_index)) {
-                disk.store(key, *region_index, entry, &cubin);
-            }
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    let work = || {
+        loop {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            let Some((_, source, ..)) = compiles.get(at) else {
+                break;
+            };
+            let built = compile(source, architecture);
+            *out[at]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built);
         }
-        return;
+    };
+    // Each worker joined here: one that panics leaves its region unbuilt,
+    // refused below, and takes nothing else down.
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..width).map(|_| scope.spawn(work)).collect();
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
+    out.into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|| {
+                    Err(Failure::Retryable {
+                        reason: "a region's compile panicked".into(),
+                    })
+                })
+        })
+        .collect()
+}
+
+/// The dynamic shared memory a region's text asks: CUDA keeps the exact
+/// cut's state there; HIP's text keeps it static.
+fn cut_state_bytes(source: &str) -> u32 {
+    if !cfg!(feature = "rocm") && source.contains(eta_compiler::codegen::cuda::CUT_STATE_MARK) {
+        eta_compiler::codegen::cuda::CUT_STATE_BYTES
+    } else {
+        0
     }
-    let mut held = ahead.lock().expect("ahead lock poisoned");
-    if held.len() + built.len() > MAX_AHEAD {
-        held.clear();
-    }
-    held.extend(built);
+}
+
+/// The symbol every region's kernel is built under.
+const REGION_SYMBOL: &str = "ptir_region";
+
+/// Refuses a region's code object whose kernel asks the HIP runtime for
+/// memory it allocates late: a buffer at its first launch, or scratch, which
+/// ROCr grows at the first dispatch that needs it. Either is a device
+/// allocation after the load, so a region is refused at registration, as the
+/// engine's own kernels are at theirs, never at its first fire. CUDA's
+/// modules ask for neither.
+fn late_memory(cubin: &[u8]) -> std::result::Result<(), String> {
+    #[cfg(feature = "rocm")]
+    kernels_cuda::hip::code_object::refuse_late_buffers(cubin)?;
+    #[cfg(not(feature = "rocm"))]
+    let _ = cubin;
+    Ok(())
 }
 
 fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
@@ -1064,21 +1461,129 @@ mod tests {
 
     #[test]
     fn compile_every_case() {
-        editing_the_source_changes_the_disk_key_with_no_version_bump();
+        the_region_key_is_its_text_and_what_compiles_it();
         a_corrupt_entry_is_a_miss_and_is_deleted();
         a_disabled_cache_is_a_miss_and_not_a_failure();
+        #[cfg(feature = "rocm")]
+        {
+            regions_the_same_but_for_their_names_are_built_once();
+            a_region_that_asks_for_scratch_is_refused_by_name();
+        }
     }
 
-    fn editing_the_source_changes_the_disk_key_with_no_version_bump() {
-        let identity = "0100000000000000000300000000000000000000-v0003000400000003 00000015";
-        let before = disk_key(identity, "__global__ void k() { a(); }");
-        let after = disk_key(identity, "__global__ void k() { b(); }");
+    #[cfg(feature = "rocm")]
+    fn device_target() -> Target {
+        Target {
+            major: 9,
+            minor: 4,
+            device: 0,
+            rtc: rtc_version().expect("hiprtc answers its version"),
+            arch: kernels_cuda::jit::cache::arch(0).expect("a gfx device"),
+        }
+    }
+
+    #[cfg(feature = "rocm")]
+    fn regions_the_same_but_for_their_names_are_built_once() {
+        let region = |entry: &str| {
+            format!(
+                "extern \"C\" __global__ void {entry}(unsigned* out) {{ out[threadIdx.x] = 1u; }}"
+            )
+        };
+        let directory = scratch("shared");
+        let target = device_target();
+        // Two stages' regions: other names, other region indices.
+        let (a, b) = (
+            "ptir_fused_00000000000000aa_r0",
+            "ptir_fused_00000000000000bb_r3",
+        );
+        let mut cache = Cache::new(Disk::at(&directory));
+        let first = cache
+            .region_module(&target, 0, a, &region(a))
+            .expect("builds");
+        let second = cache
+            .region_module(&target, 3, b, &region(b))
+            .expect("builds");
+        assert_eq!(
+            cache.stats().compilations,
+            1,
+            "the second stage's region is the first's code"
+        );
+        assert!(Arc::ptr_eq(&first, &second), "and the first's module");
+
+        // A later boot finds it on disk under a third name and index.
+        let c = "ptir_fused_00000000000000cc_r5";
+        let mut later = Cache::new(Disk::at(&directory));
+        let _third = later
+            .region_module(&target, 5, c, &region(c))
+            .expect("loads");
+        assert_eq!(
+            (later.stats().compilations, later.stats().persistent_hits),
+            (0, 1),
+            "the disk entry is the region's text's, not its stage's"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(feature = "rocm")]
+    fn a_region_that_asks_for_scratch_is_refused_by_name() {
+        // A local array read at a lane's own index lives in private memory.
+        let entry = "ptir_fused_00000000000000cc_r1";
+        let source = format!(
+            "extern \"C\" __global__ void {entry}(const unsigned* in, unsigned* out) {{\n\
+             \x20 unsigned local[1024];\n\
+             \x20 for (unsigned i = 0; i < 1024u; ++i) local[i] = in[i];\n\
+             \x20 out[threadIdx.x] = local[in[threadIdx.x] & 1023u];\n\
+             }}"
+        );
+        let mut cache = Cache::new(Disk::disabled());
+        match cache.region_module(&device_target(), 1, entry, &source) {
+            Err(Failure::Deterministic { reason }) => assert!(
+                reason.contains(entry) && reason.contains("scratch"),
+                "the refusal names the region and what it asks: {reason}"
+            ),
+            Err(other) => panic!("refused as retryable, which would compile it again: {other:?}"),
+            Ok(_) => panic!("a region that asks for scratch was registered"),
+        }
+    }
+
+    fn the_region_key_is_its_text_and_what_compiles_it() {
+        let target = Target {
+            major: 8,
+            minor: 9,
+            device: 0,
+            rtc: (12, 4),
+            #[cfg(feature = "rocm")]
+            arch: "gfx942",
+        };
+        let before = region_key(&target, "__global__ void k() { a(); }");
+        let after = region_key(&target, "__global__ void k() { b(); }");
         assert_ne!(
             before, after,
             "a template edit bumps no version, so the source itself has to be \
              in the key — otherwise yesterday's cubin answers today's launch"
         );
-        assert!(before.starts_with(identity), "the identity stays readable");
+        let other_device = Target {
+            device: 1,
+            ..target
+        };
+        assert_eq!(
+            before,
+            region_key(&other_device, "__global__ void k() { a(); }"),
+            "a second card of the same architecture shares the build"
+        );
+        let newer = Target {
+            rtc: (12, 5),
+            ..target
+        };
+        assert_ne!(
+            before,
+            region_key(&newer, "__global__ void k() { a(); }"),
+            "another runtime compiler builds it again"
+        );
+        assert!(
+            before.contains(&target.architecture()),
+            "the target stays readable"
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -1091,26 +1596,26 @@ mod tests {
     fn a_corrupt_entry_is_a_miss_and_is_deleted() {
         let directory = scratch("corrupt");
         let disk = Disk::at(&directory);
-        disk.store("key-a", 0, "entry", b"cubin-bytes");
-        let path = disk.path("key-a", 0).expect("enabled");
+        disk.store("key-a", "entry", b"cubin-bytes");
+        let path = disk.path("key-a").expect("enabled");
         let good = fs::read(&path).expect("stored");
 
         fs::write(&path, &good[..good.len() - 3]).expect("truncate");
-        assert_eq!(disk.load("key-a", 0, "entry"), None, "a short tail misses");
+        assert_eq!(disk.load("key-a", "entry"), None, "a short tail misses");
         assert!(!path.exists(), "and the entry is removed");
 
-        disk.store("key-a", 0, "entry", b"cubin-bytes");
+        disk.store("key-a", "entry", b"cubin-bytes");
         let mut wrong_magic = fs::read(&path).expect("stored");
         wrong_magic[7] = b'9';
         fs::write(&path, &wrong_magic).expect("write");
-        assert_eq!(disk.load("key-a", 0, "entry"), None, "a format bump misses");
+        assert_eq!(disk.load("key-a", "entry"), None, "a format bump misses");
         assert!(!path.exists());
     }
 
     fn a_disabled_cache_is_a_miss_and_not_a_failure() {
         let disk = Disk::disabled();
         assert!(!disk.is_enabled());
-        disk.store("key", 0, "entry", b"cubin");
-        assert_eq!(disk.load("key", 0, "entry"), None);
+        disk.store("key", "entry", b"cubin");
+        assert_eq!(disk.load("key", "entry"), None);
     }
 }

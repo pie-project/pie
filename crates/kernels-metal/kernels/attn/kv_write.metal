@@ -31,8 +31,8 @@ template <typename T>
   const uint page = w_page[i];
   const size_t row_stride = size_t(n_kv_heads) * size_t(head_dim);
   const size_t in_row = size_t(w_off[i]) * row_stride + size_t(h) * size_t(head_dim) + size_t(d);
-  const size_t k_dst = size_t(page) * size_t(k_page_stride / sizeof(T)) + in_row;
-  const size_t v_dst = size_t(page) * size_t(v_page_stride / sizeof(T)) + in_row;
+  const size_t k_dst = pie_page_at(page, k_page_stride / sizeof(T), sizeof(T)) + in_row;
+  const size_t v_dst = pie_page_at(page, v_page_stride / sizeof(T), sizeof(T)) + in_row;
   k_pages = pie_kv_plane(k_pages, k_offset);
   v_pages = pie_kv_plane(v_pages, v_offset);
   const size_t src_row = src_row_stride > 0 ? size_t(src_row_stride) : row_stride;
@@ -139,8 +139,8 @@ template <typename T, uint N>
   // Destination: one N/2+2-byte block per (slot, head); a slot's heads are
   // contiguous, so the whole slot is n_kv_heads * (N/2+2) bytes.
   const size_t in_page = (size_t(w_off[i]) * uint(n_kv_heads) + h) * BYTES;
-  device uchar* kb = pie_kv_plane(k_pages, k_offset) + size_t(w_page[i]) * k_page_stride + in_page;
-  device uchar* vb = pie_kv_plane(v_pages, v_offset) + size_t(w_page[i]) * v_page_stride + in_page;
+  device uchar* kb = pie_kv_plane(k_pages, k_offset) + pie_page_at(w_page[i], k_page_stride, 1) + in_page;
+  device uchar* vb = pie_kv_plane(v_pages, v_offset) + pie_page_at(w_page[i], v_page_stride, 1) + in_page;
   if (d < NIB_BYTES) {
     kb[d] = uchar((uint(nk[2 * d + 1]) << 4) | uint(nk[2 * d]));
     vb[d] = uchar((uint(nv[2 * d + 1]) << 4) | uint(nv[2 * d]));

@@ -81,6 +81,8 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             kv_heads: None,
             window: *window,
         }),
+        // A lane's mask is per-lane data, read in the arm its rows land in
+        // whether it states one or not: it never shapes the reading.
         Attn::Prefill {
             q,
             plan,
@@ -88,7 +90,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: Some(_),
             selection: None,
             bias: None,
             lse: None,
@@ -101,40 +102,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: Some(_),
-            selection: None,
-            bias: None,
-            lse: Some(_),
-            ..
-        } => Some(Reader {
-            q: *q,
-            plan: *plan,
-            cache: *cache,
-            head_dim: *head_dim,
-            kv_heads: Some(*kv_heads),
-            window: *window,
-        }),
-        Attn::Prefill {
-            q,
-            plan,
-            cache,
-            window,
-            head_dim,
-            kv_heads,
-            mask: None,
-            selection: None,
-            bias: None,
-            lse: None,
-            ..
-        }
-        | Attn::Prefill {
-            q,
-            plan,
-            cache,
-            window,
-            head_dim,
-            kv_heads,
-            mask: None,
             selection: None,
             bias: None,
             lse: Some(_),
@@ -147,7 +114,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: None,
             selection: None,
             bias: Some(_),
             lse: None,
@@ -160,7 +126,6 @@ pub fn reads(op: &Operation) -> Option<Reader> {
             window,
             head_dim,
             kv_heads,
-            mask: None,
             selection: Some(_),
             bias: None,
             lse: None,
@@ -228,6 +193,39 @@ pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
         }
     }
     Ok(width)
+}
+
+/// What a key an attention attends costs a row, all layers together: `(the
+/// flops, the kv bytes read)`. Four flops a query element (the scores'
+/// product and the values'), the widest query a kv row is read by (a row
+/// read by a prefill and a decode attention alike counts once), and every
+/// plane of each kv row read at its element's size.
+pub fn attention_counts(trace: &Trace) -> Result<(u64, u64)> {
+    let mut query = std::collections::BTreeMap::new();
+    for node in &trace.nodes {
+        let Some(read) = reads(&node.op) else {
+            continue;
+        };
+        let Some(row) = row_of(trace, read.cache) else {
+            continue;
+        };
+        let width = width_of(trace, read.q)?;
+        let seat = query.entry(row).or_insert(0u64);
+        *seat = (*seat).max(width);
+    }
+    let kv_bytes_per_key = query
+        .keys()
+        .filter_map(|&row| match trace.caches.get(row) {
+            Some(CacheRow::Kv { planes, dtype, .. }) => Some(
+                planes.iter().sum::<u64>() * poem_compiler::arena::elem_bytes(*dtype).unwrap_or(2),
+            ),
+            _ => None,
+        })
+        .sum();
+    Ok((
+        query.values().sum::<u64>().saturating_mul(4),
+        kv_bytes_per_key,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +297,20 @@ impl Paging {
                 spare: 0,
             });
         self
+    }
+
+    /// The paging as a sequence holds it between fires: windowed rows read
+    /// through `tokens`, each holding its window alone
+    /// ([`Paging::window_held`]), no fire's rows past it. What a sequence
+    /// moved or seated between steps takes; a fire's rows past the window
+    /// are the fire's ([`Paging::windowed`]).
+    #[must_use]
+    pub fn held(self, tokens: Option<u32>) -> Paging {
+        let mut paging = self.windowed(tokens, 0);
+        if let Some(window) = paging.window.as_mut() {
+            window.fire_pages = 0;
+        }
+        paging
     }
 
     /// The paging with its windowed pool sized for `lanes` seated at once.
@@ -586,6 +598,21 @@ mod tests {
         a_decode_step_appends_one_row_past_what_the_slot_holds();
         a_sequence_past_its_slots_pages_is_refused_rather_than_wrapped();
         a_windowed_table_reads_the_null_page_behind_the_window();
+        a_held_sequence_holds_its_window_and_no_fire_past_it();
+    }
+
+    fn a_held_sequence_holds_its_window_and_no_fire_past_it() {
+        let of = || Paging::of(16, 1024, 1, 64).expect("a page size of 16 spells geometry");
+        // A 32-token window straddles 3 pages; a fire of 100 rows adds 8.
+        let fired = of().windowed(Some(32), 100);
+        let held = of().held(Some(32));
+        assert_eq!(fired.window_held(), 3);
+        assert_eq!(fired.window_ring(), 3 + 8);
+        assert_eq!(held.window_held(), 3);
+        assert_eq!(held.window_ring(), 3, "no fire's pages past the window");
+        // A window spanning the context is none: every page held.
+        assert_eq!(of().held(Some(4096)).window_ring(), 64);
+        assert_eq!(of().held(None), of().windowed(None, 100));
     }
 
     fn a_windowed_table_reads_the_null_page_behind_the_window() {

@@ -26,7 +26,6 @@ use std::collections::BTreeSet;
 use engine::{ChannelId, InstanceId, ProgramRegistration};
 use engine_cuda::device::{Buffer, Context};
 use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
 use engine_cuda::program::launch::INTRINSIC_STORAGE_F32;
 use engine_cuda::program::session::{Fired, Launched};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -523,12 +522,21 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let idx = p.input_dims(&plane, Dtype::I32, Gen::Index(w));
             let y = p.op(Op::Gather { src: flat, idx });
             p.output(y, &plane, Dtype::U32, exact, "elements by index");
+            // A mask's rows by a parent index, as a beam carries its mask.
+            let mask = p.input_dims(&plane, Dtype::Bool, Gen::Bool);
+            let idx = p.input_dims(&[r], Dtype::I32, Gen::Index(r));
+            let y = p.op(Op::Gather { src: mask, idx });
+            p.output(y, &plane, Dtype::Bool, exact, "bool rows by index");
         }
         tags::GATHER_ROW => {
             let src = p.input_dims(&plane, f, Gen::Signed);
             let idx = p.input_dims(&[r], Dtype::I32, Gen::Index(w));
             let y = p.op(Op::GatherRow { src, idx });
             p.output(y, &[r], f, exact, "each row's pick");
+            let src = p.input_dims(&plane, Dtype::Bool, Gen::Bool);
+            let idx = p.input_dims(&[r], Dtype::I32, Gen::Index(w));
+            let y = p.op(Op::GatherRow { src, idx });
+            p.output(y, &[r], Dtype::Bool, exact, "each row's bool pick");
         }
         tags::SCATTER_ADD | tags::SCATTER_SET => {
             let op = |base, idx, vals| {
@@ -625,6 +633,48 @@ fn body(tag: u8, p: &mut Prog, r: u32, w: u32) {
             let s = p.op(Op::Add(l, g));
             let y = p.op(Op::ReduceArgmax(s));
             p.output(y, &[r], Dtype::I32, exact, "gumbel-max");
+        }
+        tags::GUMBEL_ARGMAX => {
+            // A masked draw at a divisor, over f32 and bf16 rows: every lane
+            // made in f32 in the reduction.
+            let state = p.input_dims(&[2], Dtype::U32, Gen::Below(u32::MAX));
+            let x = p.input_dims(&plane, f, Gen::Signed);
+            let keep = p.input_dims(&plane, Dtype::Bool, Gen::Bool);
+            let divisor = p.input_dims(&[1], f, Gen::Positive);
+            let divisor = p.op(Op::Reshape {
+                value: divisor,
+                shape: scalar(),
+            });
+            let y = p.op(Op::GumbelArgmax {
+                logits: x,
+                keep,
+                scale: divisor,
+                state,
+            });
+            p.output(y, &[r], Dtype::I32, exact, "f32, masked");
+            let h = p.op(Op::Cast {
+                value: x,
+                dtype: Dtype::Bf16,
+            });
+            let y = p.op(Op::GumbelArgmax {
+                logits: h,
+                keep,
+                scale: divisor,
+                state,
+            });
+            p.output(y, &[r], Dtype::I32, exact, "bf16, masked");
+            // Over the logits, every lane kept at a divisor of one: the draw
+            // that scans the model's row itself.
+            let l = p.logits(r, w);
+            let every = p.op(Op::Const(Literal::Bool(true)));
+            let one = p.op(Op::Const(Literal::F32(1.0)));
+            let y = p.op(Op::GumbelArgmax {
+                logits: l,
+                keep: every,
+                scale: one,
+                state,
+            });
+            p.output(y, &[r], Dtype::I32, exact, "logits");
         }
         tags::CONST => {
             for (literal, dtype) in [
@@ -946,6 +996,8 @@ impl Rig {
                     false,
                     &vec![None; count],
                     &ids,
+                    crate::guest::alone_slots(&self.plane, program),
+                    &crate::guest::alone_span,
                     self.context.stream(),
                 )
                 .unwrap_or_else(|e| panic!("{}: the instance binds: {e:?}", case.name));
@@ -963,6 +1015,7 @@ impl Rig {
                         case.width,
                         case.width,
                         0,
+                        logits.len() as u32 / case.width,
                     )
                     .expect("the logits bind");
                 planes.push(buffer);
@@ -1053,7 +1106,7 @@ fn every_op_agrees_with_the_host_interpreter() {
     let only = std::env::var("PIE_EVERY_OP_ONLY").ok();
     let mut rig = Rig {
         context: Context::bind(0, None).expect("a CUDA context"),
-        plane: Plane::new(Disk::disabled()),
+        plane: crate::guest::alone_plane(),
     };
     let mut failures: Vec<String> = Vec::new();
     for (index, case) in cases.iter().enumerate() {

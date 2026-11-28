@@ -1,11 +1,10 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::attn::elementwise;
 use crate::attn::lse_plane;
 use crate::attn::per_head_elementwise;
 use crate::attn::row_heads;
-use crate::jit::{Arg, Ctx, Fire, count, dtype_dispatch, kernel, nonzero, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 
 pub fn sink(
@@ -101,21 +100,14 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     if cap.is_nan() || cap <= 0.0 {
         return Err(refuse(OP, format!("{cap} is not a logit soft cap")));
     }
-    let n = x.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the element count", lanes)?;
+    let sweep = crate::elemwise::elementwise(OP, *x)?;
     ctx.fire(
         OP,
         Fire::at(kernel(
             "attn/attention.hip",
-            &format!("::pie::attn::logit_softcap<{t}>"),
+            &format!("::pie::attn::logit_softcap<{t}, {}>", sweep.index()),
         ))
-        .apply(elementwise(lanes)),
-        &[x.arg(), cap.arg(), n.arg()],
+        .apply(sweep.launch),
+        &[x.arg(), cap.arg(), sweep.count()],
     )
 }

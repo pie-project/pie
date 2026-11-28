@@ -5,9 +5,8 @@
     const M1ValueDesc* all_descriptors,
     const M1OpParams* params,
     const m1_u32* offsets,
-    m1_u8* all_scratch,
+    const m1_u64* lane_scratch,
     m1_u32 value_count,
-    m1_u32 scratch_stride,
     m1_u32 temporary_offset,
     m1_u8* pending_flags,
     const m1_u64* intrinsic_bases,
@@ -15,8 +14,11 @@
     const m1_u32* intrinsic_widths,
     const m1_u32* intrinsic_strides,
     const m1_u32* intrinsic_offsets,
+    const m1_u32* intrinsic_rows,
     m1_u32 rows_per_lane,
-    m1_u32 temporary_stride) {
+    m1_u32 temporary_stride,
+    m1_u8* lane_arenas,
+    m1_u32 ptir_phase) {
 
   const m1_u32 lane_blocks = rows_per_lane == 0u ? 1u : rows_per_lane;
   const m1_u32 dispatch_lane = blockIdx.x / lane_blocks;

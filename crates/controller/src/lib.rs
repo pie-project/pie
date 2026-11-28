@@ -1,12 +1,9 @@
 mod actor;
-mod actuator;
 pub mod cluster;
 pub mod directory;
 mod service;
 mod state;
 mod topology;
-
-pub use actuator::Slot;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,13 +16,16 @@ use tokio_util::sync::CancellationToken;
 
 use controller_api::{
     Ack, DirectoryView, GatewayDecisions, GatewayInfo, Key, Neighbors, ProcessEvent, RoutingTable,
-    ScaleStatus, StateReport, WorkerInfo, WorkerStatus,
+    StateReport, WorkerInfo, WorkerStatus,
 };
 use ids::{GatewayId, NodeId, WorkerId};
 
 use actor::{Actor, ActorConfig, Command};
 use topology::{Topology, empty_routing, project};
 
+/// How long a long-poll watch hangs before answering with what it holds:
+/// well inside the callers' transport deadline (300 s), so an idle watch
+/// answers rather than times out.
 const T_HANG: Duration = Duration::from_secs(20);
 /// How often a changed directory is published to the gateways: reports
 /// within it go out as one view.
@@ -42,12 +42,9 @@ pub struct Config {
     pub listen: String,
     pub heartbeat_timeout: Duration,
     pub tick_interval: Duration,
-    /// The workers the actuator may launch to meet a scale table; none,
-    /// and the controller does not scale (`cluster.scale` is absent).
-    pub slots: Vec<Slot>,
     /// The cluster policies: each a built-in policy's name or a `.wasm`
-    /// path, no two granted the same write. None: every gateway goes by its
-    /// defaults.
+    /// path, no two granted the same write. Default: `default-cluster`.
+    /// None: every gateway goes by the columns' own defaults.
     pub cluster_policies: Vec<String>,
 }
 
@@ -57,31 +54,20 @@ impl Default for Config {
             listen: "0.0.0.0:7000".to_string(),
             heartbeat_timeout: Duration::from_secs(8),
             tick_interval: Duration::from_secs(2),
-            slots: Vec::new(),
-            cluster_policies: Vec::new(),
+            cluster_policies: vec![builtins::DEFAULT_CLUSTER_POLICY.to_string()],
         }
     }
 }
 
 /// The controller's file: `listen`, `heartbeat_timeout` and `tick_interval`
-/// (written with their unit, `"8s"`), `cluster_policies`, and
-/// `[[scale.slot]]`.
+/// (written with their unit, `"8s"`), and `cluster_policies`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigToml {
     listen: String,
     heartbeat_timeout: units::Duration,
     tick_interval: units::Duration,
-    scale: ScaleToml,
     cluster_policies: Vec<String>,
-}
-
-/// `[scale]`: `[[scale.slot]]` entries, each a worker the actuator may
-/// launch (`model`, `engine`, `command`).
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ScaleToml {
-    slot: Vec<Slot>,
 }
 
 impl Default for ConfigToml {
@@ -91,7 +77,6 @@ impl Default for ConfigToml {
             listen: d.listen,
             heartbeat_timeout: units::Duration::from_secs(d.heartbeat_timeout.as_secs()),
             tick_interval: units::Duration::from_secs(d.tick_interval.as_secs()),
-            scale: ScaleToml::default(),
             cluster_policies: d.cluster_policies,
         }
     }
@@ -103,7 +88,6 @@ impl From<ConfigToml> for Config {
             listen: t.listen,
             heartbeat_timeout: t.heartbeat_timeout.into(),
             tick_interval: t.tick_interval.into(),
-            slots: t.scale.slot,
             cluster_policies: t.cluster_policies,
         }
     }
@@ -130,16 +114,6 @@ impl Config {
             !self.tick_interval.is_zero(),
             "controller config: `tick_interval` must be > 0"
         );
-        for (at, slot) in self.slots.iter().enumerate() {
-            ensure!(
-                !slot.command.is_empty(),
-                "controller config: `[[scale.slot]]` {at} has an empty `command`"
-            );
-            ensure!(
-                !slot.engine.trim().is_empty(),
-                "controller config: `[[scale.slot]]` {at} names no `engine`"
-            );
-        }
         Ok(())
     }
 }
@@ -191,14 +165,6 @@ impl ControllerHandle {
         let _ = self.cmd.send(Command::ReportWorker { id, status }).await;
     }
 
-    /// Each shape the scale table names, desired against current; none
-    /// once the controller's actor has stopped.
-    pub async fn scale_status(&self) -> Vec<ScaleStatus> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.cmd.send(Command::ScaleStatus { reply }).await;
-        rx.await.unwrap_or_default()
-    }
-
     pub fn worker_watch(&self, id: WorkerId) -> watch::Receiver<Neighbors> {
         let mut topo_rx = self.worker_rx.clone();
         let initial = project(&topo_rx.borrow(), id);
@@ -220,6 +186,13 @@ impl ControllerHandle {
 
     /// What `worker` holds, gained and lost since its last report.
     pub fn report_state(&self, worker: WorkerId, report: StateReport) {
+        tracing::debug!(
+            %worker,
+            added = report.added.len(),
+            runs_added = report.runs_added.len(),
+            pool = report.pool,
+            "a worker's state report"
+        );
         let quiet = !report.full
             && report.added.is_empty()
             && report.removed.is_empty()
@@ -228,8 +201,8 @@ impl ControllerHandle {
             && report.published.is_none()
             && report.disk_added.is_empty()
             && report.disk_removed.is_empty()
-            && report.persist_hints.is_none()
             && report.disk_tier.is_none()
+            && report.off_device.is_none()
             && report.link.is_none();
         self.directory.report_state(worker, report);
         if !quiet {
@@ -308,17 +281,14 @@ impl ControllerHandle {
         let programs = policy_components(specs)?;
         let host = self.cluster.lock().unwrap().clone();
         match host {
+            None if programs.is_empty() => Ok(()),
             Some(host) => host
                 .reload(programs)
                 .await
                 .context("reload the cluster policies"),
             None => {
-                let host = start_cluster(
-                    programs,
-                    self.gateway_rx.clone(),
-                    self.directory_rx.clone(),
-                    self.cmd.clone(),
-                )?;
+                let host =
+                    start_cluster(programs, self.gateway_rx.clone(), self.directory_rx.clone())?;
                 *self.cluster.lock().unwrap() = Some(host);
                 Ok(())
             }
@@ -387,7 +357,6 @@ pub fn embed(config: Config) -> ControllerHandle {
         ActorConfig {
             heartbeat_timeout: config.heartbeat_timeout,
         },
-        actuator::Actuator::new(config.slots.clone(), config.heartbeat_timeout),
     );
     let actor_token = shutdown.clone();
     let actor_task = tokio::spawn(async move {
@@ -430,14 +399,9 @@ pub fn embed(config: Config) -> ControllerHandle {
     let cluster = if config.cluster_policies.is_empty() {
         None
     } else {
-        match policy_components(&config.cluster_policies).and_then(|programs| {
-            start_cluster(
-                programs,
-                gateway_rx.clone(),
-                directory_rx.clone(),
-                cmd_tx.clone(),
-            )
-        }) {
+        match policy_components(&config.cluster_policies)
+            .and_then(|programs| start_cluster(programs, gateway_rx.clone(), directory_rx.clone()))
+        {
             Ok(host) => Some(host),
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"), "cluster policies not started");
@@ -467,28 +431,14 @@ fn policy_components(specs: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
         .collect()
 }
 
-/// Starts the cluster policies `programs`, their scale table sent to the
-/// actuator as it changes.
+/// Starts the cluster policies `programs`.
 fn start_cluster(
     programs: Vec<(String, Vec<u8>)>,
     routing: watch::Receiver<RoutingTable>,
     directory: watch::Receiver<DirectoryView>,
-    cmd: mpsc::Sender<Command>,
 ) -> Result<Arc<cluster::Host>> {
-    let host =
-        cluster::Host::start(programs, routing, directory).context("load the cluster policies")?;
-    let mut scale = host.scale_watch();
-    tokio::spawn(async move {
-        while scale.changed().await.is_ok() {
-            let entries = scale.borrow_and_update().clone();
-            if let Some(entries) = entries
-                && cmd.send(Command::DesireScale { entries }).await.is_err()
-            {
-                return;
-            }
-        }
-    });
-    Ok(host)
+    cluster::Host::start(programs, cluster::call_deadline(), routing, directory)
+        .context("load the cluster policies")
 }
 
 /// Publishes the directory whenever a report changed it, at most every
@@ -552,27 +502,6 @@ mod tests {
     fn lib_every_case() {
         parse_empty_is_default();
         parse_overrides_fields();
-        parse_scale_slots();
-    }
-
-    fn parse_scale_slots() {
-        let cfg = Config::parse(
-            r#"
-            [[scale.slot]]
-            model = "Qwen/Qwen3-14B"
-            engine = "cuda"
-            command = ["pie-worker", "-c", "wa.toml"]
-
-            [[scale.slot]]
-            engine = "cuda"
-            command = ["pie-pool"]
-            "#,
-        )
-        .expect("scale slots parse");
-        assert_eq!(cfg.slots.len(), 2);
-        assert_eq!(cfg.slots[0].model.as_deref(), Some("Qwen/Qwen3-14B"));
-        assert_eq!(cfg.slots[1].model, None);
-        assert!(Config::parse("[[scale.slot]]\nengine = \"cuda\"\ncommand = []\n").is_err());
     }
 
     fn parse_empty_is_default() {
@@ -581,6 +510,9 @@ mod tests {
         assert_eq!(cfg.listen, d.listen);
         assert_eq!(cfg.heartbeat_timeout, d.heartbeat_timeout);
         assert_eq!(cfg.tick_interval, d.tick_interval);
+        assert_eq!(cfg.cluster_policies, ["default-cluster"]);
+        let none = Config::parse("cluster_policies = []").unwrap();
+        assert!(none.cluster_policies.is_empty(), "[] runs none");
     }
 
     fn parse_overrides_fields() {
@@ -589,14 +521,14 @@ mod tests {
             listen = "127.0.0.1:9000"
             heartbeat_timeout = "12s"
             tick_interval = "500ms"
-            cluster_policies = ["persist-prefix"]
+            cluster_policies = ["my-policy"]
             "#,
         )
         .expect("valid config parses");
         assert_eq!(cfg.listen, "127.0.0.1:9000");
         assert_eq!(cfg.heartbeat_timeout, Duration::from_secs(12));
         assert_eq!(cfg.tick_interval, Duration::from_millis(500));
-        assert_eq!(cfg.cluster_policies, ["persist-prefix"]);
+        assert_eq!(cfg.cluster_policies, ["my-policy"]);
         assert!(
             Config::parse("heartbeat_timeout = 12").is_err(),
             "a duration is written with its unit"
@@ -637,6 +569,22 @@ mod tests {
                 .await
                 .is_err(),
             "a quiet report publishes nothing"
+        );
+        // A copy that moved off the device is a change of its own.
+        handle.report_state(
+            WorkerId(4),
+            StateReport {
+                off_device: Some(vec![([1; 32], controller_api::OffDevice::Host)]),
+                ..StateReport::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), views.changed())
+            .await
+            .expect("published")
+            .unwrap();
+        assert_eq!(
+            views.borrow_and_update().groups[0].1.site_tiers,
+            [(WorkerId(4), controller_api::OffDevice::Host)]
         );
         handle.forget_state(WorkerId(4));
         tokio::time::timeout(Duration::from_secs(2), views.changed())

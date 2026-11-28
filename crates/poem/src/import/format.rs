@@ -200,6 +200,16 @@ pub fn read_one<T>(
     }
 }
 
+/// Whether some format of `formats` could take `src`: one that recognizes
+/// it, or one with no recognizer whose stated values agree. [`read_one`]
+/// refuses a checkpoint none takes before reading anything.
+pub fn any_takes<T>(src: &ztensor::Source, formats: &[Format<'_, T>]) -> bool {
+    formats.iter().any(|format| match &format.recognizes {
+        Some(recognizes) => recognizes(src),
+        None => agrees(src, &format.states).is_ok(),
+    })
+}
+
 /// Whether every value `states` names that `src` states is the one wanted; a
 /// value the checkpoint does not state is not held against it.
 fn agrees(src: &ztensor::Source, states: &[Stated]) -> Result<(), String> {

@@ -29,6 +29,10 @@ struct Paged {
     const i32* kv_tile_indices;
     const i32* kv_chunk_size;
     const u8* block_valid;
+    // A captured grid's live work items (staged each fire), null for every
+    // block of the grid: the blocks past them exit, and the live ones take
+    // the unpadded grid's order (`prefill_item`).
+    const i32* block_live;
     void* o;
     float* lse;
     i32 num_qo_heads;
@@ -94,12 +98,45 @@ __device__ __forceinline__ long long kv_token(const Paged& p, int req, int t, in
 
 // ---------------------------------------------------------------- decode --
 
+// A fire's per-lane masks as a decode reads them (`engine-cuda`'s
+// `mask::stage`): request r's word origin[r] (its boundary; bit 31, the wide
+// bit, says nothing to a decode row, its lane's last) and its plane of bits
+// from byte indptr[r]. Its single row reads key t where t < boundary, else
+// bit t - boundary of its plane; a boundary at or past its keys (the word
+// stating none, u32::MAX >> 1) reads no bit.
+struct DecodeMask {
+    const u8* bits;
+    const i64* indptr;
+    const u32* origin;
+};
+
+// One lane's mask, read once a block: its boundary, and its plane only when
+// some key lies past it.
+struct LaneMask {
+    int boundary;
+    const u8* plane;
+
+    __device__ __forceinline__ bool reads(int t) const {
+        return t < boundary || ((plane[(t - boundary) >> 3] >> ((t - boundary) & 7)) & 1u);
+    }
+};
+
+template <bool MASK>
+__device__ __forceinline__ LaneMask lane_mask(const DecodeMask& m, int req, int kv_len) {
+    if constexpr (!MASK) {
+        return LaneMask{0x7fffffff, nullptr};
+    } else {
+        const int boundary = static_cast<int>(m.origin[req] & 0x7fffffffu);
+        return LaneMask{boundary, boundary < kv_len ? m.bits + m.indptr[req] : nullptr};
+    }
+}
+
 // One block per (work item, kv head), WAVES wavefronts splitting the chunk's
 // tokens. Lane i of a wavefront scores token t0 + i for every query head of
 // the GQA group, the wavefront keeps an online softmax per head, and each
 // lane accumulates its D/kWave columns of the output.
-template <int D, int G, int WAVES, bool HND, bool FP8>
-__global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
+template <int D, int G, int WAVES, bool HND, bool FP8, bool MASK>
+__global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p, const DecodeMask dm) {
     using KV = Kv<FP8>;
     constexpr int kCols = D / kWave;
     static_assert(D % kWave == 0, "a decode head is a whole number of lanes wide");
@@ -120,6 +157,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 
     // The window keeps keys at or after kv_len - 1 - window_left.
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
+    const LaneMask mask = lane_mask<MASK>(dm, req, kv_len);
 
     const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n;
     for (int i = threadIdx.x; i < G * D; i += blockDim.x) {
@@ -139,7 +177,7 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 
     for (int t0 = lo + wave * kWave; t0 < end; t0 += WAVES * kWave) {
         const int t = t0 + ln;
-        const bool live = t < end;
+        const bool live = t < end && (!MASK || mask.reads(t));
         float s[G];
 #pragma unroll
         for (int g = 0; g < G; ++g) s[g] = 0.f;
@@ -159,7 +197,8 @@ __global__ __launch_bounds__(kWave* WAVES) void paged_decode(const Paged p) {
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             const float m_new = fmaxf(m[g], wave_max(live ? s[g] : neg_inf()));
-            const float alpha = exp2f(m[g] - m_new);
+            // (a wavefront whose keys a lane's mask hides all of keeps none)
+            const float alpha = m_new == neg_inf() ? 1.f : exp2f(m[g] - m_new);
             pr[g] = live ? exp2f(s[g] - m_new) : 0.f;
             l[g] = l[g] * alpha + wave_sum(pr[g]);
             m[g] = m_new;
@@ -235,8 +274,7 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // with K straight from the pages (lane l holds keys 4(l/16)+t for head
 // l%16). The weights go through LDS to the value side, where a lane
 // accumulates 8 columns of P·V from 16-byte value reads; the wavefronts
-// fold through LDS at the end. Four wavefronts at 512-wide heads (eight
-// spill there); QL keeps Qᵀ in LDS for the registers.
+// fold through LDS at the end; QL keeps Qᵀ in LDS for the registers.
 
 // With PVM the round's P·V runs on the matrix core too: the wavefront lays
 // its 16 value rows in LDS and takes Oᵀ (16 columns × 16 heads) += Vᵀ · Pᵀ a
@@ -245,8 +283,8 @@ __host__ __device__ constexpr int decode_fold_heads(int G, int D, int waves) {
 // accumulator quads for its head instead of G × 8 floats, and a round costs
 // D/16 MFMAs instead of G·D/8 FMAs a lane. The weights round to bf16 for the
 // product, as a prefill's do.
-template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8>
-__global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
+template <int D, int G, bool HND, int WAVES, bool QL, bool PVM, bool FP8, bool MASK>
+__global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p, const DecodeMask dm) {
     using KV = Kv<FP8>;
     constexpr int SUB = 16, KT = SUB / 16, KP = D / 32;
     // Elements a value read takes: sixteen e4m3 codes (16 bytes) where the
@@ -256,13 +294,21 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     constexpr int KPI = kWave / LPK;     // keys one value read covers
     constexpr int VR = SUB / KPI;        // value reads a round
     static_assert(G <= 16 && D % 32 == 0 && kWave % LPK == 0, "a group within one column tile");
-    static_assert(!PVM || D <= 256, "the staged value rows of a round within LDS");
-    constexpr int VLD = D + 8;           // a staged value row's pitch
+    // Under PVM a round's value rows stage in LDS HV column halves at a
+    // time: two past 256-wide heads, so four wavefronts' rows fit at 512.
+    constexpr int HV = PVM && D > 256 ? 2 : 1, DH = D / HV;
+    static_assert(!PVM || WAVES * SUB * (DH + 8) * 2 <= 40 * 1024,
+                  "the staged value rows of a round within LDS");
+    // A 512-wide head's key row, value reads and G·8 vector accumulators
+    // spill past the registers into scratch: there the values are weighed on
+    // the matrix core, whose accumulator tiles the AGPRs hold.
+    static_assert(D < 512 || PVM, "512-wide heads weigh their values on the matrix core");
+    constexpr int VLD = DH + 8;          // a staged value row's pitch
     __shared__ float ps[PVM ? 1 : WAVES][SUB][G];
     __shared__ float alph[WAVES][G];
     __shared__ float part_m[WAVES][G], part_l[WAVES][G];
     // The wavefronts' outputs fold through LDS HG heads at a time: all G at
-    // once where they fit beside the rest (D = 512 does not). Under PVM the
+    // once where they fit beside the rest. Under PVM the
     // fold reuses the rounds' value rows' LDS.
     constexpr int HG = decode_fold_heads(G, D, WAVES);
     constexpr int PO = WAVES * HG * D;
@@ -287,14 +333,12 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     const int wave = threadIdx.x / kWave, l = lane();
     const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
     const int g = l % 16, quad = l / 16;
+    const LaneMask mask = lane_mask<MASK>(dm, req, kv_len);
 
     // Qᵀ as B operands: this lane's column is head g, k pairs 8·quad. Held in
-    // registers, except at 512-wide heads, where they would push the round's
-    // reads into scratch, or under QL: there every wavefront rereads them
-    // from LDS.
-    constexpr bool QLDS = D >= 512 || QL;
-    // (the round's reads in halves, at 512-wide heads only)
-    constexpr bool HALVES = D >= 512;
+    // registers, except under QL: there every wavefront rereads them from
+    // LDS.
+    constexpr bool QLDS = QL;
     mfma_ab2 qf[QLDS ? 1 : KP];
     // (only the G live columns: a lane past them reads head G - 1's, whose
     // score columns no head's softmax reads)
@@ -350,51 +394,35 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     for (int t0 = w0 + wave * SUB; t0 < wend; t0 += WAVES * SUB) {
         // The round's key and value reads, all issued before any is used
         // (past the chunk they reread its last key, which weighs zero).
-        // The key reads in halves (KH of them at once): a 512-wide head's
-        // whole key row beside its value reads would not fit the registers.
-        constexpr int KH = HALVES ? KP / 2 : KP;
         mfma_cd s[KT];
-        typename KV::Raw kr[KT][KH];
-        auto read_keys = [&](int half) {
+        typename KV::Raw kr[KT][KP];
 #pragma unroll
-            for (int kt = 0; kt < KT; ++kt) {
-                KV::keys(p.k, at(min(t0 + kt * 16 + g, wend - 1), 0), quad, half * KH, kr[kt]);
-            }
-        };
-        auto score_keys = [&](int half) {
-#pragma unroll
-            for (int kt = 0; kt < KT; ++kt)
-#pragma unroll
-                for (int st = 0; st < KH; ++st) s[kt] = mfma16x2(KV::ab2(kr[kt][st]), q_at(half * KH + st), s[kt]);
-        };
+        for (int kt = 0; kt < KT; ++kt) {
+            KV::keys(p.k, at(min(t0 + kt * 16 + g, wend - 1), 0), quad, 0, kr[kt]);
+        }
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) s[kt] = mfma_zero();
-        read_keys(0);
-        // The value reads ride ahead of the scores, except at 512-wide heads,
-        // which read them in halves after the weights (registers again).
+        // The value reads ride ahead of the scores.
         using VRaw = typename conditional<RE == 16, Pack8<bf16>, typename KV::Raw>::type;
         auto value_at = [&](int i) -> VRaw {
             const long long v = at(min(t0 + i * KPI + parity, wend - 1), col);
             if constexpr (RE == 16) return *reinterpret_cast<const VRaw*>(reinterpret_cast<const u8*>(p.v) + v);
             else return KV::raw(p.v, v);
         };
-        VRaw vr[HALVES ? 1 : VR];
-        if constexpr (!HALVES) {
+        VRaw vr[VR];
 #pragma unroll
-            for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
-        }
-        score_keys(0);
-        if constexpr (KH < KP) {
-            read_keys(1);
-            score_keys(1);
-        }
+        for (int i = 0; i < VR; ++i) vr[i] = value_at(i);
+#pragma unroll
+        for (int kt = 0; kt < KT; ++kt)
+#pragma unroll
+            for (int st = 0; st < KP; ++st) s[kt] = mfma16x2(KV::ab2(kr[kt][st]), q_at(st), s[kt]);
         float tmax = neg_inf();
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt)
 #pragma unroll
             for (int t = 0; t < 4; ++t) {
                 const int key = t0 + kt * 16 + 4 * quad + t;
-                s[kt][t] = key < wend ? rel.score(s[kt][t], key) : neg_inf();
+                s[kt][t] = key < wend && (!MASK || mask.reads(key)) ? rel.score(s[kt][t], key) : neg_inf();
                 tmax = fmaxf(tmax, s[kt][t]);
             }
         tmax = fmaxf(tmax, __shfl_xor(tmax, 16, kWave));
@@ -417,37 +445,45 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
         lsum = lsum * alpha + sum;
         m = m_new;
         if constexpr (PVM) {
-            static_assert(KT == 1 && !HALVES, "one 16-key tile a round");
-            // The round's value rows into this wavefront's LDS rows.
+            static_assert(KT == 1, "one 16-key tile a round");
+            // The round's value rows into this wavefront's LDS rows, a column
+            // half at a time: each half's lanes stage theirs, then its tiles
+            // take Vᵀ · Pᵀ.
             bf16* vs = vbuf + wave * SUB * VLD;
-#pragma unroll
-            for (int i = 0; i < VR; ++i) {
-                bf16* row = vs + (i * KPI + parity) * VLD + col;
-                if constexpr (RE == 16) {
-                    const auto w = __builtin_bit_cast(mfma_ab2, vr[i]);
-                    *reinterpret_cast<mfma_ab2*>(row) = e4m3x8_bf16(__builtin_bit_cast(u64, w.lo));
-                    *reinterpret_cast<mfma_ab2*>(row + 8) = e4m3x8_bf16(__builtin_bit_cast(u64, w.hi));
-                } else {
-                    *reinterpret_cast<Pack8<bf16>*>(row) = KV::wide(vr[i]);
-                }
-            }
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-            __builtin_amdgcn_wave_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
             const mfma_ab b = pack4(ew[0][0], ew[0][1], ew[0][2], ew[0][3]);
 #pragma unroll
-            for (int mt = 0; mt < D / 16; ++mt) {
-                mfma_ab a;
+            for (int half = 0; half < HV; ++half) {
+                if (col / DH == half) {
 #pragma unroll
-                for (int t = 0; t < 4; ++t)
-                    a[t] = __builtin_bit_cast(short, vs[(4 * quad + t) * VLD + 16 * mt + g]);
+                    for (int i = 0; i < VR; ++i) {
+                        bf16* row = vs + (i * KPI + parity) * VLD + (col - half * DH);
+                        if constexpr (RE == 16) {
+                            const auto w = __builtin_bit_cast(mfma_ab2, vr[i]);
+                            *reinterpret_cast<mfma_ab2*>(row) = e4m3x8_bf16(__builtin_bit_cast(u64, w.lo));
+                            *reinterpret_cast<mfma_ab2*>(row + 8) = e4m3x8_bf16(__builtin_bit_cast(u64, w.hi));
+                        } else {
+                            *reinterpret_cast<Pack8<bf16>*>(row) = KV::wide(vr[i]);
+                        }
+                    }
+                }
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 #pragma unroll
-                for (int t = 0; t < 4; ++t) ot[mt][t] *= alpha;
-                ot[mt] = mfma16(a, b, ot[mt]);
+                for (int mh = 0; mh < DH / 16; ++mh) {
+                    const int mt = half * (DH / 16) + mh;
+                    mfma_ab a;
+#pragma unroll
+                    for (int t = 0; t < 4; ++t)
+                        a[t] = __builtin_bit_cast(short, vs[(4 * quad + t) * VLD + 16 * mh + g]);
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) ot[mt][t] *= alpha;
+                    ot[mt] = mfma16(a, b, ot[mt]);
+                }
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+                __builtin_amdgcn_wave_barrier();
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
             }
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-            __builtin_amdgcn_wave_barrier();
-            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
             continue;
         }
         if (quad == 0 && g < G) alph[wave][g] = alpha;
@@ -476,16 +512,6 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
             }
         };
         if constexpr (PVM) {
-        } else if constexpr (HALVES) {
-            constexpr int VH = VR / 2;
-#pragma unroll
-            for (int half = 0; half < 2; ++half) {
-                VRaw vh[VH];
-#pragma unroll
-                for (int i = 0; i < VH; ++i) vh[i] = value_at(half * VH + i);
-#pragma unroll
-                for (int i = 0; i < VH; ++i) weigh(half * VH + i, vh[i]);
-            }
         } else {
 #pragma unroll
             for (int i = 0; i < VR; ++i) weigh(i, vr[i]);
@@ -557,180 +583,6 @@ __global__ __launch_bounds__(64 * WAVES) void paged_decode_mfma(const Paged p) {
     }
 }
 
-// The decode at the widest heads, its columns split over four wavefronts:
-// each walks every key 16 a round over its quarter of the head, the
-// quarters' MFMA scores summed through LDS, the same online softmax in each.
-// Nothing folds at the end, and a lane's G·4 accumulators leave room for a
-// few blocks a CU.
-template <int D, int G, bool HND, bool FP8>
-__global__ __launch_bounds__(256) void paged_decode_cols(const Paged p) {
-    using KV = Kv<FP8>;
-    constexpr int WAVES = 4, SUB = 16, DW = D / WAVES, KPW = DW / 32;
-    constexpr int VC = 4;              // value columns a lane
-    constexpr int LPV = DW / VC;       // lanes a key's value quarter spans
-    constexpr int KPV = kWave / LPV;   // keys one value read covers
-    constexpr int VR = SUB / KPV;      // value reads a round
-    static_assert(G <= 16 && DW % 32 == 0 && kWave % LPV == 0, "a group within one column tile");
-    // The quarters' partial scores, by round parity (a wavefront is at most
-    // one round past the slowest: the barrier between).
-    __shared__ float sp[2][WAVES][SUB][16];
-    __shared__ float pw[WAVES][SUB][G];
-    __shared__ float alph[WAVES][G];
-    __shared__ float fin_m[WAVES][G], fin_l[WAVES][G];
-    constexpr int TABLE = 512;
-    __shared__ i32 table[TABLE];
-
-    const int bx = blockIdx.x;
-    const int kv_head = blockIdx.y;
-    // (the work item read beside its mask: the staged lists span the padded grid)
-    const int req = p.request_indices[bx];
-    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
-    const int kv_len = kv_length(p, req);
-    const int chunk = *p.kv_chunk_size;
-    const int start = p.partition ? p.kv_tile_indices[bx] * chunk : 0;
-    const int end = p.partition ? min(start + chunk, kv_len) : kv_len;
-    const int wave = threadIdx.x / kWave, l = lane();
-    const int lo = p.window_left >= 0 ? max(start, kv_len - 1 - p.window_left) : start;
-    const int g = l % 16, quad = l / 16;
-    const int c0 = wave * DW;
-
-    // This quarter of Qᵀ as B operands (a lane past the group reads head
-    // G - 1's, whose score columns no head's softmax reads).
-    mfma_ab2 qf[KPW];
-    {
-        const bf16* qrow = p.q + static_cast<long long>(p.q_indptr[req]) * p.q_stride_n +
-                           static_cast<long long>(kv_head * G + min(g, G - 1)) * p.q_stride_h + c0;
-#pragma unroll
-        for (int st = 0; st < KPW; ++st) qf[st] = load8(qrow + KV::col(st, quad));
-    }
-
-    float m = neg_inf(), lsum = 0.f;
-    float acc[G][VC];
-#pragma unroll
-    for (int h = 0; h < G; ++h)
-#pragma unroll
-        for (int c = 0; c < VC; ++c) acc[h][c] = 0.f;
-    const int vcol = c0 + VC * (l % LPV), vpar = l / LPV;
-    int parity = 0;
-
-    const i32* pages = p.page_indices + p.page_indptr[req];
-    const int ps_ = p.page_size;
-    for (int page0 = lo / ps_; page0 * ps_ < end; page0 += TABLE) {
-    const int w0 = max(lo, page0 * ps_), wend = min(end, (page0 + TABLE) * ps_);
-    __syncthreads();
-    for (int i = threadIdx.x; i < TABLE && page0 + i <= (wend - 1) / ps_; i += blockDim.x) table[i] = pages[page0 + i];
-    __syncthreads();
-    auto at = [&](int t, int j) {
-        return kv_at<HND>(static_cast<long long>(table[t / ps_ - page0]), t % ps_, kv_head, j, ps_, p.num_kv_heads, D, p.stride_page);
-    };
-    for (int t0 = w0; t0 < wend; t0 += SUB) {
-        // The round's key and value reads, all issued before any is used
-        // (past the chunk they reread its last key, which weighs zero).
-        typename KV::Raw kr[KPW];
-        {
-            KV::keys(p.k, at(min(t0 + g, wend - 1), c0), quad, 0, kr);
-        }
-        typename KV::Raw4 vr[VR];
-#pragma unroll
-        for (int i = 0; i < VR; ++i) vr[i] = KV::raw4(p.v, at(min(t0 + i * KPV + vpar, wend - 1), vcol));
-        mfma_cd s = mfma_zero();
-#pragma unroll
-        for (int st = 0; st < KPW; ++st) s = mfma16x2(KV::ab2(kr[st]), qf[st], s);
-#pragma unroll
-        for (int t = 0; t < 4; ++t) sp[parity][wave][4 * quad + t][g] = s[t];
-        __syncthreads();
-        float tmax = neg_inf();
-#pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            float full = 0.f;
-#pragma unroll
-            for (int w = 0; w < WAVES; ++w) full += sp[parity][w][4 * quad + t][g];
-            const int key = t0 + 4 * quad + t;
-            s[t] = key < wend ? full * p.scale_log2 : neg_inf();
-            tmax = fmaxf(tmax, s[t]);
-        }
-        parity ^= 1;
-        tmax = fmaxf(tmax, __shfl_xor(tmax, 16, kWave));
-        tmax = fmaxf(tmax, __shfl_xor(tmax, 32, kWave));
-        const float m_new = fmaxf(m, tmax);
-        const float alpha = m_new == neg_inf() ? 1.f : exp2f(m - m_new);
-        float sum = 0.f;
-#pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const float e = m_new == neg_inf() ? 0.f : exp2f(s[t] - m_new);
-            sum += e;
-            if (g < G) pw[wave][4 * quad + t][g] = e;
-        }
-        lsum = lsum * alpha + sum;
-        m = m_new;
-        if (quad == 0 && g < G) alph[wave][g] = alpha;
-        // (the wavefront reads back only its own weights)
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-        __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-#pragma unroll
-        for (int h = 0; h < G; ++h) {
-            const float a = alph[wave][h];
-#pragma unroll
-            for (int c = 0; c < VC; ++c) acc[h][c] *= a;
-        }
-#pragma unroll
-        for (int i = 0; i < VR; ++i) {
-            const int kl = i * KPV + vpar;
-            float pv[G];
-#pragma unroll
-            for (int h = 0; h < G; ++h) pv[h] = pw[wave][kl][h];
-#pragma unroll
-            for (int c = 0; c < VC; ++c) {
-                const float vf = KV::f(vr[i], c);
-#pragma unroll
-                for (int h = 0; h < G; ++h) acc[h][c] += pv[h] * vf;
-            }
-        }
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-        __builtin_amdgcn_wave_barrier();
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-    }
-    }
-
-    // The head's sum over its four quads, the columns' over the parities.
-    lsum += __shfl_xor(lsum, 16, kWave);
-    lsum += __shfl_xor(lsum, 32, kWave);
-#pragma unroll
-    for (int off = LPV; off < kWave; off <<= 1)
-#pragma unroll
-        for (int h = 0; h < G; ++h)
-#pragma unroll
-            for (int c = 0; c < VC; ++c) acc[h][c] += __shfl_xor(acc[h][c], off, kWave);
-    if (quad == 0 && g < G) {
-        fin_m[wave][g] = m;
-        fin_l[wave][g] = lsum;
-    }
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
-    __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
-
-    // As `paged_decode_mfma` writes: a partial row, or the output row.
-    const long long row = static_cast<long long>(p.partition ? bx : p.q_indptr[req]) * p.num_qo_heads;
-    if (l < LPV) {
-#pragma unroll
-        for (int h = 0; h < G; ++h) {
-            const float big = fin_m[wave][h], sum_h = fin_l[wave][h];
-            const float inv = sum_h > 0.f ? KV::unit / sum_h : 0.f;
-            const long long at = (row + kv_head * G + h) * D + vcol;
-            if (!p.partition) {
-                *reinterpret_cast<mfma_ab*>(static_cast<bf16*>(p.o) + at) =
-                    pack4(acc[h][0] * inv, acc[h][1] * inv, acc[h][2] * inv, acc[h][3] * inv);
-            } else {
-                *reinterpret_cast<float4*>(static_cast<float*>(p.o) + at) =
-                    float4{acc[h][0] * inv, acc[h][1] * inv, acc[h][2] * inv, acc[h][3] * inv};
-            }
-            if (wave == 0 && l == 0 && p.lse != nullptr)
-                p.lse[row + kv_head * G + h] = sum_h > 0.f ? big + log2f(sum_h) : neg_inf();
-        }
-    }
-}
-
 // --------------------------------------------------------------- prefill --
 //
 // MFMA flash attention for D = 512. A block owns 128 packed query rows (row
@@ -761,17 +613,39 @@ constexpr int prefill_bc() {
 // at once are neighbouring query tiles of one head and find that head's keys
 // and values in its L2; causal items walk each head from its last (the
 // longest) down.
-__device__ __forceinline__ void prefill_item(bool causal, int& bx, int& kv_head) {
-    const int total = gridDim.x * gridDim.y, b = blockIdx.x + gridDim.x * blockIdx.y;
+__device__ __forceinline__ void prefill_item(const Paged& p, bool causal, int& bx, int& kv_head) {
+    // A captured grid is padded past its live items. Spread over the padded
+    // width, the swizzle below would give half the chiplets only empty
+    // blocks; over the live width the live blocks are the grid's first and
+    // run in the unpadded order, and the rest leave (bx −1).
+    const int live = p.block_live != nullptr ? min(*p.block_live, static_cast<int>(gridDim.x)) : gridDim.x;
+    const int total = live * gridDim.y, b = blockIdx.x + gridDim.x * blockIdx.y;
+    if (b >= total) {
+        bx = -1;
+        kv_head = 0;
+        return;
+    }
     const int xcd = b % 8, q = total / 8, rem = total % 8;
     const int at = xcd * q + min(xcd, rem) + b / 8;
-    kv_head = at / gridDim.x;
-    bx = at % gridDim.x;
-    if (causal) bx = gridDim.x - 1 - bx;
+    kv_head = at / live;
+    bx = at % live;
+    if (causal) bx = live - 1 - bx;
 }
 
-template <int D, bool HND, bool CAUSAL, bool FP8>
-__global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+// The masked form's two segments, a request each (`kernels_cuda`'s custom
+// mask): below `origin` its committed run, every key read (and cut at the
+// row's own position unless the word's wide bit is set); from `origin` on its
+// buffer, key j of query row r read where bit r·(kv_len − origin) + (j −
+// origin) of the request's plane is set, the plane from byte indptr[req],
+// least bit first. No origin table: origin 0, wide.
+struct PrefillMask {
+    const u8* bits;
+    const i64* indptr;
+    const u32* origin;
+};
+
+template <int D, bool HND, bool CAUSAL, bool MASK, bool FP8>
+__device__ __forceinline__ void paged_prefill_wide_body(const Paged& p, const PrefillMask& mask) {
     using KV = Kv<FP8>;
     constexpr int BC = prefill_bc<D>();
     constexpr int KS = D / 16;   // d tiles for Oᵀ
@@ -784,8 +658,8 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     __shared__ alignas(16) bf16 vt[D][VPAD];
 
     int bx, kv_head;
-    prefill_item(CAUSAL, bx, kv_head);
-    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
+    prefill_item(p, CAUSAL, bx, kv_head);
+    if (bx < 0 || (p.block_valid != nullptr && p.block_valid[bx] == 0)) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
     const int qo_tile = p.qo_tile_indices[bx];
@@ -795,11 +669,21 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     const int kv_len = kv_length(p, req);
     const int chunk = *p.kv_chunk_size;
     const int wl = p.window_left >= 0 ? p.window_left : kv_len;
+    // A masked request is cut at each row's position unless its word is wide.
+    int origin = 0;
+    bool causal = CAUSAL;
+    const u8* bits = nullptr;
+    if constexpr (MASK) {
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        origin = static_cast<int>(word & 0x7fffffffu);
+        causal = (word >> 31) == 0;
+        bits = mask.bits + mask.indptr[req];
+    }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
     const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
     int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
-    if (CAUSAL) {
+    if (causal) {
         // No key past the tile's last query is seen by any row of it.
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
@@ -829,8 +713,10 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     for (int s = 0; s < KS; ++s) o[s] = mfma_cd{0.f, 0.f, 0.f, 0.f};
     float m = neg_inf(), l = 0.f;
     // The last key this row may see, and the first (the window).
-    const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
+    const int key_hi = causal ? kv_len - qo_len + token : kv_len - 1;
     const int key_lo = kv_len - qo_len + token - wl;
+    // This row's bits of the buffer: key j's at row_bits + (j − origin).
+    const long long row_bits = static_cast<long long>(token) * (kv_len - origin);
 
     // A thread's reads of a tile: K piece c = tid + r·THREADS as (key c /
     // (D/8), columns 8·(c % (D/8))), a wavefront one key's row; V piece c as
@@ -888,12 +774,19 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
             }
         }
     };
-    if (chunk_start < chunk_end) fetch(chunk_start);
+    // The next tile is read into registers across the tile's products, where
+    // they have room: at D = 512 the output's (D/16 · 4) and Qᵀ's (D/32 · 4)
+    // registers take 192 of the 256 a lane has at two wavefronts a SIMD, and
+    // a tile held beside them spills to scratch. There the tile is read just
+    // before it is staged.
+    constexpr bool AHEAD = D < 512;
+    if (AHEAD && chunk_start < chunk_end) fetch(chunk_start);
 
     for (int kv0 = chunk_start; kv0 < chunk_end; kv0 += BC) {
+        if constexpr (!AHEAD) fetch(kv0);
         stage(kv0);
         lds_barrier();
-        if (kv0 + BC < chunk_end) fetch(kv0 + BC);
+        if (AHEAD && kv0 + BC < chunk_end) fetch(kv0 + BC);
         if (wave_live) {
             // Sᵀ: lane holds keys 4·quad + t of each 16-key tile, for its row;
             // two chains over the head, so a product waits on the one before
@@ -913,7 +806,13 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
 #pragma unroll
                 for (int t = 0; t < 4; ++t) {
                     const int key = kv0 + kt * 16 + 4 * quad + t;
-                    const bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    bool seen = row_live && key < chunk_end && key <= key_hi && key >= key_lo;
+                    if constexpr (MASK) {
+                        if (seen && key >= origin) {
+                            const long long bit = row_bits + (key - origin);
+                            seen = (bits[bit / 8] >> (bit % 8)) & 1u;
+                        }
+                    }
                     s[kt][t] = seen ? s[kt][t] * p.scale_log2 : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -972,6 +871,16 @@ __global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
     if (quad == 0 && p.lse != nullptr) p.lse[row * p.num_qo_heads + head] = l > 0.f ? m + log2f(l) : neg_inf();
 }
 
+template <int D, bool HND, bool CAUSAL, bool FP8>
+__global__ __launch_bounds__(512) void paged_prefill_wide(const Paged p) {
+    paged_prefill_wide_body<D, HND, CAUSAL, false, FP8>(p, PrefillMask{});
+}
+
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_wide_masked(const Paged p, const PrefillMask mask) {
+    paged_prefill_wide_body<D, HND, false, true, false>(p, mask);
+}
+
 // MFMA flash attention for heads up to 256, the wide kernel's products with
 // the page table in LDS, the next tile read into registers across an
 // LDS-only barrier (`lds_barrier`), and K / Vᵀ rows padded 8 bytes for the
@@ -988,8 +897,20 @@ constexpr int kSelTokens = 16;
 constexpr int kSelBlocks = 2048;
 constexpr int kSelWords = kSelBlocks / 32;
 
-template <int D, bool HND, bool CAUSAL, bool SEL, bool FP8>
-__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel) {
+
+// The narrow prefill's tiles in LDS (K, Vᵀ, the page table), one allocation
+// a head width: every body of a width shares it (the masked prefill runs the
+// unmasked body or the masked one in the same kernel).
+template <int D>
+__device__ __forceinline__ unsigned char* prefill_lds() {
+    constexpr int BC = 32, KPAD = D + 4, VPAD = BC + 4, TABLE = 512;
+    __shared__ alignas(16) unsigned char lds[(BC * KPAD + D * VPAD) * sizeof(bf16) + TABLE * sizeof(i32)];
+    return lds;
+}
+
+template <int D, bool HND, bool CAUSAL, bool SEL, bool MASK, bool FP8>
+__device__ __forceinline__ void paged_prefill_body(const Paged& p, const PrefillSel& sel,
+                                                   const PrefillMask& mask) {
     using KV = Kv<FP8>;
     constexpr int BC = 32, KT = BC / 16, KP = D / 32, DT = D / 16;
     constexpr int KPAD = D + 4, VPAD = BC + 4;
@@ -999,15 +920,17 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     // (t%16)·D/16) and, for the first 4·D threads, two V reads (keys 2(t%16)
     // and +1, columns 8·(t/16)).
     constexpr int KR = BC * D / 8 / THREADS;
-    __shared__ alignas(16) bf16 ks[BC * KPAD];
-    __shared__ alignas(16) bf16 vt[D * VPAD];
-    __shared__ i32 table[TABLE];
+    bf16* const ks = reinterpret_cast<bf16*>(prefill_lds<D>());
+    bf16* const vt = ks + BC * KPAD;
+    i32* const table = reinterpret_cast<i32*>(vt + D * VPAD);
+    static_assert((BC * KPAD * sizeof(bf16)) % 16 == 0 && (D * VPAD * sizeof(bf16)) % 16 == 0,
+                  "each tile on a 16-byte bound");
 
     // Causal tiles grow with their position: the last of a request walks the
     // most keys, so the grid starts there and the short ones fill the tail.
     int bx, kv_head;
-    prefill_item(CAUSAL, bx, kv_head);
-    if (p.block_valid != nullptr && p.block_valid[bx] == 0) return;
+    prefill_item(p, CAUSAL, bx, kv_head);
+    if (bx < 0 || (p.block_valid != nullptr && p.block_valid[bx] == 0)) return;
     const int G = p.num_qo_heads / p.num_kv_heads;
     const int req = p.request_indices[bx];
     const int qo_tile = p.qo_tile_indices[bx];
@@ -1017,11 +940,21 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
     const int kv_len = kv_length(p, req);
     const int chunk = *p.kv_chunk_size;
     const int wl = p.window_left >= 0 ? p.window_left : kv_len;
+    // A masked request is cut at each row's position unless its word is wide.
+    int origin = 0;
+    bool causal = CAUSAL;
+    const u8* bits = nullptr;
+    if constexpr (MASK) {
+        const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+        origin = static_cast<int>(word & 0x7fffffffu);
+        causal = (word >> 31) == 0;
+        bits = mask.bits + mask.indptr[req];
+    }
 
     const int kv_start = max(0, kv_len + (qo_tile * kPrefillTileQ) / G - qo_len - wl);
     const int chunk_start = p.partition ? min(kv_tile * chunk + kv_start, kv_len) : kv_start;
     int chunk_end = p.partition ? min((kv_tile + 1) * chunk + kv_start, kv_len) : kv_len;
-    if (CAUSAL) {
+    if (causal) {
         const int last_token = min(qo_len, ((qo_tile + 1) * kPrefillTileQ + G - 1) / G) - 1;
         chunk_end = min(chunk_end, kv_len - qo_len + last_token + 1);
     }
@@ -1045,7 +978,9 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 #pragma unroll
     for (int s = 0; s < DT; ++s) o[s] = mfma_zero();
     float m = neg_inf(), l = 0.f;
-    const int key_hi = CAUSAL ? kv_len - qo_len + token : kv_len - 1;
+    const int key_hi = causal ? kv_len - qo_len + token : kv_len - 1;
+    // This row's bits of the buffer: key j's at row_bits + (j − origin).
+    const long long row_bits = static_cast<long long>(token) * (kv_len - origin);
     const int key_lo = kv_len - qo_len + token - wl;
 
     // The tile's tokens' selected blocks, and how many blocks each pools.
@@ -1146,6 +1081,12 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
                         const int b = key / sel.ratio;
                         seen = seen && (b >= sel_blocks[sel_row] || ((sel_bits[sel_row][b / 32] >> (b % 32)) & 1u));
                     }
+                    if constexpr (MASK) {
+                        if (seen && key >= origin) {
+                            const long long bit = row_bits + (key - origin);
+                            seen = (bits[bit / 8] >> (bit % 8)) & 1u;
+                        }
+                    }
                     s[kt][t] = seen ? rel.score(s[kt][t], key) : neg_inf();
                     tile_max = fmaxf(tile_max, s[kt][t]);
                 }
@@ -1203,12 +1144,48 @@ __device__ __forceinline__ void paged_prefill_body(const Paged& p, const Prefill
 
 template <int D, bool HND, bool CAUSAL, bool FP8>
 __global__ __launch_bounds__(512) void paged_prefill(const Paged p) {
-    paged_prefill_body<D, HND, CAUSAL, false, FP8>(p, PrefillSel{});
+    paged_prefill_body<D, HND, CAUSAL, false, false, FP8>(p, PrefillSel{}, PrefillMask{});
 }
 
 template <int D, bool HND>
 __global__ __launch_bounds__(512) void paged_prefill_selected(const Paged p, const PrefillSel sel) {
-    paged_prefill_body<D, HND, true, true, false>(p, sel);
+    paged_prefill_body<D, HND, true, true, false, false>(p, sel, PrefillMask{});
+}
+
+// Whether this block's request, in a causal masked prefill, reads no bit:
+// its word not wide and its boundary at or past its keys. Its keys and cut
+// are then the unmasked causal prefill's. A word table the fire did not
+// bind reads as masked (origin 0, wide), as the masked body reads it.
+__device__ __forceinline__ bool prefill_reads_no_bit(const Paged& p, const PrefillMask& mask) {
+    int bx, kv_head;
+    prefill_item(p, true, bx, kv_head);
+    if (bx < 0 || (p.block_valid != nullptr && p.block_valid[bx] == 0)) return false;
+    const int req = p.request_indices[bx];
+    const u32 word = mask.origin != nullptr ? mask.origin[req] : 0x80000000u;
+    return (word >> 31) == 0 && static_cast<int>(word & 0x7fffffffu) >= kv_length(p, req);
+}
+
+// A causal masked prefill is two launches over the same grid, each block
+// taken by exactly one: this one runs the requests that read no bit on the
+// unmasked body alone (its registers, so its residency), and
+// `paged_prefill_masked` the rest. Which one runs a request is its word,
+// staged each fire, so a replayed body chooses by the fire it serves.
+template <int D, bool HND>
+__global__ __launch_bounds__(512) void paged_prefill_unmasked_of(const Paged p, const PrefillMask mask) {
+    if (!prefill_reads_no_bit(p, mask)) return;
+    paged_prefill_body<D, HND, true, false, false, false>(p, PrefillSel{}, PrefillMask{});
+}
+
+// `CAUSAL`: the plan's (as the unmasked prefill's): its block order, the
+// causal tiles' longest first. Each request is still cut at its rows'
+// positions, or not, by its mask word's wide bit. A causal one leaves the
+// requests that read no bit to `paged_prefill_unmasked_of`.
+template <int D, bool HND, bool CAUSAL>
+__global__ __launch_bounds__(512) void paged_prefill_masked(const Paged p, const PrefillMask mask) {
+    if constexpr (CAUSAL) {
+        if (prefill_reads_no_bit(p, mask)) return;
+    }
+    paged_prefill_body<D, HND, CAUSAL, false, true, false>(p, PrefillSel{}, mask);
 }
 
 // ----------------------------------------------------------------- merge --

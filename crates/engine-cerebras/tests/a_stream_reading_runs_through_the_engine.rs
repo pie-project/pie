@@ -248,6 +248,7 @@ fn run_loop(
             residency: Residency::default(),
             ordinal: 0,
             frames_in_flight: 1,
+            steps: Default::default(),
         })
         .expect("flux2-mini loads on the cerebras engine");
     common::guest::loop_on(&mut engine, &loaded.caps, steps, &common::context())

@@ -22,11 +22,9 @@ listen = "127.0.0.1:$port"
 [model]
 name = "default"
 source = "Qwen/Qwen3.5-0.8B"
-device_memory_share = 0.85
 [engine]
 type = "cuda"
 device = ["cuda:0"]
-activation_dtype = "bfloat16"
 [sandbox]
 allow_fs = false
 allow_network = true

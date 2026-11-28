@@ -140,7 +140,7 @@ fn conv1d_update(
                 [(channels / CONV_VEC).div_ceil(CONV_BLOCK), n, 1],
                 [CONV_BLOCK, 1, 1],
             )
-            .programmatic(ctx.tuning().pdl),
+            .programmatic(ctx.tuning().pdl()),
         )
     } else {
         args.push(dil.arg());
@@ -246,7 +246,7 @@ fn conv1d_chunked(
         && [x.data.ptr, y.ptr, weight.ptr, state.conv_slab.ptr]
             .iter()
             .all(|&at| aligned16(at));
-    let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4 {
+    let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4() {
         (
             format!("::pie::ssm::conv1d_chunked_row_tile_vec4{}", out.args()),
             Launch::grid(
@@ -357,4 +357,176 @@ fn conv1d_chunked(
             stated(op, lanes)?.arg(),
         ],
     )
+}
+
+/// The causal conv's decode step over each lane's carried rows then its own
+/// ([`Carry`]): `conv1d_update`'s sums a row, the own row's window from the
+/// committed cells and at most `conv_width - 1` carried rows, the window
+/// stored at the lane's commit length; the own row's input lands in the
+/// lane's buffer (plane 0), and its output's channels `keys` (offset,
+/// count: the channels its recurrence reads its buffered rows by) in plane
+/// 1.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_carried(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    bias: Option<Tensor>,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    carry: &Carry,
+    keys: Option<(u32, u32)>,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d";
+    conv1d_carried(
+        ctx,
+        OP,
+        x,
+        weight,
+        bias,
+        state,
+        conv_width,
+        dilation,
+        y,
+        ConvOut::Silu,
+        carry,
+        keys,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv1d_carried(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    weight: Tensor,
+    bias: Option<Tensor>,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    out: ConvOut,
+    carry: &Carry,
+    keys: Option<(u32, u32)>,
+) -> Result<(), Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    let (channels, c, k) = conv_extents(op, x, y, conv_width)?;
+    let dil = stated(op, nonzero(op, "the conv's dilation", dilation)?)?;
+    let n = nonzero(op, "rows", x.rows)?;
+    if conv_width > CONV_K_MAX {
+        return Err(refuse(
+            op,
+            format!("a {conv_width}-tap conv, past the {CONV_K_MAX} taps the step sums"),
+        ));
+    }
+    seated(op, state, "conv1d_carried", true, false, false)?;
+    let rows = state.rows(op, state.conv_slab, state.conv_stride, channels)?;
+    let vectors = channels % CONV_VEC == 0
+        && dilation == 1
+        && conv_width == 4
+        && rows.keeps(i64::from(CONV_VEC))
+        && rows.atoms().is_multiple_of(CONV_VEC)
+        && aligned16(x.ptr)
+        && aligned16(y.ptr)
+        && aligned16(weight.ptr)
+        && bias.is_none_or(|b| aligned16(b.ptr))
+        && aligned16(state.conv_slab.ptr)
+        && carry.plane_off.iter().all(|off| off.is_multiple_of(16))
+        && carry
+            .plane_stride
+            .iter()
+            .all(|stride| stride.is_multiple_of(16))
+        && keys.is_none_or(|(off, len)| off % CONV_VEC == 0 && len % CONV_VEC == 0);
+    let mut args = vec![
+        x.arg(),
+        weight.arg(),
+        bias.map_or(ArgValue::ABSENT, |b| b.arg()),
+        rows.arg(),
+        y.arg(),
+        stated(op, n)?.arg(),
+        c.arg(),
+        k.arg(),
+    ];
+    let (entrypoint, launch) = if vectors {
+        (
+            format!("::pie::ssm::conv1d_carried_vec8{}", out.args()),
+            Launch::grid(
+                [(channels / CONV_VEC).div_ceil(CONV_BLOCK), n, 1],
+                [CONV_BLOCK, 1, 1],
+            )
+            .programmatic(ctx.tuning().pdl()),
+        )
+    } else {
+        args.push(dil.arg());
+        (
+            format!("::pie::ssm::conv1d_carried{}", out.args()),
+            Launch::grid([channels.div_ceil(BLOCK), n, 1], [BLOCK, 1, 1]),
+        )
+    };
+    args.extend([
+        state.write_state.arg(),
+        state.write_state_mask.arg(),
+        carry.arg(),
+        stated(op, keys.map_or(0, |(off, _)| off))?.arg(),
+        stated(op, keys.map_or(0, |(_, len)| len))?.arg(),
+        ctx.stage(),
+    ]);
+    ctx.fire(
+        op,
+        Fire::at(kernel(CONV1D, &entrypoint)).apply(launch),
+        &args,
+    )
+}
+
+/// Folds each beam group's fold rows (plane 0 of
+/// `carry`: the rows' conv inputs, through the group's representative lane's
+/// pages) into its conv window: the window stored as it stands after them.
+/// The groups that fold lead `folds` (`groups` entries at most, the first of
+/// no rows ending them); a block folds each in turn, so a fire none of whose
+/// groups folds costs one read a block.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_fold(
+    ctx: &Ctx,
+    state: &RecurrentPool,
+    channels: u32,
+    conv_width: u32,
+    dilation: u32,
+    carry: &Carry,
+    folds: Tensor,
+    groups: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d group fold";
+    const BLOCK: u32 = 256;
+    if groups == 0 {
+        return Ok(());
+    }
+    let span = conv_width
+        .checked_sub(1)
+        .and_then(|k| k.checked_mul(dilation))
+        .and_then(|cells| cells.checked_add(1))
+        .unwrap_or(u32::MAX);
+    let channels = nonzero(OP, "the conv's channel count", channels)?;
+    let rows = state.rows(OP, state.conv_slab, state.conv_stride, channels)?;
+    ctx.fire(
+        OP,
+        Fire::at(fold_kernel()).apply(Launch::grid(
+            [channels.div_ceil(BLOCK), 1, 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            rows.arg(),
+            stated(OP, channels)?.arg(),
+            stated(OP, span)?.arg(),
+            carry.arg(),
+            folds.arg(),
+            stated(OP, groups)?.arg(),
+        ],
+    )
+}
+
+/// The conv window's group fold kernel ([`conv1d_fold`]).
+pub(super) fn fold_kernel() -> &'static crate::jit::Kernel {
+    kernel(CONV1D, "::pie::ssm::conv1d_fold<::pie::bf16>")
 }

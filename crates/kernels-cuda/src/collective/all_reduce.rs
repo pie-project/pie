@@ -143,13 +143,18 @@ fn copy(ctx: &Ctx, op: &'static str, dst: u64, src: u64, bytes: u64) -> Result<(
         // stays inside the stage `Ctx::with_peers` vouched for; `src` is a
         // range of the caller's tensor.
         let code = unsafe {
-            rt::cudaMemcpyAsync(
-                dst as usize as *mut core::ffi::c_void,
-                src as usize as *const core::ffi::c_void,
-                bytes as usize,
-                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
-                ctx.stream().cast(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) moves nothing.
+                rt::cudaError::cudaSuccess
+            } else {
+                rt::cudaMemcpyAsync(
+                    dst as usize as *mut core::ffi::c_void,
+                    src as usize as *const core::ffi::c_void,
+                    bytes as usize,
+                    rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                    ctx.stream().cast(),
+                )
+            }
         };
         if code != rt::cudaError::cudaSuccess {
             return Err(refuse(
@@ -190,15 +195,20 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
         // for and the stream is `ctx`'s. The reduce is in place over the
         // `count` elements of `buf`, a device allocation the caller owns.
         let code = unsafe {
-            nccl::ncclAllReduce(
-                send,
-                send.cast_mut(),
-                count,
-                dtype,
-                nccl::ncclRedOp_t::ncclSum,
-                comm.cast(),
-                ctx.stream().cast(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                nccl::ncclResult_t::ncclSuccess
+            } else {
+                nccl::ncclAllReduce(
+                    send,
+                    send.cast_mut(),
+                    count,
+                    dtype,
+                    nccl::ncclRedOp_t::ncclSum,
+                    comm.cast(),
+                    ctx.stream().cast(),
+                )
+            }
         };
         answered(OP, "ncclAllReduce", code)
     }
@@ -242,14 +252,19 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             // `count * world` into `y`; that `y` is that large is the
             // caller's to keep beyond the assertion above, which holds it to whole shards.
             let code = unsafe {
-                nccl::ncclAllGather(
-                    send,
-                    y.ptr as usize as *mut core::ffi::c_void,
-                    count,
-                    dtype,
-                    comm.cast(),
-                    ctx.stream().cast(),
-                )
+                if crate::sizing::active() {
+                    // A size-only walk (`crate::sizing`) runs no collective.
+                    nccl::ncclResult_t::ncclSuccess
+                } else {
+                    nccl::ncclAllGather(
+                        send,
+                        y.ptr as usize as *mut core::ffi::c_void,
+                        count,
+                        dtype,
+                        comm.cast(),
+                        ctx.stream().cast(),
+                    )
+                }
             };
             return answered(OP, "ncclAllGather", code);
         }
@@ -267,7 +282,12 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         // `y.elements()` elements, which is `count * world` by the
         // division above; `send` is `x`'s `count` elements.
         let code = unsafe {
-            nccl::ncclAllGather(send, stage, count, dtype, comm.cast(), ctx.stream().cast())
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                nccl::ncclResult_t::ncclSuccess
+            } else {
+                nccl::ncclAllGather(send, stage, count, dtype, comm.cast(), ctx.stream().cast())
+            }
         };
         answered(OP, "ncclAllGather", code)?;
         crate::gather::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
@@ -288,10 +308,24 @@ pub fn grouped<R>(op: &'static str, body: impl FnOnce() -> Result<R, Error>) -> 
 
         // SAFETY: takes no arguments; it opens a group on this thread that
         // the `ncclGroupEnd` below closes whatever `body` returns.
-        answered(op, "ncclGroupStart", unsafe { nccl::ncclGroupStart() })?;
+        answered(op, "ncclGroupStart", unsafe {
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                nccl::ncclResult_t::ncclSuccess
+            } else {
+                nccl::ncclGroupStart()
+            }
+        })?;
         let ran = body();
         // SAFETY: closes the group opened above, on the same thread.
-        let ended = answered(op, "ncclGroupEnd", unsafe { nccl::ncclGroupEnd() });
+        let ended = answered(op, "ncclGroupEnd", unsafe {
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                nccl::ncclResult_t::ncclSuccess
+            } else {
+                nccl::ncclGroupEnd()
+            }
+        });
         let out = ran?;
         ended?;
         Ok(out)
@@ -338,15 +372,20 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
         // that many is the caller's to keep beyond the assertion above,
         // which holds it to whole shards.
         let code = unsafe {
-            nccl::ncclReduceScatter(
-                x.ptr as usize as *const core::ffi::c_void,
-                recv.cast_mut(),
-                count,
-                dtype,
-                nccl::ncclRedOp_t::ncclSum,
-                comm.cast(),
-                ctx.stream().cast(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) runs no collective.
+                nccl::ncclResult_t::ncclSuccess
+            } else {
+                nccl::ncclReduceScatter(
+                    x.ptr as usize as *const core::ffi::c_void,
+                    recv.cast_mut(),
+                    count,
+                    dtype,
+                    nccl::ncclRedOp_t::ncclSum,
+                    comm.cast(),
+                    ctx.stream().cast(),
+                )
+            }
         };
         answered(OP, "ncclReduceScatter", code)
     }

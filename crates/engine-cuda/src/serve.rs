@@ -3,16 +3,31 @@ mod boot;
 pub(crate) mod btrace;
 pub mod diag;
 mod enqueue;
+pub(crate) mod landing;
 mod lanes;
 mod load;
+mod measured;
+
+/// The bodies records under `cache_dir` this build made, copied into
+/// `out`'s `bodies/` for a build to carry (`pie tune export --engine cuda`).
+pub fn export_bodies(
+    cache_dir: &std::path::Path,
+    out: &std::path::Path,
+) -> std::io::Result<Vec<String>> {
+    measured::export(cache_dir, out)
+}
 pub use load::Staged;
+pub(crate) mod pages;
 mod prepare;
+mod ring;
+#[doc(hidden)]
+pub mod ring_table;
 mod segments;
 mod settle;
 mod stats;
 
 pub use arming::{Armed, Kind, Seal};
-pub use boot::{Boot, DEFAULT_BODIES_MEGABYTES, Golden, Graphs, Knobs, Recording};
+pub use boot::{Boot, EveryRung, Golden, Graphs, Knobs, QueueMasks, Recording, WeightPin};
 pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
@@ -53,10 +68,33 @@ use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
-use enqueue::{GuestBatch, Owed, Reap, reap_guest_fires};
+use enqueue::{GuestBatch, GuestFault, Owed, Reap, reap_guest_fires};
 use segments::Segmented;
 
+/// What a load's windowed fires have done ([`Shell::ring_seen`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingSeen {
+    /// Fires' own pages written on their ring directly.
+    pub direct: u64,
+    /// Own-row pages taken.
+    pub own: u64,
+    /// Ring pages a fire both read and then folded rows onto.
+    pub read_then_folded: u64,
+    /// Snapshots of a lane's rings landed inside its fire.
+    pub snapshots: u64,
+}
+
 pub struct Shell {
+    /// The rungs the load weighed its top by and the estimate it weighed
+    /// them with (`None` where the profile states no rates).
+    weighed: Option<crate::top::Weighed>,
+    /// The table a windowed fire's ring runs go out over; `None` where the
+    /// load keeps no ring (`serve::ring_table`).
+    ring_runs: Option<ring_table::RingTable>,
+    /// What the windowed fires served have done since load: pages they
+    /// wrote on their rings directly, own-row pages they took, and the ring
+    /// pages they folded onto that their own reads had read.
+    ring_seen: RingSeen,
     device: Context,
     accounting: crate::store::Accounting,
     trace: Trace,
@@ -85,15 +123,22 @@ pub struct Shell {
     inputs: Inputs,
     facts: kv::Facts,
     page_tables: usize,
+    /// The classes a lane may state a mask on (`exports::masked_classes`).
     masked: poem_ir::ClassSet,
+    /// The classes whose attention reads the fire's masks: a fire carrying
+    /// one stages every lane's entry, a mask or none.
+    mask_read: poem_ir::ClassSet,
+    /// The classes a stated mask reaches as a group's (a ragged attention):
+    /// a lane there states one or none.
+    group_masked: poem_ir::ClassSet,
+    /// The ragged packings an attention stating a mask reads, a fire's
+    /// group masks staged in their order (`exports::stated_feeds`).
+    stated_feeds: Vec<(poem_ir::Selection, poem_ir::Selection)>,
     wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
     tiers: record::Tiers,
-    /// The class words of a drafter's classes (`Shell::drafts_only`); none
-    /// on a model without a drafter.
-    drafting_words: std::collections::HashSet<u64>,
     landing: Vec<Vec<poem_ir::Request>>,
     armed: Option<Armed>,
     media: poem_ir::ClassSet,
@@ -104,34 +149,67 @@ pub struct Shell {
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
     adapter_fact: Option<u32>,
+    /// The classes only adapted requests land in (`exports::adapted_of`): a
+    /// fire with a lane of one is stated eager at load.
+    eager_classes: poem_ir::ClassSet,
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
+    /// Where a fire's capturing lanes write their readers' rows: `None`
+    /// where the trace captures none (`crate::scores`).
+    capture: Option<crate::scores::CaptureLayout>,
+    /// The run a fire stages a host-resident bank's experts in, bounded at
+    /// load and laid with the staged inputs (`experts::staging`).
+    expert_staging: crate::experts::staging::Staging,
+    /// Where it lies once laid; `None` where the load stages none.
+    expert_staged: Option<crate::experts::staging::Staged>,
     exports: Exports,
     graphs: Graphs,
     copies: bool,
-    /// `engine.seated_first`.
-    seated_first: bool,
-    /// `engine.seat_to_end`.
-    seat_to_end: bool,
-    /// `engine.seat_spread`.
-    seat_spread: bool,
     /// `engine.prefill_lanes`.
     prefill_lanes: u32,
     /// `engine.fire_lanes` (`Shell::fire_lanes`).
     fire_lanes: u32,
-    /// The default lattice's `(steps, prefill_from, prefill_steps)` where no
-    /// buckets were stated: what arming coarsens to fit the bodies' allowance
-    /// (`Shell::fit_lattice`).
-    lattice: Option<(u32, u32, u32)>,
     pad: bool,
     bodies: bool,
     bodies_mem: usize,
-    /// The bodies' allowance is the operator's: a hard cap, never stretched.
-    bodies_stated: bool,
-    /// The most the allowance may stretch to while arming: what the fit
-    /// before arming held the bodies ([`crate::store::Pools::fit_the_card`]).
-    bodies_ceiling: usize,
+    /// Where this deployment's measured bodies are recorded
+    /// ([`measured`]), once every rung arms; none without a cache dir.
+    bodies_record: Option<std::path::PathBuf>,
+    /// The bodies' allowance is a record's figure, not the configured
+    /// ceiling: a load that then arms short of whole drops the record.
+    bodies_from_record: bool,
+    /// The load's own arming is under way: its pool is not backed yet.
+    arming_at_load: bool,
+    /// A re-arm within the load is under way, allowed what the load's own
+    /// arming took ([`Shell::rearm_bodies`]).
+    rearming: bool,
+    /// An arming narrowed to one bucket's targets (`Shell::rearm_bucket`).
+    arm_only: Option<u32>,
+    /// The kernels each composition launches, as the size-only walk passed
+    /// over them (`Shell::size_arming`), by its bucket and composition: the
+    /// order arming takes within one row count (`lattice_targets`).
+    walked_launches: std::collections::HashMap<(u32, String), u64>,
+    /// The step compositions the runtime's builder forms over this load,
+    /// computed from the load request's rules before
+    /// arming: what the arm walk takes its targets from, in its order.
+    steps: engine::StepShapes,
+    /// What the last whole arming recorded, by treatment and bucket:
+    /// whether every body of the compositions it walked there is held.
+    /// What the load states eager is read from it ([`Shell::stated_steps`]).
+    walked: std::collections::HashMap<(engine::Treatment, u32), bool>,
+    /// What the last arming's captures took, which a re-arm within the
+    /// same load is allowed.
+    bodies_took: u64,
+    /// A load on a flat range with no record of what its bodies take: it
+    /// arms over the least range that serves, measures, and fits the range
+    /// again to what arming took ([`super::serve::Staged::finish`]).
+    measuring: bool,
+    /// The kernels' workspaces in the activation's span, once a load has
+    /// walked what its fires take.
+    workspace: Option<load::Workspace>,
+    /// Where the staged inputs' slab starts in the activation's span.
+    inputs_at: u64,
     decoded_tiles: Vec<u64>,
     arming: bool,
     golden_arm: Golden,
@@ -142,10 +220,44 @@ pub struct Shell {
     /// How the arming fire's lanes treat their recurrent rows: a buffering
     /// treatment is recorded with lanes that land and replay nothing.
     arm_rs: record::RsBody,
+    /// The device's bytes and those in use before this load began: what
+    /// the load's ledger is read against.
+    card: (u64, u64),
+    /// What every fit of this load holds for the guests' programs
+    /// (`Pools::fit_the_card`): the fit a load that arms at its starting
+    /// weight residency settles there holds what the load's fits held.
+    held_for_fires: u64,
+    /// What the runtime reads of this shell while it serves: the fires it
+    /// counts.
+    live: engine::live::Live,
     /// The lattice waits for the starting weight residency: the load
     /// streams its weights, and bodies armed over the host copy would read
-    /// every expert over the bus (`Staged::finish`).
+    /// every expert over the bus (`Staged::finish`). It arms at the
+    /// starting residency the runtime sends at bootstrap, before ready,
+    /// and settles its fit there ([`Shell::settle_fit`]): what the load's
+    /// last fit held back for bodies still to arm is the cache rows' from
+    /// then on, and the residency answers what is still held. A later flip
+    /// never arms once lanes name slot refs (it is refused by name, or the
+    /// bodies stay as recorded).
     arm_deferred: bool,
+    /// How the load seated its weights ahead of the runtime's first
+    /// residency (`filed`, `copied`; `Shell::preseat_weights`), for a
+    /// measuring load that seats them again in a range reserved anew.
+    preseated_as: Option<(bool, bool)>,
+    /// What this load's stored measurements are keyed by.
+    keys: crate::stored::Keys,
+    /// The decode products' times the profile states under a matching key:
+    /// a load's measurement joins them before it is saved.
+    products: Vec<profile::rates::ProductTime>,
+    /// Whether the load times the decode products' kernels no layer states
+    /// (`[engine] measure`).
+    routes_measuring: engine::rates::Measuring,
+    /// What this load timed, each by name (`engine::Engine::measured_at_load`):
+    /// the device's rates where no layer stated them, the decode products'
+    /// times (`[rates] product_ns`) where the profile held none, and the
+    /// bodies where no record held what they take. Empty: it measured
+    /// nothing.
+    measured: Vec<String>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
     windows_memo: Vec<prepare::WindowsMemo>,
     cache: GraphCache,
@@ -161,11 +273,17 @@ pub struct Shell {
     tap_sink: Option<engine::TapSink>,
     airborne: crate::settle::Airborne,
     owed: Owed,
+    /// The guest passes of the step under way that faulted their lanes.
+    guest_faults: Vec<GuestFault>,
     /// Landed events of reaped batches, for the next to record.
     spare_events: Vec<crate::device::graph::Event>,
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
+    /// Each set's written end as far as the fires admitted carried it,
+    /// ahead of what the runtime states until they settle
+    /// (`engine::extent`).
+    written: engine::extent::Written,
     /// Last, so it drops after everything else the shell holds.
     _released: Released,
 }
@@ -195,6 +313,17 @@ pub(crate) struct KvReport {
     pub(crate) offsets: Vec<u32>,
     pub(crate) fold: Option<u32>,
     pub(crate) fold_at: Option<u64>,
+    /// One past the last slot the lane's rows landed at, in the set's own
+    /// slot numbering, for a lane whose rows land where the device says.
+    pub(crate) end: Option<u32>,
+}
+
+impl Shell {
+    /// What this load timed, each by name: empty where it measured nothing.
+    #[must_use]
+    pub fn measured_at_load(&self) -> &[String] {
+        &self.measured
+    }
 }
 
 impl Shell {
@@ -312,6 +441,7 @@ impl Shell {
                     attachments: &[],
                     media: &[],
                     voxels: &[],
+                    shape: None,
                 },
                 None,
             )?;
@@ -381,27 +511,6 @@ impl Shell {
         self.tap_sink = Some(sink);
     }
 
-    /// Whether this load asks the planner to serve a decoding lane's pages
-    /// before a prompt waiting to be seated (`engine.seated_first`).
-    #[must_use]
-    pub fn seated_first(&self) -> bool {
-        self.seated_first
-    }
-
-    /// Whether this load asks the planner to start a process only while the
-    /// pools hold the started ones to the end (`engine.seat_to_end`).
-    #[must_use]
-    pub fn seat_to_end(&self) -> bool {
-        self.seat_to_end
-    }
-
-    /// Whether this load asks the planner to spread the starts the pools do
-    /// not hold to the end at once over a life (`engine.seat_spread`).
-    #[must_use]
-    pub fn seat_spread(&self) -> bool {
-        self.seat_spread
-    }
-
     #[must_use]
     pub fn buffer_pages(&self) -> u32 {
         0
@@ -440,6 +549,12 @@ impl Shell {
     /// what expert parallelism seats its buffers by.
     pub fn drop_rungs(&mut self) {
         self.arena.drop_rungs();
+    }
+
+    /// See [`crate::store::Pools::keep_contiguous`]: before the load's
+    /// last fit.
+    pub fn keep_contiguous(&mut self) {
+        self.pools.keep_contiguous();
     }
 
     /// Backs every page the pools declare ([`crate::store::Pools::back_whole`]).
@@ -487,8 +602,10 @@ impl Shell {
     /// ([`Self::seat_host_kv`]).
     pub const HOST_POOLS: u64 = 4;
 
-    /// Seats this rank's host tier (CONTRACT-BC 22), pinned as it is first
-    /// used, from `stated` bytes shared by `ranks`, within the host memory
+    /// Seats this rank's host tier, committed as it is
+    /// first used, behind the staging `ring` the load pinned before it
+    /// measured the device ([`crate::store::staging_ring_for`]; `None` seats
+    /// no tier), from `stated` bytes shared by `ranks`, within the host memory
     /// the load left: whole chunks of the state pool's size, every shape's
     /// slots parking in them, and as many host kv slots for byte reads
     /// ([`Self::read_host_kv`], a tap's read-out). Unstated, it holds `seats`
@@ -500,6 +617,7 @@ impl Shell {
         seats: u32,
         context: u32,
         ranks: u32,
+        ring: Option<crate::store::Ring>,
     ) -> Result<u32> {
         let ranks = u64::from(ranks.max(1));
         let row = self.state_row_bytes();
@@ -539,47 +657,112 @@ impl Shell {
         // shelf a load does not move through costs nothing.
         self.pools
             .seat_host(u32::try_from(budget.checked_div(page).unwrap_or(0)).unwrap_or(u32::MAX));
-        self.pools.seat_tier(budget, whole)?;
+        self.pools.seat_tier(budget, ring)?;
         Ok(self.pools.host_pages())
     }
-    /// Opens this rank's share of `budget` disk kv bytes under `dir`.
-    /// Seats this rank's disk tier; `persistent` keeps its slot file for the
-    /// next run. Answers the pages it holds.
+    /// Seats this rank's share of `budget` disk bytes under `dir`: disk
+    /// chunks of a pool chunk each, any state shape's slots in any chunk,
+    /// laid out as the device's, the division stated at
+    /// load. `persistent` keeps its slot file for the next run. Answers
+    /// the disk chunks it holds.
     pub fn seat_disk_kv(
         &mut self,
         budget: Option<u64>,
         dir: Option<&std::path::Path>,
         persistent: bool,
+        seats: u32,
+        context: u32,
         world: crate::World,
     ) -> Result<u32> {
         let ranks = u64::from(world.size.max(1));
         let keep =
             persistent.then(|| format!("{} rank {}/{}", self.trace().name, world.rank, ranks));
         let keep = keep.as_deref();
-        match (budget, dir) {
-            (Some(0), _) | (_, None) => {}
+        let stated = match (budget, dir) {
+            (Some(0), _) | (_, None) => None,
             (Some(bytes), Some(dir)) => {
                 self.pools.seat_disk(dir, world.rank, bytes / ranks, keep)?;
+                Some(bytes / ranks)
             }
             (None, Some(dir)) => {
                 // What kept files take already is theirs again, so a restart
                 // sizes the tier as the run that wrote it did.
                 let kept: u64 = if persistent {
-                    (0..ranks)
-                        .map(|rank| engine::disk::kept_bytes(dir, &format!("r{rank}.kv")))
+                    (0..world.size.max(1))
+                        .map(|rank| engine::disk::kept_bytes(dir, &crate::store::disk_file(rank)))
                         .sum()
                 } else {
                     0
                 };
-                let free = engine::disk::free_space(dir).saturating_add(kept);
-                let host = u64::from(self.pools.host_pages()) * self.pools.paged_page_bytes();
-                let bytes = host.saturating_mul(4).min(free / 4 / ranks);
-                if self.pools.seat_disk(dir, world.rank, bytes, keep).is_err() {
-                    self.pools.unseat_disk();
-                }
+                // Derived on its own ([`engine::disk::derived_budget`]): the
+                // disk chunks `seats` sequences' kv pages at `context` and
+                // their state take, within this rank's share of the free
+                // disk; nothing of the device pool enters it. Never four times the host
+                // tier (a host budget below one chunk seated no disk tier)
+                // nor a quarter of the disk. One that cannot be seated is
+                // refused by name.
+                let room = engine::disk::room(dir);
+                let free = room.for_us().saturating_add(kept);
+                let paging = self.pools.paging();
+                let pages = u64::from(seats)
+                    * u64::from(context).div_ceil(u64::from(paging.page_size.max(1)));
+                let per_chunk = self
+                    .pools
+                    .chunk_layout()
+                    .list
+                    .as_ref()
+                    .map_or(1, |list| u64::from(list.per_chunk.max(1)));
+                let chunk = self.pools.disk_chunk_bytes();
+                let state = (u64::from(seats) * self.state_row_bytes()).div_ceil(chunk.max(1));
+                // The guest state the device can hold live (the room a
+                // guest program binds within): evicted, it has a home.
+                let guest = self.chunk_facts()?.guest_room_bytes();
+                let need = engine::disk::derived_need(
+                    0,
+                    0,
+                    pages.div_ceil(per_chunk) + state,
+                    chunk,
+                    guest,
+                );
+                let bytes = need.min(free / ranks);
+                // Its inputs, stated at load: what the field rules on.
+                tracing::info!(
+                    "the unstated disk tier: {bytes} bytes of a derived need of \
+                     {need} bytes ({seats} seats x {context} tokens: {pages} kv pages in {} \
+                     chunks and {state} chunks of state ({} B a seat), and {guest} B of guest \
+                     state the device holds live, chunks of {chunk} B), within {} bytes a rank \
+                     of {} under {}: {room}{}",
+                    pages.div_ceil(per_chunk),
+                    self.state_row_bytes(),
+                    free / ranks,
+                    free,
+                    dir.display(),
+                    if kept > 0 {
+                        format!(", and the {kept} bytes its kept files take")
+                    } else {
+                        String::new()
+                    },
+                );
+                self.pools.seat_disk(dir, world.rank, bytes, keep)?;
+                Some(bytes)
             }
+        };
+        let chunks = self.pools.disk_chunks();
+        if let (Some(budget), true) = (stated, chunks > 0) {
+            let division = self
+                .pools
+                .disk_division()
+                .iter()
+                .map(|(id, per, bytes)| format!("shape {id}: {per} slots of {bytes} bytes"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            tracing::info!(
+                "the disk tier: {budget} bytes in {chunks} disk chunks of {} bytes, \
+                 each laid out as the device's, any state shape's slots in any chunk ({division})",
+                self.pools.disk_chunk_bytes()
+            );
         }
-        Ok(self.pools.disk_pages())
+        Ok(chunks)
     }
 
     /// The disk tier is kept, and holds what the last run left.
@@ -646,6 +829,37 @@ impl Shell {
         self.pools.state_slot_bytes()
     }
 
+    /// The bytes a record takes, its rings' among them.
+    #[must_use]
+    pub fn record_bytes(&self) -> u64 {
+        self.pools.record_bytes()
+    }
+
+    /// What this load's windowed fires have done since it loaded.
+    #[must_use]
+    pub fn ring_seen(&self) -> RingSeen {
+        self.ring_seen
+    }
+
+    /// The side streams this load's fires fork regions onto.
+    #[must_use]
+    pub fn side_streams(&self) -> usize {
+        self.device.side_streams().len()
+    }
+
+    /// The record a slot ref names (`Pools::record_key`).
+    #[must_use]
+    pub fn record_key(&self, slot: u32) -> u32 {
+        self.pools.record_key(slot)
+    }
+
+    /// The windowed layers the record holds the rings of; none where the
+    /// load serves its windowed rows by window lists.
+    #[must_use]
+    pub fn windowed_layers(&self) -> Vec<engine::chunk::WindowedLayer> {
+        self.pools.windowed_layers()
+    }
+
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
         self.pools.state_bytes(self.device.stream(), slot)
     }
@@ -654,6 +868,30 @@ impl Shell {
     #[must_use]
     pub fn lands_snapshots(&self) -> bool {
         self.predicate.lands_snapshots()
+    }
+
+    /// The snapshots a fire lands inside itself, a lane at most
+    /// (`Capabilities::rs_snapshots`; 0: none). A load of rings alone lands
+    /// its snapshots itself (`serve::ring`); one of recurrent state too, as
+    /// its state lands them. Both the caps and the arm walk's step facts
+    /// read it here.
+    #[must_use]
+    pub fn rs_snapshots(&self) -> u32 {
+        let state_rows = self
+            .trace
+            .caches
+            .iter()
+            .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
+        let lands = if state_rows {
+            self.lands_snapshots()
+        } else {
+            !self.windowed_layers().is_empty()
+        };
+        if lands {
+            crate::store::rs::SNAPSHOTS
+        } else {
+            0
+        }
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -682,10 +920,6 @@ impl Shell {
         crate::device::ctx::sync(self.device.stream())?;
         *torn = false;
         Ok(written)
-    }
-
-    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
-        self.adapters.mount(root);
     }
 
     pub fn bind_adapter(
@@ -757,14 +991,98 @@ impl Shell {
         &mut self,
         registration: &engine::program::ProgramRegistration,
     ) -> Result<engine::ProgramId> {
-        self.programs.register(&self.device, registration)
+        let before = self.programs.built_late();
+        let registered = self.programs.register(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        self.count_built_at_register(late);
+        registered
     }
 
-    pub fn program_compiler(&self) -> Option<engine::ProgramCompiler> {
-        if cfg!(feature = "rocm") {
-            return None;
+    /// Builds the region modules of `registrations` (the runtime's prewarm,
+    /// before ready) and registers none of them.
+    pub fn prewarm_programs(
+        &mut self,
+        registrations: &[engine::program::ProgramRegistration],
+    ) -> Result<()> {
+        self.programs.prewarm(&self.device, registrations)
+    }
+
+    /// `late` guest region modules a registration built that no prewarm
+    /// had: counted, and said, so a knob's value that keys a program (it
+    /// should be data) shows in the log.
+    fn count_built_at_register(&self, late: u64) {
+        if late == 0 {
+            return;
         }
-        self.programs.compiler(&self.device).ok()
+        self.live.tally(engine::live::Tally::BuiltAtRegister, late);
+        let total = self.live.tallied(engine::live::Tally::BuiltAtRegister);
+        tracing::info!(
+            "a program's registration built {late} guest region(s) no prewarm had; \
+             {total} since load (Tally::BuiltAtRegister)"
+        );
+    }
+
+    /// A program's registration, first step ([`crate::program::Plane::prepare`]):
+    /// its build runs off the engine's thread.
+    pub fn prepare_program(
+        &mut self,
+        registration: &engine::program::ProgramRegistration,
+    ) -> Result<crate::program::Pending> {
+        // The regions it plans to build that no prewarm or earlier
+        // registration built: each a module built after ready.
+        let before = self.programs.built_late();
+        let prepared = self.programs.prepare(&self.device, registration);
+        let late = self.programs.built_late() - before;
+        self.count_built_at_register(late);
+        prepared
+    }
+
+    /// A program's registration, last step ([`crate::program::Plane::finish`]).
+    pub fn finish_program(
+        &mut self,
+        pending: crate::program::Pending,
+    ) -> Result<engine::ProgramId> {
+        self.programs.finish(pending)
+    }
+
+    /// Beam `beam`'s page list of instance `id`'s beam group as its last
+    /// fire left it: its state's lists are kept
+    /// twice by the fire count's parity (`channel.hip`), the last fire's at
+    /// `4 + (fired mod 2) * lanes * cap` words, `cap` columns a beam. Every
+    /// fire in flight lands first.
+    pub fn beam_list(&mut self, id: engine::InstanceId, beam: u32) -> Result<Vec<u32>> {
+        let (at, layout) = self.programs.beam_state(id).ok_or_else(|| {
+            crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id} binds no beam group (parents)"),
+            )
+        })?;
+        if beam >= layout.lanes {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("beam {beam} of a group of {}", layout.lanes),
+            ));
+        }
+        self.device.synchronize()?;
+        let mut header = [0u8; 16];
+        crate::device::copy_d2h(at, &mut header)?;
+        let fired = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        if header[0] == 0 {
+            return Err(crate::error::Fault::program(
+                "serve::beam_list",
+                format!("instance {id}'s beam group has fired no step yet"),
+            ));
+        }
+        let (lanes, cap) = (u64::from(layout.lanes), u64::from(layout.cap));
+        let row = (4 + u64::from(fired & 1) * lanes * cap + u64::from(beam) * cap) * 4;
+        let mut bytes = vec![0u8; cap as usize * 4];
+        crate::device::copy_d2h(at + row, &mut bytes)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -777,31 +1095,160 @@ impl Shell {
         device: eta_ir::registry::PortMask,
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[engine::ChannelId],
+        slots: crate::program::Slots,
     ) -> Result<engine::InstanceId> {
-        let reads_scores = self.programs.program(program_id).is_some_and(|program| {
-            program
-                .plan
-                .outputs()
-                .iter()
-                .any(|(name, _)| *name == "attn.scores")
-        });
-        if reads_scores {
-            self.arena.ensure_whole(&mut self.pools)?;
+        // A hybrid's beam group pages its beams' recurrent rows by the same
+        // lists as their kv slots, slot by slot:
+        // the rs page's rows must divide the kv page's. A load whose recipe
+        // does not says so at the bind, before any beam fires.
+        if device.contains(eta_ir::registry::Port::Parents)
+            && let Some(buffers) = self.buffers.as_ref()
+        {
+            let (tokens, page) = (buffers.page_tokens().max(1), self.pools.paging().page_size);
+            if page % tokens != 0 {
+                return Err(crate::error::Fault::program(
+                    "serve::bind",
+                    format!(
+                        "a beam group (parents) on this hybrid pages its beams' recurrent rows \
+                         by their kv page lists, and the load's recipe pages them {tokens} rows a \
+                         page against kv pages of {page}: the rs page's rows must divide the kv \
+                         page's"
+                    ),
+                ));
+            }
         }
         let stream = self.device.stream();
         let buffers_rs = self.buffers.is_some();
+        let pools = &self.pools;
         self.programs.bind(
-            program_id, seeds, extents, geometry, device, buffers_rs, adopted, ids, stream,
+            program_id,
+            seeds,
+            extents,
+            geometry,
+            device,
+            buffers_rs,
+            adopted,
+            ids,
+            slots,
+            &|item, bytes| pools.guest_item(item, bytes),
+            stream,
         )
     }
 
+    /// What `program` bound at `extents` holds as state, as the pool lays
+    /// it: each instance's lane scratch and its pair's tables
+    /// ([`crate::program::Plane::pair_room`]).
+    /// Whether the pair's state is laid again at its next fire
+    /// ([`crate::program::Plane::pair_stale`]). For a test.
+    #[doc(hidden)]
     #[must_use]
-    pub fn program_ticket_disagreement(
+    pub fn pair_stale(
         &self,
-        instance_id: engine::InstanceId,
-        tickets: &[engine::Ticket],
-    ) -> Option<String> {
-        self.programs.disagreeing_ticket(instance_id, tickets)
+        program: engine::ProgramId,
+        extents: eta_exec::Extents,
+    ) -> Option<bool> {
+        self.programs.pair_stale(program, extents)
+    }
+
+    pub fn guest_state(
+        &self,
+        program: engine::ProgramId,
+        extents: eta_exec::Extents,
+    ) -> Result<engine::GuestState> {
+        let (per_instance, resident, per_pair) = self.programs.state_bytes(program, extents)?;
+        self.pools.guest_state(per_instance, resident, per_pair)
+    }
+
+    /// What an instance of `program` keeps in the pool's `Instance` and
+    /// `Channel` slots.
+    pub fn program_facts(
+        &self,
+        program: engine::ProgramId,
+    ) -> Result<engine::program::ProgramFacts> {
+        use engine::chunk::SlotRole;
+        let held = self.programs.held(program)?;
+        let footprint = |role, bytes| self.pools.guest_footprint(role, bytes);
+        let declared = self
+            .programs
+            .program(program)
+            .map(|program| &program.plan.package.channels);
+        Ok(engine::program::ProgramFacts {
+            instance: footprint(SlotRole::Instance, held.instance_bytes),
+            rings: held
+                .ring_bytes
+                .iter()
+                .enumerate()
+                .filter_map(|(channel, bytes)| {
+                    let bytes = (*bytes)?;
+                    let declared = declared?.get(channel)?;
+                    let shape = crate::program::ChannelShape::of(declared);
+                    Some(engine::program::RingFacts {
+                        channel: channel as u32,
+                        cell_bytes: shape.cell_bytes() as u64,
+                        capacity: shape.capacity,
+                        footprint: footprint(SlotRole::Channel, bytes),
+                    })
+                })
+                .collect(),
+            adapter: engine::program::Footprint::default(),
+        })
+    }
+
+    /// Where instance `instance`'s capturing lane's rows lie now: its key
+    /// row of the load's context, then its page row (`crate::scores`).
+    /// `None` for an instance whose program reads none.
+    #[must_use]
+    pub fn score_rows(&self, instance: engine::InstanceId) -> Option<u64> {
+        self.programs.score_rows(instance)
+    }
+
+    /// The address of a guest item of `bytes` in `refs`, where they lie now.
+    pub fn guest_span(
+        &self,
+        role: engine::chunk::SlotRole,
+        refs: &[u32],
+        bytes: u64,
+    ) -> Result<u64> {
+        self.pools.guest_span(role, refs, bytes)
+    }
+
+    /// The device address of slot ref `slot` of `shape`, its chunk seated
+    /// for the shape.
+    pub fn slot_span(&mut self, shape: engine::chunk::ShapeId, slot: u32) -> Result<u64> {
+        self.pools.slot_span(shape, slot)
+    }
+
+    /// The slots a guest item of `bytes` takes.
+    #[must_use]
+    pub fn guest_footprint(
+        &self,
+        role: engine::chunk::SlotRole,
+        bytes: u64,
+    ) -> engine::program::Footprint {
+        self.pools.guest_footprint(role, bytes)
+    }
+
+    /// Instance `id`'s process parked (`engine::Rebind::Parked`).
+    pub fn park_program(&mut self, id: engine::InstanceId, kept: bool) -> Result<()> {
+        let pools = &self.pools;
+        self.programs
+            .park(id, kept, &|item, bytes| pools.guest_item(item, bytes))
+    }
+
+    /// Instance `id`'s items lie in `slots` now.
+    pub fn rebind_program(
+        &mut self,
+        id: engine::InstanceId,
+        slots: crate::program::Slots,
+    ) -> Result<()> {
+        let stream = self.device.stream();
+        let pools = &self.pools;
+        self.programs.rebind(
+            id,
+            slots,
+            &|item, bytes| pools.guest_item(item, bytes),
+            stream,
+        )
     }
 
     /// Settles the guest batches whose steps have landed: their channels'
@@ -845,6 +1292,11 @@ impl Shell {
         Ok(self.programs.instance_mut(instance_id))
     }
 
+    /// Releases a registered program no instance binds.
+    pub fn close_program(&mut self, id: engine::ProgramId) -> Result<()> {
+        self.programs.close_program(id)
+    }
+
     pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.reap_landed_guests()?;
         self.programs.close_instance(instance_id)
@@ -861,31 +1313,6 @@ impl Shell {
             .is_some_and(|class| self.wide.contains(class))
     }
 
-    /// The token buckets a fire whose lanes buffer recurrent rows, or land
-    /// in a drafter's class, composes at: each one up to the lane ceiling
-    /// (every decode width), past it the powers of two and the widest. The
-    /// lattice records those at these alone.
-    /// Whether a lane of `word` lands in a class keyed only for a drafter's
-    /// fires (plain but for reading the drafts): it composes at
-    /// [`Shell::rs_rungs`] too, a verify's lanes being narrow.
-    fn drafts_only(&self, word: u64) -> bool {
-        !self.drafting_words.is_empty()
-            && self
-                .drafting_words
-                .contains(&(word & self.compiled.classes.mask))
-    }
-
-    fn rs_rungs(&self) -> Vec<u32> {
-        let ceiling = self.lane_ceiling();
-        let top = self.budget.buckets.last().copied();
-        self.budget
-            .buckets
-            .iter()
-            .copied()
-            .filter(|&bucket| bucket <= ceiling || bucket.is_power_of_two() || Some(bucket) == top)
-            .collect()
-    }
-
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
             .min(self.fire_lanes())
@@ -900,6 +1327,17 @@ impl Shell {
         match self.fire_lanes {
             0 => self.budget.max_lanes,
             cap => self.budget.max_lanes.min(cap),
+        }
+    }
+
+    /// The most lanes a fire of prompts alone carries, where the profile
+    /// pads such a fire to fewer than every fire's (`engine.prefill_lanes`):
+    /// its bodies carry no more. 0: as many as any fire.
+    #[must_use]
+    pub fn prefill_lanes(&self) -> u32 {
+        match self.prefill_lanes {
+            0 => 0,
+            cap => cap.min(self.fire_lanes()),
         }
     }
 
@@ -954,6 +1392,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels,
+                shape: None,
             },
             None,
         )?;
@@ -963,22 +1402,69 @@ impl Shell {
         Ok(std::mem::take(&mut settled.pixels))
     }
 
+    /// [`Shell::fire`] of text lanes timed to its landing: the time from
+    /// its preparation to the device's last work done, its logits read back
+    /// after (the check of the estimate's fire, `crate::check`).
+    pub fn fire_landed(
+        &mut self,
+        lanes: &[Lane<'_>],
+    ) -> Result<(std::time::Duration, Vec<Vec<f32>>)> {
+        let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
+        let began = std::time::Instant::now();
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &seated,
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+                shape: None,
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        self.device.synchronize()?;
+        let landed = began.elapsed();
+        Shell::read_out(self, &mut settled)?;
+        Ok((landed, std::mem::take(&mut settled.logits)))
+    }
+
     pub fn fire_media(
         &mut self,
         lanes: &[Seated<'_>],
         attachments: &[Attached],
         media: &[Media<'_>],
     ) -> Result<Vec<Vec<f32>>> {
-        let prepared = FrameShell::prepare(
-            self,
-            StepView {
-                lanes,
-                attachments,
-                media,
-                voxels: &[],
-            },
-            None,
-        )?;
+        self.fire_step(StepView {
+            lanes,
+            attachments,
+            media,
+            voxels: &[],
+            shape: None,
+        })
+    }
+
+    /// A fire of lanes with their media and voxel clips, no attachments:
+    /// arming's synthetic fires ([`Shell::fire_step`]).
+    pub(crate) fn fire_view(
+        &mut self,
+        lanes: &[Seated<'_>],
+        media: &[Media<'_>],
+        voxels: &[Clips<'_>],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.fire_step(StepView {
+            lanes,
+            attachments: &[],
+            media,
+            voxels,
+            shape: None,
+        })
+    }
+
+    /// One fire of `step`, its logits read back.
+    fn fire_step(&mut self, step: StepView<'_>) -> Result<Vec<Vec<f32>>> {
+        let prepared = FrameShell::prepare(self, step, None)?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;
@@ -999,6 +1485,7 @@ impl Shell {
                 attachments: &[],
                 media: &[],
                 voxels: &[],
+                shape: None,
             },
             None,
         )?;
@@ -1050,6 +1537,11 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     pub media: &'a [Media<'a>],
     pub voxels: &'a [Clips<'a>],
+    /// The stated shape the runtime stamped the step with:
+    /// what treatment its body keys and the bucket a buffering step with a
+    /// prompt's rows composes at are read from. `None` on a fire built by
+    /// hand (arming's, a test's): read from its lanes.
+    pub shape: Option<engine::FireShape>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1062,8 +1554,8 @@ struct RsFire<'a> {
     truncates: bool,
     /// How its lanes treat their recurrent rows.
     body: record::RsBody,
-    /// Each lane's replayed buffer rows.
-    replays: Vec<u32>,
+    /// Whether its beam groups fold their sets: it stages a fold.
+    group_folds: bool,
     rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
 }
@@ -1101,6 +1593,9 @@ pub(crate) struct MergeLand {
 }
 
 pub struct Prepared<'a> {
+    /// The ring work of a fire of windowed lanes: the pages filled before
+    /// it, the rows folded after.
+    ring_work: ring::Work,
     lanes: &'a [Seated<'a>],
     attachments: &'a [Attached],
     composition: Composition,
@@ -1138,16 +1633,20 @@ pub struct Prepared<'a> {
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
     mask_injects: Vec<crate::inputs::MaskInject>,
+    /// What the fire's pages-bound lanes have the device resolve and copy.
+    page_work: pages::PageWork,
+    /// Where the staged fire's page-list fault words lie, read at settle.
+    page_faults: Option<u64>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
+    /// Why not, in a load that records bodies: the key and the reason.
+    unbodied: Option<String>,
+    /// The load stated the fire eager: a lane of it is of an adapted class.
+    stated_eager: bool,
     admits: std::sync::Arc<[crate::window::Admit]>,
-    /// The key's island bits, so the fire records and replays under the key
-    /// that was prepared.
-    islands: Box<[u8]>,
-    ladder: record::Ladder,
+    /// The body's key as prepared: the fire records and replays under it.
+    key: record::BodyKey,
     lane_ceiling: u32,
-    patch_ladder: Option<record::Ladder>,
-    towered: bool,
 }
 
 impl Drop for Prepared<'_> {

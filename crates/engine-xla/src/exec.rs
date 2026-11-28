@@ -22,9 +22,11 @@ pub fn run(
     let t0 = std::time::Instant::now();
     let (text, sig) = tracer.finish(extra);
     let t1 = std::time::Instant::now();
-    let program = device.program(&text, sig)?;
+    // The program is cached by its text: one traced over other roots of the
+    // same shapes (another host bank, say) binds this trace's roots.
+    let program = device.program(&text, sig.clone())?;
     let t2 = std::time::Instant::now();
-    let out = run_program(device, &program, weights, pools, inputs, wait);
+    let out = bind_and_run(device, &sig, &program, weights, pools, inputs, &[], wait);
     if crate::serve::timing() {
         eprintln!(
             "  xla run: finish {:.2}ms ({} KiB) lookup {:.2}ms bind+run {:.2}ms",
@@ -56,7 +58,38 @@ pub fn run_program(
     inputs: &Inputs,
     wait: bool,
 ) -> Result<Vec<Buffer>> {
-    bind_and_run(device, &program.sig, program, weights, pools, inputs, wait)
+    bind_and_run(
+        device,
+        &program.sig,
+        program,
+        weights,
+        pools,
+        inputs,
+        &[],
+        wait,
+    )
+}
+
+/// A readout program: [`run_program`] with its entries (`Source::Entry`),
+/// the planes its fire's forward returned.
+pub fn run_readout(
+    device: &Device,
+    program: &crate::device::Program,
+    weights: Option<&Weights>,
+    pools: &mut Pools,
+    inputs: &Inputs,
+    entries: &[Buffer],
+) -> Result<Vec<Buffer>> {
+    bind_and_run(
+        device,
+        &program.sig,
+        program,
+        weights,
+        pools,
+        inputs,
+        entries,
+        false,
+    )
 }
 
 /// A maintenance program: pools and `inputs` in, nothing out.
@@ -69,6 +102,7 @@ pub fn maintain(
     run(device, tracer, &[], None, pools, inputs, false).map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_and_run(
     device: &Device,
     sig: &Signature,
@@ -76,29 +110,51 @@ fn bind_and_run(
     weights: Option<&Weights>,
     pools: &mut Pools,
     inputs: &Inputs,
+    entries: &[Buffer],
     wait: bool,
 ) -> Result<Vec<Buffer>> {
     if device.is_dry() {
         return Ok(Vec::new());
     }
-    let mut uploaded: Vec<(u32, Buffer)> = Vec::new();
-    let mut pack: Option<Buffer> = None;
+    // Bulk data, written into the bulk ring's next slot.
+    let mut bulk: Vec<(u32, usize)> = Vec::new();
     for source in &sig.params {
-        match *source {
-            Source::Input { input } => uploaded.push((input, inputs.upload(device, input)?)),
-            Source::Pack if pack.is_none() => pack = Some(inputs.upload_pack(device)?),
-            _ => {}
+        if let Source::Bulk { input } = *source {
+            let ring = pools.bulk().ok_or_else(|| Fault::Unbound {
+                what: "the bulk ring, which this load did not lay".into(),
+            })?;
+            bulk.push((input, ring.write_bytes(inputs.bulk_bytes(input))?));
         }
     }
+    // The fire's inputs, written into the staging ring's next slot.
+    let slot = if sig.params.contains(&Source::Stage) {
+        let ring = pools.ring().ok_or_else(|| Fault::Unbound {
+            what: "the staging ring, which this load did not lay".into(),
+        })?;
+        Some(ring.write(inputs.image())?)
+    } else {
+        None
+    };
     let donated: Vec<usize> = sig
         .results
         .iter()
         .filter_map(|r| r.map(|(_, param)| param))
         .collect();
+    // A readout ring's next plane, still read, refuses the fire before it
+    // takes the pool or anything else.
+    for (at, source) in sig.params.iter().enumerate() {
+        if let (true, Source::Readout { index }) = (donated.contains(&at), source) {
+            pools.readout_ready(*index)?;
+        }
+    }
     let mut taken: Vec<(usize, Buffer)> = Vec::new();
     for (at, source) in sig.params.iter().enumerate() {
-        if let (true, Source::Pool { row, plane }) = (donated.contains(&at), source) {
-            taken.push((at, pools.take(*row, *plane)?));
+        match (donated.contains(&at), source) {
+            (true, Source::Pool { row, plane }) => taken.push((at, pools.take(*row, *plane)?)),
+            (true, Source::Readout { index }) => {
+                taken.push((at, pools.readout_take(device, *index)?));
+            }
+            _ => {}
         }
     }
     let mut args: Vec<Arg<'_>> = Vec::with_capacity(sig.params.len());
@@ -113,21 +169,43 @@ fn bind_and_run(
             Source::Weight { param, plane, .. } => {
                 weights.and_then(|w| w.buffer_plane(param, plane))
             }
+            Source::Entry { index } => entries.get(usize::from(index)),
             Source::Pool { row, plane } => pools.get(row, plane),
-            Source::Input { input } => uploaded.iter().find(|(i, _)| *i == input).map(|(_, b)| b),
-            Source::Pack => pack.as_ref(),
-            Source::Temp | Source::Packed { .. } => None,
+            Source::HostBank { param } => pools.host_bank(param),
+            Source::Stage => slot.and_then(|at| pools.ring_buffer(at)),
+            Source::Bulk { input } => bulk
+                .iter()
+                .find(|(i, _)| *i == input)
+                .and_then(|&(_, at)| pools.bulk_buffer(at)),
+            Source::Readout { .. }
+            | Source::Temp
+            | Source::Staged { .. }
+            | Source::Streamed { .. } => None,
         }
         .ok_or_else(|| Fault::Unbound {
             what: format!("parameter {at} ({source:?}), which nothing on this device holds"),
         })?;
         args.push(Arg::Keep(buffer));
     }
-    let outs = device.run(program, args, wait)?;
+    let (outs, done) = device.run_fenced(program, args, wait)?;
+    // The slots it read are free again once this run has completed on the
+    // device: its own event, whatever it outputs.
+    let done = done.map(crate::store::stage::Done::of);
+    if let Some(at) = slot
+        && let Some(ring) = pools.ring()
+    {
+        ring.read_by(at, done.clone());
+    }
+    for &(_, at) in &bulk {
+        if let Some(ring) = pools.bulk() {
+            ring.read_by(at, done.clone());
+        }
+    }
     let mut extra = Vec::new();
     for (out, result) in outs.into_iter().zip(&sig.results) {
         match result {
             Some((Source::Pool { row, plane }, _)) => pools.put(*row, *plane, out),
+            Some((Source::Readout { index }, _)) => pools.readout_put(*index, out),
             Some((other, _)) => {
                 return Err(Fault::Unbound {
                     what: format!("a result aliasing {other:?}, which is not a pool"),

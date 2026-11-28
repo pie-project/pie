@@ -1,6 +1,8 @@
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, Ctx, Fire, Launch, dtype_dispatch, flat_wide, kernel, nonzero, refuse, stated,
+};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -16,7 +18,7 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         return ctx.fire(
             OP,
             Fire::at(kernel(POINTWISE, "::pie::elemwise::residual_add_vec8"))
-                .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl)),
+                .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl())),
             &[
                 y.arg(),
                 x.arg(),
@@ -109,7 +111,7 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(kernel(POINTWISE, &format!("::pie::elemwise::scale<{t}>")))
-            .apply(launch.programmatic(ctx.tuning().pdl)),
+            .apply(launch.programmatic(ctx.tuning().pdl())),
         &[
             x.arg(),
             s.arg(),
@@ -194,24 +196,20 @@ fn fire_unary(
         ));
     }
     let n = o.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the element count", lanes)?;
+    if n == 0 {
+        return Err(refuse(op, "the element count is 0"));
+    }
     ctx.fire(
         op,
         Fire::at(kernel(
             POINTWISE,
             &format!("::pie::elemwise::activation<{t}, {stamp}>"),
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(flat_wide(op, n, BLOCK)?),
         &[
             x.arg(),
             o.arg(),
-            stated(op, lanes)?.arg(),
+            (n as i64).arg(),
             stated(op, o.width)?.arg(),
             ctx.stage(),
         ],
@@ -257,25 +255,21 @@ fn fire_binary(
         }
     }
     let n = o.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the element count", lanes)?;
+    if n == 0 {
+        return Err(refuse(op, "the element count is 0"));
+    }
     ctx.fire(
         op,
         Fire::at(kernel(
             POINTWISE,
             &format!("::pie::elemwise::binary<{t}, {stamp}>"),
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(flat_wide(op, n, BLOCK)?),
         &[
             x.arg(),
             y.arg(),
             o.arg(),
-            stated(op, lanes)?.arg(),
+            (n as i64).arg(),
             stated(op, o.width)?.arg(),
             ctx.stage(),
         ],

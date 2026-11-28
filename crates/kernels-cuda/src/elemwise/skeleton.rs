@@ -464,7 +464,7 @@ pub(crate) fn fire(
         Fire::at(kernel).apply(
             Launch::per_row(blocks, threads)
                 .smem(floats * 4)
-                .programmatic(ctx.tuning().pdl),
+                .programmatic(ctx.tuning().pdl()),
         ),
         &[ArgValue::of_slice(&planes), fields, ctx.stage()],
     )

@@ -71,7 +71,6 @@ pub struct PullLane {
     pub ticket_offset: u32,
     pub ticket_count: u32,
     pub initial_commit: u32,
-    pub diagnose: u32,
 }
 
 const _: () = assert!(
@@ -117,10 +116,13 @@ pub struct SettleLane {
     pub commit: DevicePtr,
     pub ticket_offset: u32,
     pub ticket_count: u32,
+    /// Where the host reads the pass's verdict, which the settle copies
+    /// from `commit` (in the wave's device tables).
+    pub commit_host: DevicePtr,
 }
 
 const _: () = assert!(
-    core::mem::size_of::<SettleLane>() == 16,
+    core::mem::size_of::<SettleLane>() == 24,
     "channel::SettleLane: sizeof disagrees with `runtime/channel.hip`'s SettleLane",
 );
 
@@ -186,6 +188,50 @@ const _: () = assert!(
     core::mem::size_of::<Rings>() == 40,
     "channel::Rings: a registry is four addresses, a slot count and its padding",
 );
+
+/// The kernels a guest's wave fires: every load fires them once a program
+/// binds.
+const WAVE: [&str; 4] = ["pull_validate", "commit_bump", "scatter_publish", "settle"];
+
+/// The kernels a fire's staging fires: a tap's words, a lane's
+/// device-carried mask bits, a table of them, and a beam group's step and
+/// copies.
+const STAGING: [&str; 6] = [
+    "gather_words",
+    "gather_bits",
+    "gather_bit_runs",
+    "beam_step",
+    "copy_pages",
+    "copy_rs_rows",
+];
+
+/// The kernel a windowed fire moves its ring's rows with (its pages' fills,
+/// its snapshots and its fold).
+const RING: [&str; 1] = ["copy_runs"];
+
+fn load_all(names: &[&str]) -> Result<(), Error> {
+    for name in names {
+        kernel(FILE, &format!("::pie::channel::{name}")).load()?;
+    }
+    Ok(())
+}
+
+/// Loads [`WAVE`] on the current device now: the host fires them, so no
+/// walk resolves them, and nothing builds after ready.
+pub fn load_wave_kernels() -> Result<(), Error> {
+    load_all(&WAVE)
+}
+
+/// Loads [`STAGING`], as [`load_wave_kernels`] does its own.
+pub fn load_gather_kernels() -> Result<(), Error> {
+    load_all(&STAGING)
+}
+
+/// Loads [`RING`], as [`load_wave_kernels`] does its own: for a load of
+/// windowed layers.
+pub fn load_ring_kernels() -> Result<(), Error> {
+    load_all(&RING)
+}
 
 pub fn pull_validate(
     ctx: &Ctx,
@@ -314,11 +360,13 @@ pub fn gather_bits(ctx: &Ctx, src: DevicePtr, dst: DevicePtr, bits: u32) -> Resu
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BitRun {
     pub src: DevicePtr,
-    pub dst_byte: u32,
+    /// Where the run lands in the fire's masks: 64-bit, as their offsets.
+    pub dst_byte: u64,
     pub bits: u32,
+    pub _pad: u32,
 }
 
-const _: () = assert!(size_of::<BitRun>() == 16);
+const _: () = assert!(size_of::<BitRun>() == 24);
 
 /// Packs each of `run_count` [`BitRun`]s at `runs` into `dst`, a block a run.
 pub fn gather_bit_runs(
@@ -394,12 +442,19 @@ pub struct RsLane {
     pub replay_off: u32,
     /// Where its pages' slot addresses start in the page table.
     pub page_off: u32,
+    /// Where its extended rows start in the fire's extended run: past
+    /// every earlier lane's replayed and own rows.
+    pub ext: u32,
 }
 
-const _: () = assert!(size_of::<RsLane>() == 16);
+const _: () = assert!(size_of::<RsLane>() == 20);
 
 impl RsLane {
     pub const NONE: u32 = u32::MAX;
+    /// A [`RsLane::page_off`] with this bit names the lane's entry of the
+    /// fire's lane rows ([`RsTables::lane_rows`], [`RsRows`]) in its low bits:
+    /// its rows resolve on the device, and it stages no pages.
+    pub const ROWS: u32 = 0x8000_0000;
 
     /// A lane that lands no rows and replays none.
     pub const INERT: RsLane = RsLane {
@@ -407,6 +462,7 @@ impl RsLane {
         replay: 0,
         replay_off: 0,
         page_off: 0,
+        ext: 0,
     };
 }
 
@@ -417,7 +473,10 @@ impl RsLane {
 pub struct RsTables {
     pub lanes: DevicePtr,
     pub pages: DevicePtr,
-    pub replay_tok: DevicePtr,
+    /// The fire's beams' rows ([`RsRows`]), a fire lane each: a lane whose
+    /// [`RsLane::page_off`] carries [`RsLane::ROWS`] reads its rows there.
+    pub lane_rows: DevicePtr,
+    pub replay_spans: DevicePtr,
     /// The rows a page holds.
     pub page_tokens: u32,
 }
@@ -431,6 +490,33 @@ pub struct RsPlane {
 }
 
 const RS_BLOCK: u32 = 128;
+
+/// One run of a windowed fire's ring fold: `bytes` from `src` to `dst`
+/// (`copy_runs`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopyRun {
+    pub dst: u64,
+    pub src: u64,
+    pub bytes: u64,
+}
+
+/// Copies each of the `count` runs at `runs` (a block a run): a windowed
+/// fire's rows folded onto their ring pages. A windowed layer is a state and
+/// a buffer, as a recurrent one is: its window holds only folded rows, and
+/// rows past the fold read from the buffer.
+pub fn copy_runs(ctx: &Ctx, runs: DevicePtr, count: u32) -> Result<(), Error> {
+    const OP: &str = "channel.copy_runs";
+    if count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::copy_runs"))
+            .apply(Launch::grid([count, 1, 1], [RS_BLOCK, 1, 1])),
+        &[ArgValue::Ptr(runs), ArgValue::U32(count)],
+    )
+}
 
 /// Lands each lane's rows of `src` at its buffer tokens (a block a lane, up
 /// to `lanes_stated`; the armed window's live words say how many are live).
@@ -459,6 +545,7 @@ pub fn rs_scatter(
             ArgValue::U32(lanes_stated),
             ArgValue::Ptr(tables.lanes),
             ArgValue::Ptr(tables.pages),
+            ArgValue::Ptr(tables.lane_rows),
             ArgValue::U32(tables.page_tokens),
             ArgValue::Usize(plane.off),
             ArgValue::Usize(plane.stride),
@@ -467,7 +554,9 @@ pub fn rs_scatter(
 }
 
 /// The window's extended layout into `csr` (`lanes_cap + 1` words) and the
-/// live words the recurrent kernels read the extended rows by (`ext_win`).
+/// live words the recurrent kernels read the extended rows by (`ext_win`):
+/// from the window's place in the fire's extended run, its first lane's
+/// [`RsLane::ext`].
 pub fn rs_ext_csr(
     ctx: &Ctx,
     qo_indptr: DevicePtr,
@@ -534,7 +623,8 @@ pub fn rs_ext_gather(
             ArgValue::U32(lanes_stated),
             ArgValue::Ptr(tables.lanes),
             ArgValue::Ptr(pages),
-            ArgValue::Ptr(tables.replay_tok),
+            ArgValue::Ptr(tables.lane_rows),
+            ArgValue::Ptr(tables.replay_spans),
             ArgValue::U32(tables.page_tokens.max(1)),
             ArgValue::Usize(at.off),
             ArgValue::Usize(at.stride),
@@ -610,5 +700,320 @@ mod tests {
             (rings.full, rings.head, rings.tail, rings.cap1),
         );
         assert_eq!((lane.taken_count, lane.put_count), (2, 1));
+    }
+}
+
+/// A lane's page copy in one page list (`channel.hip`'s `PageCopyRun`):
+/// its `[src, dst, tokens]` at `copy`, the reserve pages' base addresses at
+/// `base`, its planes `planes` entries of the plane table from `plane_at`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageCopyRun {
+    pub copy: DevicePtr,
+    pub base: DevicePtr,
+    pub fault: DevicePtr,
+    pub reserve: u32,
+    pub page: u32,
+    pub floor_rel: u32,
+    pub plane_at: u32,
+    pub planes: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<PageCopyRun>() == 48);
+
+/// Where a kv plane lies in a page, and the bytes one token holds in it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PagePlane {
+    pub offset: u64,
+    pub cell: u64,
+}
+
+const _: () = assert!(size_of::<PagePlane>() == 16);
+
+/// The fault a lane's page list states in its fault word: an entry past its
+/// set's reserve, a list shorter than the pages it reads, a row written below
+/// the set's frozen slots, a copy out of its bounds (`channel.hip`).
+pub const PAGES_PAST_RESERVE: u32 = 1;
+pub const PAGES_SHORT: u32 = 2;
+pub const PAGES_BELOW_FLOOR: u32 = 3;
+pub const PAGES_COPY_BOUNDS: u32 = 4;
+
+const PAGES_BLOCK: u32 = 128;
+
+/// Copies each of `run_count` [`PageCopyRun`]s at `runs` over its planes of
+/// `planes`, a block a (run, plane); `max_planes` is the most a run spans.
+pub fn copy_pages(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    planes: DevicePtr,
+    run_count: u32,
+    max_planes: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.copy_pages";
+    if run_count == 0 || max_planes == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::copy_pages")).apply(Launch::grid(
+            [run_count, max_planes, 1],
+            [PAGES_BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::Ptr(planes),
+            ArgValue::U32(run_count),
+        ],
+    )
+}
+
+/// A lane's staged page table [`beam_step`] resolves over its group's list
+/// (`channel.hip`'s `BeamListRun`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamListRun {
+    pub indices: DevicePtr,
+    pub write_page: DevicePtr,
+    pub write_offset: DevicePtr,
+    pub lane: u32,
+    pub entries: u32,
+    pub rows: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<BeamListRun>() == 40);
+
+/// Where a lane's buffered rows lie (`runtime/rs_rows.hip`'s `RsRows`), resolved row
+/// by row on the device, so a fire stages no entry a row whatever its lanes
+/// carry: buffer token `tok` (slot `base + tok`) is the row of slot `σ` on
+/// entry `(σ - base) / tokens` of `bases` (`bases_len` of them), row
+/// `(σ - base) mod tokens`. A lane alone on its set reads its own pages
+/// (`list` 0, `σ` the slot). A beam on a hybrid reads its set's rs pages
+/// through its row of its group's page list, which [`beam_step`]
+/// points `list` at (`cap` columns): `σ = (f0 + list[slot / page - f0]) page
+/// + slot mod page`, a slot below `f0 page` the set's own.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsRows {
+    pub list: DevicePtr,
+    pub bases: DevicePtr,
+    pub cap: u32,
+    pub f0: u32,
+    pub page: u32,
+    pub base: u32,
+    pub tokens: u32,
+    pub bases_len: u32,
+}
+
+const _: () = assert!(size_of::<RsRows>() == 40);
+
+/// A beam's rs copy (`channel.hip`'s `RsCopyRun`): on a hybrid, a fork's
+/// page copy moves the beam's rs rows with its kv slots, before any lane of
+/// the fire appends or reads. The `[src, dst, tokens]` its group's step left
+/// at `copy`,
+/// moved row by row of each plane through the set's rs entries (`bases`,
+/// as [`RsRows`]'s); slots below the buffer have no row.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsCopyRun {
+    pub copy: DevicePtr,
+    pub bases: DevicePtr,
+    pub fault: DevicePtr,
+    pub reserve: u32,
+    pub page: u32,
+    pub tokens: u32,
+    pub base: u32,
+    pub f0: u32,
+    pub floor_rel: u32,
+    pub plane_at: u32,
+    pub planes: u32,
+    pub bases_len: u32,
+    pub _pad: u32,
+}
+
+const _: () = assert!(size_of::<RsCopyRun>() == 64);
+
+/// Copies each of `run_count` [`RsCopyRun`]s at `runs` over its planes of
+/// `planes`, a block a (run, plane); `max_planes` is the most a run spans.
+pub fn copy_rs_rows(
+    ctx: &Ctx,
+    runs: DevicePtr,
+    planes: DevicePtr,
+    run_count: u32,
+    max_planes: u32,
+) -> Result<(), Error> {
+    const OP: &str = "channel.copy_rs_rows";
+    if run_count == 0 || max_planes == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::copy_rs_rows")).apply(Launch::grid(
+            [run_count, max_planes, 1],
+            [PAGES_BLOCK, 1, 1],
+        )),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::Ptr(planes),
+            ArgValue::U32(run_count),
+        ],
+    )
+}
+
+/// One beam group's step (`channel.hip`'s `BeamStepRun`), which turns the
+/// parents a group's last epilogue chose into its lanes' page lists (each
+/// beam's pages, a fork copying the page it parts on, retired pages freed
+/// some fires later): its resident state, the parents its
+/// last epilogue wrote, its pool's device ids, its lanes' list runs and
+/// fault words, and its numbers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BeamStepRun {
+    pub state: DevicePtr,
+    pub parents: DevicePtr,
+    pub trans: DevicePtr,
+    pub lists: DevicePtr,
+    pub faults: DevicePtr,
+    pub lanes: u32,
+    /// The list width and pool pages the state is laid for.
+    pub cap: u32,
+    /// The pool's pages now (`reserved` pages past `f0`).
+    pub reserve: u32,
+    pub page: u32,
+    pub folded: u32,
+    /// The slot every beam writes this fire.
+    pub slot: u32,
+    pub list_count: u32,
+    /// The ring of pending pages: a page freed at fire t is handed out from
+    /// fire t + frames + 1.
+    pub frames: u32,
+    /// The pool pages the fire stages, from the first: every page the step
+    /// names lies below them (the lowest-free rule), and one that does not
+    /// faults its lane.
+    pub backed: u32,
+    /// Its beams' rs rows on a hybrid ([`RsRows`], a beam each), which the
+    /// step points at their lists as it leaves them; 0 off a hybrid.
+    pub rows: DevicePtr,
+}
+
+const _: () = assert!(size_of::<BeamStepRun>() == 88);
+
+/// A lane's parent past its group (`beam_step`).
+pub const PAGES_PARENT: u32 = 5;
+/// A fire found fewer free pages than it hands out (exact sizing makes it
+/// unreachable: a bug where it happens).
+pub const PAGES_EXHAUSTED: u32 = 6;
+/// A group wider than its step was laid for (`beam_step`'s `width`).
+pub const PAGES_TOO_WIDE: u32 = 7;
+
+/// The u32 words of a group's state header (primed, fires run, the pool's
+/// pages at the last fire, the common slot), before its lists
+/// (`PIE_BEAM_HEADER`).
+pub const BEAM_HEADER: u32 = 4;
+
+/// The u32 words a group of `lanes` beams keeps for lists of `cap` columns
+/// over `cap` pool pages and `frames` pending rings
+/// (`channel.hip`'s state layout).
+#[must_use]
+pub const fn beam_state_words(lanes: u32, cap: u32, frames: u32) -> u64 {
+    BEAM_HEADER as u64
+        + 2 * lanes as u64 * cap as u64
+        + cap as u64
+        + frames as u64 * cap as u64
+        + 3 * lanes as u64
+        + lanes as u64 * lanes as u64
+}
+
+/// The state words where a group's copies for this fire lie.
+#[must_use]
+pub const fn beam_copies_word(lanes: u32, cap: u32, frames: u32) -> u64 {
+    BEAM_HEADER as u64 + 2 * lanes as u64 * cap as u64 + cap as u64 + frames as u64 * cap as u64
+}
+
+const BEAM_BLOCK: u32 = 256;
+
+/// The dynamic shared memory `beam_step` takes for groups of up to `width`
+/// beams: five per-lane tables and the lanes' pairwise common slots.
+#[must_use]
+pub const fn beam_step_shared_bytes(width: u32) -> u32 {
+    (5 * width + width * width) * 4
+}
+
+/// The shared memory `beam_step` holds beside them: its 256-word count
+/// table and three words.
+const BEAM_STATIC_SHARED: u32 = (256 + 3) * 4;
+
+/// The widest beam group the device steps: the most beams whose tables fit
+/// a block's opt-in shared memory beside the step's own (48 KiB where the
+/// device does not say). A bind wider than it is refused by name.
+#[must_use]
+pub fn beam_max_lanes(ctx: &Ctx) -> u32 {
+    #[cfg(feature = "rocm")]
+    let optin = crate::jit::device::max_shared_memory_per_block_optin();
+    #[cfg(not(feature = "rocm"))]
+    let optin: Option<u32> = None;
+    let _ = ctx;
+    #[allow(
+        clippy::unnecessary_literal_unwrap,
+        reason = "without the rocm feature optin is None"
+    )]
+    let room = optin.unwrap_or(48 << 10).saturating_sub(BEAM_STATIC_SHARED);
+    let mut width = 1u32;
+    while beam_step_shared_bytes(width + 1) <= room {
+        width += 1;
+    }
+    width
+}
+
+/// Runs each of `run_count` [`BeamStepRun`]s at `runs`, a block a group, its
+/// tables laid for groups of up to `width` beams (a wider one faults its
+/// lanes [`PAGES_TOO_WIDE`]).
+pub fn beam_step(ctx: &Ctx, runs: DevicePtr, run_count: u32, width: u32) -> Result<(), Error> {
+    const OP: &str = "channel.beam_step";
+    if run_count == 0 {
+        return Ok(());
+    }
+    let width = width.max(1);
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::beam_step")).apply(
+            Launch::grid([run_count, 1, 1], [BEAM_BLOCK, 1, 1]).smem(beam_step_shared_bytes(width)),
+        ),
+        &[
+            ArgValue::Ptr(runs),
+            ArgValue::U32(run_count),
+            ArgValue::U32(width),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod preloads {
+    /// Each kernel a wrapper here fires is either on a list a load resolves
+    /// before ready (the host fires it, around a body) or dispatched inside
+    /// a body, which the load's walk resolves. One on neither list is built
+    /// by the first serving fire that reaches it.
+    #[test]
+    fn every_fired_kernel_is_preloaded_or_walked() {
+        const WALKED: [&str; 5] = [
+            "mask_from_commit",
+            "rs_scatter",
+            "rs_ext_csr",
+            "rs_ext_gather",
+            "rs_ext_land",
+        ];
+        let held: Vec<&str> = [&super::WAVE[..], &super::STAGING, &super::RING, &WALKED].concat();
+        let mut fired: Vec<&str> = include_str!("channel.rs")
+            .split("kernel(FILE, \"::pie::channel::")
+            .skip(1)
+            .filter_map(|rest| rest.split(['"', '<']).next())
+            .collect();
+        fired.sort_unstable();
+        fired.dedup();
+        let mut listed = held.clone();
+        listed.sort_unstable();
+        assert_eq!(fired, listed);
     }
 }

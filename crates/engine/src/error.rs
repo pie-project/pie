@@ -25,6 +25,13 @@ pub enum Error {
     #[error("impossible submission: {0}")]
     Impossible(String),
 
+    /// An impossible submission for where state lies: `chunks` (logical
+    /// chunk ids) hold state where the engine will not read or write it
+    /// (inside the activation's carve). Refused before anything was read
+    /// or written: the runtime moves that state and submits again.
+    #[error("impossible submission: {reason}")]
+    Placement { chunks: Vec<u32>, reason: String },
+
     #[error("load failed: {0}")]
     Load(String),
 
@@ -36,6 +43,37 @@ pub enum Error {
 
     #[error("engine disconnected: {0}")]
     Disconnected(String),
+
+    /// The tier below the device (the disk tier's slot file) is full: a
+    /// copy down to it failed writing there (`io::ErrorKind::StorageFull`).
+    /// Nothing on the device changed: what the copy would have moved lies
+    /// where it lay, and the runtime takes the move back.
+    #[error("the tier below is full: {0}")]
+    TierFull(String),
+
+    /// The lanes a step refused for their own sake: a lane's word, mask,
+    /// positions, adapter or payload this load does not serve as stated.
+    /// Nothing of the frame ran; every other lane would have, and the
+    /// runtime fails these lanes' fires alone ([`crate::Engine::submit`]).
+    #[error("{}", refused_lanes(.0))]
+    Lanes(Vec<crate::LaneFault>),
+
+    /// A bind or a rebind would lay a guest instance's state over bytes
+    /// another live instance's or pair's state holds (two holders handed
+    /// overlapping slots), or would move its pair's state alone while other
+    /// instances are bound on it: a placement slip of the runtime's.
+    /// Refused before any table or descriptor was written there: every
+    /// holder stands as it stood ([`crate::guest_claims`]).
+    #[error("`guest::claims` refused: {0}")]
+    Claimed(crate::guest_claims::Refusal),
+}
+
+fn refused_lanes(lanes: &[crate::LaneFault]) -> String {
+    let named: Vec<String> = lanes
+        .iter()
+        .map(|fault| format!("lane {} refused: {}", fault.lane, fault.reason))
+        .collect();
+    named.join("; ")
 }
 
 impl Error {
@@ -58,6 +96,24 @@ impl Error {
 
     pub fn load(why: impl fmt::Display) -> Error {
         Error::Load(why.to_string())
+    }
+
+    /// Lane `lane` of its step refused, for `why`, with no other lane named.
+    pub fn lane(lane: u32, why: impl fmt::Display) -> Error {
+        Error::Lanes(vec![crate::LaneFault {
+            lane,
+            instance: None,
+            reason: why.to_string(),
+        }])
+    }
+
+    /// A refusal of the step's lanes `self` is, read at step `step` of a
+    /// frame whose steps before it fired: the frame stops there, answering
+    /// those steps ([`crate::FrameTicket::refused`]), and any other
+    /// refusal, or one at the first step, refuses the frame.
+    #[must_use]
+    pub fn stops_frame_at(&self, step: usize) -> bool {
+        step > 0 && matches!(self, Error::Lanes(_))
     }
 
     #[must_use]

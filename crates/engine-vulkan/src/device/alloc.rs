@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ash::vk;
 use engine_gpu::pread::pread_jobs;
 
+use engine_gpu::Owner;
 use engine_gpu::error::{Fault, Result};
 
 use super::ctx::{Context, Core, STAGING_BYTES, note_reservation};
@@ -16,6 +17,12 @@ pub(crate) struct Raw {
     pub(crate) buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     pub(crate) size: u64,
+    /// What the driver took for it (its requirement, at least `size`):
+    /// what the device's books count, where it lies in a device-local heap.
+    charged: u64,
+    /// Whose it is in the device's books; `None` off the device's heaps,
+    /// where the books' host count holds it.
+    owner: Option<Owner>,
     pub(crate) mapped: Option<NonNull<u8>>,
     pub(crate) kind: Memory,
 }
@@ -35,7 +42,12 @@ unsafe impl Sync for Raw {}
 pub(crate) type Slab = Arc<Raw>;
 
 impl Raw {
-    fn memory_type(core: &Core, need: &vk::MemoryRequirements, kind: Memory) -> Option<u32> {
+    fn memory_type(
+        core: &Core,
+        need: &vk::MemoryRequirements,
+        kind: Memory,
+        owner: Owner,
+    ) -> Option<u32> {
         let types = &core.memory.memory_types[..core.memory.memory_type_count as usize];
         let prefers = |flags: vk::MemoryPropertyFlags| {
             (0..core.memory.memory_type_count).find(|&i| {
@@ -46,6 +58,13 @@ impl Raw {
         use vk::MemoryPropertyFlags as F;
         match kind {
             Memory::Device => prefers(F::DEVICE_LOCAL).or_else(|| prefers(F::empty())),
+            // The fire block: the host writes it each fire and every dispatch
+            // reads it, so it lies on the device where the host can map it.
+            Memory::Host if owner == engine_gpu::books::owners::UNIFORMS => {
+                prefers(F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT)
+                    .or_else(|| prefers(F::HOST_VISIBLE | F::HOST_COHERENT))
+                    .or_else(|| prefers(F::HOST_VISIBLE))
+            }
             Memory::Host | Memory::Staging | Memory::Readback => {
                 prefers(F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED)
                     .or_else(|| prefers(F::HOST_VISIBLE | F::HOST_COHERENT))
@@ -54,16 +73,31 @@ impl Raw {
         }
     }
 
-    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory) -> Result<Slab> {
+    pub(crate) fn new(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Slab> {
         note_reservation();
         let size = bytes.max(4).next_multiple_of(4);
         let d = &core.device;
+        // The pool's segments hold guest configs a stage binds as a uniform,
+        // and a guest stage's own buffers its steps' uniforms
+        // (`guest::session`), beside everything bound as storage.
+        // The fire block holds each dispatch's scalars, bound as a uniform,
+        // and its group counts, read by an indirect dispatch.
+        let uniform = if owner == engine_gpu::books::owners::POOL
+            || owner == engine_gpu::books::owners::GUEST
+        {
+            vk::BufferUsageFlags::UNIFORM_BUFFER
+        } else if owner == engine_gpu::books::owners::UNIFORMS {
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER
+        } else {
+            vk::BufferUsageFlags::empty()
+        };
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | uniform,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `d` is the live device `core` owns, and `info` is a valid
@@ -72,7 +106,7 @@ impl Raw {
             unsafe { d.create_buffer(&info, None) }.map_err(|e| core.fault("vkCreateBuffer", e))?;
         // SAFETY: `buffer` was just created on `d`.
         let need = unsafe { d.get_buffer_memory_requirements(buffer) };
-        let Some(index) = Self::memory_type(core, &need, kind) else {
+        let Some(index) = Self::memory_type(core, &need, kind, owner) else {
             // SAFETY: `buffer` is ours, unbound and unused by any command.
             unsafe { d.destroy_buffer(buffer, None) };
             return Err(Fault::NoDevice {
@@ -99,9 +133,7 @@ impl Raw {
                             "host-visible memory"
                         },
                         need: need.size,
-                        have: core.device_local.saturating_sub(
-                            core.allocated.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        have: core.device_local.saturating_sub(core.books.device()),
                     });
                 }
                 return Err(core.fault("vkAllocateMemory", e));
@@ -134,13 +166,25 @@ impl Raw {
                 }
             }
         };
-        core.allocated
-            .fetch_add(need.size, std::sync::atomic::Ordering::Relaxed);
+        // A host-visible type off every device-local heap is host memory.
+        let heap = core.memory.memory_types[index as usize].heap_index as usize;
+        let owner = core.memory.memory_heaps[heap]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            .then_some(owner);
+        match owner {
+            Some(owner) => core.books.take(owner, need.size),
+            // Pinned host memory: no device ledger holds it, the books'
+            // host count does.
+            None => core.books.host_take(need.size),
+        }
         Ok(Arc::new(Raw {
             core: Arc::clone(core),
             buffer,
             memory,
             size,
+            charged: need.size,
+            owner,
             mapped,
             kind,
         }))
@@ -288,9 +332,10 @@ impl Drop for Raw {
             d.destroy_buffer(self.buffer, None);
             d.free_memory(self.memory, None);
         }
-        self.core
-            .allocated
-            .fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+        match self.owner {
+            Some(owner) => self.core.books.give(owner, self.charged),
+            None => self.core.books.host_give(self.charged),
+        }
     }
 }
 
@@ -310,16 +355,20 @@ impl std::fmt::Debug for Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Device)
+    pub fn zeroed(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Device, owner)
     }
 
-    pub fn host(device: &Context, bytes: u64) -> Result<Buffer> {
-        Buffer::with(device, bytes, Memory::Host)
+    pub fn host(device: &Context, bytes: u64, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, Memory::Host, owner)
     }
 
-    pub fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        let slab = Raw::new(device.core(), bytes, kind)?;
+    pub fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        Buffer::on(device.core(), bytes, kind, owner)
+    }
+
+    pub(crate) fn on(core: &Arc<Core>, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        let slab = Raw::new(core, bytes, kind, owner)?;
         let buffer = Buffer { slab, bytes };
         buffer.slab.zero(0, buffer.slab.size)?;
         Ok(buffer)
@@ -401,8 +450,8 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(device: &Context, bytes: u64, kind: Memory, owner: Owner) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {

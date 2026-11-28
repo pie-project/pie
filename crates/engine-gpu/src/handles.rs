@@ -10,6 +10,15 @@ pub struct Binding<B: Backend> {
     offset: u64,
 
     extent: u64,
+
+    /// The first byte of the value this binding is a window of
+    /// ([`Handles::window`]), its own offset where it is a value whole.
+    origin: u64,
+
+    /// The byte past that value's last: a backend that binds no two views
+    /// of one buffer overlapping binds the value to here, not to its slab's
+    /// end ([`Binding::end`]).
+    end: u64,
 }
 
 impl<B: Backend> Clone for Binding<B> {
@@ -18,6 +27,8 @@ impl<B: Backend> Clone for Binding<B> {
             buffer: self.buffer.clone(),
             offset: self.offset,
             extent: self.extent,
+            origin: self.origin,
+            end: self.end,
         }
     }
 }
@@ -41,6 +52,16 @@ impl<B: Backend> Binding<B> {
         self.offset
     }
 
+    /// The first byte of the value this binding windows: a fire's class
+    /// region binds its rows of a value from the region's row offset, and a
+    /// backend whose views start only at aligned bytes binds the value from
+    /// here, whatever row the region starts at, and steps the kernel over
+    /// the rows before it.
+    #[must_use]
+    pub fn origin(&self) -> u64 {
+        self.origin
+    }
+
     /// The bytes of the reservation from this binding's offset on.
     #[must_use]
     pub fn remaining(&self) -> u64 {
@@ -50,6 +71,13 @@ impl<B: Backend> Binding<B> {
     #[must_use]
     pub fn extent(&self) -> u64 {
         self.extent
+    }
+
+    /// The byte past the last of the value this binding is a window of
+    /// (its own end where it is a value whole).
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.end
     }
 
     #[must_use]
@@ -115,6 +143,8 @@ impl<B: Backend> Handles<B> {
             buffer: buffer.clone(),
             offset,
             extent: len,
+            origin: offset,
+            end: offset + len,
         });
         Ok(at as u32)
     }
@@ -126,13 +156,25 @@ impl<B: Backend> Handles<B> {
         binding.read(len)
     }
 
+    /// `len` bytes of `handle` from byte `skip`: a value of its own.
     pub fn cut(&self, handle: u32, skip: u64, len: u64) -> Result<u32> {
-        let (buffer, offset) = {
+        self.cut_of(handle, skip, len, false)
+    }
+
+    /// `len` bytes of `handle` from byte `skip` as a window of it (a class
+    /// region's rows of a fire's value): the binding keeps where the value
+    /// starts ([`Binding::origin`]).
+    pub fn window(&self, handle: u32, skip: u64, len: u64) -> Result<u32> {
+        self.cut_of(handle, skip, len, true)
+    }
+
+    fn cut_of(&self, handle: u32, skip: u64, len: u64, window: bool) -> Result<u32> {
+        let (buffer, offset, origin, end) = {
             let rows = self.rows.borrow();
             let row = rows.get(handle as usize).ok_or_else(|| Fault::Unbound {
                 what: format!("handle {handle}, which this load minted no row for"),
             })?;
-            (row.buffer.clone(), row.offset)
+            (row.buffer.clone(), row.offset, row.origin, row.end)
         };
         let at_offset = offset.checked_add(skip).ok_or(Fault::Ceiling {
             what: "bytes of a device reservation",
@@ -163,6 +205,8 @@ impl<B: Backend> Handles<B> {
             buffer,
             offset: at_offset,
             extent: len,
+            origin: if window { origin } else { at_offset },
+            end: if window { end } else { at_offset + len },
         });
         Ok(at as u32)
     }
@@ -187,6 +231,11 @@ impl<B: Backend> Handles<B> {
 
     pub fn rewind(&self) {
         self.rows.borrow_mut().truncate(self.sealed.get());
+    }
+
+    /// Drops the rows past `len` (a mark of [`Handles::len`]), none sealed.
+    pub fn rewind_to(&self, len: usize) {
+        self.rows.borrow_mut().truncate(len.max(self.sealed.get()));
     }
 
     #[must_use]

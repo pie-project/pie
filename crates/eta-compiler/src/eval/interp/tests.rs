@@ -238,3 +238,116 @@ fn numeric_contract_argmax_and_topk() {
     assert_eq!(argmax_ordered(&[16_777_216u32, 16_777_217]), 1);
     assert_eq!(argmax_ordered(&[-2i32, -1]), 1);
 }
+
+/// `gumbel_argmax` over f32 logits is the draw it fuses, bit for bit:
+/// `reduce_argmax(select(keep, logits * scale, -inf) + rng_keyed(state))`.
+#[test]
+fn gumbel_argmax_is_the_draw_it_fuses() {
+    use eta_ir::types::Shape;
+    let n = 997usize;
+    let x: Vec<f32> = (0..n)
+        .map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 9.0)
+        .collect();
+    let keep: Vec<bool> = (0..n).map(|i| i % 5 != 3).collect();
+    for seed in 0..40u32 {
+        let vals = vec![
+            Value::F32(x.clone()),
+            Value::Bool(keep.clone()),
+            Value::F32(vec![1.0 / 0.7]),
+            Value::U32(vec![seed, seed * 3 + 1]),
+        ];
+        let ty = |id: u32| match id {
+            0 => ValueType::vector(n as u32, Dtype::F32),
+            1 => ValueType::vector(n as u32, Dtype::Bool),
+            2 => ValueType::scalar(Dtype::F32),
+            _ => ValueType::vector(2, Dtype::U32),
+        };
+        let fused = eval_op(
+            &Op::GumbelArgmax {
+                logits: 0,
+                keep: 1,
+                scale: 2,
+                state: 3,
+            },
+            &vals,
+            &ty,
+            &PassInputs::default(),
+            &[],
+        )
+        .unwrap();
+        let Evaled::One(Value::I32(fused)) = fused else {
+            panic!("an index")
+        };
+        let noise = eval_op(
+            &Op::RngKeyed {
+                state: 3,
+                shape: Shape::vector(n as u32),
+                kind: RngKind::Gumbel,
+            },
+            &vals,
+            &ty,
+            &PassInputs::default(),
+            &[],
+        )
+        .unwrap();
+        let Evaled::One(Value::F32(noise)) = noise else {
+            panic!("noise")
+        };
+        let perturbed: Vec<f32> = (0..n)
+            .map(|i| {
+                let scaled = if keep[i] {
+                    x[i] * (1.0 / 0.7)
+                } else {
+                    f32::NEG_INFINITY
+                };
+                scaled + noise[i]
+            })
+            .collect();
+        assert_eq!(fused, vec![argmax_row(&perturbed)], "seed {seed}");
+    }
+}
+
+/// Over a bf16 row the draw is unbiased between two tokens whose logits
+/// round to one bf16 value: each perturbed lane is f32, so neither the
+/// rounding nor the lowest index decides it.
+#[test]
+fn a_bf16_draw_splits_a_tie_evenly() {
+    let row = [24.0f32, 24.0];
+    let bits: Vec<u16> = row.iter().map(|&a| eta_ir::types::bf16_bits(a)).collect();
+    let (mut second, trials) = (0u32, 4000u32);
+    for seed in 0..trials {
+        let vals = vec![
+            Value::Bf16(bits.clone()),
+            Value::Bool(vec![true]),
+            Value::F32(vec![1.0]),
+            Value::U32(vec![seed, 7]),
+        ];
+        let ty = |id: u32| match id {
+            0 => ValueType::vector(2, Dtype::Bf16),
+            1 => ValueType::scalar(Dtype::Bool),
+            2 => ValueType::scalar(Dtype::F32),
+            _ => ValueType::vector(2, Dtype::U32),
+        };
+        let Evaled::One(Value::I32(i)) = eval_op(
+            &Op::GumbelArgmax {
+                logits: 0,
+                keep: 1,
+                scale: 2,
+                state: 3,
+            },
+            &vals,
+            &ty,
+            &PassInputs::default(),
+            &[],
+        )
+        .unwrap() else {
+            panic!("an index")
+        };
+        second += i[0] as u32;
+    }
+    let share = f64::from(second) / f64::from(trials);
+    assert!(
+        (share - 0.5).abs() < 0.03,
+        "token 1 drawn {share:.3} of the time"
+    );
+}

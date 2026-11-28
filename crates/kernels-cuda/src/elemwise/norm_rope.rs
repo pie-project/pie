@@ -140,7 +140,7 @@ fn one_pass(
     let head_dim = t.head_dim;
     let rotary_dim = t.rotary_dim;
     let per = head_dim / 32;
-    let fits = ctx.tuning().rows_vec
+    let fits = ctx.tuning().rows_vec()
         && t.interleaved
         && matches!(head_dim, 128 | 256 | 512)
         && rotary_dim > 0
@@ -264,7 +264,7 @@ pub fn norm_rope_pair(
 ) -> Result<bool, Error> {
     const OP: &str = "fused.norm_rope_pair";
     let qper = q.head_dim / 32;
-    let fits = ctx.tuning().rows_vec
+    let fits = ctx.tuning().rows_vec()
         && q.x.dtype == Dtype::Bf16
         && kv.x.dtype == Dtype::Bf16
         && kv_weight.dtype == Dtype::Bf16

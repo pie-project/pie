@@ -10,8 +10,9 @@ pub struct Device {
     doc: String,
 }
 
-/// The page's boot config: the host-neutral `Settings` plus the two keys
-/// only the WebGPU engine reads.
+/// The page's boot config: the host-neutral `Settings` (`budget_device`
+/// among them, which the WebGPU engine requires, and `measure`, which its
+/// document carries) plus the key only the WebGPU engine reads.
 pub fn parse_config(text: &str) -> Result<(Settings, String)> {
     let mut document: serde_json::Value = if text.trim_start().starts_with('{') {
         serde_json::from_str(text)?
@@ -21,24 +22,19 @@ pub fn parse_config(text: &str) -> Result<(Settings, String)> {
     let table = document
         .as_object_mut()
         .ok_or_else(|| anyhow!("the boot config is not a table"))?;
-    let device_memory_mb: Option<u64> = table
-        .remove("device_memory_mb")
-        .map(serde_json::from_value)
-        .transpose()?
-        .flatten();
     let power_preference: String = table
         .remove("power_preference")
         .map(serde_json::from_value)
         .transpose()?
         .unwrap_or_else(|| "high-performance".into());
     let config: Settings = serde_json::from_value(document).context("parse the boot config")?;
-    let mut doc = format!(
-        "[wgpu]\nadapter_index = 0\npower_preference = {}\n",
+    // The tab opens its engine itself, so the worker's `[engine] measure`
+    // is carried into the engine's own document here.
+    let doc = format!(
+        "[wgpu]\nadapter_index = 0\npower_preference = {}\nmeasure = {}\n",
         toml::Value::String(power_preference),
+        config.measure,
     );
-    if let Some(mib) = device_memory_mb {
-        doc.push_str(&format!("device_memory = {}\n", mib << 20));
-    }
     Ok((config, doc))
 }
 

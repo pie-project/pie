@@ -133,6 +133,94 @@ impl TraceContainer {
     pub fn hash(&self) -> u64 {
         super::container_hash(&encode(self))
     }
+
+    /// The channels whose length is a fire's row count rather than part of
+    /// the program's code: a seeded `i32` / `u32` vector bound only to
+    /// per-row ports (tokens, positions, slots: the stage signature's
+    /// `token_count` extent) that no op, extern or input touches, in a pass
+    /// whose every port the host feeds (no op puts a port's channel, and
+    /// each is seeded or host-written). The host resolves those ports from
+    /// the channel's values, row by row, up to the rows the indptr spans;
+    /// nothing compiled reads its length. (A seeded channel a port reads is
+    /// declared a host writer, its seed the latest value.) An unseeded
+    /// host-written channel keeps its length: a writer's every put is one
+    /// length for the program's life.
+    pub fn row_extent_channels(&self) -> Vec<bool> {
+        let mut rows = alloc::vec![false; self.channels.len()];
+        let ops = || self.stages.iter().flat_map(|stage| stage.ops.iter());
+        let put = |channel: ChannelIndex| {
+            ops().any(|op| op.channel_use() == Some((op::ChannelUse::Put, channel)))
+        };
+        let host_fed = self.ports.iter().all(|binding| match binding.source {
+            PortSource::Const { .. } => true,
+            PortSource::Channel(channel) => {
+                !put(channel)
+                    && self
+                        .channels
+                        .get(channel as usize)
+                        .is_some_and(|decl| decl.seeded || decl.host_role == HostRole::Writer)
+            }
+        });
+        if !host_fed {
+            return rows;
+        }
+        for binding in &self.ports {
+            if let PortSource::Channel(channel) = binding.source
+                && let Some(flag) = rows.get_mut(channel as usize)
+            {
+                *flag = matches!(
+                    binding.port,
+                    Port::EmbedTokens | Port::Positions | Port::Slots
+                );
+            }
+        }
+        // A channel another port also binds is that port's too: unflagged.
+        for binding in &self.ports {
+            if let PortSource::Channel(channel) = binding.source
+                && !matches!(
+                    binding.port,
+                    Port::EmbedTokens | Port::Positions | Port::Slots
+                )
+                && let Some(flag) = rows.get_mut(channel as usize)
+            {
+                *flag = false;
+            }
+        }
+        for (flag, decl) in rows.iter_mut().zip(&self.channels) {
+            *flag &= decl.seeded
+                && decl.host_role != HostRole::Reader
+                && decl.shape.rank() == 1
+                && matches!(decl.dtype, ChanDType::Concrete(Dtype::I32 | Dtype::U32));
+        }
+        let touched = ops()
+            .filter_map(|op| op.channel_use().map(|(_, channel)| channel))
+            .chain(self.externs.iter().map(|binding| binding.chan))
+            .chain(self.inputs.iter().copied());
+        for channel in touched {
+            if let Some(flag) = rows.get_mut(channel as usize) {
+                *flag = false;
+            }
+        }
+        rows
+    }
+
+    /// This program as one identity for every row count: each
+    /// [`row_extent_channels`](Self::row_extent_channels) channel declared at
+    /// `rows`, the most rows one fire binds, whatever its own length. A
+    /// request's length is then data (the host resolves the ports from the
+    /// instance's own rows, the indptr states the live ones, and a pass
+    /// longer than one fire is cut into fires), so programs that differ only
+    /// in it encode, hash and register alike. Returns which channels are so
+    /// declared.
+    pub fn bind_row_extents(&mut self, rows: u32) -> Vec<bool> {
+        let bound = self.row_extent_channels();
+        for (decl, &bound) in self.channels.iter_mut().zip(&bound) {
+            if bound {
+                decl.shape = Shape::vector(rows);
+            }
+        }
+        bound
+    }
 }
 
 fn wire_len<T>(len: usize, table: &str) -> T

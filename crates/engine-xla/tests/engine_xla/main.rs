@@ -1,17 +1,39 @@
 //! engine-xla's integration tests, one binary: each module was a test file.
 
+mod a_batched_decode_answers_what_each_lane_answers_alone;
+mod a_beam_step_matches_the_host_replay;
+mod a_corrupt_recorded_program_is_built_again;
+mod a_device_fold_replays_what_a_host_fold_replays;
+mod a_fire_the_load_did_not_prepare_is_counted;
+mod a_guest_reading_no_plane_is_refused_at_registration;
+mod a_masked_beam_beside_plain_decodes_answers_as_each_alone;
+mod a_pool_view_reads_the_packed_rows_order;
+mod a_readout_lands_in_one_plane_shape;
+mod a_registered_channel_carries_one_cell_across_its_instances;
+mod a_sink_xla_does_not_run_is_refused_at_registration;
+mod a_stale_trace_record_is_traced_again;
+mod a_state_model_serves_the_cuda_reference;
+mod an_adapter_lies_in_its_slots;
+mod an_output_less_run_fences_the_slot_it_read;
 mod common;
 mod common_dit;
 mod common_llm;
 
 mod a_channel_fed_voxel_input_lands_the_committed_cell;
+mod a_channel_slot_parks_and_returns_whole;
 mod a_context_input_merged_into_the_stream_lands_its_rows;
 mod a_conv_decoder_fires_over_a_voxel_input;
 mod a_device_geometry_beam_answers_the_host_path;
+mod a_device_open_keeps_the_process_signal_handlers;
 mod a_double_block_fires_two_streams_through_the_engine;
+mod a_lagged_window_fold_reads_what_folding_reads;
+mod a_mask_reads_from_the_committed_boundary;
+mod a_padded_decode_leaves_another_lanes_state;
 mod a_pool_answers_what_the_base_build_answered;
 mod a_prompt_length_reuses_its_programs;
+mod a_tier_read_lands_every_slot_whole;
 mod an_epilogue_agrees_with_the_host_interpreter;
+mod host_bank;
 mod kernels_act;
 mod kernels_attn;
 mod kernels_collective;
@@ -35,4 +57,7 @@ mod kernels_spatial;
 mod kernels_ssm;
 mod nemotron_traces_on_a_dry_device;
 mod pjrt_runs_a_built_module;
+mod snapshots;
 mod speed;
+
+mod streamed_weights;

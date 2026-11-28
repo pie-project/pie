@@ -425,6 +425,7 @@ pub struct Rig {
     /// The plan's guest inputs by name, in id order.
     pub inputs: Vec<String>,
     next_channel: u64,
+    guest: crate::guest::Guest,
     _dir: tempfile::TempDir,
 }
 
@@ -453,10 +454,7 @@ impl Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
         let mut boot = engine_cuda::DeviceBoot::default();
-        boot.knobs.chip = Some(engine_cuda::chip::pinned(
-            engine_cuda::Graphs::On,
-            Some(recording),
-        ));
+        boot.knobs.pin = Some((engine_cuda::Graphs::On, Some(recording)));
         let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
         let facts = plan.facts.clone();
         let inputs = plan.inputs.iter().map(|input| input.name.clone()).collect();
@@ -478,12 +476,17 @@ impl Rig {
                     max_voxels: None,
                     max_clips: None,
                 },
-                residency: Residency::default(),
+                residency: Residency {
+                    device_kv_budget: Some(crate::POOL),
+                    ..Residency::default()
+                },
                 ordinal: 0,
                 frames_in_flight: 1,
+                steps: Default::default(),
             })
             .expect("the miniature loads");
         Rig {
+            guest: crate::guest::Guest::on(&mut engine, &loaded.caps.chunks),
             engine,
             loaded,
             facts,
@@ -545,9 +548,9 @@ impl Rig {
     fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> ChannelId {
         let id = ChannelId(self.next_channel);
         self.next_channel += 1;
-        Channels::open(
+        self.guest.register(
             &mut self.engine,
-            &ChannelRegistration {
+            ChannelRegistration {
                 id,
                 shape,
                 dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -556,9 +559,9 @@ impl Rig {
                 extern_dir: None,
                 capacity: 2,
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             },
-        )
-        .expect("the channel registers");
+        );
         id
     }
 
@@ -572,9 +575,9 @@ impl Rig {
         let timestep = self.channel(vec![1, 1], HostRole::Writer);
         let positions = self.channel(vec![rows, 2], HostRole::Writer);
         let out = self.channel(vec![rows, width], HostRole::Reader);
-        let bound = self
-            .engine
-            .bind(&InstanceBinding {
+        let bound = self.guest.bind(
+            &mut self.engine,
+            InstanceBinding {
                 program,
                 channels: vec![latent, timestep, positions, out],
                 seeds: Vec::new(),
@@ -587,8 +590,14 @@ impl Rig {
                     query_len: rows,
                     ..engine::program::BindExtents::default()
                 },
-            })
-            .expect("the instance binds");
+                instance_slots: Vec::new(),
+                ring_slots: Vec::new(),
+                adapter_slots: Vec::new(),
+                scratch: engine::ScratchPlace::None,
+                pair: engine::ScratchPlace::None,
+                pair_generation: 0,
+            },
+        );
         LaneHandles {
             instance: bound.id,
             latent,
@@ -655,6 +664,7 @@ pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
         lanes: 1,
         instance: handles.instance,
         adapter_only: false,
+        scratch: ::engine::ScratchPlace::None,
     }
 }
 
@@ -664,6 +674,7 @@ pub fn frame(lanes: Vec<Lane>, attachments: Vec<Attachment>) -> FrameSubmission 
         attachments,
         media: Vec::new(),
         voxels: Vec::new(),
+        shape: None,
     })
 }
 

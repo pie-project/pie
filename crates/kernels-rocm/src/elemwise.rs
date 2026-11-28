@@ -25,16 +25,69 @@ const WARP: u32 = 64;
 
 const VEC_WIDTH: u32 = 8;
 
-pub(crate) fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
+/// A plane's element count as the flat kernels take it: any count a plane
+/// holds, refused at zero.
+pub(crate) fn element_count(
+    op: &'static str,
+    axis: &'static str,
+    t: &Tensor,
+) -> Result<i64, Error> {
     let n = t.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            op,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(op, "the element count", lanes)?;
-    Ok((Launch::flat(lanes, BLOCK), n))
+    if n == 0 {
+        return Err(refuse(op, format!("`{axis}` is zero")));
+    }
+    i64::try_from(n).map_err(|_| refuse(op, format!("{n} elements are past any plane")))
+}
+
+/// A flat grid-stride sweep over `n` elements (or lanes), a thread each,
+/// and the index type its kernel runs at: unsigned 32-bit while `n` fits
+/// a signed 32-bit count (a thread's next index then stays under 2^32),
+/// 64-bit past it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sweep {
+    pub launch: Launch,
+    pub n: i64,
+}
+
+impl Sweep {
+    #[allow(clippy::cast_sign_loss)]
+    pub(crate) fn of(n: i64, block: u32) -> Sweep {
+        Sweep {
+            launch: Launch::strided(n as u64, block),
+            n,
+        }
+    }
+
+    fn narrow(self) -> bool {
+        self.n <= i64::from(i32::MAX)
+    }
+
+    /// The kernel's index type, its last template argument.
+    pub(crate) fn index(self) -> &'static str {
+        if self.narrow() {
+            "unsigned"
+        } else {
+            "long long"
+        }
+    }
+
+    /// The count as the kernel's index type takes it.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub(crate) fn count(self) -> crate::jit::ArgValue<'static> {
+        if self.narrow() {
+            crate::jit::ArgValue::U32(self.n as u32)
+        } else {
+            crate::jit::ArgValue::I64(self.n)
+        }
+    }
+}
+
+/// A flat sweep over `t`'s elements, a thread an element.
+pub(crate) fn elementwise(op: &'static str, t: Tensor) -> Result<Sweep, Error> {
+    Ok(Sweep::of(
+        element_count(op, "the element count", &t)?,
+        BLOCK,
+    ))
 }
 
 fn route_rows(rows: u32, width: u32) -> Launch {

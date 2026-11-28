@@ -186,6 +186,7 @@ fn gated_delta(gpu: &Gpu, dim: u32, tuning: &kernels_metal::Tuning, what: &str) 
                     commit: gpu.ints(&[commit as i32], Dtype::I32),
                     slots: gpu.ints(&[slot as i32], Dtype::I32),
                     lane0: 0,
+                    ext_replay: gpu.ints(&[0], Dtype::I32),
                 },
                 gates_t,
                 &pool(slot, T),
@@ -233,6 +234,7 @@ fn gated_delta(gpu: &Gpu, dim: u32, tuning: &kernels_metal::Tuning, what: &str) 
 
 #[test]
 fn a_prompt_scan_lands_its_snapshots() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;
@@ -315,6 +317,7 @@ fn a_prompt_scan_lands_its_snapshots() {
                 commit: gpu.ints(&[T as i32], Dtype::I32),
                 slots: gpu.ints(&[5], Dtype::I32),
                 lane0: 0,
+                ext_replay: gpu.ints(&[0], Dtype::I32),
             },
             weight,
             &conv_pool(5, T),
@@ -342,5 +345,4 @@ fn a_prompt_scan_lands_its_snapshots() {
         window(3),
         "the committed conv lands its window as of the row"
     );
-    eprintln!("snapshots at rows {SNAPS:?} of {T} land every scan's state bit for bit");
 }

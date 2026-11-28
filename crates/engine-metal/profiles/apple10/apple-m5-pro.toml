@@ -1,0 +1,18 @@
+api = 1
+
+[target]
+device = "Apple M5 Pro"
+
+[kernel]
+# kernel.dense from `pie tune metal` (quick grid) on 2026-11-21: the tensor-op
+# tile, the few-row vector forms and the simdgroup row tiles timed at rows 2 to
+# 512 over Qwen3-0.6B's, Qwen3.5-0.8B's, Gemma 4 E4B's and an 8B layer's bf16
+# weight shapes, each launch checked against an f64 reference; this ladder runs
+# at 1.009x the per-point best, the unmeasured route (the tile from 8 rows) at
+# 1.033x. At 8 rows the tile pads 8 rows to its 32 and loses to the 8-row
+# simdgroup tile by 1.1-1.9x; from 10 rows it wins by up to 1.8x.
+dense = [
+  { when = "rows >= 10", use = "mpp" },
+  { when = "rows < 8 and n < 248320", use = "rows" },
+  "tile",
+]

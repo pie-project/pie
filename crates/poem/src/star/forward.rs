@@ -372,6 +372,15 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    /// States how many tokens the model's draft head chains in one pass:
+    /// what a guest may draft a round, whatever width `mtp.drafts` has.
+    fn draft_depth(#[starlark(require = pos)] depth: u32) -> anyhow::Result<NoneType> {
+        let rec = with(|t| t.inputs.first().map(|i| i.recorder().clone()))
+            .ok_or_else(|| anyhow::anyhow!("a draft depth is stated while `forward` runs"))?;
+        dsl("draft_depth", || rec.draft_depth(depth))?;
+        Ok(NoneType)
+    }
+
     fn switch_is(
         #[starlark(require = pos)] name: &str,
         #[starlark(require = pos)] value: &str,

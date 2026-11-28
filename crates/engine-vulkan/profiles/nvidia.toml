@@ -1,0 +1,17 @@
+api = 1
+
+[target]
+assumes = { vendor = "nvidia" }
+
+[kernel]
+gemm.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]
+moe.path = [{ when = "coopmat", use = "coopmat" }, { use = "tiled" }]
+qmm = [
+  { when = "coopmat and rows >= 12", use = "coopmat" },
+  { when = "rows >= 12", use = "tiled", crossover_tg = 160 },
+  { use = "qmv", vecs = 4 },
+]
+sdpa.decode.split = [
+  { when = "cores > 0", use = "per_core", per = 1 },
+  { use = "fixed", groups = 16 },
+]

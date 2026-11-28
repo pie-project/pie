@@ -580,8 +580,15 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
         if !matches!(decl.def, Def::Weight(_))
             && let Ty::Tensor { shape, .. } = &decl.ty
         {
+            // A capturing lane's row is the one value whose width the load
+            // states: its last axis, runs of the load's context.
+            let capture_width = |axis: usize, dim: Dim| {
+                shape.first() == Some(&Dim::Capturing)
+                    && axis == shape.len() - 1
+                    && matches!(dim, Dim::ContextTimes(_) | Dim::ContextPages)
+            };
             for (axis, &dim) in shape.iter().enumerate().skip(1) {
-                if !matches!(dim, Dim::Const(_)) {
+                if !matches!(dim, Dim::Const(_)) && !capture_width(axis, dim) {
                     faults.push(Fault::SymbolicAxis { id, axis, dim });
                 }
             }
@@ -742,6 +749,9 @@ impl Display for D {
             Dim::VoxelsScaled(n, d) => write!(f, "voxels*{n}/{d}"),
             Dim::Clips => f.write_str("clips"),
             Dim::ClipsPlus(k) => write!(f, "clips+{k}"),
+            Dim::Capturing => f.write_str("capturing"),
+            Dim::ContextTimes(k) => write!(f, "context*{k}"),
+            Dim::ContextPages => f.write_str("context-pages"),
         }
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 
 use super::hash::Hash256;
@@ -83,7 +83,7 @@ type Runs = SmallVec<[Range<u32>; 2]>;
 
 /// A page as a snapshot keeps it.
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ExportedPage {
     pub backing: KvPageBacking,
     pub key: Option<Hash256>,
@@ -91,7 +91,7 @@ pub struct ExportedPage {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct ExportedSet {
     pub pages: Vec<ExportedPage>,
     pub page_len: u64,
@@ -106,6 +106,10 @@ pub struct PublishedPage {
     pub token_hashes: Vec<Option<Hash256>>,
     pub page_hash: Option<Hash256>,
 }
+
+/// Per node, what live sets and pins read of it: some of its pages, or
+/// (`None`) every one.
+pub(super) type LiveReads = FxHashMap<NodeId, Option<Vec<Range<u32>>>>;
 
 enum Pages {
     Owned {
@@ -122,6 +126,9 @@ struct KvTrieNode {
     parent: Option<NodeId>,
     children: SmallVec<[NodeId; 2]>,
     pages: Pages,
+    /// Its sealed pages are a shared set's (or came from elsewhere by key):
+    /// what the directory hears of. A private set's keys are never told.
+    published: bool,
     exact_anchors: u32,
     path_anchors: u32,
 }
@@ -131,7 +138,16 @@ struct WorkingSetEntry {
     page_len: u64,
     mapped_len: u64,
     suspended: bool,
+    /// What it has folded: the one such length a working set has, which its
+    /// recurrent state follows.
     folded: u64,
+    /// Fires on their way that fold it by a count placed when they settle.
+    /// Until they do `folded` is behind what they fold, so the set is not
+    /// forked or exported.
+    unsettled: u32,
+    /// A fold settled and its count was never told: `folded` is a lower
+    /// bound from then on.
+    bound: bool,
     /// Past them a decode wrote, and the cache lets that go first.
     prompt_pages: u64,
     owner: Option<ProcessId>,
@@ -149,6 +165,8 @@ impl WorkingSetEntry {
             mapped_len,
             suspended: false,
             folded: 0,
+            unsettled: 0,
+            bound: false,
             prompt_pages: 0,
             owner: None,
             logged: Vec::new(),
@@ -162,6 +180,12 @@ pub(super) struct KeptPath {
     pub(super) terminal: NodeId,
     pub(super) pages: u64,
 }
+
+/// What a set whose folded length is a bound is refused with, where it
+/// would be copied or kept: a child or an image states its length as exact.
+pub const UNPLACED: &str = "its frozen length is not known: a fire that was to place \
+                            its fold when it settled never did (dropped before it \
+                            settled, or run with no count reported)";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KvTableError {
@@ -188,6 +212,21 @@ pub enum KvTableError {
     NonResident { index: u64 },
     #[error("page backing changed while a residency transaction was in flight")]
     BackingChanged,
+    #[error(
+        "a fire on its way folds this working set by a count placed when it settles; it is \
+         not forked or exported until then"
+    )]
+    FoldUnsettled,
+    /// A fold settled untold: `folded` is a bound, which a copy would state
+    /// as its length.
+    #[error("{}", UNPLACED)]
+    FoldUnplaced,
+    /// [`KvPageTable::truncate`] ends inside a sealed page.
+    #[error(
+        "row {rows} ends inside a sealed page: its rows past {rows} are frozen under the key \
+         that names them"
+    )]
+    SealedPast { rows: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -211,6 +250,17 @@ pub struct KvPageTable {
     pins: HashMap<NodeId, u32>,
     swap_locations: HashSet<TriePageLocation>,
     node_starts: HashMap<Hash256, SmallVec<[NodeId; 2]>>,
+    /// Bumped by every change to the table's nodes, backings, leases, pins
+    /// or moves (a working set's log and fold counts move it not): what was
+    /// read of those under one revision stands until the next.
+    rev: u64,
+    /// Per trie node, the epoch through which a fire may read its pages past
+    /// what its live readers hold ([`Self::stamp_path`]): only those not
+    /// yet retired.
+    read_through: HashMap<NodeId, u64>,
+    /// The last epoch handed out, and the last retired ([`Self::epochs`]).
+    handed: u64,
+    retired: u64,
 }
 
 /// Pages sealed apart are copies, and one may be off the device.
@@ -221,7 +271,13 @@ impl KvPageTable {
         Self::default()
     }
 
+    /// See the `rev` field.
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
+
     pub fn create_working_set(&mut self) -> WorkingSetId {
+        self.rev += 1;
         self.working_sets.insert(WorkingSetEntry::new(None, 0, 0))
     }
 
@@ -229,8 +285,18 @@ impl KvPageTable {
         self.working_sets.iter().count()
     }
 
+    /// Not while a fire on its way folds `ws` by a count placed when it
+    /// settles, nor once such a fold settled untold: the child would take a
+    /// folded length behind the device's.
     pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvTableError> {
+        self.rev += 1;
         let entry = self.entry(ws)?;
+        if entry.unsettled > 0 {
+            return Err(KvTableError::FoldUnsettled);
+        }
+        if entry.bound {
+            return Err(KvTableError::FoldUnplaced);
+        }
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
         // The child holds what the parent's log knows, short of what the
         // parent's fires on their way may still change, and what it froze.
@@ -333,6 +399,7 @@ impl KvPageTable {
     }
 
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvTableError> {
+        self.rev += 1;
         let entry = self.entry_mut(ws)?;
         let start = entry.page_len;
         entry.page_len += pages;
@@ -344,6 +411,7 @@ impl KvPageTable {
         ws: WorkingSetId,
         pages: Vec<PublishedPage>,
     ) -> Result<(), KvTableError> {
+        self.rev += 1;
         let entry = self.entry(ws)?;
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
         let count = pages.len() as u64;
@@ -393,6 +461,7 @@ impl KvPageTable {
                         token_hashes,
                         page_hashes,
                     },
+                    published: false,
                     exact_anchors: 0,
                     path_anchors: 0,
                 });
@@ -420,6 +489,7 @@ impl KvPageTable {
         from: u64,
         pages: Vec<PublishedPage>,
     ) -> Result<Vec<KvPageBacking>, KvTableError> {
+        self.rev += 1;
         let entry = self.entry(ws)?;
         let (terminal, page_len, mapped_len) = (entry.terminal, entry.page_len, entry.mapped_len);
         if from > mapped_len {
@@ -454,6 +524,47 @@ impl KvPageTable {
         Ok(Vec::new())
     }
 
+    /// `ws` ends at row `rows`: what it holds past them goes, the pages
+    /// wholly past them leave its path (freed where nothing else holds
+    /// them), and its folded length, log and prompt reach stop there. The
+    /// page the rows end inside stays, its rows past `rows` the buffer's.
+    /// Refused while a fold is on its way unplaced, or where that page is
+    /// sealed: a sealed page is frozen whole, and its rows past `rows` would
+    /// be written in place under the key that names them.
+    pub fn truncate(
+        &mut self,
+        ws: WorkingSetId,
+        rows: u64,
+        page_size: u32,
+    ) -> Result<Vec<KvPageBacking>, KvTableError> {
+        let page = u64::from(page_size.max(1));
+        let entry = self.entry(ws)?;
+        if entry.unsettled > 0 {
+            return Err(KvTableError::FoldUnsettled);
+        }
+        let (terminal, mapped_len) = (entry.terminal, entry.mapped_len);
+        let kept = rows.div_ceil(page).min(mapped_len);
+        if !rows.is_multiple_of(page) && rows / page < mapped_len && self.sealed(ws, rows / page)? {
+            return Err(KvTableError::SealedPast { rows });
+        }
+        let freed = if kept < mapped_len {
+            let segs = self.segments(terminal, mapped_len);
+            let terminal = (kept > 0).then(|| self.boundary_terminal(&segs, kept));
+            self.move_terminal(ws, terminal)?
+        } else {
+            Vec::new()
+        };
+        let entry = self.entry_mut(ws)?;
+        entry.mapped_len = kept;
+        entry.folded = entry.folded.min(rows);
+        entry.prompt_pages = entry.prompt_pages.min(rows / page);
+        entry.logged.truncate(rows as usize);
+        for cut in entry.pending.values_mut() {
+            *cut = (*cut).min(rows);
+        }
+        Ok(freed)
+    }
+
     pub fn commit_in_place(
         &mut self,
         ws: WorkingSetId,
@@ -461,6 +572,7 @@ impl KvPageTable {
         token_hashes: Vec<Option<Hash256>>,
         page_hash: Option<Hash256>,
     ) -> Result<(), KvTableError> {
+        self.rev += 1;
         let (owner, owner_local) = self.page_owner(ws, index)?;
         let node = self.nodes.get_mut(owner).expect("live node");
         match &mut node.pages {
@@ -488,11 +600,38 @@ impl KvPageTable {
         Ok(entry.folded)
     }
 
+    /// A fire on its way folds `ws` by a count placed when it settles.
+    pub fn unsettle(&mut self, ws: WorkingSetId) -> Result<(), KvTableError> {
+        self.entry_mut(ws)?.unsettled += 1;
+        Ok(())
+    }
+
+    /// That fire settled, `placed` when its count was.
+    pub fn fold_settled(&mut self, ws: WorkingSetId, placed: bool) -> Result<(), KvTableError> {
+        let entry = self.entry_mut(ws)?;
+        entry.unsettled = entry.unsettled.saturating_sub(1);
+        entry.bound |= !placed;
+        Ok(())
+    }
+
+    /// How many fires on their way fold `ws` by a count not placed yet.
+    pub fn unsettled(&self, ws: WorkingSetId) -> Result<u32, KvTableError> {
+        Ok(self.entry(ws)?.unsettled)
+    }
+
+    /// Whether `folded` is all `ws` has folded: no fold is on its way
+    /// unplaced, and none settled untold.
+    pub fn folded_exact(&self, ws: WorkingSetId) -> Result<bool, KvTableError> {
+        let entry = self.entry(ws)?;
+        Ok(entry.unsettled == 0 && !entry.bound)
+    }
+
     pub fn prompt_pages(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
         Ok(self.entry(ws)?.prompt_pages)
     }
 
     pub fn reach_prompt(&mut self, ws: WorkingSetId, pages: u64) -> Result<(), KvTableError> {
+        self.rev += 1;
         let entry = self.entry_mut(ws)?;
         entry.prompt_pages = entry.prompt_pages.max(pages);
         Ok(())
@@ -582,12 +721,16 @@ impl KvPageTable {
         Ok(self.page_hash_at(ws, index)?.is_some())
     }
 
+    /// `published`: `ws` shares, so the pages it seals are told to the
+    /// directory.
     pub fn commit_hashes(
         &mut self,
         ws: WorkingSetId,
         first: u64,
         pages: Vec<(Vec<Option<Hash256>>, Option<Hash256>)>,
+        published: bool,
     ) -> Result<(), KvTableError> {
+        self.rev += 1;
         let entry = self.entry(ws)?;
         let end = first + pages.len() as u64;
         if end > entry.mapped_len {
@@ -605,7 +748,9 @@ impl KvPageTable {
                 .copied()
                 .expect("published mapping covers [0, mapped_len)");
             let (owner, local) = self.resolve_owner(seg.node, (index as i64 - seg.start) as u64);
-            match &mut self.nodes.get_mut(owner).expect("live node").pages {
+            let node = self.nodes.get_mut(owner).expect("live node");
+            node.published |= published && page.is_some();
+            match &mut node.pages {
                 Pages::Owned {
                     token_hashes,
                     page_hashes,
@@ -666,6 +811,7 @@ impl KvPageTable {
 
     #[cfg(test)]
     pub fn release_working_set(&mut self, ws: WorkingSetId) -> Vec<PhysicalKvPageId> {
+        self.rev += 1;
         self.release_working_set_backings(ws)
             .into_iter()
             .filter_map(|backing| match backing {
@@ -679,6 +825,7 @@ impl KvPageTable {
     }
 
     pub fn release_working_set_backings(&mut self, ws: WorkingSetId) -> Vec<KvPageBacking> {
+        self.rev += 1;
         let Some(entry) = self.working_sets.remove(ws) else {
             return Vec::new();
         };
@@ -756,6 +903,7 @@ impl KvPageTable {
         node: NodeId,
         local: u64,
     ) -> Result<u64, KvTableError> {
+        self.rev += 1;
         let node_len = self.contribution_len(node);
         debug_assert!(local < node_len);
         let end = self.path_prefix_len(node, local);
@@ -814,6 +962,7 @@ impl KvPageTable {
     }
 
     pub(super) fn keep_prefix_of(&mut self, path: KeptPath, pages: u64) -> KeptPath {
+        self.rev += 1;
         let segs = self.segments(Some(path.terminal), path.pages);
         let terminal = self.boundary_terminal(&segs, pages);
         KeptPath { terminal, pages }
@@ -824,6 +973,7 @@ impl KvPageTable {
         ws: WorkingSetId,
         pages: u64,
     ) -> Result<KeptPath, KvTableError> {
+        self.rev += 1;
         let entry = self.entry(ws)?;
         let segs = self.segments(entry.terminal, entry.mapped_len);
         let terminal = self.boundary_terminal(&segs, pages);
@@ -831,12 +981,21 @@ impl KvPageTable {
     }
 
     pub fn set_owner(&mut self, ws: WorkingSetId, owner: ProcessId) -> Result<(), KvTableError> {
+        self.rev += 1;
         self.entry_mut(ws)?.owner = Some(owner);
         Ok(())
     }
 
     pub fn owner(&self, ws: WorkingSetId) -> Result<Option<ProcessId>, KvTableError> {
         Ok(self.entry(ws)?.owner)
+    }
+
+    /// The owners of the live working sets.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn working_set_owners(&self) -> impl Iterator<Item = ProcessId> + '_ {
+        self.working_sets
+            .iter()
+            .filter_map(|(_, entry)| entry.owner)
     }
 
     pub fn page_hash_at(
@@ -912,8 +1071,37 @@ impl KvPageTable {
     pub fn sealed_key_list(&self, ids: &[NodeId]) -> Vec<Hash256> {
         let mut keys = Vec::new();
         for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
+            if !node.published {
+                continue;
+            }
             if let Pages::Owned { page_hashes, .. } = &node.pages {
                 keys.extend(page_hashes.iter().flatten().copied());
+            }
+        }
+        keys
+    }
+
+    /// The sealed pages of the nodes of `ids` that are off the device, by
+    /// key: `false` on the host, `true` on disk.
+    pub fn off_device_key_list(&self, ids: &[NodeId]) -> Vec<(Hash256, bool)> {
+        let mut keys = Vec::new();
+        for node in ids.iter().filter_map(|&id| self.nodes.get(id)) {
+            if let Pages::Owned {
+                page_hashes,
+                backings,
+                ..
+            } = &node.pages
+            {
+                for (key, backing) in page_hashes.iter().zip(backings) {
+                    let on_disk = match backing {
+                        KvPageBacking::Resident(_) => continue,
+                        KvPageBacking::Swapped(_) => false,
+                        KvPageBacking::OnDisk(_) => true,
+                    };
+                    if let Some(key) = key {
+                        keys.push((*key, on_disk));
+                    }
+                }
             }
         }
         keys
@@ -930,6 +1118,7 @@ impl KvPageTable {
         token_hashes: Vec<Vec<Option<Hash256>>>,
         page_hashes: Vec<Hash256>,
     ) -> NodeId {
+        self.rev += 1;
         let parent = after.map(|at| {
             let pages = match &self.nodes.get(at.node).expect("live node").pages {
                 Pages::Owned { backings, .. } => backings.len() as u64,
@@ -950,6 +1139,7 @@ impl KvPageTable {
                 token_hashes,
                 page_hashes: page_hashes.into_iter().map(Some).collect(),
             },
+            published: true,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -967,12 +1157,14 @@ impl KvPageTable {
     }
 
     pub fn lease_cache_root(&mut self, node: NodeId) {
+        self.rev += 1;
         if hold(&mut self.cache_roots, node) {
             self.add_anchor(node);
         }
     }
 
     pub fn release_cache_root(&mut self, node: NodeId) -> Vec<KvPageBacking> {
+        self.rev += 1;
         if !let_go(&mut self.cache_roots, node) {
             return Vec::new();
         }
@@ -980,15 +1172,18 @@ impl KvPageTable {
     }
 
     pub fn pin(&mut self, node: NodeId) {
+        self.rev += 1;
         if hold(&mut self.pins, node) {
             self.add_anchor(node);
         }
     }
 
     pub fn unpin(&mut self, node: NodeId) -> Vec<KvPageBacking> {
+        self.rev += 1;
         if !let_go(&mut self.pins, node) {
             return Vec::new();
         }
+        self.stamp_path(node, None, self.handed);
         self.remove_anchor(node)
     }
 
@@ -1099,6 +1294,69 @@ impl KvPageTable {
         Ok(self.resolve_owner(seg.node, (index as i64 - seg.start) as u64))
     }
 
+    /// The epoch through which a fire may read the pages that go with the
+    /// one anchor at `terminal`: 0 where none may. Above the first node
+    /// another anchor holds nothing goes, and the fires that read there are
+    /// no fires of these pages.
+    pub fn read_through(&self, terminal: NodeId) -> u64 {
+        let mut through = 0;
+        let mut cursor = Some(terminal);
+        while let Some(node) = cursor {
+            let Some(entry) = self.nodes.get(node) else {
+                break;
+            };
+            let goes = entry.path_anchors <= 1;
+            // The first that stays too: its child gone, the pages no
+            // selection takes of it may go ([`Self::compact_owner`]).
+            through = through.max(self.node_read_through(node));
+            if !goes {
+                break;
+            }
+            cursor = entry.parent;
+        }
+        through
+    }
+
+    /// The epoch through which a fire may read `node`'s own pages.
+    pub fn node_read_through(&self, node: NodeId) -> u64 {
+        self.read_through.get(&node).copied().unwrap_or(0)
+    }
+
+    /// A fire handed out through `epoch` may read the pages on `node`'s
+    /// path, down from what `held` (a path its reader stays on) holds.
+    pub fn stamp_path(&mut self, node: NodeId, held: Option<NodeId>, epoch: u64) {
+        if epoch <= self.retired {
+            return;
+        }
+        // An owner its selection alone is held through is held in part.
+        let mut whole = FxHashSet::default();
+        let mut in_part = false;
+        for node in held.map_or_else(Vec::new, |held| self.lineage(held)) {
+            if !in_part {
+                whole.insert(node);
+            }
+            in_part = self.node_is_selection(node);
+        }
+        for node in self.lineage(node) {
+            if whole.contains(&node) {
+                break;
+            }
+            let stamp = self.read_through.entry(node).or_insert(0);
+            *stamp = (*stamp).max(epoch);
+        }
+    }
+
+    /// Fires are handed out through `handed` and retired through `retired`.
+    pub fn epochs(&mut self, handed: u64, retired: u64) {
+        self.handed = handed;
+        if retired > self.retired {
+            self.retired = retired;
+            if !self.read_through.is_empty() {
+                self.read_through.retain(|_, stamp| *stamp > retired);
+            }
+        }
+    }
+
     fn move_terminal(
         &mut self,
         ws: WorkingSetId,
@@ -1112,6 +1370,10 @@ impl KvPageTable {
             self.add_anchor(node);
         }
         self.entry_mut(ws)?.terminal = terminal;
+        // The set's fires in flight read what it leaves.
+        if let Some(left) = previous {
+            self.stamp_path(left, terminal, self.handed);
+        }
         Ok(previous.map_or_else(Vec::new, |node| self.remove_anchor(node)))
     }
 
@@ -1311,6 +1573,7 @@ impl KvPageTable {
             parent: Some(owner),
             children: SmallVec::new(),
             pages: Pages::ParentSelection { runs },
+            published: false,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -1334,13 +1597,13 @@ impl KvPageTable {
     }
 
     /// `None` for all of it, else the runs their selections take of it.
-    fn live_reads(&self) -> HashMap<NodeId, Option<Vec<Range<u32>>>> {
+    pub(super) fn live_reads(&self) -> LiveReads {
         let anchors = self
             .working_sets
             .iter()
             .filter_map(|(_, e)| e.terminal)
             .chain(self.pins.keys().copied());
-        let mut reads: HashMap<NodeId, Option<Vec<Range<u32>>>> = HashMap::new();
+        let mut reads = LiveReads::default();
         for anchor in anchors {
             let (mut cursor, mut read) = (anchor, None);
             loop {
@@ -1380,21 +1643,25 @@ impl KvPageTable {
         self.cache_roots
             .keys()
             .copied()
-            .filter(|&root| {
-                let node = self.nodes.get(root).expect("live node");
-                let (source, runs) = match &node.pages {
-                    Pages::ParentSelection { runs } => {
-                        (node.parent.expect("selection has owner"), runs.clone())
-                    }
-                    Pages::Owned { backings, .. } => (root, smallvec![0..backings.len() as u32]),
-                };
-                match reads.get(&source) {
-                    None => true,
-                    Some(None) => false,
-                    Some(Some(read)) => !covers(read, &runs),
-                }
-            })
+            .filter(|&root| self.unused_under(&reads, root))
             .collect()
+    }
+
+    /// Whether cache root `root` holds a page `reads` ([`Self::live_reads`])
+    /// do not.
+    pub(super) fn unused_under(&self, reads: &LiveReads, root: NodeId) -> bool {
+        let node = self.nodes.get(root).expect("live node");
+        let (source, runs) = match &node.pages {
+            Pages::ParentSelection { runs } => {
+                (node.parent.expect("selection has owner"), runs.clone())
+            }
+            Pages::Owned { backings, .. } => (root, smallvec![0..backings.len() as u32]),
+        };
+        match reads.get(&source) {
+            None => true,
+            Some(None) => false,
+            Some(Some(read)) => !covers(read, &runs),
+        }
     }
 
     pub fn unused_cache_lease_pages(&self) -> u32 {
@@ -1403,6 +1670,7 @@ impl KvPageTable {
 
     #[cfg(test)]
     pub fn drop_unused_cache_leases(&mut self) -> (usize, Vec<KvPageBacking>) {
+        self.rev += 1;
         let dropped = self.unused_cache_roots();
         let mut freed = Vec::new();
         for node in &dropped {
@@ -1486,6 +1754,104 @@ impl KvPageTable {
                 KvPageBacking::Swapped(_) | KvPageBacking::OnDisk(_) => None,
             })
             .collect())
+    }
+
+    /// [`Self::movable_resident_pages`] of each of `groups`, the running
+    /// working sets' and the pins' locations walked once for all of them:
+    /// asked one group at a time, every group walked every running set's
+    /// every page (O(groups x pages): ~32 us a process, ~9 ms a map of 250
+    /// on a realistic store, every pass that built the occupancy map).
+    pub fn movable_resident_pages_each(
+        &self,
+        groups: &[HashSet<WorkingSetId>],
+    ) -> Vec<Vec<(TriePageLocation, PhysicalKvPageId)>> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        // The running sets reading each location (one inline, more in a
+        // list: most pages have one reader), and the pinned ones.
+        enum Readers {
+            One(WorkingSetId),
+            Many(Vec<WorkingSetId>),
+        }
+        // Each running set's locations, walked once: the readers counted
+        // from them, and a group of running sets read from them again
+        // rather than resolved a second time.
+        let mut readers: FxHashMap<TriePageLocation, Readers> = FxHashMap::default();
+        let mut walked: FxHashMap<WorkingSetId, Vec<TriePageLocation>> = FxHashMap::default();
+        for (ws, entry) in self.working_sets.iter() {
+            if entry.suspended {
+                continue;
+            }
+            let mut locations = Vec::new();
+            let _ = self.visit_working_set_locations(ws, |location| {
+                locations.push(location);
+                match readers.entry(location) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Readers::One(ws));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let by = slot.get_mut();
+                        match by {
+                            Readers::One(first) => *by = Readers::Many(vec![*first, ws]),
+                            Readers::Many(list) => list.push(ws),
+                        }
+                    }
+                }
+            });
+            walked.insert(ws, locations);
+        }
+        let mut pinned: FxHashSet<TriePageLocation> = FxHashSet::default();
+        for &terminal in self.pins.keys() {
+            self.visit_anchor_locations(terminal, |location| {
+                pinned.insert(location);
+            });
+        }
+        groups
+            .iter()
+            .map(|sets| {
+                let mut seen: FxHashSet<TriePageLocation> = FxHashSet::default();
+                let mut out = Vec::new();
+                for &ws in sets {
+                    let fresh;
+                    let locations: &[TriePageLocation] = match walked.get(&ws) {
+                        Some(locations) => locations,
+                        None => {
+                            let mut locations = Vec::new();
+                            if self
+                                .visit_working_set_locations(ws, |location| {
+                                    locations.push(location)
+                                })
+                                .is_err()
+                            {
+                                // A set the table no longer knows: as a
+                                // group it names nothing movable.
+                                return Vec::new();
+                            }
+                            fresh = locations;
+                            &fresh
+                        }
+                    };
+                    for &location in locations {
+                        if (sets.len() > 1 && !seen.insert(location))
+                            || pinned.contains(&location)
+                            || readers.get(&location).is_some_and(|by| match by {
+                                Readers::One(reader) => !sets.contains(reader),
+                                Readers::Many(list) => {
+                                    list.iter().any(|reader| !sets.contains(reader))
+                                }
+                            })
+                        {
+                            continue;
+                        }
+                        if let Ok(KvPageBacking::Resident(id)) = self.backing_at(&location) {
+                            out.push((location, id));
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
     }
 
     /// Only those pages stay; the rest of `working_sets` can still go.
@@ -1597,6 +1963,19 @@ impl KvPageTable {
         })
     }
 
+    /// How many pages only the cache reads of `roots` sit below the device,
+    /// `(on the host, on disk)`, none a root of `above` reads: room a demand
+    /// can take by dropping them.
+    pub fn cache_only_below_device(&self, roots: &[NodeId], above: &[NodeId]) -> (u32, u32) {
+        let pages = self.cache_only(roots, above, |backing| match backing {
+            KvPageBacking::Swapped(_) => Some(true),
+            KvPageBacking::OnDisk(_) => Some(false),
+            KvPageBacking::Resident(_) => None,
+        });
+        let host = pages.iter().filter(|&&(_, on_host)| on_host).count() as u32;
+        (host, pages.len() as u32 - host)
+    }
+
     /// The pages of `roots` no working set, pin, move or root of `above`
     /// reads, as `pick` takes their backings.
     fn cache_only<T>(
@@ -1658,6 +2037,11 @@ impl KvPageTable {
     /// Whether any page on `root`'s path is parked on the host.
     pub fn holds_on_host(&self, root: NodeId) -> bool {
         self.holds(root, |backing| matches!(backing, KvPageBacking::Swapped(_)))
+    }
+
+    /// Whether any page on `root`'s path is held on disk.
+    pub fn holds_on_disk(&self, root: NodeId) -> bool {
+        self.holds(root, |backing| matches!(backing, KvPageBacking::OnDisk(_)))
     }
 
     fn holds(&self, root: NodeId, backed: impl Fn(&KvPageBacking) -> bool) -> bool {
@@ -1749,6 +2133,11 @@ impl KvPageTable {
             .count() as u32
     }
 
+    /// The pages a move between tiers holds a slot of on both sides.
+    pub fn moving_pages(&self) -> usize {
+        self.swap_locations.len()
+    }
+
     /// Dropping what holds it would change pages under the move.
     pub fn in_move_at(&self, root: NodeId) -> bool {
         if self.swap_locations.is_empty() {
@@ -1782,6 +2171,7 @@ impl KvPageTable {
     }
 
     pub fn set_suspended(&mut self, working_sets: &HashSet<WorkingSetId>, suspended: bool) {
+        self.rev += 1;
         for &ws in working_sets {
             if let Ok(entry) = self.entry_mut(ws) {
                 entry.suspended = suspended;
@@ -1869,9 +2259,15 @@ impl KvPageTable {
     }
 
     /// Every page of `ws`, first to last, and what the table knows of it.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn exported(&self, ws: WorkingSetId) -> Result<ExportedSet, KvTableError> {
         let entry = self.entry(ws)?;
+        if entry.unsettled > 0 {
+            return Err(KvTableError::FoldUnsettled);
+        }
+        if entry.bound {
+            return Err(KvTableError::FoldUnplaced);
+        }
         let mut locations = Vec::with_capacity(entry.mapped_len as usize);
         self.visit_working_set_locations(ws, |location| locations.push(location))?;
         let mut pages = Vec::with_capacity(locations.len());
@@ -1894,12 +2290,13 @@ impl KvPageTable {
 
     /// A working set of `pages`' own, as [`Self::exported`] said one stood,
     /// with every page at `backings`.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn imported(
         &mut self,
         set: ExportedSet,
         backings: Vec<KvPageBacking>,
     ) -> Result<WorkingSetId, KvTableError> {
+        self.rev += 1;
         let mapped_len = backings.len() as u64;
         let (token_hashes, page_hashes) = set
             .pages
@@ -1914,6 +2311,7 @@ impl KvPageTable {
                 token_hashes,
                 page_hashes,
             },
+            published: false,
             exact_anchors: 0,
             path_anchors: 0,
         });
@@ -1932,6 +2330,7 @@ impl KvPageTable {
         &mut self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<Vec<NodeId>, KvTableError> {
+        self.rev += 1;
         let mut terminals = HashSet::new();
         for &ws in working_sets {
             if let Some(terminal) = self.entry(ws)?.terminal {
@@ -1945,6 +2344,7 @@ impl KvPageTable {
     }
 
     pub fn unpin_terminals(&mut self, terminals: &[NodeId]) -> Vec<KvPageBacking> {
+        self.rev += 1;
         let mut freed = Vec::new();
         for &terminal in terminals {
             freed.extend(self.unpin(terminal));
@@ -1984,6 +2384,60 @@ impl KvPageTable {
         }
     }
 
+    /// Every page resident on the device, where it lies and its id, with
+    /// the working sets whose pages it is, each with whether it is
+    /// suspended (none: idle cache, read by no set): what a list
+    /// compaction reads its movable pages from
+    /// ([`super::KvStore::plan_list_compaction`]). `None` for a page that
+    /// stays where it lies: one a move holds, or one a pin keeps (an
+    /// export, a promote, a persist).
+    #[allow(clippy::type_complexity)]
+    pub fn device_pages_by_reader(
+        &self,
+    ) -> Vec<(
+        TriePageLocation,
+        PhysicalKvPageId,
+        Option<Vec<(WorkingSetId, bool)>>,
+    )> {
+        let mut readers: FxHashMap<TriePageLocation, Option<Vec<(WorkingSetId, bool)>>> =
+            FxHashMap::default();
+        for (ws, entry) in self.working_sets.iter() {
+            let suspended = entry.suspended;
+            let _ = self.visit_working_set_locations(ws, |location| {
+                if let Some(list) = readers.entry(location).or_insert_with(|| Some(Vec::new())) {
+                    list.push((ws, suspended));
+                }
+            });
+        }
+        for &terminal in self.pins.keys() {
+            self.visit_anchor_locations(terminal, |location| {
+                readers.insert(location, None);
+            });
+        }
+        let mut pages = Vec::new();
+        for (node, trie_node) in self.nodes.iter() {
+            let Pages::Owned { backings, .. } = &trie_node.pages else {
+                continue;
+            };
+            for (local, backing) in backings.iter().enumerate() {
+                let KvPageBacking::Resident(id) = *backing else {
+                    continue;
+                };
+                let location = TriePageLocation {
+                    node,
+                    local: local as u64,
+                };
+                let by = if self.swap_locations.contains(&location) {
+                    None
+                } else {
+                    readers.get(&location).cloned().unwrap_or(Some(Vec::new()))
+                };
+                pages.push((location, id, by));
+            }
+        }
+        pages
+    }
+
     pub fn page_location_pinned(&self, location: TriePageLocation) -> bool {
         self.swap_locations.contains(&location)
     }
@@ -1991,6 +2445,7 @@ impl KvPageTable {
     /// One move has a page at a time: every move leaves out, or waits for, the
     /// pages another holds.
     pub fn pin_swap_locations<I: IntoIterator<Item = TriePageLocation>>(&mut self, locations: I) {
+        self.rev += 1;
         for location in locations {
             let fresh = self.swap_locations.insert(location);
             debug_assert!(fresh, "a page in two residency moves");
@@ -2001,6 +2456,7 @@ impl KvPageTable {
         &mut self,
         locations: I,
     ) -> Vec<KvPageBacking> {
+        self.rev += 1;
         let mut owners = HashSet::new();
         for location in locations {
             if self.swap_locations.remove(&location) {
@@ -2018,6 +2474,7 @@ impl KvPageTable {
         &mut self,
         replacements: &[(TriePageLocation, KvPageBacking, KvPageBacking)],
     ) -> Result<(), KvTableError> {
+        self.rev += 1;
         for (location, expected, _) in replacements {
             if self.backing_at(location)? != *expected {
                 return Err(KvTableError::BackingChanged);
@@ -2038,12 +2495,55 @@ impl KvPageTable {
         Ok(())
     }
 
+    /// Every live working set whose table resolves now, and the device page
+    /// ids it names: what a page given back must be in none of (a check).
+    pub fn every_resident_table(&self) -> Vec<(WorkingSetId, Vec<u32>)> {
+        self.working_sets
+            .iter()
+            .filter_map(|(ws, _)| {
+                Some((
+                    ws,
+                    self.flatten(ws).ok()?.iter().map(|page| page.0).collect(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The device page ids `working_sets` reach that are resident, for a
+    /// debug line.
+    pub fn resident_ids(&self, working_sets: &HashSet<WorkingSetId>) -> Vec<u32> {
+        let Ok(locations) = self.locations(working_sets) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u32> = locations
+            .into_iter()
+            .filter_map(|location| match self.backing_at(&location).ok()? {
+                KvPageBacking::Resident(id) => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     fn locations(
         &self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<FxHashSet<TriePageLocation>, KvTableError> {
         let mut locations = FxHashSet::default();
-        for &ws in working_sets {
+        // Under test the sets are walked in id order, whatever order the
+        // caller's set holds them in: the locations' order (and every move
+        // laid from it) is then the same on each run of a seeded simulation.
+        // In service they are walked as the set holds them, nothing built.
+        #[cfg(test)]
+        let order = {
+            let mut order: Vec<WorkingSetId> = working_sets.iter().copied().collect();
+            order.sort_unstable_by_key(|ws| ws.to_bits());
+            order
+        };
+        #[cfg(not(test))]
+        let order = working_sets.iter().copied();
+        for ws in order {
             self.visit_working_set_locations(ws, |location| {
                 locations.insert(location);
             })?;

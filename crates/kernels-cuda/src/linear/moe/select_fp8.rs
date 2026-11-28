@@ -156,14 +156,14 @@ pub fn select_fp8_w8a8(
     // slower a step at 384 to 492 rows.
     // A prefill's busy experts on the warp-specialized GEMM
     // (`kernel.moe.fp8a8_ws_from`): 128 routes by 128 weight rows a CTA.
-    let ws_from = ctx.tuning().fp8a8_ws_from;
+    let ws_from = ctx.tuning().fp8a8_ws_from();
     if hopper_wgmma() && ws_from > 0 && per >= ws_from {
         // The weight rows by TMA, persistent (`kernel.moe.fp8a8_tma`), on a
         // bank the device holds (a streamed table may name host memory).
-        if ctx.tuning().fp8a8_tma
+        if ctx.tuning().fp8a8_tma()
             && !table.streams()
             && y.width.is_multiple_of(256)
-            && !ctx.tuning().fp8a8_ws_narrow
+            && !ctx.tuning().fp8a8_ws_narrow()
         {
             use crate::linear::gemm_sm100::{Map, encode};
             use cudarc::driver::sys as dr;
@@ -239,7 +239,7 @@ pub fn select_fp8_w8a8(
         }
         // Two 128-row halves a CTA where N is whole 256s (the routes' rows
         // read half as often), four stages; one, six stages.
-        let halves: u32 = if y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow {
+        let halves: u32 = if y.width.is_multiple_of(256) && !ctx.tuning().fp8a8_ws_narrow() {
             2
         } else {
             1
@@ -778,7 +778,7 @@ pub fn select_fp8_w8a16(
     table: ExpertTable,
 ) -> Result<(), Error> {
     const THREADS: u32 = 128;
-    let depth = ctx.tuning().fp8_mma_depth;
+    let depth = ctx.tuning().fp8_mma_depth();
     let fan = selected(op, x, routes, y)?;
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(refuse(op, "a W8A16 select reads and lands bf16 rows"));
@@ -815,7 +815,7 @@ pub fn select_fp8_w8a16(
         y,
         glu.is_some(),
         fan.route_count >= FP8_GEMM_FROM,
-        ctx.tuning().fp8_mma_fill,
+        ctx.tuning().fp8_mma_fill(),
         None,
     )?;
     let fire = if tiled {
@@ -1177,7 +1177,7 @@ pub fn matmul_grouped_strided(
     // One row (a decode's) as one GEMV over every group's rows, where the
     // profile says (`kernel.gemm.grouped_gemv`): batched cuBLAS spends its
     // few CTAs on a plane a GEMV streams at full bandwidth.
-    if ctx.tuning().grouped_gemv
+    if ctx.tuning().grouped_gemv()
         && y.rows == 1
         && k.is_multiple_of(8)
         && [x.ptr, w.ptr].iter().all(|p| p.is_multiple_of(16))
@@ -1206,34 +1206,39 @@ pub fn matmul_grouped_strided(
     let alpha = 1.0f32;
     let beta = 0.0f32;
     // Column-major: Y_g^T = W_g (op T) x X_g^T.
-    // SAFETY: `handle` is this context's live cuBLAS handle bound to its stream;
-    // the planes hold what the extents say.
-    let status = unsafe {
-        cublasGemmStridedBatchedEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            int(n)?,
-            int(y.rows)?,
-            int(k)?,
-            core::ptr::from_ref(&alpha).cast(),
-            w.ptr as usize as *const core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            int(k)?,
-            i64::from(n) * i64::from(k),
-            x.ptr as usize as *const core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            int(x.width)?,
-            i64::from(k),
-            core::ptr::from_ref(&beta).cast(),
-            y.ptr as usize as *mut core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            int(y.width)?,
-            i64::from(n),
-            int(groups)?,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-        )
+    let status = if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        // SAFETY: `handle` is this context's live cuBLAS handle bound to its stream;
+        // the planes hold what the extents say.
+        unsafe {
+            cublasGemmStridedBatchedEx(
+                handle,
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                int(n)?,
+                int(y.rows)?,
+                int(k)?,
+                core::ptr::from_ref(&alpha).cast(),
+                w.ptr as usize as *const core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                int(k)?,
+                i64::from(n) * i64::from(k),
+                x.ptr as usize as *const core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                int(x.width)?,
+                i64::from(k),
+                core::ptr::from_ref(&beta).cast(),
+                y.ptr as usize as *mut core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                int(y.width)?,
+                i64::from(n),
+                int(groups)?,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
     };
     if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         Ok(())

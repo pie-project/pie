@@ -57,7 +57,8 @@ pub fn all() -> Vec<Rule> {
         rmsnorm_residual_add(),
         embed_scale_add_select(),
         embed_scale_add(),
-        residual_add_rmsnorm(),
+        // Before the MLP alone takes its products.
+        residual_add_rmsnorm_matmul_swiglu_matmul(),
         matmul_swiglu_matmul(),
         matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
         moe_mega(),
@@ -67,6 +68,10 @@ pub fn all() -> Vec<Rule> {
         matmul_bias(),
         matmul_moe_route(),
         matmul_split_rows(),
+        // After every product's own rules (a product they fold keeps them),
+        // before the residual norm alone takes the norm.
+        residual_add_rmsnorm_matmul(),
+        residual_add_rmsnorm(),
         gated_residual_norm_modulate(),
         norm_modulate(),
         norm_rope(Rotated::First),
@@ -485,12 +490,23 @@ pub fn mla_prefill_expanded() -> Rule {
 /// A log-sum-exp attention and the sinks over its output.
 #[must_use]
 pub fn lse_sink() -> Rule {
-    let pair = |decode: bool| {
+    // The attention reads the fire's per-lane masks or none
+    // (`attn.attend` with its mask open, or not).
+    let pair = |decode: bool, masked: bool| {
         template(move |p| {
             let q = p.rows("q", W);
             let cache = p.cache("cache");
             let d = p.u32("d");
             p.free("window");
+            let mask = masked.then(|| {
+                p.value(
+                    "mask",
+                    Ty::Tensor {
+                        shape: vec![poem_ir::Dim::Tokens],
+                        dtype: poem_ir::Dtype::U8,
+                    },
+                )
+            });
             let (o, lse) = if decode {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnDecodePlan));
                 both(attn::decode(
@@ -507,6 +523,7 @@ pub fn lse_sink() -> Rule {
                     None,
                     None,
                     None,
+                    mask.as_ref(),
                 ))
             } else {
                 let plan = p.value("plan", Ty::Struct(StructKind::AttnPrefillPlan));
@@ -519,7 +536,7 @@ pub fn lse_sink() -> Rule {
                     p.u32("kv_heads"),
                     p.f32("sm_scale"),
                     true,
-                    None,
+                    mask.as_ref(),
                     true,
                     None,
                     None,
@@ -536,17 +553,26 @@ pub fn lse_sink() -> Rule {
             p.export("o_out", &out);
         })
     };
-    Rule::new("fused.lse_sink", [pair(true), pair(false)], |m| {
-        let Operation::Attn(attn) = m.op("o") else {
-            panic!("the sinked output comes from an attention");
-        };
-        Fused::LseSink {
-            attn: Box::new(attn.clone()),
-            sink: m.value("sink"),
-            head_dim: m.u32("d"),
-            o_out: m.value("o_out"),
-        }
-    })
+    Rule::new(
+        "fused.lse_sink",
+        [
+            pair(true, false),
+            pair(false, false),
+            pair(true, true),
+            pair(false, true),
+        ],
+        |m| {
+            let Operation::Attn(attn) = m.op("o") else {
+                panic!("the sinked output comes from an attention");
+            };
+            Fused::LseSink {
+                attn: Box::new(attn.clone()),
+                sink: m.value("sink"),
+                head_dim: m.u32("d"),
+                o_out: m.value("o_out"),
+            }
+        },
+    )
 }
 
 /// `rope_yarn_append` reading q, k and v straight from a packed q/k/v row
@@ -732,7 +758,8 @@ fn plus_one(op: &Operation) -> bool {
 /// An attention prologue on the packed qkv row: split it, norm q and k per
 /// head, rotate them, and write k and v to the cache. Gemma 4's norms carry
 /// weights and v's a scaleless norm, rotated in part on a global layer;
-/// Muse Spark's are scaleless with v as it is, its global layers unturned.
+/// Qwen 3's carry weights with v as it is, rotated whole; Muse Spark's are
+/// scaleless with v as it is, its global layers unturned.
 #[must_use]
 pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
     Rule::new(
@@ -750,7 +777,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write() -> Rule {
 /// past a piece's widths is one no window of the product addresses.
 #[must_use]
 pub fn qkv_fused_padded() -> Rule {
-    let patterns: Vec<Template> = qkv_patterns().into_iter().skip(4).collect();
+    let patterns: Vec<Template> = qkv_patterns().into_iter().skip(4).take(2).collect();
     Rule::new(
         "fused.qkv_fused_qknorm_rope_vnorm_write",
         patterns,
@@ -760,10 +787,22 @@ pub fn qkv_fused_padded() -> Rule {
     .form("padded")
 }
 
-/// The qkv write's forms: Gemma's (the rotation: 0 none, 1 full, 2
-/// partial), MiMo's (no norms, v scaled, a partial rotation).
+/// How a qkv write norms q, k and v.
+#[derive(Clone, Copy)]
+enum QkvNorms {
+    /// q and k by their weights per head, v scaleless (Gemma's).
+    WeightedV,
+    /// q and k by their weights per head, v as it is (Qwen's).
+    Weighted,
+    /// q and k scaleless per head, v as it is (Muse Spark's).
+    Bare,
+}
+
+/// The qkv write's forms: Gemma's, Qwen's and Muse Spark's norms (the
+/// rotation: 0 none, 1 full, 2 partial), MiMo's (no norms, v scaled, a
+/// partial rotation; 3, or 4 with its heads padded).
 fn qkv_patterns() -> Vec<Template> {
-    let pattern = |gemma: bool, rope: u8| {
+    let pattern = |norms: QkvNorms, rope: u8| {
         template(move |p| {
             let packed = p.rows("packed", 3 * W);
             let positions = p.indices("positions");
@@ -797,18 +836,22 @@ fn qkv_patterns() -> Vec<Template> {
                 return;
             }
             let eps = p.f32("eps");
-            let (q, k, v) = if gemma {
-                (
+            let (q, k, v) = match norms {
+                QkvNorms::WeightedV | QkvNorms::Weighted => (
                     elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [W]), d, eps),
                     elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [W]), d, eps),
-                    elemwise::rmsnorm_no_scale(&v, d, eps),
-                )
-            } else {
-                (
+                    match norms {
+                        // Its own eps, which the rule admits only where it
+                        // is q's and k's: the match states the v norm.
+                        QkvNorms::WeightedV => elemwise::rmsnorm_no_scale(&v, d, p.f32("v_eps")),
+                        _ => v,
+                    },
+                ),
+                QkvNorms::Bare => (
                     elemwise::rmsnorm_no_scale(&q, d, eps),
                     elemwise::rmsnorm_no_scale(&k, d, eps),
                     v,
-                )
+                ),
             };
             let (q, k) = match rope {
                 0 => (q, k),
@@ -843,13 +886,16 @@ fn qkv_patterns() -> Vec<Template> {
             p.export("q", &q);
         })
     };
+    // MiMo's two are the fifth and sixth (`qkv_fused_padded`).
     vec![
-        pattern(true, 2),
-        pattern(true, 1),
-        pattern(false, 1),
-        pattern(false, 0),
-        pattern(false, 3),
-        pattern(false, 4),
+        pattern(QkvNorms::WeightedV, 2),
+        pattern(QkvNorms::WeightedV, 1),
+        pattern(QkvNorms::Bare, 1),
+        pattern(QkvNorms::Bare, 0),
+        pattern(QkvNorms::Bare, 3),
+        pattern(QkvNorms::Bare, 4),
+        pattern(QkvNorms::Weighted, 2),
+        pattern(QkvNorms::Weighted, 1),
     ]
 }
 
@@ -863,7 +909,7 @@ fn qkv_fused(m: &Match) -> Fused {
         positions: m.get("positions").filter(|_| rotated),
         q_norm_weight: m.get("q_norm"),
         k_norm_weight: m.get("k_norm"),
-        v_norm: m.get("q_norm").is_some(),
+        v_norm: m.get_f32("v_eps").is_some(),
         eps: m.get_f32("eps").unwrap_or(0.0),
         cache: m.value("cache"),
         write_page: m.value("write_page"),
@@ -896,6 +942,8 @@ fn qkv_admits(m: &Match) -> bool {
             span == d / 2 || (m.get_f32("eps").is_none() && 2 * span <= d && span > 0)
         })
         && m.get_u32("kv_width").is_none_or(|w| w % d == 0)
+        && m.get_f32("v_eps")
+            .is_none_or(|v| Some(v) == m.get_f32("eps"))
 }
 
 /// A row norm whose output joins the residual stream, optionally scaled and
@@ -1039,6 +1087,86 @@ pub fn residual_add_rmsnorm() -> Rule {
             out: m.value("out"),
         }
     })
+}
+
+/// A residual add whose sum is normed and a product of the normed rows: a
+/// backend may norm them where it stages them for the product, landing them
+/// too for their other readers (an adapter's correction reads them beside
+/// the projection).
+#[must_use]
+pub fn residual_add_rmsnorm_matmul() -> Rule {
+    let chain = |norm: Norm| {
+        template(move |p| {
+            let y_out = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
+            p.export("y_out", &y_out);
+            let out = norm.apply(p, &y_out, "weight", "eps");
+            p.export("out", &out);
+            let z = linear::matmul(&out, &p.weight("w", [W, W]));
+            p.export("z", &z);
+        })
+    };
+    Rule::new(
+        "fused.residual_add_rmsnorm_matmul",
+        Norm::BOTH.map(chain),
+        |m| Fused::ResidualAddRmsnormMatmul {
+            x: m.value("x"),
+            y: m.value("y"),
+            y_out: m.value("y_out"),
+            weight: m.value("weight"),
+            plus_one: plus_one(m.op("out")),
+            eps: m.f32("eps"),
+            out: m.value("out"),
+            w: m.value("w"),
+            z: m.value("z"),
+        },
+    )
+}
+
+/// [`residual_add_rmsnorm_matmul`]'s norm feeding a dense MLP whole
+/// ([`matmul_swiglu_matmul`]'s chain over the normed rows): a backend may
+/// norm them where it stages them for the gate-up product.
+#[must_use]
+pub fn residual_add_rmsnorm_matmul_swiglu_matmul() -> Rule {
+    let chain = |norm: Norm| {
+        template(move |p| {
+            let y_out = elemwise::residual_add(&p.rows("x", W), &p.rows("y", W));
+            p.export("y_out", &y_out);
+            let out = norm.apply(p, &y_out, "weight", "eps");
+            p.export("out", &out);
+            let packed = linear::matmul(&out, &p.weight("gate_up", [2 * W, W]));
+            p.name("packed", &packed);
+            let h = linear::glu(
+                &packed,
+                GluAct::Swiglu,
+                Some(p.u32("intermediate")),
+                None,
+                None,
+                None,
+            );
+            p.name("h", &h);
+            let z = linear::matmul(&h, &p.weight("down", [W, W]));
+            p.export("z", &z);
+        })
+    };
+    Rule::new(
+        "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+        Norm::BOTH.map(chain),
+        |m| Fused::ResidualAddRmsnormMatmulSwigluMatmul {
+            x: m.value("x"),
+            y: m.value("y"),
+            y_out: m.value("y_out"),
+            weight: m.value("weight"),
+            plus_one: plus_one(m.op("out")),
+            eps: m.f32("eps"),
+            out: m.value("out"),
+            gate_up: m.value("gate_up"),
+            down: m.value("down"),
+            intermediate: m.u32("intermediate"),
+            packed: m.value("packed"),
+            h: m.value("h"),
+            z: m.value("z"),
+        },
+    )
 }
 
 /// A dense MLP whole: the packed gate-up projection, swiglu, and the down

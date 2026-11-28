@@ -4,10 +4,10 @@
 //! with no slot), with the softplus gate and the floored sigmoid gate, at
 //! the baseline and (on SPIR-V) the subgroup tier. The f32 outputs and every slot's state are compared.
 
-use kernels_slang::{RaggedTensor, Tensor};
+use kernels_slang::Tensor;
 use poem_ir::Dtype;
 
-use crate::gpu::{Gpu, Out, landed, noise};
+use crate::gpu::{CSR_AT, Gpu, Out, committed_batches, csr_at, landed, noise};
 
 const SLOTS: usize = 3;
 const HEADS: usize = 2;
@@ -194,7 +194,7 @@ fn the_kda_answers_the_reference() {
             let rows = 5;
             let slot_rows = [1u32, 1, 1, 2, 2];
             let (p, host) = upload(&mut gpu, 20, rows, floor);
-            let (ib, sb) = (gpu.up_i32(&indptr), gpu.up_u32(&slot_rows));
+            let sb = gpu.up_u32(&slot_rows);
             let mut want_y = vec![0.0; rows * wide];
             let mut want_s = bank64.clone();
             for r in 0..3 {
@@ -203,31 +203,28 @@ fn the_kda_answers_the_reference() {
                     host.token(row, &mut want_s[s * slab..][..slab], &mut want_y);
                 }
             }
-            let ragged = RaggedTensor {
-                data: p.mixed,
-                indptr: t(ib, 4, 1, Dtype::I32),
-            };
-            landed(
-                &mut gpu,
-                &what("chunked"),
-                &fresh(rows, 0),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::kda::kda_chunked(
-                            c,
-                            tier,
-                            kernels_slang::RaggedTensor {
-                                data: ragged.data,
-                                indptr: ragged.indptr,
-                            },
-                            &p.gates(fl, p.f, p.b),
-                            &pool(o[1].0, sb, rows),
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-            );
+            for at in CSR_AT {
+                let csr = csr_at(&mut gpu, &indptr, at);
+                landed(
+                    &mut gpu,
+                    &format!("{} csr at {at}", what("chunked")),
+                    &fresh(rows, 0),
+                    &[want_y.clone(), want_s.clone()],
+                    &|g, o| {
+                        g.run(|c| {
+                            kernels_slang::ssm::kda::kda_chunked(
+                                c,
+                                tier,
+                                p.mixed,
+                                csr,
+                                &p.gates(fl, p.f, p.b),
+                                &pool(o[1].0, sb, rows),
+                                y(o[0].0, rows),
+                            )
+                        })
+                    },
+                );
+            }
 
             // The chunked walk landing a snapshot (CONTRACT-BC 16): request
             // 0 (lane 1 of the table) the state as of its row 2 into slot 0.
@@ -235,7 +232,7 @@ fn the_kda_answers_the_reference() {
             let rows = 5;
             let slot_rows = [1u32, 1, 1, 2, 2];
             let (p, host) = upload(&mut gpu, 40, rows, floor);
-            let (ib, sb) = (gpu.up_i32(&indptr), gpu.up_u32(&slot_rows));
+            let sb = gpu.up_u32(&slot_rows);
             let max = kernels_slang::ssm::RS_SNAPSHOTS as usize;
             let mut table = vec![0i32; 4 * 2 * max];
             table[2 * max] = 2;
@@ -256,30 +253,31 @@ fn the_kda_answers_the_reference() {
                     }
                 }
             }
-            landed(
-                &mut gpu,
-                &what("chunked, a snapshot"),
-                &fresh(rows, 0),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::kda::kda_chunked(
-                            c,
-                            tier,
-                            kernels_slang::RaggedTensor {
-                                data: p.mixed,
-                                indptr: t(ib, 4, 1, Dtype::I32),
-                            },
-                            &p.gates(fl, p.f, p.b),
-                            &kernels_slang::ssm::StatePool {
-                                snapshots: Some(snaps),
-                                ..pool(o[1].0, sb, rows)
-                            },
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-            );
+            for at in CSR_AT {
+                let csr = csr_at(&mut gpu, &indptr, at);
+                landed(
+                    &mut gpu,
+                    &format!("{} csr at {at}", what("chunked, a snapshot")),
+                    &fresh(rows, 0),
+                    &[want_y.clone(), want_s.clone()],
+                    &|g, o| {
+                        g.run(|c| {
+                            kernels_slang::ssm::kda::kda_chunked(
+                                c,
+                                tier,
+                                p.mixed,
+                                csr,
+                                &p.gates(fl, p.f, p.b),
+                                &kernels_slang::ssm::StatePool {
+                                    snapshots: Some(snaps),
+                                    ..pool(o[1].0, sb, rows)
+                                },
+                                y(o[0].0, rows),
+                            )
+                        })
+                    },
+                );
+            }
 
             // The committed window, lanes 1..4: 2 own rows after 1 replayed,
             // kept as of row 2 on slot 2; 1 after 1, kept whole on slot 0; 1
@@ -291,7 +289,6 @@ fn the_kda_answers_the_reference() {
             let slots = [7i32, 2, 0, -1];
             let rows = 6;
             let (p, host) = upload(&mut gpu, 30, rows, floor);
-            let ib = gpu.up_i32(&indptr);
             let (rb, cb, sb) = (gpu.up_i32(&replay), gpu.up_i32(&commit), gpu.up_i32(&slots));
             let mut want_y = vec![0.0; rows * wide];
             let mut want_s = bank64.clone();
@@ -319,30 +316,50 @@ fn the_kda_answers_the_reference() {
                 slots: i32s(sb, 4),
                 lane0: lane0 as u32,
             };
-            let window = i32s(ib, 4);
             let work = 4 * slab;
-            let work_t = |buf: u32| t(buf, 4, slab, Dtype::F32);
-            landed(
-                &mut gpu,
-                &what("committed"),
-                &fresh(rows, work),
-                &[want_y, want_s],
-                &|g, o| {
-                    g.run(|c| {
-                        kernels_slang::ssm::kda::kda_committed(
-                            c,
-                            tier,
-                            p.mixed,
-                            window,
-                            &committed,
-                            &p.gates(fl, p.f, p.b),
-                            &pool(o[1].0, sb, 4),
-                            work_t(o[2].0),
-                            y(o[0].0, rows),
-                        )
-                    })
-                },
-            );
+            // The window's 3 lanes in one dispatch, and in dispatches of a
+            // work plane holding 2 and 1 of them.
+            for at in CSR_AT {
+                for batch in [3u32, 2, 1] {
+                    let csr = csr_at(&mut gpu, &indptr, at);
+                    let batches = committed_batches(3, batch, &replay, lane0 as u32);
+                    landed(
+                        &mut gpu,
+                        &format!(
+                            "{} csr at {at}, {batch} lane(s) a dispatch",
+                            what("committed")
+                        ),
+                        &fresh(rows, work),
+                        &[want_y.clone(), want_s.clone()],
+                        &|g, o| {
+                            g.run(|c| {
+                                for &(first, lanes, row0) in &batches {
+                                    kernels_slang::ssm::kda::kda_committed(
+                                        c,
+                                        tier,
+                                        p.mixed,
+                                        kernels_slang::ssm::Csr {
+                                            at: csr.at + first,
+                                            lanes,
+                                            ..csr
+                                        },
+                                        &kernels_slang::ssm::Committed {
+                                            lane0: committed.lane0 + first,
+                                            ..committed
+                                        },
+                                        &p.gates(fl, p.f, p.b),
+                                        &pool(o[1].0, sb, 4),
+                                        t(o[2].0, batch as usize, slab, Dtype::F32),
+                                        y(o[0].0, rows),
+                                        row0,
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    );
+                }
+            }
         }
     }
 }

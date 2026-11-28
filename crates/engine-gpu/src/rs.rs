@@ -21,6 +21,24 @@ pub enum Role {
     KdaF,
 
     KdaB,
+
+    /// A gated-delta row's keys (the conv output's key heads, bf16), which
+    /// a decode step reads its carried rows' attention weights by
+    /// (`ChunkProfile::rs_corrected`).
+    Keys,
+
+    /// A gated-delta row's corrected value `u = beta (v - g S^T k)` (f32),
+    /// the value its delta rule writes, landed once, when the row is a
+    /// fire's own.
+    U,
+
+    /// A gated-delta row's per-head scalars (f32, `v_heads` log-gates then
+    /// `v_heads` key-norm inverses, `poem_compiler::rs::gdn_scalars_bytes`),
+    /// which the recipe's rs row lays after its corrected values. This
+    /// shell recomputes them from the row's `[b | a]` and keys: it lays the
+    /// plane (a beam's fork copies it with the rest) and neither writes nor
+    /// reads it.
+    Scalars,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +49,11 @@ pub struct Plane {
     pub dtype: Dtype,
 
     pub row_bytes: u64,
+
+    /// Whether a fire's extended run holds rows of it: a recurrence input
+    /// replayed through the activation path. A gated-delta row's keys and
+    /// corrected values are read in the pool where they lie, never extended.
+    pub extended: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,9 +72,94 @@ pub struct Layout {
 
     pub out_of: HashMap<u32, usize>,
 
+    /// Each plane by its recurrence's state cache row and its role: a
+    /// decode step finds its planes by the state it reads, whichever form
+    /// of the layer's ops named them.
+    pub by_role: HashMap<(u32, Role), usize>,
+
     pub token_bytes: u64,
 
     pub work_elems: u64,
+
+    /// The heads of the scan whose work is widest: a committed dispatch's
+    /// workgroups are its lanes times these.
+    pub work_heads: u32,
+
+    /// Each plane's life over the trace's nodes, first and last: a plane is
+    /// read only by the ops that extend its value.
+    pub plane_life: Vec<(usize, usize)>,
+    /// Each region's life: from the op that lands it extended to the last
+    /// op that reads it so (`Run::rs_ext_of`).
+    pub region_life: Vec<(usize, usize)>,
+}
+
+/// A load's recurrent planes and work plane: per-fire temporaries, laid
+/// once at load in reservations of their own, not in the activation span.
+/// The span is one binding's range, which a phone holds to as little as
+/// 1 GiB; the planes (for the top rung's tokens of own rows and as many
+/// carried, `engine::fire::ActivationRows`) and the work plane (a state a
+/// lane, for the top rung's lanes) beside its carve would push the top rung
+/// past it. Each is a binding of its own; one past a binding is refused by
+/// name at load.
+pub struct Reservation<B: Backend> {
+    planes: B::Buffer,
+    rows: u32,
+    work: B::Buffer,
+    lanes: u32,
+}
+
+impl<B: Backend> Reservation<B> {
+    /// The planes for `rows` extended rows, packed by their lives, and the
+    /// work plane for `lanes` lanes, each within `binding` bytes.
+    pub fn lay(
+        device: &B::Context,
+        layout: &Layout,
+        rows: u32,
+        lanes: u32,
+        binding: u64,
+    ) -> Result<Reservation<B>> {
+        let (_, _, planes) = layout.pack(rows);
+        let work = (u64::from(lanes.max(1)) * layout.work_elems * 4)
+            .max(4)
+            .next_multiple_of(256);
+        for (what, need) in [
+            (
+                "bytes of the recurrent planes for the top rung's rows",
+                planes,
+            ),
+            (
+                "bytes of the recurrent work plane for the top rung's lanes",
+                work,
+            ),
+        ] {
+            if need > binding {
+                return Err(Fault::Ceiling {
+                    what,
+                    need,
+                    have: binding,
+                });
+            }
+        }
+        tracing::info!(
+            planes_bytes = planes,
+            rows,
+            work_bytes = work,
+            work_lanes = lanes.max(1),
+            "the recurrent planes and work plane, each a reservation of its own"
+        );
+        Ok(Reservation {
+            planes: B::Buffer::zeroed(device, planes.max(256), crate::books::owners::RS_WORK)?,
+            rows,
+            work: B::Buffer::zeroed(device, work, crate::books::owners::RS_WORK)?,
+            lanes: lanes.max(1),
+        })
+    }
+}
+
+/// `life` widened to hold `node`.
+fn live(life: &mut (usize, usize), node: usize) {
+    life.0 = life.0.min(node);
+    life.1 = life.1.max(node);
 }
 
 fn row_of(trace: &Trace, id: ValueId) -> Result<(u32, Dtype, u64)> {
@@ -106,12 +214,28 @@ impl Layout {
         let mut region_keys: HashMap<(u32, &'static str), usize> = HashMap::new();
         let mut gates_cache: HashMap<u32, u32> = HashMap::new();
 
+        // A plane of `value`'s rows, or (`fixed`) of a row `width` wide of
+        // `dtype` read off it in place, which no fire extends.
         let mut plane = |layout: &mut Layout,
                          cache: u32,
                          role: Role,
-                         value: ValueId|
+                         value: ValueId,
+                         node: usize,
+                         fixed: Option<(u32, Dtype)>|
          -> Result<()> {
-            let (width, dtype, row_bytes) = row_of(trace, value)?;
+            let (width, dtype, row_bytes) = match fixed {
+                None => row_of(trace, value)?,
+                Some((width, dtype)) => (
+                    width,
+                    dtype,
+                    u64::from(width)
+                        * poem_compiler::arena::elem_bytes(dtype).ok_or_else(|| {
+                            Fault::Unbound {
+                                what: format!("a {dtype:?} plane, whose element has no size"),
+                            }
+                        })?,
+                ),
+            };
             let at = match plane_keys.get(&(cache, role)) {
                 Some(&at) => {
                     let have = layout.planes[at];
@@ -133,43 +257,59 @@ impl Layout {
                         width,
                         dtype,
                         row_bytes,
+                        extended: fixed.is_none(),
                     });
+                    layout.plane_life.push((node, node));
                     plane_keys.insert((cache, role), layout.planes.len() - 1);
+                    layout
+                        .by_role
+                        .insert((cache, role), layout.planes.len() - 1);
                     layout.planes.len() - 1
                 }
             };
+            live(&mut layout.plane_life[at], node);
             layout.in_of.insert(value.0, at);
             Ok(())
         };
-        let mut region =
-            |layout: &mut Layout, cache: u32, what: &'static str, value: ValueId| -> Result<()> {
-                let (width, dtype, row_bytes) = row_of(trace, value)?;
-                let at = match region_keys.get(&(cache, what)) {
-                    Some(&at) => at,
-                    None => {
-                        layout.regions.push(Region {
-                            width,
-                            dtype,
-                            row_bytes,
-                        });
-                        region_keys.insert((cache, what), layout.regions.len() - 1);
-                        layout.regions.len() - 1
-                    }
-                };
-                layout.out_of.insert(value.0, at);
-                Ok(())
-            };
-
-        for node in &trace.nodes {
-            match &node.op {
-                Operation::Ssm(
-                    Ssm::CausalConv1d { x, state, y, .. }
-                    | Ssm::CausalConv1dChunked { x, state, y, .. },
-                ) => {
-                    let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::ConvX, *x)?;
-                    region(&mut layout, cache, "conv", *y)?;
+        let mut region = |layout: &mut Layout,
+                          cache: u32,
+                          what: &'static str,
+                          value: ValueId,
+                          node: usize|
+         -> Result<()> {
+            let (width, dtype, row_bytes) = row_of(trace, value)?;
+            let at = match region_keys.get(&(cache, what)) {
+                Some(&at) => at,
+                None => {
+                    layout.regions.push(Region {
+                        width,
+                        dtype,
+                        row_bytes,
+                    });
+                    layout.region_life.push((node, node));
+                    region_keys.insert((cache, what), layout.regions.len() - 1);
+                    layout.regions.len() - 1
                 }
+            };
+            live(&mut layout.region_life[at], node);
+            layout.out_of.insert(value.0, at);
+            Ok(())
+        };
+
+        // The convs the rs buffer covers: the chunk plan's rule
+        // (`poem_compiler::rs::buffered_convs`), the one the recipe's rs rows
+        // read, not a walk of this shell's own. A conv feeding a recurrence
+        // and a conv no recurrence reads (Qwen4's PLE conv, `Feeds::Alone`)
+        // alike buffer their input and replay it at a fold. This shell
+        // replays no Mamba-2 layer, so a Mamba-2 conv commits with it and
+        // keeps no plane.
+        for conv in poem_compiler::rs::buffered_convs(trace, false) {
+            let cache = cache_of(trace, conv.state)?;
+            plane(&mut layout, cache, Role::ConvX, conv.x, conv.node, None)?;
+            region(&mut layout, cache, "conv", conv.y, conv.node)?;
+        }
+        for (at, node) in trace.nodes.iter().enumerate() {
+            match &node.op {
                 Operation::Ssm(
                     Ssm::GatedDelta {
                         gates,
@@ -193,12 +333,43 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    let _ = k_heads;
                     gates_cache.insert(gates.0, cache);
-                    region(&mut layout, cache, "scan", *y)?;
-                    layout.work_elems = layout
-                        .work_elems
-                        .max(u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim));
+                    region(&mut layout, cache, "scan", *y, at)?;
+                    // The prompt form's rows keep their keys and corrected
+                    // values (the recipe's rs row lays them by its `q k v`
+                    // and its output): a decode step reads its carried rows
+                    // as a linear attention over them.
+                    if let Operation::Ssm(Ssm::GatedDeltaChunked { qkv, .. }) = &node.op {
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::Keys,
+                            *qkv,
+                            at,
+                            Some((k_heads * k_dim, Dtype::Bf16)),
+                        )?;
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::U,
+                            *y,
+                            at,
+                            Some((v_heads * v_dim, Dtype::F32)),
+                        )?;
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::Scalars,
+                            *gates,
+                            at,
+                            Some((2 * v_heads, Dtype::F32)),
+                        )?;
+                    }
+                    let elems = u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim);
+                    if elems > layout.work_elems {
+                        layout.work_elems = elems;
+                        layout.work_heads = *v_heads;
+                    }
                 }
                 Operation::Ssm(
                     Ssm::Kda {
@@ -221,35 +392,56 @@ impl Layout {
                     },
                 ) => {
                     let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::KdaF, *f)?;
-                    plane(&mut layout, cache, Role::KdaB, *b)?;
-                    region(&mut layout, cache, "scan", *y)?;
-                    layout.work_elems = layout
-                        .work_elems
-                        .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
+                    plane(&mut layout, cache, Role::KdaF, *f, at, None)?;
+                    plane(&mut layout, cache, Role::KdaB, *b, at, None)?;
+                    region(&mut layout, cache, "scan", *y, at)?;
+                    // The prompt form's rows keep their keys and corrected
+                    // values too (the recipe lays them by its `mixed` and its
+                    // output). This shell's KDA decode step has no carried
+                    // form: it replays its rows extended and reads neither.
+                    if let Operation::Ssm(Ssm::KdaChunked { mixed, .. }) = &node.op {
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::Keys,
+                            *mixed,
+                            at,
+                            Some((heads * head_dim, Dtype::Bf16)),
+                        )?;
+                        plane(
+                            &mut layout,
+                            cache,
+                            Role::U,
+                            *y,
+                            at,
+                            Some((heads * head_dim, Dtype::F32)),
+                        )?;
+                    }
+                    let elems = u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim);
+                    if elems > layout.work_elems {
+                        layout.work_elems = elems;
+                        layout.work_heads = *heads;
+                    }
                 }
                 Operation::Gather(
-                    Gather::NgramIds {
-                        ids,
-                        state,
-                        ngram_ids,
-                        ..
-                    }
-                    | Gather::NgramIdsChunked {
-                        ids,
-                        state,
-                        ngram_ids,
-                        ..
-                    },
+                    Gather::NgramIds { ids, state, .. }
+                    | Gather::NgramIdsChunked { ids, state, .. },
                 ) => {
-                    let cache = cache_of(trace, *state)?;
-                    plane(&mut layout, cache, Role::Ids, *ids)?;
-                    region(&mut layout, cache, "ngram", *ngram_ids)?;
+                    // Its own rows' table ids land where the fire's land
+                    // (`gather.ngram_ids_committed`): no extended region.
+                    plane(
+                        &mut layout,
+                        cache_of(trace, *state)?,
+                        Role::Ids,
+                        *ids,
+                        at,
+                        None,
+                    )?;
                 }
                 _ => {}
             }
         }
-        for node in &trace.nodes {
+        for (at, node) in trace.nodes.iter().enumerate() {
             let Operation::Ssm(Ssm::GdnGates { ba, gates, .. }) = &node.op else {
                 continue;
             };
@@ -259,8 +451,23 @@ impl Layout {
                     gates.0
                 ),
             })?;
-            plane(&mut layout, cache, Role::Ba, *ba)?;
-            region(&mut layout, cache, "gates", *gates)?;
+            plane(&mut layout, cache, Role::Ba, *ba, at, None)?;
+            region(&mut layout, cache, "gates", *gates, at)?;
+        }
+        // A region lives on to the last op that reads its value extended.
+        for (at, node) in trace.nodes.iter().enumerate() {
+            let read: &[ValueId] = match &node.op {
+                Operation::Ssm(
+                    Ssm::GatedDelta { qkv, gates, .. } | Ssm::GatedDeltaChunked { qkv, gates, .. },
+                ) => &[*qkv, *gates],
+                Operation::Ssm(Ssm::Kda { mixed, .. } | Ssm::KdaChunked { mixed, .. }) => &[*mixed],
+                _ => &[],
+            };
+            for value in read {
+                if let Some(&region) = layout.out_of.get(&value.0) {
+                    live(&mut layout.region_life[region], at);
+                }
+            }
         }
         if layout.planes.is_empty() {
             return Ok(None);
@@ -294,110 +501,262 @@ impl Buffers {
     pub fn page_tokens(&self) -> u32 {
         self.page_tokens
     }
+
+    /// Each plane's first byte in an rs page.
+    #[must_use]
+    pub fn plane_at(&self) -> Vec<u64> {
+        self.plane_at.clone()
+    }
+
+    /// The bytes an rs page id counts.
+    #[must_use]
+    pub fn stride(&self) -> u64 {
+        self.stride
+    }
 }
 
-#[derive(Debug)]
 pub struct Seat {
     pub lanes: Vec<LanePlan>,
+
+    /// Whether each lane's decode steps carry its buffered rows in their own
+    /// kernels, reading them through [`Self::carry`] where they lie: such a
+    /// lane's plan moves nothing from the host.
+    pub carried: Vec<bool>,
 
     pub replay: Tensor,
 
     pub commit: Tensor,
 
+    /// The fire's staged rs table (`kernels_slang::ssm::Carry`).
+    pub carry: Tensor,
+
     pub slots: Tensor,
 
     /// The chunk pool the rs pages lie in.
     pub pool: Segments,
+    /// The pool bound whole, past a fire's carve too: what the copies of
+    /// runs between the pool and the planes bind, where in a pool of one
+    /// segment the planes lie in the pool's buffer and are read through its
+    /// binding (`kernels/gather/rows.slang`'s one-segment form).
+    pub pool_whole: Segments,
+    /// In a pool of one segment, its buffer's slab: the only one the
+    /// copies' arenas may be, as the one-segment form reads them there.
+    pub one_buffer: Option<u64>,
     pub layout: Arc<Layout>,
     pub plane_at: Vec<u64>,
     pub page_tokens: u32,
     /// The bytes an rs page id counts.
     pub stride: u64,
 
-    pub ext_in: Vec<Tensor>,
+    /// Each plane's extended rows, where a fire extends it.
+    pub ext_in: Vec<Option<Tensor>>,
 
     pub ext_out: Vec<Tensor>,
 
     pub work: Tensor,
     pub rows_ext: u32,
 
+    /// The most runs a recurrent copy of the fire moves
+    /// ([`kernels_slang::gather::rows::copy_runs`]): every lane's rows over
+    /// the most pages its rung's rows span, twice, and a run of its own
+    /// each. The rung's, so every fire of a body copies alike.
+    pub run_most: usize,
+
     pub ext: RefCell<HashMap<u32, Tensor>>,
+
+    /// The fire's beam groups' folds (`BEAM-PAGE-LISTS.md` §11.3): their
+    /// staged table and records, a lane a fold, and how many. Each
+    /// recurrent layer's folds run ahead of its decode step.
+    pub folds: Option<Folds>,
+    /// Each fold's group's first lane in the fire (its rs table header),
+    /// ascending: a window's folds are those of its lanes.
+    pub fold_lanes: Vec<u32>,
+}
+
+/// A fire's beam groups' folds as a carried step's fold twin reads them:
+/// a rs table (`kernels_slang::ssm::Carry`) and slot table of their own,
+/// a lane a group's set, and their count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Folds {
+    pub table: Tensor,
+    pub slots: Tensor,
+    pub count: u32,
+}
+
+/// What a fire's recording is keyed by: everything its kernels bind and every
+/// host move it makes. A lane's replay and commit lengths are the staged
+/// tables' data, read on the device, and key nothing: only the plans of lanes
+/// whose rows the host moves (an extended lane's gathers and scatter) do. A
+/// carried lane moves none, so its decodes replay one recording whatever rows
+/// they carry, and a folding lane beside them keys none either.
+impl std::fmt::Debug for Seat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let moved: Vec<(usize, &LanePlan)> = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(lane, plan)| {
+                !self.carried.get(*lane).copied().unwrap_or(false)
+                    && (!plan.gathers.is_empty() || plan.scatter.is_some())
+            })
+            .collect();
+        f.debug_struct("Seat")
+            .field("moved", &moved)
+            .field("carried", &self.carried)
+            .field("replay", &self.replay)
+            .field("commit", &self.commit)
+            .field("carry", &self.carry)
+            .field("slots", &self.slots)
+            .field("pool", &self.pool)
+            .field("plane_at", &self.plane_at)
+            .field("page_tokens", &self.page_tokens)
+            .field("stride", &self.stride)
+            .field("folds", &self.folds)
+            .field("fold_lanes", &self.fold_lanes)
+            .field("ext_in", &self.ext_in)
+            .field("ext_out", &self.ext_out)
+            .field("work", &self.work)
+            .field("rows_ext", &self.rows_ext)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Layout {
+    /// Where each plane and region lies for `rows` extended rows, and the
+    /// bytes they take: first fit by their lives, so two whose lives do not
+    /// overlap (one layer's and the next's) share bytes. Every plane and
+    /// region starts at a multiple of 256.
+    #[must_use]
+    pub fn pack(&self, rows: u32) -> (Vec<u64>, Vec<u64>, u64) {
+        let rows = u64::from(rows.max(1));
+        let items: Vec<(u64, (usize, usize))> = self
+            .planes
+            .iter()
+            .map(|plane| plane.extended.then_some(plane.row_bytes))
+            .zip(self.plane_life.iter().copied())
+            .chain(
+                self.regions
+                    .iter()
+                    .map(|region| Some(region.row_bytes))
+                    .zip(self.region_life.iter().copied()),
+            )
+            // A plane no fire extends takes no bytes of the run.
+            .map(|(row_bytes, life)| {
+                (
+                    row_bytes.map_or(0, |row_bytes| {
+                        (rows * row_bytes).max(4).next_multiple_of(256)
+                    }),
+                    life,
+                )
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by_key(|&at| (items[at].1.0, std::cmp::Reverse(items[at].0)));
+        let mut placed: Vec<(u64, u64, (usize, usize))> = Vec::with_capacity(items.len());
+        let mut offsets = vec![0u64; items.len()];
+        let mut total = 0u64;
+        for at in order {
+            let (bytes, life) = items[at];
+            let mut busy: Vec<(u64, u64)> = placed
+                .iter()
+                .filter(|(_, _, other)| other.0 <= life.1 && life.0 <= other.1)
+                .map(|&(offset, size, _)| (offset, offset + size))
+                .collect();
+            busy.sort_unstable();
+            let mut offset = 0u64;
+            for (start, end) in busy {
+                if offset + bytes <= start {
+                    break;
+                }
+                offset = offset.max(end);
+            }
+            offsets[at] = offset;
+            placed.push((offset, bytes, life));
+            total = total.max(offset + bytes);
+        }
+        let regions = offsets.split_off(self.planes.len());
+        (offsets, regions, total)
+    }
 }
 
 impl Seat {
-    #[must_use]
-    pub fn scratch_bytes(layout: &Layout, rows_ext: u32, lanes: u32) -> u64 {
-        let rows = u64::from(rows_ext.max(1));
-        let mut at = 0u64;
-
-        for plane in &layout.planes {
-            at += (rows * plane.row_bytes).max(4).next_multiple_of(256);
-        }
-        for region in &layout.regions {
-            at += (rows * region.row_bytes).max(4).next_multiple_of(256);
-        }
-        at += (u64::from(lanes.max(1)) * layout.work_elems * 4)
-            .max(4)
-            .next_multiple_of(256);
-        at.max(256)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn mint<B: Backend>(
         handles: &Handles<B>,
         layout: &Arc<Layout>,
         buffers: &Buffers,
-        pool: Segments,
-        scratch: &B::Buffer,
+        [pool, pool_whole]: [Segments; 2],
+        one_buffer: Option<u64>,
+        held: &Reservation<B>,
         lanes: Vec<LanePlan>,
+        carried: Vec<bool>,
         replay: Tensor,
         commit: Tensor,
+        carry: Tensor,
         slots: Tensor,
         rows_ext: u32,
+        folds: Option<Folds>,
+        fold_lanes: Vec<u32>,
+        max_lanes: u32,
+        rung_rows: u32,
     ) -> Result<Seat> {
-        let lane_count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-        let need = Seat::scratch_bytes(layout, rows_ext, lane_count);
-        if scratch.bytes() < need {
+        // The planes lie where the load's reservation lays them for the top
+        // rung's rows, bound at their room: one view whatever the fire.
+        let (buffer, room_rows) = (&held.planes, held.rows);
+        if rows_ext > room_rows {
             return Err(Fault::Ceiling {
-                what: "recurrent buffer scratch bytes",
-                need,
-                have: scratch.bytes(),
+                what: "extended rows of the recurrent planes the load lays",
+                need: u64::from(rows_ext),
+                have: u64::from(room_rows),
             });
         }
-        let rows = u64::from(rows_ext.max(1));
-        let mut at = 0u64;
-        let mut take = |row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
-            let bytes = rows * row_bytes;
-            let here = at;
-            at += bytes.next_multiple_of(256);
+        // Each plane and region where the room packs them by their lives.
+        let rows = u64::from(room_rows.max(1));
+        let (plane_at, region_at, _) = layout.pack(room_rows);
+        let take = |offset: u64, row_bytes: u64, width: u32, dtype: Dtype| -> Result<Tensor> {
             Ok(Tensor::new(
-                handles.bind(scratch, here, bytes.max(4))?,
+                handles.bind(buffer, offset, (rows * row_bytes).max(4))?,
                 rows_ext.max(1),
                 width,
                 dtype,
             ))
         };
+        // A fire whose lanes all carry their rows in their decode steps
+        // extends none: it binds no view of the run.
+        let extends = !carried.iter().all(|&carried| carried);
         let mut ext_in = Vec::with_capacity(layout.planes.len());
-        for plane in &layout.planes {
-            ext_in.push(take(plane.row_bytes, plane.width, plane.dtype)?);
+        for (plane, &offset) in layout.planes.iter().zip(&plane_at) {
+            ext_in.push(if plane.extended && extends {
+                Some(take(offset, plane.row_bytes, plane.width, plane.dtype)?)
+            } else {
+                None
+            });
         }
         let mut ext_out = Vec::with_capacity(layout.regions.len());
-        for region in &layout.regions {
-            ext_out.push(take(region.row_bytes, region.width, region.dtype)?);
+        for (region, &offset) in layout.regions.iter().zip(&region_at) {
+            if extends {
+                ext_out.push(take(offset, region.row_bytes, region.width, region.dtype)?);
+            }
         }
-        let work_bytes = u64::from(lane_count.max(1)) * layout.work_elems * 4;
+        // The work plane holds a committed dispatch's lanes: a window of more
+        // takes as many dispatches (`dispatch::ssm`).
         let work = Tensor::new(
-            handles.bind(scratch, at, work_bytes.max(4))?,
-            lane_count.max(1),
+            handles.bind(&held.work, 0, held.work.bytes())?,
+            held.lanes,
             u32::try_from(layout.work_elems).unwrap_or(u32::MAX),
             Dtype::F32,
         );
+        let run_most = run_most(rung_rows, buffers.page_tokens, max_lanes);
         Ok(Seat {
             lanes,
+            carried,
             replay,
             commit,
+            carry,
             slots,
             pool,
+            pool_whole,
+            one_buffer,
             layout: Arc::clone(layout),
             plane_at: buffers.plane_at.clone(),
             page_tokens: buffers.page_tokens,
@@ -406,12 +765,102 @@ impl Seat {
             ext_out,
             work,
             rows_ext,
+            run_most,
             ext: RefCell::new(HashMap::new()),
+            folds,
+            fold_lanes,
+        })
+    }
+
+    /// Whether the window from fire lane `lane0` carries its lanes' buffered
+    /// rows in its decode steps' own kernels.
+    #[must_use]
+    pub fn carries(&self, lane0: u32) -> bool {
+        self.carried.get(lane0 as usize).copied().unwrap_or(false)
+    }
+
+    /// The staged rs table as the window from fire lane `lane0` reads it.
+    pub fn carry(&self, lane0: u32) -> Result<kernels_slang::ssm::Carry> {
+        let stride_words = u32::try_from(self.stride / 4)
+            .ok()
+            .filter(|_| self.stride.is_multiple_of(4))
+            .ok_or(Fault::Ceiling {
+                what: "words of an rs page a kernel addresses",
+                need: self.stride,
+                have: u64::from(u32::MAX),
+            })?;
+        Ok(kernels_slang::ssm::Carry {
+            table: self.carry,
+            slots: self.slots,
+            lane0,
+            page_tokens: self.page_tokens,
+            stride_words,
+        })
+    }
+
+    /// Where plane `role` of the recurrence keeping state cache row `cache`
+    /// lies in an rs page, in words.
+    /// The beam groups' folds' rs table from fold `lane0`, as their fold
+    /// twins read it.
+    pub fn fold_carry(&self, folds: &Folds, lane0: u32) -> Result<kernels_slang::ssm::Carry> {
+        let stride_words = u32::try_from(self.stride / 4).map_err(|_| Fault::Ceiling {
+            what: "words an rs page id counts",
+            need: self.stride / 4,
+            have: u64::from(u32::MAX),
+        })?;
+        Ok(kernels_slang::ssm::Carry {
+            table: folds.table,
+            slots: folds.slots,
+            lane0,
+            page_tokens: self.page_tokens,
+            stride_words,
+        })
+    }
+
+    pub fn carry_plane(&self, cache: u32, role: Role) -> Result<kernels_slang::ssm::CarryPlane> {
+        let plane = *self.layout.by_role.get(&(cache, role)).ok_or_else(|| Fault::Unbound {
+            what: format!(
+                "the {role:?} plane of state cache row {cache}, which this load buffers no rows of"
+            ),
+        })?;
+        let (at, row) = (self.plane_at[plane], self.layout.planes[plane].row_bytes);
+        let words = |bytes: u64| {
+            u32::try_from(bytes / 4)
+                .ok()
+                .filter(|_| bytes.is_multiple_of(4))
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "the {role:?} plane of state cache row {cache} at byte {at}, {row} bytes \
+                         a token: a kernel reads its rows in whole words"
+                    ),
+                })
+        };
+        Ok(kernels_slang::ssm::CarryPlane {
+            at: words(at)?,
+            row: words(row)?,
         })
     }
 
     /// Where token `token` of `run`'s plane `plane` lies: the segment's
     /// handle, the byte there, and the rows left in its page.
+    /// [`Seat::locate`] by the segment's place among the pool's: the segment,
+    /// the byte in it, and the rows from there to the page's end.
+    pub fn locate_segment(&self, run: &Run, plane: usize, token: u32) -> Result<(u32, u64, u32)> {
+        let page = token / self.page_tokens;
+        let in_page = token % self.page_tokens;
+        let id = *run.pages.get(page as usize).ok_or(Fault::Ceiling {
+            what: "recurrent buffer pages",
+            need: u64::from(page) + 1,
+            have: run.pages.len() as u64,
+        })?;
+        let row_bytes = self.layout.planes[plane].row_bytes;
+        let at =
+            u64::from(id) * self.stride + self.plane_at[plane] + u64::from(in_page) * row_bytes;
+        let span = u64::from(self.pool.words) * 4;
+        let segment = u32::try_from(at / span).unwrap_or(u32::MAX);
+        Ok((segment, at % span, self.page_tokens - in_page))
+    }
+
     pub fn locate(&self, run: &Run, plane: usize, token: u32) -> Result<(u32, u64, u32)> {
         let page = token / self.page_tokens;
         let in_page = token % self.page_tokens;
@@ -481,4 +930,27 @@ pub fn snapshots(trace: &poem_ir::Trace) -> u32 {
     } else {
         0
     }
+}
+
+/// The most runs a recurrent copy of a fire at a rung of `rung_rows` moves,
+/// its rows in pages of `page_tokens` and at most `max_lanes` lanes: a
+/// lane's gathered and scattered rows each split at the pages they span (at
+/// most the rung's rows over a page, and one more a run), and its own rows.
+#[must_use]
+pub fn run_most(rung_rows: u32, page_tokens: u32, max_lanes: u32) -> usize {
+    let pages = u64::from(rung_rows.div_ceil(page_tokens.max(1)));
+    let lanes = u64::from(max_lanes.max(1)).min(u64::from(rung_rows.max(1)));
+    usize::try_from(2 * (pages + lanes) + lanes).unwrap_or(usize::MAX)
+}
+
+/// The run tables (each one copy dispatch's scalars) the widest fire of a
+/// load lays: every recurrent extend and land of a fire (`copies`) at the
+/// top rung's bound, pages of one row at the most (any page size lays no
+/// more), and the bytes of the largest. What a fire block is sized by.
+#[must_use]
+pub fn run_tables(copies: usize, top_rows: u32, max_lanes: u32) -> (u64, u64) {
+    let most = run_most(top_rows, 1, max_lanes);
+    let (runs, _, dispatches) = kernels_slang::gather::rows::copy_runs_plan(most);
+    let tables = u64::try_from(copies.saturating_mul(dispatches)).unwrap_or(u64::MAX);
+    (tables, 16 + 16 * runs as u64)
 }

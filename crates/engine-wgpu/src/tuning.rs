@@ -62,8 +62,9 @@ pub enum DecodeSplit {
         #[constant(range(1..=65_536), default = 128)]
         groups: u32,
     },
-    /// `per` workgroups for each core the engine sizes work by (the count
-    /// the native driver reports, else a fallback).
+    /// `per` times the workgroups the device holds at once, as its rates
+    /// step measured them (WebGPU reports no count of an adapter's compute
+    /// units: `profile::rates::RESIDENT_WORKGROUPS`).
     PerCore {
         #[constant(range(1..=64), default = 1)]
         per: u32,
@@ -82,19 +83,138 @@ pub fn register(registry: &mut Registry) {
 #[derive(Clone, Debug)]
 pub struct Tuning {
     profile: Profile,
-    cores: u32,
-    /// Storage buffers a shader stage may bind; 0 where unknown.
-    storage_buffers: u32,
+    /// The workgroups the device holds at once, as its profile states
+    /// them (`[rates] resident_workgroups`, measured at the first load).
+    resident: Option<u32>,
+    /// The decodes (head width, LSE) whose split walk the adapter binds,
+    /// as the load held them ([`Tuning::hold_decodes`]).
+    splits: Vec<(u32, bool)>,
+    /// The workgroup memory the adapter states a kernel may take.
+    workgroup_bytes: u32,
 }
+
+/// The workgroup memory every WebGPU adapter allows
+/// (`maxComputeWorkgroupStorageSize`'s floor).
+pub const WORKGROUP_BYTES_FLOOR: u32 = 16 << 10;
 
 impl Tuning {
     #[must_use]
-    pub fn new(profile: Profile, cores: u32, storage_buffers: u32) -> Tuning {
+    pub fn new(profile: Profile) -> Tuning {
+        let resident = profile
+            .rates()
+            .resident_workgroups
+            .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32);
         Tuning {
             profile,
-            cores,
-            storage_buffers,
+            resident,
+            splits: Vec::new(),
+            workgroup_bytes: WORKGROUP_BYTES_FLOOR,
         }
+    }
+
+    /// This tuning over `profile` (another resolution of the device's, its
+    /// rates or curves joined): what the load held stays (the decodes whose
+    /// split walk the adapter binds, the workgroup memory it states), so the
+    /// kernels a load names are the same whether its curves were timed this
+    /// load or read from a profile.
+    #[must_use]
+    pub fn with_profile(&self, profile: Profile) -> Tuning {
+        Tuning {
+            splits: self.splits.clone(),
+            workgroup_bytes: self.workgroup_bytes,
+            ..Tuning::new(profile)
+        }
+    }
+
+    /// The workgroups the device holds at once, as its profile states them;
+    /// `None` before the load's rates step has measured them.
+    #[must_use]
+    pub fn resident(&self) -> Option<u32> {
+        self.resident
+    }
+
+    /// What sizes work to the device: the workgroups it holds at once; one
+    /// before the rates step has measured them, in that step's own tuning,
+    /// whose timed kernels read neither the qmm's fill nor a decode's split
+    /// (a load's tuning states them, [`crate::rates::at_load`]).
+    fn sized(&self) -> u32 {
+        self.resident.unwrap_or(1)
+    }
+
+    /// With the workgroup memory the adapter states.
+    #[must_use]
+    pub fn with_workgroup_bytes(mut self, bytes: u32) -> Tuning {
+        self.workgroup_bytes = bytes;
+        self
+    }
+
+    /// Holds the decodes a load walks (`decodes`: head width, LSE) to
+    /// `limit`, the storage buffers the adapter binds a shader stage, each
+    /// kernel's count read from the module it is compiled from. A decode
+    /// whose walk of a row's keys whole does not bind refuses the load by
+    /// that kernel, its buffers and the limit; its split walk is taken
+    /// where that binds too, which the load states.
+    #[cfg(feature = "wgpu")]
+    pub fn hold_decodes(
+        &mut self,
+        tier: kernels_slang::Tier,
+        decodes: &[(u32, bool)],
+        windowed: &[(u32, bool)],
+        limit: u32,
+    ) -> engine_gpu::Result<()> {
+        use engine_gpu::backend::Tactics as _;
+        self.splits.clear();
+        // A windowed decode's ring form binds one table more: held as the
+        // plain form is, its split taken only where both forms' bind.
+        let forms = decodes
+            .iter()
+            .map(|&decode| (decode, false))
+            .chain(windowed.iter().map(|&decode| (decode, true)));
+        let mut unsplit: Vec<(u32, bool)> = Vec::new();
+        for ((head_dim, lse), ring) in forms {
+            let [whole, split] = kernels_slang::attn::sdpa::decode_kernels(
+                kernels_slang::Target::Wgsl,
+                self.sdpa(tier, head_dim),
+                head_dim,
+                lse,
+                ring,
+            )?
+            .map(|fire| {
+                let key = kernels_slang::key(fire.entrypoint, fire.tier).ok_or(
+                    engine_gpu::Fault::Shader {
+                        file: fire.file,
+                        entrypoint: fire.entrypoint,
+                        why: format!("not instantiated at the {} tier", fire.tier.name()),
+                    },
+                )?;
+                let (own, pool) = crate::device::pipelines::storage(
+                    fire.file,
+                    key,
+                    crate::device::pipelines::one_segment(limit),
+                )?;
+                Ok::<_, engine_gpu::Fault>((key, own, pool))
+            });
+            let (key, own, pool) = whole?;
+            engine_gpu::storage_buffers(key, own, pool, limit)?;
+            let (key, own, pool) = split?;
+            let binds = engine_gpu::storage_buffers(key, own, pool, limit).is_ok();
+            tracing::info!(
+                kernel = key,
+                own,
+                pool,
+                limit,
+                split = binds,
+                "a decode splits a row's keys where the adapter binds the split walk's storage \
+                 buffers"
+            );
+            if !binds {
+                unsplit.push((head_dim, lse));
+            } else if !ring && !self.splits.contains(&(head_dim, lse)) {
+                self.splits.push((head_dim, lse));
+            }
+        }
+        self.splits.retain(|decode| !unsplit.contains(decode));
+        Ok(())
     }
 
     #[must_use]
@@ -103,16 +223,11 @@ impl Tuning {
     }
 
     #[must_use]
-    pub fn storage_buffers(&self) -> u32 {
-        self.storage_buffers
-    }
-
-    #[must_use]
     pub fn qmm_at(&self, rows: u32, n: u32, k: u32, bits: u32, group: u32) -> QmmAt {
         let tiles = u64::from(rows.div_ceil(32)) * u64::from(n.div_ceil(64));
         QmmAt {
             rows: i64::from(rows),
-            fill: i64::try_from(tiles * 8 / u64::from(self.cores.max(1))).unwrap_or(i64::MAX),
+            fill: i64::try_from(tiles * 8 / u64::from(self.sized())).unwrap_or(i64::MAX),
             n: i64::from(n),
             k: i64::from(k),
             bits: i64::from(bits),
@@ -129,11 +244,32 @@ impl Tuning {
             .collect()
     }
 
+    /// Every rung a batch between the shapes `first` and `last` (one row
+    /// and the most a fire holds, the other widths the same) reaches: its
+    /// region meets the shapes between them and it fits one of the two,
+    /// since no rung tells rows apart ([`Qmm::fits_shape`]).
+    #[must_use]
+    pub fn qmm_between(&self, first: &QmmAt, last: &QmmAt) -> Vec<Qmm> {
+        use profile::Point as _;
+        let cell: Vec<profile::Set> = (0..Qmm::spec().vars.len())
+            .map(|var| match (first.coord(var), last.coord(var)) {
+                (Some(lo), Some(hi)) => profile::Set::span(lo, hi),
+                _ => unreachable!("a `kernel.qmm` point states every variable"),
+            })
+            .collect();
+        self.profile
+            .ladder::<Qmm>()
+            .meeting(&cell)
+            .filter(|rung| rung.fits(first) || rung.fits(last))
+            .copied()
+            .collect()
+    }
+
     #[must_use]
     pub fn sdpa_split_groups(&self) -> u32 {
         match *self.profile.get::<DecodeSplit>() {
             DecodeSplit::Fixed { groups } => groups,
-            DecodeSplit::PerCore { per } => self.cores.saturating_mul(per).max(1),
+            DecodeSplit::PerCore { per } => self.sized().saturating_mul(per).max(1),
         }
     }
 }
@@ -144,10 +280,6 @@ const KQUANT: kernels_slang::linear::kquant::Tactic = kernels_slang::linear::kqu
     slices: 4,
 };
 
-/// Storage buffers a split decode binds (its LSE form one more); a device
-/// offering fewer (SwiftShader: 10) walks each row whole.
-const SPLIT_STORAGE_BUFFERS: u32 = 12;
-
 /// A tab's prefill dispatches, in rows times keys. A GPU cannot leave a
 /// dispatch to draw the screen, and macOS ends a command buffer once that has
 /// gone on for about 20 seconds (`Impacting Interactivity`), which costs the
@@ -155,6 +287,14 @@ const SPLIT_STORAGE_BUFFERS: u32 = 12;
 /// dispatches of 95 ms are ended and these, of 48 ms, are not. A browser hides
 /// its adapter from wgpu, so every tab pays for them, about 3% of a prefill.
 const TAB_PREFILL_WORK: u64 = 1 << 19;
+
+fn qmm_rung(rung: Qmm) -> kernels_slang::linear::qmm::Qmm {
+    use kernels_slang::linear::qmm::Qmm as Rung;
+    match rung {
+        Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+        Qmm::Qmv => Rung::Qmv { vecs: 2 },
+    }
+}
 
 impl engine_gpu::backend::Tactics for Tuning {
     fn profile(&self) -> &profile::Profile {
@@ -172,14 +312,21 @@ impl engine_gpu::backend::Tactics for Tuning {
         contraction: u32,
         bank: kernels_slang::Bank,
     ) -> Vec<kernels_slang::linear::qmm::Qmm> {
-        use kernels_slang::linear::qmm::Qmm as Rung;
         let at = self.qmm_at(rows, columns, contraction, bank.bits, bank.group);
-        self.qmm(&at)
-            .iter()
-            .map(|q| match *q {
-                Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
-                Qmm::Qmv => Rung::Qmv { vecs: 2 },
-            })
+        self.qmm(&at).into_iter().map(qmm_rung).collect()
+    }
+
+    fn qmm_rungs(
+        &self,
+        capacity: u32,
+        columns: u32,
+        contraction: u32,
+        bank: kernels_slang::Bank,
+    ) -> Vec<kernels_slang::linear::qmm::Qmm> {
+        let at = |rows| self.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+        self.qmm_between(&at(1), &at(capacity.max(1)))
+            .into_iter()
+            .map(qmm_rung)
             .collect()
     }
 
@@ -189,8 +336,25 @@ impl engine_gpu::backend::Tactics for Tuning {
 
     /// The vector kernel folds by shuffles where the adapter's subgroups
     /// hold a 32-lane strip.
-    fn gemm(&self, tier: kernels_slang::Tier) -> kernels_slang::linear::gemm::Tactic {
-        kernels_slang::linear::gemm::Tactic { tier }
+    fn gemm(&self, tier: kernels_slang::Tier, _rows: u32) -> kernels_slang::linear::gemm::Tactic {
+        kernels_slang::linear::gemm::Tactic {
+            tier,
+            vector: 0,
+            wide: true,
+        }
+    }
+
+    /// One tactic at every row count.
+    fn gemm_tactics(
+        &self,
+        tier: kernels_slang::Tier,
+        _capacity: u32,
+    ) -> Vec<kernels_slang::linear::gemm::Tactic> {
+        vec![kernels_slang::linear::gemm::Tactic {
+            tier,
+            vector: 0,
+            wide: true,
+        }]
     }
 
     fn batch(&self, pairs: u32, experts: u32) -> kernels_slang::linear::moe::select::Batch {
@@ -232,9 +396,10 @@ impl engine_gpu::backend::Tactics for Tuning {
         }
     }
 
-    fn binds_split(&self, lse: bool) -> bool {
-        let buffers = self.storage_buffers();
-        buffers == 0 || buffers >= SPLIT_STORAGE_BUFFERS + u32::from(lse)
+    /// As the load held it: the split walk's storage buffers are within
+    /// what the adapter binds a stage.
+    fn binds_split(&self, head_dim: u32, lse: bool) -> bool {
+        self.splits.contains(&(head_dim, lse))
     }
 
     /// The recurrences fold their norms through workgroup memory, as WGSL
@@ -249,5 +414,151 @@ impl engine_gpu::backend::Tactics for Tuning {
 
     fn sdpa_split_groups(&self) -> u32 {
         Tuning::sdpa_split_groups(self)
+    }
+
+    fn workgroup_bytes(&self) -> u32 {
+        self.workgroup_bytes
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod tests {
+    use engine_gpu::backend::Tactics as _;
+
+    use super::*;
+
+    fn tuning() -> Tuning {
+        let adapter = crate::chip::Device {
+            name: "an adapter".to_string(),
+            vendor: "intel",
+            subgroup_min: None,
+            cores: None,
+            f16: true,
+        };
+        let (profile, _) = crate::chip::resolve(&adapter, None);
+        Tuning::new(profile)
+    }
+
+    /// The rungs between one row and a capacity hold the rungs of every
+    /// row count up to it.
+    #[test]
+    fn the_rungs_between_one_row_and_a_capacity_hold_every_row_counts_rungs() {
+        let t = tuning();
+        for (n, k) in [(4096, 4096), (1024, 4100), (64, 64)] {
+            let at = |rows| t.qmm_at(rows, n, k, 4, 64);
+            for capacity in [1, 11, 12, 64, 300] {
+                let between = t.qmm_between(&at(1), &at(capacity));
+                for rows in 1..=capacity {
+                    for rung in t.qmm(&at(rows)) {
+                        assert!(
+                            between.contains(&rung),
+                            "{rows} rows of {n} columns over {k} reach {rung:?}, which the \
+                             rungs up to {capacity} rows leave out"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An adapter binding a stage too few storage buffers for every pool
+    /// kernel's own beside four segments (fewer than
+    /// `kernels_slang::POOL_OWN_MAX` + 4) takes the one-segment forms: the
+    /// pool is one binding.
+    #[test]
+    fn the_pool_is_one_segment_below_every_kernels_four() {
+        let four = kernels_slang::POOL_OWN_MAX + kernels_slang::SEGMENTS as u32;
+        for (limit, one) in [
+            (8, true),
+            (10, true),
+            (four - 1, true),
+            (four, false),
+            (48, false),
+        ] {
+            assert_eq!(
+                crate::device::pipelines::one_segment(limit),
+                one,
+                "at {limit}"
+            );
+        }
+    }
+
+    /// An adapter binding a stage 10 storage buffers (Chrome on macOS,
+    /// SwiftShader) takes the decode's one-segment form: 8 buffers of its
+    /// own and one segment bind, the split walk's 10 and one do not. At 8
+    /// (WebGPU's default) not even that binds: the load is refused by the
+    /// kernel, its counts and the limit.
+    #[test]
+    fn an_adapter_of_10_storage_buffers_takes_the_one_segment_decode() {
+        let mut tuning = tuning();
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], &[], 10)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false));
+        let refused = tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &[(64, false)], &[], 8)
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "`attn_sdpa_decode_bf16_d_64` binds 9 storage buffers in its shader stage (8 of \
+             its own and 1 pool segments) and this adapter binds a stage 8 \
+             (`maxStorageBuffersPerShaderStage`)"
+        );
+    }
+
+    /// At 16 (every pool kernel's own and four segments) the load is taken
+    /// with four segments and every decode splits; below it the forms bind
+    /// one segment, so the split walk (10 own, its LSE form 11) splits down
+    /// to 12, and at 10 the decode is walked whole.
+    #[test]
+    fn an_adapter_splits_by_the_forms_it_takes() {
+        let decodes = [(64, false), (64, true)];
+        let mut tuning = tuning();
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 16)
+            .unwrap();
+        assert!(tuning.binds_split(64, false) && tuning.binds_split(64, true));
+        // A decode the load did not hold is not split.
+        assert!(!tuning.binds_split(128, false));
+        for limit in [14, 13, 12] {
+            tuning
+                .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], limit)
+                .unwrap();
+            assert!(
+                tuning.binds_split(64, false) && tuning.binds_split(64, true),
+                "at {limit}"
+            );
+        }
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 11)
+            .unwrap();
+        assert!(tuning.binds_split(64, false) && !tuning.binds_split(64, true));
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &[], 10)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false) && !tuning.binds_split(64, true));
+    }
+
+    /// A windowed decode's ring form binds one table more than the plain
+    /// form: with one segment its split binds from 12, so the decode splits
+    /// there; at 10 both whole walks bind and neither split does.
+    #[test]
+    fn a_windowed_decode_splits_where_its_ring_form_binds() {
+        let decodes = [(64, false)];
+        let mut tuning = tuning();
+        for limit in [12, 14, 15] {
+            tuning
+                .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, limit)
+                .unwrap();
+            assert!(tuning.binds_split(64, false), "at {limit}");
+        }
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 11)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false));
+        tuning
+            .hold_decodes(kernels_slang::Tier::Baseline, &decodes, &decodes, 10)
+            .unwrap();
+        assert!(!tuning.binds_split(64, false));
     }
 }

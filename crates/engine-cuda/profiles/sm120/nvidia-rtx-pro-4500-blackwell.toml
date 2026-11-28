@@ -5,12 +5,10 @@ device = "NVIDIA RTX PRO 4500 Blackwell"
 
 # Starts as the RTX PRO 6000 profile (the same sm_120 die family, 99 KiB shared memory); lines below are its measured wins.
 [kernel]
-attn.qkv_rows_from = 88  # 1.4% faster end to end
+# attn.qkv_rows_from = 88 reset to its default: the tune timed it 1.4% faster on gpt-oss-20b,
+# which never reads it here (the QK-normed qkv append; it has no QK norm): the win was noise.
 moe.mxfp4_mma_from = 49  # 2.9% faster end to end
 moe.mxfp4_select_lean = true  # 1.7% faster end to end
-# bf16 MoE routes past one token on the grouped mma.sync kernel: Qwen3.6-35B-A3B c128 1,489 -> 3,590 tok/s
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 # NVFP4 experts against bf16 rows on the register-dequant mma.sync kernel past one token, as L40S:
 # MiniMax-M3.1-Flash mini pf32-512 70.8k -> 94.3k, c512 23.4k -> 28.2k tok/s
 moe.nvfp4_mma_from = 17
@@ -67,9 +65,13 @@ dag_streams_until = 256
 # no 1024-row walk fires (the PRO 6000's line): on this card they starve the gated delta trunk,
 # Qwen3.8-Flash-Next mini pf32-512 62.1k -> 76.8k, Qwen3.8-27B mini20 pf8-512 7.98k -> 8.89k tok/s, greedy tokens unchanged
 [engine]
-# a fire takes at most 5120 rows, so a batch's prompts end over two fires and those the first
-# finishes are answered, and replaced, while the second runs: DeepSeek-V4 mini pf16-512 98.7k -> 103k
-fire_rows = 5120
+# the fire top, from a measured sweep (2026-11-25): 32,768-token prompts at c1, prefill tok/s at tops
+# 2048 / 4096 / 8192 / 16384: Qwen3-8B bf16 5582 / 5767 / 5651 / 5581, Qwen3-0.6B 24811 / 27367 / 28269 / 28514,
+# gpt-oss-20b 11914 / 12373 / 12382 / (refused at load, since fixed); 4096 is best on 8B and tied best on gpt-oss,
+# 4.0% short of 0.6B's best (8192 would be 2.0% short of 8B's at most, the minimax) and boots faster with more kv pages
+# (8B 12.5 s against 20.0 s, 5992 pages against 5840). It replaces 5120 (DeepSeek-V4 mini pf16-512 98.7k -> 103k
+# against no cap), which the rule took as 4871.
+fire_rows = 4096
 # one recurrent-state slot a lane (the PRO 6000 asks two): on 32 GB the doubled slab left the Qwen3.8-27B
 # mini20 kv pages for 3 sequences, c128 453 -> 2,410 tok/s; Nemotron, Qwen3.6-35B, Qwen3.8-Flash-Next unchanged
 # prompt fires pad to 64 lanes, not the 512 decoding lanes two slots seat: Qwen3.8-Flash-Next mini
@@ -80,13 +82,11 @@ prefill_lanes = 64
 window_spare = true
 
 [provenance]
+# engine.fire_rows: the fire-top sweep of 2026-11-25 on this card (Qwen3-8B, Qwen3-0.6B, gpt-oss-20b), see [engine].
 source = "pie tune (quick, gptoss-20b) on RunPod; 512-token prompt 20.5 -> 20.5 ms, 1-lane step 2.99 -> 2.93 ms, 4-lane step 4.11 -> 4.06 ms, 8-lane step 6.36 -> 5.33 ms, readout cosine 1.0000"
+# `measured` names only what gpt-oss-20b, the tune's model, reads on this device: the tune once listed
+# every decision, since a load counted each as read; those it cannot read are dropped (and reset where set).
 measured = [
-  "kernel.attn.qkv_rows_from",
-  "kernel.attn_res.fused_norm",
-  "kernel.elemwise.hc_mma",
-  "kernel.elemwise.hc_tile",
-  "kernel.elemwise.norm_emit",
   "kernel.elemwise.rows_vec",
   "kernel.gemm.affine_mma",
   "kernel.gemm.fp8_o_down",
@@ -95,17 +95,9 @@ measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.skinny_rows",
   "kernel.gemm.split_rows_from",
-  "kernel.gemm.tc5_raster",
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
   "kernel.gemv.splitk_max_n",
-  "kernel.mla.expanded_from",
-  "kernel.mla.path",
-  "kernel.moe.affine_grouped",
-  "kernel.moe.affine_grouped_from",
-  "kernel.moe.affine_wmma",
-  "kernel.moe.group_at",
-  "kernel.moe.grouped",
   "kernel.moe.mxfp4_cvt",
   "kernel.moe.mxfp4_grouped",
   "kernel.moe.mxfp4_grouped_reuse",
@@ -113,12 +105,6 @@ measured = [
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_select_lean",
   "kernel.moe.mxfp4_wmma",
-  "kernel.moe.nvfp4_mma_from",
-  "kernel.moe.routes_sized",
-  "kernel.moe.tc5",
-  "kernel.moe.tc5_from",
-  "kernel.moe.w4a4_fused_from",
-  "kernel.moe.w4a4_fused_layout",
   "kernel.moe.w4a8_fused_from",
   "kernel.pdl",
   "kernel.qmm.gemm_from",
@@ -127,45 +113,20 @@ measured = [
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
-  "kernel.sdpa.decode.chunk_floor_128",
   "kernel.sdpa.decode.gqa",
   "kernel.sdpa.decode.gqa_cluster",
   "kernel.sdpa.decode.gqa_deep_64",
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.fa2_live",
-  "kernel.sdpa.index_fp4_tc5",
-  "kernel.sdpa.index_mma",
-  "kernel.sdpa.index_radix",
-  "kernel.sdpa.index_split_until",
-  "kernel.sdpa.index_tc5",
   "kernel.sdpa.merge_warp",
-  "kernel.sdpa.mla_dense_short",
-  "kernel.sdpa.mla_sparse",
-  "kernel.sdpa.pool_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
-  "kernel.sdpa.prefill.tc5",
   "kernel.sdpa.prefill.wide_sliding",
-  "kernel.sdpa.selected_mma",
-  "kernel.ssm.conv_vec4",
-  "kernel.ssm.gdn_fused_scan",
-  "kernel.ssm.gdn_out_bf16",
-  "kernel.ssm.gdn_scan_until",
-  "kernel.ssm.gdn_step_blocks",
-  "kernel.ssm.gdn_tc5",
-  "kernel.ssm.kda_chunked",
-  "kernel.ssm.kda_step_fused",
   "engine.copies",
-  "engine.graphs",
   "engine.host_planes",
   "engine.lattice_steps",
   "engine.prefill_lattice_from",
   "engine.prefill_lattice_steps",
-  "engine.recording",
-  "engine.seated_first",
   "engine.working_set_percent",
   "fuse.hc_fold_pre",
   "fuse.hc_gates_norm",

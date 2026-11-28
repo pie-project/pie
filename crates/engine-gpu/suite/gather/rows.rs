@@ -286,11 +286,56 @@ fn the_row_movers_answer_the_reference() {
             g.run(|c| {
                 kernels_slang::gather::rows::copy_words(
                     c,
-                    t(xf, 1, 1, Dtype::U32),
-                    t(o[0].0, 1, 1, Dtype::U32),
+                    t(xf, rows * W, 1, Dtype::U32),
+                    0,
+                    t(o[0].0, 2 * rows * W, 1, Dtype::U32),
+                    0,
                     (rows * W * 4) as u64,
                 )
             })
         },
     );
+}
+
+/// A run copied from a word offset of one whole buffer to a word offset of
+/// another lands there and nowhere else, and a run past either buffer's
+/// words is refused before it fires.
+#[test]
+fn a_copy_lands_its_run_at_its_offsets_and_no_further() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    const N: usize = 4096;
+    let src: Vec<u32> = (0..N as u32)
+        .map(|w| w.wrapping_mul(2_654_435_761) | 1)
+        .collect();
+    let (s, d) = (gpu.up_u32(&src), gpu.up_u32(&vec![0; N]));
+    let t = |b: u32, words: usize| Tensor::new(b, words as u32, 1, Dtype::U32);
+    let (src_at, dst_at, words) = (37u32, 1001u32, 523usize);
+    gpu.run(|c| {
+        kernels_slang::gather::rows::copy_words(
+            c,
+            t(s, N),
+            src_at,
+            t(d, N),
+            dst_at,
+            (words * 4) as u64,
+        )
+    });
+    let got: Vec<u32> = gpu.down_f32(d, N).iter().map(|v| v.to_bits()).collect();
+    let mut want = vec![0u32; N];
+    want[dst_at as usize..][..words].copy_from_slice(&src[src_at as usize..][..words]);
+    assert!(got == want, "the run did not land at word {dst_at} alone");
+    gpu.run(|c| {
+        for (from, into) in [(N as u32 - 4, 0), (0, N as u32 - 4)] {
+            let refused =
+                kernels_slang::gather::rows::copy_words(c, t(s, N), from, t(d, N), into, 32);
+            assert!(
+                refused.is_err(),
+                "a run of 8 words at {from} -> {into} of {N} was not refused"
+            );
+        }
+        Ok(())
+    });
 }

@@ -13,8 +13,14 @@ pub(crate) struct Exports {
 }
 
 impl Exports {
-    pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Exports> {
-        let outputs = poem_exec::feeds::class_outputs(trace, compiled).map_err(Fault::Recipe)?;
+    pub(crate) fn of(
+        trace: &Trace,
+        compiled: &CompiledModel,
+        context: u32,
+        page_size: u32,
+    ) -> Result<Exports> {
+        let outputs = poem_exec::feeds::class_outputs(trace, compiled, context, page_size)
+            .map_err(Fault::Recipe)?;
         if outputs.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
@@ -47,41 +53,133 @@ impl Exports {
     pub(crate) fn reads_readout_rows(&self) -> bool {
         self.outputs.iter().any(|out| out.decl.readout)
     }
+}
 
-    /// The widest row of an output on the readout rows, in f32.
-    #[must_use]
-    pub(crate) fn readout_row_bytes(&self) -> u64 {
-        self.outputs
-            .iter()
-            .filter(|out| out.decl.readout)
-            .map(|out| u64::from(out.decl.width) * 4)
-            .max()
-            .unwrap_or(0)
-    }
+/// The attention `op` is, where it reads the fire's masks (a fused sink's
+/// attention included).
+fn mask_reader(op: &poem_ir::Operation) -> Option<&poem_ir::Attn> {
+    let attn = match op {
+        poem_ir::Operation::Attn(attn) => attn,
+        poem_ir::Operation::Fused(poem_ir::Fused::LseSink { attn, .. }) => &**attn,
+        _ => return None,
+    };
+    matches!(
+        attn,
+        poem_ir::Attn::Prefill { mask: Some(_), .. } | poem_ir::Attn::Decode { mask: Some(_), .. }
+    )
+    .then_some(attn)
+}
+
+/// Whether this backend's kernel for `attn` (which reads the masks) applies
+/// each lane's: a selection's and a relative bias's arms read none.
+fn applies_mask(attn: &poem_ir::Attn) -> bool {
+    matches!(
+        attn,
+        poem_ir::Attn::Prefill {
+            selection: None,
+            bias: None,
+            ..
+        } | poem_ir::Attn::Decode {
+            selection: None,
+            bias: None,
+            ..
+        }
+    )
+}
+
+/// The classes whose fires stage every lane's mask entry, a mask or the
+/// word stating none: an attention of theirs applies the fire's masks.
+#[must_use]
+pub(crate) fn mask_reading_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    classes_running(trace, compiled, |op| {
+        mask_reader(op).is_some_and(applies_mask)
+    })
+}
+
+/// The classes a lane may state a mask on: some attention of theirs applies
+/// the fire's masks and none that reads them passes a lane's by (a
+/// selection's arm, a biased one, or a kernel here that reads no mask).
+#[must_use]
+pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    let reading = mask_reading_classes(trace, compiled);
+    let passing = classes_running(trace, compiled, |op| {
+        mask_reader(op).is_some_and(|attn| !applies_mask(attn))
+    });
+    poem_ir::ClassSet::of(reading.iter().filter(|&class| !passing.contains(class)))
+}
+
+/// The classes a lane's stated mask reaches over its group's rows: a
+/// ragged attention the model states one on (`RaggedMask::Stated`) reads a
+/// lane's mask as its group's (the custom arm). There a mask is the lane's
+/// to state or not (stating none, a row attends every row of its group); an
+/// attention the model states none on reads none, and costs no mask's room.
+///
+/// Only a kv-less lane states a group mask, so a class that writes or reads
+/// a cache (a language model's prefill beside its vision tower's ragged
+/// attention) takes none: arming records a masked twin of each body over
+/// these classes, and the rest arm once.
+/// The ragged attentions' packings (`Feeds::ragged`, in their order) that
+/// an attention the model states a mask on reads: the ones a fire stages a
+/// lane's group mask for, a stretch of the inputs slab each. A packing only
+/// attentions stating none read takes no stretch.
+#[must_use]
+pub(crate) fn stated_feeds(
+    trace: &Trace,
+    ragged: &[(poem_ir::Selection, poem_ir::Selection)],
+) -> Vec<(poem_ir::Selection, poem_ir::Selection)> {
+    use poem_ir::{Def, GeomKind, RuntimeInput};
+    let packing = |id: ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
+        Some(Def::Input(RuntimeInput::Geometry {
+            kind: GeomKind::GroupIndptr { select },
+            ..
+        })) => Some(*select),
+        _ => None,
+    };
+    let stated: Vec<(poem_ir::Selection, poem_ir::Selection)> = trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
+                q_indptr,
+                kv_indptr,
+                mask: poem_ir::RaggedMask::Stated,
+                ..
+            }) => packing(*q_indptr).zip(packing(*kv_indptr)),
+            _ => None,
+        })
+        .collect();
+    ragged
+        .iter()
+        .copied()
+        .filter(|feed| stated.contains(feed))
+        .collect()
 }
 
 #[must_use]
-pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
-    classes_running(trace, compiled, |op| {
+pub(crate) fn group_masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    let ragged = classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
+                mask: poem_ir::RaggedMask::Stated,
+                ..
+            })
+        )
+    });
+    let cached = classes_running(trace, compiled, |op| {
         matches!(
             op,
             poem_ir::Operation::Attn(
-                poem_ir::Attn::Prefill {
-                    mask: Some(_),
-                    selection: None,
-                    bias: None,
-                    lse: None,
-                    ..
-                } | poem_ir::Attn::Prefill {
-                    mask: Some(_),
-                    selection: None,
-                    bias: None,
-                    lse: Some(_),
-                    ..
-                }
+                poem_ir::Attn::Decode { .. }
+                    | poem_ir::Attn::Prefill { .. }
+                    | poem_ir::Attn::KvAppend { .. }
+                    | poem_ir::Attn::MlaKvAppend { .. }
+                    | poem_ir::Attn::MlaDecode { .. }
+                    | poem_ir::Attn::MlaPrefill { .. }
             )
         )
-    })
+    });
+    poem_ir::ClassSet::of(ragged.iter().filter(|&class| !cached.contains(class)))
 }
 
 #[must_use]
@@ -156,17 +254,18 @@ pub(crate) fn landing_requests(
     landing
 }
 
-/// The classes the lattice keys and arms: those a plain request, or one
-/// plain but for its adapter, lands in, and, on a model with a drafter (an
-/// output only drafting classes write, MTP's `mtp.drafts`), those writing it
-/// that a request plain but for reading its pass's drafts lands in (the
-/// drafter's verify).
+/// The classes the lattice keys and arms: those a plain request lands in,
+/// and, on a model with a drafter (an output only drafting classes write,
+/// MTP's `mtp.drafts`), those writing it that a request plain but for
+/// reading its pass's drafts lands in (the drafter's verify). A class only
+/// an adapted request lands in is not keyed: its fires are stated eager
+/// ([`adapted_of`]).
 #[must_use]
 pub(crate) fn plain_of(
     landing: &[Vec<poem_ir::Request>],
     outputs: &[poem_exec::feeds::ClassOutput],
 ) -> poem_ir::ClassSet {
-    let plain = |class: usize| landing[class].iter().any(plain_or_adapted);
+    let plain = |class: usize| landing[class].iter().any(poem_ir::Request::plain);
     // An output's name no plain class writes: the drafter's (a name written
     // by several value sets is one output a set).
     let plain_names: std::collections::HashSet<&str> = outputs
@@ -184,17 +283,21 @@ pub(crate) fn plain_of(
     }))
 }
 
+/// The classes only adapted requests land in: their lanes run the
+/// correction, no body is recorded for them, and their fires are stated
+/// eager.
+#[must_use]
+pub(crate) fn adapted_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
+    poem_ir::ClassSet::of((0..landing.len()).filter(|&class| {
+        !landing[class].is_empty() && landing[class].iter().all(poem_ir::Request::has_adapter)
+    }))
+}
+
 /// Whether only its query length and its reading the pass's drafts set
 /// this request apart.
 #[must_use]
 pub(crate) fn drafts_only(request: &poem_ir::Request) -> bool {
     request.drafts() && request.departures() == usize::from(request.query_len() != 1) + 1
-}
-
-#[must_use]
-pub(crate) fn plain_or_adapted(request: &poem_ir::Request) -> bool {
-    request.departures()
-        == usize::from(request.query_len() != 1) + usize::from(request.has_adapter())
 }
 
 #[must_use]
@@ -431,6 +534,23 @@ pub(crate) fn regions_launching_schedules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lattice keys the classes a plain request lands in; one only an
+    /// adapted request lands in stays out of it and is stated eager.
+    #[test]
+    fn a_class_only_adapted_requests_land_in_is_eager_and_not_keyed() {
+        let landing = vec![
+            vec![poem_ir::Request::new(1, false)],
+            vec![poem_ir::Request::new(1, false).adapted(true)],
+            vec![poem_ir::Request::new(4, false)],
+            vec![poem_ir::Request::new(4, false).adapted(true)],
+            Vec::new(),
+        ];
+        let keyed = plain_of(&landing, &[]);
+        assert!(keyed.contains(0) && keyed.contains(2));
+        assert!(!keyed.contains(1) && !keyed.contains(3));
+        assert_eq!(adapted_of(&landing).iter().collect::<Vec<_>>(), vec![1, 3]);
+    }
 
     #[test]
     fn a_class_attending_both_ways_under_one_mask_is_refused() {

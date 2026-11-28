@@ -146,12 +146,12 @@ pub fn ragged(
     let operands = match mask {
         RaggedMask::None => Operands::of(Arm::Full),
         RaggedMask::Custom { bits, indptr } => {
-            if bits.dtype != Dtype::U8 || indptr.dtype != Dtype::I32 || indptr.rows != q_indptr.rows
+            if bits.dtype != Dtype::U8 || indptr.dtype != Dtype::I64 || indptr.rows != q_indptr.rows
             {
                 return Err(refuse(
                     OP,
                     format!(
-                        "a custom mask is u8 bits and an i32 byte offset a group; this one is \
+                        "a custom mask is u8 bits and an i64 byte offset a group; this one is \
                          {:?} bits and {} {:?} offsets for {} groups",
                         bits.dtype,
                         indptr.rows,

@@ -17,9 +17,9 @@ export const modelStub = {
   frameSize: () => 1,
   channelCapacity: () => 8,
   rsStateSize: () => 4096n,
-  submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
+  draftDepth: () => 0,
   switches: () => [{ name: 'mode', values: ['encode', 'denoise'] }],
   lane: (switches: Array<[string, string]>) => ({
     inputs: switches.some(([k, v]) => k === 'mode' && v === 'denoise')
@@ -27,7 +27,7 @@ export const modelStub = {
       : [],
     state: true,
     embeds: true,
-    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true }],
+    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true, planes: new Uint32Array() }],
   }),
 };
 
@@ -117,6 +117,7 @@ export class PipelineStub {
   close() {
     this.closed = true;
   }
+  retract(_fires: number) {}
 }
 
 export class WorkingSetStub {
@@ -127,6 +128,7 @@ export class WorkingSetStub {
   fork() {
     return new WorkingSetStub();
   }
+  share() {}
 }
 
 export class ForwardPassStub {
@@ -146,6 +148,12 @@ export class ForwardPassStub {
   }
   checkpoints(slots: Uint32Array) {
     this.checkpointSlots = Array.from(slots);
+  }
+  finalStated = 0;
+  finalRefusal: string | undefined;
+  finalRows() {
+    if (this.finalRefusal) throw Object.assign(new Error(this.finalRefusal), { payload: this.finalRefusal });
+    this.finalStated += 1;
   }
   media(lane: number, spans: unknown[]) {
     this.mediaLane = lane;

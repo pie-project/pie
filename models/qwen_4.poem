@@ -762,6 +762,7 @@ def forward(m, inputs):
             hidden = r
             chain.append(draft)
         output("mtp.drafts", ops.sampling.argmax(chain))
+        draft_depth(mtp.depth)
 
     output("logits", logits)
 

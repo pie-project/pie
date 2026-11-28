@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
+use engine::Engine;
 use engine::adapter::AdapterRegistration;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
@@ -15,7 +16,6 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{DeviceReach, KvCopy, MemoryDomain};
-use engine::{Channels, Completion, Engine, Pool, Programs, Tiers, WeightCache};
 use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
@@ -31,9 +31,33 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceBoot {
-    pub adapter_dir: Option<std::path::PathBuf>,
     /// `$PIE_HOME/profiles`, where a user's device profiles live.
     pub profiles: Option<std::path::PathBuf>,
+    /// `[metal] cache`: pie's engine cache directory, where the Neural
+    /// Engine's compiled programs are kept between runs. `None` (a test or
+    /// a tool stating no home): a directory of the system's temporary one.
+    pub cache: Option<std::path::PathBuf>,
+    /// `[metal] measure`: whether a load times what no stored or committed
+    /// profile states under a matching key.
+    pub measure: engine::rates::Measuring,
+    /// Tests only (`test-limits`): the top rung a load serves, `None` the
+    /// ruling's (`Top::Ruled`, as every served load). A test that hand-builds
+    /// frames wider than a miniature's ruled top (which the runtime's step
+    /// builder never forms) loads every rung (`Top::EveryRung`), as the shell
+    /// tests do.
+    #[cfg(feature = "test-limits")]
+    pub top: Option<crate::Top>,
+}
+
+impl DeviceBoot {
+    /// The top rung a load serves: the ruling's, but where a test states one.
+    fn top(&self) -> crate::Top {
+        #[cfg(feature = "test-limits")]
+        if let Some(top) = self.top {
+            return top;
+        }
+        crate::Top::Ruled
+    }
 }
 
 struct PendingStep {
@@ -51,11 +75,37 @@ pub struct Metal {
     next_frame: u64,
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
-    adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
+    /// The adapter id each instance's lanes route by.
+    adapters: BTreeMap<InstanceId, u32>,
+    /// What the load armed and what its fires tallied (`engine::live`).
+    live: engine::live::Live,
+    /// Where a tier copy still landing is told landed
+    /// (`Engine::copy_slots_landing`).
+    landed: Option<engine::LandingSink>,
+    /// Test builds: the slots the runtime gave back, poisoned before the
+    /// next verb (`Engine::poison_queue`).
+    #[cfg(feature = "test-slot-fill")]
+    poison: Option<engine::chunk::PoisonQueue>,
+    /// A reload that failed part way: the weights are torn until one lands.
     torn: bool,
 }
 
 impl Metal {
+    /// Fires that reached a pipeline the load did not build, counted as
+    /// `Tally::BuiltInFire`: once the load is sealed nothing builds on a
+    /// fire's path here (the pipeline cache refuses the key, and the fire
+    /// with it), so what a backend that builds there would count is these.
+    /// It reads 0 where every pipeline a fire can reach was built before
+    /// ready.
+    fn tally_unbuilt(&self) {
+        if let Some(shell) = self.shell.as_ref() {
+            let missed = shell.take_unbuilt_pipelines();
+            if missed > 0 {
+                self.live.tally(engine::live::Tally::BuiltInFire, missed);
+            }
+        }
+    }
+
     #[must_use]
     pub fn new(boot: DeviceBoot, contract_for: ContractFor) -> Metal {
         Metal {
@@ -68,6 +118,10 @@ impl Metal {
             sink: None,
             pending: None,
             adapters: BTreeMap::new(),
+            live: engine::live::Live::armed(),
+            landed: None,
+            #[cfg(feature = "test-slot-fill")]
+            poison: None,
             torn: false,
         }
     }
@@ -95,10 +149,28 @@ impl Metal {
             })
     }
 
-    fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
+    fn loaded(&self) -> EngineResult<&Shell> {
         self.shell
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))
+    }
+
+    fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
+        let shell = self
+            .shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the metal engine has no model loaded".into()))?;
+        // Test builds: what the runtime gave back since the last verb is
+        // poisoned before this one touches the pool.
+        #[cfg(feature = "test-slot-fill")]
+        if let Some(queue) = &self.poison {
+            let due = std::mem::take(&mut *queue.lock().expect("the poison queue's lock"));
+            if !due.is_empty() {
+                let poisoned = shell.poison_given_back(&due);
+                tracing::trace!(target: "engine_metal::poison", due = due.len(), poisoned, "given-back slots poisoned");
+            }
+        }
+        Ok(shell)
     }
 }
 
@@ -137,8 +209,14 @@ fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
 }
 
 fn fault(fault: Fault) -> Error {
+    // A fault one lane earns refuses that lane alone; the step's other
+    // lanes are the runtime's to submit again (`engine::Error::Lanes`).
+    if let Some(lane) = fault.lane() {
+        return Error::lane(lane, fault);
+    }
     match fault {
         Fault::Deviceless | Fault::Device { .. } => Error::Device(fault.to_string()),
+        Fault::TierFull(_) => Error::TierFull(fault.to_string()),
         Fault::Refused { bytes } => Error::Exhausted {
             resource: "device memory",
             wanted: bytes,
@@ -152,6 +230,7 @@ fn fault(fault: Fault) -> Error {
         | Fault::Param { .. }
         | Fault::Recipe(_)
         | Fault::Shader { .. }
+        | Fault::Unprepared { .. }
         | Fault::Unbound { .. } => Error::Load(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
@@ -162,9 +241,12 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
-        | Fault::MaskWord { .. }
+        | Fault::MaskUnread { .. }
         | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Adapterless { .. }
+        | Fault::AdapterWord { .. }
+        | Fault::GeometryLanes { .. }
+        | Fault::OutputRows { .. } => Error::Invalid(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,
@@ -172,11 +254,16 @@ fn fault(fault: Fault) -> Error {
         },
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
+        Fault::Claimed(refusal) => Error::Claimed(refusal),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
-        Fault::Residency(_) => Error::Impossible(fault.to_string()),
+        Fault::UnderCarve { logical, .. } => Error::Placement {
+            chunks: vec![logical],
+            reason: fault.to_string(),
+        },
+        Fault::Residency(_) | Fault::FitShort(_) => Error::Impossible(fault.to_string()),
     }
 }
 
@@ -190,11 +277,86 @@ fn extents(stated: &BindExtents) -> eta_exec::Extents {
     }
 }
 
-/// The narrowest forward width a load lowers `[engine] max_forward_tokens` to
+/// The narrowest forward width a load narrows its fires to
 /// so its arena scratch fits beside resident weights.
 const MIN_FITTED_FORWARD_TOKENS: u32 = 512;
 
 const DEFAULT_STATE_SLOTS: u32 = 256;
+
+/// Bounds what the load tells (`FireLimits`) to the fires it walks: its top
+/// rung, as the ruling bounded it (`crate::top::bounded`). A rung of so
+/// many tokens walks no wider fire, and the runtime lifts its largest rung
+/// to the limit told: told wider, it packs fires the walk refuses.
+fn told_within(budgets: &mut LoadBudgets, served: &Budget) {
+    if served.max_tokens < budgets.max_tokens {
+        budgets.max_tokens = served.max_tokens;
+        budgets.max_lanes = budgets.max_lanes.min(served.max_lanes);
+        budgets.buckets.clone_from(&served.buckets);
+    }
+}
+
+/// The tokens a kv page of this engine holds.
+pub const PAGE_SIZE: u32 = 32;
+
+/// The widest fire this engine asks of its load
+/// ([`Engine::fire_ceiling`]).
+pub const FIRE_CEILING: engine::load::FireCeiling = engine::load::FireCeiling {
+    lanes: 512,
+    tokens: 10240,
+    page_size: Some(PAGE_SIZE),
+    context_binds: false,
+};
+
+/// The budgets a load at [`FIRE_CEILING`] and no adapter seats starts from.
+pub(crate) fn ceiling_budgets() -> LoadBudgets {
+    LoadBudgets {
+        max_lanes: FIRE_CEILING.lanes,
+        max_tokens: FIRE_CEILING.tokens,
+        page_size: PAGE_SIZE,
+        slots: 0,
+        ..LoadBudgets::default()
+    }
+}
+
+/// What `trace`'s weights take of device memory whatever the pool holds, and
+/// the streamable weights' whole bytes: every plane where nothing streams
+/// (`caches` false); else the planes the weight cache does not stream, and
+/// the floor it keeps of those it does.
+pub(crate) fn weight_demand(
+    trace: &Trace,
+    budgets: &LoadBudgets,
+    caches: bool,
+    held: bool,
+) -> crate::error::Result<(u64, u64)> {
+    let planes = crate::weights::plane_bytes(trace)?;
+    if !caches {
+        let whole = planes
+            .iter()
+            .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+            .sum();
+        return Ok((whole, 0));
+    }
+    let recipe = crate::chunks::recipe(
+        trace,
+        &poem_compiler::Budgets::of(bake_budgets(budgets, trace)),
+    )?;
+    Ok(crate::store::streamed::resident_demand(
+        trace,
+        &recipe,
+        &planes,
+        crate::experts::rows_streamed(held),
+    ))
+}
+
+/// What one sequence of `context` tokens takes of the pool.
+pub(crate) fn sequence_demand(
+    trace: &Trace,
+    page_size: u32,
+    context: u32,
+) -> crate::error::Result<u64> {
+    let paging = crate::store::kv::Paging::of(page_size, context, 1, 1)?;
+    Ok(crate::store::PoolDemand::of(trace, paging, None)?.bytes(u64::from(paging.pages_per_slot)))
+}
 
 /// The load's budgets: its logit readouts sized to what `trace` reads, not a
 /// general figure, so a vocab-wide head carves only the rows a fire can read.
@@ -274,12 +436,65 @@ fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
+/// The adapter an instance bound with `seeds` lands, by its content: two
+/// independent 64-bit digests (FNV-1a high, SipHash low) of the sink's site
+/// word and, in the sink's plane order, each plane's bank role, its seed's
+/// length and its seed, word for word as CUDA's `adapter_key_of`, so one
+/// adapter keys the same on both. None: the program lands none.
+pub fn adapter_key_of(
+    shell: &Shell,
+    program: engine::program::ProgramId,
+    seeds: &[engine::channel::ChannelSeed],
+) -> EngineResult<Option<u128>> {
+    let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
+        return Ok(None);
+    };
+    Ok(Some(adapter_digest(
+        sink.sites,
+        sink.planes.iter().map(|(role, channel)| {
+            let wire = seeds
+                .iter()
+                .find(|seed| seed.channel == *channel)
+                .map_or(&[][..], |seed| seed.bytes.as_slice());
+            (role.bank(), wire)
+        }),
+    )))
+}
+
+/// The digest [`adapter_key_of`] states, over a sink's site word and its
+/// planes `(bank role, seed)` in order.
+#[must_use]
+pub fn adapter_digest<'a>(sites: u32, planes: impl Iterator<Item = (&'a str, &'a [u8])>) -> u128 {
+    let mut fnv: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut sip = std::collections::hash_map::DefaultHasher::new();
+    let mut eat = |bytes: &[u8]| {
+        use std::hash::Hasher;
+        for byte in bytes {
+            fnv = (fnv ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        sip.write(bytes);
+    };
+    eat(&sites.to_le_bytes());
+    for (bank, wire) in planes {
+        eat(bank.as_bytes());
+        eat(&(wire.len() as u64).to_le_bytes());
+        eat(wire);
+    }
+    let sip = std::hash::Hasher::finish(&sip);
+    (u128::from(fnv) << 64) | u128::from(sip)
+}
+
+/// Lands the adapter an instance of `program` carries, its planes the
+/// bind's seeds, in the `Adapter` slots the runtime took (`slots`): where
+/// another instance landed the same adapter there it joins it. Its adapter
+/// id, what its lanes route by; None where it carries none.
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
     instance: InstanceId,
     seeds: &[(u32, Vec<u8>)],
-) -> EngineResult<Option<crate::adapter::Binding>> {
+    slots: &[u32],
+) -> EngineResult<Option<u32>> {
     let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
         return Ok(None);
     };
@@ -310,18 +525,57 @@ fn adapter_of(
             bytes,
         })
         .collect();
+    let planes: Vec<(String, Vec<u8>)> = planes
+        .iter()
+        .map(|plane| (plane.bank.to_string(), plane.bytes.to_vec()))
+        .collect();
     shell
-        .bind_adapter(crate::adapter::Source::Own {
-            instance,
-            planes: &planes,
-        })
+        .land_adapter(instance, slots, planes)
         .map(Some)
         .map_err(fault)
 }
 
 impl Engine for Metal {
+    /// The device shares the host's memory: the governor holds the pool
+    /// within what the GPU can still be given (`Context::host_room`), read
+    /// on its tick, so the host side growing beside the pool shrinks it.
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        Some(std::sync::Arc::new(crate::device::Context::host_room))
+    }
+
+    fn cover_fingerprint(&self) -> Option<String> {
+        self.shell
+            .as_ref()
+            .map(crate::serve::Shell::cover_fingerprint)
+    }
+
+    fn committed_covers(&self) -> &'static [&'static str] {
+        crate::chip::COVERS
+    }
+
+    fn skips_measuring(&self) -> bool {
+        self.boot.measure == engine::rates::Measuring::Skip
+    }
+
+    /// What the load timed (`Shell::measured_at_load`): the device's rates
+    /// and the model's kernel.dense curves, each where it measured them.
+    /// Nothing before a load, which has timed nothing yet.
+    fn measured_at_load(&self) -> Vec<String> {
+        self.shell
+            .as_ref()
+            .map(|shell| shell.measured_at_load().to_vec())
+            .unwrap_or_default()
+    }
+
     fn kind(&self) -> &'static str {
         "metal"
+    }
+
+    /// The widest fire the Metal shell asks of its load, which narrows it to
+    /// what the device's resident weights leave room for; its kv page is
+    /// its own (no planner derives one).
+    fn fire_ceiling(&self) -> Option<engine::load::FireCeiling> {
+        Some(FIRE_CEILING)
     }
 
     fn device_facts(&self) -> Option<&DeviceFacts> {
@@ -348,11 +602,13 @@ impl Engine for Metal {
             residency,
             ordinal,
             frames_in_flight,
+            steps,
         } = request;
 
         if ordinal > 0 {
             return Err(Error::unsupported("metal", "device ordinal selection"));
         }
+        no_host_tier(residency.host_kv_budget)?;
 
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
@@ -363,11 +619,11 @@ impl Engine for Metal {
         };
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
-        let (working_set, elsewhere, caches) = {
+        let (working_set, outside, caches) = {
             let device = crate::device::Context::bind().map_err(fault)?;
             (
                 device.working_set(),
-                device.held_elsewhere(),
+                device.allocated(),
                 // The weight cache runs where the queue keeps a residency set.
                 device
                     .hold_resident(std::iter::empty(), true)
@@ -379,45 +635,22 @@ impl Engine for Metal {
         // (routed experts, token-id tables) only the floor the cache keeps
         // must: the rest leaves the device under streaming, and a held set
         // seats it in the pool.
-        let planes = crate::weights::plane_bytes(&trace).map_err(fault)?;
-        let (weights, streamable) = if caches {
-            let recipe = crate::chunks::recipe(
-                &trace,
-                &poem_compiler::Budgets::of(bake_budgets(&budgets, &trace)),
-            )
-            .map_err(fault)?;
-            crate::store::streamed::resident_demand(
-                &trace,
-                &recipe,
-                &planes,
-                crate::experts::rows_streamed(residency.weights_held),
-            )
-        } else {
-            (
-                planes
-                    .iter()
-                    .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
-                    .sum::<u64>(),
-                0,
-            )
-        };
-        let util = residency.device_memory_share;
+        let (weights, streamable) =
+            weight_demand(&trace, &budgets, caches, residency.weights_held).map_err(fault)?;
         let slots = poem_compiler::state_slots(budgets.slots, &trace, DEFAULT_STATE_SLOTS);
-        let paging = crate::store::kv::Paging::of(budgets.page_size, budgets.max_context, 1, 1)
-            .map_err(|error| fault(Fault::from(error)))?;
         // The pool the weights must leave room for: the stated budget,
         // or one sequence when the pool fills what is left.
         let kv_pool = match residency.device_kv_budget {
             Some(budget) => budget,
-            None => crate::store::PoolDemand::of(&trace, paging, None)
-                .map_err(fault)?
-                .bytes(u64::from(paging.pages_per_slot)),
+            None => {
+                sequence_demand(&trace, budgets.page_size, budgets.max_context).map_err(fault)?
+            }
         };
         let accounting = |weights: u64, scratch: u64| {
-            crate::store::accounting::Accounting::with_scratch(
+            crate::store::accounting::Accounting::of(
                 working_set,
-                elsewhere,
-                util,
+                outside,
+                residency.device.budget,
                 weights,
                 scratch,
                 kv_pool,
@@ -432,84 +665,108 @@ impl Engine for Metal {
         // the width halves until it fits: a narrower prefill fire is slower,
         // a refused load serves nothing.
         let mut budgets = budgets;
-        let mut prepared = loop {
-            let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
-            let mut fitted = poem_compiler::fit_voxels(
-                &trace,
-                poem_compiler::Budgets {
-                    tokens: bake_budgets(&budgets, &trace),
-                    patches: patch_ladder(&trace, &budgets),
-                    voxels: poem_compiler::VoxelLadder::of(
-                        &trace,
-                        budgets.max_voxels,
-                        budgets.max_clips,
-                        budgets.max_lanes,
-                    ),
-                },
-                &DeviceProfile::default(),
-                room,
-            );
-            let slots = match slots {
-                0 => poem_compiler::fit_frame_slots(
+        // The widest fire's activation (its carve, its rs scratch, its
+        // staged rows) beside one working set past the allowance: the fit
+        // refuses, and the widest fire halves until it fits, once at load
+        // (nothing narrows while serving). What was cut and why is told once.
+        let asked = budgets.max_tokens;
+        let mut cut: Option<engine::chunk::FitShort> = None;
+        let mut shell = loop {
+            let mut prepared = loop {
+                let room = accounting(weights, 0).pool.saturating_sub(kv_pool) / 2;
+                let mut fitted = poem_compiler::fit_voxels(
                     &trace,
-                    fitted.voxels.as_mut(),
+                    poem_compiler::Budgets {
+                        tokens: bake_budgets(&budgets, &trace),
+                        patches: patch_ladder(&trace, &budgets),
+                        voxels: poem_compiler::VoxelLadder::of(
+                            &trace,
+                            budgets.max_voxels,
+                            budgets.max_clips,
+                            budgets.max_lanes,
+                        ),
+                    },
+                    &DeviceProfile::default(),
                     room,
-                    engine::fit::least_state_slots(1),
-                    frames_in_flight,
-                ),
-                slots => slots,
+                );
+                let slots = match slots {
+                    0 => poem_compiler::fit_frame_slots(
+                        &trace,
+                        fitted.voxels.as_mut(),
+                        room,
+                        engine::fit::least_state_slots(1),
+                        frames_in_flight,
+                    ),
+                    slots => slots,
+                };
+                let voxels = fitted.voxels;
+                let prepared = Shell::prepare(Boot {
+                    trace: trace.clone(),
+                    contract: &contract,
+                    checkpoint: &path,
+                    budget: bake_budgets(&budgets, &trace),
+                    patches: patch_ladder(&trace, &budgets),
+                    voxels,
+                    profile: None::<DeviceProfile>,
+                    page_size: budgets.page_size,
+                    context: budgets.max_context,
+                    slots,
+                    kv_budget: residency.device_kv_budget,
+                    allowance: residency.device,
+                    runahead: engine::runahead::Runahead::of(frames_in_flight),
+                    residency: experts::Plan::default(),
+                    profiles: self.boot.profiles.clone(),
+                    top: self.boot.top(),
+                    measure: self.boot.measure,
+                })
+                .map_err(fault)?;
+                let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+                if narrower >= budgets.max_tokens
+                    || accounting(weights, prepared.arena_bytes()).admit().is_ok()
+                    || accounting(weights, 0).admit().is_err()
+                {
+                    break prepared;
+                }
+                tracing::warn!(
+                    "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
+                 resident weights on this device: fires narrowed to {narrower} tokens",
+                    budgets.max_tokens,
+                    prepared.arena_bytes(),
+                );
+                budgets.max_tokens = narrower;
+                budgets.buckets.retain(|&rows| rows <= narrower);
             };
-            let voxels = fitted.voxels;
-            let prepared = Shell::prepare(Boot {
-                trace: trace.clone(),
-                contract: &contract,
-                checkpoint: &path,
-                budget: bake_budgets(&budgets, &trace),
-                patches: patch_ladder(&trace, &budgets),
-                voxels,
-                profile: None::<DeviceProfile>,
-                page_size: budgets.page_size,
-                context: budgets.max_context,
-                slots,
-                kv_budget: residency.device_kv_budget,
-                memory_share: residency.device_memory_share,
-                runahead: engine::runahead::Runahead::of(frames_in_flight),
-                residency: experts::Plan::default(),
-                profiles: self.boot.profiles.clone(),
-            })
-            .map_err(fault)?;
-            let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
-            if narrower >= budgets.max_tokens
-                || accounting(weights, prepared.arena_bytes())
-                    .admit(util)
-                    .is_ok()
-                || accounting(weights, 0).admit(util).is_err()
-            {
-                break prepared;
+            let scratch = prepared.arena_bytes();
+
+            accounting(weights, scratch).admit().map_err(fault)?;
+
+            prepared
+                .set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
+            prepared.set_ane_cache(self.boot.cache.clone());
+            match prepared.load_for_runtime() {
+                Ok(shell) => break shell,
+                Err(Fault::FitShort(short)) => {
+                    let narrower = (budgets.max_tokens / 2).max(MIN_FITTED_FORWARD_TOKENS);
+                    if narrower >= budgets.max_tokens {
+                        return Err(fault(Fault::FitShort(short)));
+                    }
+                    cut = Some(short);
+                    budgets.max_tokens = narrower;
+                    budgets.buckets.retain(|&rows| rows <= narrower);
+                }
+                Err(other) => return Err(fault(other)),
             }
-            eprintln!(
-                "the arena scratch for {} forward tokens ({} bytes) does not fit beside the \
-                 resident weights on this device: `[engine] max_forward_tokens` lowered to {narrower}",
-                budgets.max_tokens,
-                prepared.arena_bytes(),
-            );
-            budgets.max_tokens = narrower;
-            budgets.buckets.retain(|&rows| rows <= narrower);
         };
-        let scratch = prepared.arena_bytes();
+        if let Some(short) = cut {
+            tracing::warn!(
+                "the widest fire narrowed from {asked} to {} forward tokens at load: at the \
+                 wider fire, {short}",
+                budgets.max_tokens
+            );
+        }
 
-        accounting(weights, scratch).admit(util).map_err(fault)?;
-
-        prepared.set_residency(experts::Plan::default().with_weights_held(residency.weights_held));
-        let mut shell = prepared.load().map_err(fault)?;
-
-        shell.mount_adapters(self.boot.adapter_dir.clone());
-        // The device pool already is host memory, so a host tier would only
-        // move kv and rs slots within the same DRAM: one is seated only
-        // where its budget is stated (it frees room in the pool's heap, not
-        // memory), and suspended slots otherwise go straight to disk.
-        shell.seat_tier(residency.host_kv_budget.unwrap_or(0));
-        let disk_kv_pages = shell
+        told_within(&mut budgets, shell.budget());
+        shell
             .seat_disk_kv(
                 residency.disk_kv_budget,
                 residency.disk_kv_dir.as_deref(),
@@ -518,13 +775,23 @@ impl Engine for Metal {
             )
             .map_err(fault)?;
 
+        if crate::diag::on().tier_trace {
+            let audit = shell.audit();
+            eprintln!(
+                "ledger: {}; device {} MiB, {} KiB beside the entries; process footprint {} MiB",
+                shell.ledger(),
+                audit.device >> 20,
+                audit.gap() / 1024,
+                crate::device::ctx::host_resident(0) >> 20
+            );
+        }
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
         let (pool_committed_bytes, pool_high_water_bytes) = shell.pool_residency();
         let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
-        let pools = shell.pool_facts(disk_kv_pages);
+        let pools = shell.pool_facts();
         let chunks = shell.chunk_facts().map_err(fault)?;
         shell.log_chunk_recipe(&chunks);
 
@@ -542,6 +809,7 @@ impl Engine for Metal {
                 storage_alignment: 256,
                 storage_max_tile_bytes: shell.max_buffer(),
                 codegen_backend: Some("metal".to_string()),
+                library_forms: eta_compiler::codegen::metal::LIBRARY_FORMS,
             },
             pools,
             chunks,
@@ -553,10 +821,13 @@ impl Engine for Metal {
                 prefill_rows: shell
                     .neural_engine()
                     .map_or(0, crate::ane::Ane::prefill_rows),
+                prefill_lanes: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(&bake_budgets(
                     &budgets, &trace,
                 )))
                 .unwrap_or(u32::MAX),
+                // Each lane's rung bounds what it replays.
+                replayed_rows: 0,
                 dispatch_depth: 0,
             },
             has_lora: true,
@@ -566,20 +837,116 @@ impl Engine for Metal {
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
-                .with(Port::Fold),
+                .with(Port::Fold)
+                .with(Port::Parents),
             geometry: GeometryClass::DeviceGeometry,
             kv_handle: None,
             media_encode: false,
-            device_channel_commit: false,
             rs_verbs: shell.serves_rs_verbs(),
+            // Windowed layers as ring + buffer: a load
+            // with any states the rings and the window buffer in its facts.
+            windowed_state: shell.pool_ring().is_some(),
             rs_snapshots: crate::rs::snapshots(shell.trace()),
             bidirectional_attention: true,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
             classes: shell.classes(),
+            // Metal states no bound on one submission yet
+            // (`crate::rates::at_load`).
+            guest_cost: engine::GuestCost::default(),
+            // A beam group's page list (`beam_list`), read at a search's finish.
+            host_ops: engine::HostOps { beam_list: true },
+            mixed_lanes: engine::MixedLanes::Any,
+            frames_in_flight: engine::stated_frames(shell.frames_in_flight())?,
+            steps: engine::StatedSteps::default(),
         };
 
+        // The step compositions the runtime's builder forms over this load's
+        // facts, computed before the walk, which fires each.
+        let mut caps = caps;
+        caps.steps = engine::StatedSteps::of(
+            &steps,
+            &engine::StepFacts::stated(&caps, &engine::ReadoutFacts::default()),
+        );
+        // Metal records no bodies (its walk builds pipelines): every shape
+        // is walked, none eager.
+        caps.steps.eager.clear();
+        tracing::info!(
+            "engine-metal: step set: {}; the walk fires every one of the {}, none eager",
+            caps.steps.shapes.census(),
+            caps.steps.shapes.len(),
+        );
+
+        // Every pipeline the load's rungs dispatch is built now, before
+        // ready; a key met after is refused by name and tallied.
+        let began = std::time::Instant::now();
+        // A later boot of the same load (the same key) builds the keys an
+        // earlier boot listed, from its binary archive, without walking; a
+        // missing, stale or unreadable cache only costs the walk.
+        let cache = self
+            .boot
+            .profiles
+            .as_ref()
+            .and_then(|profiles| profiles.parent())
+            .map(|home| {
+                let key = shell.pipeline_cache_key(&caps.steps.shapes);
+                let name = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                });
+                let dir = home.join("cache").join("metal");
+                (
+                    key,
+                    dir.join(format!("{name:016x}.keys")),
+                    dir.join(format!("{name:016x}.metalarchive")),
+                )
+            });
+        #[cfg(target_vendor = "apple")]
+        if let Some((_, _, archive)) = cache.as_ref() {
+            shell.use_pipeline_archive(archive);
+        }
+        let listed = cache
+            .as_ref()
+            .and_then(|(key, keys, _)| read_pipeline_keys(keys, key));
+        let built = listed.and_then(|keys| {
+            shell
+                .build_pipelines(&keys)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        "metal: a listed pipeline did not build, so the load walks: {error}"
+                    );
+                })
+                .ok()
+        });
+        let (fires, built) = match built {
+            Some(built) => (0, built),
+            None => {
+                let walked = shell
+                    .warm_pipelines_over(&caps.steps.shapes)
+                    .map_err(fault)?;
+                if let Some((key, keys, _archive)) = cache.as_ref() {
+                    write_pipeline_keys(keys, key, &shell.pipeline_keys());
+                    #[cfg(target_vendor = "apple")]
+                    let _ = shell.save_pipeline_archive(_archive);
+                    drop_older_pipelines(keys, key);
+                }
+                walked
+            }
+        };
+        shell.seal_pipelines().map_err(fault)?;
+        tracing::info!(
+            fires,
+            built,
+            listed = fires == 0,
+            ms = began.elapsed().as_millis() as u64,
+            "metal: every pipeline the load dispatches is built before ready"
+        );
+        // Not in the ledger: what Metal's driver holds for the process beside
+        // what the device says it allocated (it settles seconds after the
+        // walk). Stated, not measured into `outside_bytes`, not carved.
+        tracing::info!(
+            "metal: Metal's driver holds memory outside budget_device that the device's allocated size does not show; it is not carved from the budget"
+        );
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -611,15 +978,40 @@ impl Engine for Metal {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
+        // The runtime's stamp of each step's stated shape, cross-checked
+        // against this load's stated set in debug builds.
+        if let Some(caps) = self.caps.as_ref() {
+            frame.debug_check_shapes(&caps.steps);
+        }
+        if let Some(shell) = self.shell.as_ref() {
+            let facts = &shell.trace().facts;
+            for step in &frame.steps {
+                step.validate_captures(|word| facts.holds(word, poem_ir::Builtin::Scores))?;
+            }
+        }
+        // Test builds: what was given back is poisoned before any step.
+        #[cfg(feature = "test-slot-fill")]
+        if self.shell.is_some() {
+            self.loaded_mut()?;
+        }
         let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
-        self.pending = None;
+        // A frame's rows are held while it is the open one: the steps of one
+        // its caller never settled are let go now.
+        if let Some((_, unsettled)) = self.pending.take()
+            && let Some(shell) = self.shell.as_mut()
+        {
+            for step in unsettled.iter().filter(|step| step.rows.is_none()) {
+                shell.forget(&step.landed);
+            }
+        }
 
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut pending = Vec::with_capacity(frame.steps.len());
+        let mut refused = None;
         for (index, step) in frame.steps.iter().enumerate() {
             if let Some(next) = frame.steps.get(index + 1) {
-                self.expect_fire(next);
+                engine::Completion::expect_fire(self, next);
             }
             let at = engine::StepDone {
                 frame: id,
@@ -630,18 +1022,37 @@ impl Engine for Metal {
                     steps.push(ticket);
                     pending.push(step_pending);
                 }
+                // A step's lanes refused past the first step: the frame is
+                // the steps before it (`engine::Error::Lanes`).
+                Err(error) if error.stops_frame_at(index) => {
+                    refused = Some(error);
+                    break;
+                }
                 Err(error) => {
                     self.pending = None;
+                    // The steps this frame fired before the one that failed:
+                    // no one asks their rows.
+                    if let Some(shell) = self.shell.as_mut() {
+                        for step in &pending {
+                            shell.forget(&step.landed);
+                        }
+                    }
+                    self.tally_unbuilt();
                     return Err(error);
                 }
             }
         }
-        let mut ticket = FrameTicket { id, steps };
+        self.tally_unbuilt();
+        let mut ticket = FrameTicket::of(id, steps, refused);
         self.pending = Some((id, pending));
-        if self.completion().is_none() {
+        if !engine::Completion::asynchronous(self) {
             self.settle_frame(&mut ticket)?;
         }
         Ok(ticket)
+    }
+
+    fn live(&self) -> engine::live::Live {
+        self.live.clone()
     }
 
     fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
@@ -693,42 +1104,57 @@ impl Engine for Metal {
         Ok(())
     }
 
-    fn completion(&mut self) -> Option<&mut dyn Completion> {
-        if self
-            .shell
-            .as_ref()
-            .is_some_and(|shell| shell.frames_in_flight() > 1)
-        {
-            Some(self)
-        } else {
-            None
-        }
-    }
-
-    fn programs(&mut self) -> Option<&mut dyn Programs> {
+    fn completion(&mut self) -> Option<&mut dyn engine::Completion> {
         Some(self)
     }
 
-    fn channels(&mut self) -> Option<&mut dyn Channels> {
+    fn programs(&mut self) -> Option<&mut dyn engine::Programs> {
         Some(self)
     }
 
-    fn pool(&mut self) -> Option<&mut dyn Pool> {
+    fn programs_ref(&self) -> Option<&dyn engine::Programs> {
         Some(self)
     }
 
-    fn weights(&mut self) -> Option<&mut dyn WeightCache> {
+    fn channels(&mut self) -> Option<&mut dyn engine::Channels> {
         Some(self)
     }
 
-    fn tiers(&mut self) -> Option<&mut dyn Tiers> {
+    fn channels_ref(&self) -> Option<&dyn engine::Channels> {
+        Some(self)
+    }
+
+    fn pool(&mut self) -> Option<&mut dyn engine::Pool> {
+        Some(self)
+    }
+
+    fn weights(&mut self) -> Option<&mut dyn engine::WeightCache> {
+        Some(self)
+    }
+
+    fn tiers(&mut self) -> Option<&mut dyn engine::Tiers> {
         Some(self)
     }
 }
 
-impl Completion for Metal {
+impl engine::Completion for Metal {
+    fn asynchronous(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.frames_in_flight() > 1)
+    }
+
     fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
+    }
+
+    /// Commits the epilogues of every landed step (their sink was told from
+    /// the completion handler) before the runtime takes their channels.
+    fn publish_landed(&mut self) -> EngineResult<()> {
+        if let Some(shell) = self.shell.as_mut() {
+            shell.reap().map_err(fault)?;
+        }
+        Ok(())
     }
 
     fn expect_fire(&mut self, submission: &Step) {
@@ -739,11 +1165,121 @@ impl Completion for Metal {
     }
 }
 
-impl Programs for Metal {
+impl engine::Programs for Metal {
+    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
+        Err(Error::Invalid(format!(
+            "adapter {} is operator-declared, and no backend hosts operator-declared \
+             adapters: an adapter arrives through a program's `lora` sink at bind, its \
+             planes the bind's seeds, and lands in `Adapter` slots shared by every \
+             instance that carries the same planes",
+            registration.id
+        )))
+    }
+
     fn register(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        let shell = self.loaded_mut()?;
+        let before = (shell.program_compilations(), shell.program_compile_nanos());
+        let id = shell.register_program(registration).map_err(fault)?;
+        // A registration after ready that compiled guest code is one the
+        // load's prewarm did not prepare: built at its registration, before
+        // its first fire (no fire waits on it). Its compile's wall time
+        // reads an OS shader-cache hit apart from a cold compile.
+        let built = shell.program_compilations() - before.0;
+        if built > 0 {
+            let ms = (shell.program_compile_nanos() - before.1) / 1_000_000;
+            self.live.tally(engine::live::Tally::BuiltAtRegister, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegisterMs, ms);
+            tracing::warn!(
+                program = registration.program_hash,
+                regions = built,
+                ms,
+                "metal: a registration after ready compiled guest code the prewarm did not"
+            );
+        }
+        Ok(id)
+    }
+
+    fn prewarm(&mut self, registrations: &[ProgramRegistration]) -> EngineResult<()> {
         self.loaded_mut()?
-            .register_program(registration)
+            .prewarm_programs(registrations)
             .map_err(fault)
+    }
+
+    /// The plan here; the libraries and pipelines in the compile, off this
+    /// thread (cold, a sampler's take 0.1-0.4 s on an M1 Max).
+    fn prepare(
+        &mut self,
+        registration: &ProgramRegistration,
+    ) -> EngineResult<engine::ProgramCompile> {
+        let registering = self
+            .loaded_mut()?
+            .prepare_program(registration)
+            .map_err(fault)?;
+        Ok(Box::new(move || {
+            engine::Prepared(Box::new(registering.compile()))
+        }))
+    }
+
+    fn finish(&mut self, prepared: engine::Prepared) -> EngineResult<ProgramId> {
+        let registered = prepared
+            .0
+            .downcast::<crate::program::Registered>()
+            .map_err(|_| {
+                engine::Error::Program("a prepared program this engine did not prepare".into())
+            })?;
+        let shell = self.loaded_mut()?;
+        let before = (shell.program_compilations(), shell.program_compile_nanos());
+        let id = shell.finish_program(*registered).map_err(fault)?;
+        // The compile's regions count at the finish: a registration after
+        // ready that compiled guest code is one the prewarm did not prepare,
+        // built at its registration (no fire waits on it). Its compile's
+        // wall time, off this thread, reads a cache hit apart from a cold
+        // compile.
+        let built = shell.program_compilations() - before.0;
+        if built > 0 {
+            let ms = (shell.program_compile_nanos() - before.1) / 1_000_000;
+            self.live.tally(engine::live::Tally::BuiltAtRegister, built);
+            self.live.tally(engine::live::Tally::BuiltAtRegisterMs, ms);
+            tracing::warn!(
+                program = id.0,
+                regions = built,
+                ms,
+                "metal: a registration after ready compiled guest code the prewarm did not"
+            );
+        }
+        Ok(id)
+    }
+
+    fn close_program(&mut self, program: ProgramId) -> EngineResult<()> {
+        self.loaded_mut()?.close_program(program).map_err(fault)
+    }
+
+    fn adapter_key(&self, binding: &engine::InstanceBinding) -> EngineResult<Option<u128>> {
+        adapter_key_of(self.loaded()?, binding.program, &binding.seeds)
+    }
+
+    fn facts(&self, program: ProgramId) -> EngineResult<engine::ProgramFacts> {
+        self.loaded()?.program_facts(program).map_err(fault)
+    }
+
+    /// A guest program's state: its instances' value scratch and its
+    /// pair's batch sets, in `Instance` slots. Nothing of it lies in the
+    /// span, so Metal states no fire term (`Engine::fire_facts`' default)
+    /// and no standing bytes (`Engine::standing_after`'s).
+    fn guest_state(
+        &self,
+        program: ProgramId,
+        at: &engine::BindExtents,
+        // The class bound: the engine half states per-class arms.
+        _class: engine::ports::GeometryClass,
+    ) -> EngineResult<engine::GuestState> {
+        self.loaded()?
+            .guest_state(program, &extents(at))
+            .map_err(fault)
+    }
+
+    fn rebind(&mut self, rebind: engine::Rebind) -> EngineResult<()> {
+        self.loaded_mut()?.rebind_slots(&rebind).map_err(fault)
     }
 
     fn bind(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
@@ -772,9 +1308,14 @@ impl Programs for Metal {
                 binding.geometry,
                 binding.device_resolved,
                 &binding.channels,
+                &binding.instance_slots,
+                &binding.ring_slots,
+                &binding.scratch,
+                &binding.pair,
+                binding.pair_generation,
             )
             .map_err(fault)?;
-        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let landed = adapter_of(shell, binding.program, id, &seeds, &binding.adapter_slots);
         let bound = match landed {
             Ok(bound) => bound,
             Err(why) => {
@@ -789,50 +1330,48 @@ impl Programs for Metal {
             id,
             program: binding.program,
             geometry: binding.geometry,
+            standing_guest_bytes: 0,
         })
     }
 
-    fn close(&mut self, id: InstanceId) -> EngineResult<()> {
-        let held = self.adapters.remove(&id);
+    fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
+        self.adapters.remove(&id);
         let shell = self.loaded_mut()?;
-        if let Some(bound) = held.as_ref() {
-            shell.release_adapter(bound);
-        }
-        shell.close_program_instance(id).map_err(fault)
+        shell.detach_adapter(id);
+        shell.close_program_instance(id).map_err(fault)?;
+        Ok(0)
     }
 
-    fn adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        let planes: Vec<AdapterPlane<'_>> = registration
-            .planes
-            .iter()
-            .map(|plane| AdapterPlane {
-                bank: plane.bank.as_str(),
-                bytes: &plane.bytes,
-            })
-            .collect();
-        self.loaded_mut()?
-            .register_adapter(registration.id, &planes)
-            .map_err(fault)
+    fn beam_list(&mut self, instance: InstanceId, beam: u32) -> EngineResult<Vec<u32>> {
+        self.loaded_mut()?.beam_list(instance, beam).map_err(fault)
     }
 }
 
-impl Channels for Metal {
+impl engine::Channels for Metal {
+    /// A device channel's ring is a shared ring in its `Channel` slots; a
+    /// channel the host reads or writes is the runtime's, each instance
+    /// holding its own ring of it.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        registration.host_role == eta_ir::container::HostRole::None
+    }
+
+    fn ring_facts(
+        &self,
+        registration: &ChannelRegistration,
+    ) -> EngineResult<Option<engine::RingFacts>> {
+        if registration.host_role != eta_ir::container::HostRole::None {
+            return Ok(None);
+        }
+        Ok(self.loaded()?.ring_facts(channel_shape(registration)))
+    }
+
     fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         if registration.host_role != eta_ir::container::HostRole::None {
             return Err(Error::unsupported(self.kind(), "register_channel"));
         }
-        let shape = crate::program::ChannelShape {
-            capacity: registration.capacity.max(1),
-            numel: registration
-                .shape
-                .iter()
-                .map(|&dim| dim as usize)
-                .product::<usize>()
-                .max(1),
-            dtype: registration.dtype.program_dtype(),
-        };
+        let shape = channel_shape(registration);
         self.loaded_mut()?
-            .register_shared_channel(registration.id, shape)
+            .register_shared_channel(registration.id, shape, &registration.slots)
             .map_err(fault)?;
         Ok(RegisteredChannel {
             id: registration.id,
@@ -856,45 +1395,19 @@ impl Channels for Metal {
     }
 
     fn take(&mut self, instance: InstanceId, channel: u32) -> EngineResult<Option<Vec<u8>>> {
-        self.instance(instance)?.take(channel).map_err(fault)
-    }
-}
-
-impl Tiers for Metal {
-    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
-        copy.validate()?;
-        let device = self.caps.as_ref().map(|caps| caps.device.domain);
-        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
-            return Err(Error::Unsupported {
-                verb: kv_copy_direction(copy.src, copy.dst),
-                engine: "metal",
-            });
-        }
-        let page_size = self.loaded_mut()?.paging().page_size;
-        let moves = copy.runs(page_size)?;
-        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
-    }
-
-    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
-        self.loaded_mut()?.copy_slots(copy).map_err(fault)
-    }
-
-    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
-        self.loaded_mut()?.read_tier_slots(slots).map_err(fault)
-    }
-
-    fn write(
-        &mut self,
-        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
-        bytes: &[u8],
-    ) -> EngineResult<()> {
         self.loaded_mut()?
-            .write_tier_slots(slots, bytes)
+            .program_instance_taking(instance, channel)
+            .map_err(fault)?
+            .ok_or(Error::Closed {
+                what: "instance",
+                id: instance.0,
+            })?
+            .take(channel)
             .map_err(fault)
     }
 }
 
-impl Pool for Metal {
+impl engine::Pool for Metal {
     fn commit(&mut self, segments: u32) -> EngineResult<()> {
         self.loaded_mut()?.commit_segments(segments).map_err(fault)
     }
@@ -903,12 +1416,46 @@ impl Pool for Metal {
         self.loaded_mut()?.release_segments(segments).map_err(fault)
     }
 
+    fn set_rung(&mut self, from: u32, to: u32) -> EngineResult<()> {
+        self.loaded_mut()?.set_rung(from, to).map_err(fault)
+    }
+
+    fn commit_span(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.commit_span(segments).map_err(fault)
+    }
+
+    fn release_span(&mut self, segments: u32) -> EngineResult<()> {
+        self.loaded_mut()?.release_span(segments).map_err(fault)
+    }
+
     fn evacuate(&mut self, evacuation: &engine::chunk::Evacuation) -> EngineResult<()> {
         self.loaded_mut()?.evacuate(evacuation).map_err(fault)
     }
+
+    fn chunk_table(&self) -> EngineResult<engine::chunk::ChunkTable> {
+        Ok(self.loaded()?.chunk_table().clone())
+    }
+
+    #[cfg(feature = "test-slot-fill")]
+    fn poison_queue(&mut self, queue: engine::chunk::PoisonQueue) {
+        self.poison = Some(queue);
+    }
 }
 
-impl WeightCache for Metal {
+impl engine::WeightCache for Metal {
+    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<u64> {
+        // This engine holds back none of the chunks it states
+        // (`ChunkFacts::held_bytes` is 0 at load): the answer repeats it.
+        self.loaded_mut()?
+            .weight_residency(residency)
+            .map(|()| 0)
+            .map_err(fault)
+    }
+
+    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
+        self.loaded_mut()?.weight_uses().map_err(fault)
+    }
+
     fn reload(&mut self, reload: &engine::load::Reload) -> EngineResult<engine::load::Reloaded> {
         let path = reload.checkpoint.as_path();
         let shell = self
@@ -921,15 +1468,63 @@ impl WeightCache for Metal {
             .map_err(fault)?;
         Ok(engine::load::Reloaded { planes, bytes })
     }
+}
 
-    fn set_residency(&mut self, residency: &engine::chunk::WeightResidency) -> EngineResult<()> {
+impl engine::Tiers for Metal {
+    /// Waits on the last copy's command buffer: every copy submitted so far
+    /// has read its sources and written its destinations.
+    fn settle(&mut self) -> EngineResult<()> {
+        match self.shell.as_mut() {
+            Some(shell) => shell.settle_copies().map_err(fault),
+            None => Ok(()),
+        }
+    }
+
+    /// A copy on the device rides a command buffer that may still be
+    /// reading its sources when the call returns: told landed from that
+    /// buffer's completion. A move to or from the slot
+    /// files is a host copy done inside the call: its sources are read.
+    fn copy_landing(&mut self, copy: &engine::chunk::SlotCopy, token: u64) -> EngineResult<bool> {
+        let landed = self.landed.clone();
         self.loaded_mut()?
-            .weight_residency(residency)
+            .copy_slots_landing(copy, landed.map(|sink| (sink, token)))
             .map_err(fault)
     }
 
-    fn uses(&mut self) -> EngineResult<engine::chunk::WeightUses> {
-        self.loaded_mut()?.weight_uses().map_err(fault)
+    fn on_landed(&mut self, sink: engine::LandingSink) {
+        self.landed = Some(sink);
+    }
+
+    fn copy(&mut self, copy: &engine::chunk::SlotCopy) -> EngineResult<()> {
+        self.loaded_mut()?.copy_slots(copy).map_err(fault)
+    }
+
+    fn read(&mut self, slots: &[(engine::chunk::ShapeId, Vec<u32>)]) -> EngineResult<Vec<u8>> {
+        let _ = slots;
+        Err(no_host_slots())
+    }
+
+    fn write(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, Vec<u32>)],
+        bytes: &[u8],
+    ) -> EngineResult<()> {
+        let _ = (slots, bytes);
+        Err(no_host_slots())
+    }
+
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+        copy.validate()?;
+        let device = self.caps.as_ref().map(|caps| caps.device.domain);
+        if device.is_none_or(|device| copy.src != device || copy.dst != device) {
+            return Err(Error::Unsupported {
+                verb: kv_copy_direction(copy.src, copy.dst),
+                engine: "metal",
+            });
+        }
+        let page_size = self.loaded_mut()?.paging().page_size;
+        let moves = copy.runs(page_size)?;
+        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
     }
 }
 
@@ -1036,7 +1631,7 @@ impl Metal {
                     continue;
                 };
                 if let Some(slot) = lane_adapters.get_mut(attachment.lane as usize) {
-                    *slot = Some(bound.slot);
+                    *slot = Some(*bound);
                 }
             }
         }
@@ -1058,13 +1653,16 @@ impl Metal {
                 ))
             })?;
         }
-        // A lane stating its slot tables names its kv pages and its state
-        // record there; until the runtime states them, the legacy fields
-        // carry the same slot refs.
+        // A lane names its kv pages, its window pages and its state record
+        // in its slot tables: this engine states one shared
+        // pool, so the runtime states them. A device-geometry lane's list
+        // table is its working set's whole mapped table, which its ports'
+        // page indexes translate through.
         let mut pages_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut record_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut run_of: Vec<Option<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
         let mut window_of: Vec<Vec<Vec<u32>>> = Vec::with_capacity(submission.lanes.len());
+        let mut ring_of: Vec<Option<Vec<[u32; 2]>>> = Vec::with_capacity(submission.lanes.len());
         let mut forks: Vec<(u32, u32)> = Vec::new();
         for lane in &submission.lanes {
             pages_of.push(
@@ -1073,11 +1671,9 @@ impl Metal {
                     .find(|(shape, _)| *shape == crate::store::layout::LIST)
                     .map(|(_, refs)| refs.clone()),
             );
-            // One table a window list, in the load's order; until the
-            // runtime states them, the legacy window pages are the first
-            // list's.
+            // One table a window list, in the load's order.
             let lists = shell.pool_layout().window_lists().count();
-            let mut windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
+            let windows: Vec<Vec<u32>> = crate::store::layout::WINDOWS[..lists]
                 .iter()
                 .map(|id| {
                     lane.tables
@@ -1087,23 +1683,41 @@ impl Metal {
                         .unwrap_or_default()
                 })
                 .collect();
-            if let Some(first) = windows.first_mut()
-                && first.is_empty()
-            {
-                first.clone_from(&lane.kv.window);
-            }
             window_of.push(windows);
-            let fixed = lane
-                .fixed
-                .iter()
-                .find(|(shape, _)| *shape == crate::store::layout::FIXED);
-            run_of.push(fixed.and_then(|(_, pieces)| {
+            ring_of.push(match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::RING)
+                    .map(|(_, pieces)| pieces.clone()),
+                _ => None,
+            });
+            // A load that holds state is told every lane's record: its
+            // pieces, or none (the null record).
+            let fixed: Option<Vec<[u32; 2]>> = match &lane.record {
+                engine::fire::LaneRecord::Pieces(pieces) => pieces
+                    .iter()
+                    .find(|(shape, _)| *shape == crate::store::layout::FIXED)
+                    .map(|(_, pieces)| pieces.clone()),
+                engine::fire::LaneRecord::Null => shell
+                    .null_record()
+                    .map(|null| null.iter().map(|&r| [r, r]).collect()),
+                engine::fire::LaneRecord::Unstated if shell.null_record().is_some() => {
+                    return Err(Error::Invalid(format!(
+                        "lane in slot {} states no record, and this load holds recurrent \
+                         state: the runtime states every lane's record, or that it has none",
+                        lane.slot
+                    )));
+                }
+                engine::fire::LaneRecord::Unstated => None,
+            };
+            let fixed = fixed.as_ref();
+            run_of.push(fixed.and_then(|pieces| {
                 pieces
                     .iter()
                     .any(|&[run, cow]| run != cow)
                     .then(|| pieces.iter().map(|&[run, _]| run).collect())
             }));
-            record_of.push(fixed.map(|(_, pieces)| {
+            record_of.push(fixed.map(|pieces| {
                 // `cow != run`: the record is copied before the fire, once
                 // for every lane of a group naming the same pair.
                 for &[run, cow] in pieces {
@@ -1114,11 +1728,19 @@ impl Metal {
                 pieces.iter().map(|&[_, cow]| cow).collect()
             }));
         }
-        if !forks.is_empty() {
-            shell.copy_state(&forks).map_err(fault)?;
+        let mut ring_forks: Vec<(u32, u32)> = Vec::new();
+        for pieces in ring_of.iter().flatten() {
+            for &[run, cow] in pieces {
+                if run != cow && !ring_forks.contains(&(run, cow)) {
+                    ring_forks.push((run, cow));
+                }
+            }
+        }
+        if !forks.is_empty() || !ring_forks.is_empty() {
+            shell.copy_records(&forks, &ring_forks).map_err(fault)?;
         }
         // Tail copies (an rs-list or kv slot a fork shares) land before any
-        // lane of the fire reads or writes (CONTRACT-BC 20).
+        // lane of the fire reads or writes.
         let slot_copies: Vec<_> = submission
             .lanes
             .iter()
@@ -1131,6 +1753,7 @@ impl Metal {
             .enumerate()
             .map(|(at, lane)| {
                 Ok(Seated {
+                    replay_stated: lane.replay_stated,
                     lane: Lane {
                         slot: lane.slot,
                         word: words[at],
@@ -1138,9 +1761,11 @@ impl Metal {
                     },
                     group: lane.group,
                     inputs: &lane.inputs,
-                    pages: pages_of[at].as_deref().unwrap_or(&lane.kv.pages),
-                    held: (!lane.kv.pages.is_empty() || pages_of[at].is_some())
-                        .then_some(lane.kv.held),
+                    pages: pages_of[at].as_deref().unwrap_or(&[]),
+                    held: pages_of[at].is_some().then_some(lane.kv.held),
+                    folded: lane.kv.folded,
+                    readable: lane.kv.readable,
+                    set: lane.kv.set,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1149,15 +1774,30 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    translation: &lane.kv.translation,
+                    // A beam group's lane resolves through its working set's
+                    // whole reserve (the pool its list's entries name);
+                    // any other lane through its own
+                    // table.
+                    translation: if lane.reserve.is_empty() {
+                        match lane.list {
+                            engine::fire::ListKind::Translation => {
+                                pages_of[at].as_deref().unwrap_or(&[])
+                            }
+                            engine::fire::ListKind::Pages => &[],
+                        }
+                    } else {
+                        &lane.reserve
+                    },
                     rs: &lane.rs,
                     rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
                     rs_snapshots: &lane.rs_snapshots,
                     refs: true,
                     record: record_of[at].as_deref(),
                     record_run: run_of[at].as_deref(),
                     windows: &window_of[at],
+                    ring: ring_of[at].as_deref(),
+                    window: submission.lanes[at].window,
+                    reports: lane.reports,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
@@ -1225,3 +1865,256 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // moves sole ownership of all of them, and Metal's device, queue, pipeline and
 // resource objects are documented usable from any thread.
 unsafe impl Send for Metal {}
+
+/// The ring a registered channel declares.
+fn channel_shape(registration: &ChannelRegistration) -> crate::program::ChannelShape {
+    crate::program::ChannelShape {
+        capacity: registration.capacity.max(1),
+        numel: registration
+            .shape
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>()
+            .max(1),
+        dtype: registration.dtype.program_dtype(),
+    }
+}
+
+type PipelineKeyText = (String, String, String, Option<[u64; 2]>);
+
+/// The keys a boot of the load `key` listed at `path`: `None` where there
+/// is no list, it was written for another key, or a line does not parse.
+fn read_pipeline_keys(path: &std::path::Path, key: &str) -> Option<Vec<PipelineKeyText>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != key {
+        return None;
+    }
+    lines
+        .map(|line| {
+            let mut parts = line.split('\t');
+            let file = parts.next()?.to_string();
+            let entry = parts.next()?.to_string();
+            let stamp = parts.next()?.to_string();
+            let strides = match parts.next()? {
+                "-" => None,
+                pair => {
+                    let (k, v) = pair.split_once(',')?;
+                    Some([k.parse().ok()?, v.parse().ok()?])
+                }
+            };
+            Some((file, entry, stamp, strides))
+        })
+        .collect()
+}
+
+/// Writes the load `key`'s pipeline keys to `path`, whole or not at all (a
+/// list cut short would leave pipelines unbuilt); a failed write only costs
+/// the next boot a walk.
+fn write_pipeline_keys(path: &std::path::Path, key: &str, keys: &[PipelineKeyText]) {
+    let mut text = format!("{key}\n");
+    for (file, entry, stamp, strides) in keys {
+        let strides = strides.map_or_else(|| "-".to_string(), |[k, v]| format!("{k},{v}"));
+        text.push_str(&format!("{file}\t{entry}\t{stamp}\t{strides}\n"));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let partial = path.with_extension(format!("keys.{}", std::process::id()));
+    if std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, path))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&partial);
+    }
+}
+
+/// The model's graph, by a pipeline cache key (`metal-pipelines-N|device|OS
+/// build|binary|graph|shape`).
+fn pipeline_key_graph(key: &str) -> Option<&str> {
+    key.strip_prefix("metal-pipelines-")?.split('|').nth(4)
+}
+
+/// Removes the lists and archives beside `keep` that an earlier load of
+/// `key`'s graph wrote, and nothing else in that directory.
+fn drop_older_pipelines(keep: &std::path::Path, key: &str) {
+    let Some((dir, graph)) = keep.parent().zip(pipeline_key_graph(key)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut dropped = 0u32;
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path == keep || path.extension().is_none_or(|ext| ext != "keys") {
+            continue;
+        }
+        let older = std::fs::read_to_string(&path)
+            .is_ok_and(|text| text.lines().next().and_then(pipeline_key_graph) == Some(graph));
+        if older && std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(path.with_extension("metalarchive"));
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        tracing::info!(
+            dropped,
+            "metal: this model's older pipeline lists and archives are removed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pipeline_cache {
+    use super::*;
+
+    /// A save keeps its own pair and drops its graph's older ones, whatever
+    /// key version wrote them; another graph's, and any other file, stay.
+    #[test]
+    fn a_save_drops_only_its_graphs_older_pairs() {
+        let dir = std::env::temp_dir().join(format!("pie-pipeline-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = |version: u32, graph: &str, shape: &str| {
+            format!("metal-pipelines-{version}|Apple M5|Version 27|1:2|{graph}|{shape}")
+        };
+        let put = |name: &str, key: &str| {
+            write_pipeline_keys(&dir.join(format!("{name}.keys")), key, &[]);
+            std::fs::write(dir.join(format!("{name}.metalarchive")), b"a").unwrap();
+        };
+        put("old", &key(1, "aa", "s1"));
+        put("new", &key(2, "aa", "s2"));
+        put("other", &key(2, "bb", "s1"));
+        std::fs::write(dir.join("note.keys"), b"aa").unwrap();
+        drop_older_pipelines(&dir.join("new.keys"), &key(2, "aa", "s2"));
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            left,
+            [
+                "new.keys",
+                "new.metalarchive",
+                "note.keys",
+                "other.keys",
+                "other.metalarchive"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod told {
+    use super::*;
+
+    /// A load whose ruling picks a top rung under the asked fire tells that
+    /// rung's tokens as its widest fire, and its lanes and buckets as the
+    /// rung walks them; one ruled at what it asked tells what it asked.
+    #[test]
+    fn the_told_limit_is_the_ruled_top_rung() {
+        let asked = LoadBudgets {
+            max_lanes: 2048,
+            max_tokens: 4096,
+            buckets: vec![1, 64, 512, 2048, 4096],
+            ..LoadBudgets::default()
+        };
+        let baked = Budget {
+            max_lanes: asked.max_lanes,
+            max_tokens: asked.max_tokens,
+            buckets: asked.buckets.clone(),
+            max_adapters: 0,
+            readouts_per_lane: 1,
+        };
+        for top in [1024, 512, 64] {
+            let served = crate::top::bounded(&baked, top);
+            let mut told = asked.clone();
+            told_within(&mut told, &served);
+            assert_eq!(
+                told.max_tokens, top,
+                "the told widest fire is the ruled top rung"
+            );
+            assert_eq!(told.max_lanes, top.min(asked.max_lanes));
+            assert_eq!(told.buckets, served.buckets);
+            assert!(told.buckets.iter().all(|&rows| rows <= top));
+        }
+        let mut told = asked.clone();
+        told_within(&mut told, &crate::top::bounded(&baked, asked.max_tokens));
+        assert_eq!(told.max_tokens, asked.max_tokens);
+        assert_eq!(told.max_lanes, asked.max_lanes);
+    }
+}
+
+/// The device's memory is the host's: a host tier would copy slots within
+/// the same DRAM, freeing nothing physical and only moving them between
+/// budgets. Suspended slots go to disk; a host budget stated for this
+/// device is refused by name, not ignored.
+fn no_host_tier(host_kv_budget: Option<u64>) -> EngineResult<()> {
+    match host_kv_budget.filter(|&budget| budget > 0) {
+        Some(budget) => Err(Error::Load(format!(
+            "budget_host ({budget} bytes) on Metal: the device's memory is the host's, so \
+             there is no host kv tier (a move there would copy within the same memory and \
+             free nothing); suspended state goes to the disk tier (budget_disk). Remove \
+             budget_host from [engine.memory]"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// A read or write of host tier slots: Metal seats no host tier
+/// ([`no_host_tier`]), so there are none to name.
+fn no_host_slots() -> Error {
+    Error::Invalid(
+        "host tier slots on Metal: the device's memory is the host's, so a load seats no host \
+         tier; suspended state goes to the disk tier"
+            .into(),
+    )
+}
+
+#[cfg(test)]
+mod no_host_tier_tests {
+    /// A host budget on a device whose memory is the host's is refused by
+    /// name; none stated (or zero) loads.
+    #[test]
+    fn a_host_budget_on_metal_is_refused_by_name() {
+        let refused = super::no_host_tier(Some(8 << 30)).expect_err("refused");
+        let text = refused.to_string();
+        assert!(
+            text.contains("budget_host") && text.contains("the device's memory is the host's"),
+            "{text}"
+        );
+        assert!(super::no_host_tier(None).is_ok());
+        assert!(super::no_host_tier(Some(0)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod placement {
+    use super::*;
+
+    /// A fire naming a state slot inside the activation's carve is refused
+    /// as a placement, naming the logical chunk: the runtime moves that
+    /// state down and submits again, failing no lane.
+    #[test]
+    fn a_slot_under_the_carve_is_refused_naming_its_chunk() {
+        let refused = fault(Fault::UnderCarve {
+            logical: 2057,
+            physical: 2057,
+            carve: 482_998_272,
+            range: 4_162_532_352,
+        });
+        let Error::Placement { chunks, reason } = &refused else {
+            panic!("a placement refusal: {refused:?}");
+        };
+        assert_eq!(chunks, &vec![2057]);
+        assert!(
+            reason.contains("activation span's backed carve"),
+            "{reason}"
+        );
+        assert!(
+            refused.to_string().starts_with("impossible submission: "),
+            "{refused}"
+        );
+    }
+}

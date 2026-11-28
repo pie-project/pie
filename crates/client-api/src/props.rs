@@ -31,37 +31,34 @@ pub const MAX_SESSION_BYTES: usize = 128;
 /// inferlet tokenizes.
 pub const PROMPT: &str = "prompt";
 
+/// A completion's prompt text exactly as the client sent it (the compat
+/// gateway sets it for `/v1/completions`): the runtime tokenizes it at
+/// arrival, as the compat inferlet will, to look its prefix up in the cache
+/// before the process is admitted.
+pub const RAW_PROMPT: &str = "raw-prompt";
+
+/// The tokens a raw prompt runs as: the model's prefix (a chat render's
+/// BOS), then the text's own, unless the text already spells the prefix (as
+/// vLLM and SGLang read it). One rule, for the compat inferlet that runs the
+/// prompt and the runtime that looks it up while it waits.
+#[must_use]
+pub fn raw_prompt_tokens(prefix: Vec<u32>, body: Vec<u32>) -> Vec<u32> {
+    if body.starts_with(&prefix) {
+        body
+    } else {
+        [prefix, body].concat()
+    }
+}
+
+/// The prompt's token ids (an array of integers), as a program that has them
+/// states them at launch: the runtime looks their prefix up in the cache
+/// before the process is admitted.
+pub const PROMPT_TOKENS: &str = "prompt-tokens";
+
 /// The request's output limit, so the router has it before the inferlet runs.
 pub const MAX_TOKENS: &str = "max-tokens";
 
 pub const MAX_PROMPT_BYTES: usize = 16 * 1024 * 1024;
-
-/// Keep this many of the process's leading tokens on its worker's
-/// persistent disk tier (`disk_kv_persistent`), for later processes and
-/// restarts.
-pub const PERSIST_PREFIX_TOKENS: &str = "persist-prefix-tokens";
-
-/// Keep the process's system turn so: as many tokens as `system-tokens`.
-pub const PERSIST_SYSTEM: &str = "persist-system";
-
-/// How many tokens the system turn takes, as the inferlet that rendered it
-/// counts them (the compat inferlet sets it).
-pub const SYSTEM_TOKENS: &str = "system-tokens";
-
-/// How many leading tokens `props` ask to be kept on disk: `persist-prefix-
-/// tokens`, else `system-tokens` under `persist-system`.
-#[must_use]
-pub fn persist_tokens(props: &Props) -> Option<u64> {
-    let int = |name: &str| props.0.get(name).and_then(Value::as_u64);
-    int(PERSIST_PREFIX_TOKENS).or_else(|| {
-        props
-            .0
-            .get(PERSIST_SYSTEM)
-            .and_then(Value::as_bool)
-            .filter(|&asked| asked)
-            .and_then(|_| int(SYSTEM_TOKENS))
-    })
-}
 
 pub const PROMPT_BLOCK_BYTES: usize = 64;
 
@@ -112,14 +109,31 @@ pub fn from_client(props: &mut Props) -> Result<(), String> {
                 "prop name '{name}' must be 1 to {MAX_NAME_BYTES} bytes"
             ));
         }
-        if let (PROMPT, Some(text)) = (name.as_str(), value.as_str()) {
+        if let (PROMPT | RAW_PROMPT, Some(text)) = (name.as_str(), value.as_str()) {
             if text.len() > MAX_PROMPT_BYTES {
                 return Err(format!(
-                    "prop '{PROMPT}' is {} bytes, limit {MAX_PROMPT_BYTES}",
+                    "prop '{name}' is {} bytes, limit {MAX_PROMPT_BYTES}",
                     text.len()
                 ));
             }
             continue;
+        }
+        if name == PROMPT_TOKENS {
+            match prompt_tokens(props) {
+                Some(tokens) if tokens.len() * 4 <= MAX_PROMPT_BYTES => continue,
+                Some(tokens) => {
+                    return Err(format!(
+                        "prop '{PROMPT_TOKENS}' is {} tokens, limit {}",
+                        tokens.len(),
+                        MAX_PROMPT_BYTES / 4
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "prop '{PROMPT_TOKENS}' must be an array of token ids"
+                    ));
+                }
+            }
         }
         bytes += name.len() + value.to_string().len();
     }
@@ -127,6 +141,18 @@ pub fn from_client(props: &mut Props) -> Result<(), String> {
         return Err(format!("props are {bytes} bytes, limit {MAX_PROPS_BYTES}"));
     }
     Ok(())
+}
+
+/// The token ids `prompt-tokens` states, if it is an array of them.
+#[must_use]
+pub fn prompt_tokens(props: &Props) -> Option<Vec<u32>> {
+    props
+        .0
+        .get(PROMPT_TOKENS)?
+        .as_array()?
+        .iter()
+        .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+        .collect()
 }
 
 /// English runs about four bytes a token.
@@ -298,30 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn a_prefix_to_persist_is_named_outright_or_as_the_system_turn() {
-        assert_eq!(
-            persist_tokens(&props(json!({"persist-prefix-tokens": 96}))),
-            Some(96)
-        );
-        assert_eq!(
-            persist_tokens(&props(json!({"persist-system": true, "system-tokens": 40}))),
-            Some(40)
-        );
-        assert_eq!(
-            persist_tokens(&props(json!({"persist-system": true}))),
-            None,
-            "the system turn not counted yet"
-        );
-        assert_eq!(
-            persist_tokens(&props(
-                json!({"persist-system": false, "system-tokens": 40})
-            )),
-            None
-        );
-        assert_eq!(persist_tokens(&props(json!({"system-tokens": 40}))), None);
-    }
-
-    #[test]
     fn a_client_sets_any_name_but_the_routers_within_the_limits() {
         let mut given = props(json!({
             "priority": 3,
@@ -472,5 +474,12 @@ mod tests {
             assert!(props.is_empty());
             assert_eq!(session.as_deref(), Some("conv-1"));
         }
+    }
+
+    #[test]
+    fn a_raw_prompt_gets_the_prefix_once() {
+        assert_eq!(raw_prompt_tokens(vec![1], vec![5, 6]), vec![1, 5, 6]);
+        assert_eq!(raw_prompt_tokens(vec![1], vec![1, 5, 6]), vec![1, 5, 6]);
+        assert_eq!(raw_prompt_tokens(Vec::new(), vec![5]), vec![5]);
     }
 }

@@ -4,7 +4,8 @@
 //! the block mean, the entry store, and the attention over pooled entries
 //! with its LSE, causal and selected.
 
-use kernels_slang::{KvPool, RaggedTensor, Tensor};
+use kernels_slang::attn::pool::PoolState;
+use kernels_slang::{KvPool, RaggedTensor, Segments, Tensor};
 use poem_ir::Dtype;
 
 use crate::gpu::{Gpu, landed, noise};
@@ -129,18 +130,24 @@ fn the_compressed_pool_answers_the_reference() {
         want_sc[s * width..][..width].copy_from_slice(&scr[r * width..][..width]);
     }
     let pool_pages = pool_of(pi, HD);
+    // The state as rows of its pages in one pool buffer: every page's
+    // projection rows, then every page's score rows.
+    let state_of = |buf: u32| {
+        let words = (slots * width / 2) as u32;
+        PoolState {
+            pool: Segments::one(buf, 2 * words),
+            origin: [0, words],
+            page_stride: (PAGE * width / 2) as u32,
+            pitch: width as u32,
+        }
+    };
     let u = |b: u32| t(b, 3, 1, Dtype::U32);
     let bt = |b: u32, r: usize, w: usize| t(b, r, w, Dtype::Bf16);
     landed(
         &mut gpu,
         "pool state write",
-        &|g| {
-            vec![
-                (g.zeros(slots * width), slots * width, false),
-                (g.zeros(slots * width), slots * width, false),
-            ]
-        },
-        &[want_kv, want_sc],
+        &|g| vec![(g.zeros(2 * slots * width), 2 * slots * width, false)],
+        &[[want_kv, want_sc].concat()],
         &|g, o| {
             g.run(|c| {
                 kernels_slang::attn::pool::state_write(
@@ -152,8 +159,7 @@ fn the_compressed_pool_answers_the_reference() {
                     u(wo),
                     HD as u32,
                     RATIO as u32,
-                    bt(o[0].0, slots, width),
-                    bt(o[1].0, slots, width),
+                    state_of(o[0].0),
                 )
             })
         },
@@ -164,12 +170,11 @@ fn the_compressed_pool_answers_the_reference() {
     let bpos = [7i32, 15, -1];
     let breq = [0i32, 0, 1];
     let (bpb, brb) = (gpu.up_i32(&bpos), gpu.up_i32(&breq));
-    let (skv, skvr) = gpu.up(&noise(3, slots * width));
-    let (ssc, sscr) = gpu.up(&noise(4, slots * width)
-        .iter()
-        .map(|v| v * 2.0)
-        .collect::<Vec<_>>());
-    let (skvr, sscr) = (f64s(&skvr), f64s(&sscr));
+    let skv_v = noise(3, slots * width);
+    let ssc_v: Vec<f32> = noise(4, slots * width).iter().map(|v| v * 2.0).collect();
+    let (state, stater) = gpu.up(&[skv_v, ssc_v].concat());
+    let stater = f64s(&stater);
+    let (skvr, sscr) = stater.split_at(slots * width);
     for (coff, with_ape) in [(2usize, false), (1, true)] {
         let ape_w = coff * HD;
         let ape_v: Vec<f32> = noise(5, RATIO * ape_w).iter().map(|v| v * 0.5).collect();
@@ -217,8 +222,7 @@ fn the_compressed_pool_answers_the_reference() {
                         &pool_pages,
                         HD as u32,
                         RATIO as u32,
-                        bt(skv, slots, width),
-                        bt(ssc, slots, width),
+                        state_of(state),
                         apet,
                         bt(o[0].0, 3, HD),
                     )

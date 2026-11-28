@@ -51,11 +51,6 @@ def architecture() -> str:
     return _model.architecture()
 
 
-def submit_deadline_us() -> int:
-    """How long a pipeline may hold a frame's wait-set, in microseconds."""
-    return _model.submit_deadline_us()
-
-
 @dataclass(frozen=True)
 class BlockDrafter:
     """What a guest needs to seed a BLOCK drafter's draft pass."""
@@ -69,6 +64,11 @@ def draft_block() -> BlockDrafter | None:
     """The bound model's block drafter, if it carries one."""
     d = _model.draft_block()
     return BlockDrafter(d.rows, d.mask_token, d.proposals_from) if d is not None else None
+
+
+def draft_depth() -> int:
+    """Tokens the model's draft head chains in one pass; 0 with no head."""
+    return _model.draft_depth()
 
 
 def run_ahead_window() -> int:

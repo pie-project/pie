@@ -91,16 +91,22 @@ impl Program {
 }
 
 fn plan_of(container: TraceContainer, vocab: u32) -> ExecPlan {
+    plan_over(container, vocab, 1)
+}
+
+/// The program bound over `lanes` lanes, each returning its logits.
+fn plan_over(container: TraceContainer, vocab: u32, lanes: usize) -> ExecPlan {
+    let logits = eta_ir::registry::OutputDecl {
+        name: "logits".to_string(),
+        axis: eta_ir::registry::Axis::Row,
+        width: vocab,
+        dtype: eta_ir::types::Dtype::F32,
+        layers: 0,
+        readout: true,
+    };
     let bound = eta_ir::validate::bind(
         container,
-        vec![vec![eta_ir::registry::OutputDecl {
-            name: "logits".to_string(),
-            axis: eta_ir::registry::Axis::Row,
-            width: vocab,
-            dtype: eta_ir::types::Dtype::F32,
-            layers: 0,
-            readout: true,
-        }]],
+        vec![vec![logits]; lanes],
         EngineCaps {
             lora: true,
             attn_page_mask: true,
@@ -191,7 +197,7 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
         "logits".to_string(),
         poem_ir::InputAxis::Row,
         true,
-        buffer,
+        std::sync::Arc::new(buffer),
         rows,
         width,
         0,
@@ -204,13 +210,16 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
             .collect(),
         readback: vec![None; layout.len()],
         pixels: (String::new(), Vec::new()),
-        host: None,
+        host: Vec::new(),
     }
 }
 
-/// Where the program reads its outputs for the fire's lane `lane`.
+/// Where the program reads its outputs for the fire's lane `lane`,
+/// attached over that one lane.
 fn bound(plan: &ExecPlan, kept: &Kept, lane: usize) -> Vec<Bound> {
-    engine_xla::guest::run::bound(plan, Some(kept), lane as u32).expect("the lane binds")
+    engine_xla::guest::run::bound(plan, Some(kept), lane as u32, 1)
+        .expect("the program reads its own lane")
+        .expect("the lane binds")
 }
 
 /// The device's answer for one lane reading its outputs where `bound` says.
@@ -508,7 +517,7 @@ fn sampler_seeds(vocab: u32, seed: u64) -> Vec<(u32, Value)> {
     let n = vocab as usize;
     let mut counts = vec![0.0f32; n];
     let mut present = vec![0.0f32; n];
-    let mut mask = vec![1u8; n];
+    let mut mask = vec![true; n];
     let mut words = vec![u32::MAX; n.div_ceil(32)];
     for (i, u) in noise(seed ^ 0x55, 64, 0.0, n as f32)
         .into_iter()
@@ -518,7 +527,7 @@ fn sampler_seeds(vocab: u32, seed: u64) -> Vec<(u32, Value)> {
         match i % 4 {
             0 => counts[at] += 1.0,
             1 => present[at] = 1.0,
-            2 => mask[at] = 0,
+            2 => mask[at] = false,
             _ => words[at / 32] &= !(1 << (at % 32)),
         }
     }
@@ -889,6 +898,13 @@ fn corners() -> (TraceContainer, Vec<u32>) {
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cs);
     let cp = p.op(Op::CumProd(table));
     put(&mut p, Shape::matrix(5, 3), Dtype::F32, cp);
+    // Integer scans wrap, as the interpreter's do.
+    for (value, dtype) in [(a, Dtype::I32), (ua, Dtype::U32)] {
+        for op in [Op::CumSum(value), Op::CumProd(value)] {
+            let c = p.op(op);
+            put(&mut p, v, dtype, c);
+        }
+    }
     let pos_y = p.op(Op::Abs(y));
     for op in [
         Op::Exp(y),
@@ -974,13 +990,32 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         9,
         16,
         -3,
-        1,
-        1,
+        -1,
+        i32::MIN,
         4,
         i32::MAX,
         15,
     ];
-    let b = vec![2, 2, -1, 0, 3, 3, 0, -2, 4, 1, 1, 17, 1, -5, -1, 15];
+    // Division corners, beside the others: MIN / -1 wraps, x / 0 is 0,
+    // MIN / MIN, -1 / MAX.
+    let b = vec![
+        2,
+        2,
+        -1,
+        0,
+        3,
+        3,
+        0,
+        -2,
+        4,
+        1,
+        1,
+        i32::MAX,
+        i32::MIN,
+        -5,
+        -1,
+        15,
+    ];
     let ua = vec![
         7,
         u32::MAX,
@@ -993,13 +1028,31 @@ fn corner_seeds() -> Vec<(u32, Value)> {
         9,
         16,
         3,
-        1,
-        1,
+        u32::MAX,
+        u32::MAX,
         40,
         12,
         15,
     ];
-    let ub = vec![2, 2, 0, 0, 3, 7, 0xFFFF_FFF0, 2, 4, 1, 1, 17, 1, 5, 3, 15];
+    // u32::MAX / 1, u32::MAX / u32::MAX.
+    let ub = vec![
+        2,
+        2,
+        0,
+        0,
+        3,
+        7,
+        0xFFFF_FFF0,
+        2,
+        4,
+        1,
+        1,
+        1,
+        u32::MAX,
+        5,
+        3,
+        15,
+    ];
     vec![
         (0, Value::F32(x)),
         (1, Value::F32(y)),
@@ -1036,6 +1089,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
     the_sampler_agrees(device, &mut stages, VOCAB);
     the_rowwise_sampler_agrees(device, &mut stages);
     a_group_answers_what_each_lane_answers_alone(device, &mut stages);
+    a_guest_reads_no_row_past_its_own_lanes(device, &mut stages);
     carried_cells_answer_what_the_rings_answer(device, &mut stages);
     eprintln!("compiled {} stage program(s)", stages.len());
 }
@@ -1204,9 +1258,10 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         .map(|(inst, lane)| Member {
             inst,
             bound: bound(&plan, &kept, lane),
+            cells: Vec::new(),
         })
         .collect();
-    let (outcomes, _) = step_group(
+    let outcomes = step_group(
         device,
         stages,
         key,
@@ -1214,7 +1269,7 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         Some(&kept),
         &mut members,
         &[],
-        None,
+        &mut None,
         eta_ir::registry::Stage::Epilogue,
     );
     assert!(
@@ -1230,6 +1285,92 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         }
         close(&got[6], &want[6], 1e-5, "group probabilities");
     }
+}
+
+/// Each row's largest logit over `rows` rows of the lane `lane` the
+/// program is attached at (`lane` past the first, a lane after it).
+fn row_peaks(rows: u32, lane: u32) -> (TraceContainer, Vec<u32>) {
+    let mut p = Program::new();
+    let logits = p.op(Op::Output {
+        index: 0,
+        lane,
+        shape: Shape::matrix(rows, VOCAB),
+        dtype: Dtype::F32,
+    });
+    let peak = p.op(Op::ReduceMax(logits));
+    let peak = p.op(Op::Reshape {
+        value: peak,
+        shape: Shape::vector(rows),
+    });
+    let out = p.output(Shape::vector(rows), Dtype::F32, peak);
+    (p.container(), vec![out])
+}
+
+/// A guest reads its own lanes' rows and no other request's: lane 1's row
+/// (a sentinel) lies right after lane 0's, and a program attached at lane 0
+/// alone that reads two rows is refused by name, its channel holding
+/// nothing; attached over both lanes it reads both rows. A program reading
+/// a lane past the ones it is attached over is refused before it binds.
+fn a_guest_reads_no_row_past_its_own_lanes(device: &Device, stages: &mut Stages) {
+    const SENTINEL: f32 = 4321.0;
+    let mut plane = logits_plane(2, VOCAB, 61);
+    plane[VOCAB as usize..].fill(SENTINEL);
+    let kept = kept(device, &plane, 2, vec![(0, 1), (1, 1)]);
+    let (container, outs) = row_peaks(2, 0);
+    let plan = plan_of(container, VOCAB);
+
+    let alone = bound(&plan, &kept, 0);
+    assert_eq!(
+        alone[0].seat,
+        Seat { first: 0, count: 1 },
+        "a lane attached alone is seated on its own row, not its neighbour's"
+    );
+    let mut inst = instance(&plan, &[]);
+    let mut runner = OnDevice::new(device, stages, key_of(&plan), Some(&kept), alone);
+    let outcome = eta_exec::step_with(
+        &mut inst,
+        &plan,
+        &PassInputs::none(),
+        &mut runner,
+        eta_ir::registry::Stage::Epilogue,
+    );
+    match &outcome {
+        StepOutcome::Faulted(why) => assert!(
+            why.contains("reads 2 rows of output `logits` and its lane holds 1"),
+            "refused for reading past its lane: {why}"
+        ),
+        other => panic!("a pass reading its neighbour's row was not refused: {other:?}"),
+    }
+    for &c in &outs {
+        let held = eta_exec::host_take(&inst, &plan, c);
+        assert!(
+            !matches!(&held.1, Some(Value::F32(x)) if x.contains(&SENTINEL)),
+            "the refused pass put its neighbour's row on channel {c}: {held:?}"
+        );
+    }
+
+    // Attached over both lanes, its two rows are its own.
+    let both = engine_xla::guest::run::bound(&plan, Some(&kept), 0, 2)
+        .expect("the program reads its own lanes")
+        .expect("the lanes bind");
+    assert_eq!(both[0].seat, Seat { first: 0, count: 2 });
+    let got = on_device(device, stages, &plan, &[], Some(&kept), both, &outs);
+    let want = host(&plan, &[], &plane, 2, &outs);
+    exact(&got[0], &want[0], "the peaks of the attachment's two rows");
+    assert!(
+        matches!(&got[0], Value::F32(x) if x[1] == SENTINEL),
+        "the second lane's row is the attachment's own: {got:?}"
+    );
+
+    // A program reading its lane 1, attached over lane 0 alone.
+    let (container, _) = row_peaks(1, 1);
+    let plan = plan_over(container, VOCAB, 2);
+    let refused = engine_xla::guest::run::bound(&plan, Some(&kept), 0, 1)
+        .expect_err("a program reading a lane it is not attached over binds nothing");
+    assert!(
+        refused.contains("reads output `logits` of its lane 1, and it is attached over 1 lane(s)"),
+        "refused by name: {refused}"
+    );
 }
 
 /// A sampler that carries its rng state and histogram from pass to pass in
@@ -1324,7 +1465,49 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         .collect();
     let mut device_insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
     let mut host_insts: Vec<InterpInstance> = seeds.iter().map(|s| instance(&plan, s)).collect();
-    let mut cells = None;
+    // A small pool: each lane's cells in rows of their own, the sink last.
+    let words = engine_xla::guest::carried_words(&plan.package);
+    let per_lane: u32 = words
+        .iter()
+        .map(|&(_, w)| (engine_xla::guest::lower::cell_rows(w as usize) as u32).next_multiple_of(2))
+        .sum();
+    let pool_rows = per_lane * lanes + 8;
+    let sink_row = pool_rows - 8;
+    let cells: Vec<Vec<(u32, u32)>> = (0..lanes)
+        .map(|l| {
+            let mut at = l * per_lane;
+            words
+                .iter()
+                .map(|&(c, w)| {
+                    let first = at;
+                    at += (engine_xla::guest::lower::cell_rows(w as usize) as u32)
+                        .next_multiple_of(2);
+                    (c, first)
+                })
+                .collect()
+        })
+        .collect();
+    stages.pool_rows = i64::from(pool_rows);
+    stages.sink_row = sink_row;
+    let mut pool = device
+        .zeros_or_dry(dtype::Dtype::U32, pool_rows, 128)
+        .expect("the pool");
+    {
+        let writes: Vec<(&InterpInstance, &[(u32, u32)])> = device_insts
+            .iter()
+            .zip(&cells)
+            .map(|(i, c)| (i, c.as_slice()))
+            .collect();
+        engine_xla::guest::run::write_cells(
+            device,
+            &plan,
+            &mut pool,
+            i64::from(pool_rows),
+            sink_row,
+            &writes,
+        )
+        .expect("the seeds land in the slots");
+    }
     for pass in 0..4 {
         let plane = logits_plane(lanes, VOCAB, 70 + pass);
         let kept = kept(device, &plane, lanes, (0..lanes).map(|l| (l, 1)).collect());
@@ -1334,9 +1517,10 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             .map(|(l, inst)| Member {
                 inst,
                 bound: bound(&plan, &kept, l),
+                cells: cells[l].clone(),
             })
             .collect();
-        let (outcomes, next) = step_group(
+        let outcomes = step_group(
             device,
             stages,
             key,
@@ -1344,15 +1528,13 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             Some(&kept),
             &mut members,
             &carried,
-            cells.take(),
+            &mut pool,
             eta_ir::registry::Stage::Epilogue,
         );
         assert!(
             outcomes.iter().all(|o| *o == StepOutcome::Committed),
             "{outcomes:?}"
         );
-        assert!(next.is_some(), "the pass carried its cells");
-        cells = next;
         for (l, inst) in host_insts.iter_mut().enumerate() {
             let row = &plane[l * VOCAB as usize..(l + 1) * VOCAB as usize];
             let outputs = [("logits".to_string(), 0, Value::F32(row.to_vec()))];
@@ -1364,9 +1546,10 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         }
     }
     // Back to the rings: the cells the device carried are the interpreter's.
-    let cells = cells.expect("cells");
-    let insts: Vec<Option<&InterpInstance>> = device_insts.iter().map(Some).collect();
-    engine_xla::guest::run::flush(&plan, &cells, &insts).expect("the cells come back");
+    let whole = pool.as_ref().expect("the pool");
+    for (inst, c) in device_insts.iter().zip(&cells) {
+        engine_xla::guest::run::read_cells(&plan, whole, c, inst).expect("the cells come back");
+    }
     for (d, h) in device_insts.iter().zip(&host_insts) {
         for c in 0..2 {
             exact(

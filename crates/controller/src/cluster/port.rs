@@ -1,0 +1,1345 @@
+//! The cluster's PLEX 1.1 port: the gateways' process events and the
+//! directory into the PLEX host (`plex-host`), and the rows its policies
+//! commit back out as each gateway's [`GatewayDecisions`].
+//!
+//! A process is `"<gateway>.<req>"` to the policies: each gateway counts its
+//! own requests from 0. A worker is its id in decimal.
+//!
+//! The gate: a gateway does not dispatch a launch before every policy has
+//! heard it, or its gate bound has passed, while a loaded policy imports a
+//! column that decides a pending process ([`GATED`]). With none, the gate
+//! bound is zero: a launch goes by the rows in force and the policies hear
+//! it after. Each arrival's host sequence
+//! number is kept beside the gateway's own, and a gateway's `heard` is its
+//! highest arrival whose host number the host has heard
+//! ([`plex_host::host::Host::heard`]).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use client_api::props::{PROMPT_BLOCK_BYTES, TOKENS_PER_BYTE};
+use controller_api::{
+    DirectoryView, GatewayDecisions, Health, PlacementView, ProcessEvent, ReplicateOrder, Role,
+    RoutingTable, ShareGrants,
+};
+use ids::{GatewayId, WorkerId};
+use plex_host::host::{Config, Delta, Host as PlexHost};
+use plex_host::runtime::wit::Tier;
+use plex_host::tables::{self, Refusal, Subject, Value};
+use tokio::sync::watch;
+
+/// The columns a cluster of pie gateways enacts. Every worker that links to
+/// a controller can reach its peers, so helpers are always enactable.
+const SUPPORTED: &[&str] = &[
+    tables::PLACEMENT_WORKERS,
+    tables::PLACEMENT_HELPERS,
+    tables::REPLICATION_WORKERS,
+    tables::SHARE_GROUPS,
+];
+
+/// The time one call of a policy may take, and so what one that decides
+/// arrivals adds to the gate's bound: the PLEX host's own.
+#[must_use]
+pub fn call_deadline() -> Duration {
+    Duration::from_millis(Config::default().deadline_ms)
+}
+
+/// How often the policies hear what the directory and the routing table
+/// hold.
+const STATE_TICK: Duration = Duration::from_secs(1);
+
+/// Why the policies did not load.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct LoadError(pub String);
+
+fn hex(key: &[u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A process's name to the policies.
+fn pid(gateway: GatewayId, req: u64) -> String {
+    format!("{}.{req}", gateway.0)
+}
+
+/// The gateway a process is at, and its id there.
+fn at_gateway(pid: &str) -> Option<(GatewayId, u64)> {
+    let (gateway, req) = pid.split_once('.')?;
+    Some((GatewayId(gateway.parse().ok()?), req.parse().ok()?))
+}
+
+/// A policy is named by its built-in name, or by its file's stem.
+fn policy_name(spec: &str) -> String {
+    std::path::Path::new(spec)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map_or_else(|| spec.to_string(), str::to_string)
+}
+
+/// A client's prop (JSON text) as a hint value: lists and objects stay text.
+fn hint_value(json: &str) -> Option<Value> {
+    use serde_json::Value as Json;
+    Some(match serde_json::from_str::<Json>(json).ok()? {
+        Json::Null => return None,
+        Json::Bool(b) => Value::Boolean(b),
+        Json::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64()?),
+        },
+        Json::String(s) => Value::Text(s),
+        json @ (Json::Array(_) | Json::Object(_)) => Value::Text(json.to_string()),
+    })
+}
+
+fn value_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::Value::from(*i),
+        Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Value::Text(s) => serde_json::Value::String(s.clone()),
+    }
+}
+
+/// The rows in force, kept for the gateways.
+#[derive(Default)]
+struct Tables {
+    /// `placement/workers` rows: a process's workers, best first.
+    workers: HashMap<String, Vec<WorkerId>>,
+    /// The column's default, if a policy set one.
+    workers_default: Option<Vec<WorkerId>>,
+    /// `placement/helpers` rows: the workers a process's prefill may run
+    /// on, best first.
+    helpers: HashMap<String, Vec<WorkerId>>,
+    helpers_default: Option<Vec<WorkerId>>,
+    /// `replication/workers` rows: by prefix (a working set, and its first
+    /// tokens or all of it), the workers to hold a copy of it.
+    replicas: HashMap<(String, Option<u32>), Vec<WorkerId>>,
+    replicas_default: Option<Vec<WorkerId>>,
+    /// Notes on a process, passed on with it: the worker plane reads them
+    /// as `cluster/note/<writer>/<name>`.
+    notes: HashMap<String, BTreeMap<String, String>>,
+    /// `pie:plex-ext/share-groups` rows: a group's tenants and its grant's
+    /// id, and the default's.
+    share: BTreeMap<String, (Vec<String>, u64)>,
+    share_default: Option<(Vec<String>, u64)>,
+    /// Bumped by every change to the grants. A grant's id is the version
+    /// it was made at, so a revoke or a re-grant is a new id everywhere.
+    share_version: u64,
+}
+
+struct Shared {
+    tables: RwLock<Tables>,
+    /// Each gateway's highest arrival every policy has heard.
+    heard: Mutex<HashMap<GatewayId, u64>>,
+    /// No policy runs: every gate is open.
+    dead: AtomicBool,
+    gate_ms: AtomicU64,
+    /// Processes the policies ended, and why, until they exit.
+    terminated: Mutex<BTreeMap<String, String>>,
+    /// Each gateway's live processes: a default row reaches them.
+    live: Mutex<HashMap<GatewayId, HashSet<u64>>>,
+    views: Mutex<HashMap<GatewayId, watch::Sender<GatewayDecisions>>>,
+    /// The directory as last heard: the copies replication asks for are
+    /// the ones it does not show.
+    directory: RwLock<Arc<DirectoryView>>,
+}
+
+/// The cluster policies, running.
+pub struct Host {
+    events: Sender<Event>,
+    shared: Arc<Shared>,
+}
+
+enum Event {
+    Process(GatewayId, ProcessEvent),
+    /// Swap every policy for these (name, component): the answer is why
+    /// they did not load, if they did not.
+    Reload {
+        policies: Vec<(String, Vec<u8>)>,
+        answer: tokio::sync::oneshot::Sender<Result<(), LoadError>>,
+    },
+    /// The directory and the routing table as of now.
+    State(Arc<DirectoryView>, Arc<RoutingTable>),
+}
+
+/// The columns that decide a pending process: its placement, read once at
+/// dispatch (PLEX 1.1 §2, the gate: "the row must be there first"), and its
+/// termination, answered at the gate while it is pending. An import is the
+/// authority to write (§1 principle 6, §6 "an import is a capability"): a
+/// policy that imports neither has stated it decides no arrival before
+/// dispatch.
+const GATED: &[&str] = &[tables::PLACEMENT_WORKERS, tables::TERMINATE];
+
+/// Whether a policy importing `imports` decides arrivals at the gate.
+fn gates(imports: &[String]) -> bool {
+    imports.iter().any(|i| GATED.contains(&i.as_str()))
+}
+
+/// A launch's gate time: one call's deadline per policy that decides
+/// arrivals at the gate, the longest a round that heard the arrival can
+/// take before a policy is stuck. Zero when none does: a launch goes by the
+/// rows in force, and the policies hear it after.
+fn gate_ms(config: &Config, gating: usize) -> u64 {
+    config.deadline_ms * gating as u64
+}
+
+impl Host {
+    /// Starts the cluster policies `policies` names, (spec, component), in
+    /// one PLEX host: each writes only the columns it imports, which no
+    /// other may, and each call of one takes `deadline` at most.
+    pub fn start(
+        policies: Vec<(String, Vec<u8>)>,
+        deadline: Duration,
+        mut routing: watch::Receiver<RoutingTable>,
+        mut directory: watch::Receiver<DirectoryView>,
+    ) -> Result<Arc<Self>, LoadError> {
+        let config = Config {
+            supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            // The port's thread keeps the time and runs the rounds.
+            // plex-host documents `manual` for scenario tests; a port that
+            // keeps the time is the same mode.
+            manual: true,
+            ..Config::default()
+        };
+        let host = PlexHost::new(config.clone());
+        let mut names = Vec::new();
+        let mut gating = 0;
+        for (spec, component) in &policies {
+            let name = policy_name(spec);
+            gating += usize::from(gates(&host.load(&name, component).map_err(LoadError)?));
+            names.push(name);
+        }
+        let shared = Arc::new(Shared {
+            tables: RwLock::default(),
+            heard: Mutex::default(),
+            dead: AtomicBool::new(names.is_empty()),
+            gate_ms: AtomicU64::new(gate_ms(&config, gating)),
+            terminated: Mutex::default(),
+            live: Mutex::default(),
+            views: Mutex::default(),
+            directory: RwLock::default(),
+        });
+        let (events, rx) = channel();
+        std::thread::Builder::new()
+            .name("pie-cluster-plex".into())
+            .spawn({
+                let shared = shared.clone();
+                let loaded = policies
+                    .into_iter()
+                    .map(|(spec, component)| (policy_name(&spec), component))
+                    .collect();
+                move || run(host, config, loaded, rx, shared)
+            })
+            .map_err(|e| LoadError(format!("spawning the cluster port: {e}")))?;
+        // The workers before any process (a row naming a worker the host
+        // does not know is ignored), again whenever the routing table
+        // changes, and the directory every tick.
+        let mut state = move || {
+            let view = Arc::new(directory.borrow_and_update().clone());
+            let table = Arc::new(routing.borrow_and_update().clone());
+            (Event::State(view, table), routing.clone())
+        };
+        let (first, mut changes) = state();
+        let _ = events.send(first);
+        let ticks = events.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(STATE_TICK) => {}
+                    changed = changes.changed() => if changed.is_err() { return },
+                }
+                let (now, next) = state();
+                changes = next;
+                if ticks.send(now).is_err() {
+                    return;
+                }
+            }
+        });
+        tracing::info!(policies = ?names, "cluster policies started (PLEX 1.1)");
+        Ok(Arc::new(Self { events, shared }))
+    }
+
+    /// What happened to `gateway`'s processes, in order.
+    pub fn events(&self, gateway: GatewayId, events: Vec<ProcessEvent>) {
+        for event in events {
+            let _ = self.events.send(Event::Process(gateway, event));
+        }
+    }
+
+    /// The policies' decisions about `gateway`'s processes, as they change.
+    pub fn decisions(&self, gateway: GatewayId) -> watch::Receiver<GatewayDecisions> {
+        let mut views = self.shared.views.lock().unwrap();
+        if let Some(view) = views.get(&gateway) {
+            return view.subscribe();
+        }
+        let courier = views.keys().all(|other| other.0 > gateway.0);
+        let mut view = decisions_of(&self.shared, gateway, courier);
+        view.epoch = 1;
+        let (tx, rx) = watch::channel(view);
+        views.insert(gateway, tx);
+        rx
+    }
+
+    /// Swaps every running policy for `policies` (spec, component), as a
+    /// SIGHUP asks: the old ones are unloaded (their rows withdrawn) and
+    /// the new ones loaded; if one does not load, the old set is loaded
+    /// again.
+    pub async fn reload(&self, policies: Vec<(String, Vec<u8>)>) -> Result<(), LoadError> {
+        if policies.is_empty() {
+            return Err(LoadError(
+                "a reload names at least one cluster policy; a controller with none starts \
+                 without them"
+                    .into(),
+            ));
+        }
+        let policies = policies
+            .into_iter()
+            .map(|(spec, component)| (policy_name(&spec), component))
+            .collect();
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        self.events
+            .send(Event::Reload { policies, answer })
+            .map_err(|_| LoadError("the cluster port has ended".into()))?;
+        answered
+            .await
+            .map_err(|_| LoadError("the cluster port has ended".into()))??;
+        publish(&self.shared);
+        Ok(())
+    }
+}
+
+/// `gateway`'s view as the rows leave it now, epoch 0.
+/// `courier`: this gateway carries the copies replication asks for.
+fn decisions_of(shared: &Shared, gateway: GatewayId, courier: bool) -> GatewayDecisions {
+    let mine = |id: &str| {
+        at_gateway(id)
+            .filter(|(g, _)| *g == gateway)
+            .map(|(_, req)| req)
+    };
+    let tables = shared.tables.read().unwrap();
+    let mut placements: BTreeMap<u64, PlacementView> = BTreeMap::new();
+    // The default row reaches every live process without a row of its own.
+    if let Some(default) = &tables.workers_default {
+        for &req in shared
+            .live
+            .lock()
+            .unwrap()
+            .get(&gateway)
+            .into_iter()
+            .flatten()
+        {
+            placements.entry(req).or_default().workers = Some(default.clone());
+        }
+    }
+    for (id, workers) in &tables.workers {
+        if let Some(req) = mine(id) {
+            placements.entry(req).or_default().workers = Some(workers.clone());
+        }
+    }
+    if let Some(default) = &tables.helpers_default {
+        for &req in shared
+            .live
+            .lock()
+            .unwrap()
+            .get(&gateway)
+            .into_iter()
+            .flatten()
+        {
+            placements.entry(req).or_default().executors = default.clone();
+        }
+    }
+    for (id, helpers) in &tables.helpers {
+        if let Some(req) = mine(id) {
+            placements.entry(req).or_default().executors = helpers.clone();
+        }
+    }
+    for (id, notes) in &tables.notes {
+        if let Some(req) = mine(id) {
+            placements.entry(req).or_default().props = notes
+                .iter()
+                .map(|(name, json)| (name.clone(), json.clone()))
+                .collect();
+        }
+    }
+    let share = ShareGrants {
+        version: tables.share_version,
+        groups: tables
+            .share
+            .iter()
+            .map(|(group, (tenants, id))| (group.clone(), tenants.clone(), *id))
+            .collect(),
+        default: tables.share_default.clone(),
+    };
+    drop(tables);
+    let terminated = shared
+        .terminated
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(id, why)| Some((mine(id)?, why.clone())))
+        .collect();
+    let heard = if shared.dead.load(Ordering::Acquire) {
+        u64::MAX
+    } else {
+        shared
+            .heard
+            .lock()
+            .unwrap()
+            .get(&gateway)
+            .copied()
+            .unwrap_or(0)
+    };
+    GatewayDecisions {
+        epoch: 0,
+        active: true,
+        gate_ms: shared.gate_ms.load(Ordering::Acquire),
+        heard,
+        placements: placements.into_iter().collect(),
+        terminated,
+        replicate: if courier { orders(shared) } else { Vec::new() },
+        share,
+    }
+}
+
+/// Each gateway's view, sent where it changed.
+/// For each working set `replication/workers` names, a copy for each named
+/// worker the directory does not show holding it, from a worker that does.
+/// The worker's own retention decides how long a copy is kept. A pool
+/// keeps it in host memory.
+fn orders(shared: &Shared) -> Vec<ReplicateOrder> {
+    let tables = shared.tables.read().unwrap();
+    if tables.replicas.is_empty() && tables.replicas_default.is_none() {
+        return Vec::new();
+    }
+    let directory = shared.directory.read().unwrap().clone();
+    let peer = |worker: WorkerId| {
+        directory
+            .peers
+            .iter()
+            .find(|(w, _)| *w == worker)
+            .map(|(_, peer)| peer.clone())
+    };
+    let page = |group: &controller_api::GroupView| {
+        group
+            .sites
+            .iter()
+            .find_map(|w| {
+                directory
+                    .disk_tiers
+                    .iter()
+                    .find(|(d, _)| d == w)
+                    .map(|(_, (page, _))| u64::from(*page).max(1))
+            })
+            .unwrap_or(1)
+    };
+    // By (group, worker): the most pages any row covering it wants there.
+    let mut wanted: BTreeMap<(String, WorkerId), usize> = BTreeMap::new();
+    for (key, group) in &directory.groups {
+        let id = hex(key);
+        let mut covers: Vec<(Option<u32>, &Vec<WorkerId>)> = tables
+            .replicas
+            .iter()
+            .filter(|((set, _), _)| *set == id)
+            .map(|((_, tokens), workers)| (*tokens, workers))
+            .collect();
+        if covers.is_empty()
+            && let Some(default) = &tables.replicas_default
+        {
+            covers.push((None, default));
+        }
+        for (tokens, workers) in covers {
+            // A page is covered when its first token is.
+            let pages = tokens.map_or(group.keys.len(), |tokens| {
+                (u64::from(tokens).div_ceil(page(group)) as usize).min(group.keys.len())
+            });
+            for &worker in workers {
+                if pages == 0 || group.sites.contains(&worker) {
+                    continue;
+                }
+                let at = wanted.entry((id.clone(), worker)).or_default();
+                *at = (*at).max(pages);
+            }
+        }
+    }
+    let groups: HashMap<String, &controller_api::GroupView> = directory
+        .groups
+        .iter()
+        .map(|(key, group)| (hex(key), group))
+        .collect();
+    wanted
+        .into_iter()
+        .filter_map(|((id, worker), pages)| {
+            let group = groups.get(&id)?;
+            let from = group.sites.iter().find_map(|holder| peer(*holder))?;
+            Some(ReplicateOrder {
+                group: id,
+                worker,
+                keys: group.keys[..pages].to_vec(),
+                from,
+                table: tables::REPLICATION_WORKERS.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn publish(shared: &Shared) {
+    let gateways: Vec<GatewayId> = shared.views.lock().unwrap().keys().copied().collect();
+    // Workers dial gateways; the lowest-numbered linked one carries each
+    // copy, so it is asked once.
+    let courier = gateways.iter().map(|g| g.0).min();
+    for gateway in gateways {
+        let view = decisions_of(shared, gateway, courier == Some(gateway.0));
+        if let Some(tx) = shared.views.lock().unwrap().get(&gateway) {
+            tx.send_if_modified(|current| {
+                let epoch = current.epoch;
+                current.epoch = 0;
+                let changed = *current != view;
+                *current = GatewayDecisions {
+                    epoch: if changed { epoch + 1 } else { epoch },
+                    ..view
+                };
+                changed
+            });
+        }
+    }
+}
+
+/// The port's own record.
+struct Port {
+    host: PlexHost,
+    config: Config,
+    shared: Arc<Shared>,
+    loaded: Vec<(String, Vec<u8>)>,
+    /// Arrivals not yet heard: (host sequence, gateway, gateway sequence).
+    unheard: Vec<(u64, GatewayId, u64)>,
+    /// The workers last put to the host.
+    workers: HashSet<WorkerId>,
+    /// The working sets last put to the host, each with a worker that held
+    /// it (named when it goes).
+    sets: HashMap<String, String>,
+    version: u64,
+}
+
+fn run(
+    host: PlexHost,
+    config: Config,
+    loaded: Vec<(String, Vec<u8>)>,
+    events: Receiver<Event>,
+    shared: Arc<Shared>,
+) {
+    let mut port = Port {
+        host,
+        config,
+        shared,
+        loaded,
+        unheard: Vec::new(),
+        workers: HashSet::new(),
+        sets: HashMap::new(),
+        version: 0,
+    };
+    let start = Instant::now();
+    let clock = |host: &PlexHost| {
+        let now = start.elapsed().as_nanos() as u64;
+        host.set_now(now);
+        now
+    };
+    loop {
+        // The next event, or the next call a policy asked for. A round runs
+        // here, so nothing it commits waits to be noticed.
+        let now = clock(&port.host);
+        let wait = match port.host.alarm() {
+            _ if port.host.due() => Some(Duration::ZERO),
+            Some(at) => Some(Duration::from_nanos(at.saturating_sub(now))),
+            None => None,
+        };
+        let first = match wait {
+            None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(wait) => events.recv_timeout(wait),
+        };
+        let first = match first {
+            Ok(event) => Some(event),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        clock(&port.host);
+        let mut changed = false;
+        for event in first.into_iter().chain(events.try_iter()) {
+            match event {
+                Event::Process(gateway, event) => changed |= port.apply(gateway, event),
+                Event::State(view, table) => port.state(&view, &table),
+                Event::Reload { policies, answer } => {
+                    let _ = answer.send(port.reload(policies));
+                    changed = true;
+                }
+            }
+        }
+        port.host.run(false);
+        // What the host has heard is read before its rows: every row a round
+        // committed is in force before a gate that round opens.
+        let heard = port.host.heard();
+        let version = port.host.version();
+        if version != port.version {
+            port.version = version;
+            let delta = port.host.poll_delta();
+            port.enact(delta);
+            changed = true;
+        }
+        changed |= port.hear(heard);
+        if changed {
+            publish(&port.shared);
+        }
+    }
+}
+
+impl Port {
+    fn reload(&mut self, policies: Vec<(String, Vec<u8>)>) -> Result<(), LoadError> {
+        for (name, _) in &self.loaded {
+            self.host.unload(name);
+        }
+        let mut gating = 0;
+        for (i, (name, component)) in policies.iter().enumerate() {
+            let loaded = self.host.load(name, component);
+            if let Ok(imports) = &loaded {
+                gating += usize::from(gates(imports));
+            }
+            if let Err(error) = loaded {
+                tracing::error!(%error, policy = %name, "cluster policies not reloaded; the running ones go on");
+                for (name, _) in &policies[..i] {
+                    self.host.unload(name);
+                }
+                for (name, component) in &self.loaded {
+                    let _ = self.host.load(name, component);
+                }
+                return Err(LoadError(error));
+            }
+        }
+        tracing::info!(policies = ?policies.iter().map(|(n, _)| n).collect::<Vec<_>>(), "cluster policies reloaded (PLEX 1.1)");
+        self.shared
+            .dead
+            .store(policies.is_empty(), Ordering::Release);
+        self.shared
+            .gate_ms
+            .store(gate_ms(&self.config, gating), Ordering::Release);
+        self.loaded = policies;
+        Ok(())
+    }
+
+    /// Whether the event changed a gateway's view.
+    fn apply(&mut self, gateway: GatewayId, event: ProcessEvent) -> bool {
+        let host = &self.host;
+        match event {
+            ProcessEvent::Arrived {
+                req,
+                seq,
+                tenant,
+                session,
+                props,
+                prompt,
+                connection,
+                tied,
+            } => {
+                let id = pid(gateway, req);
+                // Facts of the launch, read with its arrival: stated first.
+                host.attr(
+                    Subject::Process(id.clone()),
+                    "pie/connection",
+                    connection.map(|n| Value::Text(format!("{}.{n}", gateway.0))),
+                );
+                host.attr(
+                    Subject::Process(id.clone()),
+                    "pie/tied",
+                    tied.map(|worker| Value::Text(worker.0.to_string())),
+                );
+                // Tokens a text block makes, guessed from its bytes: the
+                // prompt reaches the controller as blocks, not tokens.
+                let per_block = TOKENS_PER_BYTE * PROMPT_BLOCK_BYTES as f64;
+                let prompt_tokens = prompt.map(|blocks| (blocks.len() as f64 * per_block) as u32);
+                let max_tokens = props
+                    .iter()
+                    .find(|(name, _)| name == client_api::props::MAX_TOKENS)
+                    .and_then(|(_, json)| json.parse::<u32>().ok());
+                let hints = props
+                    .iter()
+                    .filter_map(|(name, json)| Some((name.clone(), hint_value(json)?)))
+                    .collect();
+                let session = session.map(|session| format!("{tenant}/{session}"));
+                let at = host.arrived(
+                    &id,
+                    session,
+                    Some(tenant),
+                    None,
+                    prompt_tokens,
+                    max_tokens,
+                    hints,
+                    0,
+                );
+                self.unheard.push((at, gateway, seq));
+                self.shared
+                    .live
+                    .lock()
+                    .unwrap()
+                    .entry(gateway)
+                    .or_default()
+                    .insert(req);
+                false
+            }
+            ProcessEvent::Dispatched { req, worker } => {
+                host.dispatched(&pid(gateway, req), &worker.0.to_string());
+                false
+            }
+            ProcessEvent::Started { req } => {
+                host.started(&pid(gateway, req));
+                false
+            }
+            ProcessEvent::Moved { req, worker, why } => {
+                let id = pid(gateway, req);
+                match worker {
+                    Some(worker) => host.dispatched(&id, &worker.0.to_string()),
+                    None => {
+                        tracing::info!(process = %id, %why, "a placement that moves a running process is refused");
+                        host.refuse(
+                            tables::PLACEMENT_WORKERS,
+                            &id,
+                            None,
+                            Some(Refusal::NotSupported),
+                        );
+                    }
+                }
+                false
+            }
+            ProcessEvent::Exited { req, outcome } => {
+                let id = pid(gateway, req);
+                let outcome = match outcome {
+                    controller_api::Outcome::Completed => "completed",
+                    controller_api::Outcome::Failed => "failed",
+                    controller_api::Outcome::Cancelled => "cancelled",
+                };
+                host.exited(&id, outcome, None, None, 0);
+                if let Some(live) = self.shared.live.lock().unwrap().get_mut(&gateway) {
+                    live.remove(&req);
+                }
+                self.shared.terminated.lock().unwrap().remove(&id).is_some()
+            }
+            ProcessEvent::SessionProps { id, changes } => {
+                for (name, json) in changes {
+                    host.hint(Subject::Session(id.clone()), &name, hint_value(&json));
+                }
+                false
+            }
+            ProcessEvent::SessionClosed { id } => {
+                host.closed(&id);
+                false
+            }
+            // Which workers a gateway reaches is read from the routing table.
+            ProcessEvent::Workers(_) => false,
+        }
+    }
+
+    /// The workers and the working sets, as the routing table and the
+    /// directory have them now.
+    fn state(&mut self, view: &Arc<DirectoryView>, table: &RoutingTable) {
+        *self.shared.directory.write().unwrap() = view.clone();
+        let pools: HashSet<WorkerId> = view.pools.iter().copied().collect();
+        let page: HashMap<WorkerId, u64> = view
+            .disk_tiers
+            .iter()
+            .map(|(w, (page, _))| (*w, u64::from(*page)))
+            .collect();
+        let mut now = HashSet::new();
+        for worker in &table.workers {
+            if worker.health == Health::Unreachable {
+                continue;
+            }
+            let load = &worker.coarse_load;
+            let tiers = if pools.contains(&worker.id) {
+                vec![(Tier::Host, None, 0)]
+            } else {
+                let capacity = (load.capacity_tokens > 0).then_some(load.capacity_tokens);
+                vec![(Tier::Device, capacity, load.used_tokens)]
+            };
+            let id = worker.id.0.to_string();
+            self.host
+                .put_worker(&id, load.draining, tiers, load.running, load.waiting, None);
+            let role = match worker.role {
+                Role::Prefill => "prefill",
+                Role::Decode => "decode",
+                Role::Encode => "encode",
+            };
+            self.host.attr(
+                Subject::Worker(id.clone()),
+                "pie/role",
+                Some(Value::Text(role.into())),
+            );
+            self.host.attr(
+                Subject::Worker(id.clone()),
+                "pie/model",
+                Some(Value::Text(worker.model.clone())),
+            );
+            // Its load as it reports it, for a policy that places by it: the
+            // kv pressure (0-255, idle work and idle cache counted as room)
+            // and the processes it holds.
+            self.host.attr(
+                Subject::Worker(id.clone()),
+                "pie/kv-pressure",
+                Some(Value::Int(i64::from(load.kv_pressure_bucket))),
+            );
+            self.host.attr(
+                Subject::Worker(id.clone()),
+                "pie/inflight",
+                Some(Value::Int(i64::from(load.inflight))),
+            );
+            // It serves other workers' passes: a helper the default cluster
+            // policy names.
+            let listen = view
+                .links
+                .iter()
+                .find(|(w, _)| *w == worker.id)
+                .map(|(_, link)| Value::Text(link.clone()));
+            self.host
+                .attr(Subject::Worker(id), "pie/prefill-listen", listen);
+            now.insert(worker.id);
+        }
+        // A pool is a worker without a device tier: it keeps what it is sent
+        // in host memory, and serves nothing.
+        for pool in &pools {
+            if now.contains(pool) {
+                continue;
+            }
+            let id = pool.0.to_string();
+            self.host
+                .put_worker(&id, false, vec![(Tier::Host, None, 0)], 0, 0, None);
+            self.host.attr(
+                Subject::Worker(id),
+                "pie/role",
+                Some(Value::Text("pool".into())),
+            );
+            now.insert(*pool);
+        }
+        for gone in self.workers.difference(&now) {
+            self.host.remove_worker(&gone.0.to_string());
+        }
+        self.workers = now;
+
+        // A group (a run kept whole from token 0) is a working set, named by
+        // its last key; its copies are where the directory has it.
+        let mut sets = HashMap::new();
+        for (key, group) in &view.groups {
+            let id = hex(key);
+            let page = group
+                .sites
+                .iter()
+                .chain(&group.disk_sites)
+                .find_map(|w| page.get(w).copied())
+                .unwrap_or(1);
+            let tokens = u32::try_from(group.keys.len() as u64 * page).unwrap_or(u32::MAX);
+            let mut copies: Vec<(String, Tier, u32)> = group
+                .sites
+                .iter()
+                .map(|w| {
+                    let off = group
+                        .site_tiers
+                        .iter()
+                        .find(|(site, _)| site == w)
+                        .map(|(_, tier)| *tier);
+                    // A pool keeps what it holds in host memory.
+                    let tier = match off {
+                        Some(controller_api::OffDevice::Disk) => Tier::Disk,
+                        Some(controller_api::OffDevice::Host) => Tier::Host,
+                        None if pools.contains(w) => Tier::Host,
+                        None => Tier::Device,
+                    };
+                    (w.0.to_string(), tier, tokens)
+                })
+                .collect();
+            copies.extend(
+                group
+                    .disk_sites
+                    .iter()
+                    .map(|w| (w.0.to_string(), Tier::Disk, tokens)),
+            );
+            let held = copies
+                .first()
+                .map(|(w, _, _)| w.clone())
+                .unwrap_or_default();
+            self.host
+                .put_working_set(&id, None, None, None, tokens, 0, copies);
+            sets.insert(id, held);
+        }
+        for (gone, held) in &self.sets {
+            if !sets.contains_key(gone) {
+                self.host.evicted(gone, held, "host", true);
+            }
+        }
+        self.sets = sets;
+        // What replication asks for is what the directory does not show.
+        publish(&self.shared);
+    }
+
+    /// The rows a round committed.
+    fn enact(&mut self, delta: Delta) {
+        let mut tables = self.shared.tables.write().unwrap();
+        let parse = |list: Vec<String>| -> Vec<WorkerId> {
+            list.into_iter()
+                .filter_map(|w| w.parse().ok().map(WorkerId))
+                .collect()
+        };
+        for (id, row) in delta.placement_workers.rows {
+            match row {
+                Some(list) => {
+                    tables.workers.insert(id, parse(list));
+                }
+                None => {
+                    tables.workers.remove(&id);
+                }
+            }
+        }
+        if let Some(default) = delta.placement_workers.default {
+            tables.workers_default = default.map(parse);
+        }
+        for (id, row) in delta.placement_helpers.rows {
+            match row {
+                Some(list) => {
+                    tables.helpers.insert(id, parse(list));
+                }
+                None => {
+                    tables.helpers.remove(&id);
+                }
+            }
+        }
+        if let Some(default) = delta.placement_helpers.default {
+            tables.helpers_default = default.map(parse);
+        }
+        for (id, row) in delta.replication_workers.rows {
+            match row {
+                Some(list) => {
+                    tables.replicas.insert(id, parse(list));
+                }
+                None => {
+                    tables.replicas.remove(&id);
+                }
+            }
+        }
+        if let Some(default) = delta.replication_workers.default {
+            tables.replicas_default = default.map(parse);
+        }
+        for (group, row) in delta.share_groups.rows {
+            tables.share_version += 1;
+            let id = tables.share_version;
+            match row {
+                Some(tenants) => {
+                    tables.share.insert(group, (tenants, id));
+                }
+                None => {
+                    tables.share.remove(&group);
+                }
+            }
+        }
+        if let Some(default) = delta.share_groups.default {
+            tables.share_version += 1;
+            let id = tables.share_version;
+            tables.share_default = default.map(|tenants| (tenants, id));
+        }
+        for (writer, subject, name, value) in delta.notes {
+            tracing::debug!(%writer, subject = %format!("{}/{}", subject.kind(), subject.id()), %name, ?value, "cluster policy note");
+            let Subject::Process(id) = subject else {
+                continue;
+            };
+            let name = format!("{}note/{writer}/{name}", client_api::props::CLUSTER_PREFIX);
+            let notes = tables.notes.entry(id).or_default();
+            match value {
+                Some(value) => {
+                    notes.insert(name, value_json(&value).to_string());
+                }
+                None => {
+                    notes.remove(&name);
+                }
+            }
+        }
+        drop(tables);
+        let mut terminated = self.shared.terminated.lock().unwrap();
+        for (id, reason) in delta.terminate {
+            terminated.insert(id, reason);
+        }
+    }
+
+    /// Moves each gateway's `heard` up to its highest arrival the host has
+    /// heard. Whether one moved.
+    fn hear(&mut self, heard: u64) -> bool {
+        if self.unheard.is_empty() {
+            return false;
+        }
+        let mut moved = false;
+        let mut gateways = self.shared.heard.lock().unwrap();
+        self.unheard.retain(|&(at, gateway, seq)| {
+            if at > heard {
+                return true;
+            }
+            let h = gateways.entry(gateway).or_insert(0);
+            if seq > *h {
+                *h = seq;
+                moved = true;
+            }
+            false
+        });
+        moved
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use controller_api::GroupView;
+
+    fn shared(tables: Tables, directory: DirectoryView) -> Shared {
+        Shared {
+            tables: RwLock::new(tables),
+            heard: Mutex::default(),
+            dead: AtomicBool::new(false),
+            gate_ms: AtomicU64::new(0),
+            terminated: Mutex::default(),
+            live: Mutex::default(),
+            views: Mutex::default(),
+            directory: RwLock::new(Arc::new(directory)),
+        }
+    }
+
+    /// What a call of a policy may take here: no load reaches it.
+    const CALL: Duration = Duration::from_secs(60 * 60);
+
+    fn component(name: &str) -> Vec<u8> {
+        builtins::policy(name).unwrap().component.to_vec()
+    }
+
+    /// A port over a host whose rounds the test runs, `policy` loaded.
+    fn port(policy: &str) -> Port {
+        let config = Config {
+            supported: SUPPORTED.iter().map(|c| c.to_string()).collect(),
+            manual: true,
+            deadline_ms: CALL.as_millis() as u64,
+            ..Config::default()
+        };
+        let host = PlexHost::new(config.clone());
+        host.load(policy, &component(policy)).unwrap();
+        Port {
+            host,
+            config,
+            shared: Arc::new(shared(Tables::default(), DirectoryView::default())),
+            loaded: Vec::new(),
+            unheard: Vec::new(),
+            workers: HashSet::new(),
+            sets: HashMap::new(),
+            version: 0,
+        }
+    }
+
+    fn arrived(req: u64, props: &[(&str, &str)], prompt: Option<&str>) -> ProcessEvent {
+        ProcessEvent::Arrived {
+            req,
+            seq: 1,
+            tenant: "t".into(),
+            session: None,
+            props: props
+                .iter()
+                .map(|(name, json)| (name.to_string(), json.to_string()))
+                .collect(),
+            prompt: prompt.map(client_api::props::prompt_blocks),
+            connection: None,
+            tied: None,
+        }
+    }
+
+    /// Two gateways number their requests alike: each reads the placement,
+    /// the termination and the arrivals heard of its own request alone, the
+    /// courier alone carries copies, and an exit ends its termination.
+    #[test]
+    fn each_gateway_reads_the_decisions_about_its_own_processes() {
+        let (one, two) = (GatewayId(1), GatewayId(2));
+        let mut port = port("test-route");
+        for id in ["1", "2"] {
+            port.host
+                .put_worker(id, false, vec![(Tier::Device, None, 0)], 0, 0, None);
+        }
+        port.apply(one, arrived(7, &[("to", "\"1\"")], None));
+        port.apply(two, arrived(7, &[("refuse", "\"not today\"")], None));
+        port.host.run(true);
+        let heard = port.host.heard();
+        let delta = port.host.poll_delta();
+        port.enact(delta);
+        port.hear(heard);
+
+        let first = decisions_of(&port.shared, one, false);
+        assert_eq!(first.heard, 1);
+        assert_eq!(first.placements.len(), 1);
+        assert_eq!(first.placements[0].0, 7);
+        assert_eq!(first.placements[0].1.workers, Some(vec![WorkerId(1)]));
+        assert!(first.terminated.is_empty());
+        let second = decisions_of(&port.shared, two, false);
+        assert_eq!(second.heard, 1);
+        assert!(second.placements.is_empty());
+        assert_eq!(second.terminated, [(7, "not today".to_string())]);
+        assert_eq!(
+            decisions_of(&port.shared, GatewayId(3), false).heard,
+            0,
+            "none of its arrivals"
+        );
+
+        let exited = ProcessEvent::Exited {
+            req: 7,
+            outcome: controller_api::Outcome::Cancelled,
+        };
+        port.apply(one, exited.clone());
+        assert_eq!(decisions_of(&port.shared, two, false).terminated.len(), 1);
+        port.apply(two, exited);
+        assert!(decisions_of(&port.shared, two, false).terminated.is_empty());
+
+        *port.shared.directory.write().unwrap() = Arc::new(DirectoryView {
+            groups: vec![(
+                [1; 32],
+                GroupView {
+                    keys: vec![[1; 32]],
+                    sites: vec![WorkerId(1)],
+                    site_tiers: Vec::new(),
+                    disk_sites: Vec::new(),
+                },
+            )],
+            peers: vec![(WorkerId(1), "w1".into())],
+            ..DirectoryView::default()
+        });
+        port.shared.tables.write().unwrap().replicas_default = Some(vec![WorkerId(2)]);
+        let copies = |courier| decisions_of(&port.shared, two, courier).replicate.len();
+        assert_eq!((copies(true), copies(false)), (1, 0));
+    }
+
+    /// A process that arrives as the policies start is placed: they know the
+    /// workers before any process. The runtime's thread is kept from every
+    /// other task until the policies have heard.
+    #[tokio::test]
+    async fn a_process_that_arrives_first_is_placed() {
+        let table = RoutingTable {
+            epoch: 1,
+            author: None,
+            workers: vec![controller_api::RoutableWorker {
+                id: WorkerId(1),
+                addr: String::new(),
+                role: Role::Decode,
+                model: "m".into(),
+                engine: String::new(),
+                health: Health::Healthy,
+                coarse_load: Default::default(),
+            }],
+        };
+        let host = Host::start(
+            vec![("test-route".into(), component("test-route"))],
+            CALL,
+            watch::channel(table).1,
+            watch::channel(DirectoryView::default()).1,
+        )
+        .unwrap();
+        let decisions = host.decisions(GatewayId(0));
+        host.events(GatewayId(0), vec![arrived(7, &[("to", "\"1\"")], None)]);
+        while decisions.borrow().heard < 1 {
+            std::thread::yield_now();
+        }
+        let view = decisions.borrow().clone();
+        assert_eq!(view.placements[0].1.workers, Some(vec![WorkerId(1)]));
+    }
+
+    /// A launch at an idle gateway is heard, and its row in force, with the
+    /// round its arrival wakes: the port waits on events and alarms alone,
+    /// and the runtime's thread is kept from every task that sends another.
+    #[tokio::test]
+    async fn a_gate_opens_with_the_round_its_launch_wakes() {
+        let table = RoutingTable {
+            epoch: 1,
+            author: None,
+            workers: vec![controller_api::RoutableWorker {
+                id: WorkerId(1),
+                addr: String::new(),
+                role: Role::Decode,
+                model: "m".into(),
+                engine: String::new(),
+                health: Health::Healthy,
+                coarse_load: Default::default(),
+            }],
+        };
+        let host = Host::start(
+            vec![("test-route".into(), component("test-route"))],
+            CALL,
+            watch::channel(table).1,
+            watch::channel(DirectoryView::default()).1,
+        )
+        .unwrap();
+        let decisions = host.decisions(GatewayId(0));
+        for nth in [1, 2] {
+            let mut launch = arrived(nth, &[("to", "\"1\"")], None);
+            if let ProcessEvent::Arrived { seq, .. } = &mut launch {
+                *seq = nth;
+            }
+            host.events(GatewayId(0), vec![launch]);
+            while decisions.borrow().heard < nth {
+                std::thread::yield_now();
+            }
+            let view = decisions.borrow().clone();
+            let row = view.placements.iter().find(|(req, _)| *req == nth);
+            assert_eq!(row.unwrap().1.workers, Some(vec![WorkerId(1)]));
+        }
+    }
+
+    /// A worker's policy writes columns no cluster enacts: it does not load
+    /// here.
+    #[test]
+    fn a_worker_policy_does_not_load_in_the_cluster() {
+        let refused = port("noop")
+            .host
+            .load("default", &component("default"))
+            .unwrap_err();
+        assert!(refused.contains("cannot enact"), "{refused}");
+    }
+
+    /// A policy reads a process in the call that delivers its exit:
+    /// `default` learns there how much of what is retained was prompt.
+    #[test]
+    fn an_exited_process_is_read_by_the_call_about_its_exit() {
+        let host = PlexHost::new(Config {
+            manual: true,
+            deadline_ms: CALL.as_millis() as u64,
+            ..Config::default()
+        });
+        host.load("default", &component("default")).unwrap();
+        host.put_worker("1", false, vec![(Tier::Device, None, 0)], 0, 0, None);
+        host.arrived(
+            "p",
+            None,
+            None,
+            Some("1".into()),
+            Some(100),
+            None,
+            Vec::new(),
+            0,
+        );
+        host.started("p");
+        host.run(true);
+        host.put_working_set(
+            "p",
+            None,
+            None,
+            None,
+            300,
+            0,
+            vec![("1".into(), Tier::Device, 300)],
+        );
+        host.exited("p", "completed", None, None, 0);
+        host.retained("p", "1");
+        host.run(true);
+        let rows = host.poll_delta().retention_priority.rows;
+        let mut keys: Vec<(Option<u32>, Option<i64>)> =
+            rows.into_iter().map(|(at, key)| (at.1, key)).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [(None, Some(-1)), (Some(100), Some(0))],
+            "its prompt above its tail"
+        );
+    }
+
+    /// A pending process is sized from its prompt's text, the tokens its
+    /// blocks are guessed at.
+    #[test]
+    fn a_pending_process_is_sized_from_its_prompt_text() {
+        let mut port = port("test-route");
+        let text = "x".repeat(640);
+        port.apply(GatewayId(0), arrived(1, &[], Some(&text)));
+        // `test-route` notes the prompt tokens of a process with a working
+        // set (`<prompt>/<set>:<copies>`).
+        port.host
+            .put_working_set("0.1", None, None, None, 0, 0, Vec::new());
+        port.host.run(true);
+        let seen = port
+            .host
+            .poll_delta()
+            .notes
+            .into_iter()
+            .find(|(_, _, name, _)| name == "seen");
+        let Some((_, _, _, Some(Value::Text(seen)))) = seen else {
+            panic!("no note: {seen:?}");
+        };
+        assert!(seen.starts_with("160/"), "{seen}");
+    }
+
+    /// A policy gates launches by its imports: `default-cluster` places
+    /// pending processes (`placement/workers`), so a launch under it waits
+    /// at the gate, as under `test-route`; `noop` decides nothing and gates
+    /// nothing.
+    #[test]
+    fn only_a_policy_that_decides_pending_processes_gates_launches() {
+        let config = Config::default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _in = runtime.enter();
+        let gate = |names: &[&str]| {
+            let programs = names
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        builtins::policy(n).unwrap().component.to_vec(),
+                    )
+                })
+                .collect();
+            let host = Host::start(
+                programs,
+                call_deadline(),
+                watch::channel(RoutingTable {
+                    epoch: 0,
+                    workers: Vec::new(),
+                    author: None,
+                })
+                .1,
+                watch::channel(DirectoryView::default()).1,
+            )
+            .unwrap();
+            host.decisions(GatewayId(0)).borrow().gate_ms
+        };
+        assert_eq!(gate(&["noop"]), 0);
+        assert_eq!(gate(&["default-cluster"]), config.deadline_ms);
+        assert_eq!(gate(&["default-cluster", "noop"]), config.deadline_ms);
+    }
+
+    #[test]
+    fn replication_asks_each_named_worker_without_a_copy_for_the_pages_its_rows_cover() {
+        let group = GroupView {
+            keys: vec![[1; 32], [2; 32], [3; 32]],
+            sites: vec![WorkerId(0)],
+            site_tiers: Vec::new(),
+            disk_sites: Vec::new(),
+        };
+        let id = hex(&[3; 32]);
+        let directory = DirectoryView {
+            groups: vec![([3; 32], group)],
+            peers: vec![(WorkerId(0), "w0".into())],
+            disk_tiers: vec![(WorkerId(0), (16, false))],
+            ..Default::default()
+        };
+        let mut tables = Tables::default();
+        // 17 tokens cover two 16-token pages; all of it covers three; the
+        // worker that holds it is asked nothing.
+        tables.replicas.insert(
+            (id.clone(), Some(17)),
+            vec![WorkerId(0), WorkerId(1), WorkerId(9)],
+        );
+        tables
+            .replicas
+            .insert((id.clone(), None), vec![WorkerId(9)]);
+        let mut orders = orders(&shared(tables, directory));
+        orders.sort_by_key(|o| o.worker.0);
+        let asked: Vec<(u64, usize, &str)> = orders
+            .iter()
+            .map(|o| (o.worker.0, o.keys.len(), o.from.as_str()))
+            .collect();
+        assert_eq!(asked, [(1, 2, "w0"), (9, 3, "w0")]);
+    }
+}

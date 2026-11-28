@@ -166,7 +166,7 @@ pub(crate) fn fold_compare(
 }
 
 pub(crate) fn canonicalize_commutative(op: &mut Op, result_type: Option<&SymbolicType>) {
-    if result_type.is_some_and(|result_type| result_type.dtype == Dtype::F32) {
+    if result_type.is_some_and(|result_type| eta_ir::types::is_float(result_type.dtype)) {
         return;
     }
     match op {

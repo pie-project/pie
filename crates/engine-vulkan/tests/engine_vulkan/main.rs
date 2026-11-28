@@ -17,6 +17,19 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
+    /// Every frame this thread waits on from here timed by the device's
+    /// timestamps (`on`), or no longer.
+    pub fn watch_frames(on: bool) {
+        engine_vulkan::encode::profile_kernels(on);
+        let _ = engine_vulkan::encode::take_longest_frame_span_ns();
+    }
+
+    /// The longest device span of a frame this thread waited on since
+    /// [`watch_frames`]; `None` where the backend times none.
+    pub fn longest_frame_ns() -> Option<u64> {
+        Some(engine_vulkan::encode::take_longest_frame_span_ns())
+    }
+
     pub const NAME: &str = "vulkan";
     pub const PLATFORM: poem::Platform = poem::Platform::Vulkan;
     /// Kernels compile to SPIR-V: the register-tiled and cooperative-matrix
@@ -28,6 +41,9 @@ mod backend {
     pub const LOGITS: &str = "PIE_VK_LOGITS";
     pub const FIXTURES: &str = "PIE_VK_FIXTURES";
     pub const CHUNK: &str = "PIE_VK_CHUNK";
+
+    /// What a test's load takes: the whole device.
+    pub const ALLOWANCE: engine::Allowance = engine::Allowance::WHOLE;
 
     /// The narrowest subgroup the device runs.
     pub fn subgroup(device: &Context) -> u32 {
@@ -68,6 +84,7 @@ mod collective;
 mod conv;
 #[path = "../../../engine-gpu/suite/elemwise/mod.rs"]
 mod elemwise;
+mod fills_verified;
 #[path = "../../../engine-gpu/suite/gather/mod.rs"]
 mod gather;
 #[path = "../../../engine-gpu/suite/gpu.rs"]
@@ -76,6 +93,8 @@ mod gpu;
 mod linear;
 #[path = "../../../engine-gpu/suite/model_logits.rs"]
 mod model_logits;
+mod rates_bound;
+mod replay;
 #[path = "../../../engine-gpu/suite/runtime/mod.rs"]
 mod runtime;
 #[path = "../../../engine-gpu/suite/sampling/mod.rs"]

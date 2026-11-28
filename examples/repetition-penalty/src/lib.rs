@@ -274,12 +274,17 @@ async fn main(input: Input) -> Result<Output> {
     let g0 = tok_out_p.take_host::<i32>().await?;
     let p0 = pen_out_p.take_host::<f32>().await?;
     let k0 = peak_out_p.take_host::<f32>().await?;
-    generated.push(g0 as u32);
+    // A stop token ends the text and is not part of it, as every chat
+    // inferlet here ends its text.
+    let stopped = inferlet::chat::is_stop(g0 as u32);
+    if !stopped {
+        generated.push(g0 as u32);
+    }
     penalized.push(p0);
     peaks.push(k0);
 
     // ── DECODE LOOP (1-wide, run-ahead). ──
-    if generated.len() < max_tokens {
+    if !stopped && generated.len() < max_tokens {
         let mut hist0 = vec![-1i32; max_tokens];
         hist0[0] = g0;
 
@@ -325,6 +330,9 @@ async fn main(input: Input) -> Result<Output> {
                 .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
+            if inferlet::chat::is_stop(v[0] as u32) {
+                return Ok(ControlFlow::Break(()));
+            }
             generated.push(v[0] as u32);
             penalized.push(v[1]);
             peaks.push(v[2]);
@@ -354,6 +362,6 @@ async fn main(input: Input) -> Result<Output> {
         repetition_penalty: cfg.repetition_penalty,
         mean_penalized: penalized.iter().sum::<f32>() / penalized.len() as f32,
         peak_repeat: peaks.iter().fold(0.0f32, |a, &b| a.max(b)),
-        unique_ratio: unique.len() as f32 / generated.len() as f32,
+        unique_ratio: unique.len() as f32 / generated.len().max(1) as f32,
     })
 }

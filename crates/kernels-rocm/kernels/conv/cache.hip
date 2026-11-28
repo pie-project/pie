@@ -40,6 +40,7 @@ __device__ __forceinline__ int cache_lane_of(const int* __restrict__ grid, int l
 
 template <class T>
 __global__ __launch_bounds__(256) void cache_gather(StateRows rows, const int* __restrict__ grid,
+                                                    const int* __restrict__ clip_lanes, int lane_base,
                                                     T* __restrict__ cache, int lanes, int frames, int c,
                                                     long long row_elems, long long total) {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -54,12 +55,13 @@ __global__ __launch_bounds__(256) void cache_gather(StateRows rows, const int* _
         cache[e] = from_f32<T>(0.f);
         return;
     }
-    cache[e] = *cache_cell<const T>(rows, l, row - base, c, col);
+    cache[e] = *cache_cell<const T>(rows, clip_lanes[l] - lane_base, row - base, c, col);
 }
 
 template <class T>
 __global__ __launch_bounds__(256) void cache_store(const T* __restrict__ x, const T* __restrict__ cache,
-                                                   StateRows rows, const int* __restrict__ grid, int lanes,
+                                                   StateRows rows, const int* __restrict__ grid,
+                                                   const int* __restrict__ clip_lanes, int lane_base, int lanes,
                                                    int frames, int c, long long row_elems, int x_base,
                                                    long long total) {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -88,7 +90,7 @@ __global__ __launch_bounds__(256) void cache_store(const T* __restrict__ x, cons
     } else {
         value = cache[(static_cast<long long>(base) + static_cast<long long>(f + g.t) * plane + hw) * c + col];
     }
-    *cache_cell<T>(rows, l, local_row, c, col) = value;
+    *cache_cell<T>(rows, clip_lanes[l] - lane_base, local_row, c, col) = value;
 }
 
 }  // namespace pie::conv

@@ -1,7 +1,8 @@
 //! The dense matmuls on the first device against an f64 host reference: the
-//! vector kernels below four rows (an even contraction in eight-wide loads,
-//! an odd one; odd column counts on SPIR-V; at the subgroup tier too where
-//! every subgroup is 32 lanes), the tiled kernel over ragged tiles, the register tile from 96 rows at its
+//! vector kernels at 1 to 16 rows on each workgroup's rows (an even
+//! contraction in eight-wide loads, an odd one; odd column counts on
+//! SPIR-V; at the subgroup tier too where every subgroup is 32 lanes), the
+//! tiled kernel over ragged tiles, the register tile part-filled and past one at its
 //! 64- and 32-column forms, the cooperative-matrix tier where the device has
 //! one, and the f32 lane form at every weight and result dtype (f32 results
 //! only on WGSL).
@@ -48,25 +49,43 @@ fn the_dense_matmuls_answer_the_reference() {
         eprintln!("not asked: no device");
         return;
     };
-    // (rows, columns, contraction, tier)
+    // (rows, columns, contraction, tier, vector rows a workgroup (0 tiled),
+    // the wide tile)
     let mut cases = vec![
-        (1usize, 24usize, 64usize, kernels_slang::Tier::Baseline),
-        (3, 21, 60, kernels_slang::Tier::Baseline),
-        (3, 22, 64, kernels_slang::Tier::Baseline),
-        (2, 22, 61, kernels_slang::Tier::Baseline),
-        (40, 50, 70, kernels_slang::Tier::Baseline),
-        (70, 66, 33, kernels_slang::Tier::Baseline),
-        // The register tile from 96 rows: its 64- and 32-column forms.
-        (130, 70, 48, kernels_slang::Tier::Baseline),
-        (100, 96, 32, kernels_slang::Tier::Baseline),
+        (
+            3usize,
+            21usize,
+            60usize,
+            kernels_slang::Tier::Baseline,
+            4u32,
+            false,
+        ),
+        (2, 22, 61, kernels_slang::Tier::Baseline, 4, false),
+        // The plain vector kernel past four rows.
+        (9, 22, 61, kernels_slang::Tier::Baseline, 16, false),
+        (40, 50, 70, kernels_slang::Tier::Baseline, 0, false),
+        (70, 66, 33, kernels_slang::Tier::Baseline, 0, false),
+        // The register tile, part-filled and past one tile: its 64- and
+        // 32-column forms; the 32 x 32 tile past one register tile.
+        (130, 70, 48, kernels_slang::Tier::Baseline, 0, true),
+        (5, 96, 32, kernels_slang::Tier::Baseline, 0, true),
+        (300, 96, 32, kernels_slang::Tier::Baseline, 0, true),
+        (300, 66, 32, kernels_slang::Tier::Baseline, 0, false),
     ];
+    // The eight-column kernel at 1 to 16 rows on each workgroup's rows:
+    // a block of them, the last part-filled, past them.
+    for m in 1..=16 {
+        for vector in kernels_slang::linear::gemm::VECTOR_ROWS {
+            cases.push((m, 22, 64, kernels_slang::Tier::Baseline, vector, false));
+        }
+    }
     if gpu.subgroup() >= 32 {
-        cases.push((3, 22, 64, kernels_slang::Tier::Subgroup));
+        cases.push((3, 22, 64, kernels_slang::Tier::Subgroup, 4, false));
     }
     if gpu.coopmat() {
-        cases.push((70, 64, 96, kernels_slang::Tier::Coopmat));
+        cases.push((70, 64, 96, kernels_slang::Tier::Coopmat, 0, false));
     }
-    for (m, n, k, tier) in cases {
+    for (m, n, k, tier, vector, wide) in cases {
         if !crate::gpu::lands(n) {
             continue;
         }
@@ -81,12 +100,18 @@ fn the_dense_matmuls_answer_the_reference() {
         let want = reference(&xr, &wr, (m, n, k), op);
         landed(
             &mut gpu,
-            &format!("gemm {m} x {n} x {k} at {}", tier.name()),
+            &format!(
+                "gemm {m} x {n} x {k} at {} (vector {vector}, wide {wide})",
+                tier.name()
+            ),
             &|g| vec![(g.zeros(m * n), m * n, false)],
             std::slice::from_ref(&want),
             &|g, o| {
                 let y = t(o[0].0, m, n, Dtype::Bf16);
-                g.run(|c| gemm::matmul(c, Tactic { tier }, xt, wt, y));
+                let tactic = Tactic { tier, vector, wide };
+                g.run(|c| {
+                    gemm::matmul(c, tactic, xt, wt, y, kernels_slang::ssm::RowSpan::whole(xt))
+                });
             },
         );
     }

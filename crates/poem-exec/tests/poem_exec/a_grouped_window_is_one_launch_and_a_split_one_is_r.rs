@@ -243,7 +243,9 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     let split = bake(&trace, &split_arm());
     let grouped = bake(&trace, &grouped_arm());
     let lanes = one_lane_per_class(&split);
-    assert_eq!(lanes.len(), 32, "`{DEPLOYMENT}` resolves 32 classes");
+    // The attention mask is per-lane data, no class bit: the classes the
+    // deployment resolves are the maskless ones.
+    assert_eq!(lanes.len(), 16, "`{DEPLOYMENT}` resolves 16 classes");
 
     let descriptor = fire(&split, &lanes);
     let mask = split

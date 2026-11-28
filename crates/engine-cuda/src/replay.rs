@@ -4,10 +4,11 @@
 //! (unannounced; the replay floor op stamps where decoder windows start), then
 //! the step with each prompt cut to its last window.
 
-use engine::fire::{Readout, RsReset, RsVerb, Step};
+use engine::fire::{ListKind, Readout, RsReset, RsVerb, Step};
 use poem_ir::{Attn, Builtin, Fact, Fused, Operation};
 
 use crate::serve::Shell;
+use crate::store::layout::LIST;
 
 /// Where a load replays: the word bit of the encoder-only rows, and the
 /// window the decoder replays.
@@ -22,10 +23,8 @@ impl Replay {
     /// (`kernel.sdpa.compressed_replay`) and its trace reads the floor.
     #[must_use]
     pub fn of(shell: &Shell) -> Option<Replay> {
-        if !shell.tuning().compressed_replay {
-            return None;
-        }
-        Replay::in_trace(shell.trace())
+        let replay = Replay::in_trace(shell.trace())?;
+        shell.tuning().compressed_replay().then_some(replay)
     }
 
     /// The replay `trace` states: its `encode` fact and its floored
@@ -62,6 +61,18 @@ impl Replay {
     /// `step` as the encoder-only step to fire first and the step to fire
     /// after it, where a lane of it is a prompt longer than the window;
     /// `None` where none is. `plain` says whether a word is a plain lane's, attending one way.
+    /// A lane whose list table is a translation (its program places its rows, device
+    /// geometry) is never cut.
+    /// The lanes of `step` [`Self::split`] cuts, in order: the split's
+    /// head lane `i` is lane `cut_lanes[i]` of the step.
+    #[must_use]
+    pub fn cut_lanes(self, step: &Step, plain: impl Fn(u64) -> bool) -> Vec<u32> {
+        (0..step.lanes.len())
+            .filter(|&at| self.cuts(step, at, &plain))
+            .map(|at| u32::try_from(at).unwrap_or(u32::MAX))
+            .collect()
+    }
+
     #[must_use]
     pub fn split(self, step: &Step, plain: impl Fn(u64) -> bool) -> Option<(Step, Step)> {
         let window = self.window as usize;
@@ -80,6 +91,7 @@ impl Replay {
             attachments: Vec::new(),
             media: Vec::new(),
             voxels: Vec::new(),
+            shape: None,
         };
         let mut tail = step.clone();
         for (lane, skipped) in tail.lanes.iter_mut().zip(cuts) {
@@ -88,7 +100,6 @@ impl Replay {
             lead.word |= self.bit;
             lead.tokens.truncate(skipped);
             lead.readout = Readout::None;
-            lead.channels.clear();
             head.lanes.push(lead);
 
             lane.tokens.drain(..skipped);
@@ -119,8 +130,11 @@ impl Replay {
             && matches!(lane.rs, RsVerb::Fold)
             && lane.inputs.is_empty()
             && !lane.kv_less
-            && !lane.kv.pages.is_empty()
-            && lane.kv.translation.is_empty()
+            && lane.list == ListKind::Pages
+            && lane
+                .tables
+                .iter()
+                .any(|(shape, refs)| *shape == LIST && !refs.is_empty())
             && lane.group.is_none()
             && match &lane.readout {
                 Readout::Rows(read) => read.iter().all(|&row| row as usize >= rows - window),
@@ -133,8 +147,8 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
-    use super::Replay;
-    use engine::fire::{KvDelta, Lane, Readout, RsReset, Step};
+    use super::{LIST, Replay};
+    use engine::fire::{KvDelta, Lane, ListKind, Readout, RsReset, Step};
 
     fn prompt(slot: u32, rows: u32, held: u32) -> Lane {
         Lane {
@@ -143,9 +157,9 @@ mod tests {
             tokens: (0..rows).collect(),
             kv: KvDelta {
                 held,
-                pages: (0..(held + rows).div_ceil(64)).collect(),
                 ..KvDelta::default()
             },
+            tables: vec![(LIST, (0..(held + rows).div_ceil(64)).collect())],
             rs_reset: RsReset::Fresh,
             ..Lane::default()
         }
@@ -208,6 +222,21 @@ mod tests {
         read.readout = Readout::Rows(vec![100, 299]);
         let step = Step {
             lanes: vec![read],
+            ..Step::default()
+        };
+        assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());
+    }
+
+    #[test]
+    fn a_lane_whose_list_is_a_translation_is_left_whole() {
+        let replay = Replay {
+            bit: 0b100,
+            window: 128,
+        };
+        let mut placed = prompt(3, 300, 0);
+        placed.list = ListKind::Translation;
+        let step = Step {
+            lanes: vec![placed],
             ..Step::default()
         };
         assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());

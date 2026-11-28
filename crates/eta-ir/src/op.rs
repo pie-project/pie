@@ -77,6 +77,18 @@ pub enum Op {
     ReduceMax(ValueId),
     ReduceMin(ValueId),
     ReduceArgmax(ValueId),
+    /// A Gumbel-max draw over the last axis, reduced with no row of its
+    /// own: the index of each row's largest `logits[i] * scale +
+    /// gumbel(state, i)` (as `RngKeyed { state, shape: logits' shape,
+    /// kind: Gumbel }` draws lane `i`), a lane whose `keep` is false
+    /// `-inf`, each lane computed in f32 and never rounded, ties and NaN
+    /// as `ReduceArgmax`'s. See `types`' bf16 rules.
+    GumbelArgmax {
+        logits: ValueId,
+        keep: ValueId,
+        scale: ValueId,
+        state: ValueId,
+    },
 
     Broadcast {
         value: ValueId,
@@ -268,6 +280,7 @@ impl Op {
             | Op::ReduceMax(..)
             | Op::ReduceMin(..)
             | Op::ReduceArgmax(..)
+            | Op::GumbelArgmax { .. }
             | Op::Broadcast { .. }
             | Op::Reshape { .. }
             | Op::Transpose(..)
@@ -333,6 +346,7 @@ impl Op {
             | Op::ReduceMax(..)
             | Op::ReduceMin(..)
             | Op::ReduceArgmax(..)
+            | Op::GumbelArgmax { .. }
             | Op::Broadcast { .. }
             | Op::Reshape { .. }
             | Op::Transpose(..)
@@ -449,6 +463,8 @@ declare_operands! {
         | Op::MaskApply { logits: a, mask: b } => [a, b],
 
         Op::Select { cond: a, a: b, b: c } => [a, b, c],
+
+        Op::GumbelArgmax { logits: a, keep: b, scale: c, state: d } => [a, b, c, d],
 
         Op::ScatterAdd { base: a, idx: b, vals: c }
         | Op::ScatterSet { base: a, idx: b, vals: c } => [a, b, c],
@@ -585,6 +601,9 @@ declare_ops! {
         Op::ReduceMin(0), Op::ReduceMin(_), [Value];
     REDUCE_ARGMAX = 0x33, "reduce_argmax", ReduceScan, 1, 1,
         Op::ReduceArgmax(0), Op::ReduceArgmax(_), [Value];
+    GUMBEL_ARGMAX = 0x34, "gumbel_argmax", ReduceScan, 4, 1,
+        Op::GumbelArgmax { logits: 0, keep: 1, scale: 2, state: 3 }, Op::GumbelArgmax { .. },
+        [Value, Value, Value, Value];
     BROADCAST = 0x38, "broadcast", Shape, 1, 1,
         Op::Broadcast { value: 0, shape: Shape::vector(4) }, Op::Broadcast { .. }, [Value, Shape];
     RESHAPE = 0x39, "reshape", Shape, 1, 1,

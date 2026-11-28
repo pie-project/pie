@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::bf16_bits;
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use poem::ops::conv::{self, ConvShape};
@@ -97,12 +98,6 @@ impl Lcg {
     fn unit(&mut self) -> f32 {
         ((self.next() >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
-}
-
-fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    ((bits + rounding) >> 16) as u16
 }
 
 fn bf16_round(value: f32) -> f32 {
@@ -387,28 +382,12 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
 
     let max_voxels: u32 = (BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8) * 16;
     let mut shell = Shell::load(Boot {
-        trace,
-        contract: &contract,
-        checkpoint: &container,
-        budget: Budget::new(4, 16),
-        patches: None,
         voxels: Some(VoxelLadder::new(max_voxels, 4)),
-        page_size: 16,
-        context: 64,
-        slots: 4,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
+            pin: Some((Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
+        ..crate::common::boot(trace, &contract, &container, Budget::new(4, 16), 64, 4)
     })
     .expect("the decoder loads");
     shell.open(0).expect("slot 0 opens");
@@ -663,28 +642,12 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     };
     drop(source);
     let mut shell = Shell::load(Boot {
-        trace,
-        contract: &contract,
-        checkpoint: &container,
-        budget: Budget::new(4, 16),
-        patches: None,
         voxels: Some(VoxelLadder::new(256, 4)),
-        page_size: 16,
-        context: 64,
-        slots: 4,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
         knobs: Knobs {
-            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
+            pin: Some((Graphs::Off, Some(Recording::Off))),
             ..Knobs::default()
         },
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
+        ..crate::common::boot(trace, &contract, &container, Budget::new(4, 16), 64, 4)
     })
     .expect("the causal text loads");
     shell.open(0).expect("slot 0 opens");

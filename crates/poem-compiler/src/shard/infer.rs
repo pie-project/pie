@@ -373,7 +373,8 @@ impl<'r, 't> Walk<'r, 't> {
         for output in &trace.outputs {
             let per_lane = matches!(
                 &trace.values[output.value.0 as usize].ty,
-                Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Lanes | Dim::LanesPlus(_)))
+                Ty::Tensor { shape, .. }
+                    if matches!(shape.first(), Some(Dim::Lanes | Dim::LanesPlus(_) | Dim::Capturing))
             );
             for v in output.values() {
                 self.reduce(v);
@@ -524,10 +525,18 @@ impl<'r, 't> Walk<'r, 't> {
             return;
         }
         let rule = rules::rule_of(op, |v| self.width(v));
-        // Partial sums any op but a sum reads are reduced first.
+        // Partial sums any op but a sum reads are reduced first. A score
+        // capture adds into a row the ranks hold a term of each, so its
+        // `into` stays one.
+        let into = match op {
+            poem_ir::Operation::Attn(poem_ir::Attn::ScoreCapture { into, .. }) => *into,
+            _ => None,
+        };
         if !matches!(rule, Rule::Linear { .. }) {
             for v in &ins {
-                self.reduce(*v);
+                if Some(*v) != into {
+                    self.reduce(*v);
+                }
             }
         }
         let held = match rule {
@@ -659,6 +668,20 @@ impl<'r, 't> Walk<'r, 't> {
             Rule::Heads(heads) => {
                 let others = read(heads.follow);
                 self.heads(op, &t, heads, &field, &others, &outs)
+            }
+            // Split by head as a head rule's query, each rank holding a term
+            // of the row.
+            Rule::Scores => {
+                let heads =
+                    rules::Heads::of(&["q"], &[rules::KV_HEADS]).cache(rules::Cache::SplitOrWhole);
+                let others = read(&["q", "into"]);
+                self.heads(op, &t, heads, &field, &others, &outs)
+                    .into_iter()
+                    .map(|held| match held {
+                        Held::Split(origins) => Held::Partial(origins),
+                        other => other,
+                    })
+                    .collect()
             }
         };
         for (o, h) in outs.into_iter().zip(held) {

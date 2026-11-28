@@ -192,27 +192,6 @@ pub struct PadRowSteps(pub u32);
 #[decision(id = "engine.pad.half_rungs", constant(set(0, 32, 64, 128, 256, 512)), default = 0, tune = search)]
 pub struct PadHalfRungs(pub u32);
 
-/// Whether a decoding lane's next pages come before seating a waiting
-/// prompt, and a prompt waits rather than suspending a lane
-/// (`PoolFacts::seated_first`). Off keeps arrival order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
-pub struct SeatedFirst;
-
-/// Whether a process starts only while the pools hold the started ones to
-/// the pages a finished one held (`PoolFacts::seat_to_end`): the engine
-/// keeps no kv on the host, so a lane the pool runs short for restarts its
-/// process. Off starts each at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
-pub struct SeatToEnd;
-
-/// With `engine.seat_to_end`, whether the starts the pools do not hold to
-/// the end at once go spread over a life (`PoolFacts::seat_spread`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_spread", flag, default = false, tune = engine)]
-pub struct SeatSpread;
-
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("xla", FACTS, &["rows"]);
     kernels_xla::tuning::register(&mut r);
@@ -225,10 +204,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PageFloor>()
         .add::<PrefillFloor>()
         .add::<PadRowSteps>()
-        .add::<PadHalfRungs>()
-        .add::<SeatedFirst>()
-        .add::<SeatToEnd>()
-        .add::<SeatSpread>();
+        .add::<PadHalfRungs>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 2);
     r
@@ -252,8 +228,6 @@ pub struct Engine {
     pub gemm_transpose: bool,
     pub embed_fold: bool,
     pub pad: Pad,
-    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
-    pub seats: [bool; 3],
 }
 
 /// How fires are padded to canonical shapes.
@@ -339,11 +313,6 @@ impl Engine {
                 row_steps: profile.get::<PadRowSteps>().0,
                 half_rungs: profile.get::<PadHalfRungs>().0,
             },
-            seats: [
-                profile.on::<SeatedFirst>(any),
-                profile.on::<SeatToEnd>(any),
-                profile.on::<SeatSpread>(any),
-            ],
         }
     }
 }
@@ -359,6 +328,12 @@ macro_rules! seeded {
 
 seeded!("v5e.toml", "v6e.toml", "v7.toml");
 
+/// The host covers committed for TPUs (`profiles/<device>.covers.json`,
+/// `pie tune export --engine xla`), each listed here: the runtime takes a
+/// cover whose key matches where the home's own cache holds none
+/// (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[];
+
 pub static SHELF: Shelf = Shelf {
     backend: "xla",
     seeded: SEEDED,
@@ -370,6 +345,24 @@ pub static SHELF: Shelf = Shelf {
 #[must_use]
 pub fn resolve(kind: &str, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), kind, &Tpu::of(kind).facts(), profiles)
+}
+
+/// [`resolve`] with the stored measurements keyed (`crate::stored`): each
+/// `[rates]` entry is taken from the user's file where its key matches this
+/// plugin on this device, else from the device's committed measured
+/// profile where its key matches, else left for the load to measure; each
+/// is said once, by the layer and key that decided it.
+#[must_use]
+pub fn resolve_keyed(kind: &str, platform: &str, profiles: Option<&Path>) -> (Profile, Report) {
+    let keys = crate::stored::Keys {
+        on: crate::stored::measured_on(kind, platform),
+    };
+    let (profile, report) =
+        SHELF.resolve_keyed(registry(), kind, &Tpu::of(kind).facts(), profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
 }
 
 #[cfg(test)]
@@ -397,7 +390,6 @@ mod tests {
         // the defaults, but for its 256-row attention blocks and flat rope
         let mut want = kernels_xla::tuning::Tuning::DEFAULT;
         want.chunks.block_rows = 256;
-        want.chunks.decode_pages = 64;
         want.rope_flat_rows = 1024;
         want.glu_land_from = 1024;
         want.glu_gemm_from = 1024;

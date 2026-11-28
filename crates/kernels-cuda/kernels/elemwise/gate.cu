@@ -9,12 +9,12 @@ template <class T>
 __global__ void gate_sigmoid_mul(
     T* __restrict__ x,
     const T* __restrict__ gate,
-    i32 n,
+    i64 n,
     i32 width,
     i32 fan,
     const u32* __restrict__ win)
 {
-    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     if (win != nullptr &&
@@ -34,12 +34,12 @@ __global__ void gate_sigmoid_mul(
 __global__ void gate_sigmoid_mul_vec8(
     bf16* __restrict__ x,
     const bf16* __restrict__ gate,
-    i32 n8,
+    i64 n8,
     i32 width,
     i32 fan,
     const u32* __restrict__ win)
 {
-    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    const i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n8) return;
     if (win != nullptr &&
         static_cast<long long>(i) * 8 >=

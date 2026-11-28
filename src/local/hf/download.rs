@@ -55,7 +55,7 @@ fn token() -> Option<String> {
 }
 
 fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    worker::http::builder()?
         .user_agent(concat!("pie/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()

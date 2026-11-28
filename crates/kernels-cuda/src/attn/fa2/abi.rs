@@ -73,6 +73,12 @@ pub struct DecodeParams {
     pub block_valid_mask: DevicePtr,
     pub partition_kv: bool,
     pub q_indptr: DevicePtr,
+    /// The fire's masks a custom-mask arm reads, as
+    /// [`PrefillPagedParams`]'s: bits, each request's byte offset, and
+    /// its word (`variants.cuh`); null for every other arm.
+    pub maybe_custom_mask: DevicePtr,
+    pub maybe_mask_indptr: DevicePtr,
+    pub maybe_mask_origin: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -118,6 +124,10 @@ pub struct PrefillPagedParams {
     pub token_pos_in_items_len: u32,
     pub maybe_max_item_len_ptr: DevicePtr,
     pub maybe_sinks: DevicePtr,
+    /// Per request, the committed boundary its mask speaks of the keys past
+    /// (bits 0-30) and whether its rows read both ways (bit 31); null: every
+    /// boundary 0 and every row wide (`variants.cuh`).
+    pub maybe_mask_origin: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

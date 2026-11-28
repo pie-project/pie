@@ -24,7 +24,7 @@ pub const LIST: ShapeId = ShapeId(0);
 /// The first (narrowest) window list's; the lists after it are
 /// [`window_id`]'s.
 pub const WINDOW: ShapeId = ShapeId(1);
-/// The window lists a load may state (CONTRACT-BC 21).
+/// The window lists a load may state.
 pub const MOST_WINDOWS: usize = 4;
 /// The ids of the window lists past the first start here, clear of the
 /// weight shapes' ([`WEIGHTS`] on).
@@ -49,6 +49,45 @@ pub fn window_of(id: ShapeId) -> Option<usize> {
 pub const FIXED: ShapeId = ShapeId(2);
 /// The rs list's.
 pub const RS: ShapeId = ShapeId(3);
+/// The ring shape's: the windowed layers' rings, a record's first pieces,
+/// clear of the weight shapes' and the window lists'.
+pub const RING: ShapeId = ShapeId(MORE_WINDOWS - 1);
+
+/// The guest shapes' ids start here, clear of the weight shapes' and the
+/// window lists'.
+const GUEST: u32 = 1 << 17;
+/// A guest instance's own tables (`SlotRole::Instance`): its rings'
+/// registry and the native cells of the rings the host reads or writes.
+pub const INSTANCE: ShapeId = ShapeId(GUEST);
+/// A ring only the device reads and writes (`SlotRole::Channel`).
+pub const CHANNEL: ShapeId = ShapeId(GUEST + 1);
+/// An `Instance` slot's bytes.
+pub const INSTANCE_SLOT: u64 = 4 << 10;
+/// A `Channel` slot's bytes.
+pub const CHANNEL_SLOT: u64 = 1 << 10;
+
+/// One of the two guest shapes: fixed slots an item takes a run of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestShape {
+    pub id: ShapeId,
+    pub role: engine::chunk::SlotRole,
+    pub slot_bytes: u64,
+    pub per_chunk: u32,
+}
+
+impl GuestShape {
+    /// The slots an item of `bytes` takes: one, or one run of adjacent
+    /// slots it is addressed through as a span.
+    #[must_use]
+    pub fn footprint(&self, bytes: u64) -> engine::program::Footprint {
+        let slots = u32::try_from(bytes.div_ceil(self.slot_bytes)).unwrap_or(u32::MAX);
+        engine::program::Footprint {
+            bytes,
+            slots,
+            contiguous: slots > 1,
+        }
+    }
+}
 
 /// Which of a load's slot shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +102,12 @@ pub enum Kind {
     /// A page of the rs buffer: the rows a lane lands past its state before
     /// they fold, every recurrent layer's.
     Rs,
+    /// A slot of a guest instance's tables ([`INSTANCE`]).
+    Instance,
+    /// A slot of a ring only the device reads and writes ([`CHANNEL`]).
+    Channel,
+    /// A piece of a record's windowed rings, a chunk's one slot ([`RING`]).
+    Ring,
 }
 
 impl Kind {
@@ -75,6 +120,9 @@ impl Kind {
         Kind::Window(1),
         Kind::Window(2),
         Kind::Window(3),
+        Kind::Instance,
+        Kind::Channel,
+        Kind::Ring,
     ];
 
     /// The shape the pages of a kv row of list `list` are slots of: 0 the
@@ -88,6 +136,24 @@ impl Kind {
         }
     }
 
+    /// The guest shape items of `role` take slots of; `None` for a role
+    /// that is not a guest's.
+    #[must_use]
+    pub const fn guest(role: engine::chunk::SlotRole) -> Option<Kind> {
+        match role {
+            engine::chunk::SlotRole::Instance => Some(Kind::Instance),
+            engine::chunk::SlotRole::Channel => Some(Kind::Channel),
+            _ => None,
+        }
+    }
+
+    /// A guest shape: its slots are the runtime's from the load on, named
+    /// by slot ref, never seated by the pool.
+    #[must_use]
+    pub const fn is_guest(self) -> bool {
+        matches!(self, Kind::Instance | Kind::Channel)
+    }
+
     /// A place of its own among the kinds, for a table a kind.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -96,11 +162,14 @@ impl Kind {
             Kind::Fixed => 1,
             Kind::Rs => 2,
             Kind::Window(at) => 3 + at as usize,
+            Kind::Instance => 3 + MOST_WINDOWS,
+            Kind::Channel => 4 + MOST_WINDOWS,
+            Kind::Ring => 5 + MOST_WINDOWS,
         }
     }
 
     /// The kinds [`Kind::index`] numbers.
-    pub const COUNT: usize = 3 + MOST_WINDOWS;
+    pub const COUNT: usize = 6 + MOST_WINDOWS;
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -109,6 +178,9 @@ impl Kind {
             Kind::Window(_) => "windowed page",
             Kind::Fixed => "state slot",
             Kind::Rs => "rs buffer page",
+            Kind::Instance => "guest instance slot",
+            Kind::Channel => "guest channel slot",
+            Kind::Ring => "ring slot",
         }
     }
 }
@@ -172,17 +244,44 @@ impl SlotShape {
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Cache(row) => Some((row, run.offset)),
-                    RowId::Rs(_) | RowId::Pool(_) => None,
+                    RowId::Rs(_) | RowId::Pool(_) | RowId::Ring => None,
                 })
                 .collect(),
             pools: runs
                 .iter()
                 .filter_map(|run| match run.row {
                     RowId::Pool(row) => Some((row, run.offset)),
-                    RowId::Cache(_) | RowId::Rs(_) => None,
+                    RowId::Cache(_) | RowId::Rs(_) | RowId::Ring => None,
                 })
                 .collect(),
         })
+    }
+
+    /// A guest shape: `bytes` a slot, as many as a chunk holds, no row of
+    /// the model's laid in it.
+    fn guest(id: ShapeId, bytes: u64, chunk_bytes: u64) -> SlotShape {
+        SlotShape {
+            id,
+            tokens: 0,
+            slot_bytes: bytes,
+            per_chunk: u32::try_from(chunk_bytes / bytes).unwrap_or(u32::MAX),
+            grain: gcd(chunk_bytes, bytes),
+            window: None,
+            rows: Vec::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    /// Where slot ref `slot` lies in a tier whose chunk ids are their
+    /// places (the host tier): its chunk, and its bytes
+    /// from the chunk's start.
+    #[must_use]
+    pub fn tier_place(&self, slot: u32) -> (u32, u64) {
+        let per_chunk = self.per_chunk.max(1);
+        (
+            slot / per_chunk,
+            u64::from(slot % per_chunk) * self.slot_bytes,
+        )
     }
 
     /// Where the compressor state keyed by cache row `row` starts in a slot.
@@ -232,7 +331,13 @@ pub struct Layout {
     /// window page by one table.
     pub windows: Vec<SlotShape>,
     pub fixed: Option<FixedShape>,
+    /// The windowed rings, a record's first pieces, where the load serves
+    /// its windowed rows as ring + buffer.
+    pub ring: Option<RingShape>,
     pub rs: Option<RsShape>,
+    /// The guest shapes: an instance's tables, a device ring.
+    pub instance: SlotShape,
+    pub channel: SlotShape,
     /// The tables the weight cache streams by their rows, a shape each.
     pub rows: Vec<RowsShape>,
     /// The routed experts the weight cache streams, a shape a layer size.
@@ -301,6 +406,100 @@ impl ExpertShape {
     }
 }
 
+/// Whether ROCm streams fp8 bank `codes` as it lies, codes put in the FP8
+/// matrix core's order (`weights::hip::canonical_fp8`): an `[experts, n,
+/// k]` bank of e4m3 codes beside f32 factors a 128x128 block, n in whole
+/// 16-row strips (the order's unit, so an expert's codes never cross into
+/// the next). Never on another backend (CUDA lays its fp8 banks' factors in
+/// atoms, `weights::laid_planes`).
+#[must_use]
+pub fn fp8_ordered(trace: &poem_ir::Trace, codes: usize) -> bool {
+    use poem_ir::Dtype;
+    if !cfg!(feature = "rocm") {
+        return false;
+    }
+    let Some(param) = trace.params.get(codes) else {
+        return false;
+    };
+    if param.dtype != Dtype::E4m3 || param.shape.len() < 3 || param.shape[1] % 16 != 0 {
+        return false;
+    }
+    let leads = poem_ir::residency::leads(trace);
+    let scales = poem::declare::scales_name(&param.name);
+    trace.params.iter().enumerate().any(|(at, other)| {
+        at != codes && leads[at] == codes && other.name == scales && other.dtype == Dtype::F32
+    })
+}
+
+/// Whether ROCm lays MXFP4 bank `codes` in the matrix core's lane order
+/// (`weights::hip::order_mxfp4_banks`): an `[experts, n, ..]` bank of n in
+/// whole 16-row strips and K in whole 128-code units, under e8m0 exponents
+/// alone, that only routed selects of bf16 rows read (the plain quantized
+/// select, or its e4m3-quantized twin). Never on another backend.
+#[must_use]
+pub fn lane_ordered(trace: &poem_ir::Trace, codes: usize) -> bool {
+    use poem_ir::{ActQuant, Def, Dtype, Fused, Linear, Operands, Operation, Ty};
+    if !cfg!(feature = "rocm") {
+        return false;
+    }
+    let Some(param) = trace.params.get(codes) else {
+        return false;
+    };
+    if param.dtype != Dtype::Mxfp4
+        || param.shape.len() < 3
+        || param.shape[1] % 16 != 0
+        || (2 * param.shape[2..].iter().product::<u64>()) % 128 != 0
+        || select_bias(trace, codes).is_some_and(|bias| bias.is_some())
+    {
+        return false;
+    }
+    let reads_it = |id: poem_ir::ValueId| {
+        matches!(trace.values.get(id.0 as usize).map(|decl| &decl.def),
+            Some(Def::Weight(w)) if *w as usize == codes)
+    };
+    let bf16 = |id: poem_ir::ValueId| {
+        matches!(
+            trace.values.get(id.0 as usize).map(|decl| &decl.ty),
+            Some(Ty::Tensor {
+                dtype: Dtype::Bf16,
+                ..
+            })
+        )
+    };
+    let (mut reads, mut selects) = (0u32, 0u32);
+    let mut ins = Vec::new();
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        reads += ins.iter().filter(|&&id| reads_it(id)).count() as u32;
+        let legs: Vec<&Linear> = match &node.op {
+            Operation::Linear(op) => vec![op],
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => vec![&**select, &**down],
+            Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
+            _ => Vec::new(),
+        };
+        for leg in legs {
+            let x = match leg {
+                Linear::MoeSelect {
+                    x,
+                    bank,
+                    bias: None,
+                    quantized: true,
+                    quant: None | Some(ActQuant::E4m3 { .. }),
+                    ..
+                } if reads_it(*bank) => *x,
+                _ => continue,
+            };
+            if bf16(x) {
+                selects += 1;
+            }
+        }
+    }
+    selects > 0 && selects == reads
+}
+
 /// The planes an expert's entry of a packed bank's table lists
 /// (`kernels_cuda::linear::moe::Planes`), by the bank's codes: a block-FP8
 /// bank's `[codes, atoms]` (its scales laid at load), an MXFP4
@@ -327,6 +526,14 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
         param.dtype,
         Dtype::E4m3 | Dtype::E4m3tile128 | Dtype::E4m3g128
     ) {
+        // ROCm's: its codes in the FP8 matrix core's order, its f32 factors
+        // as they lie (`fp8_ordered`): `[codes, factors]`.
+        if fp8_ordered(trace, codes) {
+            return match scales {
+                Some(scales) => vec![Some(codes as u32), Some(scales)],
+                None => Vec::new(),
+            };
+        }
         let laid = crate::weights::laid_planes(trace).into_iter().any(|laid| {
             laid.codes == codes && laid.leads > 1 && Some(laid.scales as u32) == scales
         });
@@ -357,6 +564,14 @@ pub fn packed_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<Option<u32>> {
         },
         _ => return Vec::new(),
     };
+    // An MXFP4 bank ROCm lays in the matrix core's lane order: its codes
+    // and exponents, as the lane-order selects read them (`[codes, scales]`).
+    if param.dtype == Dtype::Mxfp4 && third.is_none() && lane_ordered(trace, codes) {
+        return match scales {
+            Some(scales) => vec![Some(codes as u32), Some(scales)],
+            None => Vec::new(),
+        };
+    }
     match scales {
         Some(scales) => vec![Some(codes as u32), Some(scales), third],
         None => Vec::new(),
@@ -431,17 +646,17 @@ pub fn beside_planes(trace: &poem_ir::Trace, codes: usize) -> Vec<u32> {
 /// The routed banks of `trace` this engine streams an expert at a time:
 /// planes out of the checkpoint read only at the `bank` port of a plain
 /// routed select with no bias, the select whose kernels read an expert
-/// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table,
-/// and off the HIP build) an MXFP4, NVFP4 or affine u4 bank against bf16
-/// activations or (W4A8, W4A4) against the rows its select quantizes, with
-/// the planes its table lists.
+/// table: a dense bank, or (off tcgen05, whose grouped GEMM reads no table)
+/// an MXFP4, NVFP4 or affine u4 bank against bf16 activations or (W4A8,
+/// W4A4) against the rows its select quantizes, with the planes its table
+/// lists (a bank ROCm lays in lane order, its lane-ordered planes).
 #[must_use]
 pub fn streamed_experts(trace: &poem_ir::Trace) -> Vec<usize> {
     use poem_ir::residency::{Residency, residency};
     use poem_ir::{Def, Linear, Operands, Operation};
     let classes = residency(trace);
     let leads = poem_ir::residency::leads(trace);
-    let packs = !cfg!(feature = "rocm") && !packed_unread();
+    let packs = !packed_unread();
     let mut out = Vec::new();
     let mut inputs = Vec::new();
     'params: for (at, param) in trace.params.iter().enumerate() {
@@ -611,7 +826,11 @@ fn packed_unread() -> bool {
     {
         kernels_cuda::linear::gemm_sm100::supported()
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(feature = "rocm")]
+    {
+        false
+    }
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
         true
     }
@@ -715,6 +934,135 @@ pub struct FixedShape {
     pub tables: Vec<Vec<u32>>,
 }
 
+/// The ring shape: a record's windowed rings, `pieces` slots of it, one a
+/// chunk, named first among the record's pieces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingShape {
+    pub slot: SlotShape,
+    /// The slots a record's rings take.
+    pub pieces: u32,
+    pub ring: Ring,
+}
+
+/// The windowed layers' rings in a record: `pages` pages laid exactly as a
+/// window-buffer slot is (every windowed row's `P` rows, layer-major), so a
+/// kernel reads a ring page by a page id of the window buffer's grain: each
+/// record piece starts a chunk (`RingPlacement::ChunkStart`) and holds
+/// `per_piece` pages from `offset`. Row `r` folded lies on ring page
+/// `(r / P) mod pages`; `pages * P` rows are the widest window rounded up to
+/// a page and one page more (the rows a lane's own fire writes past its
+/// window before it folds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ring {
+    /// Ring pages: `ceil(W / P) + 1` of the widest window `W`.
+    pub pages: u32,
+    /// Ring pages a record piece holds.
+    pub per_piece: u32,
+    /// Where a piece's first ring page starts in its slot.
+    pub offset: u64,
+    /// A ring page's bytes: a window-buffer slot's.
+    pub page_bytes: u64,
+    /// Rows a page holds: the window buffer's `P`.
+    pub page_rows: u32,
+    /// Each windowed row's window, by cache row, as its slot lays them.
+    pub windows: Vec<(u32, u32)>,
+    /// Each windowed layer: (layer, window, its share of the ring's bytes),
+    /// as the recipe states them (`WindowedLayer`).
+    pub layers: Vec<(u32, u32, u64)>,
+}
+
+impl Ring {
+    /// The rows the ring holds.
+    #[must_use]
+    pub const fn rows(&self) -> u32 {
+        self.pages * self.page_rows
+    }
+
+    /// Ring page `page`'s record piece and its place in it.
+    #[must_use]
+    pub const fn place(&self, page: u32) -> (u32, u32) {
+        (page / self.per_piece, page % self.per_piece)
+    }
+}
+
+impl RingShape {
+    /// The rings of a load that serves its windowed rows as ring + buffer:
+    /// its ring shape's pieces, each a
+    /// chunk's whole slot, their pages laid as the window buffer's slots
+    /// from the ring run's offset (`CudaRings`, the recipe's ring hook).
+    pub fn of_ring(recipe: &ChunkRecipe, buffer: &SlotShape) -> Result<Option<RingShape>> {
+        let Some(windowed) = recipe.windowed.as_ref() else {
+            return Ok(None);
+        };
+        let (
+            Some(SlotLayout::Fixed {
+                bytes,
+                pieces_per_ws,
+                ..
+            }),
+            Some(run),
+        ) = (windowed.ring_shape(recipe), windowed.ring_run(recipe))
+        else {
+            return Err(Fault::program(
+                "store::layout",
+                "a windowed recipe whose rings lie in no shape of their own",
+            ));
+        };
+        let chunk_bytes = recipe.chunk_bytes;
+        let page_rows = buffer.tokens.max(1);
+        let pages =
+            u32::try_from(windowed.region.bytes / buffer.slot_bytes.max(1)).unwrap_or(u32::MAX);
+        let windows = windowed
+            .layers
+            .iter()
+            .flat_map(|layer| {
+                layer.rows.iter().filter_map(move |row| match row {
+                    RowId::Cache(row) => Some((*row, layer.window)),
+                    _ => None,
+                })
+            })
+            .collect();
+        let layers = windowed
+            .layers
+            .iter()
+            .zip(&windowed.region.layer_bytes)
+            .map(|(layer, &bytes)| {
+                let row = layer.rows.iter().find_map(|row| match row {
+                    RowId::Cache(row) => Some(*row),
+                    _ => None,
+                });
+                (layer.layer.or(row).unwrap_or(0), layer.window, bytes)
+            })
+            .collect();
+        Ok(Some(RingShape {
+            slot: SlotShape {
+                id: RING,
+                tokens: 0,
+                slot_bytes: *bytes,
+                per_chunk: u32::try_from(chunk_bytes / (*bytes).max(1))
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+                grain: gcd(chunk_bytes, *bytes),
+                window: None,
+                rows: Vec::new(),
+                pools: Vec::new(),
+            },
+            pieces: (*pieces_per_ws).max(1),
+            ring: Ring {
+                pages,
+                per_piece: u32::try_from(run.atoms_per_piece)
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+                offset: run.offset,
+                page_bytes: buffer.slot_bytes,
+                page_rows,
+                windows,
+                layers,
+            },
+        }))
+    }
+}
+
 impl FixedShape {
     fn of(recipe: &ChunkRecipe, layout: &SlotLayout) -> Result<FixedShape> {
         let chunk_bytes = recipe.chunk_bytes;
@@ -768,7 +1116,7 @@ impl FixedShape {
                         "an rs row in the fixed record: the rs buffer is a list shape",
                     ));
                 }
-                RowId::Pool(_) => {}
+                RowId::Pool(_) | RowId::Ring => {}
             }
         }
         Ok(FixedShape {
@@ -849,6 +1197,15 @@ impl Layout {
             .fixed()
             .map(|layout| FixedShape::of(recipe, layout))
             .transpose()?;
+        // A windowed recipe's one window buffer, stated as the first window
+        // list's shape, and its rings as the record.
+        let mut windows = windows;
+        let mut ring = None;
+        if let Some(buffer) = recipe.window_buffer() {
+            let buffer = SlotShape::of(buffer, chunk_bytes, WINDOW)?;
+            ring = RingShape::of_ring(recipe, &buffer)?;
+            windows = vec![buffer];
+        }
         let rs = recipe
             .rs_list()
             .map(|layout| -> Result<RsShape> {
@@ -976,7 +1333,10 @@ impl Layout {
             list,
             windows,
             fixed,
+            ring,
             rs,
+            instance: SlotShape::guest(INSTANCE, INSTANCE_SLOT, chunk_bytes),
+            channel: SlotShape::guest(CHANNEL, CHANNEL_SLOT, chunk_bytes),
             rows,
             experts,
         })
@@ -988,8 +1348,35 @@ impl Layout {
             Kind::List => self.list.as_ref(),
             Kind::Window(at) => self.windows.get(at as usize),
             Kind::Fixed => self.fixed.as_ref().map(|fixed| &fixed.slot),
+            Kind::Ring => self.ring.as_ref().map(|ring| &ring.slot),
             Kind::Rs => self.rs.as_ref().map(|rs| &rs.slot),
+            Kind::Instance => Some(&self.instance),
+            Kind::Channel => Some(&self.channel),
         }
+    }
+
+    /// Every state shape the load lays (weights excepted): the kv list,
+    /// the window lists, the rs list, the record, the guests'.
+    pub fn state_shapes(&self) -> impl Iterator<Item = &SlotShape> {
+        self.list
+            .iter()
+            .chain(&self.windows)
+            .chain(self.rs.as_ref().map(|rs| &rs.slot))
+            .chain(self.ring.as_ref().map(|ring| &ring.slot))
+            .chain(self.fixed.as_ref().map(|fixed| &fixed.slot))
+            .chain([&self.instance, &self.channel])
+    }
+
+    /// The guest shape of `role`; `None` for a role that is not a guest's.
+    #[must_use]
+    pub fn guest(&self, role: engine::chunk::SlotRole) -> Option<GuestShape> {
+        let shape = self.shape(Kind::guest(role)?)?;
+        Some(GuestShape {
+            id: shape.id,
+            role,
+            slot_bytes: shape.slot_bytes,
+            per_chunk: shape.per_chunk,
+        })
     }
 
     /// The chunks `slots` slots of a shape take.
@@ -998,6 +1385,23 @@ impl Layout {
         self.shape(kind)
             .map_or(0, |shape| slots.div_ceil(u64::from(shape.per_chunk.max(1))))
     }
+
+    /// The chunks every weight the caches stream takes held whole: each
+    /// shape's atoms in whole chunks of its own, as
+    /// `Pools::preseat_plan` seats them.
+    #[must_use]
+    pub fn weight_chunks(&self) -> u64 {
+        let whole = |atoms: u32, per_chunk: u32| u64::from(atoms.div_ceil(per_chunk.max(1)));
+        self.rows
+            .iter()
+            .map(|shape| whole(shape.blocks, shape.per_chunk))
+            .chain(
+                self.experts
+                    .iter()
+                    .map(|shape| whole(shape.count(), shape.per_chunk)),
+            )
+            .sum()
+    }
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -1005,4 +1409,82 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
         (a, b) = (b, a % b);
     }
     a.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: u64 = 2 << 20;
+
+    /// The bytes of the host tier slot ref `slot` of `shape` takes.
+    fn place(shape: &SlotShape, slot: u32) -> std::ops::Range<u64> {
+        let (chunk, offset) = shape.tier_place(slot);
+        let at = u64::from(chunk) * CHUNK + offset;
+        at..at + shape.slot_bytes
+    }
+
+    /// Host refs handed out as the runtime's host tier hands them
+    /// (`SharedPool::tier`): one chunk id space, a chunk opened for one
+    /// shape, a ref its chunk times the shape's slots a chunk plus its
+    /// index.
+    struct HostRefs {
+        next: u32,
+        open: Vec<(ShapeId, u32, u32)>,
+    }
+
+    impl HostRefs {
+        fn take(&mut self, shape: &SlotShape) -> u32 {
+            let at = match self.open.iter().position(|&(id, ..)| id == shape.id) {
+                Some(at) if self.open[at].2 < shape.per_chunk => at,
+                found => {
+                    self.next += 1;
+                    let fresh = (shape.id, self.next - 1, 0);
+                    match found {
+                        Some(at) => self.open[at] = fresh,
+                        None => self.open.push(fresh),
+                    }
+                    found.unwrap_or(self.open.len() - 1)
+                }
+            };
+            self.open[at].2 += 1;
+            self.open[at].1 * shape.per_chunk + self.open[at].2 - 1
+        }
+    }
+
+    /// The host tier has no place a shape: a ref lies at its chunk and its
+    /// index in it, so ref `r` of two shapes may be the same bytes, and
+    /// what keeps two shapes apart is that each takes refs of its own
+    /// chunks, as the runtime hands them out.
+    #[test]
+    fn two_shapes_host_refs_of_their_own_chunks_never_meet() {
+        // A kv list, a record and an rs list of slot sizes that divide no
+        // chunk evenly, beside the two guest shapes.
+        let shapes = [
+            SlotShape::guest(LIST, 24_576 + 48, CHUNK),
+            SlotShape::guest(FIXED, 1_000, CHUNK),
+            SlotShape::guest(RS, 6_144, CHUNK),
+            SlotShape::guest(INSTANCE, INSTANCE_SLOT, CHUNK),
+            SlotShape::guest(CHANNEL, CHANNEL_SLOT, CHUNK),
+        ];
+        let mut host = HostRefs {
+            next: 0,
+            open: Vec::new(),
+        };
+        // Shape after shape in turn, past a chunk of each.
+        let mut held: Vec<std::ops::Range<u64>> = Vec::new();
+        for round in 0..2_500 {
+            for shape in &shapes {
+                if round < 2 * shape.per_chunk + 3 {
+                    held.push(place(shape, host.take(shape)));
+                }
+            }
+        }
+        held.sort_by_key(|place| place.start);
+        assert!(held.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        // The control: refs counted from 0 a shape, as if each shape had a
+        // tier of its own, are the same bytes.
+        let (instance, channel) = (&shapes[3], &shapes[4]);
+        assert_eq!(place(instance, 0).start, place(channel, 0).start);
+    }
 }

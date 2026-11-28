@@ -64,12 +64,32 @@ pub struct Split {
 pub struct Tables {
     pub positions: Tensor,
     pub request_of_token: Tensor,
-    /// The packed byte mask, `mask_stride` bytes a row.
+    /// The fire's mask plane, a byte a column, whole: each masked row's
+    /// columns lie where its entry says, so no row of a window cuts it.
     pub mask: Tensor,
-    /// One byte a row: whether the row reads its mask.
-    pub mask_enabled: Tensor,
-    pub mask_stride: u32,
+    /// Two u32 a row: the key its columns start at (its lane's committed
+    /// boundary; [`MASK_NONE`], past every key, where the row states no
+    /// mask), then the byte its columns start at in the plane. Every key
+    /// below the boundary is read under the model's own bounds and no mask
+    /// byte; a row stating none reads no plane. The masks are data: a fire
+    /// of masked and unmasked rows runs the kernels a fire of either runs.
+    pub mask_words: Tensor,
+    /// The row of the tables, the queries and the output the window's first
+    /// row is: they are bound whole, the same views whatever window a fire
+    /// cuts, and the kernels add it to each row they index.
+    pub row0: u32,
+    /// The row of the tables (positions, owners, mask words) the window's
+    /// first row is: `row0`, but for a query of the fire's readouts, whose
+    /// rows are not the window's tokens and whose tables are still the
+    /// fire's whole.
+    pub table0: u32,
+    /// The window's rows, which the kernels launch over.
+    pub rows: u32,
 }
+
+/// A row's boundary stating no mask: past every key (`sdpa.slang`'s
+/// `MASK_NONE`).
+pub const MASK_NONE: u32 = u32::MAX >> 1;
 
 impl Tables {
     /// `attn.plan_decode` and `attn.plan_prefill`: the fire's tables, refused
@@ -79,7 +99,7 @@ impl Tables {
             ("position table", tables.positions, Dtype::I32),
             ("owning-request table", tables.request_of_token, Dtype::I32),
             ("mask planes", tables.mask, Dtype::U8),
-            ("mask-enabled flags", tables.mask_enabled, Dtype::U8),
+            ("mask words", tables.mask_words, Dtype::U32),
         ];
         for (what, t, want) in stated {
             if t.dtype != want {
@@ -91,6 +111,26 @@ impl Tables {
                     ),
                 ));
             }
+        }
+        if tables.mask_words.width != 2 {
+            return Err(refuse(
+                op,
+                format!(
+                    "the fire's mask words are {} a row, and a row's entry is two: its \
+                     boundary and its offset",
+                    tables.mask_words.width
+                ),
+            ));
+        }
+        let end = u64::from(tables.table0) + u64::from(tables.rows);
+        if end > u64::from(tables.positions.rows) || end > u64::from(tables.mask_words.rows) {
+            return Err(refuse(
+                op,
+                format!(
+                    "the window's rows {}..{end} pass the fire tables' {} positions and {}                      mask entries",
+                    tables.table0, tables.positions.rows, tables.mask_words.rows
+                ),
+            ));
         }
         if tables.positions.rows != tables.request_of_token.rows {
             return Err(refuse(
@@ -110,12 +150,15 @@ struct Shape {
     q_heads: u32,
     kv_heads: u32,
     rows: u32,
+    row0: u32,
+    table0: u32,
     window: i32,
 }
 
 fn shape(
     op: &'static str,
     q: Tensor,
+    tables: &Tables,
     pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
@@ -159,10 +202,24 @@ fn shape(
         None => 0,
         Some(w) => stated(op, nonzero(op, "the sliding extent", w)?)?,
     };
+    let rows = nonzero(op, "rows", tables.rows)?;
+    if u64::from(tables.row0) + u64::from(rows) > u64::from(q.rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "the window's rows {}..{} pass the {} query rows bound",
+                tables.row0,
+                u64::from(tables.row0) + u64::from(rows),
+                q.rows
+            ),
+        ));
+    }
     Ok(Shape {
         q_heads,
         kv_heads,
-        rows: nonzero(op, "rows", q.rows)?,
+        rows,
+        row0: tables.row0,
+        table0: tables.table0,
         window,
     })
 }
@@ -189,6 +246,17 @@ fn args(
             ),
         ));
     }
+    if u64::from(shape.row0) + u64::from(shape.rows) > u64::from(o.rows) {
+        return Err(refuse(
+            op,
+            format!(
+                "the window's rows {}..{} pass the {} output rows bound",
+                shape.row0,
+                u64::from(shape.row0) + u64::from(shape.rows),
+                o.rows
+            ),
+        ));
+    }
     let mut args = vec![
         q.arg(),
         o.arg_mut(),
@@ -197,9 +265,12 @@ fn args(
         pool.page_indices.arg(),
         pool.page_indptr.arg(),
         tables.mask.arg(),
-        tables.mask_enabled.arg(),
+        tables.mask_words.arg(),
     ];
     args.extend_from_slice(extra);
+    if let Some(ring) = &pool.ring {
+        args.push(ring.lanes.arg());
+    }
     args.extend(pool.pool.args(false));
     args.extend([
         pool.pool.words.arg(),
@@ -210,30 +281,106 @@ fn args(
         pool.page_size.arg(),
         stated(op, shape.kv_heads)?.arg(),
         sm_scale.arg(),
-        tables.mask_stride.arg(),
         shape.window.arg(),
         stated(op, shape.q_heads)?.arg(),
+        shape.row0.arg(),
+        shape.table0.arg(),
     ]);
     Ok(args)
 }
 
+/// The ring's scalars, after every other a form reads (`Params`' last).
+fn ring_params(op: &'static str, pool: &KvPool) -> Result<Vec<ArgValue>, Error> {
+    let Some(ring) = &pool.ring else {
+        return Ok(Vec::new());
+    };
+    if ring.lanes.dtype != Dtype::I32 {
+        return Err(refuse(op, "a ring's lane table is i32".to_string()));
+    }
+    if ring.pieces == 0 || ring.piece >= ring.pieces || ring.values_piece >= ring.pieces {
+        return Err(refuse(
+            op,
+            format!(
+                "the ring lies in piece {} of a record of {} pieces",
+                ring.piece, ring.pieces
+            ),
+        ));
+    }
+    Ok(vec![
+        nonzero(op, "the ring's rows", ring.rows)?.arg(),
+        ring.piece.arg(),
+        ring.values_piece.arg(),
+        ring.pieces.arg(),
+        ring.keys.arg(),
+        ring.values.arg(),
+        ring.slot_stride.arg(),
+    ])
+}
+
+/// `_ring` where the pool's windowed rows lie in a ring.
+fn ring_kind(pool: &KvPool) -> &'static str {
+    if pool.ring.is_some() { "_ring" } else { "" }
+}
+
 fn lse_plane(op: &'static str, lse: Tensor, shape: &Shape) -> Result<ArgValue, Error> {
     let held = u64::from(lse.rows) * u64::from(lse.width);
-    if lse.dtype != Dtype::F32 || held < u64::from(shape.rows) * u64::from(shape.q_heads) {
+    let rows = u64::from(shape.row0) + u64::from(shape.rows);
+    if lse.dtype != Dtype::F32 || held < rows * u64::from(shape.q_heads) {
         return Err(refuse(
             op,
             format!(
                 "the log-sum-exp plane is {} x {} {:?}, and it holds an f32 a head a row ({} x {})",
-                lse.rows, lse.width, lse.dtype, shape.rows, shape.q_heads
+                lse.rows, lse.width, lse.dtype, rows, shape.q_heads
             ),
         ));
     }
     Ok(lse.arg_mut())
 }
 
+/// The kind a decode's walk of a row's keys is instantiated under: whole or
+/// split into ranges, landing the row's LSE or not.
+fn walk_kind(split: bool, lse: bool) -> &'static str {
+    match (split, lse) {
+        (false, false) => "decode",
+        (false, true) => "decode_lse",
+        (true, false) => "split",
+        (true, true) => "split_lse",
+    }
+}
+
+/// The kernels a decode of `head_dim`-wide heads fires on `target` under
+/// `tactic` (`lse` where it lands its LSE): the walk of a row's keys whole,
+/// then the walk that splits them. A load holds them to its device before
+/// any fire names one.
+pub fn decode_kernels(
+    target: Target,
+    tactic: Tactic,
+    head_dim: u32,
+    lse: bool,
+    ring: bool,
+) -> Result<[Fire; 2], Error> {
+    let ring = if ring { "_ring" } else { "" };
+    Ok([
+        decode_entry(
+            target,
+            "attn.decode",
+            tactic,
+            &format!("{}{ring}", walk_kind(false, lse)),
+            head_dim,
+        )?,
+        decode_entry(
+            target,
+            "attn.decode_split",
+            tactic,
+            &format!("{}{ring}", walk_kind(true, lse)),
+            head_dim,
+        )?,
+    ])
+}
+
 /// A decode workgroup's entry: `kind`, then its thread and lane variants.
 fn decode_entry(
-    ctx: &Ctx<'_>,
+    target: Target,
     op: &'static str,
     tactic: Tactic,
     kind: &str,
@@ -244,7 +391,7 @@ fn decode_entry(
     } else {
         128
     };
-    let subgroup = tactic.tier == Tier::Subgroup && ctx.target() == Target::Spirv;
+    let subgroup = tactic.tier == Tier::Subgroup && target == Target::Spirv;
     let name = format!(
         "attn_sdpa_{kind}{}{}_bf16_d_{head_dim}",
         if threads < 256 { "_t128" } else { "" },
@@ -282,17 +429,30 @@ pub fn decode(
     split: Option<Split>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.decode";
-    let shape = shape(OP, q, pool, window, head_dim)?;
+    let shape = shape(OP, q, tables, pool, window, head_dim)?;
+    if let Some(names) = ctx.naming() {
+        // The rows and the keys a fire holds say whether it splits: where
+        // the planes are there to split into, either walk, then the fold.
+        let [whole, ranges] = decode_kernels(
+            ctx.target(),
+            tactic,
+            head_dim,
+            lse.is_some(),
+            pool.ring.is_some(),
+        )?;
+        if split.is_none() {
+            return names.either(&[whole]);
+        }
+        names.either(&[whole, ranges])?;
+        return names.either(&[fold_kernel(lse.is_some())]);
+    }
     if let Some(planes) = split {
         let ceiling = split_ceiling(&planes, &shape, head_dim);
-        // Every page the fire's tables name: the walker splits no row past
-        // the keys it holds.
-        let keys = pool
-            .page_indices
-            .rows
-            .saturating_mul(pool.page_indices.width)
-            .saturating_mul(u32::try_from(pool.page_size).unwrap_or(0));
-        let slices = splits_for(&tactic, &shape, ceiling, window, keys);
+        // The splits are the shape's alone, never the keys the fire holds:
+        // each row's walker splits its own keys (no split under the fewest,
+        // and one split lands the row whole for the fold to pass), so a
+        // fire's dispatches are the same as its keys grow.
+        let slices = splits_for(&tactic, &shape, ceiling);
         if slices > 1 {
             return decode_split(
                 ctx, tactic, q, tables, pool, &shape, head_dim, sm_scale, o, lse, planes, slices,
@@ -304,34 +464,30 @@ pub fn decode(
         extra.push(lse_plane(OP, lse, &shape)?);
     }
     let fire = decode_entry(
-        ctx,
+        ctx.target(),
         OP,
         tactic,
-        if lse.is_some() {
-            "decode_lse"
-        } else {
-            "decode"
-        },
+        &format!("{}{}", walk_kind(false, lse.is_some()), ring_kind(pool)),
         head_dim,
     )?;
-    let args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
+    let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
+    args.extend(ring_params(OP, pool)?);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
 }
 
 /// The splits a decode of this shape takes: enough (heads x rows x splits)
-/// workgroups to reach the device's want, no split under its fewest keys,
-/// and no more than the partial planes hold.
-fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32, window: Option<u32>, keys: u32) -> u32 {
+/// workgroups to reach the device's want, and no more than the partial
+/// planes hold. Its rows' keys play no part: each row's walker takes as many
+/// of these as its own keys fill (`split_min_keys` each), the rest landing
+/// nothing.
+fn splits_for(tactic: &Tactic, shape: &Shape, ceiling: u32) -> u32 {
     let groups = shape.q_heads.saturating_mul(shape.rows).max(1);
     if ceiling <= 1 || groups >= tactic.split_groups {
         return 1;
     }
-    let min_keys = tactic.split_min_keys.max(1);
-    let bound = window.map_or(keys, |w| w.min(keys));
     tactic
         .split_groups
         .div_ceil(groups)
-        .min(bound.div_ceil(min_keys))
         .clamp(1, ceiling.max(1))
 }
 
@@ -370,10 +526,10 @@ fn decode_split(
         extra.push(lse_plane(OP, lse, shape)?);
     }
     let fire = decode_entry(
-        ctx,
+        ctx.target(),
         OP,
         tactic,
-        if lse.is_some() { "split_lse" } else { "split" },
+        &format!("{}{}", walk_kind(true, lse.is_some()), ring_kind(pool)),
         head_dim,
     )?;
     let mut args = args(OP, q, pool, tables, shape, sm_scale, o, &extra)?;
@@ -382,6 +538,7 @@ fn decode_split(
         stated(OP, shape.rows)?.arg(),
         stated(OP, tactic.split_min_keys.max(1))?.arg(),
     ]);
+    args.extend(ring_params(OP, pool)?);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, slices]), &args)?;
 
     let mut fold = vec![split.part_out.arg(), split.part_lse.arg(), o.arg_mut()];
@@ -393,15 +550,25 @@ fn decode_split(
         stated(OP, shape.rows)?.arg(),
         stated(OP, shape.q_heads)?.arg(),
         stated(OP, head_dim)?.arg(),
+        shape.row0.arg(),
     ]);
-    let entry = if lse.is_some() {
-        "attn_sdpa_fold_lse_bf16"
-    } else {
-        "attn_sdpa_fold_bf16"
-    };
     ctx.fire(
-        Fire::at(SDPA, entry).apply(Grid::of([o.width / 2, shape.rows, 1], [FOLD_GROUP, 1, 1])),
+        fold_kernel(lse.is_some())
+            .apply(Grid::of([o.width / 2, shape.rows, 1], [FOLD_GROUP, 1, 1])),
         &fold,
+    )
+}
+
+/// The kernel that weighs a split decode's partials into its rows, landing
+/// their LSE where `lse`.
+fn fold_kernel(lse: bool) -> Fire {
+    Fire::at(
+        SDPA,
+        if lse {
+            "attn_sdpa_fold_lse_bf16"
+        } else {
+            "attn_sdpa_fold_bf16"
+        },
     )
 }
 
@@ -421,7 +588,13 @@ pub fn selected(
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.selected";
-    let shape = shape(OP, q, pool, None, head_dim)?;
+    if pool.ring.is_some() {
+        return Err(refuse(
+            OP,
+            "a selection reads keys by score, and a ring is a window's".to_string(),
+        ));
+    }
+    let shape = shape(OP, q, tables, pool, None, head_dim)?;
     if selection.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
@@ -433,16 +606,18 @@ pub fn selected(
     }
     let ratio = nonzero(OP, "the block width this reader expands", ratio)?;
     let top_k = nonzero(OP, "the selection budget", selection.width)?;
-    if selection.rows < shape.rows {
+    if u64::from(selection.rows) < u64::from(shape.row0) + u64::from(shape.rows) {
         return Err(refuse(
             OP,
             format!(
-                "the selection seats {} rows and this reader launches {}",
-                selection.rows, shape.rows
+                "the selection seats {} rows and this reader reads rows {}..{}",
+                selection.rows,
+                shape.row0,
+                u64::from(shape.row0) + u64::from(shape.rows)
             ),
         ));
     }
-    let fire = decode_entry(ctx, OP, tactic, "selected", head_dim)?;
+    let fire = decode_entry(ctx.target(), OP, tactic, "selected", head_dim)?;
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &[selection.arg()])?;
     args.extend([stated(OP, top_k)?.arg(), stated(OP, ratio)?.arg()]);
     ctx.fire(fire.groups([shape.q_heads, shape.rows, 1]), &args)
@@ -463,7 +638,7 @@ pub fn prefill(
     lse: Option<Tensor>,
 ) -> Result<(), Error> {
     const OP: &str = "attn.prefill";
-    let shape = shape(OP, q, pool, window, head_dim)?;
+    let shape = shape(OP, q, tables, pool, window, head_dim)?;
     let (lanes, tile) = match (tactic.tile_lanes, tactic.tile_rows) {
         (..=16, _) => (16, 16),
         (_, 32..) => (32, 32),
@@ -478,8 +653,9 @@ pub fn prefill(
     let one_segment = ctx.target() == Target::Spirv
         && pool.pool.bufs[1..].iter().all(|&buf| buf == crate::ABSENT);
     let name = format!(
-        "attn_sdpa_{}{}{}{}_bf16_d_{head_dim}",
+        "attn_sdpa_{}{}{}{}{}_bf16_d_{head_dim}",
         if lse.is_some() { "tiled_lse" } else { "tiled" },
+        ring_kind(pool),
         if lanes == 32 { "" } else { "_l16" },
         if tile == 32 {
             String::new()
@@ -500,19 +676,23 @@ pub fn prefill(
     };
     let mut args = args(OP, q, pool, tables, &shape, sm_scale, o, &extra)?;
     args.push(stated(OP, shape.rows)?.arg());
-    let tiles = shape.rows.div_ceil(tile);
+    let ring = ring_params(OP, pool)?;
     let keys = u64::from(pool.page_indices.rows) * pool.page_size.max(1) as u64;
     let keys = window
         .map_or(keys, |window| keys.min(u64::from(window)))
         .max(1);
-    let rows = match tactic.prefill_work {
-        0 => shape.rows,
-        work => (work / keys).min(u64::from(shape.rows)) as u32,
+    // A naming sink is told the longest way: at the most rows and keys a
+    // fire of the load may bring.
+    let (rows, keys) = match ctx.naming() {
+        Some(names) => (names.most_rows().max(shape.rows), Keys::Most),
+        None => (shape.rows, Keys::Held(keys)),
     };
-    let step = (rows / tile).max(1);
+    let tiles = rows.div_ceil(tile);
+    let step = prefill_step(tactic.prefill_work, rows, tile, keys);
     for first in (0..tiles).step_by(step as usize) {
         let mut args = args.clone();
         args.push(stated(OP, first)?.arg());
+        args.extend_from_slice(&ring);
         ctx.fire(
             Fire::at(SDPA, entry)
                 .tier(tier)
@@ -522,4 +702,175 @@ pub fn prefill(
         )?;
     }
     Ok(())
+}
+
+/// The keys a prefill's rows attend: what the fire's tables hold, or the
+/// most a fire may bring, which a naming sink is told.
+#[derive(Clone, Copy, Debug)]
+enum Keys {
+    Held(u64),
+    Most,
+}
+
+/// Tiles of `tile` rows one prefill dispatch holds, of a fire's `rows`:
+/// every one where `work` (rows times keys a dispatch may take; 0 for no
+/// bound) holds the fire's rows at `keys`, else as many whole tiles as it
+/// holds rows, one at least. At the most keys a fire may bring a budget past
+/// 0 holds one tile a dispatch: the longest way its rows can take.
+fn prefill_step(work: u64, rows: u32, tile: u32, keys: Keys) -> u32 {
+    let tiles = rows.div_ceil(tile).max(1);
+    let held = match (work, keys) {
+        (0, _) => return tiles,
+        (_, Keys::Most) => return 1,
+        (work, Keys::Held(keys)) => work / keys.max(1),
+    };
+    if held >= u64::from(rows) {
+        tiles
+    } else {
+        (held as u32 / tile).max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dispatches a prefill of `rows` makes at `step` tiles each.
+    fn dispatches(rows: u32, tile: u32, step: u32) -> u32 {
+        rows.div_ceil(tile).max(1).div_ceil(step)
+    }
+
+    /// Regression (6430473a3): a budget of 0 split 21 rows of 16-row tiles
+    /// into two dispatches. With no budget a prefill is one dispatch; with
+    /// one, its dispatches grow with the rows and never pass what a naming
+    /// sink is told.
+    #[test]
+    fn a_prefill_dispatches_as_its_budget_says_and_names_its_longest_way() {
+        let (tile, work) = (16, 1 << 20);
+        for keys in [1u64, 4096, 1 << 21] {
+            let mut before = 0;
+            for rows in [1, 15, 16, 21, 33, 1000, 4096] {
+                assert_eq!(
+                    dispatches(rows, tile, prefill_step(0, rows, tile, Keys::Held(keys))),
+                    1,
+                    "{rows} rows at {keys} keys, no budget"
+                );
+                let made = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Held(keys)));
+                let named = dispatches(rows, tile, prefill_step(work, rows, tile, Keys::Most));
+                assert!(
+                    before <= made && made <= named,
+                    "{rows} rows at {keys} keys"
+                );
+                before = made;
+            }
+        }
+    }
+
+    /// A naming sink of the most rows a fire may bring, counting what is
+    /// fired into it.
+    struct Counted {
+        most: u32,
+        fired: std::cell::Cell<u32>,
+    }
+
+    impl crate::Encode for Counted {
+        fn fire(&self, _fire: Fire, _args: &[ArgValue]) -> Result<(), Error> {
+            self.fired.set(self.fired.get() + 1);
+            Ok(())
+        }
+
+        fn absent(&self) -> Result<ArgValue, Error> {
+            Ok(ArgValue::Buffer(crate::ABSENT))
+        }
+
+        fn target(&self) -> Target {
+            Target::Wgsl
+        }
+
+        fn naming(&self) -> Option<&dyn crate::Naming> {
+            Some(self)
+        }
+    }
+
+    impl crate::Naming for Counted {
+        fn either(&self, _alternatives: &[Fire]) -> Result<(), Error> {
+            self.fired.set(self.fired.get() + 1);
+            Ok(())
+        }
+
+        fn fork(&self) {}
+
+        fn or(&self) {}
+
+        fn join(&self) {}
+
+        fn most_rows(&self) -> u32 {
+            self.most
+        }
+    }
+
+    /// A budgeted prefill a naming sink walks counts at the most rows the
+    /// sink states, a tile a dispatch, whatever rows the naming fire holds;
+    /// unbudgeted, one dispatch. The negative control: a prefill of the
+    /// naming fire's own rows makes fewer.
+    #[test]
+    fn a_budgeted_prefill_counts_at_the_most_rows_a_naming_sink_states() {
+        let tactic = |prefill_work| Tactic {
+            tier: Tier::Baseline,
+            narrow: false,
+            decode_threads: 256,
+            tile_rows: 16,
+            tile_lanes: 16,
+            split_groups: 1,
+            split_min_keys: 1,
+            prefill_work,
+        };
+        let tensor = |buf, rows, width, dtype| Tensor::new(buf, rows, width, dtype);
+        let (heads, head_dim, staged, most) = (2u32, 64u32, 3u32, 4096u32);
+        let q = tensor(1, staged, heads * head_dim, Dtype::Bf16);
+        let o = tensor(2, staged, heads * head_dim, Dtype::Bf16);
+        let tables = Tables {
+            positions: tensor(3, staged, 1, Dtype::I32),
+            request_of_token: tensor(4, staged, 1, Dtype::I32),
+            mask: tensor(5, 1, 1, Dtype::U8),
+            mask_words: tensor(6, staged, 2, Dtype::U32),
+            row0: 0,
+            table0: 0,
+            rows: staged,
+        };
+        let plane = tensor(7, 64, heads * head_dim, Dtype::Bf16);
+        let pool = KvPool::planes(
+            plane,
+            plane,
+            tensor(8, 4, 1, Dtype::I32),
+            tensor(9, 2, 1, Dtype::I32),
+            16,
+            u64::from(heads * head_dim),
+            u64::from(head_dim),
+        );
+        let fired = |prefill_work, most| {
+            let sink = Counted {
+                most,
+                fired: std::cell::Cell::new(0),
+            };
+            prefill(
+                &sink,
+                tactic(prefill_work),
+                q,
+                &tables,
+                &pool,
+                None,
+                head_dim,
+                1.0,
+                o,
+                None,
+            )
+            .unwrap_or_else(|why| panic!("the prefill names its fires: {why}"));
+            sink.fired.get()
+        };
+        assert_eq!(fired(1 << 20, most), most.div_ceil(16));
+        assert_eq!(fired(0, most), 1);
+        assert_eq!(fired(1 << 20, 0), staged.div_ceil(16));
+        assert!(fired(1 << 20, 0) < fired(1 << 20, most));
+    }
 }

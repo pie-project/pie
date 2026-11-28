@@ -17,6 +17,10 @@ pub struct Window {
 
     pub indptr: Tensor,
 
+    /// The int of the fire's packed table [`Self::indptr`] starts at
+    /// ([`Windows::table`] binds the table whole).
+    pub indptr_at: u32,
+
     pub gathered: Option<Gathered>,
 
     pub pass: u32,
@@ -39,9 +43,21 @@ pub struct Gathered {
 
     pub positions: Tensor,
 
+    pub rotations_host: Vec<i32>,
+
+    pub rotations: Tensor,
+
     pub request_of_token_host: Vec<i32>,
 
     pub request_of_token: Tensor,
+
+    /// The window's rows' mask entries (two words a row, as the fire's),
+    /// relayed as its positions are: a mask is per-row data, and the plane
+    /// they point into stays where the fire staged it.
+    /// Bit for bit the u32 words, packed with the window's other ints.
+    pub mask_words_host: Vec<i32>,
+
+    pub mask_words: Tensor,
 
     pub page_tables: Vec<GatheredTable>,
 }
@@ -75,7 +91,14 @@ pub struct Copies<'a> {
 
     pub positions: &'a [i32],
 
+    pub rotations: &'a [i32],
+
     pub request_of_token: &'a [i32],
+
+    /// The fire's mask entries, two words a row (`mask::Staged::words`);
+    /// empty where no lane states a mask, every row's entry then stating
+    /// none.
+    pub mask_words: &'a [u32],
 }
 
 impl Copies<'_> {
@@ -86,7 +109,9 @@ impl Copies<'_> {
             enabled: false,
             page_tables: &[],
             positions: &[],
+            rotations: &[],
             request_of_token: &[],
+            mask_words: &[],
         }
     }
 }
@@ -94,6 +119,9 @@ impl Copies<'_> {
 #[derive(Debug, Clone, Default)]
 pub struct Windows {
     windows: Vec<Window>,
+
+    /// The fire's packed table bound whole, once [`Windows::bind`] has.
+    table: Option<Tensor>,
 
     runs: Vec<u32>,
 
@@ -108,6 +136,15 @@ impl Windows {
         self.windows.iter().any(|w| w.gathered.is_some())
     }
 }
+
+/// What a copied window carries beside its token rows: each row's mask
+/// entry ([`Gathered::mask_words`]), the plane it points into staying whole
+/// where the fire staged it. A mask is per-row data, so a mask-reading
+/// region copies as one that reads none.
+pub const CARRIES: fallback::Carries = fallback::Carries {
+    masks: true,
+    read_ints: false,
+};
 
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     let same = |held: &Window| {
@@ -153,7 +190,18 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             .collect()
     };
     let positions_host = relay(copies.positions);
+    let rotations_host = relay(copies.rotations);
     let request_of_token_host = relay(copies.request_of_token);
+    let mask_words_host: Vec<i32> = rows_host
+        .iter()
+        .flat_map(|&row| {
+            let at = 2 * row as usize;
+            match copies.mask_words.get(at..at + 2) {
+                Some(entry) => [entry[0] as i32, entry[1] as i32],
+                None => [crate::mask::NONE as i32, 0],
+            }
+        })
+        .collect();
 
     let page_tables = copies
         .page_tables
@@ -194,14 +242,19 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
         },
         indptr_host: bounds,
         indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
+        indptr_at: 0,
         gathered: Some(Gathered {
             runs: runs.to_vec(),
             rows: Tensor::new(NIL, 0, 1, Dtype::I32),
             rows_host,
             positions: Tensor::new(NIL, 0, 1, Dtype::I32),
             positions_host,
+            rotations: Tensor::new(NIL, 0, 1, Dtype::I32),
+            rotations_host,
             request_of_token: Tensor::new(NIL, 0, 1, Dtype::I32),
             request_of_token_host,
+            mask_words: Tensor::new(NIL, 0, 2, Dtype::U32),
+            mask_words_host,
             page_tables,
         }),
 
@@ -278,7 +331,7 @@ impl Windows {
             if spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, axis, &region.mask, copies.bucket)
-                && fallback::copyable_mask(trace, compiled, &region.mask)
+                && fallback::copyable_mask(trace, compiled, &region.mask, CARRIES)
             {
                 let mut gathered = gather_of(&spans, indptr_host, copies);
                 gathered.patch = patch;
@@ -312,6 +365,7 @@ impl Windows {
                         poem_ir::RowAxis::Patches | poem_ir::RowAxis::Voxels => Vec::new(),
                     },
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
+                    indptr_at: 0,
                     gathered: None,
                     patch,
                     voxel,
@@ -324,6 +378,7 @@ impl Windows {
 
         Ok(Windows {
             windows,
+            table: None,
             runs,
             of_region,
         })
@@ -349,7 +404,9 @@ impl Windows {
             };
             out.extend_from_slice(&gathered.rows_host);
             out.extend_from_slice(&gathered.positions_host);
+            out.extend_from_slice(&gathered.rotations_host);
             out.extend_from_slice(&gathered.request_of_token_host);
+            out.extend_from_slice(&gathered.mask_words_host);
             for table in &gathered.page_tables {
                 out.extend_from_slice(&table.page_indptr_host);
                 out.extend_from_slice(&table.page_indices_host);
@@ -361,27 +418,33 @@ impl Windows {
     }
 
     pub fn bind<B: Backend>(&mut self, handles: &Handles<B>, packed: u32) -> Result<()> {
+        let ints = self.packed().len() as u32;
+        self.table = Some(Tensor::new(packed, ints, 1, Dtype::I32));
         let mut at = 0u64;
-        let mut take = |vector: &[i32]| -> Result<Tensor> {
+        let take = |at: &mut u64, vector: &[i32]| -> Result<Tensor> {
             let rows = vector.len() as u32;
             let bytes = u64::from(rows) * 4;
-            let cut = handles.cut(packed, at, bytes)?;
-            at += bytes;
+            let cut = handles.window(packed, *at, bytes)?;
+            *at += bytes;
             Ok(Tensor::new(cut, rows, 1, Dtype::I32))
         };
         for window in &mut self.windows {
-            window.indptr = take(&window.indptr_host)?;
+            window.indptr_at = u32::try_from(at / 4).unwrap_or(u32::MAX);
+            window.indptr = take(&mut at, &window.indptr_host)?;
             let Some(gathered) = &mut window.gathered else {
                 continue;
             };
-            gathered.rows = take(&gathered.rows_host)?;
-            gathered.positions = take(&gathered.positions_host)?;
-            gathered.request_of_token = take(&gathered.request_of_token_host)?;
+            gathered.rows = take(&mut at, &gathered.rows_host)?;
+            gathered.positions = take(&mut at, &gathered.positions_host)?;
+            gathered.rotations = take(&mut at, &gathered.rotations_host)?;
+            gathered.request_of_token = take(&mut at, &gathered.request_of_token_host)?;
+            let words = take(&mut at, &gathered.mask_words_host)?;
+            gathered.mask_words = Tensor::new(words.buf, words.rows / 2, 2, Dtype::U32);
             for table in &mut gathered.page_tables {
-                table.page_indptr = take(&table.page_indptr_host)?;
-                table.page_indices = take(&table.page_indices_host)?;
-                table.last_page_lens = take(&table.last_page_lens_host)?;
-                table.kv_len = take(&table.kv_len_host)?;
+                table.page_indptr = take(&mut at, &table.page_indptr_host)?;
+                table.page_indices = take(&mut at, &table.page_indices_host)?;
+                table.last_page_lens = take(&mut at, &table.last_page_lens_host)?;
+                table.kv_len = take(&mut at, &table.kv_len_host)?;
             }
         }
         Ok(())
@@ -418,6 +481,12 @@ impl Windows {
             .max()
             .unwrap_or(1)
             .max(1)
+    }
+
+    /// The fire's packed table, bound whole, once [`Self::bind`] has.
+    #[must_use]
+    pub fn table(&self) -> Tensor {
+        self.table.unwrap_or(Tensor::new(NIL, 0, 1, Dtype::I32))
     }
 
     #[must_use]

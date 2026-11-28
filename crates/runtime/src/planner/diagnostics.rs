@@ -39,8 +39,13 @@ pub struct PlannerDiagnostics {
     pub bypassable_entries: u32,
     pub bypassable_pages: u32,
     pub eviction_rollbacks_total: u64,
+    pub eviction_faults_total: u64,
+    pub restore_faults_total: u64,
     pub restores_total: u64,
     pub restore_failures_total: u64,
+    pub restore_roles_short_total: u64,
+    /// Role slots leaked by moves an engine could not settle.
+    pub leaked_role_slots_total: u64,
     pub gate_parks_total: u64,
     pub hog_failures_total: u64,
     pub starvations_total: u64,
@@ -48,6 +53,11 @@ pub struct PlannerDiagnostics {
     pub salvages_total: u64,
     pub e6_relaxations_total: u64,
     pub restore_absorb_short_total: u64,
+    pub grow_waits_total: u64,
+    pub compaction_waits_total: u64,
+    pub list_compactions_total: u64,
+    pub grow_parked: u64,
+    pub no_grows_total: u64,
     pub host_swap_exhaustions_total: u64,
     pub host_swap_unblocks_total: u64,
     pub d2h_pages_total: u64,
@@ -161,8 +171,12 @@ impl ResidencyPlanner {
             bypassable_entries,
             bypassable_pages,
             eviction_rollbacks_total: self.stats.eviction_rollbacks.load(Relaxed),
+            eviction_faults_total: self.stats.eviction_faults.load(Relaxed),
+            restore_faults_total: self.stats.restore_faults.load(Relaxed),
             restores_total: self.stats.restores.load(Relaxed),
             restore_failures_total: self.stats.restore_failures.load(Relaxed),
+            restore_roles_short_total: self.stats.restore_roles_short.load(Relaxed),
+            leaked_role_slots_total: self.stats.leaked_role_slots.load(Relaxed),
             gate_parks_total: self.stats.gate_parks.load(Relaxed),
             hog_failures_total: self.stats.hog_failures.load(Relaxed),
             starvations_total: self.stats.starvations.load(Relaxed),
@@ -170,6 +184,11 @@ impl ResidencyPlanner {
             salvages_total: self.stats.salvages.load(Relaxed),
             e6_relaxations_total: self.stats.e6_relaxations.load(Relaxed),
             restore_absorb_short_total: self.stats.restore_absorb_short.load(Relaxed),
+            grow_waits_total: self.stats.grow_waits.load(Relaxed),
+            compaction_waits_total: self.stats.compaction_waits.load(Relaxed),
+            list_compactions_total: self.stats.list_compactions.load(Relaxed),
+            grow_parked: self.stats.grow_parked.load(Relaxed),
+            no_grows_total: self.stats.no_grows.load(Relaxed),
             host_swap_exhaustions_total: self.stats.host_swap_exhaustions.load(Relaxed),
             host_swap_unblocks_total: self.stats.host_swap_unblocks.load(Relaxed),
             d2h_pages_total: self.stats.d2h_pages.load(Relaxed),
@@ -211,6 +230,12 @@ impl ResidencyPlanner {
                         WaitKind::Restore { demand } => {
                             format!("restore kv={} rs={}", demand.kv_pages, demand.rs)
                         }
+                        WaitKind::BindRoom {
+                            run,
+                            pieces,
+                            served,
+                            ..
+                        } => format!("bind room {pieces} runs of {run} served={served}"),
                     };
                     format!("{key:?} pid={} {kind}", waiter.pid)
                 })
@@ -220,7 +245,10 @@ impl ResidencyPlanner {
     }
 
     pub fn kv_pressure_bucket(&self) -> u8 {
-        let (swap_free, swap_total) = self.swap_stats();
+        // The slots free now; idle cache below the device is added below.
+        let (host_free, host_total) = self.port.host_stats();
+        let (disk_free, disk_total) = self.port.disk_stats();
+        let (swap_free, swap_total) = (host_free + disk_free, host_total + disk_total);
         let ratio = |(free, total): (u32, u32)| {
             if total == 0 {
                 0.0
@@ -258,9 +286,27 @@ impl ResidencyPlanner {
                 .min(total),
             total,
         ));
-        let mut bucket = (device.max(ratio((swap_free, swap_total))) * 255.0).round() as u8;
+        // Below the device the same holds: host and disk slots only idle
+        // cache keeps (demoted, spilled) are room the next demand takes by
+        // dropping that cache. On an idle worker nothing else displaces it,
+        // so counted as used it would hold a launch for good. Fullness from
+        // droppable cache never saturates admission: demand past what is
+        // free runs slower, and is never held forever.
+        let (host_cache, disk_cache) = self.port.idle_below_device();
+        let swap = ratio((
+            swap_free
+                .saturating_add(host_cache)
+                .saturating_add(disk_cache)
+                .min(swap_total),
+            swap_total,
+        ));
+        let mut bucket = (device.max(swap) * 255.0).round() as u8;
+        // A parked process or a waiter marks pressure but stays below the
+        // gateway's saturation mark (`kv_saturate_bucket`, 240): a process
+        // parked idle comes back only when it fires, so on its own it must
+        // never hold a launch.
         if self.nonresident.load(Ordering::Acquire) != 0
-            || self.waiters.load(Ordering::Acquire) != 0
+            || self.returns.waiters.load(Ordering::Acquire) != 0
         {
             bucket = bucket.max(224);
         }

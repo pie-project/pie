@@ -55,7 +55,7 @@ pub fn weighted_sum(
     ctx.fire(
         OP,
         Fire::at(kernel(COMBINE, &format!("::pie::linear::{entry}<{t}>")))
-            .apply(elementwise_rows(OP, y.rows, threads)?.programmatic(ctx.tuning().pdl && vec8)),
+            .apply(elementwise_rows(OP, y.rows, threads)?.programmatic(ctx.tuning().pdl() && vec8)),
         &[
             y.arg(),
             routed.arg(),

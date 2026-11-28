@@ -1,9 +1,9 @@
 #![cfg(feature = "device")]
-#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Lane, Shell};
 use poem::{Dtype, Platform, Request};
@@ -58,15 +58,6 @@ fn scratch(tag: &str) -> Scratch {
 
 fn bf16_bits(value: f32) -> u16 {
     (value.to_bits() >> 16) as u16
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn write_checkpoint(path: &Path, trace: &Trace) {
@@ -149,36 +140,32 @@ fn fixture(text: Text) -> Fixture {
     }
 }
 
-/// The routed matmul's leg: the grouped tcgen05 GEMM (where the device has
-/// it), the cuBLAS grouped GEMM, or one GEMV a route.
+/// The routed matmul's leg: the grouped tcgen05 GEMM (CUDA, where the
+/// device has it), hipBLASLt's grouped GEMM (ROCm), or the leg below them:
+/// on CUDA the one its select prices cheapest, on ROCm one GEMV a route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
-    #[cfg_attr(feature = "rocm", allow(dead_code))]
+    #[cfg(not(feature = "rocm"))]
     Tcgen05,
+    #[cfg(feature = "rocm")]
     Grouped,
-    Gemv,
+    Below,
 }
 
-/// The grouped legs this build has: ROCm's grouped GEMM is hipBLASLt's.
+/// The grouped leg this build has.
 #[cfg(not(feature = "rocm"))]
-const GROUPED: [Leg; 2] = [Leg::Grouped, Leg::Tcgen05];
+const GROUPED: [Leg; 1] = [Leg::Tcgen05];
 #[cfg(feature = "rocm")]
 const GROUPED: [Leg; 1] = [Leg::Grouped];
 
 fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
-    let (tc5, grouped) = match leg {
-        Leg::Tcgen05 => (true, true),
-        Leg::Grouped => (false, true),
-        Leg::Gemv => (false, false),
-    };
-    let tc5 = if cfg!(feature = "rocm") {
-        String::new()
+    let grouped = leg != Leg::Below;
+    let knob = if cfg!(feature = "rocm") {
+        "moe.grouped"
     } else {
-        format!("moe.tc5 = {tc5}\n")
+        "moe.tc5"
     };
-    let chip = engine_cuda::chip::profile(&format!(
-        "[kernel]\nmoe.grouped = {grouped}\n{tc5}[engine]\ngraphs = \"off\"\n"
-    ));
+    let chip = engine_cuda::chip::profile(&format!("[kernel]\n{knob} = {grouped}\n"));
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
@@ -189,11 +176,17 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         page_size: PAGE,
         context: fixture.text.ceiling.next_multiple_of(PAGE),
         slots: 2,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        kv_budget: Some(engine_cuda::store::KvSize::Bytes(crate::POOL)),
+        allowance: engine::Allowance::WHOLE,
+        context_declared: false,
         ordinal: 0,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            // The fire this proves is one of the ceiling's rows: the load
+            // lays its rungs to them, not to the top the estimate would
+            // choose for serving (which chunks a prompt below it).
+            every_rung: Some(engine_cuda::EveryRung::To(fixture.text.ceiling)),
+            pin: Some((engine_cuda::Graphs::Off, None)),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,
@@ -202,6 +195,7 @@ fn load(fixture: &Fixture, leg: Leg) -> engine_cuda::Result<Shell> {
         world: engine_cuda::World::default(),
         expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
+        steps: engine::StepRules::runtime(),
     })
 }
 
@@ -257,11 +251,12 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         finite(&logits[0], "the wide prefill");
     }
 
-    // The GEMV serves the fire too: CUDA's carries a route run past its grid's
-    // y axis on z, and ROCm's lays the routes along x, whose ceiling is 2^31-1.
-    let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv)
-        .unwrap_or_else(|why| panic!("a prefill of 65600 routes fires on the GEMV leg: {why}"));
-    finite(&logits[0], "the wide prefill on the GEMV");
+    // The leg below grouping serves the fire too: CUDA's priced select, and
+    // ROCm's GEMV, which lays the routes along x, whose ceiling is 2^31-1.
+    let (logits, _) = fire_at(&fixture, WIDE, Leg::Below).unwrap_or_else(|why| {
+        panic!("a prefill of 65600 routes fires on the leg below grouping: {why}")
+    });
+    finite(&logits[0], "the wide prefill below grouping");
 }
 
 fn the_two_legs_answer_the_same_model() {
@@ -272,8 +267,8 @@ fn the_two_legs_answer_the_same_model() {
     }
     let fixture = fixture(MICRO);
 
-    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
-    finite(&gemv[0], "gemv");
+    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Below).expect("the leg below fires");
+    finite(&gemv[0], "below");
     for leg in GROUPED {
         let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
         finite(&grouped[0], "grouped");
@@ -281,7 +276,7 @@ fn the_two_legs_answer_the_same_model() {
     }
 }
 
-/// A grouped leg's logits against the GEMV's: a reordered sum moves the
+/// A grouped leg's logits against the leg below's: a reordered sum moves the
 /// tail, not the middle.
 fn agree(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv_ms: f64) {
     assert_eq!(
@@ -342,11 +337,11 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
     }
     let fixture = fixture(UNCACHED);
 
-    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Gemv).expect("the per-route GEMV fires");
-    finite(&gemv[0], "gemv");
+    let (gemv, gemv_ms) = fire_at(&fixture, BOTH, Leg::Below).expect("the leg below fires");
+    finite(&gemv[0], "below");
     for leg in GROUPED
         .into_iter()
-        .filter(|leg| *leg != Leg::Tcgen05 || tcgen05())
+        .filter(|_| cfg!(feature = "rocm") || tcgen05())
     {
         let (grouped, grouped_ms) = fire_at(&fixture, BOTH, leg).expect("the grouped leg fires");
         finite(&grouped[0], "grouped");
@@ -354,19 +349,17 @@ fn a_bank_past_the_cache_is_where_grouping_pays() {
     }
 }
 
-/// Whether the device has tcgen05 (sm_100 and up).
+/// Whether the device has tcgen05, as the routed select asks it: the
+/// datacenter Blackwells and Thor. A compute capability of 10 and up is not
+/// it: the consumer Blackwells (12.x, the RTX Spark's sm_121) have no TMEM.
+#[cfg(not(feature = "rocm"))]
 fn tcgen05() -> bool {
-    use engine_cuda::device::rt;
-    let mut major = 0;
-    // SAFETY: an attribute query of device 0 into a local.
-    unsafe {
-        rt::cudaDeviceGetAttribute(
-            &mut major,
-            rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMajor,
-            0,
-        );
-    }
-    major >= 10
+    kernels_cuda::linear::gemm_sm100::supported()
+}
+
+#[cfg(feature = "rocm")]
+fn tcgen05() -> bool {
+    false
 }
 
 /// A grouped leg reading the bank once a batch against the GEMV reading it
@@ -383,7 +376,7 @@ fn pays(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv
 
     eprintln!(
         "{} tokens, {} routes over a 134 MiB bank: {leg:?} {grouped_ms:.1} ms, \
-         gemv {gemv_ms:.1} ms ({:.1}x); mean logit gap {mean:.4} over a spread of {spread:.2}",
+         below {gemv_ms:.1} ms ({:.1}x); mean logit gap {mean:.4} over a spread of {spread:.2}",
         BOTH,
         BOTH * TOP_K,
         gemv_ms / grouped_ms,
@@ -392,12 +385,12 @@ fn pays(leg: Leg, grouped: &[Vec<f32>], grouped_ms: f64, gemv: &[Vec<f32>], gemv
         mean <= 0.01 * spread,
         "the two legs answer differently in the MEAN: {mean} over a spread of {spread}"
     );
-    // Below tcgen05 the "GEMV" leg is the routed MMA select, which reads a
-    // bank once an expert too: there grouping need only keep pace.
-    let bound = if tcgen05() { gemv_ms } else { gemv_ms * 1.1 };
+    // CUDA's leg below tcgen05 is its priced select, which reads a bank once
+    // a slice of an expert's routes too: there grouping need only keep pace.
+    let bound = gemv_ms * 1.1;
     assert!(
         grouped_ms < bound,
         "grouping a bank that does not fit in cache ({leg:?}) took {grouped_ms:.1} ms against the \
-         per-route GEMV's {gemv_ms:.1} ms; this is the shape it exists for"
+         leg below's {gemv_ms:.1} ms; this is the shape it exists for"
     );
 }

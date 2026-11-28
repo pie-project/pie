@@ -28,7 +28,7 @@ pub const SIGNATURE: &str = r#"(
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
     const device M1OpParams* params [[buffer(2)]],
     const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
+    const device ulong* lane_scratch [[buffer(4)]],
     const device M3GroupLayout* layout [[buffer(5)]],
     const device uint* channel_bindings [[buffer(6)]],
     device uchar* pending_flags [[buffer(7)]],
@@ -60,7 +60,7 @@ pub const SIGNATURE: &str = r#"(
   const device M1ValueDesc* descriptors =
       all_descriptors + dispatch_lane * layout->value_count;
   device uchar* scratch =
-      all_scratch + dispatch_lane * layout->scratch_stride;
+      reinterpret_cast<device uchar*>(lane_scratch[dispatch_lane]);
 "#;
 
 const BODY: &str = r#"
@@ -284,19 +284,18 @@ pub fn emit_grouped_nucleus(
     stage: &CompiledStage,
     region: &Region,
 ) -> Result<String, EmitError> {
-    let scaled = region.inputs.len() == 5;
     if library_op_byte(region) != LibraryOp::NucleusSample as u8
         || !library_region_valid(stage, region)
-        || !(region.inputs.len() == 3 || scaled)
+        || region.inputs.len() != 3
         || region.outputs.is_empty()
     {
         return Err(EmitError::LibraryRegionAbiInvalid(
             RegionForm::GroupedNucleus,
         ));
     }
-    let logits_value = region.inputs[if scaled { 2 } else { 0 }];
-    let top_p_value = region.inputs[if scaled { 3 } else { 1 }];
-    let state_value = region.inputs[if scaled { 4 } else { 2 }];
+    let logits_value = region.inputs[0];
+    let top_p_value = region.inputs[1];
+    let state_value = region.inputs[2];
     let output_value = region.outputs[0];
 
     let mut source = String::new();

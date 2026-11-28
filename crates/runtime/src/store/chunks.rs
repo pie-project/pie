@@ -1,9 +1,8 @@
 //! The stores' slot ids, taken from [`SlotPool`]s.
 //!
-//! The engine states its pools as chunks ([`ChunkFacts`]); until a backend
-//! switches to one shared pool, each of today's pools is a *pinned* shape:
-//! a run of chunks of its own, one slot a chunk, whose slots keep the ids
-//! the engine numbers them by today ([`ChunkFacts::degenerate`]). Each such
+//! An engine states one shared pool as chunks ([`ChunkFacts`]). Stores
+//! registered without one (`registry::register_model_with_swap`) keep
+//! *pinned* pools: a run of chunks of their own, one slot a chunk. Each such
 //! run is one [`ShapePool`]: a `SlotPool` of one shape whose chunk `c` is
 //! the store's id `base + c`. A `SlotPool` opens its lowest free chunk first,
 //! as the stores' own pools did, so the ids handed to the engine are the
@@ -16,9 +15,7 @@ use std::sync::Arc;
 use crate::policy::pressure::{Bytes, Meter, Tier};
 use crate::store::registry;
 
-use ::engine::chunk::{
-    ChunkFacts, DEGENERATE_BUFFER, DEGENERATE_KV, DEGENERATE_STATE, Pinned, SlotKind,
-};
+use ::engine::chunk::{ChunkFacts, SlotKind};
 
 use super::kv::page_table::WorkingSetId;
 use super::pool::PoolId;
@@ -70,6 +67,28 @@ fn waiter(backing: &Backing) -> u64 {
 }
 
 impl<I: PoolId> ShapePool<I> {
+    /// Calls `signal` each time this pool's ids come free, where they come
+    /// from: its own slot pool, or the shared one it takes a shape of.
+    pub fn set_room_signal(&self, signal: super::slots::RoomSignal, tier: super::slots::RoomTier) {
+        match &self.slots {
+            Backing::Own(pool) => pool.set_room_signal(signal, tier, Some(0)),
+            Backing::Shape(shared, shape) => {
+                shared
+                    .lock()
+                    .unwrap()
+                    .pool()
+                    .set_room_signal(signal, tier, Some(*shape));
+            }
+            Backing::Records(shared) => {
+                shared
+                    .lock()
+                    .unwrap()
+                    .pool()
+                    .set_room_signal(signal, tier, None);
+            }
+        }
+    }
+
     /// `capacity` ids from `base`, every one committed.
     pub fn new(kind: ShapeKind, slot_bytes: u64, base: u32, capacity: u32) -> Self {
         base.checked_add(capacity)
@@ -86,6 +105,8 @@ impl<I: PoolId> ShapePool<I> {
                 slots_per_chunk: 1,
             }],
             act_chunks: Vec::new(),
+            span_on_demand: false,
+            act_span: None,
         });
         Self {
             slots: Backing::Own(Box::new(slots)),
@@ -184,6 +205,35 @@ impl<I: PoolId> ShapePool<I> {
         self.ids_end
     }
 
+    /// The shared pool and its shape these ids are slot refs of; `None`
+    /// for a pinned run or the records.
+    pub fn shared_shape(&self) -> Option<(Shared, ShapeId)> {
+        match &self.slots {
+            Backing::Shape(shared, shape) => Some((Arc::clone(shared), *shape)),
+            Backing::Own(_) | Backing::Records(_) => None,
+        }
+    }
+
+    /// `n` ids from the partly filled chunks outside logical chunks
+    /// `outside`, opening none ([`super::shared::SharedPool::take_refs_outside`]);
+    /// `None` for a pool of no shared shape, or short of them.
+    pub fn try_alloc_outside(
+        &mut self,
+        n: usize,
+        outside: &std::collections::BTreeSet<u32>,
+    ) -> Option<Vec<I>> {
+        let (shared, shape) = self.shared_shape()?;
+        let refs = shared
+            .lock()
+            .unwrap()
+            .take_refs_outside(shape, n as u64, outside)?;
+        Some(
+            refs.into_iter()
+                .map(|r| I::from_index(self.base + r))
+                .collect(),
+        )
+    }
+
     /// Whether the ids are an engine's shared pool's.
     pub fn is_shared(&self) -> bool {
         !matches!(self.slots, Backing::Own(_))
@@ -271,8 +321,31 @@ impl<I: PoolId> ShapePool<I> {
     /// `ids` go back once the fire at `epoch` retires.
     pub fn recycle_after_epoch(&mut self, ids: Vec<I>, epoch: u64) {
         if !ids.is_empty() {
+            tracing::debug!(
+                target: "runtime::store::kv",
+                epoch,
+                ids = ?ids.iter().map(|id| id.index()).collect::<Vec<_>>(),
+                "pool ids let go behind an epoch"
+            );
             self.pending.push((epoch, ids));
         }
+    }
+
+    /// Keeps of `ids` those let go and still waiting on a fire's
+    /// retirement.
+    pub fn retain_pending(&self, ids: &mut std::collections::HashSet<I>)
+    where
+        I: std::hash::Hash + Eq,
+    {
+        if ids.is_empty() {
+            return;
+        }
+        let pending: std::collections::HashSet<I> = self
+            .pending
+            .iter()
+            .flat_map(|(_, batch)| batch.iter().copied())
+            .collect();
+        ids.retain(|id| pending.contains(id));
     }
 
     /// `ids`, which no fire has touched, go back now.
@@ -296,6 +369,12 @@ impl<I: PoolId> ShapePool<I> {
         if ids.is_empty() {
             return;
         }
+        tracing::debug!(
+            target: "runtime::store::kv",
+            base = self.base,
+            ids = ?ids.iter().map(|id| id.index()).collect::<Vec<_>>(),
+            "pool ids given back"
+        );
         match &mut self.slots {
             Backing::Own(pool) => {
                 let slots: Vec<Slot> = ids
@@ -510,7 +589,11 @@ impl<I: PoolId> ShapePool<I> {
 #[derive(Debug)]
 pub struct Seats {
     slots: SlotPool,
+    /// The seats there are in all.
     capacity: u32,
+    /// The seats are the model's state slots, not the fixed count a model
+    /// without any gets.
+    of_state_slots: bool,
     held: HashMap<WorkingSetId, Vec<Slot>>,
     /// A working set let its seats go: a fire short of seats looks again.
     freed: Arc<tokio::sync::Notify>,
@@ -523,17 +606,31 @@ const SEATS_UNBOUNDED: u32 = 1 << 16;
 pub struct SeatsShort {
     pub need: u32,
     pub have: u32,
+    /// The seats there are in all.
     pub capacity: u32,
+    /// The seats are the model's state slots; `false` for a model with
+    /// none, whose seats are the fixed count of [`SEATS_UNBOUNDED`].
+    pub of_state_slots: bool,
 }
 
 impl std::fmt::Display for SeatsShort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "this fire seats {} more sequence(s) than the pools have room for \
-             ({} seat(s) free of the {} the state slots give)",
-            self.need, self.have, self.capacity
-        )
+        if self.of_state_slots {
+            write!(
+                formatter,
+                "this fire seats {} more sequence(s) than the pools have room for \
+                 ({} seat(s) free of the {} the state slots give)",
+                self.need, self.have, self.capacity
+            )
+        } else {
+            write!(
+                formatter,
+                "this fire seats {} more sequence(s) than a model without state \
+                 slots seats at once ({} seat(s) free of {}, a fixed count: such \
+                 a model's seats take no memory)",
+                self.need, self.have, self.capacity
+            )
+        }
     }
 }
 
@@ -559,8 +656,11 @@ impl Seats {
                     slots_per_chunk: 1,
                 }],
                 act_chunks: Vec::new(),
+                span_on_demand: false,
+                act_span: None,
             }),
-            capacity: state_slots,
+            capacity,
+            of_state_slots: state_slots != 0,
             held: HashMap::new(),
             freed: Arc::new(tokio::sync::Notify::new()),
         }
@@ -579,6 +679,7 @@ impl Seats {
                     need,
                     have: self.slots.available(0) as u32,
                     capacity: self.capacity,
+                    of_state_slots: self.of_state_slots,
                 })?;
             self.held.entry(ws).or_default().extend(fresh);
         }
@@ -619,90 +720,51 @@ impl Seats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShapeRun {
     pub slot_bytes: u64,
-    /// Device ids, from [`Pinned::ids_from`].
+    /// Device ids, from `ids_from`.
     pub device: u32,
     pub ids_from: u32,
+    /// The slot ref of the device run's first slot: id `i` is ref
+    /// `i - ids_from + ref_from`.
+    pub ref_from: u32,
     pub host: u32,
     pub disk: u32,
 }
 
-impl ShapeRun {
-    fn of(pinned: Pinned, slot_bytes: u64, slots_per_chunk: u32) -> Self {
-        Self {
-            slot_bytes,
-            device: pinned.device.chunks * slots_per_chunk,
-            ids_from: pinned.ids_from,
-            host: pinned.host.chunks * slots_per_chunk,
-            disk: pinned.disk.chunks * slots_per_chunk,
-        }
-    }
-}
-
-/// What a store needs of an engine's [`ChunkFacts`]: each of today's pools,
-/// as the pinned shape the degenerate mode states it as; or, where the
-/// engine states a shared pool, its geometry, the stores drawing their ids
-/// from a [`SharedPool`] built of the same facts.
+/// What a store needs of an engine's [`ChunkFacts`]: the shared pool's
+/// geometry, the stores drawing their ids from a [`SharedPool`] built of the
+/// same facts. Stores registered without a shared pool
+/// (`registry::register_model_with_swap`) state their pinned pools' counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorePools {
     /// The shapes share one pool: the counts below are not stated.
     pub shared: bool,
     pub page_size: u32,
     pub kv: ShapeRun,
-    pub window_tokens: u32,
     pub state: ShapeRun,
     pub buffer: ShapeRun,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChunkFactsError {
-    #[error(
-        "shape {0} takes chunks from the shared pool beside pinned shapes; an engine states every shape pinned or none"
-    )]
-    Mixed(u32),
-    #[error("shape {0} is not one of the degenerate mode's")]
-    Unknown(u32),
-    #[error("shape {0} cuts a slot into pieces, which the stores do not take yet")]
-    Pieces(u32),
+    #[error("shape {0} is pinned; the stores take an engine's shared pool alone")]
+    Pinned(u32),
 }
 
 impl StorePools {
-    /// The stores' pools as `facts` states them: every shape pinned (the
-    /// degenerate mode), or none (a shared pool).
+    /// The stores' pools as `facts` states them: one shared pool, or none
+    /// where the engine states no shape.
     pub fn of(facts: &ChunkFacts) -> Result<Self, ChunkFactsError> {
-        if SharedPool::states_shared(facts) {
-            return Ok(Self::shared(facts));
+        if let Some(shape) = facts.shapes.iter().find(|shape| shape.pinned.is_some()) {
+            return Err(ChunkFactsError::Pinned(shape.id.0));
         }
-        let mut pools = Self::default();
-        for shape in &facts.shapes {
-            let pinned = shape.pinned.ok_or(ChunkFactsError::Mixed(shape.id.0))?;
-            let run = ShapeRun::of(pinned, shape.slot_bytes, shape.slots_per_chunk);
-            match (shape.id, shape.kind) {
-                (
-                    DEGENERATE_KV,
-                    SlotKind::List {
-                        tokens,
-                        window: None,
-                        ..
-                    },
-                ) => {
-                    pools.page_size = tokens;
-                    pools.kv = run;
-                }
-                (DEGENERATE_STATE | DEGENERATE_BUFFER, SlotKind::Fixed { pieces })
-                    if pieces != 1 =>
-                {
-                    return Err(ChunkFactsError::Pieces(shape.id.0));
-                }
-                (DEGENERATE_STATE, SlotKind::Fixed { .. }) => pools.state = run,
-                (DEGENERATE_BUFFER, SlotKind::Fixed { .. }) => pools.buffer = run,
-                _ => return Err(ChunkFactsError::Unknown(shape.id.0)),
-            }
+        if facts.shapes.is_empty() {
+            return Ok(Self::default());
         }
-        Ok(pools)
+        Ok(Self::shared(facts))
     }
 
-    /// A shared pool's geometry: the kv list's tokens a slot, the widest
-    /// window, and the rs list's slot bytes as the buffer's.
+    /// A shared pool's geometry: the kv list's tokens a slot and the rs
+    /// list's slot bytes as the buffer's.
     fn shared(facts: &ChunkFacts) -> Self {
         let mut pools = Self {
             shared: true,
@@ -716,27 +778,31 @@ impl StorePools {
             match shape.kind {
                 // The rs buffer's list (CONTRACT-BC 18): its tokens are
                 // the rs store's, not the kv page size.
+                // The window buffer (CONTRACT-BC 21) is the rs store's
+                // buffer as the rs list is: a load states one of them.
                 SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::RsBuffer => {
                     pools.buffer = run;
                 }
-                SlotKind::List {
-                    tokens,
-                    window: None,
-                    ..
-                } => {
+                // A hybrid's window buffer is a pool beside its rs list,
+                // which stays the buffer here.
+                SlotKind::List { .. } if shape.role == ::engine::chunk::SlotRole::WindowBuffer => {
+                    if !facts
+                        .shapes
+                        .iter()
+                        .any(|s| s.role == ::engine::chunk::SlotRole::RsBuffer)
+                    {
+                        pools.buffer = run;
+                    }
+                }
+                // A list of its own window is refused by the shared pool
+                // ([`SharedPool::new`]).
+                SlotKind::List { tokens, .. } => {
                     pools.page_size = tokens;
                     pools.kv = run;
                 }
-                SlotKind::List {
-                    tokens,
-                    window: Some(window),
-                    ..
-                } => {
-                    if pools.page_size == 0 {
-                        pools.page_size = tokens;
-                    }
-                    pools.window_tokens = pools.window_tokens.max(window);
-                }
+                // An instance's tables and a ring are taken on demand, no
+                // part of a record (`super::roles`).
+                SlotKind::Fixed { .. } if !shape.role.replayable() => {}
                 SlotKind::Fixed { pieces } => {
                     pools.state.slot_bytes += shape.slot_bytes * u64::from(pieces);
                 }
@@ -802,12 +868,19 @@ impl SlotMeter {
                 let state = rs.device_demand();
                 let total = kv_page_bytes * capacity + rows(rs.capacity());
                 let kv_cached = cached * kv_page_bytes;
+                // Instance tables and rings on the device: state, none of
+                // it cache (no token rebuilds them).
+                let roles = stores
+                    .roles
+                    .as_ref()
+                    .map_or(0, |roles| roles.lock().unwrap().device_bytes());
                 Bytes {
                     total,
-                    state: kv.live + state.live,
+                    state: kv.live + state.live + roles,
                     live: kv.live.saturating_sub(kv_cached)
-                        + state.live.saturating_sub(rows(rs.cache_only())),
-                    wanted: kv.wanted + state.wanted,
+                        + state.live.saturating_sub(rows(rs.cache_only()))
+                        + roles,
+                    wanted: kv.wanted + state.wanted + roles,
                     act: 0,
                 }
             }
@@ -845,5 +918,35 @@ impl Meter for SlotMeter {
             };
         }
         Some(sum)
+    }
+}
+
+#[cfg(test)]
+mod seats_tests {
+    use super::{SEATS_UNBOUNDED, Seats};
+    use crate::store::genmap::GenMap;
+    use crate::store::kv::page_table::WorkingSetId;
+
+    fn working_set() -> WorkingSetId {
+        GenMap::<_, ()>::new().insert(())
+    }
+
+    /// A fire past a stateless model's seats is refused with the seats
+    /// there are and why, not "0 of the 0 the state slots give".
+    #[test]
+    fn a_stateless_model_short_of_seats_names_its_real_count() {
+        let mut seats = Seats::new(0);
+        let short = seats
+            .seats(working_set(), SEATS_UNBOUNDED as usize + 1)
+            .unwrap_err();
+        assert_eq!(short.capacity, SEATS_UNBOUNDED);
+        assert_eq!(short.have, SEATS_UNBOUNDED);
+        assert!(!short.of_state_slots);
+        let message = short.to_string();
+        assert!(
+            message.contains(&format!("free of {SEATS_UNBOUNDED}"))
+                && message.contains("without state slots"),
+            "{message}"
+        );
     }
 }

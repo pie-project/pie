@@ -9,6 +9,9 @@ use std::borrow::Cow;
 pub struct Builtin {
     pub name: &'static str,
     pub component: &'static [u8],
+    /// What it was built from, by content ([`SOURCE`]): the same in any
+    /// tree of the same source, where `component`'s bytes are not.
+    pub source: &'static str,
 }
 
 include!(concat!(env!("OUT_DIR"), "/builtins.rs"));
@@ -20,6 +23,12 @@ pub fn all() -> &'static [Builtin] {
 pub fn find(name: &str) -> Option<&'static Builtin> {
     ALL.iter().find(|b| b.name == name)
 }
+
+/// The worker policy a worker runs when its configuration names none.
+pub const DEFAULT_WORKER_POLICY: &str = "default";
+
+/// The cluster policy a controller runs when its configuration names none.
+pub const DEFAULT_CLUSTER_POLICY: &str = "default-cluster";
 
 pub fn policies() -> &'static [Builtin] {
     POLICIES
@@ -57,6 +66,10 @@ mod tests {
             );
         }
         assert_eq!(find("compat-openai").map(|b| b.name), Some("compat-openai"));
+        assert!(
+            ALL.iter().all(|b| b.source == SOURCE && SOURCE.len() == 16),
+            "every built-in states the source fingerprint"
+        );
         assert!(find("nobody").is_none());
     }
 }

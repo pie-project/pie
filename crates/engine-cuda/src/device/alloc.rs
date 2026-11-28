@@ -5,27 +5,69 @@ use crate::error::{Fault, Result};
 pub struct Buffer {
     ptr: u64,
     bytes: usize,
-    /// The device heap's class this is a cell of, and the device
-    /// (`device::held::heap`).
-    #[cfg_attr(not(feature = "device"), allow(dead_code))]
-    carved: Option<(usize, i32)>,
+    /// Another owner's bytes ([`Buffer::over`]): never given back here.
+    lent: bool,
+    /// Whether a lent run lies where its owner laid it; one that does not
+    /// yet stands in ([`Buffer::lent`]).
+    laid: bool,
 }
 
-/// `bytes` of device memory for a [`Buffer`], given back once in its `Drop`,
-/// and the device heap's class when it is a cell of it: small spans are
-/// carved (`device::held::heap`), larger ones are one an earlier drop kept
-/// when its last reader landed, where there is one (`device::held::recycle`).
+thread_local! {
+    /// Whether this thread's load serves: from its first submitted frame on
+    /// ([`serving_from_here`]), no device buffer is made on it. It is the
+    /// engine's lane thread's alone: a buffer asked on another thread (a fan
+    /// or side stream's, an expert-parallel rank's) after ready is not
+    /// caught here; none is asked there on the loads the census traced.
+    static SERVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread's load serves from here: a device buffer asked on it after
+/// is refused by name ([`Buffer::zeroed`]), and one dropped is freed only
+/// once the shell is down (`device::held::deferred`).
+pub fn serving_from_here() {
+    SERVING.set(true);
+}
+
+/// This thread lays a load from here: what it makes is the load's own.
+pub fn loading_from_here() {
+    SERVING.set(false);
+}
+
+/// `f` on this thread as a load's, not a serving step's: a reload of the
+/// weights, a shell made or let go. What it makes is the load's own.
+pub fn as_load<R>(f: impl FnOnce() -> R) -> R {
+    let was = SERVING.replace(false);
+    let out = f();
+    SERVING.set(was);
+    out
+}
+
+/// `bytes` of device memory for a [`Buffer`], given back once in its
+/// `Drop`: the driver's, at load. On a thread whose load serves none is
+/// made: the load sized no room for it, a sizing bug the request that asked
+/// is refused for, by its caller's name.
 #[cfg(feature = "device")]
-fn alloc(bytes: usize) -> Result<(*mut core::ffi::c_void, Option<(usize, i32)>)> {
-    use crate::device::held::heap::{self, Kind};
-    if let Some(class) = heap::class_of(Kind::Device, bytes) {
-        let cell = heap::take(Kind::Device, class)?;
-        return Ok((
-            cell.device as *mut core::ffi::c_void,
-            Some((class, cell.ordinal)),
+#[track_caller]
+fn alloc(bytes: usize) -> Result<*mut core::ffi::c_void> {
+    use crate::device::rt;
+    if SERVING.get() {
+        let at = std::panic::Location::caller();
+        return Err(Fault::program(
+            "device::alloc",
+            format!(
+                "a device buffer of {bytes} bytes was asked by {}:{} after the load was ready: \
+                 the load's walk sized no room for it, so this request is refused (a sizing bug, \
+                 not a shortage)",
+                at.file(),
+                at.line()
+            ),
         ));
     }
-    crate::device::held::recycle::alloc(bytes).map(|ptr| (ptr as *mut core::ffi::c_void, None))
+    let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: `base` is a live local the call fills.
+    let code = unsafe { rt::cudaMalloc(&raw mut base, bytes) };
+    crate::device::ctx::check("cudaMalloc", code).map_err(|fault| out_of_room(fault, bytes))?;
+    Ok(base)
 }
 
 #[cfg(feature = "device")]
@@ -113,45 +155,65 @@ unsafe fn landed_zero(at: *mut core::ffi::c_void, len: usize) -> Result<()> {
 }
 
 impl Buffer {
+    #[track_caller]
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
+        Buffer::zeroed_with(bytes, true)
+    }
+
+    /// [`Buffer::zeroed`]: what a step that lays buffers of many sizes once
+    /// and is gone before the load reads the card asks (the rates measured
+    /// at load).
+    #[track_caller]
+    pub fn zeroed_apart(bytes: usize) -> Result<Buffer> {
+        Buffer::zeroed_with(bytes, false)
+    }
+
+    #[track_caller]
+    fn zeroed_with(bytes: usize, carve: bool) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer {
                 ptr: 0,
                 bytes: 0,
-                carved: None,
+                lent: false,
+                laid: true,
             });
         }
         #[cfg(feature = "device")]
         {
-            let (base, carved) = alloc(bytes)?;
+            let _ = carve;
+            let base = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes;
             // the set lands before any stream is handed the buffer.
             unsafe { landed_zero(base, bytes)? };
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
-                carved,
+                lent: false,
+                laid: true,
             })
         }
         #[cfg(not(feature = "device"))]
         {
+            let _ = carve;
             Err(Fault::Runtimeless)
         }
     }
 
+    #[track_caller]
     pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
             return Ok(Buffer {
                 ptr: 0,
                 bytes: 0,
-                carved: None,
+                lent: false,
+                laid: true,
             });
         }
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
 
-            let (base, carved) = alloc(bytes)?;
+            let base = alloc(bytes)?;
             // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
             // `stream` is the one every later read of it is ordered on.
             unsafe {
@@ -163,7 +225,8 @@ impl Buffer {
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
-                carved,
+                lent: false,
+                laid: true,
             })
         }
         #[cfg(not(feature = "device"))]
@@ -171,6 +234,53 @@ impl Buffer {
             let _ = stream;
             Err(Fault::Runtimeless)
         }
+    }
+
+    /// `bytes` at `ptr` that another owner holds (a run of the pool's
+    /// activation span): staged into like a buffer, given back by no drop.
+    #[must_use]
+    pub fn over(ptr: u64, bytes: usize) -> Buffer {
+        Buffer {
+            ptr,
+            bytes,
+            lent: true,
+            laid: true,
+        }
+    }
+
+    /// Whether a copy into this buffer has nowhere to land: it stands in
+    /// for a run not laid yet, which only a size-only walk
+    /// (`crate::sizing`) may stage into.
+    fn stood_in(&self) -> Result<bool> {
+        // Never by its address: a range the driver places may lie anywhere,
+        // the stand-in span included.
+        if self.laid {
+            return Ok(false);
+        }
+        if crate::sizing::active() {
+            return Ok(true);
+        }
+        Err(Fault::program(
+            "device::alloc",
+            "a fire staged into a run of the activation's span before the load laid it",
+        ))
+    }
+
+    /// `bytes` of a run of the activation's span the load has yet to lay:
+    /// it stands in till [`Buffer::lay`].
+    #[must_use]
+    pub fn lent(bytes: usize) -> Buffer {
+        Buffer {
+            laid: false,
+            ..Buffer::over(crate::sizing::STAND_IN, bytes)
+        }
+    }
+
+    /// The lent run lies at `ptr` from here on.
+    pub fn lay(&mut self, ptr: u64) {
+        debug_assert!(self.lent, "only a lent run is laid");
+        self.ptr = ptr;
+        self.laid = true;
     }
 
     #[must_use]
@@ -181,6 +291,13 @@ impl Buffer {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether this was carved from a heap: never, now that device buffers
+    /// are the driver's at load.
+    #[must_use]
+    pub const fn carved(&self) -> bool {
+        false
     }
 
     pub fn at(&self, offset: u64) -> Result<u64> {
@@ -243,7 +360,7 @@ impl Buffer {
         bytes: &[u8],
     ) -> Result<()> {
         self.span(offset, bytes.len())?;
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.stood_in()? {
             return Ok(());
         }
         #[cfg(feature = "device")]
@@ -290,6 +407,9 @@ impl Buffer {
     ) -> Result<()> {
         for &(offset, _, len) in spans {
             self.span(offset, len)?;
+        }
+        if self.stood_in()? {
+            return Ok(());
         }
         #[cfg(feature = "device")]
         {
@@ -535,19 +655,13 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         #[cfg(feature = "device")]
-        if self.ptr != 0 {
-            use crate::device::held::heap::{self, Cell, Kind};
-            match self.carved {
-                Some((class, ordinal)) => heap::give(
-                    Kind::Device,
-                    class,
-                    Cell {
-                        host: 0,
-                        device: self.ptr,
-                        ordinal,
-                    },
-                ),
-                None => crate::device::held::recycle::release(self.ptr, self.bytes),
+        if self.ptr != 0 && !self.lent {
+            if SERVING.get() {
+                // A free waits on the device: never while its load serves.
+                crate::device::held::deferred::later(self.ptr);
+            } else {
+                // SAFETY: the allocation this buffer owns, freed once.
+                let _ = unsafe { crate::device::rt::cudaFree(self.ptr as *mut core::ffi::c_void) };
             }
         }
     }
@@ -600,64 +714,22 @@ impl Pinned {
     /// no fire reads in place, the device copying out of it alone, whose
     /// address it takes as any host address (`device` is the host address).
     /// Nothing is pinned, so a span of gigabytes costs no page-locking.
-    #[cfg(unix)]
     pub fn pageable(bytes: usize) -> Result<Pinned> {
         if bytes == 0 {
             return Ok(Pinned::empty());
         }
-        // SAFETY: a fresh private anonymous mapping of a stated length; no
-        // fd, no offset, owned by this structure and unmapped once in `Drop`.
-        let at = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(Fault::Residency(format!(
+        // Owned by this structure and unmapped once in `Drop`.
+        let refused = || {
+            Fault::Residency(format!(
                 "this machine would not map {bytes} bytes of host memory for the weights' copy"
-            )));
-        }
-        prefault(at.cast(), bytes);
-        pageable_spans().push((at as usize, bytes));
-        Ok(Pinned {
-            host: at.cast(),
-            device: at as u64,
-            bytes,
-            origin: Origin::Pageable,
-        })
-    }
-
-    /// As on unix, from a committed reservation Windows zeroes as its pages
-    /// are first touched.
-    #[cfg(windows)]
-    pub fn pageable(bytes: usize) -> Result<Pinned> {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            ))
         };
-        if bytes == 0 {
-            return Ok(Pinned::empty());
+        let at = reserve_anon(bytes).ok_or_else(refused)?;
+        if !commit_anon(at, bytes) {
+            unmap_anon(at, bytes);
+            return Err(refused());
         }
-        // SAFETY: a fresh committed reservation of a stated length, owned by
-        // this structure and released once in `Drop`.
-        let at = unsafe {
-            VirtualAlloc(
-                core::ptr::null_mut(),
-                bytes,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        };
-        if at.is_null() {
-            return Err(Fault::Residency(format!(
-                "this machine would not map {bytes} bytes of host memory for the weights' copy"
-            )));
-        }
-        prefault(at.cast(), bytes);
+        prefault(at, bytes);
         pageable_spans().push((at as usize, bytes));
         Ok(Pinned {
             host: at.cast(),
@@ -841,8 +913,72 @@ impl Drop for Pinned {
     }
 }
 
+/// `bytes` of private anonymous address space, readable and writable once
+/// committed ([`commit_anon`]); released with [`unmap_anon`].
 #[cfg(unix)]
-fn unmap_anon(at: *mut u8, bytes: usize) {
+pub(crate) fn reserve_anon(bytes: usize) -> Option<*mut u8> {
+    // SAFETY: a fresh private anonymous mapping of a stated length; no fd,
+    // no offset, owned by the caller.
+    let at = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            bytes.max(1),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    (at != libc::MAP_FAILED).then_some(at.cast())
+}
+
+#[cfg(windows)]
+pub(crate) fn reserve_anon(bytes: usize) -> Option<*mut u8> {
+    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: a fresh reservation of a stated length, owned by the caller.
+    let at = unsafe {
+        VirtualAlloc(
+            core::ptr::null_mut(),
+            bytes.max(1),
+            MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    (!at.is_null()).then_some(at.cast())
+}
+
+/// Commits `bytes` at `at`, inside a [`reserve_anon`] span: false when the
+/// OS will not back them. Unix commits a page as it is first written.
+#[cfg(unix)]
+pub(crate) fn commit_anon(_at: *mut u8, _bytes: usize) -> bool {
+    true
+}
+
+#[cfg(windows)]
+pub(crate) fn commit_anon(at: *mut u8, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: committing pages of the caller's own reservation; committed
+    // pages read zero until written.
+    !unsafe { VirtualAlloc(at.cast(), bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+}
+
+/// Drops the resident pages of `bytes` at `at`, whole pages of a read-only
+/// file mapping whose contents were copied elsewhere: a later read faults
+/// them back in from the file. The advice is unix's; elsewhere the OS trims
+/// a mapping's pages on its own.
+pub(crate) fn drop_file_pages(at: usize, bytes: usize) {
+    #[cfg(unix)]
+    // SAFETY: whole pages inside a live read-only file mapping (the
+    // caller's contract); the advice changes no contents.
+    unsafe {
+        libc::madvise(at as *mut core::ffi::c_void, bytes, libc::MADV_DONTNEED);
+    }
+    #[cfg(not(unix))]
+    let _ = (at, bytes);
+}
+
+#[cfg(unix)]
+pub(crate) fn unmap_anon(at: *mut u8, bytes: usize) {
     // SAFETY: unmapping a mapping `map_anon` made, exactly once.
     unsafe {
         libc::munmap(at.cast(), bytes.max(1));
@@ -850,7 +986,7 @@ fn unmap_anon(at: *mut u8, bytes: usize) {
 }
 
 #[cfg(windows)]
-fn unmap_anon(at: *mut u8, _bytes: usize) {
+pub(crate) fn unmap_anon(at: *mut u8, _bytes: usize) {
     use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
     // SAFETY: releasing a reservation `map_anon` made, exactly once.
     unsafe {
@@ -1038,6 +1174,13 @@ fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool
     if bytes.len() < BOUNCED {
         return Ok(false);
     }
+    // A capture records the copy's source, the ring's buffer, which the ring
+    // writes again once the live copy that read it has run: a replay would
+    // read a later copy's bytes. Declined, as HIP's ring declines
+    // (`hip::held::staged_through_ring`): the caller copies its own bytes.
+    if is_capturing(stream) {
+        return Ok(false);
+    }
     let Some(device) = crate::device::held::current_device() else {
         return Ok(false);
     };
@@ -1079,6 +1222,11 @@ fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool
 }
 
 pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(dst as usize)) {
+        return Ok(());
+    }
     if bytes.is_empty() {
         return Ok(());
     }
@@ -1117,6 +1265,13 @@ pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Resu
 }
 
 pub fn copy_d2d(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst as usize) || crate::sizing::stands_in(src as usize))
+    {
+        return Ok(());
+    }
     if bytes == 0 {
         return Ok(());
     }
@@ -1168,7 +1323,18 @@ fn batch(
     dst_host: bool,
     spans: &[(u64, u64, usize)],
 ) -> Result<()> {
-    let live: Vec<(u64, u64, usize)> = spans.iter().copied().filter(|s| s.2 > 0).collect();
+    // A size-only walk (`crate::sizing`) copies no span to or from a
+    // stand-in.
+    let live: Vec<(u64, u64, usize)> = spans
+        .iter()
+        .copied()
+        .filter(|s| {
+            s.2 > 0
+                && !(crate::sizing::active()
+                    && (crate::sizing::stands_in(s.0 as usize)
+                        || crate::sizing::stands_in(s.1 as usize)))
+        })
+        .collect();
     #[cfg(all(feature = "cuda", not(feature = "rocm")))]
     if live.len() > 1 {
         use crate::device::rt;
@@ -1232,6 +1398,13 @@ fn batch(
 }
 
 pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst as usize) || crate::sizing::stands_in(src as usize))
+    {
+        return Ok(());
+    }
     if bytes == 0 {
         return Ok(());
     }
@@ -1261,6 +1434,11 @@ pub fn copy_any(stream: *mut core::ffi::c_void, dst: u64, src: u64, bytes: usize
 }
 
 pub fn zero_span(at: u64, len: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
     if len == 0 {
         return Ok(());
     }
@@ -1276,7 +1454,48 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
     }
 }
 
+/// Fills `len` bytes at `at` with `byte`, landed before it returns, on the
+/// calling thread's own stream: a diagnostic's fill of memory nothing wrote
+/// (`unwritten-nan`).
+pub fn fill_span(at: u64, len: usize, byte: u8) -> Result<()> {
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "device")]
+    {
+        use crate::device::rt;
+
+        // SAFETY: the address is a span the caller resolved against an
+        // allocation this shell owns; the stream is this thread's own.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemsetAsync",
+                rt::cudaMemsetAsync(
+                    at as *mut core::ffi::c_void,
+                    core::ffi::c_int::from(byte),
+                    len,
+                    OWN_STREAM.cast(),
+                ),
+            )?;
+        }
+        crate::device::ctx::sync(OWN_STREAM)
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (at, byte);
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Result<()> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in span.
+    if crate::sizing::active() && (crate::sizing::stands_in(at as usize)) {
+        return Ok(());
+    }
     if len == 0 {
         return Ok(());
     }
@@ -1316,6 +1535,14 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
 /// Reads `into` from `at` on `stream`, behind whatever it holds, and waits
 /// for it to land.
 pub fn copy_d2h_on(stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> Result<()> {
+    // A read of a stand-in span back to the host has no answer in a
+    // size-only walk (`crate::sizing`): it refuses.
+    if crate::sizing::active() && crate::sizing::stands_in(at as usize) {
+        return Err(Fault::program(
+            "device::copy_d2h",
+            "a size-only walk read a span it never backed back to the host",
+        ));
+    }
     if into.is_empty() {
         return Ok(());
     }
@@ -1351,12 +1578,7 @@ pub fn copy_d2h_on(stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> 
 pub fn free_bytes() -> Option<u64> {
     #[cfg(feature = "device")]
     {
-        use crate::device::rt;
-
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: two live locals; the call only writes them.
-        let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
-        (asked == rt::cudaError::cudaSuccess).then_some(free as u64)
+        crate::device::card::memory().ok().map(|(free, _)| free)
     }
     #[cfg(not(feature = "device"))]
     {
@@ -1397,9 +1619,15 @@ fn prefault(at: *mut u8, bytes: usize) {
 
 /// The spans [`Pinned::pageable`] mapped and holds: anonymous memory, which
 /// advice that lets a file's pages go would zero.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "each update of the list is one push or removal, never left half-made by a panic"
+)]
 fn pageable_spans() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
     static SPANS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-    SPANS.lock().expect("pageable spans lock poisoned")
+    SPANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether `at` lies in a pageable copy [`Pinned::pageable`] made.

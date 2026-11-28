@@ -5,10 +5,16 @@
 //! `window_size` positions; `sink_size: 0` is a plain sliding window. Masked
 //! KV remains allocated in this example.
 //!
+//! Nothing is folded: a mask speaks only of the rows past a set's committed
+//! boundary (column `c` is slot `folded + c`), and this one hides committed
+//! rows between the sink and the window, so the set keeps every row
+//! unfolded and its boundary at 0, where columns are slots.
+//!
 //! On a model with recurrent layers too, the sink/window mask is a mask over
-//! the ATTENTION layers only, and the recurrent layers fold every token as
-//! usual. There is nothing to emulate there: a recurrence has no key it can
-//! decline to read.
+//! the ATTENTION layers only: a recurrence has no key it can decline to read.
+//! Unfolded, its rows stay in the buffer and each fire replays them, so a
+//! decode past the largest activation rung's tokens is refused by name there
+//! until a fold can commit some rows and drop others.
 
 use inferlet::chat;
 use inferlet::eta::prelude::*;
@@ -121,7 +127,6 @@ async fn main(input: Input) -> Result<Output> {
             visible_kv: 0,
         });
     }
-    let stop_tokens = chat::stop_tokens();
     let span = n + input.max_tokens as u32 + 1;
 
     let ws = WorkingSet::new();
@@ -140,7 +145,7 @@ async fn main(input: Input) -> Result<Output> {
     let prefill = ForwardPass::new();
     prefill.embed(&tokens, &embed_indptr)?;
     prefill.mask(&causal)?;
-    prefill.state(&[&ws], StateGeometry::folding())?;
+    prefill.state(&[&ws], StateGeometry::default())?;
     prefill.epilogue(move || {
         first_out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
     });
@@ -150,10 +155,10 @@ async fn main(input: Input) -> Result<Output> {
     let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
-    if !stop_tokens.contains(&first) {
+    if !chat::is_stop(first) {
         generated.push(first);
     }
-    if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
+    if generated.len() >= input.max_tokens || chat::is_stop(first) {
         pipeline.close();
         return report(&generated, n, sink, window, 0);
     }
@@ -167,7 +172,7 @@ async fn main(input: Input) -> Result<Output> {
     let decode_indptr = Channel::from([0u32, 1]);
     decode.embed(&token_in, &decode_indptr)?;
     decode.mask(&mask)?;
-    decode.state(&[&ws], StateGeometry::folding())?;
+    decode.state(&[&ws], StateGeometry::default())?;
     decode.epilogue(move || {
         let base = fill.take();
         let token = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
@@ -186,7 +191,7 @@ async fn main(input: Input) -> Result<Output> {
     run_ahead(&pipeline, &decode, budget, async || {
         let token = token_out.take_host::<i32>().await? as u32;
         fires += 1;
-        if stop_tokens.contains(&token) {
+        if chat::is_stop(token) {
             return Ok(ControlFlow::Break(()));
         }
         generated.push(token);

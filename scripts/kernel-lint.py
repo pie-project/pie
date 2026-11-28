@@ -17,7 +17,8 @@ The checks, the ones the rest of the convention leans on:
     do its submodules, then);
   * kernels-slang: every unit sits in one of the convention's groups and
     has its host module at the mirrored path; every `pie:instantiate` entry
-    is named by host code (kernels-slang's `src/` or an engine's dispatch);
+    is named by host code (kernels-slang's `src/`, an engine's dispatch, or
+    engine-vulkan's device code);
     every entry and unit the host names exists; every host module has its
     test at the mirrored path in each engine's tests.
 
@@ -376,7 +377,7 @@ GROUPS = {
 }
 SLANG_TREE = "crates/kernels-slang/kernels"
 SLANG_SRC = "crates/kernels-slang/src"
-SLANG_HOSTS = [SLANG_SRC, "crates/engine-gpu/src/dispatch"]
+SLANG_HOSTS = [SLANG_SRC, "crates/engine-gpu/src/dispatch", "crates/engine-vulkan/src"]
 SLANG_TESTS = ["crates/engine-gpu/suite"]
 SLANG_INSTANTIATE = re.compile(r"(?m)^\s*// pie:instantiate (\w+)")
 SLANG_UNIT = re.compile(r'"([a-z_0-9/]+\.slang)"')

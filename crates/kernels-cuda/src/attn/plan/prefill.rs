@@ -109,23 +109,6 @@ pub fn partial_rows(tile: u32, num_qo_heads: u32, num_kv_heads: u32) -> u64 {
     u64::from(tile.div_ceil(group))
 }
 
-#[must_use]
-pub fn graph_padding(
-    rows: u32,
-    lanes: u32,
-    num_qo_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    device: &Device,
-    ctas_per_sm: u32,
-) -> (u32, u64) {
-    let kv_heads = num_kv_heads.max(1);
-    let group = u64::from((num_qo_heads / kv_heads).max(1));
-    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim);
-    let floor = u64::from(ctas_per_sm.max(1) * device.num_sm.max(1)) / u64::from(kv_heads);
-    (tile, floor.max(tiles))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,
@@ -180,9 +163,16 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         })
         .collect();
 
+    // A captured layout splits only where a replay could cut each of the
+    // rows' query tiles' prefixes in two at least: past half the grid in
+    // tiles, one long request's replay takes one chunk a tile (as its eager
+    // plan does, unsplit), and the split layout would only add the partials
+    // and their fold.
     let (split_kv, kv_chunk_size_in_pages) = if req.enable_cuda_graph
-        && (u64::from(req.total_num_rows) * group).div_ceil(u64::from(cta_tile_q))
-            >= u64::from(max_batch_size_if_split)
+        && (u64::from(req.total_num_rows) * group)
+            .div_ceil(u64::from(cta_tile_q))
+            .saturating_mul(2)
+            > u64::from(max_batch_size_if_split)
     {
         (
             false,
@@ -242,8 +232,15 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     };
     let o_indptr = narrow_all(op, "batch_prefill_o_indptr", &o_indptr)?;
 
-    let padded_batch_size = if req.enable_cuda_graph {
+    // A captured grid is laid for the widest plan its replays can take. A
+    // split layout's items reach the grid's split capacity; an unsplit one's
+    // never pass the rows' tiles, so its grid is those tiles: padding it to
+    // the split capacity re-pairs the CTAs on the SMs, and a replay ran
+    // attention up to a fifth slower than the same plan walked.
+    let padded_batch_size = if req.enable_cuda_graph && split_kv {
         u64::from(max_batch_size_if_split).max(total_num_tiles_q)
+    } else if req.enable_cuda_graph {
+        total_num_tiles_q
     } else {
         new_batch_size
     };

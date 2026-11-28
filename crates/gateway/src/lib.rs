@@ -25,7 +25,7 @@ use crate::admission::AdmissionDecision;
 use crate::blob::{BlobStore, GatewayOriginStore};
 use crate::policy::By;
 use crate::route::RoutingHandle;
-use crate::session::{AdmitReject, DispatchFail, Sessions, TurnRouter};
+use crate::session::{AdmitReject, DispatchFail, Facts, Sessions, TurnRouter};
 use crate::worker::WorkerRegistry;
 use controller_api::Outcome;
 
@@ -111,11 +111,11 @@ fn addressed(req: &Request) -> Option<&str> {
 
 #[async_trait::async_trait]
 impl TurnRouter for RouteBackend {
-    async fn admit(&self, req: &Request) -> std::result::Result<(), AdmitReject> {
+    async fn admit(&self, req: &Request, facts: Facts) -> std::result::Result<(), AdmitReject> {
         if let Some(router) = self.router_for(req) {
-            return router.admit(req, &self.routing).await;
+            return router.admit(req, facts, &self.routing).await;
         }
-        match self.routing.admit_queued(req).await {
+        match self.routing.admit(req) {
             AdmissionDecision::Admit => Ok(()),
             AdmissionDecision::Reject(reason) => Err(AdmitReject::Full(reason.to_string())),
         }
@@ -124,33 +124,63 @@ impl TurnRouter for RouteBackend {
     async fn dispatch(
         &self,
         req: &Request,
-        affinity: Option<u64>,
         pinned: Option<WorkerId>,
     ) -> std::result::Result<WorkerId, DispatchFail> {
         let router = self.router_for(req);
         let placed: Request;
         let (req, preferred) = match router {
             Some(router) => {
-                let (preferred, cluster_props, executors) = router.placement(req);
+                let (workers, cluster_props, executors) = router.placement(req);
                 placed = Request {
                     cluster_props,
                     executors,
                     ..req.clone()
                 };
-                (&placed, preferred)
+                (&placed, workers.map(Placed::List))
             }
             None => {
                 let located = &self.located.lock().unwrap().workers;
                 let preferred = addressed(req).and_then(|process| located.get(process).copied());
-                (req, preferred)
+                (req, preferred.map(Placed::Located))
             }
         };
-        let worker = self
-            .routing
-            .dispatch_with_retry(&self.workers, req, affinity, preferred, pinned)
-            .await
-            .map_err(|_| DispatchFail)?
-            .worker_id;
+        let worker = match preferred {
+            // A placement's list: the first of it that takes the process.
+            Some(Placed::List(list)) => {
+                if let Some(tied) = pinned.filter(|worker| !list.contains(worker)) {
+                    return Err(DispatchFail::Excluded(tied));
+                }
+                let mut taken = None;
+                for worker in list {
+                    if pinned.is_some_and(|p| p != worker) {
+                        continue;
+                    }
+                    if let Ok(target) = self
+                        .routing
+                        .dispatch_with_retry(&self.workers, req, None, Some(worker))
+                        .await
+                    {
+                        taken = Some(target.worker_id);
+                        break;
+                    }
+                }
+                taken.ok_or(DispatchFail::NoWorker)?
+            }
+            Some(Placed::Located(at)) => {
+                self.routing
+                    .dispatch_with_retry(&self.workers, req, Some(at), pinned)
+                    .await
+                    .map_err(|_| DispatchFail::NoWorker)?
+                    .worker_id
+            }
+            None => {
+                self.routing
+                    .dispatch_with_retry(&self.workers, req, None, pinned)
+                    .await
+                    .map_err(|_| DispatchFail::NoWorker)?
+                    .worker_id
+            }
+        };
         if let Some(router) = router {
             router.dispatched(req, worker);
         }
@@ -175,6 +205,10 @@ impl TurnRouter for RouteBackend {
         self.workers.connected_watch()
     }
 
+    fn eligible(&self) -> Vec<WorkerId> {
+        self.routing.select_worker()
+    }
+
     fn launched(&self, req: ReqId, process: &str, worker: WorkerId) {
         let mut located = self.located.lock().unwrap();
         located.workers.insert(process.to_string(), worker);
@@ -184,6 +218,12 @@ impl TurnRouter for RouteBackend {
     fn moved(&self, req: &Request, worker: Option<WorkerId>, why: &str) {
         if let Some(router) = self.router_for(req) {
             router.moved(req, worker, why);
+        }
+    }
+
+    fn started(&self, req: &Request) {
+        if let Some(router) = self.router_for(req) {
+            router.started(req);
         }
     }
 
@@ -366,10 +406,17 @@ pub async fn bind<C: GatewayControl>(config: Config, control: C) -> Result<Gatew
 }
 
 pub async fn run(config: Config) -> Result<GatewayHandle> {
-    let control = controller::Controller::connect(&config.controller).await?;
+    let control = controller_api::ControllerLink::dial(&config.controller).await?;
     run_with(config, control).await
 }
 
 pub async fn run_with<C: GatewayControl>(config: Config, control: C) -> Result<GatewayHandle> {
     Ok(bind(config, control).await?.into_handle())
+}
+
+/// Where a launch is to go: a placement's list, best first, or the worker
+/// that holds what it addresses.
+enum Placed {
+    List(Vec<WorkerId>),
+    Located(WorkerId),
 }

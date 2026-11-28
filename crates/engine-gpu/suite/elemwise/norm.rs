@@ -76,12 +76,57 @@ fn the_norms_answer_the_reference() {
             let y = gpu.zeros(n);
             let (xs, ys) = (st(x, rows, width), st(y, rows, width));
             gpu.run(|s| match i {
-                0 => slang::rmsnorm(s, xs, st(w, 1, width), eps, ys),
-                1 => slang::rmsnorm_plus_one(s, xs, st(w, 1, width), eps, ys),
-                2 => slang::rmsnorm_per_head(s, xs, st(hw, 1, head), head as u32, eps, ys),
-                3 => slang::rmsnorm_per_head_plus_one(s, xs, st(hw, 1, head), head as u32, eps, ys),
-                4 => slang::rmsnorm_grouped_plus_one(s, xs, st(w, 1, width), head as u32, eps, ys),
-                _ => slang::rmsnorm_no_scale(s, xs, head as u32, eps, ys),
+                0 => slang::rmsnorm(
+                    s,
+                    xs,
+                    st(w, 1, width),
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                1 => slang::rmsnorm_plus_one(
+                    s,
+                    xs,
+                    st(w, 1, width),
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                2 => slang::rmsnorm_per_head(
+                    s,
+                    xs,
+                    st(hw, 1, head),
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                3 => slang::rmsnorm_per_head_plus_one(
+                    s,
+                    xs,
+                    st(hw, 1, head),
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                4 => slang::rmsnorm_grouped_plus_one(
+                    s,
+                    xs,
+                    st(w, 1, width),
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
+                _ => slang::rmsnorm_no_scale(
+                    s,
+                    xs,
+                    head as u32,
+                    eps,
+                    ys,
+                    kernels_slang::ssm::RowSpan::whole(xs),
+                ),
             });
             close(
                 &gpu.down(y, n),
@@ -136,43 +181,58 @@ fn the_gated_norms_answer_the_reference() {
         for sigmoid in [false, true] {
             let want = gated_reference(&xv, &zv, &wv, vd, eps, sigmoid);
             let wt = Tensor::new(w, 1, vd as u32, Dtype::F32);
+            for spans in crate::gpu::row_cuts(rows as u32) {
+                let y = gpu.zeros(n);
+                gpu.run(|s| {
+                    for &span in &spans {
+                        kernels_slang::elemwise::norm::rmsnorm_gated(
+                            s,
+                            f32t(x, width),
+                            bt(z),
+                            wt,
+                            vd as u32,
+                            eps,
+                            sigmoid,
+                            bt(y),
+                            span,
+                        )?;
+                    }
+                    Ok(())
+                });
+                close(
+                    &gpu.down(y, n),
+                    &want,
+                    &format!(
+                        "gated rms sigmoid={sigmoid} {shape}, {} window(s)",
+                        spans.len()
+                    ),
+                );
+            }
+        }
+        let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
+        for spans in crate::gpu::row_cuts(rows as u32) {
             let y = gpu.zeros(n);
             gpu.run(|s| {
-                kernels_slang::elemwise::norm::rmsnorm_gated(
-                    s,
-                    f32t(x, width),
-                    bt(z),
-                    wt,
-                    vd as u32,
-                    eps,
-                    sigmoid,
-                    bt(y),
-                )
+                for &span in &spans {
+                    kernels_slang::elemwise::norm::rmsnorm_gated_by(
+                        s,
+                        f32t(x, width),
+                        bt(z),
+                        Tensor::new(w, 1, vd as u32, Dtype::F32),
+                        heads as u32,
+                        eps,
+                        bt(y),
+                        span,
+                    )?;
+                }
+                Ok(())
             });
             close(
                 &gpu.down(y, n),
                 &want,
-                &format!("gated rms sigmoid={sigmoid} {shape}"),
+                &format!("gated rms by heads {shape}, {} window(s)", spans.len()),
             );
         }
-        let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
-        let y = gpu.zeros(n);
-        gpu.run(|s| {
-            kernels_slang::elemwise::norm::rmsnorm_gated_by(
-                s,
-                f32t(x, width),
-                bt(z),
-                Tensor::new(w, 1, vd as u32, Dtype::F32),
-                heads as u32,
-                eps,
-                bt(y),
-            )
-        });
-        close(
-            &gpu.down(y, n),
-            &want,
-            &format!("gated rms by heads {shape}"),
-        );
     }
 }
 
@@ -324,13 +384,20 @@ fn the_layernorms_answer_the_reference() {
                 bt(b, 1),
                 eps,
                 bt(y, rows),
+                kernels_slang::ssm::RowSpan::whole(bt(x, rows)),
             )
         });
         close(&gpu.down(y, n), &want, &format!("layernorm {shape}"));
         let want = layernorm_reference(&xr, width, eps, None);
         let y = gpu.zeros(n);
         gpu.run(|s| {
-            kernels_slang::elemwise::norm::layernorm_no_scale(s, bt(x, rows), eps, bt(y, rows))
+            kernels_slang::elemwise::norm::layernorm_no_scale(
+                s,
+                bt(x, rows),
+                eps,
+                bt(y, rows),
+                kernels_slang::ssm::RowSpan::whole(bt(x, rows)),
+            )
         });
         close(
             &gpu.down(y, n),
@@ -347,7 +414,15 @@ fn the_layernorms_answer_the_reference() {
             .collect();
         let x = gpu.up_f32(&xv);
         let y = gpu.zeros(2 * n);
-        gpu.run(|s| kernels_slang::elemwise::norm::layernorm_no_scale(s, ft(x), eps, ft(y)));
+        gpu.run(|s| {
+            kernels_slang::elemwise::norm::layernorm_no_scale(
+                s,
+                ft(x),
+                eps,
+                ft(y),
+                kernels_slang::ssm::RowSpan::whole(ft(x)),
+            )
+        });
         let want = layernorm_reference(&xv, width, eps, None);
         close(
             &gpu.down_f32(y, n),

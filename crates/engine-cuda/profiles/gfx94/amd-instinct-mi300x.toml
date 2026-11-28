@@ -1,0 +1,47 @@
+api = 1
+
+# Every MI300X, the virtual function a cloud instance exposes ("AMD Instinct
+# MI300X VF") as the card itself; the rest of the family (MI300A, MI325X)
+# states its own file.
+[target]
+match = { name_contains = ["MI300X"] }
+
+[kernel]
+# One prefill attention block a CU (`kernel.sdpa.prefill.ctas_per_sm`, the
+# grid a split prefill fills and the floor a recorded one pads to), measured
+# against the default two: a captured prefill then splits its keys only where
+# its query tiles fill under half of 304 CUs' blocks, and the split (partials
+# and their fold) lost on every shape it changed. MI300X VF, time to the
+# first token, two runs each (ms; default -> one): Qwen3.5-9B 2048 rows
+# 76.1 / 75.6 -> 74.2 / 74.5, Qwen3-30B-A3B 512 rows 31.1 / 31.1 -> 29.8 /
+# 29.4; at 128, 512, 2048 and 4000 rows on Qwen3.5-9B, Qwen3-8B and
+# Qwen3-30B-A3B no shape slower past its runs' spread.
+sdpa.prefill.ctas_per_sm = 1
+
+[rates]
+# `pie tune cuda --rates` on this MI300X VF, each value the median of five
+# runs, point by point: the launch a captured dependent chain's per-node
+# gap; the matmul's efficiency curve at n = k = 1024, 2048 and 4096 over
+# rows at half octaves from 256 to 8192 through hipBLASLt's first heuristic
+# algorithm (ROCm pads no row tile: the curve carries it; between its
+# octaves it dips where hipBLASLt's tiles fit worse, 553 TFLOP/s at 4096
+# rows against 602 at 2896 and 604 at 5793 at n = k = 4096); attention by
+# keys; HBM and elementwise bandwidth; the gated delta scan; the few-rows
+# rate on the skinny kernel at 8 rows; workgroups_per_core the skinny
+# kernel's resident blocks a CU (8 x 4096 x 4096: 64 KiB of staged rows, all
+# of a CU's LDS, in 1024-thread blocks: 1, over 304 CUs).
+launch_ns = 1536
+gemm_tflops_by_rows = [
+  [1024, [[256, 111.1], [362, 131.1], [512, 167.2], [724, 203.9], [1024, 274.6], [1448, 264.7], [2048, 313.9], [2896, 345.0], [4096, 392.8], [5793, 436.8], [8192, 436.9]]],
+  [2048, [[256, 197.3], [362, 231.1], [512, 277.3], [724, 313.3], [1024, 348.8], [1448, 375.1], [2048, 421.7], [2896, 480.7], [4096, 457.5], [5793, 537.4], [8192, 568.4]]],
+  [4096, [[256, 281.6], [362, 332.0], [512, 365.0], [724, 424.6], [1024, 405.0], [1448, 482.9], [2048, 520.9], [2896, 601.6], [4096, 553.0], [5793, 604.0], [8192, 623.1]]],
+]
+attn_tflops_by_keys = [[512, 64.4], [1024, 137.9], [2048, 222.6], [4096, 362.8], [8192, 521.8]]
+hbm_gbps = 4090.0
+elementwise_gbps = 2569.3
+scan_gelems = 3025.0
+few_row_tflops = 47.9
+workgroups_per_core = 1.0
+
+[provenance]
+rates = "pie tune cuda --rates on 2026-11-18 (pie 0.6.0): AMD Instinct MI300X VF, each value the median of five runs, point by point; the matmul through hipBLASLt's first heuristic algorithm, each rate a burst on the stream doubled until it settles, timed by events, the median of 5 (the launch of 15); the few-rows rate on 8 rows over one cached 4096-square plane; workgroups_per_core the few-rows kernel's resident blocks a multiprocessor by the occupancy calculator; operands: engine::rates' pattern; at commit 92349b867; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"

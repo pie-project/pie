@@ -55,6 +55,8 @@ pub struct Quiet {
     all: std::sync::Condvar,
     /// What [`Quiet::any`] gathers.
     said: core::sync::atomic::AtomicBool,
+    /// What [`Quiet::least`] gathers.
+    least: core::sync::atomic::AtomicU32,
 }
 
 /// How long a rank waits at [`Quiet::meet`] for a peer that never comes (a
@@ -63,12 +65,13 @@ pub struct Quiet {
 const QUIET_PATIENCE: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Quiet {
-    fn new(world: u32) -> &'static Quiet {
+    pub(crate) fn new(world: u32) -> &'static Quiet {
         Box::leak(Box::new(Quiet {
             world,
             met: std::sync::Mutex::new((0, 0)),
             all: std::sync::Condvar::new(),
             said: core::sync::atomic::AtomicBool::new(false),
+            least: core::sync::atomic::AtomicU32::new(u32::MAX),
         }))
     }
 
@@ -86,6 +89,19 @@ impl Quiet {
         self.said.store(false, core::sync::atomic::Ordering::SeqCst);
         self.meet()?;
         Ok(any)
+    }
+
+    /// The least of what every rank of the group says, every rank asking.
+    pub fn least(&self, mine: u32) -> Result<u32> {
+        use core::sync::atomic::Ordering::SeqCst;
+        self.least.fetch_min(mine, SeqCst);
+        self.meet()?;
+        let least = self.least.load(SeqCst);
+        // Read by every rank before it is cleared, as [`Quiet::any`].
+        self.meet()?;
+        self.least.store(u32::MAX, SeqCst);
+        self.meet()?;
+        Ok(least)
     }
 
     /// Waits until every rank of the group has met here.

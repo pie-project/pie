@@ -79,7 +79,7 @@ pub fn loaded(
     bind(container, vec![decls; lanes as usize], caps())
 }
 
-fn caps() -> EngineCaps {
+pub fn caps() -> EngineCaps {
     EngineCaps {
         lora: true,
         attn_page_mask: true,

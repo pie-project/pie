@@ -1,0 +1,31 @@
+api = 1
+
+[target]
+device = "NVIDIA RTX PRO 4500 Blackwell"
+assumes = { coopmat = true }
+
+[provenance]
+measured = ["kernel.gemm.path"]
+rates = "pie tune vulkan --rates on 2026-11-19 (pie 0.6.0): NVIDIA RTX PRO 4500 Blackwell; the matmul through the profile's path, the host's clock around each frame; operands: engine::rates' pattern; at commit unknown; at engine::rates' shapes (matmul m x w x w, w [1024, 2048, 4096], m [256, 362, 512, 724, 1024, 1448, 2048, 2896, 4096, 5793, 8192]; attention keys x keys, keys [512, 1024, 2048, 4096, 8192], 16/8 heads of 128; per-row ops 2048 x 4096; scan 2048 tokens, 16/16 heads of 128x128, conv 4)"
+
+[kernel]
+# `pie tune --quick` over Qwen3-0.6B's and Qwen3-8B's bf16 projections: below
+# 96 rows the 64-row cooperative-matrix tile launches one row of workgroups
+# and runs 1.2-1.8x the 32x32 tiled kernel's time; from 96 it runs 0.5-0.95x.
+# The fitted path runs at 1.011x the per-point best, coopmat everywhere 1.164x.
+gemm.path = [{ when = "rows < 96", use = "tiled" }, "coopmat"]
+
+# Measured on the device at a load (GPU, 2026-11-19). The dense kernels'
+# curves (`kernel_curves`) are left to the device's own first load
+# of each model: they are timed at the model's own planes.
+[rates]
+launch_ns = 5755
+gemm_tflops_by_rows = [
+  [1024, [[256, 7.415241667932763], [362, 10.590642467530655], [512, 14.907490579921417], [724, 16.793917133060503], [1024, 18.78386060913528], [1448, 15.118371482624713], [2048, 18.45686259309076], [2896, 19.156724626618512], [4096, 20.800182558708297], [5793, 22.806770122624293], [8192, 23.377756649035696]]],
+  [2048, [[256, 12.762054352799947], [362, 17.42062413446921], [512, 18.601145510138675], [724, 14.49231446474847], [1024, 18.19885973847679], [1448, 19.81320681628745], [2048, 21.099658182934693], [2896, 22.938803599064446], [4096, 23.86268598105138], [5793, 24.3492234256624], [8192, 24.451057390327883]]],
+  [4096, [[256, 18.583559789110687], [362, 16.556741490729117], [512, 17.983761297771693], [724, 19.912630137704916], [1024, 21.02667909836718], [1448, 23.216466534848006], [2048, 23.745270168775146], [2896, 24.15550499001202], [4096, 24.544690816869032], [5793, 24.75452203981083], [8192, 25.053904124337144]]],
+]
+attn_tflops_by_keys = [[512, 4.7962417011544565], [1024, 5.986275777768796], [2048, 6.585465438980387], [4096, 6.905760694978859], [8192, 7.049434909142882]]
+hbm_gbps = 788.6021962784303
+elementwise_gbps = 884.7809302816158
+scan_gelems = 137.28256117830568

@@ -36,6 +36,13 @@ pub trait Remote: Send + Sync {
 static DIRECTORY: RwLock<Option<Arc<dyn Directory>>> = RwLock::new(None);
 static REMOTE: RwLock<Option<Arc<dyn Remote>>> = RwLock::new(None);
 
+/// Forgets the boot's directory and remote: the next boot's worker sets
+/// its own, or none.
+pub(crate) fn reset() {
+    *DIRECTORY.write().unwrap() = None;
+    *REMOTE.write().unwrap() = None;
+}
+
 pub fn set_directory(directory: Option<Arc<dyn Directory>>) {
     *DIRECTORY.write().unwrap() = directory;
 }
@@ -73,6 +80,21 @@ pub fn sealed_keys() -> HashSet<Hash256> {
     keys
 }
 
+/// The sealed pages this worker holds off the device, by key: `false` on
+/// the host, `true` on disk. A page on two tiers is where it can be read.
+pub fn off_device_keys() -> std::collections::HashMap<Hash256, bool> {
+    let mut keys = std::collections::HashMap::new();
+    for stores in crate::store::registry::all_for_model(0) {
+        let nodes = with_kv_lock(&stores.kv, "offload-report", |kv| kv.node_ids());
+        for slice in nodes.chunks(REPORT_SLICE) {
+            keys.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
+                kv.off_device_key_list(slice)
+            }));
+        }
+    }
+    keys
+}
+
 /// Every cache entry this worker holds, as its pages' keys from token 0.
 pub fn cached_runs() -> Vec<Vec<Hash256>> {
     let mut runs = Vec::new();
@@ -96,19 +118,6 @@ pub fn persisted_keys() -> HashSet<Hash256> {
         }));
     }
     keys
-}
-
-/// The runs whose owner asked a prefix of them kept on disk: each run's last
-/// key, and the tokens asked.
-pub fn persist_hints() -> Vec<(Hash256, u64)> {
-    let mut hints = Vec::new();
-    for stores in crate::store::registry::all_for_model(0) {
-        hints.extend(with_kv_lock(&stores.kv, "offload-report", |kv| {
-            kv.persist_hints()
-        }));
-    }
-    hints.sort_unstable();
-    hints
 }
 
 /// The tokens one kv page holds, and whether the disk tier is kept across

@@ -5,13 +5,15 @@ pub mod ctx;
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 pub mod host;
 #[cfg(feature = "wgpu")]
+pub mod memory;
+#[cfg(feature = "wgpu")]
 pub mod pipelines;
 
 #[cfg(feature = "wgpu")]
 pub use alloc::{Buffer, FileWriter, Memory};
 #[cfg(feature = "wgpu")]
 pub use ctx::{
-    Context, Enabled, Frame, Handed, OnDone, Pending, present, request, request_device,
+    Context, Enabled, Frame, Handed, OnDone, Pending, Stamps, present, request, request_device,
     reservations, wanted_features,
 };
 #[cfg(feature = "wgpu")]
@@ -23,7 +25,7 @@ mod stub;
 #[cfg(not(feature = "wgpu"))]
 pub mod ctx {
     pub use super::stub::{
-        Context, Enabled, Frame, Handed, OnDone, Pending, present, reservations,
+        Context, Enabled, Frame, Handed, OnDone, Pending, Stamps, present, reservations,
     };
 }
 #[cfg(not(feature = "wgpu"))]
@@ -38,7 +40,7 @@ pub mod pipelines {
 #[cfg(not(feature = "wgpu"))]
 pub use stub::{
     Buffer, Context, Enabled, FileWriter, Frame, Handed, Memory, OnDone, Pending, Pipeline,
-    Pipelines, bind_traffic, present, reservations,
+    Pipelines, Stamps, bind_traffic, present, reservations,
 };
 
 /// The shared engine's view of this API.

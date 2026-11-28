@@ -143,7 +143,7 @@ pub struct Wafer {
     pub positions: usize,
     pub vocab: usize,
     pub hidden: usize,
-    /// The program's posted-loop length (its plan's).
+    /// The program's posted-loop length (its plan's `LOOP`).
     pub posted_loop: usize,
     /// A unit program's paging: (lane slots a launch, pages a lane may hold, positions a page).
     pub paging: Option<(usize, u32, u32)>,

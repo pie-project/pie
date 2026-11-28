@@ -38,7 +38,7 @@ members = [
 
     "crates/inferlet",
     "crates/inferlet-macros",
-    "crates/policy",
+    "crates/plex-host",
     "crates/wasmtime-web",
 
     "crates/poem-ir",
@@ -123,6 +123,7 @@ exclude = [
     "examples",
     "crates/builtins/inferlets",
     "crates/builtins/policies",
+    "crates/plex-sdk",
     ".claude",
 ]
 
@@ -172,6 +173,8 @@ wgpu = ["worker/wgpu"]
 xla = ["worker/xla"]
 cerebras = ["worker/cerebras"]
 profile-fire = ["worker/profile-fire"]
+# Test fills of memory nothing should read; for a golden run of a release build.
+test-slot-fill = ["worker/test-slot-fill"]
 # Reads peers' kv in place over NIXL (needs NIXL_PREFIX at build).
 nixl = ["worker/nixl"]
 

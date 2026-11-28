@@ -52,11 +52,12 @@ pub enum Error {
     },
     /// A path is not valid UTF-8.
     Path(PathBuf),
-    /// A directory `PATH` cannot take (it holds the separator).
-    PathJoin(PathBuf),
     /// Every runtime of a process must be created on the thread that created
     /// its first one: the SDK's message system asserts on that and would abort.
     MainThread,
+    /// The SDK's `bin` directory cannot join `PATH` (a path holding the
+    /// separator): its helpers would not be found.
+    PathJoin(PathBuf, String),
 }
 
 impl fmt::Display for Error {
@@ -78,14 +79,14 @@ impl fmt::Display for Error {
                 )
             }
             Error::Path(p) => write!(f, "path is not UTF-8: {}", p.display()),
-            Error::PathJoin(p) => write!(
-                f,
-                "{} cannot join PATH (it holds the separator)",
-                p.display()
-            ),
             Error::MainThread => write!(
                 f,
                 "the SDK runtime must be created on the process's main thread"
+            ),
+            Error::PathJoin(dir, e) => write!(
+                f,
+                "the SDK's helpers in {} cannot join PATH: {e}",
+                dir.display()
             ),
         }
     }
@@ -151,12 +152,18 @@ fn owning_thread() -> bool {
 /// `dir` first on `PATH` (the SDK's helpers run from there); a `PATH` it cannot join is refused.
 fn prepend_path(dir: &Path) -> Result<()> {
     let current = std::env::var_os("PATH").unwrap_or_default();
-    let mut parts = vec![dir.to_path_buf()];
-    parts.extend(std::env::split_paths(&current));
-    let joined = std::env::join_paths(parts).map_err(|_| Error::PathJoin(dir.to_path_buf()))?;
+    let joined = prepended(dir, &current)?;
     // SAFETY: called once at open time, before the SDK spawns any helper.
     unsafe { std::env::set_var("PATH", joined) };
     Ok(())
+}
+
+/// `dir` ahead of the search path `current`, refused by name where it cannot
+/// join one.
+fn prepended(dir: &Path, current: &std::ffi::OsStr) -> Result<std::ffi::OsString> {
+    let mut parts = vec![dir.to_path_buf()];
+    parts.extend(std::env::split_paths(current));
+    std::env::join_paths(parts).map_err(|e| Error::PathJoin(dir.to_path_buf(), e.to_string()))
 }
 
 /// The simulator's threads by default: the host's available parallelism (refused if unknown).

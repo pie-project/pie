@@ -988,6 +988,10 @@ pub struct Committed {
     pub commit: Tensor,
     pub slots: Tensor,
     pub lane0: u32,
+    /// Each lane's carried rows among the extended rows: its replay, or
+    /// none for a compact decode lane, which reads them from its buffer
+    /// (the verify conv, the verify and carried scans).
+    pub ext_replay: Tensor,
 }
 
 fn committed_lanes(op: &'static str, indptr: Tensor) -> Result<u32, Error> {
@@ -1188,10 +1192,6 @@ pub fn gated_delta_committed_landing(
     )
 }
 
-/// The ints of one lane's row in a recurrent buffer's page table
-/// (`PIE_RS_PAGE_INTS`).
-pub const RS_PAGE_INTS: u32 = 8;
-
 /// A recurrent buffer's plane as a verify arm reads it through the fire's
 /// page table: `slab` from the plane's first row in the buffer's first
 /// slot, and each lane's row of `pages` the in-page token of its first
@@ -1203,6 +1203,117 @@ pub struct Paged {
     pub page_tokens: u32,
     pub page_bytes: u32,
     pub row_bytes: u32,
+    /// The ints of a lane's row of `pages`, the load's width (nonzero).
+    pub page_ints: u32,
+}
+
+/// The floats a lane's short-carry record takes (`GdnShortRecord` in
+/// `ssm/gdn_scan.metal`): the own row's normed q and k a key head, each of
+/// up to [`GDN_CARRIED_INLINE`] carried rows' normed keys a key head and
+/// corrected values a value head, their decays, the own row's scalars, and
+/// the lane's facts.
+fn short_record_floats(k_heads: u32, v_heads: u32) -> u64 {
+    let (k, v, r, d) = (
+        u64::from(k_heads),
+        u64::from(v_heads),
+        u64::from(GDN_CARRIED_INLINE),
+        u64::from(GDN_VERIFY_DIM),
+    );
+    (2 + r) * k * d + r * v * d + r * v + 4 * v + v * d + 8
+}
+
+/// The pipelines [`gated_delta_carried`] dispatches whatever its lanes
+/// carry: both forms (16 value rows a threadgroup, a head's 128) and the
+/// per-head table's prepass. A load that buffers recurrent rows builds them
+/// before ready, a beam's long carry being one its warm walk does not reach.
+#[must_use]
+pub fn carried_pipelines() -> [Fire; 10] {
+    [
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_short_bfloat16_s_8_v_4"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prep_bfloat16"),
+        Fire::at(
+            GDN_SCAN_FILE,
+            "gated_delta_carried_prepped_bfloat16_s_8_v_4",
+        ),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16"),
+        Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16"),
+        Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_2"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_bfloat16_s_8_v_16"),
+        Fire::at(GDN_SCAN_FILE, "gated_delta_carried_dots_bfloat16"),
+    ]
+}
+
+/// The carried rows past which [`gated_delta_carried`] runs a head's value
+/// rows a threadgroup (each row's work read once a head) rather than 16.
+pub const GDN_CARRIED_WIDE: u32 = 32;
+
+/// The most carried rows [`gated_delta_carried`] reduces in the scan itself
+/// (a chunk's, `kVerifyChunk`), with no per-head table launched.
+pub const GDN_CARRIED_INLINE: u32 = 16;
+
+/// The per-head table [`gated_delta_carried`] reads each carried row's
+/// reductions from (`gated_delta_carried_dots`): `rows` entries a (lane, key
+/// head), at least the window's most carried rows (`max_rep`), in `table`.
+#[derive(Clone, Copy, Debug)]
+pub struct DotsTable {
+    pub table: Tensor,
+    pub rows: u32,
+    pub max_rep: u32,
+}
+
+impl DotsTable {
+    /// Whether every lane's carried rows fit the table: else the scan makes
+    /// each chunk's reductions itself, whatever a lane carries, and no table
+    /// is launched (a carry is served up to its context, never refused).
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.max_rep <= self.rows
+    }
+}
+
+/// A buffer's corrected planes (`rs_corrected`), as a verify or carried
+/// scan lands and reads them through the fire's page table: each row's raw
+/// keys (bf16, `k_heads * k_dim`) and corrected value `u` (f32, `v_heads *
+/// v_dim`), each from the plane's first row in the buffer's first slot.
+#[derive(Clone, Copy, Debug)]
+pub struct Corrected {
+    pub keys: Tensor,
+    pub key_row_bytes: u32,
+    pub u: Tensor,
+    pub u_row_bytes: u32,
+    /// The rows' per-head scalars (`v_heads` log-gates, then `v_heads` key
+    /// norm inverses, f32): landed with the keys and `u`, read by the
+    /// carried scan in place of recomputing them.
+    pub scalars: Tensor,
+    pub scalars_row_bytes: u32,
+}
+
+fn corrected_args(
+    ctx: &Ctx<'_>,
+    corrected: Option<Corrected>,
+) -> Result<[crate::encode::ArgValue; 7], Error> {
+    Ok(match corrected {
+        Some(c) => [
+            c.keys.arg_mut(),
+            c.key_row_bytes.arg(),
+            c.u.arg_mut(),
+            c.u_row_bytes.arg(),
+            1i32.arg(),
+            c.scalars.arg_mut(),
+            c.scalars_row_bytes.arg(),
+        ],
+        None => [
+            ctx.absent()?,
+            0u32.arg(),
+            ctx.absent()?,
+            0u32.arg(),
+            0i32.arg(),
+            ctx.absent()?,
+            0u32.arg(),
+        ],
+    })
 }
 
 fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::ArgValue; 6], Error> {
@@ -1213,7 +1324,9 @@ fn paged_args(ctx: &Ctx<'_>, paged: Option<Paged>) -> Result<[crate::encode::Arg
             paged.page_tokens.arg(),
             paged.page_bytes.arg(),
             paged.row_bytes.arg(),
-            1i32.arg(),
+            i32::try_from(paged.page_ints.max(1))
+                .unwrap_or(i32::MAX)
+                .arg(),
         ],
         None => [
             ctx.absent()?,
@@ -1290,6 +1403,7 @@ pub fn gated_delta_verify(
     committed: &Committed,
     gates: &VerifyGates,
     paged: Option<Paged>,
+    corrected: Option<Corrected>,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1306,6 +1420,7 @@ pub fn gated_delta_verify(
         committed,
         gates,
         paged,
+        corrected,
         state,
         k_heads,
         v_heads,
@@ -1326,6 +1441,7 @@ fn gated_delta_verify_at(
     committed: &Committed,
     gates: &VerifyGates,
     paged: Option<Paged>,
+    corrected: Option<Corrected>,
     state: &RecurrentPool,
     k_heads: u32,
     v_heads: u32,
@@ -1381,6 +1497,15 @@ fn gated_delta_verify_at(
     let lanes = committed_lanes(OP, indptr)?;
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
+    let [
+        key_slab,
+        key_row_bytes,
+        u_slab,
+        u_row_bytes,
+        is_corrected,
+        scalar_slab,
+        scalar_row_bytes,
+    ] = corrected_args(ctx, corrected)?;
     let z = v_heads
         .checked_mul(lanes)
         .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
@@ -1409,6 +1534,390 @@ fn gated_delta_verify_at(
             page_bytes,
             row_bytes,
             is_paged,
+            state.segments.arg(),
+            key_slab,
+            key_row_bytes,
+            u_slab,
+            u_row_bytes,
+            is_corrected,
+            committed.ext_replay.arg(),
+            scalar_slab,
+            scalar_row_bytes,
+        ],
+    )
+}
+
+/// A decode step over each lane's buffered rows read as a linear attention
+/// (`gated_delta_carried`): every lane a
+/// row of its own and any number of carried rows (their gates and weights a
+/// chunk at a time), read through
+/// the fire's page table from the buffer's `[b | a]` plane (`ba_paged`) and
+/// corrected planes (`corrected`), never re-stepped. Lands the own rows'
+/// readout in `y`, gates in `gates.gates`, and their keys, `u` and `[b | a]`
+/// in the buffer; folds the committed rows into the state (the verify
+/// scan's state, layout and threadgroup).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_carried(
+    ctx: &Ctx<'_>,
+    tuning: &crate::Tuning,
+    qkv: Tensor,
+    indptr: Tensor,
+    committed: &Committed,
+    gates: &VerifyGates,
+    ba_paged: Paged,
+    corrected: Corrected,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: Tensor,
+    table: DotsTable,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_carried";
+    let _ = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_carried_bfloat16" });
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) {
+        return Err(refuse(
+            OP,
+            format!("the {v_heads} value heads are not a whole number of the {k_heads} key heads"),
+        ));
+    }
+    if !gated_delta_verify_fits(k_dim, v_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the carried step reads {GDN_VERIFY_DIM}-wide heads, and these are {k_dim} by {v_dim}"
+            ),
+        ));
+    }
+    // A short carry (a decode at its run-ahead lag) runs 16 value rows a
+    // threadgroup; a long one (a beam in a parents pass carries every row
+    // since its fold) a head's 128 a threadgroup, so each carried row's
+    // gates, weights and values are read once a head, not once a group of
+    // rows. On Qwen3.5-0.8B beam-4 over 256 steps the wide form takes the
+    // step's growth from 58 to 24 us a step.
+    let (groups, vrows, name): (u32, u32, &'static str) = if table.max_rep >= GDN_CARRIED_WIDE {
+        (8, 16, "gated_delta_carried_bfloat16_s_8_v_16")
+    } else {
+        (8, 2, "gated_delta_carried_bfloat16_s_8_v_2")
+    };
+    let lanes = committed_lanes(OP, indptr)?;
+    let z = v_heads
+        .checked_mul(lanes)
+        .ok_or_else(|| refuse(OP, "the value heads of every lane overflow a launch"))?;
+    // A carry of one chunk (a decode at its run-ahead lag): the fused
+    // step's tiling, each row's scalars once a threadgroup,
+    // a head's value tiles over
+    // as many threadgroups as the lanes and heads leave room for.
+    if table.max_rep <= GDN_CARRIED_INLINE {
+        // Four value rows a simdgroup, as the scan step's, eight simdgroups
+        // a threadgroup: a head over four threadgroups. On the M1 at c1 / c4
+        // it beat 4 x 4, 8 x 2, 8 x 8, 8 x 16 and 2 x 16.
+        let (sg, vrows) = (8, 4);
+        // A record a lane in the seat's work area, when it holds one: the
+        // prep makes each lane and value head's inputs once (the own row's
+        // normed q and k, its gates, its landing, the carried rows dense),
+        // which every simdgroup of the short scan otherwise makes for itself.
+        let record = short_record_floats(k_heads, v_heads);
+        let holds = u64::from(k_heads) * u64::from(table.rows) * 4 >= record;
+        // The prepared form where the profile's `kernel.gdn.carried` picks it
+        // at these lanes ([`crate::tuning::GdnCarried`]).
+        if holds && tuning.gdn_carried(lanes, table.max_rep) == crate::tuning::GdnCarried::Prepared
+        {
+            let args = |table_arg| -> Result<Vec<_>, Error> {
+                Ok(vec![
+                    qkv.arg(),
+                    indptr.arg(),
+                    committed.replay.arg(),
+                    committed.commit.arg(),
+                    committed.slots.arg(),
+                    stated(OP, committed.lane0)?.arg(),
+                    gates.ba.arg(),
+                    gates.a_log.arg(),
+                    gates.dt_bias.arg(),
+                    state.state.arg_mut(),
+                    y.arg_mut(),
+                    gates.gates.arg_mut(),
+                    stated(OP, k_heads)?.arg(),
+                    stated(OP, v_heads)?.arg(),
+                    ba_paged.slab.arg_mut(),
+                    ba_paged.pages.arg(),
+                    ba_paged.page_tokens.arg(),
+                    ba_paged.page_bytes.arg(),
+                    ba_paged.row_bytes.arg(),
+                    corrected.keys.arg_mut(),
+                    corrected.key_row_bytes.arg(),
+                    corrected.u.arg_mut(),
+                    corrected.u_row_bytes.arg(),
+                    state.segments.arg(),
+                    ba_paged.page_ints.arg(),
+                    table_arg,
+                    table.rows.arg(),
+                    committed.ext_replay.arg(),
+                    corrected.scalars.arg_mut(),
+                    corrected.scalars_row_bytes.arg(),
+                ])
+            };
+            ctx.fire(
+                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_prep_bfloat16")
+                    .apply(Grid::of([GDN_SCAN_LANES, 1, z], [GDN_SCAN_LANES, 1, 1])),
+                &args(table.table.arg_mut())?,
+            )?;
+            ctx.fire(
+                Fire::at(
+                    GDN_SCAN_FILE,
+                    "gated_delta_carried_prepped_bfloat16_s_8_v_4",
+                )
+                .apply(gated_delta_verify_grid(sg, vrows, z)),
+                &args(table.table.arg_mut())?,
+            )?;
+            return ctx.fire(
+                Fire::at(GDN_SCAN_FILE, "gated_delta_carried_land_bfloat16")
+                    .apply(Grid::of([GDN_SCAN_LANES, 1, z], [GDN_SCAN_LANES, 1, 1])),
+                &args(table.table.arg())?,
+            );
+        }
+        let name = "gated_delta_carried_short_bfloat16_s_8_v_4";
+        return ctx.fire(
+            Fire::at(GDN_SCAN_FILE, name).apply(gated_delta_verify_grid(sg, vrows, z)),
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                gates.ba.arg(),
+                gates.a_log.arg(),
+                gates.dt_bias.arg(),
+                state.state.arg_mut(),
+                y.arg_mut(),
+                gates.gates.arg_mut(),
+                stated(OP, k_heads)?.arg(),
+                stated(OP, v_heads)?.arg(),
+                ba_paged.slab.arg_mut(),
+                ba_paged.pages.arg(),
+                ba_paged.page_tokens.arg(),
+                ba_paged.page_bytes.arg(),
+                ba_paged.row_bytes.arg(),
+                corrected.keys.arg_mut(),
+                corrected.key_row_bytes.arg(),
+                corrected.u.arg_mut(),
+                corrected.u_row_bytes.arg(),
+                state.segments.arg(),
+                ba_paged.page_ints.arg(),
+                table.table.arg(),
+                0u32.arg(),
+                committed.ext_replay.arg(),
+                corrected.scalars.arg_mut(),
+                corrected.scalars_row_bytes.arg(),
+            ],
+        );
+    }
+    // Each carried row's reductions, once a (lane, key head): the table
+    // every value head and row group of the scan reads. A carry of one
+    // chunk (a decode at its lag) makes them in the scan itself, a
+    // simdgroup a row, and launches no table (its rows stated 0).
+    let short = table.max_rep <= GDN_CARRIED_INLINE || !table.fits();
+    let table_rows = if short { 0 } else { table.rows };
+    if table.max_rep > 0 && !short {
+        let zk = k_heads
+            .checked_mul(lanes)
+            .ok_or_else(|| refuse(OP, "the key heads of every lane overflow a launch"))?;
+        ctx.fire(
+            Fire::at(GDN_SCAN_FILE, "gated_delta_carried_dots_bfloat16").apply(Grid::of(
+                [GDN_SCAN_LANES, table.max_rep, zk],
+                [GDN_SCAN_LANES, 1, 1],
+            )),
+            &[
+                qkv.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                corrected.keys.arg_mut(),
+                ba_paged.pages.arg(),
+                ba_paged.page_tokens.arg(),
+                ba_paged.page_bytes.arg(),
+                corrected.key_row_bytes.arg(),
+                ba_paged.page_ints.arg(),
+                stated(OP, k_heads)?.arg(),
+                stated(OP, v_heads)?.arg(),
+                table.table.arg_mut(),
+                table.rows.arg(),
+                committed.ext_replay.arg(),
+            ],
+        )?;
+    }
+    ctx.fire(
+        Fire::at(GDN_SCAN_FILE, name).apply(gated_delta_verify_grid(groups, vrows, z)),
+        &[
+            qkv.arg(),
+            indptr.arg(),
+            committed.replay.arg(),
+            committed.commit.arg(),
+            committed.slots.arg(),
+            stated(OP, committed.lane0)?.arg(),
+            gates.ba.arg(),
+            gates.a_log.arg(),
+            gates.dt_bias.arg(),
+            state.state.arg_mut(),
+            y.arg_mut(),
+            gates.gates.arg_mut(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            ba_paged.slab.arg_mut(),
+            ba_paged.pages.arg(),
+            ba_paged.page_tokens.arg(),
+            ba_paged.page_bytes.arg(),
+            ba_paged.row_bytes.arg(),
+            corrected.keys.arg_mut(),
+            corrected.key_row_bytes.arg(),
+            corrected.u.arg_mut(),
+            corrected.u_row_bytes.arg(),
+            state.segments.arg(),
+            ba_paged.page_ints.arg(),
+            table.table.arg(),
+            table_rows.arg(),
+            committed.ext_replay.arg(),
+            corrected.scalars.arg_mut(),
+            corrected.scalars_row_bytes.arg(),
+        ],
+    )
+}
+
+/// A fire's beam groups' folds: `[lane, n]` a group,
+/// each folding the `n` rows every live beam shares into its set's state
+/// from its first fire lane `lane`'s buffer before the layer's step (that
+/// lane's page table row starts `n` rows past them). The folding groups lead
+/// the table and the first entry of no rows ends it: the kernels fold each
+/// in turn, so a fire with none launches nothing. `count` is how many fold.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupFolds {
+    pub table: Tensor,
+    pub count: u32,
+}
+
+/// The value rows a threadgroup of [`gated_delta_group_fold`] folds.
+const GDN_GROUP_FOLD_VROWS: u32 = 8;
+
+/// Each beam group's gated-delta fold before the layer's step
+/// (`gated_delta_group_fold`): the carried scan's commit of the rows every
+/// live beam shares, read through the group's first lane's page table row,
+/// for the groups whose lane lies in this window (`lane0`, `lanes`).
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_group_fold(
+    ctx: &Ctx<'_>,
+    folds: GroupFolds,
+    (lane0, lanes): (u32, u32),
+    slots: Tensor,
+    (a_log, dt_bias): (Tensor, Tensor),
+    ba_paged: Paged,
+    corrected: Corrected,
+    state: &RecurrentPool,
+    (k_heads, v_heads, k_dim, v_dim): (u32, u32, u32, u32),
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gated_delta_group_fold";
+    if folds.count == 0 {
+        return Ok(());
+    }
+    nonzero(OP, "the key heads this statement states", k_heads)?;
+    nonzero(OP, "the value heads this statement states", v_heads)?;
+    if !v_heads.is_multiple_of(k_heads) || !gated_delta_verify_fits(k_dim, v_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the group fold reads {GDN_VERIFY_DIM}-wide heads, the value heads a whole \
+                 number of the key heads; these are {k_heads} key and {v_heads} value heads, \
+                 {k_dim} by {v_dim}"
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at(GDN_SCAN_FILE, "gated_delta_group_fold_bfloat16").apply(Grid::of(
+            [GDN_SCAN_LANES, v_dim / GDN_GROUP_FOLD_VROWS, v_heads],
+            [GDN_SCAN_LANES, 1, 1],
+        )),
+        &[
+            folds.table.arg(),
+            stated(OP, lane0)?.arg(),
+            stated(OP, lanes)?.arg(),
+            slots.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            state.state.arg_mut(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            ba_paged.slab.arg_mut(),
+            ba_paged.pages.arg(),
+            ba_paged.page_tokens.arg(),
+            ba_paged.page_bytes.arg(),
+            ba_paged.row_bytes.arg(),
+            corrected.keys.arg_mut(),
+            corrected.key_row_bytes.arg(),
+            corrected.u.arg_mut(),
+            corrected.u_row_bytes.arg(),
+            state.segments.arg(),
+            ba_paged.page_ints.arg(),
+        ],
+    )
+}
+
+/// Each beam group's conv fold before the layer's step
+/// (`causal_conv1d_group_fold`): its window moved on by the rows every live
+/// beam shares, read from its first lane's buffer, for the groups whose lane
+/// lies in this window (`lane0`, `lanes`).
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_group_fold(
+    ctx: &Ctx<'_>,
+    folds: GroupFolds,
+    (lane0, lanes): (u32, u32),
+    slots: Tensor,
+    paged: Paged,
+    state: &RecurrentPool,
+    channels: u32,
+    conv_width: u32,
+    dilation: u32,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.causal_conv1d_group_fold";
+    if folds.count == 0 {
+        return Ok(());
+    }
+    if !causal_conv1d_verify_fits(channels, conv_width, dilation) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the group fold runs four of a multiple of four channels, at most \
+                 {CONV_X4_TAPS} taps and {CONV_VERIFY_HIST} rows of history; this one is \
+                 {channels} channels, {conv_width} taps at dilation {dilation}"
+            ),
+        ));
+    }
+    ctx.fire(
+        Fire::at("ssm/conv1d.metal", "causal_conv1d_group_fold_bfloat16").apply(Grid::of(
+            [channels / 4, 1, 1],
+            [
+                (channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS),
+                1,
+                1,
+            ],
+        )),
+        &[
+            folds.table.arg(),
+            stated(OP, lane0)?.arg(),
+            stated(OP, lanes)?.arg(),
+            slots.arg(),
+            state.new_conv_state.arg_mut(),
+            stated(OP, channels)?.arg(),
+            stated(OP, conv_width)?.arg(),
+            stated(OP, dilation)?.arg(),
+            paged.slab.arg_mut(),
+            paged.pages.arg(),
+            paged.page_tokens.arg(),
+            paged.page_bytes.arg(),
+            paged.row_bytes.arg(),
+            paged.page_ints.arg(),
             state.segments.arg(),
         ],
     )
@@ -1451,6 +1960,7 @@ pub fn causal_conv1d_verify(
     y: Tensor,
     land: Tensor,
     snapshots: Option<Snapshots>,
+    own_only: bool,
 ) -> Result<(), Error> {
     const OP: &str = "ssm.causal_conv1d_committed";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_verify_bfloat16" });
@@ -1475,13 +1985,64 @@ pub fn causal_conv1d_verify(
         ));
     }
     let lanes = committed_lanes(OP, indptr)?;
+    // A decode window through a page table: a thread a channel, as the
+    // prompt conv (`causal_conv1d_carried`).
+    if let (true, Some(paged), None) = (own_only, paged, snapshots.as_ref()) {
+        return ctx.fire(
+            Fire::at("ssm/conv1d.metal", "causal_conv1d_carried_bfloat16").apply(Grid::of(
+                [channels, lanes, 1],
+                [channels.min(CONV_GROUP), 1, 1],
+            )),
+            &[
+                x.arg(),
+                indptr.arg(),
+                committed.replay.arg(),
+                committed.commit.arg(),
+                committed.slots.arg(),
+                stated(OP, committed.lane0)?.arg(),
+                weight.arg(),
+                state.new_conv_state.arg_mut(),
+                y.arg_mut(),
+                land.arg_mut(),
+                stated(OP, channels)?.arg(),
+                taps.arg(),
+                stated(OP, dilation)?.arg(),
+                paged.slab.arg_mut(),
+                paged.pages.arg(),
+                paged.page_tokens.arg(),
+                paged.page_bytes.arg(),
+                paged.row_bytes.arg(),
+                i32::try_from(paged.page_ints.max(1))
+                    .unwrap_or(i32::MAX)
+                    .arg(),
+                state.segments.arg(),
+                committed.ext_replay.arg(),
+            ],
+        );
+    }
     let [snaps, lane0] = snapshot_args(ctx, OP, snapshots)?;
     let [slab, pages, page_tokens, page_bytes, row_bytes, is_paged] = paged_args(ctx, paged)?;
-    ctx.fire(
-        Fire::at("ssm/conv1d.metal", entry).apply(Grid::of(
+    // A decode window that makes its own row's output alone runs one row of
+    // threads: the conv's rows are its one own row, and a thread commits
+    // every row of a history it holds whole (`kConvVerifyHeld`).
+    let hist = (conv_width - 1) * dilation + 1;
+    let grid = if own_only && hist <= CONV_VERIFY_HIST / CONV_VERIFY_ROWS {
+        Grid::of(
+            [channels / 4, 1, lanes],
+            [
+                (channels / 4).min(CONV_VERIFY_CHANNELS * CONV_VERIFY_ROWS),
+                1,
+                1,
+            ],
+        )
+    } else {
+        Grid::of(
             [channels / 4, CONV_VERIFY_ROWS, lanes],
             [CONV_VERIFY_CHANNELS, CONV_VERIFY_ROWS, 1],
-        )),
+        )
+    };
+    ctx.fire(
+        Fire::at("ssm/conv1d.metal", entry).apply(grid),
         &[
             x.arg(),
             indptr.arg(),
@@ -1506,6 +2067,8 @@ pub fn causal_conv1d_verify(
             row_bytes,
             is_paged,
             state.segments.arg(),
+            i32::from(own_only).arg(),
+            committed.ext_replay.arg(),
         ],
     )
 }

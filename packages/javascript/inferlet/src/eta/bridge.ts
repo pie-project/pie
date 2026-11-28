@@ -32,12 +32,13 @@ export class InferletError extends Error {
   }
 }
 
-function wit<T>(what: string, f: () => T): T {
+function wit<T>(what: string, f: () => T, hint?: string): T {
   try {
     return f();
   } catch (e: unknown) {
     const payload = (e as { payload?: unknown })?.payload;
-    const msg = typeof payload === 'string' ? payload : e instanceof Error ? e.message : String(e);
+    let msg = typeof payload === 'string' ? payload : e instanceof Error ? e.message : String(e);
+    if (hint) msg = `${msg} ${hint}`;
     throw new InferletError(what ? `${what}: ${msg}` : msg);
   }
 }
@@ -302,11 +303,24 @@ export class WorkingSet {
     return this.ws.folded();
   }
 
-  /** A child sharing the frozen part, with a copy of the buffer. */
+  /** A child sharing the frozen part, with a copy of the buffer; it shares as this set does. */
   fork(on: Pipeline): WorkingSet {
     return WorkingSet.wrap(wit('fork', () => this.ws.fork(on.wit)));
   }
+
+  /**
+   * Publishes this set's frozen slots within `scope`, and lets its passes reuse
+   * what that scope holds. Unasked, a set is private. Ask before its first pass.
+   */
+  share(scope: ShareScope): void {
+    const wire: witWs.ShareScope =
+      typeof scope === 'string' ? { tag: scope } : { tag: 'group', val: scope.group };
+    wit('share', () => this.ws.share(wire));
+  }
 }
+
+/** Who a working set shares with: its session, its tenant, or a named group. */
+export type ShareScope = 'session' | 'tenant' | { group: string };
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -319,6 +333,13 @@ export class Pipeline {
   /** End the stream; already-submitted fires still drain. */
   close(): void {
     this.wit.close();
+  }
+
+  /** Take back what the last `fires` fires submitted on this closed pipeline
+   * wrote, once every fire on it has landed: the rows a program ran ahead
+   * past its stop. */
+  retract(fires: number): void {
+    wit('retract', () => this.wit.retract(fires));
   }
 
   /** Leave the frame wait-set until this pipeline submits again. */
@@ -346,7 +367,9 @@ export class Pipeline {
 
   /**
    * Keep the runtime's run-ahead window full while `onToken` consumes
-   * results, until `budget` fires submit or `onToken` returns `false`.
+   * results, until `budget` fires submit or `onToken` returns `false`. A
+   * break takes back the fires past the one read when `fwd` is retractable;
+   * a final pass's stay in its sets.
    * Returns the run count. `onToken` is synchronous here (host reads block).
    */
   runAhead(fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
@@ -379,7 +402,12 @@ export class Pipeline {
     while (consumed < submitted) {
       if (onToken() === false) {
         if (!ended) this.close();
-        return consumed + 1;
+        // The fire whose output broke the loop read a token the program
+        // took, so its rows stay; those past it are taken back, unless the
+        // pass is final: then they stay in its sets.
+        const kept = consumed + 1;
+        if (submitted > kept && !fwd.isFinal()) this.retract(submitted - kept);
+        return kept;
       }
       consumed += 1;
       if (submitted < budget && submitted - consumed <= (windowFrames - 1) * r) submitOneFrame();
@@ -427,7 +455,6 @@ function cached(key: string, f: () => number): number {
 
 /** Waves per frame (k) for this deployment (cached). */
 export const frameSize = () => cached('frameSize', () => Math.max(witModel.frameSize(), 1));
-export const submitDeadlineUs = () => cached('submitDeadlineUs', () => Number(witModel.submitDeadlineUs()));
 /** Host-reader channel capacity that sustains run-ahead (not cached). */
 export const channelCapacity = () => Math.max(witModel.channelCapacity(), 2);
 export const kvPageSize = () => cached('kvPageSize', () => witModel.kvPageSize());
@@ -501,6 +528,7 @@ export class ForwardPass {
   private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
   private switches: [number, string, string][] = [];
+  private retractableRows = false;
 
   constructor() {
     this.wit = new witForward.ForwardPass();
@@ -568,6 +596,24 @@ export class ForwardPass {
     wit('checkpoints', () => this.wit.checkpoints(Uint32Array.from(slots)));
   }
 
+  /**
+   * State that this pass may take back rows it sampled: the program retracts, truncates, rolls
+   * back or rewinds its sets below a sampled row (a stop string cut in a set it continues, a
+   * draft or speculative verify, a beam, a rollback). Without it a pass is final:
+   * the SDK states its rows final when the program is attached, its lanes fold every row at fire,
+   * a retract over one of its fires is refused by name, and `runAhead` leaves its rows past a
+   * break in place. Before the program.
+   */
+  retractable(): void {
+    if (this.programAttached) throw new InferletError('forward pass program is already attached');
+    this.retractableRows = true;
+  }
+
+  /** Whether this pass's rows are final: `retractable()` was not stated. */
+  isFinal(): boolean {
+    return !this.retractableRows;
+  }
+
   /** Set lane `lane`'s model switch `name` to `value`, before the program. */
   switch(lane: number, name: string, value: string): void {
     if (this.programAttached) throw new InferletError('forward pass program is already attached');
@@ -601,7 +647,10 @@ export class ForwardPass {
     wit('group', () => this.wit.group(lane, id));
   }
 
-  /** Per row, the kv slots it attends, or its attention group's rows without kv. */
+  /**
+   * Per row, what it attends past the frozen part (column c is slot folded() + c:
+   * the buffer, then the pass's rows), or its attention group's rows without kv.
+   */
   mask(rows: Channel): void {
     this.ensurePortsAvailable([Port.ATTN_MASK]);
     wit('mask', () => this.wit.mask(rows.wit()));
@@ -680,6 +729,16 @@ export class ForwardPass {
 
   attachProgram(): void {
     if (this.programAttached) return;
+    // A pass is final unless the program said it may take rows back: the
+    // program's own statement, made here since the runtime takes it before
+    // the program.
+    if (!this.retractableRows) {
+      wit(
+        'final-rows',
+        () => this.wit.finalRows(),
+        '(a pass that binds `parents`, or otherwise takes rows back, states `ForwardPass.retractable()`)',
+      );
+    }
     const builder = new Builder(this.vocab, this.pageSize);
     const lanes = Math.max(
       1,

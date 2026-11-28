@@ -427,13 +427,22 @@ fn res_blend() {
             })
             .collect();
 
-        // Scattered blocks (staged into one stack) ...
+        // Scattered blocks (staged into one stack): a spacer after each, so
+        // no two lie side by side whatever else allocates meanwhile, and the
+        // stack's slab laid in this test's own arena by a size-only walk.
         let scattered: Vec<Tensor> = block_vs
             .iter()
-            .map(|b| gpu.tensor(b, rows, hidden, Dtype::Bf16))
+            .map(|b| {
+                let block = gpu.tensor(b, rows, hidden, Dtype::Bf16);
+                let _spacer = gpu.zeros(1, 64, Dtype::Bf16);
+                block
+            })
             .collect();
         let mut y = gpu.zeros(rows, hidden, Dtype::Bf16);
-        modulate::res_blend(&ctx, prefix, &scattered, norm_w, 1e-6, proj, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            modulate::res_blend(ctx, prefix, &scattered, norm_w, 1e-6, proj, &mut y)
+        })
+        .unwrap();
         close_abs("res_blend scattered", &gpu.read(&y), &want, 2e-2);
 
         // ... and blocks already stacked side by side.

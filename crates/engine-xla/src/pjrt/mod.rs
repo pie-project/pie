@@ -216,10 +216,51 @@ macro_rules! args {
     }};
 }
 
+/// The process's own handling of SIGTERM and SIGINT, put back when dropped.
+/// libtpu installs handlers for them as its plugin loads and its client is
+/// made: they dump every thread's stack and re-raise, so pie's own shutdown
+/// (stop loading, drain, exit) never ran, and one that landed while
+/// programs deserialized hung the process for good (v6e, twice in six kills
+/// during loading behind serving). Its handlers for faults (SIGSEGV, SIGBUS,
+/// ...) stay.
+pub(crate) struct KeptSignals {
+    kept: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl KeptSignals {
+    pub(crate) fn now() -> KeptSignals {
+        let kept = [libc::SIGTERM, libc::SIGINT]
+            .into_iter()
+            .filter_map(|sig| {
+                // SAFETY: `sigaction` is plain data, zeroed a valid value; the
+                // call only reads `sig`'s action into it.
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: as above.
+                let read = unsafe { libc::sigaction(sig, std::ptr::null(), &mut action) };
+                (read == 0).then_some((sig, action))
+            })
+            .collect();
+        KeptSignals { kept }
+    }
+}
+
+impl Drop for KeptSignals {
+    fn drop(&mut self) {
+        for (sig, action) in &self.kept {
+            // SAFETY: restores an action `sigaction` itself returned.
+            unsafe {
+                libc::sigaction(*sig, action, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 impl Api {
     /// dlopens `path` and asks it for its `PJRT_Api`, then runs
-    /// `PJRT_Plugin_Initialize`.
+    /// `PJRT_Plugin_Initialize`, the process's SIGTERM and SIGINT handling
+    /// kept ([`KeptSignals`]).
     pub fn load(path: &Path) -> Result<Arc<Self>> {
+        let _kept = KeptSignals::now();
         // SAFETY: loading a PJRT plugin runs its static initializers; that is
         // the documented way to use one.
         let lib = unsafe { libloading::Library::new(path) }
@@ -336,6 +377,13 @@ impl Api {
     }
 }
 
+/// One memory a device addresses (its HBM, pinned host memory).
+#[derive(Clone, Copy)]
+pub struct Memory<'c> {
+    raw: *mut sys::PJRT_Memory,
+    _client: PhantomData<&'c Client>,
+}
+
 /// A device the client addresses. Borrowed from the client; valid while it is.
 #[derive(Clone, Copy)]
 pub struct Device<'c> {
@@ -384,6 +432,8 @@ impl fmt::Debug for Client {
 
 impl Client {
     pub fn create(api: Arc<Api>) -> Result<Self> {
+        // the process's SIGTERM and SIGINT handling kept as the client is made
+        let _kept = KeptSignals::now();
         let mut a = args!(PJRT_Client_Create_Args {});
         call!(&api, PJRT_Client_Create, &mut a)?;
         let mut client = Self {
@@ -414,6 +464,28 @@ impl Client {
         })
     }
 
+    /// The memory of `device` of `kind` (`"device"`, `"pinned_host"`,
+    /// `"unpinned_host"`), where the plugin addresses one.
+    pub fn memory(&self, device: Device<'_>, kind: &str) -> Result<Option<Memory<'_>>> {
+        let mut a = args!(PJRT_Device_AddressableMemories_Args { device: device.raw });
+        call!(&self.api, PJRT_Device_AddressableMemories, &mut a)?;
+        for i in 0..a.num_memories {
+            // SAFETY: the plugin hands `num_memories` memories owned by the
+            // client, alive as long as `&self`.
+            let raw = unsafe { *a.memories.add(i) };
+            let mut k = args!(PJRT_Memory_Kind_Args { memory: raw });
+            call!(&self.api, PJRT_Memory_Kind, &mut k)?;
+            // SAFETY: the kind is owned by the memory and `kind_size` bytes.
+            if unsafe { text(k.kind, k.kind_size) } == kind {
+                return Ok(Some(Memory {
+                    raw,
+                    _client: PhantomData,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     #[must_use]
     pub fn device_count(&self) -> usize {
         self.devices.len()
@@ -425,6 +497,15 @@ impl Client {
         // SAFETY: the name is owned by the client, which `&self` keeps alive,
         // and is `platform_name_size` bytes long; `text` copies it out.
         Ok(unsafe { text(a.platform_name, a.platform_name_size) })
+    }
+
+    /// The plugin's build, as it names it (libtpu: its version and build).
+    pub fn platform_version(&self) -> Result<String> {
+        let mut a = args!(PJRT_Client_PlatformVersion_Args { client: self.raw });
+        call!(&self.api, PJRT_Client_PlatformVersion, &mut a)?;
+        // SAFETY: the version is owned by the client, which `&self` keeps
+        // alive, and is `platform_version_size` bytes long; `text` copies it.
+        Ok(unsafe { text(a.platform_version, a.platform_version_size) })
     }
 
     pub fn device_kind(&self, device: Device<'_>) -> Result<String> {
@@ -491,6 +572,19 @@ impl Client {
         ty: ElementType,
         dims: &[i64],
     ) -> Result<Buffer> {
+        self.upload_to(device, None, data, ty, dims)
+    }
+
+    /// [`Client::upload`] into `memory` of `device` (a host memory the
+    /// device's programs read), or the device's own where `None`.
+    pub fn upload_to(
+        &self,
+        device: Device<'_>,
+        memory: Option<Memory<'_>>,
+        data: &[u8],
+        ty: ElementType,
+        dims: &[i64],
+    ) -> Result<Buffer> {
         let elements: i64 = dims.iter().product();
         let want = ty.bytes(usize::try_from(elements).unwrap_or(usize::MAX));
         if data.len() != want {
@@ -506,7 +600,12 @@ impl Client {
             dims: dims.as_ptr(),
             num_dims: dims.len(),
             host_buffer_semantics: sys::PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
-            device: device.raw,
+            device: if memory.is_some() {
+                ptr::null_mut()
+            } else {
+                device.raw
+            },
+            memory: memory.map_or(ptr::null_mut(), |m| m.raw),
         });
         call!(&self.api, PJRT_Client_BufferFromHostBuffer, &mut a)?;
         if !a.done_with_host_buffer.is_null() {
@@ -549,6 +648,29 @@ impl fmt::Debug for Buffer {
 }
 
 impl Buffer {
+    /// `size` bytes from byte `offset` of the buffer's device layout, copied
+    /// to the host (`PJRT_Buffer_CopyRawToHost`); waits for them. A u32
+    /// `[_, 128]` array's row `r` lies at `512 r`.
+    pub fn read_raw(&self, offset: i64, size: i64) -> Result<Vec<u8>> {
+        // The plugin copies into 32-byte-aligned host memory only.
+        #[repr(C, align(32))]
+        #[derive(Clone, Copy)]
+        struct Block([u8; 32]);
+        let n = usize::try_from(size).unwrap_or(0);
+        let mut blocks = vec![Block([0; 32]); n.div_ceil(32)];
+        let mut a = args!(PJRT_Buffer_CopyRawToHost_Args {
+            buffer: self.raw,
+            dst: blocks.as_mut_ptr().cast(),
+            offset: offset,
+            transfer_size: size,
+        });
+        call!(&self.api, PJRT_Buffer_CopyRawToHost, &mut a)?;
+        Event::adopt(self.api.clone(), a.event).wait()?;
+        let mut out: Vec<u8> = blocks.iter().flat_map(|b| b.0).collect();
+        out.truncate(n);
+        Ok(out)
+    }
+
     pub fn dims(&self) -> Result<Vec<i64>> {
         let mut a = args!(PJRT_Buffer_Dimensions_Args { buffer: self.raw });
         call!(&self.api, PJRT_Buffer_Dimensions, &mut a)?;
@@ -620,6 +742,15 @@ impl Buffer {
         // SAFETY: `out` outlives the wait below.
         unsafe { self.download_into(&mut out) }?.wait()?;
         Ok(out)
+    }
+
+    /// The buffer's own memory, for a buffer in host memory: a host
+    /// address the program reads in place (pinned host memory written by
+    /// the host between runs).
+    pub fn host_pointer(&self) -> Result<*mut u8> {
+        let mut a = args!(PJRT_Buffer_UnsafePointer_Args { buffer: self.raw });
+        call!(&self.api, PJRT_Buffer_UnsafePointer, &mut a)?;
+        Ok(a.buffer_pointer as *mut u8)
     }
 
     /// An event that fires once the buffer's defining computation is done.
@@ -779,6 +910,46 @@ impl Executable {
             .collect();
         Ok((outputs, Event::adopt(self.api.clone(), done)))
     }
+}
+
+impl Executable {
+    /// The memory the compiled program takes (`GetCompiledMemoryStats`):
+    /// argument, output, alias, temp and generated-code bytes, and its peak.
+    pub fn compiled_memory(&self) -> Result<CompiledMemory> {
+        let mut g = args!(PJRT_LoadedExecutable_GetExecutable_Args {
+            loaded_executable: self.raw
+        });
+        call!(&self.api, PJRT_LoadedExecutable_GetExecutable, &mut g)?;
+        let mut m = args!(PJRT_Executable_GetCompiledMemoryStats_Args {
+            executable: g.executable
+        });
+        let r = call!(&self.api, PJRT_Executable_GetCompiledMemoryStats, &mut m);
+        let mut d = args!(PJRT_Executable_Destroy_Args {
+            executable: g.executable
+        });
+        let _ = call!(&self.api, PJRT_Executable_Destroy, &mut d);
+        r?;
+        let bytes = |v: i64| u64::try_from(v).unwrap_or(0);
+        Ok(CompiledMemory {
+            argument: bytes(m.argument_size_in_bytes),
+            output: bytes(m.output_size_in_bytes),
+            alias: bytes(m.alias_size_in_bytes),
+            temp: bytes(m.temp_size_in_bytes),
+            code: bytes(m.generated_code_size_in_bytes),
+            peak: bytes(m.peak_memory_in_bytes),
+        })
+    }
+}
+
+/// A compiled program's memory (`Executable::compiled_memory`), in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompiledMemory {
+    pub argument: u64,
+    pub output: u64,
+    pub alias: u64,
+    pub temp: u64,
+    pub code: u64,
+    pub peak: u64,
 }
 
 impl Drop for Executable {

@@ -4,8 +4,12 @@
 #![allow(unsafe_code)]
 
 pub mod blas;
+pub mod code_object;
+pub mod kfd;
 pub mod lt;
 pub mod lt_grouped;
+pub mod lt_kernel;
+mod msgpack;
 pub mod rt;
 pub mod sys;
 
@@ -13,6 +17,71 @@ use core::ffi::{c_char, c_int, c_void};
 use std::ffi::{CStr, CString};
 
 use crate::error::Error;
+
+/// Takes now, on the current device, what the HIP runtime and the libraries
+/// this crate calls take of the device on their first use: the blit kernels
+/// HIP loads at its first device memset (with their buffers, about 146 MiB
+/// on gfx942) and the hipBLASLt handle (about 26 MiB). A load calls it
+/// before its pools read the card, so what the process holds beside them
+/// is held when they are sized, and no later first call takes device
+/// memory the pools were promised.
+pub fn open() -> Result<(), Error> {
+    const OP: &str = "hip.open";
+    let mut probe: *mut c_void = core::ptr::null_mut();
+    // SAFETY: a live out-parameter.
+    let code = unsafe { rt::hipMalloc(&raw mut probe, 4) };
+    if code != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipMalloc", code));
+    }
+    // SAFETY: `probe` is the four device bytes just allocated, freed once
+    // below after the memset has run.
+    let memset = unsafe { rt::hipMemset(probe, 0, 4) };
+    // SAFETY: as above.
+    let freed = unsafe { rt::hipFree(probe) };
+    if memset != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipMemset", memset));
+    }
+    if freed != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipFree", freed));
+    }
+    lt::open().map_err(|refused| Error::Backend {
+        op: OP,
+        detail: refused.to_string(),
+    })?;
+    // hipBLASLt's grouped kernels, which every routed MLP and live-row
+    // product past a decode's rows runs: a box whose hipBLASLt is not the
+    // release they are driven for is refused here, at the load.
+    lt_grouped::library(dtype::Dtype::Bf16)
+        .map(|_| ())
+        .map_err(|why| Error::Backend {
+            op: OP,
+            detail: why,
+        })
+}
+
+/// Makes each of `streams`' copy queue now ([`kfd::warm_copies`]): the
+/// streams a load copies on while serving, so no first copy makes a queue,
+/// and the device memory its save area holds, after the load.
+pub fn warm_copies(streams: &[sys::Stream]) -> Result<(), Error> {
+    const OP: &str = "hip.warm_copies";
+    if sys::copy_queues() == sys::CopyQueues::Off {
+        return Ok(());
+    }
+    let bytes = kfd::blit_threshold() + 1;
+    let mut scratch: *mut c_void = core::ptr::null_mut();
+    // SAFETY: a live out-parameter; freed below.
+    let code = unsafe { rt::hipMalloc(&raw mut scratch, bytes) };
+    if code != sys::HIP_SUCCESS {
+        return Err(hip_fault(OP, "hipMalloc", code));
+    }
+    // SAFETY: `scratch` was just allocated with `bytes`, one past the blit
+    // threshold, and nothing else holds it; the streams are the caller's
+    // live ones.
+    let warmed = unsafe { kfd::warm_copies(streams, scratch) };
+    // SAFETY: allocated above, freed once, after every copy synchronized.
+    unsafe { rt::hipFree(scratch) };
+    warmed.map_err(|detail| Error::Backend { op: OP, detail })
+}
 
 fn hip_fault(op: &'static str, call: &'static str, code: sys::HipError) -> Error {
     let text = sys::api()
@@ -69,7 +138,47 @@ pub fn warp_size(ordinal: u32) -> Result<u32, Error> {
     Ok(value as u32)
 }
 
+/// The compute units of device `ordinal` that this process's queues run
+/// on, as the engine stated them from the process's CU masks
+/// ([`hold_queue_units`]); every count of the device's units here answers
+/// these, never the device's whole.
+fn queue_units() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u32>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// States that this process's queues on device `ordinal` run on `units` of
+/// its compute units (a CU mask), before anything is shaped by the count:
+/// [`multiprocessors`], the launchers' grids and occupancy math, read it
+/// from then on.
+pub fn hold_queue_units(ordinal: u32, units: u32) {
+    queue_units()
+        .lock()
+        .expect("queue units lock poisoned")
+        .insert(ordinal, units.max(1));
+}
+
+/// `units` of device `ordinal` as its queues hold them: the stated count
+/// where one was stated, at most the device's.
+pub(crate) fn held_units(ordinal: u32, units: u32) -> u32 {
+    queue_units()
+        .lock()
+        .expect("queue units lock poisoned")
+        .get(&ordinal)
+        .map_or(units, |&held| held.min(units))
+}
+
+/// The compute units this process's queues on device `ordinal` run on
+/// (the device's, less what a stated CU mask keeps them off:
+/// [`hold_queue_units`]).
 pub fn multiprocessors(ordinal: u32) -> Result<u32, Error> {
+    Ok(held_units(ordinal, all_multiprocessors(ordinal)?))
+}
+
+/// Every compute unit device `ordinal` has, whatever this process's queues
+/// are masked to: what a CU mask is read against.
+pub fn all_multiprocessors(ordinal: u32) -> Result<u32, Error> {
     let mut value: c_int = 0;
     check!(
         "hip.multiprocessors",
@@ -166,6 +275,7 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if let Ok(api) = sys::api() {
+            kfd::forget(self.0);
             // SAFETY: the stream came from `hipStreamCreate` and is destroyed once.
             unsafe { (api.hip.hipStreamDestroy)(self.0) };
         }
@@ -389,6 +499,12 @@ pub struct Module(sys::Module);
 
 impl Module {
     pub fn load(code: &[u8]) -> Result<Self, Error> {
+        // A kernel that asks HIP for a buffer at its first launch would
+        // allocate on the device after the load: refused by name.
+        code_object::refuse_late_buffers(code).map_err(|detail| Error::Backend {
+            op: "hip.module_load",
+            detail,
+        })?;
         let mut module: sys::Module = core::ptr::null_mut();
         check!(
             "hip.module_load",
@@ -482,6 +598,16 @@ pub unsafe fn memcpy_async(
     kind: Direction,
     stream: sys::Stream,
 ) -> Result<(), sys::HipError> {
+    // A size-only walk (`crate::sizing`) copies nothing to or from a
+    // stand-in; a read of one back to the host has no answer there.
+    if crate::sizing::active()
+        && (crate::sizing::stands_in(dst.addr()) || crate::sizing::stands_in(src.addr()))
+    {
+        return match kind {
+            Direction::DeviceToHost => Err(801),
+            _ => Ok(()),
+        };
+    }
     let api = sys::api().map_err(|_| -1)?;
     let kind = match kind {
         Direction::HostToDevice => sys::MEMCPY_HOST_TO_DEVICE,

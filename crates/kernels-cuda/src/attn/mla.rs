@@ -294,35 +294,40 @@ unsafe fn absorb(
     let alpha = 1.0f32;
     let beta = 0.0f32;
 
-    // SAFETY: the handle and the three operands are as this fn's contract
-    // states; `alpha` and `beta` are host f32 locals, matching the default
-    // host pointer mode and the 32F compute type, and outlive the call.
-    let status = unsafe {
-        cublasGemmStridedBatchedEx(
-            handle.cast::<cublasContext>(),
-            op_a,
-            cublasOperation_t::CUBLAS_OP_N,
-            m,
-            n,
-            k,
-            core::ptr::from_ref(&alpha).cast(),
-            a as usize as *const core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            lda,
-            stride_a,
-            b as usize as *const core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            ldb,
-            stride_b,
-            core::ptr::from_ref(&beta).cast(),
-            c as usize as *mut core::ffi::c_void,
-            cudaDataType::CUDA_R_16BF,
-            ldc,
-            stride_c,
-            heads,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-        )
+    let status = if crate::sizing::active() {
+        // A size-only walk (`crate::sizing`) runs no product.
+        cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    } else {
+        // SAFETY: the handle and the three operands are as this fn's contract
+        // states; `alpha` and `beta` are host f32 locals, matching the default
+        // host pointer mode and the 32F compute type, and outlive the call.
+        unsafe {
+            cublasGemmStridedBatchedEx(
+                handle.cast::<cublasContext>(),
+                op_a,
+                cublasOperation_t::CUBLAS_OP_N,
+                m,
+                n,
+                k,
+                core::ptr::from_ref(&alpha).cast(),
+                a as usize as *const core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                lda,
+                stride_a,
+                b as usize as *const core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                ldb,
+                stride_b,
+                core::ptr::from_ref(&beta).cast(),
+                c as usize as *mut core::ffi::c_void,
+                cudaDataType::CUDA_R_16BF,
+                ldc,
+                stride_c,
+                heads,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
     };
     if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         Ok(())
@@ -398,7 +403,7 @@ fn dispatch_dense(
     // A rope part other than 64 wide (GLM-5.3-Flash's none) is the naive
     // kernel's too: the FA2 arms read a 64-wide one beside the latent.
     // An fp8 pool is the naive arm's tensor-core kernel's, which widens it.
-    if ctx.tuning().mla_naive
+    if ctx.tuning().mla_naive()
         || window.is_some()
         || layer.kv_lora_rank != 512
         || layer.rope_dim != 64

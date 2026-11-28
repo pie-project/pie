@@ -33,18 +33,14 @@ impl WorkerControl for NoTurns {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
-        retention: i64,
-        // A pool keeps what it takes in its own store, on disk or not, as
-        // its configuration says.
-        _disk: bool,
     ) -> Result<u32, String> {
         let pages = transport::tcp::fetch(&from, &keys, 0).await?;
         let count = pages.count as u32;
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || pool.put_run(&keys, 0, pages, retention))
+        tokio::task::spawn_blocking(move || pool.put_run(&keys, 0, pages))
             .await
             .map_err(|e| e.to_string())??;
-        tracing::info!(pages = count, %from, retention, "took a run");
+        tracing::info!(pages = count, %from, "took a run");
         Ok(count)
     }
 
@@ -52,10 +48,15 @@ impl WorkerControl for NoTurns {
         Accepted::Reject
     }
     async fn cancel(self, _: tarpc::context::Context, _: ReqId) {}
+    async fn set_executors(self, _: tarpc::context::Context, _: ReqId, _: Vec<WorkerId>) {}
     async fn set_priority(self, _: tarpc::context::Context, _: ReqId, _: Priority) {}
     async fn end_session(self, _: tarpc::context::Context, _: SessionId) {}
     async fn drain(self, _: tarpc::context::Context) {}
     async fn plex_session(self, _: tarpc::context::Context, _: String, _: Option<String>) {}
+
+    /// A pool serves runs by key and keys nothing itself: grants are the
+    /// asking workers' to check.
+    async fn share_groups(self, _: tarpc::context::Context, _: controller_api::ShareGrants) {}
 }
 
 /// Where a pool keeps every page beyond its memory.
@@ -150,7 +151,8 @@ const REDIAL_AFTER: Duration = Duration::from_secs(1);
 async fn link(pool: &engine_cpu::Pool, listen: &str, gateway: &str, id: WorkerId) -> Result<()> {
     let addr = gateway.strip_prefix("tcp://").unwrap_or(gateway);
     let mut conn = tcp::connect(addr, dispatch_codec);
-    conn.config_mut().max_frame_length(64 << 20);
+    conn.config_mut()
+        .max_frame_length(worker_api::LINK_MAX_FRAME_BYTES);
     let transport = conn
         .await
         .with_context(|| format!("dialing the gateway at {gateway}"))?;

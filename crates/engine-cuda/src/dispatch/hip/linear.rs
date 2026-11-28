@@ -6,6 +6,10 @@ use poem_ir::{Dtype, Fused, Linear, Operands, ValueId};
 
 use crate::run::Run;
 
+/// A host-resident bank's staged experts: their codes, scales and biases
+/// in the staging, and the routes renumbered to their places there.
+type StagedExperts = (Tensor, Tensor, Option<Tensor>, Tensor);
+
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
         self.linear(op).map_err(crate::error::kernel)?;
@@ -45,6 +49,152 @@ impl Run<'_> {
         }
     }
 
+    /// A residual norm whose normed rows only the product reads: in one
+    /// launch where the skinny kernel takes the product and the fold pays
+    /// (`linear::gemm::residual_add_rmsnorm_matmul` prices it), else the
+    /// norm (its sum into `y_out`, `y` left as it was) then the product.
+    pub(super) fn norm_matmul(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::ResidualAddRmsnormMatmul {
+            x,
+            y,
+            y_out,
+            weight,
+            plus_one,
+            eps,
+            out,
+            w,
+            z,
+        } = op
+        else {
+            unreachable!("only the residual norm and product dispatch here")
+        };
+        if self.dense_weight(*w)
+            && linear::gemm::residual_add_rmsnorm_matmul(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                self.tensor(*w),
+                &mut self.tensor(*y_out),
+                &mut self.tensor(*out),
+                &mut self.tensor(*z),
+            )?
+        {
+            return Ok(());
+        }
+        let norm = || {
+            kernels_cuda::elemwise::norm_residual::residual_add_rmsnorm_into(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                &mut self.tensor(*y_out),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                &mut self.tensor(*out),
+            )
+        };
+        if self.lane_shaped(*y_out) {
+            self.unseated(norm)?;
+        } else {
+            norm()?;
+        }
+        self.linear(&Linear::Matmul {
+            act: *out,
+            w: *w,
+            y: *z,
+            input_scales: None,
+            scales: None,
+            quant: None,
+            logits: false,
+        })
+    }
+
+    /// A residual norm feeding a dense MLP whole: the norm folded into the
+    /// gate-up product where the skinny kernel takes it and the fold pays
+    /// (`linear::gemm::residual_add_rmsnorm_matmul_swiglu` prices it), then
+    /// the down product; else the norm (its sum into `y_out`) then the MLP
+    /// as `MatmulSwigluMatmul` runs it, a held shared expert's included.
+    pub(super) fn norm_mlp(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::ResidualAddRmsnormMatmulSwigluMatmul {
+            x,
+            y,
+            y_out,
+            weight,
+            plus_one,
+            eps,
+            out,
+            gate_up,
+            down,
+            intermediate,
+            packed,
+            h,
+            z,
+        } = op
+        else {
+            unreachable!("only the residual norm and dense MLP dispatch here")
+        };
+        let mlp = Fused::MatmulSwigluMatmul {
+            act: *out,
+            gate_up: *gate_up,
+            down: *down,
+            intermediate: *intermediate,
+            packed: *packed,
+            h: *h,
+            y: *z,
+        };
+        let held = crate::run::HeldShared {
+            y: *z,
+            gate_up: *gate_up,
+            down: *down,
+        };
+        if !self.holds_shared(*out, held)
+            && self.dense_weight(*gate_up)
+            && linear::gemm::residual_add_rmsnorm_matmul_swiglu(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                self.tensor(*gate_up),
+                &mut self.tensor(*y_out),
+                &mut self.tensor(*out),
+                &mut self.tensor(*h),
+            )?
+        {
+            return self.linear(&Linear::Matmul {
+                act: *h,
+                w: *down,
+                y: *z,
+                input_scales: None,
+                scales: None,
+                quant: None,
+                logits: false,
+            });
+        }
+        let norm = || {
+            kernels_cuda::elemwise::norm_residual::residual_add_rmsnorm_into(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+                &mut self.tensor(*y_out),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                &mut self.tensor(*out),
+            )
+        };
+        if self.lane_shaped(*y_out) {
+            self.unseated(norm)?;
+        } else {
+            norm()?;
+        }
+        self.fused_linear(&mlp)
+    }
+
     pub(super) fn fused_linear(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
             Fused::MatmulGlu {
@@ -69,7 +219,7 @@ impl Run<'_> {
                             i,
                             k,
                             linear::skinny::Epilogue::Geglu,
-                            self.ctx().tuning().gemm_skinny_rows,
+                            self.ctx().tuning().gemm_skinny_rows(),
                         )
                     {
                         return linear::skinny::skinny_bf16(
@@ -221,7 +371,7 @@ impl Run<'_> {
                         n,
                         k,
                         epilogue,
-                        self.ctx().tuning().gemm_skinny_rows,
+                        self.ctx().tuning().gemm_skinny_rows(),
                     ) {
                         return linear::skinny::skinny_bf16(
                             self.ctx(),
@@ -266,6 +416,25 @@ impl Run<'_> {
                 return Ok(());
             }
         }
+        match op {
+            Linear::Matmul { .. } | Linear::RelBias { .. } | Linear::LoraCorrect { .. } => {
+                self.linear_matmul(op)
+            }
+            Linear::Glu { .. } | Linear::GeluTanh { .. } | Linear::Relu2 { .. } => {
+                self.linear_activation(op)
+            }
+            Linear::MoeRoute { .. } | Linear::GroupRoutes { .. } => self.linear_moe_route(op),
+            Linear::MoeSelect { .. } => self.linear_moe_select(op),
+            Linear::MatmulGrouped { .. } => self.linear_moe_grouped(op),
+            Linear::MoeCombine { .. }
+            | Linear::MoeBiasSum { .. }
+            | Linear::MoeSigmoidGateAdd { .. } => self.linear_moe_combine(op),
+        }
+    }
+
+    /// A dense product: a matmul (its logits, quantized and tiled forms), the
+    /// relative-position bias, the adapters' correction.
+    fn linear_matmul(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
             Linear::Matmul {
                 act,
@@ -314,7 +483,7 @@ impl Run<'_> {
                     let act = self.tensor(*act);
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from()
                         || act.rows > linear::affine::tiled::GEMV_ROWS
                     {
                         linear::affine::tiled::matmul
@@ -337,7 +506,7 @@ impl Run<'_> {
                     let act = self.tensor(*act);
                     // The GEMV lands one 16-row tile; past it the GEMM, whatever
                     // the dense arm's threshold.
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from()
                         || act.rows > linear::affine::tiled::GEMV_ROWS
                     {
                         linear::affine::tiled::lm_head
@@ -348,6 +517,58 @@ impl Run<'_> {
                 }
                 None => self.row_major_lm_head(act, w, y),
             },
+            Linear::Matmul {
+                act,
+                w,
+                quant: Some(quant),
+                input_scales: _,
+                scales,
+                y,
+                logits: false,
+                ..
+            } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
+            // The forms no builder makes.
+            Linear::Matmul { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Linear::RelBias {
+                x,
+                w,
+                heads,
+                d_rel,
+                extent,
+                y,
+            } => kernels_cuda::elemwise::posenc::rel_bias(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*w),
+                *heads,
+                *d_rel,
+                *extent,
+                &mut self.tensor(*y),
+            ),
+            Linear::LoraCorrect {
+                x,
+                bank_a,
+                bank_b,
+                routes,
+                y: _,
+                y_out,
+            } => linear::lora::correct(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*bank_a),
+                self.tensor(*bank_b),
+                self.tensor(*routes),
+                &mut self.tensor(*y_out),
+                self.segments(),
+            ),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A gated or plain activation over a product: the GLU forms, GELU-tanh,
+    /// squared ReLU.
+    fn linear_activation(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
@@ -452,71 +673,6 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
-            Linear::MoeCombine {
-                routed,
-                shared: Some(shared),
-                y,
-                weights: None,
-                ..
-            } => linear::moe::sum_add(
-                self.ctx(),
-                self.tensor(*routed),
-                self.tensor(*shared),
-                &mut self.tensor(*y),
-            ),
-            Linear::Matmul {
-                act,
-                w,
-                quant: Some(quant),
-                input_scales: _,
-                scales,
-                y,
-                logits: false,
-                ..
-            } => self.matmul_act_quant(*act, *w, *quant, *scales, *y),
-            // The forms no builder makes.
-            Linear::Matmul { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
-            Linear::MoeSelect {
-                x,
-                bank,
-                routes,
-                quant: Some(quant),
-                input_scales: _,
-                y,
-                bias: None,
-                quantized: true,
-                ..
-            } => {
-                const OP: &str = "linear.moe_select";
-                // The routes' rows read x's rows, so x's rows are what quantize.
-                // An fp8 bank (f32 factors) reads e4m3 rows under f32 scales
-                // a 1x128 block; any other bank, ue8m0 ones.
-                let (codes, scales, biases) = self.planes(*bank);
-                let fp8_bank = biases.is_none()
-                    && linear::moe::fp8_tiles(self.tensor(*x), codes, scales, &self.tensor(*y));
-                match *quant {
-                    poem_ir::ActQuant::E4m3 { gran: 128 } if fp8_bank => {
-                        self.select_fp8(*x, *bank, *routes, *y)
-                    }
-                    poem_ir::ActQuant::E4m3 { gran } if fp8_bank => {
-                        Err(kernels_cuda::Error::Backend {
-                            op: OP,
-                            detail: format!(
-                                "an fp8 bank folds f32 activation scales over its 128-wide blocks, not {gran}-wide ones"
-                            ),
-                        })
-                    }
-                    poem_ir::ActQuant::E4m3 { gran } => {
-                        let fan = self.plane_fan(*x);
-                        let x = self.tensor(*x);
-                        let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
-                        self.select_quant(x, *bank, *routes, *y)
-                    }
-                    poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
-                }
-            }
-            // Legs the pack left apart: the packed forms over a gate and an
-            // up plane, an unclamped SwiGLU clamped at the largest finite f32.
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
@@ -650,6 +806,13 @@ impl Run<'_> {
             }
             // The forms no builder makes.
             Linear::Glu { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A MoE router: the routes and their weights, and the routes grouped.
+    fn linear_moe_route(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
             Linear::MoeRoute {
                 logits,
                 experts,
@@ -733,22 +896,6 @@ impl Run<'_> {
                 &mut self.tensor(*routes),
                 &mut self.tensor(*weights),
             ),
-            Linear::RelBias {
-                x,
-                w,
-                heads,
-                d_rel,
-                extent,
-                y,
-            } => kernels_cuda::elemwise::posenc::rel_bias(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*w),
-                *heads,
-                *d_rel,
-                *extent,
-                &mut self.tensor(*y),
-            ),
             Linear::MoeRoute {
                 logits,
                 bias: Some(bias),
@@ -828,66 +975,54 @@ impl Run<'_> {
             Linear::GroupRoutes { groups, routes } => {
                 linear::moe_route::group_routes(self.ctx(), *groups, &mut self.tensor(*routes))
             }
-            Linear::MatmulGrouped {
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// The selected experts' product over their routes.
+    fn linear_moe_select(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Linear::MoeSelect {
                 x,
-                w,
+                bank,
                 routes,
-                groups,
+                quant: Some(quant),
+                input_scales: _,
                 y,
+                bias: None,
+                quantized: true,
+                ..
             } => {
-                const OP: &str = "linear.matmul_grouped";
-                if self.maybe_tiled_planes(*w).is_some() {
-                    return Err(kernels_cuda::Error::Backend {
-                        op: OP,
-                        detail: "a quantized o-projection plane is not yet read grouped on the \
-                                 CUDA arm"
-                            .to_string(),
-                    });
+                const OP: &str = "linear.moe_select";
+                // The routes' rows read x's rows, so x's rows are what quantize.
+                // An fp8 bank (f32 factors) reads e4m3 rows under f32 scales
+                // a 1x128 block; any other bank, ue8m0 ones.
+                let (codes, scales, biases) = self.planes(*bank);
+                let fp8_bank = biases.is_none()
+                    && linear::moe::fp8_tiles(self.tensor(*x), codes, scales, &self.tensor(*y));
+                match *quant {
+                    poem_ir::ActQuant::E4m3 { gran: 128 } if fp8_bank => {
+                        self.select_fp8(*x, *bank, *routes, *y)
+                    }
+                    poem_ir::ActQuant::E4m3 { gran } if fp8_bank => {
+                        Err(kernels_cuda::Error::Backend {
+                            op: OP,
+                            detail: format!(
+                                "an fp8 bank folds f32 activation scales over its 128-wide blocks, not {gran}-wide ones"
+                            ),
+                        })
+                    }
+                    poem_ir::ActQuant::E4m3 { gran } => {
+                        let fan = self.plane_fan(*x);
+                        let x = self.tensor(*x);
+                        let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
+                        self.select_quant(x, *bank, *routes, *y)
+                    }
+                    poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
                 }
-                let x = self.tensor(*x);
-                let y = self.tensor(*y);
-                let groups_nz = *groups;
-                if groups_nz == 0
-                    || !x.width.is_multiple_of(groups_nz)
-                    || !y.width.is_multiple_of(groups_nz)
-                {
-                    return Err(kernels_cuda::Error::Backend {
-                        op: OP,
-                        detail: format!(
-                            "{groups_nz} groups do not divide a {}-wide row into a {}-wide one",
-                            x.width, y.width
-                        ),
-                    });
-                }
-                let rows = x.rows * groups_nz;
-                let x =
-                    kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
-                let mut y =
-                    kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
-                let (bank, experts) = self.expert_bank(*w);
-                // The weight is the groups' [n, k] blocks stacked as one
-                // [groups·n, k] matrix; the select reads it as `groups`
-                // experts of n·k, the shape its expert-ordered legs take.
-                let (n, k) = (u64::from(y.width), u64::from(x.width));
-                let bank = if !experts.streams()
-                    && u64::from(bank.rows) * u64::from(bank.width) == u64::from(groups_nz) * n * k
-                    && let Ok(stride) = u32::try_from(n * k)
-                {
-                    kernels_cuda::tensor::Tensor::new(bank.ptr, groups_nz, stride, bank.dtype)
-                } else {
-                    bank
-                };
-                let identity = self.group_routes_of(*routes, groups_nz);
-                linear::moe::matmul_grouped(
-                    self.ctx(),
-                    x,
-                    bank,
-                    self.tensor(*routes),
-                    &mut y,
-                    experts,
-                    identity,
-                )
             }
+            // Legs the pack left apart: the packed forms over a gate and an
+            // up plane, an unclamped SwiGLU clamped at the largest finite f32.
             Linear::MoeSelect {
                 x,
                 bank,
@@ -924,6 +1059,9 @@ impl Run<'_> {
                     "the biased select is the mxfp4 gate/up leg's; an affine bank's \
                      zero points ride the quant twin"
                 );
+                // A bank the weight cache streams reads its experts (codes,
+                // exponents and bias) through the cache's table.
+                let experts = self.bank_table(*bank);
                 linear::moe::matmul_select_bias(
                     self.ctx(),
                     self.tensor(*x),
@@ -932,8 +1070,7 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
-                    // The engine streams no experts on ROCm yet.
-                    linear::moe::ExpertTable::RESIDENT,
+                    experts,
                 )
             }
             Linear::MoeSelect {
@@ -951,6 +1088,101 @@ impl Run<'_> {
             }
             // The forms no builder makes.
             Linear::MoeSelect { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A product over expert groups.
+    fn linear_moe_grouped(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Linear::MatmulGrouped {
+                x,
+                w,
+                routes,
+                groups,
+                y,
+            } => {
+                const OP: &str = "linear.matmul_grouped";
+                if self.maybe_tiled_planes(*w).is_some() {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: OP,
+                        detail: "a quantized o-projection plane is not yet read grouped on the \
+                                 CUDA arm"
+                            .to_string(),
+                    });
+                }
+                let x = self.tensor(*x);
+                let y = self.tensor(*y);
+                let groups_nz = *groups;
+                if groups_nz == 0
+                    || !x.width.is_multiple_of(groups_nz)
+                    || !y.width.is_multiple_of(groups_nz)
+                {
+                    return Err(kernels_cuda::Error::Backend {
+                        op: OP,
+                        detail: format!(
+                            "{groups_nz} groups do not divide a {}-wide row into a {}-wide one",
+                            x.width, y.width
+                        ),
+                    });
+                }
+                let rows = x.rows * groups_nz;
+                let x =
+                    kernels_cuda::tensor::Tensor::new(x.ptr, rows, x.width / groups_nz, x.dtype);
+                let mut y =
+                    kernels_cuda::tensor::Tensor::new(y.ptr, rows, y.width / groups_nz, y.dtype);
+                // A split-plane (affine) projection is read as its bf16,
+                // decoded into a scratch a fire; a dense one where it lies.
+                let (bank, experts) = match self.maybe_planes(*w) {
+                    Some((codes, ..)) => (
+                        self.dense_or_decoded(OP, *w, codes.rows, x.width)?,
+                        linear::moe::ExpertTable::RESIDENT,
+                    ),
+                    None => self.expert_bank(*w),
+                };
+                // The weight is the groups' [n, k] blocks stacked as one
+                // [groups·n, k] matrix; the select reads it as `groups`
+                // experts of n·k, the shape its expert-ordered legs take.
+                let (n, k) = (u64::from(y.width), u64::from(x.width));
+                let bank = if !experts.streams()
+                    && u64::from(bank.rows) * u64::from(bank.width) == u64::from(groups_nz) * n * k
+                    && let Ok(stride) = u32::try_from(n * k)
+                {
+                    kernels_cuda::tensor::Tensor::new(bank.ptr, groups_nz, stride, bank.dtype)
+                } else {
+                    bank
+                };
+                let identity = self.group_routes_of(*routes, groups_nz);
+                linear::moe::matmul_grouped(
+                    self.ctx(),
+                    x,
+                    bank,
+                    self.tensor(*routes),
+                    &mut y,
+                    experts,
+                    identity,
+                )
+            }
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// The routed rows combined: weighted sums, the bias sum, the shared
+    /// expert's sigmoid gate.
+    fn linear_moe_combine(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
+        match op {
+            Linear::MoeCombine {
+                routed,
+                shared: Some(shared),
+                y,
+                weights: None,
+                ..
+            } => linear::moe::sum_add(
+                self.ctx(),
+                self.tensor(*routed),
+                self.tensor(*shared),
+                &mut self.tensor(*y),
+            ),
             Linear::MoeCombine {
                 routed,
                 weights: Some(weights),
@@ -978,22 +1210,9 @@ impl Run<'_> {
                 self.tensor(*routes),
                 self.tensor(*weights),
                 &mut self.tensor(*y),
-            ),
-            Linear::LoraCorrect {
-                x,
-                bank_a,
-                bank_b,
-                routes,
-                y: _,
-                y_out,
-            } => linear::lora::correct(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bank_a),
-                self.tensor(*bank_b),
-                self.tensor(*routes),
-                &mut self.tensor(*y_out),
-                self.segments(),
+                // A bias the weight cache streams is a one-plane bank read
+                // through its table.
+                self.bank_table(*bias),
             ),
             Linear::MoeSigmoidGateAdd {
                 routed,
@@ -1007,6 +1226,7 @@ impl Run<'_> {
                 self.tensor(*gate),
                 &mut self.tensor(*y),
             ),
+            _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
     }
 
@@ -1024,6 +1244,10 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
+        // A bank the weight cache streams reads its experts through the
+        // cache's table; a bank on the expert tier's host copy is staged a
+        // call at a time.
+        let experts = self.bank_table(bank);
         if self.planes_in_lanes(bank) {
             return linear::moe::matmul_select_mxfp4_lanes(
                 self.ctx(),
@@ -1032,12 +1256,15 @@ impl Run<'_> {
                 scales,
                 routes,
                 &mut self.tensor(y),
-                linear::moe::ExpertTable::RESIDENT,
+                experts,
             );
         }
-        let (codes, scales, biases, routes) = self
-            .staged_experts(codes, scales, biases, routes)
-            .unwrap_or((codes, scales, biases, routes));
+        let (codes, scales, biases, routes) = if experts.tabled() {
+            (codes, scales, biases, routes)
+        } else {
+            self.staged_experts(codes, scales, biases, routes)?
+                .unwrap_or((codes, scales, biases, routes))
+        };
         linear::moe::matmul_select_quant(
             self.ctx(),
             x,
@@ -1046,7 +1273,7 @@ impl Run<'_> {
             biases,
             routes,
             &mut self.tensor(y),
-            linear::moe::ExpertTable::RESIDENT,
+            experts,
         )
     }
 
@@ -1115,9 +1342,17 @@ impl Run<'_> {
         let x = self.tensor(x);
         let (codes, scales, biases) = self.planes(bank);
         let routes = self.tensor(routes);
-        let (codes, scales, routes) = match self.staged_experts(codes, scales, biases, routes) {
-            Some((codes, scales, _, routes)) => (codes, scales, routes),
-            None => (codes, scales, routes),
+        // A bank the weight cache streams reads its experts through the
+        // cache's table; a bank on the expert tier's host copy is staged a
+        // call at a time.
+        let experts = self.bank_table(bank);
+        let (codes, scales, routes) = if experts.tabled() {
+            (codes, scales, routes)
+        } else {
+            match self.staged_experts(codes, scales, biases, routes)? {
+                Some((codes, scales, _, routes)) => (codes, scales, routes),
+                None => (codes, scales, routes),
+            }
         };
         linear::moe::matmul_select_fp8_quantized(
             self.ctx(),
@@ -1128,7 +1363,7 @@ impl Run<'_> {
             scales,
             routes,
             &mut self.tensor(y),
-            linear::moe::ExpertTable::RESIDENT,
+            experts,
         )
     }
 
@@ -1220,7 +1455,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::matmul_via_dense
                 } else {
                     linear::affine::matmul
@@ -1255,7 +1490,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::lm_head_via_dense
                 } else {
                     linear::affine::lm_head
@@ -1292,113 +1527,125 @@ impl Run<'_> {
     }
 }
 
-const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
-
 impl Run<'_> {
+    /// A host-resident bank's experts this fire routes to, copied into the
+    /// staging the load laid for them (`experts::staging`), and the routes
+    /// renumbered to their places there; `None` for a bank on the device,
+    /// or routes that name no expert. The routes are read back to the host,
+    /// so a load that stages records no body (`Run::capturable`).
     fn staged_experts(
         &self,
         codes: Tensor,
         scales: Tensor,
         biases: Option<Tensor>,
         routes: Tensor,
-    ) -> Option<(Tensor, Tensor, Option<Tensor>, Tensor)> {
+    ) -> Result<Option<StagedExperts>, kernels_cuda::Error> {
+        const OP: &str = "linear.moe_select";
         if routes.rows == 0 || !crate::device::alloc::is_host_pointer(codes.ptr) {
-            return None;
+            return Ok(None);
         }
+        let refused = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let Some(staged) = self.expert_staging() else {
+            return Err(refused(
+                "a select reads a routed bank on the host that no table of the weight cache \
+                 reads, and the load laid no staging for its experts"
+                    .to_string(),
+            ));
+        };
+        // A select on a side stream may overlap one on another: each stream
+        // stages into its own lane.
+        let Some(lane) = staged.lane(self.stream_index()) else {
+            return Err(refused(format!(
+                "a select of a host-resident bank runs on stream {}, which the load laid no \
+                 staging lane for",
+                self.stream_index()
+            )));
+        };
         let stream = self.ctx().stream();
         if crate::device::alloc::is_capturing(stream) {
-            return None;
+            return Err(refused(
+                "a host-resident bank's experts are staged by the fire's routes, read back to \
+                 the host, which no capture records"
+                    .to_string(),
+            ));
         }
+        let copy = |dst: u64, src: u64, bytes: usize| {
+            crate::device::copy_any(stream, dst, src, bytes)
+                .map_err(|fault| refused(fault.to_string()))
+        };
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
-        if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4)
-            .is_err()
-        {
-            return None;
-        }
-        let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
+        copy(picked.as_mut_ptr() as u64, routes.ptr, count * 4)?;
+        // A pad row's routes are whatever its rows last held: an id past
+        // the bank names no expert, and the select reads none for it.
+        let experts = codes.rows as i32;
+        let named = |e: i32| (0..experts).contains(&e);
+        let mut unique: Vec<i32> = picked.iter().copied().filter(|e| named(*e)).collect();
         unique.sort_unstable();
         unique.dedup();
+        // A size-only walk reads no routes: it stages the most experts the
+        // fire can route to, so its select asks the scratch a fire's can.
+        if crate::sizing::active() {
+            let most = (codes.rows as usize).min(count);
+            unique = (0..most as i32).collect();
+        }
         if unique.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let per_expert = |plane: Tensor| u64::from(plane.width);
-        let bytes_each = per_expert(codes) + per_expert(scales) + biases.map_or(0, per_expert);
-        if unique.len() as u64 * bytes_each > STAGED_EXPERT_BYTES {
-            return None;
-        }
-        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
-        let remapped: Vec<i32> = picked
-            .iter()
-            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
-            .collect();
-        let stage = |name: &'static str, plane: Tensor| -> Option<Tensor> {
-            let width = plane.width as usize;
-            let ptr = staging(name, unique.len() * width)?;
-            for (slot, expert) in unique.iter().enumerate() {
-                crate::device::copy_any(
-                    stream,
-                    ptr + (slot * width) as u64,
-                    plane.ptr + u64::from(*expert as u32) * width as u64,
-                    width,
-                )
-                .ok()?;
+        let over = |what: &str, need: u64, run: u64| {
+            refused(format!(
+                "a fire of {} rows, {} routes a row, stages {need} bytes of {what} ({} of a \
+                 bank's {} experts), past the {run} the load laid for fires of up to {} rows",
+                routes.rows,
+                routes.width,
+                unique.len(),
+                codes.rows,
+                staged.rows,
+            ))
+        };
+        let stage = |plane: Tensor, (at, run): (u64, u64)| -> Result<Tensor, kernels_cuda::Error> {
+            let width = u64::from(plane.width);
+            let need = unique.len() as u64 * width;
+            if need > run {
+                return Err(over("an expert plane", need, run));
             }
-            Some(Tensor::new(
-                ptr,
+            for (slot, expert) in unique.iter().enumerate() {
+                copy(
+                    at + slot as u64 * width,
+                    plane.ptr + u64::from(*expert as u32) * width,
+                    plane.width as usize,
+                )?;
+            }
+            Ok(Tensor::new(
+                at,
                 unique.len() as u32,
                 plane.width,
                 plane.dtype,
             ))
         };
-        let staged_codes = stage("moe.staged.codes", codes)?;
-        let staged_scales = stage("moe.staged.scales", scales)?;
+        let staged_codes = stage(codes, lane[0])?;
+        let staged_scales = stage(scales, lane[1])?;
         let staged_biases = match biases {
-            Some(biases) => Some(stage("moe.staged.biases", biases)?),
+            Some(biases) => Some(stage(biases, lane[2])?),
             None => None,
         };
-        let routes_ptr = staging("moe.staged.routes", count * 4)?;
-        crate::device::copy_any(stream, routes_ptr, remapped.as_ptr() as u64, count * 4).ok()?;
-        Some((
+        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
+        let remapped: Vec<i32> = picked
+            .iter()
+            .map(|e| if named(*e) { slot_of(*e) } else { -1 })
+            .collect();
+        let (routes_at, routes_run) = lane[3];
+        if (count * 4) as u64 > routes_run {
+            return Err(over("routes", (count * 4) as u64, routes_run));
+        }
+        copy(routes_at, remapped.as_ptr() as u64, count * 4)?;
+        Ok(Some((
             staged_codes,
             staged_scales,
             staged_biases,
-            Tensor::new(routes_ptr, routes.rows, routes.width, routes.dtype),
-        ))
+            Tensor::new(routes_at, routes.rows, routes.width, routes.dtype),
+        )))
     }
-}
-
-/// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
-/// kept, never freed: copies queued on it may still be in flight, and a
-/// free here would either race them or synchronise the device (illegal
-/// mid-capture). Doubling keeps what is retired under the live buffer's
-/// size.
-fn staging(name: &'static str, bytes: usize) -> Option<u64> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    struct Held {
-        live: HashMap<&'static str, (u64, usize)>,
-        retired: Vec<u64>,
-    }
-    static HELD: Mutex<Option<Held>> = Mutex::new(None);
-    if bytes == 0 {
-        return None;
-    }
-    let mut held = HELD.lock().expect("held lock poisoned");
-    let held = held.get_or_insert_with(|| Held {
-        live: HashMap::new(),
-        retired: Vec::new(),
-    });
-    let cap = held.live.get(name).map_or(0, |(_, cap)| *cap);
-    if let Some((ptr, _)) = held.live.get(name).filter(|_| cap >= bytes) {
-        return Some(*ptr);
-    }
-    let size = bytes.max(cap * 2);
-    let fresh = crate::device::alloc::raw_alloc(size)?;
-    if let Some((old, _)) = held.live.insert(name, (fresh, size)) {
-        held.retired.push(old);
-    }
-    Some(fresh)
 }
 
 /// NVFP4 activations (`nvfp4a4`) are a tcgen05 product, CUDA's alone.

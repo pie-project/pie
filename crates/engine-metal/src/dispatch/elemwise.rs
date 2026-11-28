@@ -25,27 +25,27 @@ impl Run<'_> {
             } => {
                 // The normed rows' projections on the register tile read
                 // their input table as this norm lays it.
-                if let Some((table, counters)) = self.producer_table(*out) {
+                if let Some((table, counters)) = self.producer_table(*out)? {
                     return elemwise::norm::residual_add_rmsnorm_table(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*y),
-                        self.tensor(*weight),
+                        self.tensor(*x)?,
+                        self.tensor(*y)?,
+                        self.tensor(*weight)?,
                         *plus_one,
                         *eps,
-                        self.tensor(*out),
+                        self.tensor(*out)?,
                         table,
                         counters,
                     );
                 }
                 elemwise::norm::residual_add_rmsnorm(
                     self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*y),
-                    self.tensor(*weight),
+                    self.tensor(*x)?,
+                    self.tensor(*y)?,
+                    self.tensor(*weight)?,
                     *plus_one,
                     *eps,
-                    self.tensor(*out),
+                    self.tensor(*out)?,
                 )
             }
             _ => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -63,26 +63,27 @@ impl Run<'_> {
             } => {
                 // The normed rows' projections on the register tile read
                 // their input table as this norm lays it.
-                match (self.tensor(*x).width == self.tensor(*y).width)
+                match (self.tensor(*x)?.width == self.tensor(*y)?.width)
                     .then(|| self.producer_table(*y))
+                    .transpose()?
                     .flatten()
                 {
                     Some((table, counters)) => elemwise::norm::rmsnorm_table(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*weight),
+                        self.tensor(*x)?,
+                        self.tensor(*weight)?,
                         false,
                         *eps,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                         table,
                         counters,
                     ),
                     None => elemwise::norm::rmsnorm(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*weight),
+                        self.tensor(*x)?,
+                        self.tensor(*weight)?,
                         *eps,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                     ),
                 }
             }
@@ -94,11 +95,11 @@ impl Run<'_> {
                 y,
             } => elemwise::norm::rmsnorm_per_head(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+                self.tensor(*x)?,
+                self.tensor(*weight)?,
                 *head_dim,
                 *eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::Rmsnorm {
                 x,
@@ -108,26 +109,27 @@ impl Run<'_> {
                 axis: NormAxis::Row,
             } => {
                 // As `Rmsnorm`: the projections read the table this lays.
-                match (self.tensor(*x).width == self.tensor(*y).width)
+                match (self.tensor(*x)?.width == self.tensor(*y)?.width)
                     .then(|| self.producer_table(*y))
+                    .transpose()?
                     .flatten()
                 {
                     Some((table, counters)) => elemwise::norm::rmsnorm_table(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*weight),
+                        self.tensor(*x)?,
+                        self.tensor(*weight)?,
                         true,
                         *eps,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                         table,
                         counters,
                     ),
                     None => elemwise::norm::rmsnorm_plus_one(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*weight),
+                        self.tensor(*x)?,
+                        self.tensor(*weight)?,
                         *eps,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                     ),
                 }
             }
@@ -148,25 +150,25 @@ impl Run<'_> {
                 Some((x2, weight2, y2)) => {
                     elemwise::norm::rmsnorm_per_head_plus_one_pair(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*weight),
-                        self.tensor(*y),
-                        self.tensor(x2),
-                        self.tensor(weight2),
-                        self.tensor(y2),
+                        self.tensor(*x)?,
+                        self.tensor(*weight)?,
+                        self.tensor(*y)?,
+                        self.tensor(x2)?,
+                        self.tensor(weight2)?,
+                        self.tensor(y2)?,
                         *head_dim,
                         *eps,
                     )?;
-                    self.land_ahead([Some(y2), None, None]);
+                    self.land_ahead([Some(y2), None, None])?;
                     Ok(())
                 }
                 None => elemwise::norm::rmsnorm_per_head_plus_one(
                     self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*weight),
+                    self.tensor(*x)?,
+                    self.tensor(*weight)?,
                     *head_dim,
                     *eps,
-                    self.tensor(*y),
+                    self.tensor(*y)?,
                 ),
             },
             // A row norm the tensor-parallel ranks split is served on CUDA.
@@ -185,19 +187,22 @@ impl Run<'_> {
                 y,
             } => elemwise::norm::norm_gate(
                 self.ctx(),
-                self.tensor(*x),
-                scale.map(|s| self.tensor(s)),
-                res.map(|r| self.tensor(r)),
-                gate.map(|g| self.tensor(g)),
+                self.tensor(*x)?,
+                scale.map(|s| self.tensor(s)).transpose()?,
+                res.map(|r| self.tensor(r)).transpose()?,
+                gate.map(|g| self.tensor(g)).transpose()?,
                 *eps,
                 *temperature,
-                next.map(|n| elemwise::norm::Next {
-                    weight: self.tensor(n.weight),
-                    eps: n.eps,
-                    plus_one: n.plus_one,
-                    y: self.tensor(n.y),
-                }),
-                self.tensor(*y),
+                next.map(|n| -> crate::run::Ran<_> {
+                    Ok(elemwise::norm::Next {
+                        weight: self.tensor(n.weight)?,
+                        eps: n.eps,
+                        plus_one: n.plus_one,
+                        y: self.tensor(n.y)?,
+                    })
+                })
+                .transpose()?,
+                self.tensor(*y)?,
             ),
             // A rotation at its own frequencies (a checkpoint's rope scaling) is
             // served on CUDA.
@@ -212,10 +217,10 @@ impl Run<'_> {
                 weight: NormWeight::None,
             } => elemwise::norm::rmsnorm_no_scale(
                 self.ctx(),
-                self.tensor(*x),
+                self.tensor(*x)?,
                 *head_dim,
                 *eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::Layernorm {
                 x,
@@ -225,11 +230,11 @@ impl Run<'_> {
                 y,
             } => elemwise::norm::layernorm(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                self.tensor(*bias),
+                self.tensor(*x)?,
+                self.tensor(*weight)?,
+                self.tensor(*bias)?,
                 *eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::Layernorm {
                 x,
@@ -239,9 +244,9 @@ impl Run<'_> {
                 bias: None,
             } => elemwise::norm::layernorm_no_scale(
                 self.ctx(),
-                self.tensor(*x),
+                self.tensor(*x)?,
                 *eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::Clamp {
                 x,
@@ -250,7 +255,7 @@ impl Run<'_> {
                 hi: None,
                 bounds: poem_ir::Bounds::Fixed { lo, hi, .. },
                 ..
-            } => elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x)),
+            } => elemwise::pointwise::clamp(self.ctx(), *lo, *hi, self.tensor(*x)?),
             Elemwise::Modulate {
                 x,
                 m,
@@ -264,13 +269,13 @@ impl Run<'_> {
                     ModulateForm::Scale => elemwise::modulate::Form::Scale,
                     ModulateForm::TanhGate => elemwise::modulate::Form::TanhGate,
                 },
-                self.tensor(*x),
+                self.tensor(*x)?,
                 match lane_of_row {
-                    Some(_) => self.uncut(*m),
-                    None => self.tensor(*m),
+                    Some(_) => self.uncut(*m)?,
+                    None => self.tensor(*m)?,
                 },
-                lane_of_row.map(|lanes| self.tensor(lanes)),
-                self.tensor(*y),
+                lane_of_row.map(|lanes| self.tensor(lanes)).transpose()?,
+                self.tensor(*y)?,
             ),
             Elemwise::ResidualAdd {
                 x: y,
@@ -279,17 +284,17 @@ impl Run<'_> {
                 y_out: _,
             } => elemwise::modulate::gated_residual_add(
                 self.ctx(),
-                self.tensor(*r),
+                self.tensor(*r)?,
                 match lane_of_row {
-                    Some(_) => self.uncut(*g),
-                    None => self.tensor(*g),
+                    Some(_) => self.uncut(*g)?,
+                    None => self.tensor(*g)?,
                 },
-                self.tensor(*y),
-                lane_of_row.map(|lanes| self.tensor(lanes)),
-                self.tensor(*r),
+                self.tensor(*y)?,
+                lane_of_row.map(|lanes| self.tensor(lanes)).transpose()?,
+                self.tensor(*r)?,
             ),
             Elemwise::Softcap { x, cap, x_out: _ } => {
-                kernels_metal::attn::logit_softcap(self.ctx(), self.tensor(*x), *cap)
+                kernels_metal::attn::logit_softcap(self.ctx(), self.tensor(*x)?, *cap)
             }
             Elemwise::Sinusoid {
                 t,
@@ -300,12 +305,12 @@ impl Run<'_> {
                 y,
             } => elemwise::sinusoid::sinusoid(
                 self.ctx(),
-                self.tensor(*t),
+                self.tensor(*t)?,
                 *dim,
                 *max_period,
                 *flip_sin_cos,
                 *scale,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::Act {
                 x,
@@ -314,7 +319,7 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Silu,
                 ..
-            } => elemwise::pointwise::silu(self.ctx(), self.tensor(*x), self.tensor(*x)),
+            } => elemwise::pointwise::silu(self.ctx(), self.tensor(*x)?, self.tensor(*x)?),
             Elemwise::Act {
                 x,
                 x_out: _,
@@ -323,7 +328,7 @@ impl Run<'_> {
                 act: poem_ir::ActFn::Gelu { tanh, .. },
                 ..
             } if *tanh => {
-                elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
+                elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x)?, self.tensor(*x)?)
             }
             Elemwise::Act {
                 x,
@@ -332,7 +337,7 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Gelu { .. },
                 ..
-            } => elemwise::pointwise::gelu(self.ctx(), self.tensor(*x), self.tensor(*x)),
+            } => elemwise::pointwise::gelu(self.ctx(), self.tensor(*x)?, self.tensor(*x)?),
             Elemwise::Act {
                 x,
                 x_out: _,
@@ -340,7 +345,7 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Tanh,
                 ..
-            } => elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x)),
+            } => elemwise::pointwise::tanh(self.ctx(), self.tensor(*x)?, self.tensor(*x)?),
             Elemwise::Act {
                 x,
                 x_out: _,
@@ -348,7 +353,7 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Sqrt,
                 ..
-            } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x), self.tensor(*x)),
+            } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x)?, self.tensor(*x)?),
             Elemwise::Snake {
                 x,
                 alpha,
@@ -356,9 +361,9 @@ impl Run<'_> {
                 x_out: _,
             } => elemwise::pointwise::snake(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*alpha),
-                self.tensor(*beta),
+                self.tensor(*x)?,
+                self.tensor(*alpha)?,
+                self.tensor(*beta)?,
             ),
             Elemwise::Hadamard {
                 x,
@@ -367,9 +372,9 @@ impl Run<'_> {
                 signs,
             } => elemwise::pointwise::hadamard(
                 self.ctx(),
-                self.tensor(*x),
+                self.tensor(*x)?,
                 *block,
-                signs.as_ref().map(|s| self.tensor(*s)),
+                signs.as_ref().map(|s| self.tensor(*s)).transpose()?,
             ),
             Elemwise::Binary {
                 x,
@@ -385,9 +390,9 @@ impl Run<'_> {
                 };
                 f(
                     self.ctx(),
-                    self.tensor(*x),
-                    self.tensor(*y),
-                    self.tensor(*z),
+                    self.tensor(*x)?,
+                    self.tensor(*y)?,
+                    self.tensor(*z)?,
                 )
             }
             Elemwise::RopeAxes {
@@ -401,8 +406,8 @@ impl Run<'_> {
                 x_out: _,
             } => elemwise::rope_axes::rope_axes(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*positions),
+                self.tensor(*x)?,
+                self.tensor(*positions)?,
                 *dims,
                 *thetas,
                 match form {
@@ -413,7 +418,7 @@ impl Run<'_> {
                 },
                 *rotary_dim,
                 *head_dim,
-                self.tensor(*x),
+                self.tensor(*x)?,
             ),
             Elemwise::RelativeBucketBias {
                 embedding,
@@ -424,12 +429,12 @@ impl Run<'_> {
                 y,
             } => elemwise::pointwise::relative_bucket_bias(
                 self.ctx(),
-                self.tensor(*embedding),
+                self.tensor(*embedding)?,
                 *max_len,
                 *num_buckets,
                 *max_distance,
                 *bidirectional,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::GateSigmoidMul {
                 x,
@@ -438,10 +443,10 @@ impl Run<'_> {
                 x_out: _,
             } => elemwise::gate::sigmoid_mul_heads(
                 self.ctx(),
-                self.tensor(*gate),
+                self.tensor(*gate)?,
                 *head_dim,
                 *scale,
-                self.tensor(*x),
+                self.tensor(*x)?,
             ),
             Elemwise::Clamp {
                 x,
@@ -452,9 +457,9 @@ impl Run<'_> {
                 ..
             } => elemwise::pointwise::clamp_learned(
                 self.ctx(),
-                self.tensor(*lo),
-                self.tensor(*hi),
-                self.tensor(*x),
+                self.tensor(*lo)?,
+                self.tensor(*hi)?,
+                self.tensor(*x)?,
             ),
             // The forms no builder makes.
             Elemwise::Clamp { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
@@ -466,11 +471,11 @@ impl Run<'_> {
                 y,
             } => elemwise::norm::rmsnorm_grouped_plus_one(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
+                self.tensor(*x)?,
+                self.tensor(*weight)?,
                 *group,
                 *eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::Act {
                 scale: Some(s),
@@ -479,7 +484,7 @@ impl Run<'_> {
                 s: None,
                 act: poem_ir::ActFn::Silu,
                 ..
-            } => elemwise::pointwise::silu_scaled(self.ctx(), *s, self.tensor(*x)),
+            } => elemwise::pointwise::silu_scaled(self.ctx(), *s, self.tensor(*x)?),
             Elemwise::HcMix {
                 gates,
                 normed,
@@ -487,10 +492,10 @@ impl Run<'_> {
                 y,
             } => elemwise::hc::mix(
                 self.ctx(),
-                self.tensor(*gates),
-                self.tensor(*normed),
+                self.tensor(*gates)?,
+                self.tensor(*normed)?,
                 *streams,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::HcInject {
                 o,
@@ -500,10 +505,10 @@ impl Run<'_> {
                 hyper_out: _,
             } => elemwise::hc::inject(
                 self.ctx(),
-                self.tensor(*o),
-                self.tensor(*gates),
+                self.tensor(*o)?,
+                self.tensor(*gates)?,
                 *streams,
-                self.tensor(*hyper),
+                self.tensor(*hyper)?,
             ),
             Elemwise::PleGate {
                 key,
@@ -513,11 +518,11 @@ impl Run<'_> {
                 y,
             } => elemwise::hc::ple_gate(
                 self.ctx(),
-                self.tensor(*key),
-                self.tensor(*query),
-                self.tensor(*value),
+                self.tensor(*key)?,
+                self.tensor(*query)?,
+                self.tensor(*value)?,
                 *streams,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             // A scaleless gated norm (Muse Spark's).
             Elemwise::RmsnormGated {
@@ -530,13 +535,13 @@ impl Run<'_> {
                 y,
             } => elemwise::norm::rmsnorm_gated(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
+                self.tensor(*x)?,
+                self.tensor(*gate)?,
                 None,
                 *head_dim,
                 *eps,
                 matches!(act, poem_ir::GateActivation::Sigmoid),
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::RmsnormGated {
                 x,
@@ -552,31 +557,32 @@ impl Run<'_> {
                 // table as the norm lays it: a GDN layer's projection reads
                 // the merge of its scan's arms, which this arm's rows land in.
                 let laid = (!sigmoid
-                    && self.tensor(*x).dtype == poem_ir::Dtype::F32
+                    && self.tensor(*x)?.dtype == poem_ir::Dtype::F32
                     && head_dim.is_multiple_of(32))
                 .then(|| self.producer_table(self.merged_into(*y).unwrap_or(*y)))
+                .transpose()?
                 .flatten();
                 match laid {
                     Some((table, counters)) => elemwise::norm::rmsnorm_gated_table(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*gate),
-                        self.tensor(*weight),
+                        self.tensor(*x)?,
+                        self.tensor(*gate)?,
+                        self.tensor(*weight)?,
                         *head_dim,
                         *eps,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                         table,
                         counters,
                     ),
                     None => elemwise::norm::rmsnorm_gated(
                         self.ctx(),
-                        self.tensor(*x),
-                        self.tensor(*gate),
-                        Some(self.tensor(*weight)),
+                        self.tensor(*x)?,
+                        self.tensor(*gate)?,
+                        Some(self.tensor(*weight)?),
                         *head_dim,
                         *eps,
                         sigmoid,
-                        self.tensor(*y),
+                        self.tensor(*y)?,
                     ),
                 }
             }
@@ -589,24 +595,24 @@ impl Run<'_> {
                 y,
             } => elemwise::norm::rmsnorm_gated_by(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*gate),
-                self.tensor(*weight),
+                self.tensor(*x)?,
+                self.tensor(*gate)?,
+                self.tensor(*weight)?,
                 *heads,
                 *eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::ResidualAdd {
                 x,
                 gate: None,
                 y,
                 y_out: _,
-            } => elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y)),
+            } => elemwise::pointwise::residual_add(self.ctx(), self.tensor(*x)?, self.tensor(*y)?),
             Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
-            } => elemwise::pointwise::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
+            } => elemwise::pointwise::add_bias(self.ctx(), self.tensor(*bias)?, self.tensor(*out)?),
             Elemwise::Standardize {
                 x,
                 bias,
@@ -614,9 +620,9 @@ impl Run<'_> {
                 x_out: _,
             } => elemwise::norm::standardize(
                 self.ctx(),
-                self.tensor(*bias),
-                self.tensor(*scale),
-                self.tensor(*x),
+                self.tensor(*bias)?,
+                self.tensor(*scale)?,
+                self.tensor(*x)?,
             ),
             Elemwise::Act {
                 scale: Some(s),
@@ -625,7 +631,7 @@ impl Run<'_> {
                 s: None,
                 act: poem_ir::ActFn::Identity,
                 ..
-            } => elemwise::pointwise::mul_scalar(self.ctx(), *s, self.tensor(*x)),
+            } => elemwise::pointwise::mul_scalar(self.ctx(), *s, self.tensor(*x)?),
             Elemwise::Act {
                 s: Some(s),
                 x,
@@ -633,7 +639,7 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Identity,
                 ..
-            } => elemwise::pointwise::scale(self.ctx(), self.tensor(*s), self.tensor(*x)),
+            } => elemwise::pointwise::scale(self.ctx(), self.tensor(*s)?, self.tensor(*x)?),
             // The forms no builder makes.
             Elemwise::Act { .. } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Elemwise::ResBlend {
@@ -644,7 +650,10 @@ impl Run<'_> {
                 proj,
                 y,
             } => {
-                let planes: Vec<Tensor> = blocks.iter().map(|b| self.tensor(*b)).collect();
+                let planes = blocks
+                    .iter()
+                    .map(|b| self.tensor(*b))
+                    .collect::<crate::run::Ran<Vec<Tensor>>>()?;
                 let Some(first) = planes.first().copied() else {
                     return Err(kernels_metal::Error::Backend {
                         op: "elemwise.res_blend",
@@ -661,12 +670,12 @@ impl Run<'_> {
                         // Blocks that lie apart are each bound where they lie.
                         return elemwise::norm::res_blend_scattered(
                             self.ctx(),
-                            self.tensor(*prefix),
+                            self.tensor(*prefix)?,
                             &planes,
-                            self.tensor(*weight),
+                            self.tensor(*weight)?,
                             *eps,
-                            self.tensor(*proj),
-                            self.tensor(*y),
+                            self.tensor(*proj)?,
+                            self.tensor(*y)?,
                         );
                     }
                     want = want.map(|at| at + plane_bytes);
@@ -681,13 +690,13 @@ impl Run<'_> {
                 );
                 elemwise::norm::res_blend(
                     self.ctx(),
-                    self.tensor(*prefix),
+                    self.tensor(*prefix)?,
                     stacked,
                     u32::try_from(planes.len()).unwrap_or(u32::MAX),
-                    self.tensor(*weight),
+                    self.tensor(*weight)?,
                     *eps,
-                    self.tensor(*proj),
-                    self.tensor(*y),
+                    self.tensor(*proj)?,
+                    self.tensor(*y)?,
                 )
             }
 
@@ -704,9 +713,9 @@ impl Run<'_> {
                 ..
             } => elemwise::rope::full(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
                 *head_dim,
                 *theta,
                 *interleaved,
@@ -727,9 +736,9 @@ impl Run<'_> {
                 ..
             } => elemwise::rope::partial(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
                 *rotary_dim,
                 *head_dim,
                 *theta,
@@ -754,9 +763,9 @@ impl Run<'_> {
                 ..
             } => elemwise::rope_mrope::interleaved(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
                 *sections,
                 *rotary_dim,
                 *head_dim,
@@ -781,9 +790,9 @@ impl Run<'_> {
                 ..
             } => elemwise::rope_mrope::split(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
                 *sections,
                 *rotary_dim,
                 *head_dim,
@@ -808,9 +817,9 @@ impl Run<'_> {
                 ..
             } => elemwise::rope_mrope::blocked(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
                 *sections,
                 *rotary_dim,
                 *head_dim,
@@ -831,8 +840,8 @@ impl Run<'_> {
                 ..
             } => elemwise::rope::partial_q(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*positions)?,
                 *rotary_dim,
                 *head_dim,
                 *theta,
@@ -856,8 +865,8 @@ impl Run<'_> {
                 ..
             } => elemwise::rope::partial_last(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*positions)?,
                 *rotary_dim,
                 *head_dim,
                 *theta,
@@ -895,9 +904,9 @@ impl Run<'_> {
                 ..
             } => elemwise::rope::yarn(
                 self.ctx(),
-                self.tensor(*q),
-                self.tensor(*k),
-                self.tensor(*positions),
+                self.tensor(*q)?,
+                self.tensor(*k)?,
+                self.tensor(*positions)?,
                 *head_dim,
                 *theta,
                 *factor,
@@ -918,26 +927,31 @@ impl Run<'_> {
             } => {
                 // The gated rows' projection on the register tile reads its
                 // input table as the gate lays it.
-                match self.producer_table(*x_out) {
+                match self.producer_table(*x_out)? {
                     Some((table, counters)) => elemwise::gate::sigmoid_mul_table(
                         self.ctx(),
-                        self.tensor(*gate),
-                        self.tensor(*x),
+                        self.tensor(*gate)?,
+                        self.tensor(*x)?,
                         table,
                         counters,
                     ),
-                    None => {
-                        elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
-                    }
+                    None => elemwise::gate::sigmoid_mul(
+                        self.ctx(),
+                        self.tensor(*gate)?,
+                        self.tensor(*x)?,
+                    ),
                 }
             }
 
             Elemwise::HcExpand { x, streams, y } => {
-                elemwise::hc::expand(self.ctx(), self.tensor(*x), *streams, self.tensor(*y))
+                elemwise::hc::expand(self.ctx(), self.tensor(*x)?, *streams, self.tensor(*y)?)
             }
-            Elemwise::HcRmsnormF32 { streams, eps, y } => {
-                elemwise::hc::rmsnorm_f32(self.ctx(), self.tensor(*streams), *eps, self.tensor(*y))
-            }
+            Elemwise::HcRmsnormF32 { streams, eps, y } => elemwise::hc::rmsnorm_f32(
+                self.ctx(),
+                self.tensor(*streams)?,
+                *eps,
+                self.tensor(*y)?,
+            ),
             Elemwise::HcProject {
                 normed,
                 weight,
@@ -945,10 +959,10 @@ impl Run<'_> {
                 mixes,
             } => elemwise::hc::project(
                 self.ctx(),
-                self.tensor(*normed),
-                self.tensor(*weight),
+                self.tensor(*normed)?,
+                self.tensor(*weight)?,
                 *stream_count,
-                self.tensor(*mixes),
+                self.tensor(*mixes)?,
             ),
             Elemwise::HcGates {
                 normed,
@@ -965,18 +979,18 @@ impl Run<'_> {
                 comb_mix,
             } => elemwise::hc::gates(
                 self.ctx(),
-                self.tensor(*normed),
-                self.tensor(*streams),
-                self.tensor(*scale),
-                self.tensor(*base),
+                self.tensor(*normed)?,
+                self.tensor(*streams)?,
+                self.tensor(*scale)?,
+                self.tensor(*base)?,
                 *stream_count,
                 *gate_eps,
                 *alpha,
                 *sinkhorn,
                 *comb,
-                self.tensor(*x),
-                self.tensor(*post_mix),
-                self.tensor(*comb_mix),
+                self.tensor(*x)?,
+                self.tensor(*post_mix)?,
+                self.tensor(*comb_mix)?,
             ),
             Elemwise::HcCollapse {
                 mixes,
@@ -988,13 +1002,13 @@ impl Run<'_> {
                 y,
             } => elemwise::hc::collapse(
                 self.ctx(),
-                self.tensor(*mixes),
-                self.tensor(*streams),
-                self.tensor(*scale),
-                self.tensor(*base),
+                self.tensor(*mixes)?,
+                self.tensor(*streams)?,
+                self.tensor(*scale)?,
+                self.tensor(*base)?,
                 *stream_count,
                 *hc_eps,
-                self.tensor(*y),
+                self.tensor(*y)?,
             ),
             Elemwise::HcFold {
                 x,
@@ -1004,11 +1018,11 @@ impl Run<'_> {
                 y,
             } => elemwise::hc::fold(
                 self.ctx(),
-                self.tensor(*x),
-                self.tensor(*streams),
-                self.tensor(*post_mix),
-                self.tensor(*comb_mix),
-                self.tensor(*y),
+                self.tensor(*x)?,
+                self.tensor(*streams)?,
+                self.tensor(*post_mix)?,
+                self.tensor(*comb_mix)?,
+                self.tensor(*y)?,
             ),
             // A weight and axis no builder pairs.
             Elemwise::Rmsnorm { .. } | Elemwise::Layernorm { .. } => {

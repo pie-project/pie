@@ -16,32 +16,23 @@ pub struct Diagnostics {
     pub trace_census: bool,
     pub nan_check: bool,
     pub fuse_chains: bool,
-    pub gumbel_direct: bool,
     /// What a fire that waits for the device does (`crate::device::guard`).
     pub sync_guard: Option<SyncGuard>,
     /// The chunk size the state pool's recipe aims near, in place of the
     /// device profile's: a small one cuts a miniature's records into the
     /// pieces only a full model's take.
     pub chunk_bytes: Option<u64>,
-    /// States no weight shape: every table and routed bank the weight cache
-    /// would stream stays dense on the device, as a load that predates the
-    /// cache seats it.
-    pub dense_weights: bool,
-    /// States no expert shape: the routed banks stay dense on the device,
-    /// while the tables streamed by their rows are stated.
-    pub dense_experts: bool,
-    /// Lays every windowed kv row in one window list, of the widest window:
-    /// a row of a narrower window then keeps pages its kernels no longer
-    /// read. The same logits as a list a window.
-    pub one_window: bool,
     /// Copies between the device and the host tier ride the compute stream,
     /// ahead of every fire after them, not the swap stream beside those
     /// fires: to weigh the overlap.
     pub tier_inline: bool,
-    /// Arms every class's compositions for lanes that buffer recurrent rows,
-    /// not only a drafter's: speculative decoding an inferlet drafts itself
-    /// (no drafts output read) replays a body too.
-    pub rs_bodies: bool,
+    /// Fills device memory no kernel has written yet with 0xFF bytes (a NaN
+    /// in f32, bf16 and f16): every pool segment as it is backed (kv pages,
+    /// state records; the null chunk and a fresh state's records are still
+    /// zeroed after, as their readers are owed) and the activation span. A
+    /// kernel that reads a cell nothing wrote, under a zero weight or a
+    /// mask, then answers NaN where it read.
+    pub unwritten_nan: bool,
 }
 
 /// The sync guard's answer to a fire that waited for the device.
@@ -70,14 +61,10 @@ impl Default for Diagnostics {
             trace_census: false,
             nan_check: false,
             fuse_chains: true,
-            gumbel_direct: true,
             sync_guard: None,
             chunk_bytes: None,
-            dense_weights: false,
-            dense_experts: false,
-            one_window: false,
             tier_inline: false,
-            rs_bodies: false,
+            unwritten_nan: false,
         }
     }
 }
@@ -99,7 +86,6 @@ impl Diagnostics {
             ("reap-trace", self.reap_trace),
             ("trace-census", self.trace_census),
             ("nan-check", self.nan_check),
-            ("rs-bodies", self.rs_bodies),
         ] {
             if on {
                 words.push(word.to_string());
@@ -122,9 +108,6 @@ impl Diagnostics {
         if !self.fuse_chains {
             words.push("fuse-chains=off".to_string());
         }
-        if !self.gumbel_direct {
-            words.push("gumbel-direct=off".to_string());
-        }
         match self.sync_guard {
             Some(SyncGuard::Report) => words.push("sync-guard".to_string()),
             Some(SyncGuard::Panic) => words.push("sync-guard=panic".to_string()),
@@ -133,17 +116,11 @@ impl Diagnostics {
         if let Some(bytes) = self.chunk_bytes {
             words.push(format!("chunk-bytes={bytes}"));
         }
-        if self.dense_weights {
-            words.push("dense-weights".to_string());
-        }
-        if self.dense_experts {
-            words.push("dense-experts".to_string());
-        }
-        if self.one_window {
-            words.push("one-window".to_string());
-        }
         if self.tier_inline {
             words.push("tier-inline".to_string());
+        }
+        if self.unwritten_nan {
+            words.push("unwritten-nan".to_string());
         }
         (!words.is_empty()).then(|| words.join(","))
     }
@@ -162,9 +139,9 @@ fn switch(word: &str, value: &str) -> std::result::Result<bool, String> {
 const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
-     `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, `dense-weights`, \
-     `dense-experts`, `one-window`, `tier-inline`, `rs-bodies`";
+     `trace-census`, `nan-check`, `fuse-chains=off`, \
+     `sync-guard[=panic]`, `chunk-bytes=<bytes>`, \
+     `tier-inline`, `unwritten-nan`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -188,13 +165,9 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
-                "dense-weights" => diag.dense_weights = switch(word, value)?,
-                "dense-experts" => diag.dense_experts = switch(word, value)?,
-                "one-window" => diag.one_window = switch(word, value)?,
                 "tier-inline" => diag.tier_inline = switch(word, value)?,
-                "rs-bodies" => diag.rs_bodies = switch(word, value)?,
+                "unwritten-nan" => diag.unwritten_nan = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
-                "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {
                     diag.sync_guard = match value {
                         "panic" => Some(SyncGuard::Panic),
@@ -243,8 +216,8 @@ static PUBLISHED: OnceLock<Diagnostics> = OnceLock::new();
 pub(crate) fn publish(stated: &Diagnostics) {
     let published = PUBLISHED.get_or_init(|| stated.clone());
     if published != stated {
-        eprintln!(
-            "engine-cuda: this process already published a diagnostics record \
+        tracing::warn!(
+            "this process already published a diagnostics record \
              ({}), so the one this boot states ({}) is ignored; every rank of a \
              group traces the same thing",
             published.words().unwrap_or_else(|| "none".to_string()),
@@ -312,7 +285,6 @@ mod tests {
         assert!(diag.golden_probe);
         assert_eq!(diag.ptr_trace.as_deref(), Some("decode:c0"));
         assert!(!diag.fuse_chains);
-        assert!(diag.gumbel_direct, "an unnamed arm keeps its default");
         assert_eq!(diag.sync_guard, None);
         let guarded: Diagnostics = "sync-guard".parse().expect("the guard parses");
         assert_eq!(guarded.sync_guard, Some(SyncGuard::Report));
@@ -333,7 +305,7 @@ mod tests {
     }
 
     fn the_words_round_trip() {
-        let list = "arm-trace,capture-serial,plan-trace=all,gumbel-direct=off,sync-guard=panic";
+        let list = "arm-trace,capture-serial,plan-trace=all,fuse-chains=off,sync-guard=panic";
         let diag: Diagnostics = list.parse().expect("parses");
         let again: Diagnostics = diag
             .words()

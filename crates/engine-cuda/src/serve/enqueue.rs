@@ -30,10 +30,33 @@ use super::{Golden, Graphs, Prepared, Readback, Shell};
 
 #[derive(Debug)]
 pub(super) struct GuestBatch {
-    launched: Vec<(usize, engine::InstanceId)>,
+    pub(super) launched: Vec<Flying>,
     pub(super) seq: u64,
     /// Recorded behind the batch's programs.
     landed: Event,
+    /// Whether the step that launched it tells its passes' verdicts to its
+    /// sink (`Some(true)`), so the reap does not fail a later fire by them;
+    /// `None` until that step settles.
+    pub(super) told: Option<bool>,
+}
+
+/// A guest pass launched in a step: the step's lanes it spans, its
+/// instance, its point, and the device address of its commit word.
+#[derive(Debug, Clone)]
+pub(super) struct Flying {
+    pub(super) lanes: std::ops::Range<u32>,
+    pub(super) instance: engine::InstanceId,
+    pub(super) at: &'static str,
+    pub(super) commit: u64,
+}
+
+/// A guest pass that did not commit on the step's lanes `lanes`: those
+/// lanes fault, the step's others commit.
+#[derive(Debug, Clone)]
+pub(super) struct GuestFault {
+    pub(super) lanes: std::ops::Range<u32>,
+    pub(super) instance: engine::InstanceId,
+    pub(super) reason: String,
 }
 
 /// The guest batches whose steps are airborne, oldest first.
@@ -42,7 +65,25 @@ pub(super) type Owed = std::collections::VecDeque<GuestBatch>;
 impl GuestBatch {
     /// The instances whose epilogues this batch launched.
     pub(super) fn instances(&self) -> impl Iterator<Item = engine::InstanceId> + '_ {
-        self.launched.iter().map(|&(_, instance)| instance)
+        self.launched.iter().map(|flying| flying.instance)
+    }
+}
+
+const fn point(at: Attach) -> &'static str {
+    match at {
+        Attach::Prologue => "prologue",
+        _ => "epilogue",
+    }
+}
+
+/// `fired`'s fault on the lanes of `flying`'s pass, where it did not commit.
+fn noted(faults: &mut Vec<GuestFault>, flying: &Flying, fired: Fired) {
+    if let Some(reason) = fault_of(fired, flying.instance, flying.at) {
+        faults.push(GuestFault {
+            lanes: flying.lanes.clone(),
+            instance: flying.instance,
+            reason,
+        });
     }
 }
 
@@ -105,23 +146,28 @@ impl Shell {
     ) -> Result<(u32, Option<Readback>)> {
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
-        if p.rs.rows_ext > 0 {
-            // The scratch grows in place within its range; past it, it is
-            // reserved anew, and the fires holding the old one land first.
-            if self
-                .buffers
-                .as_ref()
-                .is_some_and(|buffers| !buffers.scratch_reaches(p.rs.rows_ext))
-            {
-                self.drain()?;
-            }
-            if let Some(buffers) = self.buffers.as_mut() {
-                buffers.ensure_scratch(&self.pools, p.rs.rows_ext)?;
-            }
+        if p.rs.rows_ext > 0
+            && let Some(buffers) = self.buffers.as_mut()
+        {
+            buffers.ensure_scratch(&mut self.pools, p.rs.rows_ext)?;
         }
-        let rs_scratch = self.buffers.as_ref().map(Buffers::scratch);
+        let rs_scratch = self
+            .buffers
+            .as_ref()
+            .map(|buffers| buffers.scratch(&self.pools));
         let tapping = self.tapping(p.lanes)?;
+        // A windowed fire's own-row pages start as their ring pages: one
+        // launch of every page's copy.
+        let fills: Vec<(u64, u64, u64)> = p
+            .ring_work
+            .fills
+            .iter()
+            .map(|&(to, from)| (to, from, p.ring_work.page_bytes))
+            .chain(p.ring_work.refills.iter().copied())
+            .collect();
+        self.copy_ring_runs(&fills)?;
         let mut fire = FireCtx {
+            live: &self.live,
             tapping: tapping.as_ref(),
             device: &self.device,
             trace: &self.trace,
@@ -147,19 +193,20 @@ impl Shell {
             rs_scratch,
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
+            capture: self.capture.as_mut(),
             budget: &self.budget,
             owed: &mut self.owed,
             spare_events: &mut self.spare_events,
             airborne: &self.airborne,
             shifted: &self.shifted,
             schedule_readers: &self.schedule_readers,
-            decoding: &self.decoding,
-            tiers: &self.tiers,
             decoded_tiles: &self.decoded_tiles,
+            expert_staged: self.expert_staged.as_ref(),
+            guest_faults: &mut self.guest_faults,
             seq,
         };
         super::btrace::mark("prepare_tail");
-        fire.gate(p)?;
+        fire.gate(p, slot)?;
         super::btrace::mark("gate");
         let staged = fire.stage(p, slot)?;
         super::btrace::mark("stage");
@@ -167,6 +214,10 @@ impl Shell {
         super::btrace::mark("route");
         let readback = fire.readback(p, &staged)?;
         super::btrace::mark("readback");
+        // A windowed fire's snapshots land before its fold, which may write
+        // the ring pages they read.
+        self.copy_ring_runs(&p.ring_work.snaps)?;
+        self.fold_rings(&p.ring_work)?;
         if tapping.is_some() {
             // The read-outs hold the tapped pages and the host slots they
             // fill until they land: a later fire that writes a page waits for
@@ -183,7 +234,37 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// A windowed fire's fold: the rows it folds, from
+    /// their buffer or own-row pages onto their ring pages, after its
+    /// forward on its stream.
+    fn fold_rings(&mut self, work: &super::ring::Work) -> Result<()> {
+        self.copy_ring_runs(&work.folds)
+    }
+
+    /// `runs` (to, from, bytes) copied on the fire's stream over the load's
+    /// ring table: one launch of `copy_runs` a table's worth.
+    fn copy_ring_runs(&mut self, runs: &[(u64, u64, u64)]) -> Result<()> {
+        if runs.is_empty() || crate::sizing::active() {
+            return Ok(());
+        }
+        let device = &self.device;
+        let Some(table) = self.ring_runs.as_mut() else {
+            return Err(Fault::program(
+                "serve::ring",
+                "ring runs on a load that keeps no ring",
+            ));
+        };
+        table.copy(device.stream(), runs, |at, count| {
+            kernels_cuda::runtime::channel::copy_runs(device.ctx(), at, count).map_err(Fault::from)
+        })
+    }
+}
+
 struct FireCtx<'a> {
+    /// What the runtime reads of this shell: how a serving fire was served
+    /// is counted on it.
+    live: &'a engine::live::Live,
     /// The fire's taps, when a lane asks for one.
     tapping: Option<&'a crate::tap::Tapping>,
     device: &'a Context,
@@ -210,15 +291,19 @@ struct FireCtx<'a> {
     rs_scratch: Option<(u64, u64)>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
+    /// Where the fire's capturing lanes write their readers' rows.
+    capture: Option<&'a mut crate::scores::CaptureLayout>,
     budget: &'a Budget,
     owed: &'a mut Owed,
     spare_events: &'a mut Vec<Event>,
     airborne: &'a Airborne,
     shifted: &'a [bool],
     schedule_readers: &'a [Option<u32>],
-    decoding: &'a poem_ir::ClassSet,
-    tiers: &'a record::Tiers,
     decoded_tiles: &'a [u64],
+    /// Where a select stages a host-resident bank's experts.
+    expert_staged: Option<&'a crate::experts::staging::Staged>,
+    /// The step's guest passes that faulted their lanes.
+    guest_faults: &'a mut Vec<GuestFault>,
     seq: u64,
 }
 
@@ -241,6 +326,11 @@ impl Shell {
         let runs =
             |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
         let prologues: Vec<super::Attached> = attachments.iter().filter(runs).copied().collect();
+        // A batch a step that never settled left owed tells no sink.
+        for batch in self.owed.iter_mut().filter(|batch| batch.told.is_none()) {
+            batch.told = Some(false);
+        }
+        self.guest_faults.clear();
         if prologues.is_empty() {
             return Ok(());
         }
@@ -252,20 +342,17 @@ impl Shell {
             "prepare.prologue",
             Reap::Landed,
         )?;
-        let mut verdicts: Vec<(usize, Fired)> = Vec::new();
+        let mut verdicts: Vec<(Flying, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
-        for (at, attached) in attachments.iter().enumerate() {
-            if !prologues.contains(attached) {
-                continue;
-            }
-            if let Some(fired) = launched.stage(
+        for attached in &prologues {
+            if let Some(verdict) = launched.stage(
                 &self.device,
                 &mut self.programs,
-                at,
+                attached.span(),
                 attached.instance,
                 Attach::Prologue,
             )? {
-                verdicts.push((at, fired));
+                verdicts.push(verdict);
             }
         }
         launched.fly(&self.device, &mut self.programs)?;
@@ -285,15 +372,89 @@ impl Shell {
         )? {
             self.owed.push_back(batch);
         }
-        for (at, fired) in verdicts {
-            committed_or(fired, attachments[at].instance, "prologue")?;
+        // A prologue that did not commit faults its own lanes; the body
+        // runs the rest.
+        for (flying, fired) in verdicts {
+            noted(&mut self.guest_faults, &flying, fired);
         }
         Ok(())
     }
 }
 
 impl FireCtx<'_> {
-    fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
+    /// Stages the capture rows' tables (`crate::scores`): for each of the
+    /// fire's lanes, in the fire's order, the key row of the reader attached
+    /// at it where its class captures, and 0 for any other. Staged each
+    /// fire, so a row is found wherever its reader's slots lie now. Every
+    /// capturing lane a fire carries has its reader attached
+    /// (`engine::fire::Step::validate_captures`); arming's fires bind no
+    /// reader and name no row.
+    fn lay_capture(&mut self, p: &Prepared<'_>) -> Result<()> {
+        let Some(layout) = self.capture.as_deref_mut() else {
+            return Ok(());
+        };
+        let lanes = p.composition.lanes();
+        let mut keys_at = vec![0u64; lanes.len()];
+        for (at, row) in lanes.iter().enumerate() {
+            if self.arming || !layout.captures(row.class as usize) {
+                continue;
+            }
+            let source = row.source;
+            let attached = p
+                .attachments
+                .iter()
+                .find(|attached| {
+                    !attached.adapter_only
+                        && (attached.lane..attached.lane + attached.lanes.max(1)).contains(&source)
+                })
+                .ok_or_else(|| {
+                    Fault::program(
+                        "serve::lay_capture",
+                        format!(
+                            "lane {source} captures its attention scores and no reader is \
+                             attached at it: only the fire that runs a pass's program captures \
+                             (engine::fire::Step::validate_captures refuses this at submit)"
+                        ),
+                    )
+                })?;
+            if attached.lanes > 1 {
+                return Err(Fault::program(
+                    "serve::lay_capture",
+                    format!(
+                        "lane {source} captures its attention scores, and instance {} is \
+                         attached at {} lanes: an instance holds one lane's score rows",
+                        attached.instance, attached.lanes
+                    ),
+                ));
+            }
+            keys_at[at] = self.programs.score_rows(attached.instance).ok_or_else(|| {
+                Fault::program(
+                    "serve::lay_capture",
+                    format!(
+                        "lane {source} captures its attention scores, and instance {} attached \
+                         at it reads none of them, so it holds no score rows",
+                        attached.instance
+                    ),
+                )
+            })?;
+        }
+        layout.stage(self.device.stream(), &keys_at)
+    }
+
+    /// The lanes a fire's fold gate covers: the most its body carries (its
+    /// key's lane ceiling), so a body recorded at one fire's lanes lays the
+    /// mask of every fire it serves.
+    fn gate_lanes(&self, p: &Prepared<'_>) -> u32 {
+        p.composition
+            .lane_count()
+            .max(p.lane_ceiling.min(self.predicate.lanes()))
+    }
+
+    /// Stages the fire's fold gate with its tables (`Inputs::write_gate`):
+    /// each lane's commit word (a prologue's, or the constant a fold always
+    /// or never takes) and the rows it folds. The mask the folds read is laid
+    /// from them on the device, inside the fire's body (`Run::lay_gate`).
+    fn gate(&mut self, p: &mut Prepared<'_>, slot: &SlotGuard) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
             let mut commits: Vec<u64> = vec![self.predicate.always(); lane_count as usize];
@@ -316,18 +477,22 @@ impl FireCtx<'_> {
                     *slot = session.commit_word();
                 }
             }
-            self.predicate
-                .write(self.device.stream(), &commits, &p.rs.lens)?;
-            if p.rs.predicated {
-                kernels_cuda::runtime::channel::mask_from_commit(
-                    self.device.ctx(),
-                    self.predicate.commits(),
-                    self.predicate.indptr(),
-                    self.predicate.mask(lane_count).ptr,
-                    lane_count,
-                )
-                .map_err(Fault::from)?;
+            let lanes = self.gate_lanes(p);
+            if lanes > self.predicate.lanes() {
+                return Err(Fault::Ceiling {
+                    what: "rs fold predicates",
+                    need: u64::from(lanes),
+                    have: u64::from(self.predicate.lanes()),
+                });
             }
+            self.inputs.write_gate(
+                slot,
+                &mut p.lengths,
+                &commits,
+                &p.rs.lens,
+                lanes,
+                self.predicate.always(),
+            )?;
         }
         Ok(())
     }
@@ -346,7 +511,9 @@ impl FireCtx<'_> {
             &p.lengths,
             &p.token_injects,
             &p.mask_injects,
+            &p.page_work,
         )?;
+        p.page_faults = handles.page_faults;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);
@@ -371,9 +538,11 @@ impl FireCtx<'_> {
                     .stage_mrope_positions(self.device.stream(), &p.mrope_positions)?,
             )
         };
-        let group_masks = self
-            .inputs
-            .stage_group_masks(self.device.stream(), &p.group_masks)?;
+        let group_masks = self.inputs.stage_group_masks(
+            self.device.stream(),
+            &p.group_masks,
+            p.lengths.table_lanes(),
+        )?;
         let voxels = if p.voxel_tables.grid.is_empty() {
             None
         } else {
@@ -510,7 +679,7 @@ impl FireCtx<'_> {
         // A fire that runs the side streams carves the arena laid out for
         // them (`CompiledModel::arena_forked`); the rest the one in order.
         let forks = !self.device.side_ctx().is_empty()
-            && record::forks(self.compiled, p.composition.bucket(), &p.islands);
+            && record::forks(self.compiled, p.composition.bucket(), &p.key.islands);
         let (map, forked) = match &self.compiled.arena_forked {
             Some(forked) if forks => (forked, true),
             _ => (&self.compiled.arena, false),
@@ -521,14 +690,19 @@ impl FireCtx<'_> {
             forked,
             poem_compiler::FireRows {
                 tokens: carve_rows,
-                lanes: carve_lanes,
+                // A value a lane holds a row for each lane the fire can
+                // carry, which is what the arena laid it for: the body's
+                // lane capacity sizes its lane tables, never a lane value's
+                // slot, so a padded lane row lands in no neighbour's.
+                lanes: carve_lanes.min(u64::from(self.budget.max_lanes)),
                 patches: carve_patches,
                 images: u64::from(p.composition.images()),
                 voxels: u64::from(p.composition.voxel_widest()),
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },
-        );
+        )?;
+        self.lay_capture(p)?;
         if let Some(ep) = self.ep {
             ep.seats(forked)
                 .seat(ep.wire(), p.composition.bucket(), &mut slots);
@@ -567,7 +741,7 @@ impl FireCtx<'_> {
         }
         // A lane that folds part of its extended rows splits its scan there.
         let commit_len = if p.rs.truncates {
-            self.predicate.commit_len(lane_count)
+            self.inputs.gate_lens(lane_count)
         } else {
             kernels_cuda::Tensor::ABSENT
         };
@@ -676,7 +850,7 @@ impl FireCtx<'_> {
             grid: staged.voxels.as_ref().map(|seats| seats.grid),
             token_grid: staged.voxels.as_ref().and_then(|seats| seats.token_grid),
             voxels: staged.voxels.as_ref().and_then(|seats| seats.voxels),
-            clip_slots: staged.voxels.as_ref().map(|seats| seats.slots),
+            clip_lanes: staged.voxels.as_ref().map(|seats| seats.clip_lanes),
             lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
             group_masks: staged.group_masks.clone(),
@@ -693,13 +867,19 @@ impl FireCtx<'_> {
             plan_values: facts.plans.len(),
             tables: FireTables {
                 mask_indptr: handles.mask_indptr,
+                mask_origin: handles.mask_origin,
                 pool_state: self.pools.pool_slabs(),
                 row_tables: self.pools.row_tables(),
                 expert_tables: self.pools.expert_tables(),
+                expert_staging: self.expert_staged.cloned(),
             },
             device: self.device.device(),
             toggles: self.device.toggles(),
             capture: self.graphs.shaped(),
+            score_rows: self
+                .capture
+                .as_deref()
+                .map(crate::scores::CaptureLayout::seat),
         };
         let place = At::new();
         let stream = Cell::new(0u32);
@@ -754,12 +934,12 @@ impl FireCtx<'_> {
                 per_axis: poem_ir::PerAxis::new([
                     Some(record::AxisCarve {
                         classes: p.composition.table(poem_ir::RowAxis::Tokens),
-                        ladder: &p.ladder,
+                        ladder: &p.key.classes,
                         lane_ceiling: Some(p.lane_ceiling),
                     }),
-                    p.patch_ladder.as_ref().map(|ladder| record::AxisCarve {
+                    p.key.patch.as_ref().map(|axis| record::AxisCarve {
                         classes: p.composition.table(poem_ir::RowAxis::Patches),
-                        ladder,
+                        ladder: &axis.classes,
                         lane_ceiling: None,
                     }),
                     None,
@@ -787,15 +967,18 @@ impl FireCtx<'_> {
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
-        let rs_scratch = (p.rs.rows_ext > 0)
-            .then(|| {
-                self.rs_scratch
-                    .zip(self.buffers)
-                    .map(|((ptr, bytes), buffers)| {
-                        crate::run::RsScratch::new(ptr, bytes, buffers.ext_row_bytes())
-                    })
-            })
-            .flatten();
+        let rs_scratch = self
+            .rs_scratch
+            .filter(|_| p.rs.rows_ext > 0)
+            .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes, p.rs.rows_ext));
+        // A hybrid's fires buffer recurrent rows, and every hybrid load binds
+        // beam groups (the engine states `Port::Parents`), whose fires fold
+        // ahead of their body. A size-only walk of a buffering composition
+        // walks those folds too, over one stand-in group, so each fold kernel
+        // the trace's recurrences dispatch is resolved before ready, not on
+        // a group's first serving fire.
+        let folds_ahead = p.rs.group_folds
+            || (crate::sizing::active() && p.rs.body.buffers() && self.buffers.is_some());
         if p.rs.body.buffers()
             && let Some(buffers) = self.buffers
         {
@@ -809,17 +992,66 @@ impl FireCtx<'_> {
                 tables: kernels_cuda::runtime::channel::RsTables {
                     lanes: tables.lanes,
                     pages: tables.pages,
-                    replay_tok: tables.replay_tok,
+                    lane_rows: tables.lane_rows,
+                    replay_spans: tables.replay_spans,
                     page_tokens: buffers.page_tokens(),
                 },
                 extended: p.rs.body == record::RsBody::Replays,
-                replays: &p.rs.replays,
+                splits: p.rs.body == record::RsBody::Splits,
                 scratch: rs_scratch.as_ref(),
+                folds: folds_ahead.then_some((tables.folds, tables.fold_entries.max(1))),
             });
+        }
+        // The fire's beam group folds, every layer's, on its stream ahead of
+        // its body: no step of the fire reads a state before its
+        // fold.
+        if p.rs.predicated {
+            let lanes = self.gate_lanes(p);
+            run = run.gated(crate::run::Gate {
+                commits: self.inputs.gate_commits(),
+                indptr: self.predicate.indptr(),
+                mask: self.predicate.mask(lanes).ptr,
+                lanes,
+            });
+        }
+        if folds_ahead {
+            run.fold_groups_ahead()
+                .map_err(|error| Fault::from(crate::error::kernel(error)))?;
         }
         super::btrace::mark("run_new");
         let records = self.graphs.records();
-        let walked = if records {
+        // A size-only walk (`crate::sizing`) walks what arming would capture,
+        // eagerly: nothing launches, and a capture would record nothing. It
+        // walks across the side streams where the capture would, so each
+        // scratch slab is asked for under the stream and lane the body's
+        // regions take it on. A composition no body carries is walked as
+        // serving walks it, on the one stream: it captures nothing, but its
+        // fire takes its slabs eagerly, and only a walk lays them.
+        #[cfg(feature = "rocm")]
+        let (rocm_before, compiled_before) = (
+            kernels_rocm::tally::counts(),
+            self.live.tallied(engine::live::Tally::Compiled),
+        );
+        let walked = if records && crate::sizing::active() {
+            let lanes = forked.filter(|_| {
+                p.bodied && record::forks(self.compiled, p.composition.bucket(), &p.key.islands)
+            });
+            let mut cursor = match lanes {
+                Some(lanes) => Cursor::across(&place, lanes),
+                None => Cursor::new(&place),
+            };
+            lay_gate(&run).and_then(|()| {
+                walk(
+                    self.trace,
+                    self.compiled,
+                    &p.descriptor,
+                    &mut run,
+                    &mut cursor,
+                    Filter::default(),
+                )
+                .map_err(Fault::from)
+            })
+        } else if records {
             if self.arming && !p.bodied {
                 Ok(())
             } else if p.bodied {
@@ -834,24 +1066,59 @@ impl FireCtx<'_> {
                     // Side streams for the fires narrow enough to leave the
                     // card room for them (`compiler.dag_streams_until`).
                     lanes: forked.filter(|_| {
-                        record::forks(self.compiled, p.composition.bucket(), &p.islands)
+                        record::forks(self.compiled, p.composition.bucket(), &p.key.islands)
                     }),
                     conditionals,
-                    decoding: self.decoding,
-                    tiers: self.tiers,
-                    lane_ceiling: p.lane_ceiling,
-                    towered: p.towered,
                     ceilings,
-                    islands: &p.islands,
-                    rs: p.rs.body,
+                    key: &p.key,
                 };
 
-                self.cache.fire_body(&fire, &mut run, &place)
+                // A serving fire replays a body or is counted: one that
+                // captures its body as it serves waited on a build the load
+                // did not make, and one that walks ran with none.
+                let before = self.cache.tally();
+                let fired = self.cache.fire_body(&fire, &mut run, &place);
+                if !self.arming {
+                    let after = self.cache.tally();
+                    if after.captures > before.captures {
+                        self.live.tally(engine::live::Tally::Compiled, 1);
+                    } else if after.stated_eager > before.stated_eager {
+                        // A composition the load stated eager: uncaptured,
+                        // as stated.
+                        self.live.tally(engine::live::Tally::Eager, 1);
+                    } else if after.hits == before.hits {
+                        self.live.tally(engine::live::Tally::Unrecorded, 1);
+                    }
+                }
+                fired
             } else {
                 self.cache.eager_walk(p.rs.body.buffers());
-                self.cache
-                    .eager_unbodied("its composition is one a body does not carry");
+                if p.stated_eager {
+                    self.live.tally(engine::live::Tally::Eager, 1);
+                } else {
+                    self.live.tally(engine::live::Tally::Unrecorded, 1);
+                    self.cache.eager_unbodied(
+                        p.unbodied
+                            .as_deref()
+                            .unwrap_or("its composition is one a body does not carry"),
+                    );
+                }
                 let mut cursor = Cursor::new(&place);
+                lay_gate(&run).and_then(|()| {
+                    walk(
+                        self.trace,
+                        self.compiled,
+                        &p.descriptor,
+                        &mut run,
+                        &mut cursor,
+                        Filter::default(),
+                    )
+                    .map_err(Fault::from)
+                })
+            }
+        } else {
+            let mut cursor = Cursor::new(&place);
+            lay_gate(&run).and_then(|()| {
                 walk(
                     self.trace,
                     self.compiled,
@@ -861,20 +1128,13 @@ impl FireCtx<'_> {
                     Filter::default(),
                 )
                 .map_err(Fault::from)
-            }
-        } else {
-            let mut cursor = Cursor::new(&place);
-            walk(
-                self.trace,
-                self.compiled,
-                &p.descriptor,
-                &mut run,
-                &mut cursor,
-                Filter::default(),
-            )
-            .map_err(Fault::from)
+            })
         };
         drop(run);
+        #[cfg(feature = "rocm")]
+        if !self.arming {
+            self.tally_rocm(rocm_before, compiled_before, walked.is_ok());
+        }
         if let Some(tapping) = self.tapping {
             match &walked {
                 Ok(()) => tapping.finish(),
@@ -897,6 +1157,24 @@ impl FireCtx<'_> {
         Ok(())
     }
 
+    /// What kernels-rocm did on this thread across a serving fire, counted
+    /// as the fire's: a code object built or loaded is Compiled (once a
+    /// fire, with a body it captured as it served), and a code object
+    /// refused is Refused when the
+    /// fire still served (a fire that failed is counted where its frame is
+    /// refused).
+    #[cfg(feature = "rocm")]
+    fn tally_rocm(&self, before: kernels_rocm::tally::Counts, compiled_before: u64, served: bool) {
+        use engine::live::Tally;
+        let after = kernels_rocm::tally::counts();
+        if after.built > before.built && self.live.tallied(Tally::Compiled) == compiled_before {
+            self.live.tally(Tally::Compiled, 1);
+        }
+        if served && after.refused > before.refused {
+            self.live.tally(Tally::Refused, 1);
+        }
+    }
+
     fn readback(&mut self, p: &Prepared<'_>, staged: &Staged) -> Result<Option<Readback>> {
         if self.arming && self.golden_arm == Golden::Off {
             return Ok(None);
@@ -914,16 +1192,24 @@ impl FireCtx<'_> {
             voxel_first[source] = row.voxel_offset;
             lane_clips[source] = (row.clip_offset, row.clips);
         }
-        let mut last_row = vec![0u32; lane_count];
-        let mut first_row = vec![0u32; lane_count];
-        let mut lane_rows = vec![0u32; lane_count];
-        for lane in 0..lane_count {
+        // Each lane's rows of a plane: its readout indices where its output
+        // is gathered at the readout rows, its own token rows (the rows the
+        // readout names, `p.readout_rows`) where the output spans the fire's
+        // rows.
+        let rows_of = |lane: usize, gathered: bool| -> Vec<u32> {
             let first = p.readout_first.get(lane).copied().unwrap_or(0);
             let count = p.readout_count.get(lane).copied().unwrap_or(0);
-            first_row[lane] = first;
-            lane_rows[lane] = count;
-            last_row[lane] = first + count.saturating_sub(1);
-        }
+            if gathered {
+                (first..first + count).collect()
+            } else {
+                p.readout_rows
+                    .get(first as usize..(first + count) as usize)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|&row| u32::try_from(row).unwrap_or(0))
+                    .collect()
+            }
+        };
         let plane_of = |value: poem_ir::ValueId, name: &str| -> Result<kernels_cuda::Tensor> {
             slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
@@ -958,11 +1244,13 @@ impl FireCtx<'_> {
 
         let mut lane_planes: Vec<Option<(String, kernels_cuda::Tensor)>> = vec![None; lane_count];
         let mut names = vec![String::new(); lane_count];
+        let mut rows = vec![Vec::new(); lane_count];
         let mut pixels = None;
         for lane in 0..lane_count {
             let Some(out) = self.exports.readback(lane_class[lane]) else {
                 continue;
             };
+            rows[lane] = rows_of(lane, out.decl.readout);
             names[lane] = out.decl.name.clone();
             let plane = plane_of(out.values[0], &out.decl.name)?;
             if let Some(grid) = out.grid {
@@ -1000,13 +1288,19 @@ impl FireCtx<'_> {
         super::btrace::mark("epi_reap");
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
+            // Its prologue faulted its lanes already: its epilogue is not run.
+            if self
+                .guest_faults
+                .iter()
+                .any(|fault| fault.instance == attached.instance)
+            {
+                continue;
+            }
             let reads = self.programs.reads(attached.instance)?;
-            let end = attached.lane as usize + attached.lanes as usize;
-            let pass_reads =
-                pass_readouts(&first_row, &lane_rows, attached.lane as usize, end).len();
+            self.programs
+                .seat_lanes(attached.instance, attached.lanes)?;
             for k in 0..attached.lanes {
                 let at = attached.lane as usize + k as usize;
-                let run = pass_readouts(&first_row, &lane_rows, at, end);
                 for (index, out) in self.exports.outputs.iter().enumerate() {
                     if !out.classes.contains(lane_class[at])
                         || !reads
@@ -1023,26 +1317,26 @@ impl FireCtx<'_> {
                         out,
                         &plane_of,
                         &storage_of,
-                        (first_row[at], last_row[at], lane_rows[at]),
-                        (&run, pass_reads),
+                        &|lane| rows_of(lane, out.decl.readout),
+                        attached.lane as usize + attached.lanes as usize,
                         lane_row[at],
                         first_voxel(index, at),
                     )?;
                 }
             }
-            if let Some(fired) = epilogues.stage(
+            if let Some((flying, fired)) = epilogues.stage(
                 self.device,
                 self.programs,
-                attached.lane as usize,
+                attached.span(),
                 attached.instance,
                 Attach::Epilogue,
             )? {
-                committed_or(fired, attached.instance, "epilogue")?;
+                noted(self.guest_faults, &flying, fired);
             }
         }
 
         super::btrace::mark("epi_bind");
-        let mut settled: Vec<(usize, Fired)> = Vec::new();
+        let mut settled: Vec<(Flying, Fired)> = Vec::new();
         if let Some(batch) = epilogues.defer(
             self.device,
             self.programs,
@@ -1053,18 +1347,8 @@ impl FireCtx<'_> {
             self.owed.push_back(batch);
         }
         super::btrace::mark("epi_fly");
-        for (lane, fired) in settled {
-            let attached = p
-                .attachments
-                .iter()
-                .find(|a| !a.adapter_only && a.lane as usize == lane)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!("lane {lane} settled an epilogue nothing attached"),
-                    )
-                })?;
-            committed_or(fired, attached.instance, "epilogue")?;
+        for (flying, fired) in settled {
+            noted(self.guest_faults, &flying, fired);
         }
 
         for ((seat, table), kv_less) in p.seats.iter().zip(&p.tables).zip(&p.kv_less_seats) {
@@ -1079,9 +1363,7 @@ impl FireCtx<'_> {
         Ok(Some(Readback {
             names,
             lanes: lane_planes,
-            last_row,
-            first_row,
-            lane_rows,
+            rows,
             pixels,
         }))
     }
@@ -1089,7 +1371,10 @@ impl FireCtx<'_> {
     /// Points instance `instance`'s reads of `out` for its lane `k` (the
     /// fire's lane `at`) at where the fire wrote it: a readout output at the
     /// rows the lane reads out, a lane output at the lane's row (a layer
-    /// after another), a row or voxel output from the lane's first.
+    /// after another), a row or voxel output from the lane's first. The seat
+    /// holds the lane's own rows and those of the instance's later lanes
+    /// (up to the fire's lane `end`) that lie right after them: a lane read
+    /// past them reads its next lane's rows, never another instance's.
     #[allow(clippy::too_many_arguments)]
     fn bind_output(
         &mut self,
@@ -1100,15 +1385,70 @@ impl FireCtx<'_> {
         out: &poem_exec::feeds::ClassOutput,
         plane_of: &dyn Fn(poem_ir::ValueId, &str) -> Result<kernels_cuda::Tensor>,
         storage_of: &dyn Fn(Dtype) -> Result<u32>,
-        (first_row, last_row, owned): (u32, u32, u32),
-        (run, reads): (&[u32], usize),
+        rows_of: &dyn Fn(usize) -> Vec<u32>,
+        end: usize,
         lane_row: u32,
         first_voxel: u32,
     ) -> Result<()> {
         let name = &out.decl.name;
+        // A capturing lane's rows are its reader's state, not the arena's:
+        // its key row, then its page row.
+        if crate::scores::captured(name) {
+            let (Some(keys_at), Some(layout)) =
+                (self.programs.score_rows(instance), self.capture.as_deref())
+            else {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "output `{name}` of lane {k}, which instance {instance} holds no score \
+                         rows for"
+                    ),
+                });
+            };
+            let (keys, pages) = layout.widths();
+            let (at, width) = if name == crate::scores::SCORES {
+                (keys_at, keys)
+            } else {
+                (keys_at + layout.key_bytes(), pages)
+            };
+            return self.programs.bind_output(
+                instance,
+                name,
+                k,
+                at,
+                crate::program::launch::INTRINSIC_STORAGE_F32,
+                width,
+                width,
+                0,
+                1,
+            );
+        }
         let plane = plane_of(out.values[0], name)?;
         let storage = storage_of(plane.dtype)?;
         let width = plane.width;
+        // The fire's rows of lane `lane`: its token rows and its voxels.
+        let lane_rows = |lane: usize| {
+            p.composition
+                .lanes()
+                .iter()
+                .find(|row| row.source as usize == lane)
+                .copied()
+                .unwrap_or_default()
+        };
+        let own = lane_rows(at);
+        // A run of `(first, count)` from lane `at`'s, grown by each later
+        // lane of the instance whose run starts where it ends.
+        let held = |run: &dyn Fn(usize) -> Option<(u32, u32)>| -> u32 {
+            let Some((first, mut count)) = run(at) else {
+                return 0;
+            };
+            for lane in at + 1..end {
+                match run(lane) {
+                    Some((next, more)) if next == first.saturating_add(count) => count += more,
+                    _ => break,
+                }
+            }
+            count
+        };
         match out.decl.axis {
             poem_ir::InputAxis::Lane => {
                 let elem = poem_compiler::arena::elem_bytes(plane.dtype).unwrap_or(0);
@@ -1140,29 +1480,75 @@ impl FireCtx<'_> {
                     width,
                     stride,
                     0,
+                    u32::try_from(out.values.len()).unwrap_or(u32::MAX),
                 )
             }
-            poem_ir::InputAxis::Row if out.decl.readout => {
-                if let Some(rows) = p.lanes.get(at).and_then(|seated| seated.readout)
-                    && rows.len() as u32 > owned
-                {
-                    return Err(Fault::Ceiling {
-                        what: "rows in the lane a readout names",
-                        need: rows.len() as u64,
-                        have: u64::from(owned),
-                    });
-                }
-                let wanted: Vec<u32> = if run.is_empty() {
-                    vec![last_row]
-                } else {
-                    run.to_vec()
+            // A row output read whole from the lane's first token row where
+            // its readout names no rows.
+            poem_ir::InputAxis::Row
+                if !out.decl.readout
+                    && p.lanes
+                        .get(at)
+                        .and_then(|seated| seated.readout)
+                        .is_none_or(<[u32]>::is_empty) =>
+            {
+                self.programs.bind_output(
+                    instance,
+                    name,
+                    k,
+                    plane.ptr,
+                    storage,
+                    width,
+                    width,
+                    own.row_offset,
+                    held(&|lane| {
+                        let row = lane_rows(lane);
+                        Some((row.row_offset, row.rows))
+                    }),
+                )
+            }
+            // A row output's rows, gathered or the lane's own token rows
+            // (`rows`, as its readout names them).
+            poem_ir::InputAxis::Row => {
+                let wanted_of = |lane: usize| -> Result<Vec<u32>> {
+                    let rows = rows_of(lane);
+                    match p.lanes.get(lane).and_then(|seated| seated.readout) {
+                        None | Some([]) => Ok(rows.last().copied().into_iter().collect()),
+                        Some(stated) => {
+                            if stated.len() > rows.len() {
+                                return Err(Fault::Ceiling {
+                                    what: "rows in the lane a readout names",
+                                    need: stated.len() as u64,
+                                    have: rows.len() as u64,
+                                });
+                            }
+                            Ok(rows[..stated.len()].to_vec())
+                        }
+                    }
                 };
-                let consecutive = wanted
-                    .windows(2)
-                    .all(|pair| pair[1] == pair[0].wrapping_add(1));
-                if consecutive {
+                let consecutive = |rows: &[u32]| {
+                    rows.windows(2)
+                        .all(|pair| pair[1] == pair[0].wrapping_add(1))
+                };
+                // The lane's rows and, in lane order, every later lane's of
+                // the pass: what the pass reads from this lane's binding on,
+                // a mixed pass's lanes landing their rows in any order.
+                wanted_of(at)?;
+                let mut wanted = Vec::new();
+                for lane in at..end {
+                    wanted.extend(wanted_of(lane)?);
+                }
+                if consecutive(&wanted) {
                     return self.programs.bind_output(
-                        instance, name, k, plane.ptr, storage, width, width, wanted[0],
+                        instance,
+                        name,
+                        k,
+                        plane.ptr,
+                        storage,
+                        width,
+                        width,
+                        wanted.first().copied().unwrap_or(0),
+                        u32::try_from(wanted.len()).unwrap_or(u32::MAX),
                     );
                 }
                 if plane.dtype != Dtype::Bf16 {
@@ -1175,13 +1561,9 @@ impl FireCtx<'_> {
                     });
                 }
                 let row_bytes = u64::from(width) * 2;
-                let last = *wanted.last().expect("a readout run holds a row");
-                let pad = reads.saturating_sub(wanted.len());
                 let table: Vec<u8> = wanted
                     .iter()
-                    .copied()
-                    .chain(std::iter::repeat_n(last, pad))
-                    .flat_map(|row| (plane.ptr + u64::from(row) * row_bytes).to_le_bytes())
+                    .flat_map(|row| (plane.ptr + u64::from(*row) * row_bytes).to_le_bytes())
                     .collect();
                 let staged_at = u64::from(self.budget.max_tokens)
                     .saturating_mul(8)
@@ -1197,11 +1579,9 @@ impl FireCtx<'_> {
                     width,
                     width,
                     0,
+                    u32::try_from(wanted.len()).unwrap_or(u32::MAX),
                 )
             }
-            poem_ir::InputAxis::Row => self.programs.bind_output(
-                instance, name, k, plane.ptr, storage, width, width, first_row,
-            ),
             poem_ir::InputAxis::Voxel => self.programs.bind_output(
                 instance,
                 name,
@@ -1211,6 +1591,10 @@ impl FireCtx<'_> {
                 width,
                 width,
                 first_voxel,
+                held(&|lane| {
+                    let row = lane_rows(lane);
+                    Some((row.voxel_offset, row.voxels))
+                }),
             ),
         }
     }
@@ -1218,9 +1602,9 @@ impl FireCtx<'_> {
 
 #[derive(Default)]
 struct AirborneFires {
-    launched: Vec<(usize, engine::InstanceId)>,
+    launched: Vec<Flying>,
     rings: Vec<usize>,
-    settled: Vec<(usize, Fired)>,
+    settled: Vec<(Flying, Fired)>,
     flown: bool,
 }
 
@@ -1229,10 +1613,10 @@ impl AirborneFires {
         &mut self,
         device: &Context,
         programs: &mut ProgramPlane,
-        tag: usize,
+        lanes: std::ops::Range<u32>,
         instance: engine::InstanceId,
         at: Attach,
-    ) -> Result<Option<Fired>> {
+    ) -> Result<Option<(Flying, Fired)>> {
         if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
             programs.abandon_wave();
         }
@@ -1240,13 +1624,22 @@ impl AirborneFires {
         if rings.iter().any(|ring| self.rings.contains(ring)) {
             self.flush(device, programs)?;
         }
+        let mut flying = Flying {
+            lanes,
+            instance,
+            at: point(at),
+            commit: 0,
+        };
         match programs.stage(instance, at)? {
             crate::program::Launched::Airborne => {
+                flying.commit = programs
+                    .instance(instance)
+                    .map_or(0, |session| session.commit_word());
                 self.rings.extend(rings);
-                self.launched.push((tag, instance));
+                self.launched.push(flying);
                 Ok(None)
             }
-            crate::program::Launched::Refused(fired) => Ok(Some(fired)),
+            crate::program::Launched::Refused(fired) => Ok(Some((flying, fired))),
         }
     }
 
@@ -1267,9 +1660,9 @@ impl AirborneFires {
         }
         self.fly(device, programs)?;
         device.synchronize()?;
-        for (tag, instance) in self.launched.drain(..) {
-            let fired = programs.settle_launched(instance)?;
-            self.settled.push((tag, fired));
+        for flying in self.launched.drain(..) {
+            let fired = programs.settle_launched(flying.instance)?;
+            self.settled.push((flying, fired));
         }
         self.rings.clear();
         self.flown = false;
@@ -1282,7 +1675,7 @@ impl AirborneFires {
         programs: &mut ProgramPlane,
         spare_events: &mut Vec<Event>,
         seq: u64,
-        into: &mut Vec<(usize, Fired)>,
+        into: &mut Vec<(Flying, Fired)>,
     ) -> Result<Option<GuestBatch>> {
         self.fly(device, programs)?;
         into.append(&mut self.settled);
@@ -1299,6 +1692,7 @@ impl AirborneFires {
             launched: core::mem::take(&mut self.launched),
             seq,
             landed,
+            told: None,
         };
         self.rings.clear();
         self.flown = false;
@@ -1358,12 +1752,14 @@ fn settle_batch(
     }
     super::btrace::mark("waited");
     let mut first: Option<crate::error::Fault> = None;
-    for &(lane, instance) in &batch.launched {
-        let outcome = programs
-            .settle_launched(instance)
-            .and_then(|fired| committed_or(fired, instance, "epilogue"));
+    for flying in &batch.launched {
+        let fired = programs.settle_launched(flying.instance);
+        // A pass whose step told its sink faulted its own lanes there.
+        let outcome = match fired {
+            Ok(_) if batch.told == Some(true) => Ok(()),
+            fired => fired.and_then(|fired| committed_or(fired, flying.instance, flying.at)),
+        };
         if let Err(fault) = outcome {
-            let _ = lane;
             first.get_or_insert(fault);
         }
     }
@@ -1373,52 +1769,42 @@ fn settle_batch(
     }
 }
 
-fn pass_readouts(first: &[u32], count: &[u32], from: usize, end: usize) -> Vec<u32> {
-    (from..end.min(first.len()))
-        .flat_map(|lane| {
-            let at = first[lane];
-            at..at + count.get(lane).copied().unwrap_or(0)
-        })
-        .collect()
+fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<()> {
+    match fault_of(fired, instance, at) {
+        None => Ok(()),
+        Some(why) => Err(Fault::program("serve::fire", why)),
+    }
 }
 
-fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<()> {
+/// Why a pass that did not commit faulted its lanes; `None` where it committed.
+pub(super) fn fault_of(fired: Fired, instance: engine::InstanceId, at: &str) -> Option<String> {
     match fired {
-        Fired::Committed => Ok(()),
-        Fired::Blocked(channel) => Err(Fault::program(
-            "serve::fire",
-            format!(
-                "instance {instance}'s {at} blocked on channel {channel} AFTER the gate \
-                 admitted it, so something advanced its cursors between the two"
-            ),
+        Fired::Committed => None,
+        Fired::Blocked(channel) => Some(format!(
+            "instance {instance}'s {at} blocked on channel {channel} AFTER the gate admitted \
+             it, so something advanced its cursors between the two"
         )),
-        Fired::Declined => Err(Fault::program(
-            "serve::fire",
-            format!(
-                "instance {instance}'s {at} declined: a stage cleared its commit slot, so \
-                 nothing the guest computed this fire is visible"
-            ),
+        Fired::Declined => Some(format!(
+            "instance {instance}'s {at} declined: a stage cleared its commit slot, so nothing \
+             the guest computed this fire is visible"
         )),
-        Fired::Faulted(why) => Err(Fault::program(
-            "serve::fire",
-            format!("instance {instance}'s {at} faulted and stays faulted: {why}"),
+        Fired::Faulted(why) => Some(format!(
+            "instance {instance}'s {at} faulted and stays faulted: {why}"
         )),
     }
+}
+
+/// An eager walk's fold gate, laid ahead of the walk as a body records it
+/// ahead of its first stretch (`record::Bodies::fire_body`).
+fn lay_gate(run: &Run<'_>) -> Result<()> {
+    run.lay_gate()
+        .map_err(|error| Fault::from(crate::error::kernel(error)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Fired, committed_or, pass_readouts};
+    use super::{Fired, committed_or};
     use crate::serve::Attached;
-
-    #[test]
-    fn a_mixed_pass_reads_its_lanes_in_its_own_order() {
-        let (first, count) = ([1, 0, 2, 3], [1, 1, 1, 1]);
-        assert_eq!(pass_readouts(&first, &count, 0, 4), [1, 0, 2, 3]);
-        assert_eq!(pass_readouts(&first, &count, 2, 4), [2, 3]);
-        assert_eq!(pass_readouts(&[0, 1, 3], &[1, 2, 1], 0, 3), [0, 1, 2, 3]);
-        assert_eq!(pass_readouts(&[4, 0], &[2, 3], 0, 2), [4, 5, 0, 1, 2]);
-    }
 
     #[test]
     fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {

@@ -21,9 +21,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui::{Answer, Palette};
 
-/// The page size Pie's Metal engine lays kv in when `[engine] kv_page_size` is unstated.
-const PAGE_SIZE: u32 = 32;
-
 /// The checks `--many` runs at once.
 const AT_ONCE: usize = 8;
 
@@ -545,7 +542,7 @@ fn quantization_words(quantization: &serde_json::Value) -> String {
 /// What a boot of `deployment` at `context` tokens needs of this Mac, and how that fits it.
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn need(deployment: &str, context: u32) -> Result<Option<(u64, Fits)>> {
-    let (need, memory) = runtime::engine::load::need(deployment, context, PAGE_SIZE)?;
+    let (need, memory) = runtime::engine::load::need(deployment, context)?;
     let bytes = need.bytes();
     let fits = if bytes > need.ceiling {
         Fits::TooLarge
@@ -560,7 +557,6 @@ fn need(deployment: &str, context: u32) -> Result<Option<(u64, Fits)>> {
 /// Planned on Apple Silicon only.
 #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
 fn need(_deployment: &str, _context: u32) -> Result<Option<(u64, Fits)>> {
-    let _ = PAGE_SIZE;
     Ok(None)
 }
 

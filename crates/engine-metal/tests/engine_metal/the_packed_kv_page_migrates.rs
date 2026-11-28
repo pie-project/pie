@@ -1,6 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
-//! C2d belt — a packed `KvU4` page MIGRATES correctly through `store::copy_kv`.
+//! A packed `KvU4` page MIGRATES correctly through `store::copy_kv`.
 //!
 //! `copy_kv` (page defrag / fork) sizes a packed page's cell stride from the
 //! head_dim (`head_dim/2 + 2` bytes per head, NOT `width * element`), so a
@@ -14,6 +14,7 @@
 //!
 //! We run it at head_dim 256 AND 128 — the two blocks the packed codec ships.
 
+use crate::common::f32_to_bf16_bits;
 use engine::transfer::KvRun;
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -35,7 +36,7 @@ fn packed_bytes(block: usize) -> usize {
     block / 2 + 2
 }
 
-// --- deterministic outlier-heavy KV data (same mixer as the C2a/C2b tests) ----
+// --- deterministic outlier-heavy KV data (same mixer as the `the_kv_codec_round_trips`/`the_kv_write_round_trips` tests) ----
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5E5E_1234_9ABC_DEF0;
     x ^= x >> 33;
@@ -76,12 +77,6 @@ fn outlier_plane(rows: usize, width: usize, block: usize, salt: u64) -> Vec<f32>
         }
     }
     v
-}
-
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
 }
 
 fn bf16_bytes(v: &[f32]) -> Vec<u8> {
@@ -156,7 +151,7 @@ fn seats(rig: &mut Rig) -> Seats {
 
 #[test]
 fn the_packed_kv_page_migrates() {
-    eprintln!("=== C2d belt: a packed KvU4 page migrates byte-exact through copy_kv ===");
+    let _device = crate::device_alone();
     let Some(mut rig) = Rig::open() else {
         eprintln!("skipping: this machine publishes no Metal device");
         return;
@@ -164,7 +159,6 @@ fn the_packed_kv_page_migrates() {
     for &head_dim in &[256usize, 128] {
         migrate_case(&mut rig, head_dim);
     }
-    eprintln!("=== C2d belt done: packed pages migrate at head_dim 128 & 256 ===");
 }
 
 fn migrate_case(rig: &mut Rig, head_dim: usize) {
@@ -230,11 +224,11 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         atoms: Default::default(),
         shards: Default::default(),
         short_runs: Vec::new(),
-        cow_sets: 1,
         waste: Default::default(),
         profile: ChunkProfile::ON_DEVICE_METAL,
         weights: Vec::new(),
         rs: Default::default(),
+        windowed: None,
     };
     let rows = Rows::plan(&trace, &recipe, &facts, None).expect("plan packed KV");
     let layout = Layout::new(
@@ -296,9 +290,13 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         before.iter().any(|&b| b != 0),
         "head_dim {head_dim}: the source slot should hold the quantized codes"
     );
-    assert!(
-        read_slot(&pools, dst).iter().all(|&b| b == 0),
-        "head_dim {head_dim}: the destination slot should start zeroed"
+    // The destination holds none of the source's bytes before the copy (zeros,
+    // or under `test-slot-fill` the pool's poison), so a byte-exact match after
+    // it is the copy's doing.
+    assert_ne!(
+        read_slot(&pools, dst),
+        before,
+        "head_dim {head_dim}: the destination slot should not start as the source"
     );
 
     let moves = [KvRun {

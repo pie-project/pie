@@ -16,25 +16,20 @@ pub struct Prompt {
     /// Each picture, in the order its span sits in `tokens`.
     pub images: Vec<media::Image>,
     pub ends: Vec<u32>,
-    /// The tokens the opening system turn takes, when the template wrote
-    /// one.
-    pub system: Option<u32>,
 }
 
 pub fn build(req: &Request) -> Result<Prompt, String> {
     let mut tokens = Vec::new();
     let mut images = Vec::new();
     let mut ends = Vec::new();
-    let mut system_tokens = None;
-    if let Some(raw) = &req.raw_prompt {
-        // a raw prompt that already spells the model's prefix (a chat render's
-        // BOS) is not given it twice, as vLLM and SGLang read it
-        let body = model::encode(raw);
-        let prefix = chat::prefix();
-        if !body.starts_with(&prefix) {
-            tokens.extend(prefix);
-        }
-        tokens.extend(body);
+    if let Some(ids) = &req.prompt_tokens {
+        tokens.extend_from_slice(ids);
+        ends.push(tokens.len() as u32);
+    } else if let Some(raw) = &req.raw_prompt {
+        tokens.extend(client_api::props::raw_prompt_tokens(
+            chat::prefix(),
+            model::encode(raw),
+        ));
         ends.push(tokens.len() as u32);
     } else {
         let messages = &req.messages;
@@ -53,7 +48,6 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         tokens.extend(chat::open(system.as_deref(), &req.tools, effort(req)));
         if !tokens.is_empty() {
             ends.push(tokens.len() as u32);
-            system_tokens = Some(tokens.len() as u32);
         }
         for m in messages.iter().take(lead).skip(1) {
             tokens.extend(chat::system(&m.content));
@@ -125,7 +119,6 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
         tokens,
         images,
         ends,
-        system: system_tokens,
     })
 }
 

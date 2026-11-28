@@ -1,7 +1,7 @@
 pub mod adapter;
 pub mod api;
+pub mod beam;
 pub mod bench;
-pub mod blob;
 pub mod boot;
 pub mod chip;
 pub mod chunks;
@@ -25,7 +25,9 @@ pub mod rs;
 pub mod run;
 pub mod serve;
 pub mod settle;
+pub mod snapshot;
 pub mod store;
+pub mod stored;
 pub mod trace;
 pub mod weights;
 pub mod window;

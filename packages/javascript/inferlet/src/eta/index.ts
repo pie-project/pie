@@ -31,7 +31,6 @@ export {
   padTokens,
   readoutSpans,
   scale,
-  submitDeadlineUs,
   unpadTokens,
 } from './bridge.js';
 export type { Fold, StateGeometry } from './bridge.js';

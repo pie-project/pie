@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         printf("boot %d: %s\ndevice bytes before boot: %lld\n", i, argv[i], device_bytes());
         double start = now();
-        status = pie_server_start(argv[i], "{\"device_kv_budget\": \"256MiB\"}", "/tmp/pie-c-smoke", "127.0.0.1:0", &server, &error);
+        status = pie_server_start(argv[i], "{\"budget_device\": \"1GiB\"}", "/tmp/pie-c-smoke", "127.0.0.1:0", &server, &error);
         if (status != PIE_OK) return fail("boot", status, error);
         printf("booted in %.2f s: %s\n", now() - start, pie_server_summary(server));
         printf("gateway: %s\ndevice bytes serving: %lld\n", pie_server_listen_addr(server), device_bytes());

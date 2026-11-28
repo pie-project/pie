@@ -3,7 +3,7 @@ mod numeric;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use eval_op::eval_op;
+pub use eval_op::eval_op;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
@@ -23,15 +23,25 @@ pub enum Value {
     I32(Vec<i32>),
     U32(Vec<u32>),
     Bool(Vec<bool>),
+    /// Each element's bf16 bits (`eta_ir::types::bf16_bits`): what a `bf16`
+    /// value holds on every backend, two bytes an element.
+    Bf16(Vec<u16>),
 }
 
 impl Value {
+    /// `x` rounded to bf16 an element, round-to-nearest-even: the value a
+    /// `bf16` store of `x` keeps.
+    pub fn bf16_of(x: &[f32]) -> Value {
+        Value::Bf16(x.iter().map(|&a| eta_ir::types::bf16_bits(a)).collect())
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Value::F32(v) => v.len(),
             Value::I32(v) => v.len(),
             Value::U32(v) => v.len(),
             Value::Bool(v) => v.len(),
+            Value::Bf16(v) => v.len(),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -43,12 +53,35 @@ impl Value {
             Value::I32(_) => Dtype::I32,
             Value::U32(_) => Dtype::U32,
             Value::Bool(_) => Dtype::Bool,
+            Value::Bf16(_) => Dtype::Bf16,
+        }
+    }
+
+    /// `numel` (at least one) zeros of `dtype`.
+    pub fn zeros(dtype: Dtype, numel: usize) -> Value {
+        let n = numel.max(1);
+        match dtype {
+            Dtype::F32 => Value::F32(vec![0.0; n]),
+            Dtype::I32 => Value::I32(vec![0; n]),
+            Dtype::U32 => Value::U32(vec![0; n]),
+            Dtype::Bool => Value::Bool(vec![false; n]),
+            Dtype::Bf16 => Value::Bf16(vec![0; n]),
+            _ => no_interpreter_lane(dtype),
         }
     }
 
     pub fn from_le_bytes(dtype: Dtype, bytes: &[u8]) -> Option<Value> {
         match dtype {
             Dtype::Bool => Some(Value::Bool(bytes.iter().map(|&b| b != 0).collect())),
+            Dtype::Bf16 if !bytes.len().is_multiple_of(2) => None,
+            Dtype::Bf16 => Some(Value::Bf16(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            )),
             Dtype::F32 | Dtype::I32 | Dtype::U32 if !bytes.len().is_multiple_of(4) => None,
             Dtype::F32 => Some(Value::F32(
                 bytes
@@ -84,6 +117,7 @@ impl Value {
             Value::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
             Value::U32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
             Value::Bool(v) => v.iter().map(|&b| b as u8).collect(),
+            Value::Bf16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
         }
     }
 }
@@ -234,17 +268,10 @@ pub(crate) fn no_interpreter_lane(dtype: Dtype) -> ! {
 }
 
 fn zeros(ty: ValueType) -> Value {
-    let n = ty.shape.numel().max(1) as usize;
-    match ty.dtype {
-        Dtype::F32 => Value::F32(vec![0.0; n]),
-        Dtype::I32 => Value::I32(vec![0; n]),
-        Dtype::U32 => Value::U32(vec![0; n]),
-        Dtype::Bool => Value::Bool(vec![false; n]),
-        _ => no_interpreter_lane(ty.dtype),
-    }
+    Value::zeros(ty.dtype, ty.shape.numel() as usize)
 }
 
-pub(super) fn value_matches(v: &Value, ty: ValueType) -> bool {
+pub(crate) fn value_matches(v: &Value, ty: ValueType) -> bool {
     v.dtype() == ty.dtype && v.len() as u64 == ty.shape.numel().max(1)
 }
 
@@ -370,6 +397,18 @@ impl Instance {
             }
             None => Err(HostError::WouldBlock),
         })
+    }
+
+    /// The cell at channel `chan`'s front, whatever its host role: what an
+    /// engine's descriptor port reads of it (the guest-program contract's
+    /// view of a loop-carried geometry channel).
+    #[must_use]
+    pub fn peek(&self, chan: u32) -> Option<Value> {
+        if (chan as usize) < self.channels.len() {
+            self.with_chan(chan as usize, |st| st.queue.front().cloned())
+        } else {
+            None
+        }
     }
 
     pub fn host_read(&mut self, bound: &BoundTrace, chan: u32) -> Result<Value, HostError> {
@@ -524,6 +563,14 @@ pub(crate) fn const_value(dtype: Dtype, shape: Shape, data: &[u8]) -> Value {
     let n = shape.numel() as usize;
     match dtype {
         Dtype::Bool => Value::Bool(data.iter().take(n).map(|&b| b != 0).collect()),
+        Dtype::Bf16 => Value::Bf16(
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .take(n)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
         Dtype::F32 => Value::F32(
             data.as_chunks::<4>()
                 .0
@@ -622,13 +669,16 @@ fn exec_body(
     Ok(())
 }
 
-pub(crate) enum ChanEffect {
+/// A channel op's effect, which the caller's channels carry out.
+pub enum ChanEffect {
     Take(u32),
     Read(u32),
     Put(u32, ValueId),
 }
 
-pub(crate) enum Evaled {
+/// What [`eval_op`] answers: the op's result(s), or the effect its caller
+/// carries out (a channel's, a kernel's, a sink's).
+pub enum Evaled {
     One(Value),
     Two(Value, Value),
     Chan(ChanEffect),

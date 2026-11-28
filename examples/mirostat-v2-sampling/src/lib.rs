@@ -192,12 +192,17 @@ async fn main(input: Input) -> Result<Output> {
     let g0 = tok_out_p.take_host::<i32>().await?;
     let s0 = s_out_p.take_host::<f32>().await?;
 
-    generated.push(g0 as u32);
+    // A stop token ends the text and is not part of it, as every chat
+    // inferlet here ends its text.
+    let stopped = inferlet::chat::is_stop(g0 as u32);
+    if !stopped {
+        generated.push(g0 as u32);
+    }
     surprises.push(s0);
     mu -= lr * (s0 - tau);
 
     // ── DECODE LOOP (1-wide) ──
-    if generated.len() < max_tokens {
+    if !stopped && generated.len() < max_tokens {
         let tok_in = Channel::from([g0]);
         let mu_state = Channel::from([mu]);
         let rng = Channel::from([0x51ed_u32, 0]);
@@ -232,6 +237,9 @@ async fn main(input: Input) -> Result<Output> {
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let s = s_out.take_host::<f32>().await?;
+            if inferlet::chat::is_stop(t as u32) {
+                return Ok(ControlFlow::Break(()));
+            }
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

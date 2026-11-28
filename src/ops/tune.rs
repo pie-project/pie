@@ -2,7 +2,7 @@
 //! backend can measure, and write the result to the user's shelf.
 
 use anyhow::{Result, anyhow, bail};
-use clap::Args;
+use clap::{Args, Subcommand};
 use runtime::engine::profiles::backends;
 
 use super::profile::text;
@@ -10,6 +10,9 @@ use crate::ui::{self, Answer, Palette};
 
 #[derive(Args, Debug)]
 pub struct TuneArgs {
+    #[command(subcommand)]
+    pub cmd: Option<TuneCmd>,
+
     /// The backend to tune; needed only where this build hosts several.
     pub backend: Option<String>,
 
@@ -39,9 +42,71 @@ pub struct TuneArgs {
     /// Fit the measurements the last run kept, without measuring again.
     #[arg(long)]
     pub refit: bool,
+
+    /// Check the estimate the load weighs its top rung by: time a fire at
+    /// each rung width of these models (by name or substring; the smallest
+    /// imported artifact without one), to four times the fire top, through
+    /// the serving path; print the measured and estimated times a rung and
+    /// both picks, and fail where the estimate's pick falls more than the
+    /// stated bound short of the measured best. Writes nothing.
+    #[arg(long, num_args = 0..)]
+    pub check_estimate: Option<Vec<String>>,
+
+    /// With `--check-estimate`: also dissect these rung widths (comma
+    /// separated), each replayed and walked node by node beside the
+    /// estimate's picks.
+    #[arg(long, value_delimiter = ',', requires = "check_estimate")]
+    pub dissect: Vec<u32>,
+
+    /// Run the `[rates]` step alone: measure the device's roofline
+    /// constants (launch, matmul and attention rates, bandwidths, scan).
+    #[arg(long, conflicts_with = "check_estimate")]
+    pub rates: bool,
+
+    /// The serving mix a candidate is judged by: four weights for the
+    /// prompt and the 1-, 4- and 8-lane decode steps, `prompt,1,4,8`
+    /// (scaled to sum to one). A chat server might state `1,4,1,0`, a batch
+    /// service `1,0,1,4`. Equal weights where it is not stated.
+    #[arg(long, value_name = "PROMPT,1,4,8")]
+    pub mix: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TuneCmd {
+    /// Write a device's stored measurements (the user's profile a load
+    /// keeps them in) as a committed measured profile,
+    /// `<out>/<device>.measured.toml`: each entry with its key, in a fixed
+    /// order, no date or path. Checked in under
+    /// `crates/engine-<backend>/profiles/`, a load of that device takes each
+    /// entry whose key matches and measures nothing more for it. Every
+    /// model's settle is said with the curves a boot of it reads, and left
+    /// out where one is not carried. Every committed profile is boot-checked
+    /// before it is pushed: a boot on a clean home with only the committed
+    /// file measures nothing and serves c1 / c8 within 2% of the measured
+    /// home it came from.
+    Export {
+        /// The engine whose stored measurements to write: `vulkan`, `wgpu`,
+        /// `cuda` (CUDA or ROCm, as the build hosts it).
+        #[arg(long)]
+        engine: String,
+        /// The device, by number (`vulkan:<n>`); the first without it.
+        #[arg(long, value_name = "N")]
+        device: Option<u32>,
+        /// The directory to write into: the engine's `profiles/`.
+        #[arg(long, value_name = "DIR")]
+        out: std::path::PathBuf,
+    },
 }
 
 pub fn run(args: TuneArgs) -> Result<Answer> {
+    if let Some(TuneCmd::Export {
+        engine,
+        device,
+        out,
+    }) = &args.cmd
+    {
+        return export(engine, *device, out).map(text);
+    }
     let mut all = backends();
     let names: Vec<&str> = all.iter().map(|b| b.name).collect();
     let tunable: Vec<&str> = all
@@ -64,6 +129,51 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         },
     };
     let backend = all.swap_remove(at);
+    let dir = crate::paths::pie_home().join("profiles");
+    let palette = Palette::for_stream(ui::Stream::Stderr);
+    let mut say = |line: &str| eprintln!("{}", palette.dim(line));
+    let artifacts = crate::paths::pie_home().join("artifacts");
+    let cache = crate::paths::pie_home().join("tune");
+    let mix = match args.mix.as_deref() {
+        Some(text) => runtime::engine::profiles::Mix::parse(text).map_err(|e| anyhow!(e))?,
+        None => runtime::engine::profiles::Mix::default(),
+    };
+    let mut check = args.check.clone();
+    check.extend(args.check_estimate.iter().flatten().cloned());
+    let req = runtime::engine::profiles::TuneRequest {
+        full: args.full,
+        check: &check,
+        no_check: args.no_check,
+        refit: args.refit,
+        check_estimate: args.check_estimate.is_some(),
+        dissect: &args.dissect,
+        rates: args.rates,
+        mix,
+        ..runtime::engine::profiles::TuneRequest::at(&dir, &artifacts, &cache)
+    };
+    // A check of the estimate is a test: it writes nothing.
+    if req.check_estimate {
+        let checked = runtime::engine::profiles::check_estimate(&backend, &req, &mut say)
+            .map_err(|e| anyhow!(e))?;
+        let mut out = String::new();
+        for c in &checked {
+            out.push_str(&c.report);
+        }
+        out.push_str(&format!(
+            "the estimate's pick is within the bound of the measured best for {} model(s)\n",
+            checked.len()
+        ));
+        return Ok(text(out));
+    }
+    if req.rates {
+        let rated =
+            runtime::engine::profiles::rates(&backend, &req, &mut say).map_err(|e| anyhow!(e))?;
+        let head = format!(
+            "{}: rates measured in {:.0} s\n{}",
+            rated.device, rated.seconds, rated.block
+        );
+        return write_profile(&backend, &args, &dir, &rated.device, &rated.file, head).map(text);
+    }
     let tune = backend.tune.ok_or_else(|| {
         anyhow!(
             "`pie tune` cannot measure {} yet; start from `pie profile dump {}` instead",
@@ -71,24 +181,8 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             backend.name
         )
     })?;
-    let dir = crate::paths::pie_home().join("profiles");
-    let palette = Palette::for_stream(ui::Stream::Stderr);
-    let mut say = |line: &str| eprintln!("{}", palette.dim(line));
-    let artifacts = crate::paths::pie_home().join("artifacts");
-    let cache = crate::paths::pie_home().join("tune");
-    let req = runtime::engine::profiles::TuneRequest {
-        full: args.full,
-        profiles: &dir,
-        artifacts: &artifacts,
-        check: &args.check,
-        no_check: args.no_check,
-        cache: &cache,
-        refit: args.refit,
-    };
     let tuned = tune(&req, &mut say).map_err(|e| anyhow!(e))?;
 
-    let id = profile::id_of(&tuned.device);
-    let path = backend.shelf.user_path(&dir, &tuned.device);
     let mut out = format!("{}: tuned in {:.0} s\n", tuned.device, tuned.seconds);
     for (id, text) in &tuned.lines {
         out.push_str(&format!("  {id}: {text}\n"));
@@ -117,17 +211,39 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             }
         ));
     }
-    if args.dry_run {
-        out.push_str("\n--dry-run: nothing written. The profile:\n\n");
-        out.push_str(&tuned.file);
-        return Ok(text(out));
-    }
-    if failed && !args.force {
+    if failed && !args.force && !args.dry_run {
         bail!(
             "{out}the tuned profile serves slower or reads differently than today's; \
              nothing written (--force writes it anyway)"
         );
     }
+    let mut answer = write_profile(&backend, &args, &dir, &tuned.device, &tuned.file, out)?;
+    if !args.full && !args.dry_run {
+        answer.push_str(
+            "This was the quick grid; run `pie tune --full` for a profile you contribute.\n",
+        );
+    }
+    Ok(text(answer))
+}
+
+/// Write `file`, the profile of `device`, to the user's shelf (or, with
+/// `--dry-run`, print it), the previous one kept beside it; `out` is what
+/// the run says so far, the answer's head.
+fn write_profile(
+    backend: &runtime::engine::profiles::Backend,
+    args: &TuneArgs,
+    dir: &std::path::Path,
+    device: &str,
+    file: &str,
+    mut out: String,
+) -> Result<String> {
+    if args.dry_run {
+        out.push_str("\n--dry-run: nothing written. The profile:\n\n");
+        out.push_str(file);
+        return Ok(out);
+    }
+    let id = profile::id_of(device);
+    let path = backend.shelf.user_path(dir, device);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -139,7 +255,7 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
             ui::short_path(&kept)
         ));
     }
-    std::fs::write(&path, &tuned.file)?;
+    std::fs::write(&path, file)?;
     out.push_str(&format!(
         "wrote {}; every load on this device now runs it.\n\
          Consider contributing it:\n    \
@@ -150,10 +266,93 @@ pub fn run(args: TuneArgs) -> Result<Answer> {
         ui::short_path(&path),
         backend.name
     ));
-    if !args.full {
-        out.push_str(
-            "This was the quick grid; run `pie tune --full` for a profile you contribute.\n",
-        );
+    Ok(out)
+}
+
+/// `pie tune export`: the stored measurements of `engine`'s device `device`
+/// written to `out` in committed form (`profile::export`).
+fn export(engine: &str, device: Option<u32>, out: &std::path::Path) -> Result<String> {
+    let all = backends();
+    let names: Vec<&str> = all.iter().map(|b| b.name).collect();
+    let backend = all
+        .iter()
+        .find(|b| b.name == engine)
+        .ok_or_else(|| anyhow!("this build hosts no `{engine}` engine; it hosts {names:?}"))?;
+    std::fs::create_dir_all(out)?;
+    let cache = crate::paths::pie_home().join("cache");
+    // The bodies records first: a home whose rates all came from a committed
+    // profile stores none of its own, and still records its bodies.
+    let bodies =
+        runtime::engine::profiles::export_bodies(backend, &cache, out).map_err(|e| anyhow!(e))?;
+    let bodies = if bodies.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "wrote {} bodies record(s) of this build into {}: a build carries each from there, \
+             and a load of the same deployment holds its figure instead of measuring it.\n",
+            bodies.len(),
+            ui::short_path(&out.join("bodies")),
+        )
+    };
+    let dir = crate::paths::pie_home().join("profiles");
+    let exported = runtime::engine::profiles::export(backend, &dir, &cache, device.unwrap_or(0))
+        .map_err(|e| anyhow!(e))?;
+    let named = match &exported.unprobed {
+        Some(why) => format!(
+            "the {} engine was not probed ({why}): the device is `{}`, the one the home's stored \
+             measurements are filed under.\n",
+            backend.name, exported.device
+        ),
+        None => String::new(),
+    };
+    // Each part the home holds is written; each it holds none of is named.
+    let measured = match &exported.measured {
+        Ok((name, text)) => {
+            let path = out.join(name);
+            std::fs::write(&path, text)?;
+            format!(
+                "wrote {} from {}: the stored measurements of {}, each under its key.\n\
+                 A build carries it once it is listed beside the engine's checked-in profiles \
+                 (crates/engine-{}/src/chip.rs, `\"{name}\"`); a load of that device then takes \
+                 each entry whose key matches.\n",
+                ui::short_path(&path),
+                ui::short_path(&exported.from),
+                exported.device,
+                backend.name,
+            )
+        }
+        Err(why) => format!("no measured profile written: {why}.\n"),
+    };
+    let measured = exported
+        .report
+        .iter()
+        .fold(measured, |out, line| format!("{out}{line}\n"));
+    let covers = match &exported.covers {
+        Some((name, text)) => {
+            let at = out.join(name);
+            std::fs::write(&at, text)?;
+            format!(
+                "wrote {}: the host covers the home's cache holds for it; listed in \
+                 crates/engine-{}/src/chip.rs `COVERS` (`include_str!(\"../profiles/{name}\")`), \
+                 a boot whose cover key matches one takes it.\n",
+                ui::short_path(&at),
+                backend.name,
+            )
+        }
+        None => "no host covers written: none is cached for it in this home.\n".to_string(),
+    };
+    if bodies.is_empty() && exported.measured.is_err() && exported.covers.is_none() {
+        return Err(anyhow!(
+            "this home holds nothing of {} to export: {}{}no bodies record of this build",
+            exported.device,
+            measured,
+            covers
+        ));
     }
-    Ok(text(out))
+    if bodies.is_empty() && backend.name == "cuda" {
+        return Ok(format!(
+            "{named}{measured}{covers}no bodies record written: none of this build.\n"
+        ));
+    }
+    Ok(format!("{named}{measured}{covers}{bodies}"))
 }

@@ -265,12 +265,20 @@ pub fn topk(
         ));
     }
     let stride = nonzero(OP, "the score slab's key stride", scores.width)?;
+    // No weights: never read; where two views of a buffer may not overlap
+    // they bind none rather than the query again.
+    let weighted = weights.is_some();
+    let weights = match weights {
+        Some(weights) => weights.arg(),
+        None if !ctx.binds_overlap() => ctx.absent()?,
+        None => q.arg(),
+    };
     ctx.fire(
         Fire::at(INDEX, entry).apply(Grid::of([K_BLOCK * rows, 1, 1], [K_BLOCK, 1, 1])),
         &[
             &[
                 q.arg(),
-                weights.unwrap_or(q).arg(),
+                weights,
                 positions.arg(),
                 request_of_token.arg(),
                 keys.page_indices.arg(),
@@ -289,7 +297,7 @@ pub fn topk(
                 stated(OP, stride)?.arg(),
                 stated(OP, top_k)?.arg(),
                 stated(OP, ratio)?.arg(),
-                i32::from(weights.is_some()).arg(),
+                i32::from(weighted).arg(),
             ],
         ]
         .concat(),

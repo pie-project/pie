@@ -1,20 +1,36 @@
 use crate::error::{Fault, Result};
 
+/// What the driver is left beside everything a load places: the user's
+/// stated safety margin ([`engine::SAFETY_FLOOR_BYTES`]).
+pub use engine::SAFETY_FLOOR_BYTES as DRIVER_FLOOR;
+
+/// What a load may place on the device: the working set Metal recommends
+/// for this process, less what the device already held for it when the
+/// load began (the context, queues and libraries: `outside`) and the
+/// driver's floor, capped by `[engine.memory] budget_device` where the
+/// operator states one. Measured, not a share of the device.
 #[must_use]
-pub fn safety_floor_bytes(working_set: u64) -> u64 {
-    const CAP: u64 = 128 * 1024 * 1024;
-    CAP.min(working_set / 10)
+pub fn capacity(working_set: u64, outside: u64, budget: Option<u64>) -> u64 {
+    let measured = working_set
+        .saturating_sub(outside)
+        .saturating_sub(DRIVER_FLOOR);
+    budget.map_or(measured, |budget| measured.min(budget))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Accounting {
+    /// The working set Metal recommends for this process.
     pub working_set: u64,
-    /// The working set other processes held when the load began.
-    pub elsewhere: u64,
-    pub ceiling: u64,
+    /// What the device held for this process before the load placed
+    /// anything.
+    pub outside: u64,
+    /// `[engine.memory] budget_device`, where stated.
+    pub budget: Option<u64>,
+    pub capacity: u64,
     pub weights: u64,
-    pub scratch: u64,
-    pub floor: u64,
+    /// The fire's bytes the load places beside the weights: the arena and,
+    /// once they are reserved, the staged inputs, readout and kernel scratch.
+    pub fire: u64,
     pub pool: u64,
     pub minimum: u64,
     /// The streamable weights' whole bytes (routed experts, token-id
@@ -24,54 +40,25 @@ pub struct Accounting {
 }
 
 impl Accounting {
+    /// `capacity` less the weights and the fire is what the kv pool has.
     #[must_use]
     pub fn of(
         working_set: u64,
-        elsewhere: u64,
-        utilization: f64,
+        outside: u64,
+        budget: Option<u64>,
         weights: u64,
+        fire: u64,
         minimum: u64,
     ) -> Accounting {
-        Accounting::with_scratch(working_set, elsewhere, utilization, weights, 0, minimum)
-    }
-
-    /// `utilization` of `working_set`, less what `elsewhere` holds, is this
-    /// load's ceiling: the weights, the arena scratch and the driver's floor
-    /// come off it first, and the kv pool has the rest.
-    #[must_use]
-    pub fn with_scratch(
-        working_set: u64,
-        elsewhere: u64,
-        utilization: f64,
-        weights: u64,
-        scratch: u64,
-        minimum: u64,
-    ) -> Accounting {
-        let fraction = if utilization.is_finite() {
-            utilization.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a byte count of unified memory is far inside f64's exact integer \
-                      range, and the product is floored back into u64 deliberately"
-        )]
-        let ceiling = ((working_set as f64 * fraction) as u64).saturating_sub(elsewhere);
-        let floor = safety_floor_bytes(working_set);
+        let capacity = capacity(working_set, outside, budget);
         Accounting {
             working_set,
-            elsewhere,
-            ceiling,
+            outside,
+            budget,
+            capacity,
             weights,
-            scratch,
-            floor,
-            pool: ceiling
-                .saturating_sub(weights)
-                .saturating_sub(scratch)
-                .saturating_sub(floor),
+            fire,
+            pool: capacity.saturating_sub(weights).saturating_sub(fire),
             minimum,
             streamable: 0,
         }
@@ -85,10 +72,10 @@ impl Accounting {
         self
     }
 
-    /// Refuses a load whose dense weights, arena scratch and the driver's
-    /// floor leave the kv pool less than it needs. Dense weights always live
-    /// in device memory, so the refusal names their bytes and the remedies.
-    pub fn admit(&self, utilization: f64) -> Result<()> {
+    /// Refuses a load whose dense weights and fire leave the kv pool less
+    /// than it needs. Dense weights always live in device memory, so the
+    /// refusal names their bytes and the remedies.
+    pub fn admit(&self) -> Result<()> {
         if self.pool >= self.minimum {
             return Ok(());
         }
@@ -101,32 +88,25 @@ impl Accounting {
         } else {
             String::new()
         };
-        let scratch = if self.scratch > 0 {
-            format!(
-                ", the arena scratch the compiled axes reserve takes {} (sized by `[engine] \
-                 max_forward_tokens`)",
-                self.scratch
-            )
-        } else {
-            String::new()
-        };
+        let budget = self.budget.map_or_else(String::new, |budget| {
+            format!(", and `[engine.memory] budget_device` caps it at {budget}")
+        });
         Err(Fault::Residency(format!(
             "the device does not hold this deployment: recommendedMaxWorkingSetSize is \
-             {working_set} bytes, other processes held {elsewhere} of it when this load began, \
-             and `[model] device_memory_share` = {utilization} allows pie {ceiling}; the \
-             weights that stay in device memory take {weights} (every dense plane{streamable}){scratch} and the \
-             driver's safety floor holds back {floor}, leaving {pool} bytes for the kv pool, \
-             which needs {minimum} (`[model] device_kv_budget`, or one sequence at the \
-             declared context when that is omitted). On Apple Silicon a GPU-touched Shared \
-             page is WIRED and the pager never evicts it, so this is a hard bound: serve a \
-             quantized deployment of the model (its dense weights in fewer bytes), lower \
-             `[model] max_context` or `[engine] max_forward_tokens`, or raise `[model] \
-             device_memory_share`.",
+             {working_set} bytes and the device held {outside} of it for this process before \
+             the load{budget}, leaving {capacity}; the weights that stay in device memory take \
+             {weights} (every dense plane{streamable}) and one fire's activations, staged \
+             inputs, readout and kernel scratch take {fire} (sized by the widest fire), leaving \
+             {pool} bytes for the kv pool, which needs {minimum}, one sequence at the declared \
+             context. On Apple Silicon a GPU-touched Shared page is WIRED and the pager never \
+             evicts it, so this is a hard bound: serve a quantized deployment of the model (its \
+             dense weights in fewer bytes), lower `[engine] max_context`, or raise \
+             `[engine.memory] budget_device` where it is stated.",
             working_set = self.working_set,
-            elsewhere = self.elsewhere,
-            ceiling = self.ceiling,
+            outside = self.outside,
+            capacity = self.capacity,
             weights = self.weights,
-            floor = self.floor,
+            fire = self.fire,
             pool = self.pool,
             minimum = self.minimum,
         )))
@@ -134,49 +114,59 @@ impl Accounting {
 }
 
 /// What a load of a trace needs of a device before a weight is read, by the
-/// rule [`Accounting::admit`] applies: every plane resident, the pool one
-/// sequence at the context takes, and the driver's floor, against the ceiling
-/// `device_memory_share` leaves. The arena scratch is not counted: a load
-/// narrows its forward width until the scratch fits.
+/// rule [`Accounting::admit`] applies: the weights that stay in device memory
+/// ([`crate::api::weight_demand`]), one sequence at the context, and the
+/// driver's floor, against the working set less what the device holds for
+/// this process already. No `[engine.memory] budget_device` is read. The
+/// widest fire's activation is not counted: a load narrows the fire until it
+/// fits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Need {
     /// `recommendedMaxWorkingSetSize`.
     pub working_set: u64,
-    /// What `device_memory_share` of the working set allows, with nothing held elsewhere.
+    /// The working set less what the device held for this process: what the
+    /// weights, the pool and the floor have between them.
     pub ceiling: u64,
-    /// Every plane, at its stored dtype and the device's alignment.
+    /// The weights that stay in device memory, as a runtime's load holds them
+    /// (`engine::load::Residency::weights_held`): the token-id tables whole,
+    /// routed experts at the floor the weight cache keeps of them.
     pub weights: u64,
-    /// The kv pages and state slot of one sequence at the context.
+    /// One sequence at the context.
     pub pool: u64,
     /// The driver's safety floor.
     pub floor: u64,
 }
 
 impl Need {
-    /// `trace`'s need at `context` tokens on `page_size` pages, on a device
-    /// of `working_set` bytes of which the load may take `utilization`.
+    /// `trace`'s need at `context` tokens, loaded at the budgets the engine
+    /// states ([`crate::api::FIRE_CEILING`]), on a device of `working_set`
+    /// bytes that holds `outside` of them for this process; `caches` as the
+    /// load asks it of the device.
     pub fn of(
         trace: &poem_ir::Trace,
         context: u32,
-        page_size: u32,
         working_set: u64,
-        utilization: f64,
+        outside: u64,
+        caches: bool,
     ) -> Result<Need> {
-        let weights = crate::weights::plane_bytes(trace)?
-            .iter()
-            .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
-            .sum();
-        let paging = crate::store::kv::Paging::of(page_size, context, 1, 1).map_err(Fault::from)?;
-        let pool = crate::store::PoolDemand::of(trace, paging, None)?
-            .bytes(u64::from(paging.pages_per_slot));
-        let accounting = Accounting::of(working_set, 0, utilization, weights, pool);
-        Ok(Need {
+        let (weights, _) =
+            crate::api::weight_demand(trace, &crate::api::ceiling_budgets(), caches, true)?;
+        let pool = crate::api::sequence_demand(
+            trace,
+            crate::api::PAGE_SIZE,
+            context.max(crate::api::PAGE_SIZE),
+        )?;
+        Ok(Need::within(working_set, outside, weights, pool))
+    }
+
+    fn within(working_set: u64, outside: u64, weights: u64, pool: u64) -> Need {
+        Need {
             working_set,
-            ceiling: accounting.ceiling,
+            ceiling: working_set.saturating_sub(outside),
             weights,
             pool,
-            floor: accounting.floor,
-        })
+            floor: DRIVER_FLOOR,
+        }
     }
 
     /// The bytes the load takes in all.
@@ -190,61 +180,105 @@ impl Need {
 
 #[cfg(test)]
 mod tests {
-    use super::Accounting;
-    use engine::load::DEFAULT_DEVICE_MEMORY_SHARE;
+    use super::{Accounting, DRIVER_FLOOR, Need};
 
     const GIB: u64 = 1 << 30;
 
     #[test]
     fn accounting_every_case() {
-        the_arena_scratch_counts_against_the_ceiling();
-        a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses();
-        a_non_finite_fraction_is_read_as_the_whole_working_set();
-        what_other_processes_hold_comes_off_the_ceiling();
+        the_fire_counts_against_the_capacity();
+        a_load_under_the_capacity_is_admitted_and_one_over_it_refuses();
+        what_the_device_held_before_the_load_comes_off_the_capacity();
+        a_budget_caps_the_capacity();
+        a_need_past_its_ceiling_is_a_load_refused();
     }
 
-    fn the_arena_scratch_counts_against_the_ceiling() {
-        let ws = 21_800 * (GIB / 1000);
-        let util = DEFAULT_DEVICE_MEMORY_SHARE;
-        let without = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
-        assert!(without.admit(util).is_ok());
-        let with = Accounting::with_scratch(ws, 0, util, 11 * GIB, 6 * GIB, 4 * GIB);
-        let why = with.admit(util).expect_err("11 + 6 + 4 GiB is over ~19.6");
-        let said = format!("{why}");
-        assert!(
-            said.contains("max_forward_tokens"),
-            "the refusal names the scratch's knob: {said}"
-        );
-        assert_eq!(with.pool, without.pool - 6 * GIB);
-    }
-
-    fn a_load_under_the_ceiling_is_admitted_and_one_over_it_refuses() {
-        let ws = 21_800 * (GIB / 1000);
-        let util = DEFAULT_DEVICE_MEMORY_SHARE;
-        let ok = Accounting::of(ws, 0, util, 11 * GIB, 4 * GIB);
-        assert!(ok.admit(util).is_ok(), "11 + 4 GiB fits under ~19.6");
-        let over = Accounting::of(ws, 0, util, 18 * GIB, 4 * GIB);
-        let why = over.admit(util).expect_err("18 + 4 GiB over the ceiling");
-        let said = format!("{why}");
-        for needle in [
-            "recommendedMaxWorkingSetSize",
-            "device_memory_share",
-            "WIRED",
-            "quantized deployment",
-        ] {
-            assert!(said.contains(needle), "the refusal names {needle}: {said}");
+    fn a_need_past_its_ceiling_is_a_load_refused() {
+        for pool in [GIB, 4 * GIB, 9 * GIB - DRIVER_FLOOR, 9 * GIB, 20 * GIB] {
+            let need = Need::within(21 * GIB, GIB, 11 * GIB, pool);
+            let admitted = Accounting::of(21 * GIB, GIB, None, 11 * GIB, 0, pool).admit();
+            assert_eq!(need.bytes() > need.ceiling, admitted.is_err(), "{pool}");
         }
     }
 
-    fn a_non_finite_fraction_is_read_as_the_whole_working_set() {
-        let acct = Accounting::of(20 * GIB, 0, f64::NAN, GIB, GIB);
-        assert_eq!(acct.ceiling, 20 * GIB, "NaN utilization means no fraction");
+    fn the_fire_counts_against_the_capacity() {
+        let ws = 21_800 * (GIB / 1000);
+        let without = Accounting::of(ws, 0, None, 11 * GIB, 0, 4 * GIB);
+        assert!(without.admit().is_ok());
+        let with = Accounting::of(ws, 0, None, 11 * GIB, 7 * GIB, 4 * GIB);
+        let why = with.admit().expect_err("11 + 7 + 4 GiB is over ~21.3");
+        let said = format!("{why}");
+        assert!(
+            said.contains("widest fire"),
+            "the refusal names the fire: {said}"
+        );
+        assert_eq!(with.pool, without.pool - 7 * GIB);
     }
 
-    fn what_other_processes_hold_comes_off_the_ceiling() {
-        let alone = Accounting::of(40 * GIB, 0, 0.9, 16 * GIB, GIB);
-        let shared = Accounting::of(40 * GIB, 12 * GIB, 0.9, 16 * GIB, GIB);
-        assert_eq!(shared.ceiling, alone.ceiling - 12 * GIB);
-        assert_eq!(shared.pool, alone.pool - 12 * GIB);
+    fn a_load_under_the_capacity_is_admitted_and_one_over_it_refuses() {
+        let ws = 21_800 * (GIB / 1000);
+        let ok = Accounting::of(ws, 0, None, 11 * GIB, 0, 4 * GIB);
+        assert!(ok.admit().is_ok(), "11 + 4 GiB fits under ~21.3");
+        let over = Accounting::of(ws, 0, None, 18 * GIB, 0, 4 * GIB);
+        let why = over.admit().expect_err("18 + 4 GiB over the capacity");
+        let said = format!("{why}");
+        for needle in [
+            "recommendedMaxWorkingSetSize",
+            "WIRED",
+            "quantized deployment",
+            "[engine] max_context",
+            "budget_device",
+        ] {
+            assert!(said.contains(needle), "the refusal names {needle}: {said}");
+        }
+        for refused in [
+            "device_memory_share",
+            "max_forward_tokens",
+            "device_kv_budget",
+        ] {
+            assert!(
+                !said.contains(refused),
+                "a refused key is not named: {said}"
+            );
+        }
+    }
+
+    fn what_the_device_held_before_the_load_comes_off_the_capacity() {
+        let alone = Accounting::of(40 * GIB, 0, None, 16 * GIB, 0, GIB);
+        let held = Accounting::of(40 * GIB, GIB, None, 16 * GIB, 0, GIB);
+        assert_eq!(held.capacity, alone.capacity - GIB);
+        assert_eq!(
+            alone.capacity,
+            40 * GIB - DRIVER_FLOOR,
+            "the driver keeps its floor"
+        );
+        assert_eq!(held.pool, alone.pool - GIB);
+    }
+
+    fn a_budget_caps_the_capacity() {
+        let whole = Accounting::of(40 * GIB, GIB, None, 16 * GIB, 0, GIB);
+        assert_eq!(
+            whole.capacity,
+            39 * GIB - DRIVER_FLOOR,
+            "no share of the device is taken, only the floor"
+        );
+        let capped = Accounting::of(40 * GIB, GIB, Some(20 * GIB), 16 * GIB, 0, GIB);
+        assert_eq!(capped.capacity, 20 * GIB);
+        assert_eq!(capped.pool, 4 * GIB);
+        let roomy = Accounting::of(40 * GIB, GIB, Some(100 * GIB), 16 * GIB, 0, GIB);
+        assert_eq!(
+            roomy.capacity,
+            39 * GIB - DRIVER_FLOOR,
+            "a budget past the device caps nothing"
+        );
+        let over = Accounting::of(40 * GIB, 0, Some(17 * GIB), 16 * GIB, 0, 2 * GIB);
+        let said = format!(
+            "{}",
+            over.admit().expect_err("16 + 2 GiB over a 17 GiB budget")
+        );
+        assert!(
+            said.contains("caps it at"),
+            "the refusal names the budget: {said}"
+        );
     }
 }

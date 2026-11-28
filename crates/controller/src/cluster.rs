@@ -1,28 +1,8 @@
-//! The cluster plane of PLEX (`plex:policy@1.0.0`): where programs and their
-//! state live. Its programs run here, once for the cluster; the gateways
-//! send what happens to their processes and apply what the programs decide
-//! about them.
+//! The cluster plane of PLEX 1.1 (`plex:policy@1.1.0`, the `plex-host`
+//! crate): where processes run and where KV is copied. Its policies run
+//! here, once for the cluster; the gateways send what happens to their
+//! processes and apply the rows the policies commit about them.
 
-mod host;
-mod manifest;
-mod program;
+mod port;
 
-pub use host::Host;
-pub use manifest::{Manifest, ManifestError};
-pub use program::{Commit, Fault, LoadError, Plane, Program, StateCommit, Table};
-
-pub mod wit {
-    pub use super::program::bindings::plex::policy::types::*;
-}
-
-pub const CAPABILITIES: &[&str] = &[
-    "cluster.hold",
-    "cluster.scale",
-    "kv.persist",
-    "placement.executors",
-    "placement.migrate",
-    "state.replicate",
-    "state.retain",
-    "state.transfer-shares",
-    "state.accept",
-];
+pub use port::{Host, LoadError, call_deadline};

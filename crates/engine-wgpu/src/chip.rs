@@ -1,5 +1,6 @@
 //! The wgpu registry and the profile one load resolves. A browser masks the
-//! adapter, so there are no checked-in profiles.
+//! adapter, so there are no checked-in decision profiles; a native
+//! adapter's committed measured profile is listed in [`SEEDED`].
 
 use std::path::Path;
 use std::sync::LazyLock;
@@ -20,14 +21,37 @@ pub fn registry() -> &'static Registry {
     &REGISTRY
 }
 
+/// The committed measured profiles of adapters native wgpu serves
+/// (`profiles/<device>.measured.toml`, `pie tune export --engine wgpu`),
+/// each listed here as `"<device>.measured.toml"`: a browser's masked
+/// adapter matches none. No decision profile is checked in.
+macro_rules! seeded {
+    ($($file:literal),* $(,)?) => {
+        pub const SEEDED: &[(&str, &str)] = &[
+            $(($file, include_str!(concat!("../profiles/", $file)))),*
+        ];
+    };
+}
+
+seeded!(
+    "nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml",
+    "nvidia-rtx-pro-4500-blackwell.measured.toml",
+);
+
+/// The host covers committed for the adapters native wgpu serves
+/// (`profiles/<device>.covers.json`, `pie tune export --engine wgpu`), each
+/// listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[
+    include_str!("../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"),
+    include_str!("../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"),
+];
+
 pub static SHELF: Shelf = Shelf {
     backend: "wgpu",
-    seeded: &[],
+    seeded: SEEDED,
     derived: None,
 };
-
-/// The cores an adapter is sized by when it reports no count.
-pub const UNREPORTED_CORES: u32 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
@@ -69,6 +93,73 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
 }
 
+/// [`resolve`] for a load on the device `on` names (its vendor, device id
+/// and driver): the measurements the user's file stores kept where their
+/// keys match this build on this device, the rest dropped to be measured
+/// again ([`profile::rates::Rates::sift`]), each said in the load log.
+#[must_use]
+pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
+    engine_gpu::stored::resolve(
+        &SHELF,
+        registry(),
+        &device.name,
+        &device.facts(),
+        profiles,
+        on,
+        <crate::device::Api as engine_gpu::serve::Serve>::TARGET,
+    )
+}
+
+/// The adapter this machine would serve, by name, with its facts.
+#[must_use]
+pub fn probe() -> Option<(String, Facts)> {
+    probe_at(0)
+}
+
+/// What this build keys device `index`'s stored measurements by
+/// (`profile::rates::Now`: its device and driver, each kernel's code): what a
+/// committed entry is checked against before an export carries it.
+#[must_use]
+pub fn now_at(index: u32) -> Option<Box<dyn profile::rates::Now>> {
+    measured_on_at(index).map(|on| {
+        Box::new(engine_gpu::stored::Keys::new(
+            on,
+            kernels_slang::Target::Wgsl,
+        )) as Box<dyn profile::rates::Now>
+    })
+}
+
+/// The device and driver device `index`'s measurements are keyed as taken
+/// on (`Context::measured_on`): what a home's host covers of it name.
+#[must_use]
+pub fn measured_on_at(index: u32) -> Option<String> {
+    let boot = crate::api::DeviceBoot {
+        adapter_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
+    Some(context.measured_on())
+}
+
+/// [`probe`] of the device `index` names, in the order the engine numbers
+/// them (`wgpu:<n>`).
+#[must_use]
+pub fn probe_at(index: u32) -> Option<(String, Facts)> {
+    let boot = crate::api::DeviceBoot {
+        adapter_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
+    let device = context.chip();
+    Some((device.name.clone(), device.facts()))
+}
+
+/// [`resolve`] by the adapter's name and facts.
+#[must_use]
+pub fn resolve_facts(name: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
+    SHELF.resolve(registry(), name, facts, profiles)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,14 +181,14 @@ mod tests {
         };
         let (profile, report) = resolve(&d, None);
         assert_eq!(report.used, profile::Source::Defaults);
-        let t = crate::tuning::Tuning::new(profile, UNREPORTED_CORES, 0);
+        let t = crate::tuning::Tuning::new(profile);
         assert_eq!(
             (
                 t.sdpa_tile_rows_per_request(),
                 t.sdpa_split_groups(),
                 t.sdpa_split_min_keys()
             ),
-            (32, 16, 256)
+            (32, 1, 256)
         );
         use crate::tuning::Qmm;
         for (rows, k, want) in [

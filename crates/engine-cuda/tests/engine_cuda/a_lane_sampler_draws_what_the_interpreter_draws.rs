@@ -5,11 +5,11 @@
 //! host interpreter draws, over rows a trained model's and a random mini's
 //! next-token distributions span and bf16 logits' runs of equal values.
 
+use std::collections::BTreeSet;
+
 use engine::{ChannelId, ProgramRegistration};
 use engine_cuda::device::Context;
-use engine_cuda::program::Plane;
-use engine_cuda::program::compile::Disk;
-use engine_cuda::program::session::Fired;
+use engine_cuda::program::session::{Fired, Launched};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
 use eta_compiler::plan::{LibraryOp, RegionKind, compile_bound};
@@ -142,7 +142,33 @@ fn host_token(bound: &BoundTrace, seeds: &[(u32, Value)]) -> i32 {
     }
 }
 
-fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, usize) {
+/// How a run's draws fly: each alone, a lane on every block the device
+/// gives one (fired [`REPEATS`] times), or the cases over and over in one
+/// fire of that many lanes, each on the fewer blocks a wider fire gives it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fly {
+    Alone,
+    Together(usize),
+}
+
+type Case = (&'static str, Vec<f32>, f32, [u32; 2]);
+
+fn seeds(rank: bool, (_, logits, knob, state): &Case) -> Vec<(u32, Value)> {
+    let knob = if rank {
+        Value::I32(vec![*knob as i32])
+    } else {
+        Value::F32(vec![*knob])
+    };
+    vec![
+        (STATE, Value::U32(state.to_vec())),
+        (KNOB, knob),
+        (LOGITS, Value::F32(logits.clone())),
+    ]
+}
+
+/// Each run's draws as `flies` has them, against the interpreter's: how many
+/// agree of how many.
+fn draw_all(rank: bool, cases: &[Case], flies: &[Fly]) -> (usize, usize) {
     let bound = crate::bound::logits(sampler(rank), VOCAB).expect("the sampler binds");
     let stages = compile_bound(&bound);
     let lane = stages.iter().any(|stage| {
@@ -164,75 +190,122 @@ fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, us
         launch: eta_compiler::codegen::launch::build(&bound, &stages),
         ..Default::default()
     };
-    let mut plane = Plane::new(Disk::disabled());
+    let (mut plane, fence) = crate::guest::alone_plane_fenced();
     let program = plane
         .register(&context, &registration)
         .expect("the sampler compiles");
     let count = bound.container.channels.len();
     let ids: Vec<ChannelId> = (1..=count as u64).map(ChannelId).collect();
+    let wants: Vec<i32> = cases
+        .iter()
+        .map(|case| host_token(&bound, &seeds(rank, case)))
+        .collect();
+    let take = |plane: &mut engine_cuda::ProgramPlane, instance| {
+        let cell = plane
+            .instance_mut(instance)
+            .expect("the instance")
+            .take(TOKEN)
+            .expect("the token reads")
+            .expect("a token");
+        i32::from_le_bytes(cell[..4].try_into().unwrap())
+    };
     let (mut agree, mut total) = (0, 0);
-    for (what, logits, knob, state) in cases {
-        let knob = if rank {
-            Value::I32(vec![*knob as i32])
-        } else {
-            Value::F32(vec![*knob])
+    for &fly in flies {
+        let lanes = match fly {
+            Fly::Alone => cases.len(),
+            Fly::Together(lanes) => lanes,
         };
-        let seeds = vec![
-            (STATE, Value::U32(state.to_vec())),
-            (KNOB, knob.clone()),
-            (LOGITS, Value::F32(logits.clone())),
-        ];
-        let want = host_token(&bound, &seeds);
-        let wire: Vec<(u32, Vec<u8>)> = seeds.iter().map(|(c, v)| (*c, v.to_le_bytes())).collect();
-        let instance = plane
-            .bind(
-                program,
-                &wire,
-                Extents {
-                    row_count: 1,
-                    sampled_rows: 1,
-                    query_len: 1,
-                    ..Extents::default()
-                },
-                GeometryClass::Host,
-                eta_ir::registry::PortMask::NONE,
-                false,
-                &vec![None; count],
-                &ids,
-                context.stream(),
-            )
-            .expect("the sampler binds an instance");
-        // The same draw, fired again and again, lands on one token.
-        let mut drawn = Vec::new();
-        for _ in 0..REPEATS {
-            let fired = plane.fire(&context, instance).expect("the fire runs");
-            assert!(matches!(fired, Fired::Committed), "{fired:?}");
-            let cell = plane
-                .instance_mut(instance)
-                .expect("the instance")
-                .take(TOKEN)
-                .expect("the token reads")
-                .expect("a token");
-            drawn.push(i32::from_le_bytes(cell[..4].try_into().unwrap()));
+        let mut bound_draws = Vec::new();
+        for at in 0..lanes {
+            let case = at % cases.len();
+            let wire: Vec<(u32, Vec<u8>)> = seeds(rank, &cases[case])
+                .iter()
+                .map(|(c, v)| (*c, v.to_le_bytes()))
+                .collect();
+            let instance = plane
+                .bind(
+                    program,
+                    &wire,
+                    Extents {
+                        row_count: 1,
+                        sampled_rows: 1,
+                        query_len: 1,
+                        ..Extents::default()
+                    },
+                    GeometryClass::Host,
+                    eta_ir::registry::PortMask::NONE,
+                    false,
+                    &vec![None; count],
+                    &ids,
+                    crate::guest::alone_slots(&plane, program),
+                    &crate::guest::alone_span,
+                    context.stream(),
+                )
+                .expect("the sampler binds an instance");
+            bound_draws.push((case, instance));
         }
-        let got = drawn[0];
-        assert!(
-            drawn.iter().all(|&t| t == got),
-            "{what}: the same draw landed on {drawn:?}"
-        );
-        total += 1;
-        if got == want {
-            agree += 1;
-        } else {
-            eprintln!(
-                "{what} (knob {knob:?}, state {state:?}): the device drew {got}, the interpreter {want}"
-            );
+        let drawn: Vec<i32> = match fly {
+            Fly::Alone => bound_draws
+                .iter()
+                .map(|&(case, instance)| {
+                    // The same draw, fired again and again, lands on one token.
+                    let mut drawn = Vec::new();
+                    for _ in 0..REPEATS {
+                        let fired = plane.fire(&context, instance).expect("the fire runs");
+                        assert!(matches!(fired, Fired::Committed), "{fired:?}");
+                        drawn.push(take(&mut plane, instance));
+                    }
+                    assert!(
+                        drawn.iter().all(|&t| t == drawn[0]),
+                        "{}: the same draw landed on {drawn:?}",
+                        cases[case].0
+                    );
+                    drawn[0]
+                })
+                .collect(),
+            Fly::Together(_) => {
+                for &(_, instance) in &bound_draws {
+                    let launched = plane
+                        .stage(instance, Stage::Epilogue)
+                        .expect("the lane stages");
+                    assert!(matches!(launched, Launched::Airborne), "a lane was refused");
+                }
+                plane.fly(&context).expect("the wave flies");
+                plane.land(&context).expect("the wave lands");
+                context.synchronize().expect("the device synchronizes");
+                assert!(
+                    fence.intact(),
+                    "a fire of {lanes} lanes wrote past the lane arenas"
+                );
+                bound_draws
+                    .iter()
+                    .map(|&(_, instance)| {
+                        let fired = plane.settle_launched(instance).expect("the lane settles");
+                        assert!(matches!(fired, Fired::Committed), "{fired:?}");
+                        take(&mut plane, instance)
+                    })
+                    .collect()
+            }
+        };
+        for (&(case, instance), got) in bound_draws.iter().zip(drawn) {
+            let (what, _, knob, state) = &cases[case];
+            total += 1;
+            if got == wants[case] {
+                agree += 1;
+            } else {
+                eprintln!(
+                    "{what} (knob {knob}, state {state:?}, {fly:?}): the device drew {got}, the \
+                     interpreter {}",
+                    wants[case]
+                );
+            }
+            plane.close_instance(instance).expect("the lane closes");
         }
     }
     (agree, total)
 }
 
-fn cases(rank: bool) -> Vec<(&'static str, Vec<f32>, f32, [u32; 2])> {
+fn cases(rank: bool) -> Vec<Case> {
     let mut noise = Noise(0x5eed_1234_9876_abcd);
     let len = VOCAB as usize;
     let flat: Vec<f32> = (0..len).map(|_| noise.unit() * 2.0 - 1.0).collect();
@@ -265,14 +338,32 @@ fn cases(rank: bool) -> Vec<(&'static str, Vec<f32>, f32, [u32; 2])> {
     out
 }
 
+/// The process's queue masks, as the worker states them from its start's
+/// environment (`worker::backend`): these cases drive the plane with no
+/// load, which is where a serving process states them, so they state them
+/// here, before anything reads the device's units. In the child
+/// `blocks_that_meet_run_on_a_few_units` runs under `HSA_CU_MASK`, a
+/// sampler laid over every unit while its queues run on four would wait on
+/// blocks that never become resident. The shells read no environment; a
+/// test is no shell.
+fn state_masks() {
+    let var = |name: &str| std::env::var(name).ok();
+    engine_cuda::program::launch::state_queue_masks(&engine_cuda::QueueMasks {
+        visible_devices: var("HIP_VISIBLE_DEVICES").or_else(|| var("CUDA_VISIBLE_DEVICES")),
+        hsa_cu_mask: var("HSA_CU_MASK"),
+        global_cu_mask: var("ROC_GLOBAL_CU_MASK"),
+    });
+}
+
 #[test]
 fn a_lane_sampler_draws_what_the_interpreter_draws() {
+    state_masks();
     if !engine_cuda::device::present() {
         eprintln!("no device: skipping");
         return;
     }
     for rank in [false, true] {
-        let (agree, total) = draw_all(rank, &cases(rank));
+        let (agree, total) = draw_all(rank, &cases(rank), &[Fly::Alone]);
         eprintln!(
             "{}: {agree} of {total} draws as the interpreter",
             if rank { "top-k" } else { "top-p" }
@@ -280,6 +371,42 @@ fn a_lane_sampler_draws_what_the_interpreter_draws() {
         assert_eq!(
             agree, total,
             "the lane sampler drew other tokens than the interpreter"
+        );
+    }
+}
+
+/// A wide fire gives each lane fewer blocks than a lone lane has: at every
+/// count of them a lane can run on (the widest fire that gives it that
+/// many), lanes whose top-p cut gathers past their blocks' share (a flat
+/// row's) draw what they draw alone, no lane's gathers move another's draw
+/// or hang its blocks, and none lands past the lane arenas.
+#[test]
+fn a_wide_fire_s_lanes_draw_what_the_interpreter_draws() {
+    state_masks();
+    if !engine_cuda::device::present() {
+        eprintln!("no device: skipping");
+        return;
+    }
+    // The device's units, read in its context.
+    let _context = Context::bind(0, None).expect("a device context");
+    let units = engine_cuda::program::launch::device_units();
+    let widths: BTreeSet<usize> = (1..=engine_cuda::program::launch::LANE_SAMPLER_BLOCKS)
+        .map(|blocks| (units / blocks).max(1) as usize)
+        .collect();
+    let flies: Vec<Fly> = widths.iter().map(|&lanes| Fly::Together(lanes)).collect();
+    for rank in [false, true] {
+        let flat: Vec<Case> = cases(rank)
+            .into_iter()
+            .filter(|(what, ..)| *what == "flat")
+            .collect();
+        let (agree, total) = draw_all(rank, &flat, &flies);
+        eprintln!(
+            "{} in fires of {widths:?} lanes: {agree} of {total} draws as the interpreter",
+            if rank { "top-k" } else { "top-p" }
+        );
+        assert_eq!(
+            agree, total,
+            "a wide fire's lanes drew other tokens than the interpreter"
         );
     }
 }

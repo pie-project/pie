@@ -1,6 +1,8 @@
-//! `pie tune` on Vulkan: `kernel.qmm` is fitted to a kernel bench (`qmm`),
-//! then it and the other decisions are searched end to end on served models.
+//! `pie tune` on Vulkan: `kernel.qmm` and `kernel.gemm.path` are fitted to
+//! kernel benches (`qmm`, `gemm`), then they and the other decisions are
+//! searched end to end on served models.
 
+mod gemm;
 mod qmm;
 
 pub use qmm::Depth;
@@ -11,16 +13,17 @@ use std::time::Instant;
 use profile::search::{self, Bench, CONTEXT, Check, LANES, Line, PROMPT, STEPS, Serving};
 use profile::{Facts, Profile};
 
-/// The kernel bench fits `kernel.qmm`; one device with one queue has no
-/// collectives or side streams.
+/// The kernel benches fit `kernel.qmm` and `kernel.gemm.path`; one device
+/// with one queue has no collectives or side streams.
 const SEARCH_SKIPS: &[&str] = &[
     "kernel.qmm",
+    "kernel.gemm.path",
     "compiler.cost.collective_us",
     "compiler.side_streams",
 ];
 
 /// The facts a tuned file assumes: what a kernel's requirement reads.
-const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
+pub(crate) const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 
 /// What a tuned overlay on `base` may assume: its target, and the facts
 /// [`ASSUME`] names as this device reports them.
@@ -64,6 +67,13 @@ fn patches(trace: &poem_ir::Trace, slots: u32) -> Option<poem_compiler::PatchLad
     )
 }
 
+/// The user's file of `device`, pruned of what this pie does not read;
+/// `None` where there is none.
+fn user_file(profiles: Option<&Path>, device: &str) -> Option<String> {
+    let text = std::fs::read_to_string(crate::chip::SHELF.user_path(profiles?, device)).ok()?;
+    Some(crate::chip::registry().prune(&text).0)
+}
+
 /// Serve `artifact` with `file` as the user's profile for `device`.
 fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<Serving, String> {
     use poem::{Platform, Request};
@@ -100,6 +110,8 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         device: &boot,
         residency: engine::load::Residency::default(),
         handed: None,
+        check: None,
+        places_programs: false,
     })
     .map_err(|e| e.to_string())?;
     let token = |i: u32| 100 + (i * 7919) % 5000;
@@ -166,6 +178,7 @@ fn serve(artifact: &Path, deployment: &str, device: &str, file: &str) -> Result<
         readout,
         read,
         refused: None,
+        layers: trace.decoder_layers(),
     })
 }
 
@@ -201,9 +214,18 @@ struct Vulkan<'a> {
     base: &'a Profile,
     facts: &'a Facts,
     cores: u32,
+    mix: search::Mix,
 }
 
 impl Bench for Vulkan<'_> {
+    fn mix(&self) -> search::Mix {
+        self.mix
+    }
+
+    fn agreement(&self) -> f64 {
+        engine::rates::AGREEMENT
+    }
+
     fn models(&self) -> Vec<String> {
         self.models.iter().map(|(_, d)| d.clone()).collect()
     }
@@ -274,17 +296,73 @@ fn bench_qmm(
     Ok((fitted, lines, wrong))
 }
 
+/// Measure `kernel.gemm.path` by rows and fit its crossover; the
+/// measurements are kept under `cache`, where `refit` reads them back.
+fn bench_gemm(
+    depth: Depth,
+    name: &str,
+    base: &Profile,
+    cache: &Path,
+    refit: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<(search::Entries, Vec<Line>, Vec<String>), String> {
+    let grid = gemm::Grid::of(depth);
+    let kept = cache
+        .join(profile::id_of(name))
+        .join(format!("vulkan-gemm-{}.txt", depth.word()));
+    let measured = if refit {
+        let text = std::fs::read_to_string(&kept)
+            .map_err(|e| format!("no measurements at {}: {e}", kept.display()))?;
+        say(&format!("refitting the measurements in {}", kept.display()));
+        gemm::Measured::from_text(&text)?
+    } else {
+        let m = measure_gemm(base, &grid, say)?;
+        if let Some(dir) = kept.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(&kept, m.to_text(name)).map_err(|e| e.to_string())?;
+        say(&format!("measurements kept in {}", kept.display()));
+        m
+    };
+    let (fitted, lines) = gemm::fit(&measured)?;
+    let wrong = measured
+        .wrong
+        .iter()
+        .map(|(body, n, first)| format!("{body}: wrong at {n} points; first at {first}"))
+        .collect();
+    Ok((fitted, lines, wrong))
+}
+
+#[cfg(feature = "vulkan")]
+fn measure_gemm(
+    base: &Profile,
+    grid: &gemm::Grid,
+    say: &mut dyn FnMut(&str),
+) -> Result<gemm::Measured, String> {
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
+    gemm::measure(&device, base, grid, say)
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn measure_gemm(
+    _: &Profile,
+    _: &gemm::Grid,
+    _: &mut dyn FnMut(&str),
+) -> Result<gemm::Measured, String> {
+    Err("this build carries no Vulkan device code".to_string())
+}
+
 #[cfg(feature = "vulkan")]
 fn measure(
     base: &Profile,
     grid: &qmm::Grid,
     say: &mut dyn FnMut(&str),
 ) -> Result<qmm::Measured, String> {
-    let device = crate::device::Context::bind(
-        &crate::api::DeviceBoot::default(),
-        engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-    )
-    .map_err(|e| e.to_string())?;
+    let device =
+        crate::device::Context::bind(&crate::api::DeviceBoot::default(), engine::Allowance::WHOLE)
+            .map_err(|e| e.to_string())?;
     qmm::measure(&device, base, grid, say)
 }
 
@@ -300,21 +378,34 @@ pub fn run(
     cache: &Path,
     refit: bool,
     models: &[(PathBuf, String)],
+    mix: search::Mix,
     say: &mut dyn FnMut(&str),
 ) -> Result<Outcome, String> {
     let began = Instant::now();
     let (name, facts) = crate::chip::probe().ok_or("no Vulkan device answers")?;
+    let (base, report) = crate::chip::resolve_facts(&name, &facts, profiles);
+    // The cores the device reports, or where it reports none the workgroups
+    // a load measured it holds at once, as its profile states them.
     let cores = facts
         .get("cores")
         .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(crate::chip::UNREPORTED_CORES);
-    let (base, report) = crate::chip::resolve_facts(&name, &facts, profiles);
+        .or_else(|| {
+            base.rates()
+                .resident_workgroups
+                .map(|workgroups| workgroups.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+        })
+        .ok_or("the device reports no cores and its profile states no [rates] resident_workgroups: serve a model on it once, which measures them, then tune")?;
     say(&format!(
         "{name}: {}; starting from {}",
         facts.describe().join(", "),
         report.used
     ));
-    let (fitted, mut lines, wrong) = bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    let (mut fitted, mut lines, mut wrong) =
+        bench_qmm(depth, &name, &base, cores, cache, refit, say)?;
+    let (crossover, gemm_lines, gemm_wrong) = bench_gemm(depth, &name, &base, cache, refit, say)?;
+    fitted.extend(crossover);
+    lines.extend(gemm_lines);
+    wrong.extend(gemm_wrong);
     // The fitted ladder must also win end to end to be kept.
     let mut knobs: Vec<search::Knob> = Vec::new();
     for (id, value) in &fitted {
@@ -340,14 +431,19 @@ pub fn run(
         base: &base,
         facts: &facts,
         cores,
+        mix,
     };
     let mut chosen = Vec::new();
     if models.is_empty() {
         chosen = fitted;
-        for k in knobs.iter().filter(|k| k.id != "kernel.qmm") {
+        for k in knobs
+            .iter()
+            .filter(|k| !matches!(k.id, "kernel.qmm" | "kernel.gemm.path"))
+        {
             lines.push(Line {
                 id: k.id,
                 text: "not searched: no model to serve (import one, or pass --check)".to_string(),
+                measured: false,
             });
         }
     } else {
@@ -424,6 +520,11 @@ pub fn run(
         &provenance,
         ASSUME,
     )?;
+    let file = engine::rates::keeping_stored(
+        crate::chip::registry(),
+        file,
+        user_file(profiles, &name).as_deref(),
+    );
     Ok(Outcome {
         device: name,
         file,
@@ -451,7 +552,6 @@ mod tests {
             let knobs = search::knobs(&base, SEARCH_SKIPS, "");
             let ids: Vec<&str> = knobs.iter().map(|k| k.id).collect();
             assert!(ids.contains(&"kernel.sdpa.decode.threads"), "{ids:?}");
-            assert!(ids.contains(&"engine.submit.split_rows"), "{ids:?}");
             assert!(!ids.contains(&"kernel.qmm"), "{ids:?}");
             for k in &knobs {
                 for (label, _) in &k.candidates {
@@ -475,5 +575,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A tune over the user's file keeps what loads stored in it: the keyed
+    /// rates and the dense settles, beside the tuned decision.
+    #[test]
+    fn a_tune_keeps_the_measurements_the_users_file_stores() {
+        const DECISION: &str = "kernel.sdpa.decode.threads";
+        let facts = profile::Facts::of(crate::chip::registry())
+            .word("vendor", "nvidia")
+            .int("subgroup", 32)
+            .int("cores", 142)
+            .flag("coopmat", true);
+        let (base, _) = crate::chip::resolve_facts("Test GPU", &facts, None);
+        let rates = profile::rates::Rates {
+            launch_ns: Some(4321),
+            measured_on: Some("vulkan 10de:1".to_string()),
+            dense_settled: vec![profile::curves::DenseSettled {
+                method: 1,
+                of: 7,
+                code: 9,
+                ranges: vec![[1, 1, 1, 8, 0, 0]],
+                planes: vec![(1024, 2048)],
+            }],
+            ..profile::rates::Rates::default()
+        };
+        let how = ("rates", "\"a load\"".to_string());
+        let stored = engine::rates::saved_text(None, &rates, &how);
+        let knob = search::knobs(&base, SEARCH_SKIPS, "")
+            .into_iter()
+            .find(|knob| knob.id == DECISION)
+            .expect("the decision is searched");
+        let entries = vec![(DECISION.to_string(), knob.candidates[0].0.clone())];
+        let tuned = search::assemble(
+            crate::chip::registry(),
+            &base,
+            "Test GPU",
+            &facts,
+            &search::render_overrides(&entries),
+            &[("source", "\"a test\"".to_string())],
+            ASSUME,
+        )
+        .expect("the tuned file");
+        let registry = crate::chip::registry();
+        let read = |text: &str| {
+            registry
+                .parse(text, "kept", profile::Strict::User)
+                .expect("reads")
+        };
+        let kept = read(&engine::rates::keeping_stored(
+            registry,
+            tuned.clone(),
+            Some(&stored),
+        ));
+        assert!(kept.entries.contains_key(DECISION), "the tuned decision");
+        assert_eq!(kept.tuned.rates.launch_ns, Some(4321));
+        assert_eq!(kept.tuned.rates.dense_settled, rates.dense_settled);
+        assert_eq!(kept.tuned.rates.measured_on, rates.measured_on);
+        assert_eq!(
+            engine::rates::keeping_stored(registry, tuned.clone(), None),
+            tuned
+        );
     }
 }

@@ -32,18 +32,20 @@ fn check(boxes: &[Box3], c: usize, groups: usize, silu: bool) {
     let o_at = gpu.zeros(rows * c * 2);
     let ctx = gpu.ctx();
     let mut o = Tensor::new(o_at, rows as u32, c as u32, Dtype::Bf16);
-    group_norm(
-        &ctx,
-        Tensor::new(x_at, rows as u32, c as u32, Dtype::Bf16),
-        Tensor::new(grid_at, boxes.len() as u32, 4, Dtype::I32),
-        groups as u32,
-        Tensor::new(w_at, c as u32, 1, Dtype::F32),
-        Tensor::new(b_at, c as u32, 1, Dtype::F32),
-        eps,
-        silu,
-        &mut o,
-        0,
-    )
+    gpu.laid(&ctx, |ctx| {
+        group_norm(
+            ctx,
+            Tensor::new(x_at, rows as u32, c as u32, Dtype::Bf16),
+            Tensor::new(grid_at, boxes.len() as u32, 4, Dtype::I32),
+            groups as u32,
+            Tensor::new(w_at, c as u32, 1, Dtype::F32),
+            Tensor::new(b_at, c as u32, 1, Dtype::F32),
+            eps,
+            silu,
+            &mut o,
+            0,
+        )
+    })
     .expect("the norm fires");
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, rows * c);

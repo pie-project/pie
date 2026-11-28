@@ -107,6 +107,11 @@ pub struct DecodePlan {
     pub workspace: Workspace,
     pub shape: Shape,
     pub window: Option<u32>,
+    /// Each request's byte offset into the fire's masks and its word, as
+    /// [`PrefillPlan::mask_indptr`] and [`PrefillPlan::mask_origin`]: the
+    /// engine binds them where the decode reads the masks.
+    pub mask_indptr: Option<Tensor>,
+    pub mask_origin: Option<Tensor>,
     pub device: Device,
 }
 
@@ -155,8 +160,11 @@ pub struct PrefillPlan {
     pub window: Option<u32>,
     pub causal: bool,
     pub graph_capturable: bool,
-    pub graph_refusal: Option<String>,
     pub mask_indptr: Option<Tensor>,
+    /// Per request, the committed boundary its mask speaks of the keys past
+    /// and its wide bit (`PrefillPagedParams::maybe_mask_origin`); the engine
+    /// binds it beside `mask_indptr`.
+    pub mask_origin: Option<Tensor>,
     pub device: Device,
 }
 
@@ -246,28 +254,16 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
-    pub force_split_small: bool,
-
-    pub window_split: bool,
-
-    pub chunk_floor_128: bool,
-
     pub prefill_ctas_per_sm: u32,
-
-    pub static_max_requests: u32,
 
     pub decode_gqa: crate::attn::decode_gqa::Gate,
 }
 
 impl Toggles {
     #[must_use]
-    pub const fn of(tuning: crate::tuning::Tuning) -> Self {
+    pub fn of(tuning: crate::tuning::Tuning) -> Self {
         Self {
-            force_split_small: tuning.decode_split_small,
-            window_split: tuning.decode_split_window,
-            chunk_floor_128: tuning.decode_chunk_floor_128,
-            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
-            static_max_requests: tuning.decode_static_max_requests,
+            prefill_ctas_per_sm: tuning.prefill_ctas_per_sm(),
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
     }
@@ -362,43 +358,32 @@ pub fn plan_decode(
         ),
         _ => 0,
     };
-    let windowed_split = toggles.window_split && window_left >= 0;
-    let built = if !windowed_split
-        && decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
-    {
-        decode::static_nonsplit(
-            OP,
-            shape.num_requests,
-            live,
-            shape.page_size,
-            enable_cuda_graph,
-            workspace.int_bytes,
-        )?
-    } else {
-        let req = decode::Request {
-            kv_indptr,
-            batch_size: shape.num_requests,
-            live,
-            num_qo_heads: shape.num_q_heads,
-            gqa_group_size: shape.group_size(),
-            page_size: shape.page_size,
-            head_dim: shape.head_dim,
-            enable_cuda_graph,
-            chunk_floor_128: toggles.chunk_floor_128,
-            window_left: u32::try_from(window_left).ok(),
-            whole: ranks > 0
-                || toggles
-                    .decode_gqa
-                    .whole(shape.head_dim, shape.group_size(), window_left),
-        };
-        decode::plan(
-            OP,
-            &req,
-            max_grid_size,
-            workspace.int_bytes,
-            workspace.float_bytes,
-        )?
+    // An eager decode plans as a body does: its keys split across blocks
+    // only while its lanes' head groups leave the grid unfilled, each split
+    // chunk sized to fill it (`decode::estimate`); one that fills it runs
+    // unsplit.
+    let req = decode::Request {
+        kv_indptr,
+        batch_size: shape.num_requests,
+        live,
+        num_qo_heads: shape.num_q_heads,
+        gqa_group_size: shape.group_size(),
+        page_size: shape.page_size,
+        head_dim: shape.head_dim,
+        enable_cuda_graph,
+        window_left: u32::try_from(window_left).ok(),
+        whole: ranks > 0
+            || toggles
+                .decode_gqa
+                .whole(shape.head_dim, shape.group_size(), window_left),
     };
+    let built = decode::plan(
+        OP,
+        &req,
+        max_grid_size,
+        workspace.int_bytes,
+        workspace.float_bytes,
+    )?;
 
     let mut info = built.info;
     if info.whole {
@@ -412,6 +397,8 @@ pub fn plan_decode(
         workspace,
         shape,
         window,
+        mask_indptr: None,
+        mask_origin: None,
         device: *device,
     })
 }
@@ -454,20 +441,7 @@ pub fn plan_prefill(
         ctas_per_sm: toggles.prefill_ctas_per_sm,
     };
 
-    let (built, capturable, graph_refusal) =
-        match prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
-            Ok(built) => (built, enable_cuda_graph, None),
-            Err(declined) if enable_cuda_graph => {
-                let req = prefill::Request {
-                    enable_cuda_graph: false,
-                    ..req
-                };
-                let built =
-                    prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
-                (built, false, Some(declined.to_string()))
-            }
-            Err(declined) => return Err(declined),
-        };
+    let built = prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
 
     let cta_tile_q = u32::try_from(built.info.cta_tile_q).unwrap_or(0);
     if shape.head_dim >= 256 && cta_tile_q == 128 {
@@ -491,16 +465,60 @@ pub fn plan_prefill(
         total_tokens,
         window,
         causal,
-        graph_capturable: capturable,
-        graph_refusal,
+        graph_capturable: enable_cuda_graph,
         mask_indptr,
+        mask_origin: None,
         device: *device,
     })
 }
 
-pub use crate::attn::plan::prefill::{
-    graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
-};
+/// The float workspace a captured prefill plan of `rows` rows over `lanes`
+/// lanes lays: its split's partials, or nothing where its layout runs
+/// unsplit. It is [`plan_prefill`]'s own layout of that graph form (one
+/// live request of a row, one page of keys): a captured layout's tile,
+/// split and padded grid follow from its carved rows and lanes alone,
+/// never from the keys or the live rows, so every replay of that body asks
+/// exactly this. The load sizes the prefill grant as the most of it over
+/// the compositions its lattice arms (`engine_cuda::inputs`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_graph_float_bytes(
+    rows: u32,
+    lanes: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    page_size: u32,
+    window: Option<u32>,
+    device: &Device,
+    toggles: Toggles,
+) -> Result<usize, Error> {
+    const OP: &str = "attn.plan_prefill";
+    window_left(OP, window)?;
+    // The live request carries a row: the layout reads the carve's rows
+    // (`total_num_rows`), and the live rows only fill its index tables.
+    let qo_indptr = [0, 1];
+    let req = prefill::Request {
+        qo_indptr: &qo_indptr,
+        kv_indptr: &[0, 1],
+        total_num_rows: rows.max(1),
+        batch_size: lanes.max(1),
+        lane_offset: 0,
+        live: Live {
+            requests: 1,
+            lane_offset: 0,
+            row_offset: 0,
+            rows: 1,
+        },
+        num_qo_heads: num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size: page_size.max(1),
+        enable_cuda_graph: true,
+        window_left: window.map(|w| w - 1),
+        ctas_per_sm: toggles.prefill_ctas_per_sm,
+    };
+    Ok(prefill::plan(OP, &req, device, usize::MAX, usize::MAX)?.float_bytes)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn plan_mla(
@@ -563,13 +581,18 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
         // `int_ptr` addresses `bytes.len()` writable device bytes is the
         // caller's to vouch for.
         let code = unsafe {
-            rt::cudaMemcpyAsync(
-                int_ptr as usize as *mut core::ffi::c_void,
-                from.cast(),
-                bytes.len(),
-                rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                ctx.stream().cast(),
-            )
+            if crate::sizing::active() {
+                // A size-only walk (`crate::sizing`) moves nothing.
+                rt::cudaError::cudaSuccess
+            } else {
+                rt::cudaMemcpyAsync(
+                    int_ptr as usize as *mut core::ffi::c_void,
+                    from.cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    ctx.stream().cast(),
+                )
+            }
         };
         if code != rt::cudaError::cudaSuccess {
             return Err(refuse(

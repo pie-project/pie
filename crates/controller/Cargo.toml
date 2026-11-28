@@ -34,17 +34,8 @@ builtins = { path = "../builtins" }
 client-api = { package = "pie-client-api", path = "../client-api" }
 serde_json = "1"
 thiserror = "2.0.19"
-wasmparser = "0.263"
-wasmtime = { version = "49.0.2", default-features = false, features = [
-    "runtime",
-    "std",
-    "anyhow",
-    "cranelift",
-    "component-model",
-    "component-model-async",
-    "async",
-] }
-wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p3"] }
+# The PLEX 1.1 policy host the cluster port embeds.
+plex-host = { path = "../plex-host" }
 toml = "1.1"
 
 [target.'cfg(unix)'.dependencies]

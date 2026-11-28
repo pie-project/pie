@@ -281,9 +281,9 @@ impl Run<'_> {
                 // packed rows are never written and cut; a short fire, or a
                 // chip that keeps the old forms, runs the pair.
                 let a = self.tensor(*act);
-                if self.ctx().tuning().rows_vec
+                if self.ctx().tuning().rows_vec()
                     && a.dtype == Dtype::Bf16
-                    && a.rows >= self.ctx().tuning().gemm_split_rows_from
+                    && a.rows >= self.ctx().tuning().gemm_split_rows_from()
                     && self.dense_weight(*w)
                 {
                     let weight = self.tensor(*w);
@@ -564,7 +564,7 @@ impl Run<'_> {
             } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() {
                         linear::affine::tiled::matmul
                     } else {
                         linear::affine::tiled::matmul_gemv
@@ -591,7 +591,7 @@ impl Run<'_> {
             } => match self.maybe_tiled_planes(*w) {
                 Some((codes, scales, biases)) => {
                     let act = self.tensor(*act);
-                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from {
+                    let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() {
                         linear::affine::tiled::lm_head
                     } else {
                         linear::affine::tiled::lm_head_gemv
@@ -1056,7 +1056,7 @@ impl Run<'_> {
                     }
                     // Past them (`kernel.gemm.fp8_grouped_tc5_until`): each group on the tcgen05
                     // GEMM against its rows of the fp8 plane, no bf16 widened.
-                    if out.rows <= self.ctx().tuning().gemm_fp8_grouped_tc5_until
+                    if out.rows <= self.ctx().tuning().gemm_fp8_grouped_tc5_until()
                         && x.width.is_multiple_of(*groups)
                         && out.width.is_multiple_of(*groups)
                     {
@@ -1412,7 +1412,7 @@ impl Run<'_> {
             && let Some((fp8, atoms)) = self.mxfp4_fp8_bank(*bank)
         {
             let route_t = self.tensor(*routes);
-            if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from {
+            if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from() {
                 let experts = self.planes(*bank).0.rows;
                 let x = self.tensor(*x);
                 let mut out = self.tensor(*y);
@@ -1439,7 +1439,14 @@ impl Run<'_> {
                 return Ok(false);
             }
             let (x, routes, mut out) = (self.tensor(x), self.tensor(routes), self.tensor(y));
-            return linear::moe::select_bf16_held(
+            // relu^2 lands in the tiled GEMM's epilogue: fused where the
+            // plain select's cheapest leg is that GEMM.
+            if linear::moe::cheapest(self.ctx(), x, bank, routes, &out, experts)?
+                != linear::moe::Leg::Tiled
+            {
+                return Ok(false);
+            }
+            return linear::moe::select_bf16_tiled(
                 self.ctx(),
                 "fused.moe_select_glu",
                 x,
@@ -1452,7 +1459,7 @@ impl Run<'_> {
             );
         }
         // The profile first: a tcgen05 device with its grouped GEMM off resolves nothing.
-        if !self.ctx().tuning().moe_tc5 && linear::gemm_sm100::supported() {
+        if linear::gemm_sm100::supported() && !self.ctx().tuning().moe_tc5() {
             return Ok(false);
         }
         let (packed, y, glu) = match *glu {
@@ -1736,7 +1743,7 @@ impl Run<'_> {
         gate_add: Option<&Linear>,
     ) -> Result<bool, kernels_cuda::Error> {
         use linear::gemm_sm100::Glu;
-        if !self.ctx().tuning().moe_tc5 || !linear::gemm_sm100::supported() {
+        if !linear::gemm_sm100::supported() || !self.ctx().tuning().moe_tc5() {
             return Ok(false);
         }
         // The routes' norm: a scale, no residual, the down rows in, the sum's
@@ -2081,7 +2088,7 @@ impl Run<'_> {
         if codes.dtype == Dtype::Nvfp4 {
             let tensor_scales = tensor_scales("linear.moe_select", biases)?;
             let (codes, scales, tensor_scales, routes) =
-                match self.staged_experts(codes, scales, Some(tensor_scales), routes) {
+                match self.staged_experts(codes, scales, Some(tensor_scales), routes)? {
                     Some((codes, scales, Some(tensor_scales), routes)) => {
                         (codes, scales, tensor_scales, routes)
                     }
@@ -2100,7 +2107,7 @@ impl Run<'_> {
             );
         }
         let (codes, scales, biases, routes) = self
-            .staged_experts(codes, scales, biases, routes)
+            .staged_experts(codes, scales, biases, routes)?
             .unwrap_or((codes, scales, biases, routes));
         linear::moe::matmul_select_quant(
             self.ctx(),
@@ -2501,7 +2508,7 @@ impl Run<'_> {
                 if let Some((fp8, atoms)) = self.mxfp4_fp8_bank(bank) {
                     let route_t = self.tensor(routes);
                     let mut out = self.tensor(y);
-                    if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from
+                    if route_t.rows * route_t.width >= self.ctx().tuning().mxfp4_fp8_from()
                         && linear::moe::fp8_select_takes(x, out.width)
                     {
                         return linear::moe::select_fp8_w8a8(
@@ -2628,7 +2635,7 @@ impl Run<'_> {
         }
         // A prefill's rows W8A8 on an Ada's wide fp8 tiles, as the
         // deployment quantizes them (`kernel.gemm.fp8_wide_from`).
-        let wide_from = self.ctx().tuning().gemm_fp8_wide_from;
+        let wide_from = self.ctx().tuning().gemm_fp8_wide_from();
         if wide_from > 0
             && act.rows >= wide_from
             && atoms.width > 0
@@ -2743,8 +2750,8 @@ impl Run<'_> {
             // in the same launch, where it leads (`kernel.gemm.fp8_mma_gemv_until`,
             // up to `kernel.gemm.fp8_mma_k_until` of K, `moe::dense_fp8_shape`).
             let tuning = self.ctx().tuning();
-            if act.rows <= tuning.gemm_fp8_mma_gemv_until
-                && (tuning.gemm_fp8_mma_k_until == 0 || k <= tuning.gemm_fp8_mma_k_until)
+            if act.rows <= tuning.gemm_fp8_mma_gemv_until()
+                && (tuning.gemm_fp8_mma_k_until() == 0 || k <= tuning.gemm_fp8_mma_k_until())
                 && let Some(shape) = linear::moe::dense_fp8_shape(act.rows, n, k)
             {
                 return linear::moe::matmul_grouped_fp8_with(
@@ -2817,7 +2824,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::matmul_via_dense
                 } else {
                     linear::affine::matmul
@@ -2876,7 +2883,7 @@ impl Run<'_> {
             Some((codes, scales, biases)) => {
                 let act = self.tensor(*act);
                 let held = self.decoded_tile_holds(self.tensor(*y).width, act.width);
-                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from && held {
+                let entry = if act.rows >= self.ctx().tuning().qmm_gemm_from() && held {
                     linear::dequant::lm_head_via_dense
                 } else {
                     linear::affine::lm_head
@@ -2980,113 +2987,126 @@ const EXPERT_ALPHA: &str = "linear.act_quant.expert_alpha";
 #[cfg(feature = "cuda")]
 const READ_BACK: &str = "linear.act_quant.read_back";
 
-const STAGED_EXPERT_BYTES: u64 = 1536 * 1024 * 1024;
-
 impl Run<'_> {
+    /// A host-resident bank's experts this fire routes to, copied into the
+    /// staging the load laid for them (`experts::staging`), and the routes
+    /// renumbered to their places there; `None` for a bank on the device,
+    /// or routes that name no expert. The routes are read back to the host,
+    /// so a load that stages records no body (`Run::capturable`).
+    #[allow(clippy::type_complexity)]
     fn staged_experts(
         &self,
         codes: Tensor,
         scales: Tensor,
         biases: Option<Tensor>,
         routes: Tensor,
-    ) -> Option<(Tensor, Tensor, Option<Tensor>, Tensor)> {
+    ) -> Result<Option<(Tensor, Tensor, Option<Tensor>, Tensor)>, kernels_cuda::Error> {
+        const OP: &str = "linear.moe_select";
         if routes.rows == 0 || !crate::device::alloc::is_host_pointer(codes.ptr) {
-            return None;
+            return Ok(None);
         }
+        let refused = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let Some(staged) = self.expert_staging() else {
+            return Err(refused(
+                "a select reads a routed bank on the host that no table of the weight cache \
+                 reads, and the load laid no staging for its experts"
+                    .to_string(),
+            ));
+        };
+        // A select on a side stream may overlap one on another: each stream
+        // stages into its own lane.
+        let Some(lane) = staged.lane(self.stream_index()) else {
+            return Err(refused(format!(
+                "a select of a host-resident bank runs on stream {}, which the load laid no \
+                 staging lane for",
+                self.stream_index()
+            )));
+        };
         let stream = self.ctx().stream();
         if crate::device::alloc::is_capturing(stream) {
-            return None;
+            return Err(refused(
+                "a host-resident bank's experts are staged by the fire's routes, read back to \
+                 the host, which no capture records"
+                    .to_string(),
+            ));
         }
+        let copy = |dst: u64, src: u64, bytes: usize| {
+            crate::device::copy_any(stream, dst, src, bytes)
+                .map_err(|fault| refused(fault.to_string()))
+        };
         let count = routes.rows as usize * routes.width as usize;
         let mut picked = vec![0i32; count];
-        if crate::device::copy_any(stream, picked.as_mut_ptr() as u64, routes.ptr, count * 4)
-            .is_err()
-        {
-            return None;
-        }
-        let mut unique: Vec<i32> = picked.iter().copied().filter(|e| *e >= 0).collect();
+        copy(picked.as_mut_ptr() as u64, routes.ptr, count * 4)?;
+        // A pad row's routes are whatever its rows last held: an id past
+        // the bank names no expert, and the select reads none for it.
+        let experts = codes.rows as i32;
+        let named = |e: i32| (0..experts).contains(&e);
+        let mut unique: Vec<i32> = picked.iter().copied().filter(|e| named(*e)).collect();
         unique.sort_unstable();
         unique.dedup();
+        // A size-only walk reads no routes: it stages the most experts the
+        // fire can route to, so its select asks the scratch a fire's can.
+        if crate::sizing::active() {
+            let most = (codes.rows as usize).min(count);
+            unique = (0..most as i32).collect();
+        }
         if unique.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let per_expert = |plane: Tensor| u64::from(plane.width);
-        let bytes_each = per_expert(codes) + per_expert(scales) + biases.map_or(0, per_expert);
-        if unique.len() as u64 * bytes_each > STAGED_EXPERT_BYTES {
-            return None;
-        }
-        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
-        let remapped: Vec<i32> = picked
-            .iter()
-            .map(|e| if *e < 0 { -1 } else { slot_of(*e) })
-            .collect();
-        let stage = |name: &'static str, plane: Tensor| -> Option<Tensor> {
-            let width = plane.width as usize;
-            let ptr = staging(name, unique.len() * width)?;
-            for (slot, expert) in unique.iter().enumerate() {
-                crate::device::copy_any(
-                    stream,
-                    ptr + (slot * width) as u64,
-                    plane.ptr + u64::from(*expert as u32) * width as u64,
-                    width,
-                )
-                .ok()?;
+        let over = |what: &str, need: u64, run: u64| {
+            refused(format!(
+                "a fire of {} rows, {} routes a row, stages {need} bytes of {what} ({} of a \
+                 bank's {} experts), past the {run} the load laid for fires of up to {} rows",
+                routes.rows,
+                routes.width,
+                unique.len(),
+                codes.rows,
+                staged.rows,
+            ))
+        };
+        let stage = |plane: Tensor, (at, run): (u64, u64)| -> Result<Tensor, kernels_cuda::Error> {
+            let width = u64::from(plane.width);
+            let need = unique.len() as u64 * width;
+            if need > run {
+                return Err(over("an expert plane", need, run));
             }
-            Some(Tensor::new(
-                ptr,
+            for (slot, expert) in unique.iter().enumerate() {
+                copy(
+                    at + slot as u64 * width,
+                    plane.ptr + u64::from(*expert as u32) * width,
+                    plane.width as usize,
+                )?;
+            }
+            Ok(Tensor::new(
+                at,
                 unique.len() as u32,
                 plane.width,
                 plane.dtype,
             ))
         };
-        let staged_codes = stage("moe.staged.codes", codes)?;
-        let staged_scales = stage("moe.staged.scales", scales)?;
+        let staged_codes = stage(codes, lane[0])?;
+        let staged_scales = stage(scales, lane[1])?;
         let staged_biases = match biases {
-            Some(biases) => Some(stage("moe.staged.biases", biases)?),
+            Some(biases) => Some(stage(biases, lane[2])?),
             None => None,
         };
-        let routes_ptr = staging("moe.staged.routes", count * 4)?;
-        crate::device::copy_any(stream, routes_ptr, remapped.as_ptr() as u64, count * 4).ok()?;
-        Some((
+        let slot_of = |expert: i32| unique.binary_search(&expert).map_or(-1, |at| at as i32);
+        let remapped: Vec<i32> = picked
+            .iter()
+            .map(|e| if named(*e) { slot_of(*e) } else { -1 })
+            .collect();
+        let (routes_at, routes_run) = lane[3];
+        if (count * 4) as u64 > routes_run {
+            return Err(over("routes", (count * 4) as u64, routes_run));
+        }
+        copy(routes_at, remapped.as_ptr() as u64, count * 4)?;
+        Ok(Some((
             staged_codes,
             staged_scales,
             staged_biases,
-            Tensor::new(routes_ptr, routes.rows, routes.width, routes.dtype),
-        ))
+            Tensor::new(routes_at, routes.rows, routes.width, routes.dtype),
+        )))
     }
-}
-
-/// A staging buffer per `name`, grown by doubling. A buffer it outgrows is
-/// kept, never freed: copies queued on it may still be in flight, and a
-/// free here would either race them or synchronise the device (illegal
-/// mid-capture). Doubling keeps what is retired under the live buffer's
-/// size.
-fn staging(name: &'static str, bytes: usize) -> Option<u64> {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    struct Held {
-        live: HashMap<&'static str, (u64, usize)>,
-        retired: Vec<u64>,
-    }
-    static HELD: Mutex<Option<Held>> = Mutex::new(None);
-    if bytes == 0 {
-        return None;
-    }
-    let mut held = HELD.lock().expect("held lock poisoned");
-    let held = held.get_or_insert_with(|| Held {
-        live: HashMap::new(),
-        retired: Vec::new(),
-    });
-    let cap = held.live.get(name).map_or(0, |(_, cap)| *cap);
-    if let Some((ptr, _)) = held.live.get(name).filter(|_| cap >= bytes) {
-        return Some(*ptr);
-    }
-    let size = bytes.max(cap * 2);
-    let fresh = crate::device::alloc::raw_alloc(size)?;
-    if let Some((old, _)) = held.live.insert(name, (fresh, size)) {
-        held.retired.push(old);
-    }
-    Some(fresh)
 }
 
 /// The routes a routed select reads.

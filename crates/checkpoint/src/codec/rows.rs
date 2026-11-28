@@ -162,6 +162,13 @@ impl EncodeOperand<'_> {
 
 pub type EncodeRowJob<'a> = dyn Fn(usize, &mut [f32], &mut [u8], &mut [u8]) + Sync + 'a;
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::disallowed_methods,
+        reason = "available_parallelism is Err on wasm32, so one worker: the serial branch returns before the scope"
+    )
+)]
 pub fn encode_rows(
     rows: usize,
     cols: usize,

@@ -1,7 +1,7 @@
 use crate::error::Error;
 
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, flat_wide, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -18,23 +18,25 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
         "the gate plane is the rectangle it gates"
     );
     let n = x.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the gated rectangle's element count", lanes)?;
-    if ctx.tuning().rows_vec && x.width.is_multiple_of(8) && aligned16(x.ptr) && aligned16(gate.ptr)
+    if n == 0 {
+        return Err(refuse(OP, "the gated rectangle's element count is 0"));
+    }
+    if ctx.tuning().rows_vec()
+        && x.width.is_multiple_of(8)
+        && aligned16(x.ptr)
+        && aligned16(gate.ptr)
     {
         return ctx.fire(
             OP,
-            Fire::at(kernel(GATE, "::pie::elemwise::gate_sigmoid_mul_vec8"))
-                .apply(Launch::flat(lanes / 8, BLOCK)),
+            Fire::at(kernel(GATE, "::pie::elemwise::gate_sigmoid_mul_vec8")).apply(flat_wide(
+                OP,
+                n / 8,
+                BLOCK,
+            )?),
             &[
                 x.arg(),
                 gate.arg(),
-                stated(OP, lanes / 8)?.arg(),
+                ((n / 8) as i64).arg(),
                 stated(OP, x.width)?.arg(),
                 stated(OP, fan)?.arg(),
                 ctx.stage(),
@@ -47,11 +49,11 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
             GATE,
             "::pie::elemwise::gate_sigmoid_mul<::pie::bf16>",
         ))
-        .apply(Launch::flat(lanes, BLOCK)),
+        .apply(flat_wide(OP, n, BLOCK)?),
         &[
             x.arg(),
             gate.arg(),
-            stated(OP, lanes)?.arg(),
+            (n as i64).arg(),
             stated(OP, x.width)?.arg(),
             stated(OP, fan)?.arg(),
             ctx.stage(),

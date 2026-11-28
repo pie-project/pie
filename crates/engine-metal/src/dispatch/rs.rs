@@ -7,17 +7,15 @@ use poem_ir::{Operation, Ssm, ValueId};
 use crate::rs::{Convolved, Seat};
 use crate::run::Run;
 
-fn extended_origin(
-    indptr: &[i32],
-    lanes: &[engine::rs::LanePlan],
-    lane0: u32,
-    r: usize,
-) -> (u32, u32) {
+/// Lane `r`'s first extended row and its carried rows among them
+/// (`Seat::ext_replay`: a compact decode lane takes none), as the kernels
+/// lay them.
+fn extended_origin(indptr: &[i32], ext_replay: &[u32], lane0: u32, r: usize) -> (u32, u32) {
     let mut begin = indptr[r].max(0) as u32;
     for j in 0..r {
-        begin += lanes.get(lane0 as usize + j).map_or(0, |plan| plan.replay);
+        begin += ext_replay.get(lane0 as usize + j).copied().unwrap_or(0);
     }
-    let replay = lanes.get(lane0 as usize + r).map_or(0, |plan| plan.replay);
+    let replay = ext_replay.get(lane0 as usize + r).copied().unwrap_or(0);
     (begin, replay)
 }
 
@@ -31,13 +29,18 @@ impl Run<'_> {
 
     /// The committed scan's tables for the state `state`: its band's lane
     /// table of record piece ids.
-    pub(crate) fn rs_committed(&self, seat: &Seat, state: poem_ir::ValueId) -> Committed {
-        Committed {
+    pub(crate) fn rs_committed(
+        &self,
+        seat: &Seat,
+        state: poem_ir::ValueId,
+    ) -> crate::run::Ran<Committed> {
+        Ok(Committed {
             replay: seat.replay,
             commit: seat.commit,
             slots: self.lane_slots(state).unwrap_or(seat.slots),
-            lane0: self.window().span.lane_offset,
-        }
+            lane0: self.window()?.span.lane_offset,
+            ext_replay: seat.ext_replay_table,
+        })
     }
 
     /// Queues one copy of `bytes` from `src` to `dst` on `copies`.
@@ -94,16 +97,16 @@ impl Run<'_> {
         let row_bytes = seat.layout.planes[plane].row_bytes;
         let mut done = 0u32;
         while done < run.count {
-            let (at, room) = seat
+            let (buffer, at, room) = seat
                 .locate(run, plane, run.from + done)
                 .map_err(|fault| Self::kernel(fault, op))?;
             let take = room.min(run.count - done);
             let bytes = u64::from(take) * row_bytes;
             let rows_at = u64::from(row0 + done) * row_bytes;
             if into_slab {
-                self.rs_copy(op, copies, (rect.buf, rows_at), (seat.pool, at), bytes)?;
+                self.rs_copy(op, copies, (rect.buf, rows_at), (buffer, at), bytes)?;
             } else {
-                self.rs_copy(op, copies, (seat.pool, at), (rect.buf, rows_at), bytes)?;
+                self.rs_copy(op, copies, (buffer, at), (rect.buf, rows_at), bytes)?;
             }
             done += take;
         }
@@ -125,19 +128,26 @@ impl Run<'_> {
             ),
         })?;
         let ext = seat.ext_in[plane];
-        let own = self.tensor(value);
+        let own = self.tensor(value)?;
         let row_bytes = seat.layout.planes[plane].row_bytes;
-        let indptr = self.qo_indptr_host();
-        let lane0 = self.window().span.lane_offset;
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset;
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
-            let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
+            let (begin, replay) = extended_origin(indptr, &seat.ext_replay, lane0, r);
             let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
                 continue;
             };
-            if let Some(run) = &plan.gather {
-                self.rs_move(op, &mut copies, seat, plane, run, ext, begin, false)?;
+            // Every run the lane replays, one after another: a lane sharing
+            // its set replays the slots its mask admits (its ancestry), which
+            // its siblings' slots interleave, so not one run from its first.
+            // A lane that takes no extended carried rows reads them from its
+            // buffer: none are gathered.
+            let mut at = begin;
+            for run in plan.gathers.iter().filter(|_| replay == plan.replay) {
+                self.rs_move(op, &mut copies, seat, plane, run, ext, at, false)?;
+                at += run.count;
             }
             let own_at = u64::from(indptr[r].max(0) as u32) * row_bytes;
             self.rs_copy(
@@ -162,6 +172,44 @@ impl Run<'_> {
         }
         self.rs_flush(&copies)?;
         Ok(ext)
+    }
+
+    /// Copies each lane's own rows of `own` (laid by the fire's rows) into
+    /// its buffer pages of plane `plane`: what [`Self::rs_extend`] scatters,
+    /// for a plane an op lands rather than reads (a gated-delta row's
+    /// corrected keys and `u`, where the fire stages no page table).
+    pub(crate) fn rs_scatter(
+        &self,
+        op: &'static str,
+        seat: &Seat,
+        plane: usize,
+        own: Tensor,
+    ) -> Result<(), Error> {
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset;
+        let mut copies = Vec::new();
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "the index addresses more than one table"
+        )]
+        for r in 0..indptr.len().saturating_sub(1) {
+            let Some(plan) = seat.lanes.get(lane0 as usize + r) else {
+                continue;
+            };
+            if let Some(run) = &plan.scatter {
+                self.rs_move(
+                    op,
+                    &mut copies,
+                    seat,
+                    plane,
+                    run,
+                    own,
+                    indptr[r].max(0) as u32,
+                    true,
+                )?;
+            }
+        }
+        self.rs_flush(&copies)
     }
 
     pub(crate) fn rs_out(
@@ -212,7 +260,7 @@ impl Run<'_> {
         ext: Tensor,
         dest: ValueId,
     ) -> Result<(), Error> {
-        let target = self.tensor(dest);
+        let target = self.tensor(dest)?;
         if crate::diag::on().rs_trace {
             eprintln!(
                 "rs_land {op}: ext buf {} rows {} width {} {:?} -> target buf {} rows {} width {} {:?}; window {:?}",
@@ -232,12 +280,12 @@ impl Run<'_> {
                 op,
                 detail: format!("{:?} has no element size", ext.dtype),
             })?;
-        let indptr = self.qo_indptr_host();
-        let lane0 = self.window().span.lane_offset;
+        let indptr = self.qo_indptr_host()?;
+        let lane0 = self.window()?.span.lane_offset;
         let mut copies = Vec::new();
         for r in 0..indptr.len().saturating_sub(1) {
             let rows = (indptr[r + 1] - indptr[r]).max(0) as u32;
-            let (begin, replay) = extended_origin(indptr, &seat.lanes, lane0, r);
+            let (begin, replay) = extended_origin(indptr, &seat.ext_replay, lane0, r);
             self.rs_copy(
                 op,
                 &mut copies,
@@ -289,24 +337,56 @@ impl Run<'_> {
         // page table reads and lands the buffer's too.
         let paged = seat.paged(self.handles(), conv.x);
         let fits = ssm::causal_conv1d_verify_fits(ext_y.width, conv.conv_width, conv.dilation);
+        // The beam groups' conv folds first: each
+        // group's window moves on by the rows its beams share before any of
+        // its lanes reads it.
+        if let Some(folds) = seat.folds {
+            let Some(paged) = paged.filter(|_| fits) else {
+                return Err(Error::Backend {
+                    op: OP,
+                    detail: "a beam group folds its shared rows before the step, and the conv \
+                          reads its rows through no page table: a group fold reads them there"
+                        .to_string(),
+                });
+            };
+            ssm::causal_conv1d_group_fold(
+                self.ctx(),
+                folds,
+                self.window_lanes()?,
+                self.rs_committed(seat, conv.state)?.slots,
+                paged,
+                &self.recurrent(conv.state)?,
+                ext_y.width,
+                conv.conv_width,
+                conv.dilation,
+            )?;
+        }
         if fits {
             let source = match paged {
-                Some(_) => self.tensor(conv.x),
+                Some(_) => self.tensor(conv.x)?,
                 None => self.rs_extend(OP, seat, conv.x)?,
             };
             ssm::causal_conv1d_verify(
                 self.ctx(),
                 source,
                 paged,
-                self.qo_indptr(),
-                &self.rs_committed(seat, conv.state),
+                self.qo_indptr()?,
+                &self.rs_committed(seat, conv.state)?,
                 conv.weight,
-                &self.recurrent(conv.state),
+                &self.recurrent(conv.state)?,
                 conv.conv_width,
                 conv.dilation,
                 ext_y,
-                self.tensor(y),
-                self.rs_snapshots(conv.state),
+                self.tensor(y)?,
+                self.rs_snapshots(conv.state)?,
+                // The carried scan (a decode window over the corrected
+                // planes, through a page table) reads its own row alone.
+                paged.is_some()
+                    && seat.layout.in_of.get(&y.0).is_some_and(|&plane| {
+                        seat.layout.planes[plane].role == crate::rs::Role::Keys
+                    })
+                    && self.rs_snapshots(conv.state)?.is_none()
+                    && self.carried_window(seat)?,
             )?;
             return Ok(ext_y);
         }
@@ -314,14 +394,14 @@ impl Run<'_> {
         ssm::causal_conv1d_committed_landing(
             self.ctx(),
             ext_x,
-            self.qo_indptr(),
-            &self.rs_committed(seat, conv.state),
+            self.qo_indptr()?,
+            &self.rs_committed(seat, conv.state)?,
             conv.weight,
-            &self.recurrent(conv.state),
+            &self.recurrent(conv.state)?,
             conv.conv_width,
             conv.dilation,
             ext_y,
-            self.rs_snapshots(conv.state),
+            self.rs_snapshots(conv.state)?,
         )?;
         self.rs_land(OP, seat, ext_y, y)?;
         Ok(ext_y)

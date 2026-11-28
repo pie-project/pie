@@ -10,15 +10,19 @@ pub mod executors;
 pub mod prefill;
 pub mod stream;
 
-static PREFILL_MIN_SUFFIX_TOKENS: AtomicUsize = AtomicUsize::new(0);
+/// `usize::MAX`: unset, so no pass is worth sending.
+static PREFILL_MIN_SUFFIX_TOKENS: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 static HOME_KV_HANDLE: LazyLock<RwLock<Option<engine::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// The configuration's shortest suffix worth a peer's prefill (`0`: the
-/// default).
-pub fn configure(prefill_min_suffix_tokens: usize) {
-    PREFILL_MIN_SUFFIX_TOKENS.store(prefill_min_suffix_tokens, Ordering::Release);
+/// The configuration's shortest suffix worth a helper's prefill. Unset,
+/// this worker's passes stay home.
+pub fn configure(prefill_min_suffix_tokens: Option<usize>) {
+    PREFILL_MIN_SUFFIX_TOKENS.store(
+        prefill_min_suffix_tokens.unwrap_or(usize::MAX),
+        Ordering::Release,
+    );
 }
 
 /// This worker's kv as its engine exported it, for peers to read in place.
@@ -56,14 +60,18 @@ static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// the cluster link set (directory, remote, dialer, peer) is the link's,
 /// which outlives a boot.
 pub(crate) fn reset() {
-    PREFILL_MIN_SUFFIX_TOKENS.store(0, Ordering::Release);
+    PREFILL_MIN_SUFFIX_TOKENS.store(usize::MAX, Ordering::Release);
     *HOME_KV_HANDLE.write().unwrap() = None;
     SWEEPING.store(false, Ordering::Release);
     prefill::reset();
+    directory::reset();
     executors::reset();
     stream::reset();
 }
 
-pub(crate) fn prefill_min_suffix_tokens() -> usize {
-    PREFILL_MIN_SUFFIX_TOKENS.load(Ordering::Acquire)
+pub(crate) fn prefill_min_suffix_tokens() -> Option<usize> {
+    match PREFILL_MIN_SUFFIX_TOKENS.load(Ordering::Acquire) {
+        usize::MAX => None,
+        n => Some(n),
+    }
 }

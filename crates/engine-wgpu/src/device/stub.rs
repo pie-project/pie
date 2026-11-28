@@ -16,8 +16,6 @@ pub struct Enabled {
     pub subgroups: bool,
     pub f16: bool,
     pub timestamps: bool,
-    pub mappable_primary: bool,
-    pub pipeline_cache: bool,
 }
 
 #[derive(Debug)]
@@ -30,11 +28,15 @@ pub struct Handed {
 }
 
 impl Context {
-    pub fn bind(_boot: &DeviceBoot, _share: f64) -> Result<Context> {
+    pub fn bind(_boot: &DeviceBoot, _allowance: engine::Allowance) -> Result<Context> {
         Err(Fault::Deviceless)
     }
 
-    pub fn adopt(_boot: &DeviceBoot, _share: f64, handed: Handed) -> Result<Context> {
+    pub fn adopt(
+        _boot: &DeviceBoot,
+        _allowance: engine::Allowance,
+        handed: Handed,
+    ) -> Result<Context> {
         match handed.never {}
     }
 
@@ -49,7 +51,27 @@ impl Context {
     }
 
     #[must_use]
-    pub fn working_set(&self) -> u64 {
+    pub fn capacity(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn outside(&self) -> u64 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn measures_outside(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn host_room(&self) -> Option<engine::HostRoom> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn whose_memory(&self) -> engine::DeviceMemory {
         match self.never {}
     }
 
@@ -58,8 +80,26 @@ impl Context {
         match self.never {}
     }
 
+    pub fn pool_segments(&self) -> u32 {
+        match self.never {}
+    }
+
     #[must_use]
-    pub fn cores(&self) -> u32 {
+    pub fn resident(&self) -> Option<u32> {
+        match self.never {}
+    }
+
+    pub(crate) fn hold_resident(&self, _workgroups: u32) {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn workgroup_bytes(&self) -> u32 {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn table_align(&self) -> u64 {
         match self.never {}
     }
 
@@ -79,12 +119,12 @@ impl Context {
     }
 
     #[must_use]
-    pub fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
+    pub fn enabled(&self) -> Enabled {
         match self.never {}
     }
 
     #[must_use]
-    pub fn enabled(&self) -> Enabled {
+    pub fn measured_on(&self) -> String {
         match self.never {}
     }
 
@@ -103,11 +143,41 @@ impl Context {
         match self.never {}
     }
 
+    #[must_use]
+    pub fn books(&self) -> &engine_gpu::Books {
+        match self.never {}
+    }
+
     pub fn bind_thread(&self) -> Result<()> {
         match self.never {}
     }
 
     pub fn frame(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn spanned(&self) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn timed_frame(&self, _stamps: &Stamps) -> Result<Frame> {
+        match self.never {}
+    }
+
+    pub fn stamps(&self, _sets: u32) -> Result<Stamps> {
+        match self.never {}
+    }
+
+    pub fn spanned_into(&self, _stamps: &Stamps) -> Result<Frame> {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        match self.never {}
+    }
+
+    pub fn bind_frame(&self) -> Result<Frame> {
         match self.never {}
     }
 }
@@ -129,8 +199,16 @@ impl Frame {
         Err(Fault::Deviceless)
     }
 
+    pub fn submit_segment(&self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
     #[must_use]
     pub fn dispatches(&self) -> u64 {
+        match self.never {}
+    }
+
+    pub(crate) fn uniform_room(&self) -> (u64, u64) {
         match self.never {}
     }
 
@@ -139,6 +217,10 @@ impl Frame {
     }
 
     pub fn commit_timed(self) -> Result<f64> {
+        match self.never {}
+    }
+
+    pub fn commit_spanned(self) -> Result<Option<u64>> {
         match self.never {}
     }
 
@@ -164,6 +246,9 @@ impl Frame {
 
 pub use engine_gpu::backend::OnDone;
 
+#[derive(Clone, Debug)]
+pub enum Stamps {}
+
 #[derive(Debug)]
 pub struct Pending {
     never: std::convert::Infallible,
@@ -172,6 +257,11 @@ pub struct Pending {
 impl Pending {
     #[must_use]
     pub fn landed(&self) -> bool {
+        match self.never {}
+    }
+
+    #[must_use]
+    pub fn device_time(&self) -> engine_gpu::submit::DeviceTime {
         match self.never {}
     }
 
@@ -188,15 +278,20 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn zeroed(_device: &Context, _bytes: u64) -> Result<Buffer> {
+    pub fn zeroed(_device: &Context, _bytes: u64, _owner: engine_gpu::Owner) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
-    pub fn host(_device: &Context, _bytes: u64) -> Result<Buffer> {
+    pub fn host(_device: &Context, _bytes: u64, _owner: engine_gpu::Owner) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
-    pub fn with(_device: &Context, _bytes: u64, _kind: Memory) -> Result<Buffer> {
+    pub fn with(
+        _device: &Context,
+        _bytes: u64,
+        _kind: Memory,
+        _owner: engine_gpu::Owner,
+    ) -> Result<Buffer> {
         Err(Fault::Deviceless)
     }
 
@@ -263,8 +358,13 @@ impl Buffer {
 }
 
 impl engine_gpu::Buffer<super::Api> for Buffer {
-    fn with(device: &Context, bytes: u64, kind: Memory) -> Result<Buffer> {
-        Buffer::with(device, bytes, kind)
+    fn with(
+        device: &Context,
+        bytes: u64,
+        kind: Memory,
+        owner: engine_gpu::Owner,
+    ) -> Result<Buffer> {
+        Buffer::with(device, bytes, kind, owner)
     }
 
     fn bytes(&self) -> u64 {
@@ -335,6 +435,7 @@ pub struct Pipeline {
     pub uniform: Option<u32>,
     pub push_bytes: u32,
     pub local: [u32; 3],
+    pub one_segment: bool,
 }
 
 #[derive(Default, Debug)]
@@ -349,8 +450,20 @@ impl Pipelines {
     }
 
     #[must_use]
+    pub fn bound(&self) -> u64 {
+        0
+    }
+
+    #[must_use]
     pub fn compiled(&self) -> u64 {
         self.compiles.get()
+    }
+
+    /// The kernels built after `from`: none, since a device-less build
+    /// builds no pipeline.
+    #[must_use]
+    pub fn built_since(&self, _from: u64) -> Vec<&'static str> {
+        Vec::new()
     }
 
     pub fn get(
@@ -362,8 +475,8 @@ impl Pipelines {
         Err(Fault::Deviceless)
     }
 
-    pub fn persist(&self) -> Result<()> {
-        Ok(())
+    pub fn hold(_device: &Context, _file: &'static str, _key: &'static str) -> Result<()> {
+        Err(Fault::Deviceless)
     }
 }
 

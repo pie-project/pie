@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use client_api::{ClientMessage, ServerMessage};
@@ -18,9 +17,10 @@ use worker_api::{
     WorkerControl, connect_gateway_link, dispatch_codec,
 };
 
+/// The room a pushed message's envelope (its request id, the chunk wrapper,
+/// the codec's framing) takes beside its payload in one link frame: a
+/// payload past [`LINK_MAX_FRAME_BYTES`] less this is replaced by a refusal.
 const LINK_HEADROOM_BYTES: usize = 64 * 1024;
-
-const PUSH_DEADLINE: Duration = Duration::from_secs(300);
 
 const TURN_QUEUE_DEPTH: usize = 64;
 
@@ -206,6 +206,11 @@ impl GatewayLinkManager {
                 "gateway link died; dropping it so it can be re-dialed"
             );
         }
+        if !dead.is_empty() && self.links.is_empty() {
+            // No gateway carries the cluster's grants now: what this worker
+            // holds may go stale, so it holds none until a link pushes again.
+            runtime::policy::grants::withdraw();
+        }
         dead
     }
 
@@ -240,6 +245,8 @@ struct SessionRegistry {
 struct SessionHandle {
     turns: mpsc::Sender<Request>,
     cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>>,
+    /// Which process each of its turns launched.
+    routes: Arc<Mutex<TurnRoutes>>,
 }
 
 impl WorkerControl for WorkerControlServer {
@@ -257,6 +264,10 @@ impl WorkerControl for WorkerControlServer {
                 Accepted::Reject
             }
         }
+    }
+
+    async fn share_groups(self, _: tarpc::context::Context, grants: controller_api::ShareGrants) {
+        runtime::policy::grants::install(grants.version, grants.groups, grants.default);
     }
 
     async fn plex_session(
@@ -281,14 +292,7 @@ impl WorkerControl for WorkerControlServer {
         _: tarpc::context::Context,
         keys: Vec<[u8; 32]>,
         from: String,
-        retention: i64,
-        disk: bool,
     ) -> Result<u32, String> {
-        if disk {
-            let pages = runtime::planner::persist_run(keys, retention).await?;
-            tracing::info!(target: "pie::offload", pages, "kept a run on the persistent disk tier");
-            return Ok(u32::try_from(pages).unwrap_or(u32::MAX));
-        }
         let pages = runtime::offload::prefill::replicate(keys, from.clone())
             .await
             .map_err(|e| format!("{e:#}"))?;
@@ -306,6 +310,36 @@ impl WorkerControl for WorkerControlServer {
                 notify.notify_one();
                 tracing::debug!(%req_id, %session, "reverse cancel signalled");
             }
+        }
+    }
+
+    async fn set_executors(
+        self,
+        _: tarpc::context::Context,
+        req_id: ReqId,
+        executors: Vec<WorkerId>,
+    ) {
+        let session = self.sessions.active.lock().await.get(&req_id).copied();
+        let Some(session) = session else {
+            return;
+        };
+        let routes = match self.sessions.sessions.lock().await.get(&session) {
+            Some(handle) => handle.routes.clone(),
+            None => return,
+        };
+        let pid = routes
+            .lock()
+            .await
+            .by_pid
+            .iter()
+            .find(|(_, req)| **req == req_id)
+            .and_then(|(pid, _)| pid.parse().ok());
+        match pid {
+            Some(pid) => runtime::offload::executors::name(
+                pid,
+                executors.iter().map(|w| w.0.to_string()).collect(),
+            ),
+            None => tracing::debug!(%req_id, "new helpers for a turn with no process yet"),
         }
     }
 
@@ -371,12 +405,14 @@ impl WorkerControlServer {
             .map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();
+        let routes: Arc<Mutex<TurnRoutes>> = Arc::default();
         tokio::spawn(session_driver(
             session,
             client_id,
             self.gateway.clone(),
             turns_rx,
             cancels.clone(),
+            routes.clone(),
             Arc::downgrade(&self.sessions),
         ));
         map.insert(
@@ -384,6 +420,7 @@ impl WorkerControlServer {
             SessionHandle {
                 turns: turns_tx.clone(),
                 cancels,
+                routes,
             },
         );
         Ok(turns_tx)
@@ -465,9 +502,9 @@ async fn session_driver(
     gateway: GatewayInboundClient,
     mut turns: mpsc::Receiver<Request>,
     cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>>,
+    routes: Arc<Mutex<TurnRoutes>>,
     registry: Weak<SessionRegistry>,
 ) {
-    let routes: Arc<Mutex<TurnRoutes>> = Arc::default();
     let (link_gone_tx, mut link_gone) = mpsc::unbounded_channel::<()>();
     let router = tokio::spawn(message_router(client_id, routes.clone()));
     let mut running = tokio::task::JoinSet::new();
@@ -610,8 +647,30 @@ async fn run_turn(
         return push_eos(gateway, req_id).await;
     }
 
+    // Once the turn names its process, the gateway hears when it starts
+    // here (its execution admitted): the cluster's policies count its
+    // waiting from that, not from its first output.
+    let mut start: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    let mut armed = false;
+    let arm = |process_id: &Option<String>| {
+        process_id
+            .as_deref()
+            .and_then(|pid| pid.parse().ok())
+            .map(runtime::policy::started)
+    };
+    if let Some(rx) = arm(&process_id) {
+        start = Some(rx);
+        armed = true;
+    }
+
     loop {
         tokio::select! {
+            fired = async { start.as_mut().expect("armed").await }, if start.is_some() => {
+                start = None;
+                if fired.is_ok() {
+                    let _ = gateway.started(worker_api::until_link_lost(), req_id).await;
+                }
+            }
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
                 match (&process_id, corr) {
@@ -629,7 +688,11 @@ async fn run_turn(
                 };
                 let msg = within_link(msg, LINK_MAX_FRAME_BYTES - LINK_HEADROOM_BYTES);
                 let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
-                match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
+                if !armed && let Some(rx) = arm(&process_id) {
+                    start = Some(rx);
+                    armed = true;
+                }
+                match gateway.push_tokens(worker_api::until_link_lost(), req_id, Tokens::Chunk(msg)).await {
                     Ok(Control::Continue) => {}
                     Ok(Control::Abort) => {
                         tracing::debug!(%req_id, "gateway piggybacked abort");
@@ -652,7 +715,10 @@ async fn run_turn(
 }
 
 async fn push_eos(gateway: &GatewayInboundClient, req_id: ReqId) -> TurnEnd {
-    match gateway.push_tokens(push_ctx(), req_id, Tokens::Eos).await {
+    match gateway
+        .push_tokens(worker_api::until_link_lost(), req_id, Tokens::Eos)
+        .await
+    {
         Ok(_) => TurnEnd::Done,
         Err(e) => {
             tracing::warn!(%req_id, error = %e, "push Eos transport error");
@@ -687,12 +753,6 @@ fn within_link(msg: ServerMessage, budget: usize) -> ServerMessage {
         },
         other => other,
     }
-}
-
-fn push_ctx() -> tarpc::context::Context {
-    let mut ctx = tarpc::context::current();
-    ctx.deadline = std::time::Instant::now() + PUSH_DEADLINE;
-    ctx
 }
 
 fn turn_terminal(

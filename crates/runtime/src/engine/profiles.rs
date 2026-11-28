@@ -19,10 +19,31 @@ pub struct Backend {
     /// Measure this machine's device and write its profile: `pie tune`.
     /// `None` where the backend cannot tune yet.
     pub tune: Option<Tune>,
+    /// Measure the device's `[rates]` alone: `pie tune --rates`. `None`
+    /// where the engine has no rates step.
+    pub rates: Option<Rates>,
+    /// The engine's loads of one model for the check of the estimate
+    /// (`engine::load::check`): `pie tune --check-estimate`. `None` where
+    /// the engine offers none.
+    pub bench: Option<BenchOf>,
 }
+
+/// `pie tune --rates` for one backend.
+pub type Rates =
+    fn(&TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<engine::rates::Rated, String>;
+
+/// A backend's loads of the model of `artifact` (its deployment named) for
+/// the check of the estimate.
+pub type BenchOf = for<'a> fn(
+    &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String>;
 
 /// `pie tune` for one backend.
 pub type Tune = fn(&TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String>;
+
+pub use profile::search::Mix;
 
 /// What `pie tune` asks of a backend.
 pub struct TuneRequest<'a> {
@@ -41,6 +62,39 @@ pub struct TuneRequest<'a> {
     pub cache: &'a Path,
     /// Fit the kept measurements again instead of measuring.
     pub refit: bool,
+    /// Check the estimate alone: time the check models' fires at each rung
+    /// width and hold the estimate's pick to the measured best.
+    pub check_estimate: bool,
+    /// With `check_estimate`: rung widths dissected beside the picks.
+    pub dissect: &'a [u32],
+    /// Run the `[rates]` step alone.
+    pub rates: bool,
+    /// The serving mix the search judges a candidate by (`--mix`).
+    pub mix: Mix,
+}
+
+impl<'a> TuneRequest<'a> {
+    /// A quick tune over these directories, every choice off: what a caller
+    /// fills the rest of a request from (`..TuneRequest::at(..)`), so a
+    /// field this build carries under a feature the caller's crate does not
+    /// see (the workspace's feature unification turns `engine-cuda` on here
+    /// for one member and not another) still has its value.
+    #[must_use]
+    pub fn at(profiles: &'a Path, artifacts: &'a Path, cache: &'a Path) -> TuneRequest<'a> {
+        TuneRequest {
+            full: false,
+            profiles,
+            artifacts,
+            check: &[],
+            no_check: false,
+            cache,
+            refit: false,
+            check_estimate: false,
+            dissect: &[],
+            rates: false,
+            mix: Mix::default(),
+        }
+    }
 }
 
 /// What a tune produced.
@@ -61,11 +115,6 @@ pub struct Tuned {
 
 /// The check models among the artifacts stamped for `backend`: those
 /// `req.check` names, or the smallest.
-#[cfg(any(
-    feature = "engine-cuda",
-    feature = "vulkan",
-    all(feature = "metal", target_vendor = "apple")
-))]
 fn pick_models(
     backend: &str,
     req: &TuneRequest<'_>,
@@ -75,6 +124,14 @@ fn pick_models(
     }
     let found = artifacts(req.artifacts, backend);
     if req.check.is_empty() {
+        if found.is_empty() && req.check_estimate {
+            return Err(format!(
+                "a check of the estimate needs a model stamped for {backend}, and none under {} \
+                 is; make one with the import `pie serve` runs, `pie model import <its source, \
+                 e.g. Qwen/Qwen3-0.6B>`",
+                req.artifacts.display()
+            ));
+        }
         return Ok(found.into_iter().take(1).collect());
     }
     let mut picked = Vec::new();
@@ -99,11 +156,6 @@ fn pick_models(
 
 /// The `.zt` artifacts under `store` stamped for `backend`, as (path,
 /// deployment), smallest file first.
-#[cfg(any(
-    feature = "engine-cuda",
-    feature = "vulkan",
-    all(feature = "metal", target_vendor = "apple")
-))]
 fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
     let mut out: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
     let Ok(dirs) = std::fs::read_dir(store) else {
@@ -129,6 +181,59 @@ fn artifacts(store: &Path, backend: &str) -> Vec<(std::path::PathBuf, String)> {
     }
     out.sort_by_key(|(bytes, ..)| *bytes);
     out.into_iter().map(|(_, p, d)| (p, d)).collect()
+}
+
+/// `pie tune --rates`: the backend's rates step, refused by name where the
+/// engine has none.
+pub fn rates(
+    backend: &Backend,
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    let step = backend.rates.ok_or_else(|| {
+        format!(
+            "`pie tune --rates` measures a device's [rates] by its engine's rates step, and \
+             engine-{} has none",
+            backend.name
+        )
+    })?;
+    step(req, say)
+}
+
+/// `pie tune --check-estimate`: the check of the estimate
+/// (`engine::load::check`) on each check model through the backend's
+/// bench, refused by name where the engine offers none. Every model is
+/// checked before any failure is returned.
+pub fn check_estimate(
+    backend: &Backend,
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Vec<engine::load::check::Checked>, String> {
+    let bench_of = backend.bench.ok_or_else(|| {
+        format!(
+            "`pie tune --check-estimate` times fires through its engine's check bench \
+             (engine::load::check::Bench), and engine-{} offers none",
+            backend.name
+        )
+    })?;
+    let models = pick_models(backend.name, req)?;
+    let mut checked = Vec::new();
+    let mut failed = Vec::new();
+    for (artifact, deployment) in &models {
+        say(&format!("check of the estimate: {deployment}"));
+        let outcome = bench_of(req, artifact, deployment)
+            .and_then(|mut bench| engine::load::check::check(&mut *bench, req.dissect, say));
+        match outcome {
+            Ok(c) if c.passes() => checked.push(c),
+            Ok(c) => failed.push(c.failure()),
+            Err(why) => failed.push(format!("{deployment}: {why}")),
+        }
+    }
+    if failed.is_empty() {
+        Ok(checked)
+    } else {
+        Err(failed.join("\n"))
+    }
 }
 
 /// A backend's tune output as [`Tuned`]: each backend has its own type, with
@@ -164,7 +269,7 @@ macro_rules! tune_grid {
             use $engine::tune::{Depth, run};
             let depth = if req.full { Depth::Full } else { Depth::Quick };
             let models = pick_models($backend, req)?;
-            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, say)?;
+            let out = run(depth, Some(req.profiles), req.cache, req.refit, &models, req.mix, say)?;
             Ok(tuned!(out, wrong: out.wrong))
         }
     };
@@ -176,11 +281,460 @@ tune_grid!(tune_vulkan, engine_vulkan, "vulkan");
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 tune_grid!(tune_metal, engine_metal, "metal");
 
+#[cfg(feature = "vulkan")]
+fn bench_vulkan<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    let bench = engine_vulkan::check::bench(
+        req.profiles,
+        artifact,
+        deployment,
+        crate::engine::load::contract_for,
+    )?;
+    Ok(Box::new(bench))
+}
+
+#[cfg(feature = "wgpu")]
+fn bench_wgpu<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    let bench = engine_wgpu::check::bench(
+        req.profiles,
+        artifact,
+        deployment,
+        crate::engine::load::contract_for,
+    )?;
+    Ok(Box::new(bench))
+}
+
+/// `pie tune metal --rates`: the device's `[rates]` by Metal's rates step.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn rates_metal(
+    req: &TuneRequest<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Result<engine::rates::Rated, String> {
+    engine_metal::tune::rates(Some(req.profiles), say)
+}
+
+/// `pie tune metal --check-estimate`: Metal's loads of a model for the
+/// check of the estimate.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn bench_metal<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    Ok(Box::new(engine_metal::tune::check_bench(
+        Some(req.profiles),
+        artifact,
+        deployment,
+    )?))
+}
+
 #[cfg(feature = "engine-cuda")]
 fn tune_cuda(req: &TuneRequest<'_>, say: &mut dyn FnMut(&str)) -> Result<Tuned, String> {
     let models = pick_models("cuda", req)?;
-    let out = engine_cuda::tune::run(Some(req.profiles), &models, say)?;
+    let out = engine_cuda::tune::run(Some(req.profiles), &models, req.mix, say)?;
     Ok(tuned!(out, wrong: Vec::new()))
+}
+
+/// CUDA's loads of one model for the check of the estimate.
+#[cfg(feature = "engine-cuda")]
+fn bench_cuda<'a>(
+    req: &'a TuneRequest<'a>,
+    artifact: &'a Path,
+    deployment: &'a str,
+) -> Result<Box<dyn engine::load::check::Bench + 'a>, String> {
+    Ok(Box::new(engine_cuda::check::bench(
+        artifact,
+        deployment,
+        Some(req.profiles),
+    )))
+}
+
+/// What `pie tune export` wrote of a device ([`export`]): each part the
+/// home holds, `None` for each it holds none of.
+pub struct Exported {
+    /// The device, by name.
+    pub device: String,
+    /// Why the engine was not probed, where the device is instead the one
+    /// the home's stored measurements are filed under.
+    pub unprobed: Option<String>,
+    /// The user's file the measurements were read from.
+    pub from: std::path::PathBuf,
+    /// Its committed file's name (`profile::measured_name`) and text: `None`
+    /// where the home stores no measurement of the device (every entry a
+    /// load took matched a committed one), with why.
+    pub measured: Result<(String, String), String>,
+    /// What a boot of each model the export carries a settle of reads, and
+    /// whether each is carried (`profile::settles_carried`), a line a model.
+    pub report: Vec<String>,
+    /// The host covers the home's cache holds for this device
+    /// (`<device>.covers.json`, its name and text): each entry whose key
+    /// names the device the measurements were taken on. `None` where it
+    /// holds none.
+    pub covers: Option<(String, String)>,
+}
+
+/// The name a device's committed host covers are filed under:
+/// `<id>.covers.json`, beside its committed measured profile.
+#[must_use]
+pub fn covers_name(device: &str) -> String {
+    format!("{}.covers.json", profile::id_of(device))
+}
+
+/// Every host cover the cache under `cache` holds (`<cache>/cover/*.json`)
+/// whose key names `on` (the device and driver the measurements were taken
+/// on, as an engine's cover fingerprint names them), sorted by key: a JSON
+/// list of the cache's own entries, as the runtime reads a committed one.
+/// `None` where it holds none.
+#[must_use]
+pub fn covers_of(cache: &Path, on: &str) -> Option<String> {
+    covers_over(cache, on, &[])
+}
+
+/// What a cover's key names apart from the build it was measured under:
+/// its parts but the kernels' code, the guest emitter's versions and the
+/// tuning. A home's cover of the same deployment replaces a committed one.
+fn cover_identity(key: &str) -> Vec<&str> {
+    key.split('|')
+        .filter(|part| {
+            !part.starts_with("kernels ")
+                && !part.starts_with("emitter ")
+                && !part.starts_with("tuning ")
+        })
+        .collect()
+}
+
+/// [`covers_of`] over `committed` (the backend's committed covers files'
+/// texts): every committed entry of the device carried, but where the
+/// home's cache holds one of the same deployment (its key the same but for
+/// the build it was measured under, [`cover_identity`]), which replaces
+/// it: a re-export never drops a committed cover the home did not measure
+/// again.
+#[must_use]
+pub fn covers_over(cache: &Path, on: &str, committed: &[&str]) -> Option<String> {
+    let names = |entry: &serde_json::Value| {
+        entry
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| key.split('|').any(|part| part == on))
+    };
+    let key_of = |v: &serde_json::Value| {
+        v.get("key")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let mut held: Vec<serde_json::Value> = std::fs::read_dir(cache.join("cover"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(names)
+        .collect();
+    let mine: Vec<String> = held.iter().map(key_of).collect();
+    for text in committed {
+        let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(text)
+        else {
+            continue;
+        };
+        for entry in entries.into_iter().filter(names) {
+            let key = key_of(&entry);
+            if mine
+                .iter()
+                .all(|m| cover_identity(m) != cover_identity(&key))
+            {
+                held.push(entry);
+            }
+        }
+    }
+    if held.is_empty() {
+        return None;
+    }
+    held.sort_by_key(key_of);
+    serde_json::to_string_pretty(&held)
+        .ok()
+        .map(|text| text + "\n")
+}
+
+/// What the home holds of `backend`'s device `index`: its stored
+/// measurements (the user's file under `profiles` a load keeps them in) in
+/// committed form (`profile::export`; an entry stored without a key is
+/// refused by name), and the host covers its cache (`cache`) holds for the
+/// device ([`covers_of`]). A part the home holds none of is `None`, said
+/// why; the device not found is refused.
+pub fn export(
+    backend: &Backend,
+    profiles: &Path,
+    cache: &Path,
+    index: u32,
+) -> Result<Exported, String> {
+    let mut unprobed = None;
+    let device = match device_name(backend, index) {
+        Ok(device) => device,
+        // An engine that cannot be probed beside a load (XLA: opening its
+        // client takes the device): the device the home's stored entries
+        // are filed under, where they are one device's.
+        Err(why) => {
+            let stored = stored_devices(backend, profiles);
+            match stored.as_slice() {
+                [only] => {
+                    tracing::info!(
+                        device = only.as_str(),
+                        "pie tune export: the {} engine was not probed ({why}); the device is the \
+                         one the home's stored measurements are filed under",
+                        backend.name
+                    );
+                    unprobed = Some(why);
+                    only.clone()
+                }
+                [] => return Err(why),
+                many => {
+                    return Err(format!(
+                        "{why}; the home stores measurements of {} devices ({}): export names \
+                         one only where it can probe it",
+                        many.len(),
+                        many.join(", ")
+                    ));
+                }
+            }
+        }
+    };
+    let from = backend.shelf.user_path(profiles, &device);
+    let committed = backend
+        .shelf
+        .seeded
+        .iter()
+        .find(|(path, _)| *path == profile::measured_name(&device))
+        .map(|(_, text)| *text);
+    let now = device_now(backend, index, &device);
+    let mut exported = held(
+        (backend.registry)(),
+        device.clone(),
+        from,
+        cache,
+        committed,
+        committed_covers(backend),
+        now.as_deref(),
+        || device_on(backend, index, &device),
+    );
+    exported.unprobed = unprobed;
+    Ok(exported)
+}
+
+/// The devices `backend`'s stored measurements in the home are filed
+/// under (`Shelf::user_path`'s file names, each a device's id), sorted.
+fn stored_devices(backend: &Backend, profiles: &Path) -> Vec<String> {
+    let dir = backend
+        .shelf
+        .user_path(profiles, "x")
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let mut ids: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".toml").map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// [`export`] of `device`, its user's file at `from` (read where it is) and
+/// the home's cache `cache`, over its committed profile (`committed`) and
+/// covers (`committed_covers`); `on` names the device its covers key where
+/// the file states none.
+#[allow(clippy::too_many_arguments)]
+fn held(
+    registry: &Registry,
+    device: String,
+    from: std::path::PathBuf,
+    cache: &Path,
+    committed: Option<&str>,
+    committed_covers: &[&str],
+    now: Option<&dyn profile::rates::Now>,
+    on: impl FnOnce() -> Option<String>,
+) -> Exported {
+    let origin = from.display().to_string();
+    let user = std::fs::read_to_string(&from).map_err(|e| {
+        format!(
+            "{}: {e}: no measurement of `{device}` is stored (a load that took every entry from \
+             a committed profile stores none)",
+            from.display()
+        )
+    });
+    let stored = user
+        .as_ref()
+        .ok()
+        .map(|user| registry.parse(user, &origin, profile::Strict::User));
+    let stored_on = match &stored {
+        Some(Ok(file)) => file.tuned.rates.measured_on.clone(),
+        _ => None,
+    };
+    let committed_rates = committed.map(|text| {
+        registry.parse(
+            text,
+            &profile::measured_name(&device),
+            profile::Strict::Measured,
+        )
+    });
+    let mut report = Vec::new();
+    // The home's measured entries over what of the committed profile still
+    // holds for this build, each said: a re-export never shrinks it.
+    let measured = (|| -> Result<(String, String), String> {
+        let mine = match stored {
+            Some(Ok(file)) => file.tuned.rates,
+            Some(Err(why)) => return Err(why.to_string()),
+            None => profile::rates::Rates::default(),
+        };
+        let theirs = match committed_rates {
+            Some(Ok(file)) => {
+                for line in &file.skipped_rates {
+                    report.push(format!("dropped from the committed profile: {line}"));
+                }
+                Some(file.tuned.rates)
+            }
+            // Not one entry of it reads (each list entry is read alone, so
+            // this is the file as a whole): none carried, said by name.
+            Some(Err(why)) => {
+                report.push(format!(
+                    "dropped: the committed profile does not read ({why})"
+                ));
+                None
+            }
+            None => None,
+        };
+        if mine == profile::rates::Rates::default() && theirs.is_none() {
+            return Err(user
+                .clone()
+                .err()
+                .unwrap_or_else(|| format!("{origin}: stores nothing")));
+        }
+        let (merged, lines) = profile::merge_committed(mine, theirs, now)?;
+        report.extend(lines);
+        let (text, lines) = profile::export_rates(registry, &device, merged, &origin)?;
+        report.extend(lines);
+        Ok((profile::measured_name(&device), text))
+    })();
+    let covers = stored_on
+        .or_else(on)
+        .and_then(|on| covers_over(cache, &on, committed_covers))
+        .map(|text| (covers_name(&device), text));
+    Exported {
+        device,
+        unprobed: None,
+        from,
+        measured,
+        report,
+        covers,
+    }
+}
+
+/// What this build keys `backend`'s device `index` (named `device`) by
+/// (`profile::rates::Now`): what a committed entry is checked against before
+/// an export carries it. `None` where the engine states none here (its
+/// committed entries are carried unchecked, and a boot checks them).
+fn device_now(backend: &Backend, index: u32, device: &str) -> Option<Box<dyn profile::rates::Now>> {
+    let _ = (index, device);
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::now_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::now_at(index),
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => Some(Box::new(engine_cuda::stored::Keys::of(
+            i32::try_from(index).unwrap_or(0),
+            device,
+        ))),
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        "metal" => Some(Box::new(engine_metal::stored::Keys {
+            on: engine_metal::stored::measured_on(device),
+        })),
+        _ => None,
+    }
+}
+
+/// The host covers `backend` carries committed (`<device>.covers.json`,
+/// its chip's `COVERS`): what an export carries where the home measured
+/// none of the same deployment again.
+fn committed_covers(backend: &Backend) -> &'static [&'static str] {
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::COVERS,
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::COVERS,
+        _ => &[],
+    }
+}
+
+/// The device and driver `backend`'s device `index` (named `device`) keys
+/// its measurements as taken on: what its host covers name, where no stored
+/// file of the home states it.
+fn device_on(backend: &Backend, index: u32, device: &str) -> Option<String> {
+    let _ = (index, device);
+    match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::measured_on_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::measured_on_at(index),
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => Some(profile::rates::Now::on(&engine_cuda::stored::Keys::of(
+            i32::try_from(index).unwrap_or(0),
+            device,
+        ))),
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        "metal" => Some(engine_metal::stored::measured_on(device)),
+        _ => None,
+    }
+}
+
+/// The records of what a deployment's bodies took (the cuda engine's
+/// memory measurement) that this build made, from `cache_dir` into `out`'s
+/// `bodies/`, beside its committed measured profile: the names written.
+/// Another engine keeps none.
+pub fn export_bodies(
+    backend: &Backend,
+    cache_dir: &Path,
+    out: &Path,
+) -> Result<Vec<String>, String> {
+    match backend.name {
+        #[cfg(feature = "engine-cuda")]
+        "cuda" => engine_cuda::serve::export_bodies(cache_dir, out)
+            .map_err(|e| format!("{}: {e}", out.display())),
+        _ => {
+            let _ = (cache_dir, out);
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The name of `backend`'s device `index`, as its loads file its profiles.
+fn device_name(backend: &Backend, index: u32) -> Result<String, String> {
+    let probed = match backend.name {
+        #[cfg(feature = "vulkan")]
+        "vulkan" => engine_vulkan::chip::probe_at(index),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => engine_wgpu::chip::probe_at(index),
+        _ if index == 0 => (backend.probe)(),
+        other => {
+            return Err(format!(
+                "`--device {index}`: the {other} engine names its first device alone here"
+            ));
+        }
+    };
+    probed
+        .map(|(name, _)| name)
+        .ok_or_else(|| format!("no {} device {index} on this machine", backend.name))
 }
 
 /// Every backend this build hosts.
@@ -197,6 +751,8 @@ pub fn backends() -> Vec<Backend> {
         probe: || engine_cuda::chip::probe(0),
         resolve: engine_cuda::chip::resolve,
         tune: Some(tune_cuda),
+        rates: Some(|req, say| engine_cuda::tune::rates(Some(req.profiles), say)),
+        bench: Some(bench_cuda),
     });
     #[cfg(feature = "vulkan")]
     out.push(Backend {
@@ -206,6 +762,19 @@ pub fn backends() -> Vec<Backend> {
         probe: engine_vulkan::chip::probe,
         resolve: engine_vulkan::chip::resolve_facts,
         tune: Some(tune_vulkan),
+        rates: Some(|req, say| engine_vulkan::check::rated(req.profiles, say)),
+        bench: Some(bench_vulkan),
+    });
+    #[cfg(feature = "wgpu")]
+    out.push(Backend {
+        name: "wgpu",
+        registry: engine_wgpu::chip::registry,
+        shelf: &engine_wgpu::chip::SHELF,
+        probe: engine_wgpu::chip::probe,
+        resolve: engine_wgpu::chip::resolve_facts,
+        tune: None,
+        rates: Some(|req, say| engine_wgpu::check::rated(req.profiles, say)),
+        bench: Some(bench_wgpu),
     });
     #[cfg(feature = "xla")]
     out.push(Backend {
@@ -217,6 +786,8 @@ pub fn backends() -> Vec<Backend> {
         probe: || None,
         resolve: |kind, _, profiles| engine_xla::chip::resolve(kind, profiles),
         tune: None,
+        rates: None,
+        bench: None,
     });
     #[cfg(feature = "metal")]
     out.push(Backend {
@@ -229,6 +800,46 @@ pub fn backends() -> Vec<Backend> {
         tune: Some(tune_metal),
         #[cfg(not(target_vendor = "apple"))]
         tune: None,
+        #[cfg(target_vendor = "apple")]
+        rates: Some(rates_metal),
+        #[cfg(not(target_vendor = "apple"))]
+        rates: None,
+        #[cfg(target_vendor = "apple")]
+        bench: Some(bench_metal),
+        #[cfg(not(target_vendor = "apple"))]
+        bench: None,
     });
     out
+}
+
+#[cfg(test)]
+mod cover_tests {}
+
+#[cfg(test)]
+mod committed_tests {
+    use super::*;
+
+    /// Every committed measured profile this build carries reads whole, as
+    /// committed (`Strict::Measured`): an entry another pie's form left (a
+    /// format change landed without the device files re-exported) fails the
+    /// build here, where a load would skip it and measure it again.
+    #[test]
+    fn every_committed_profile_reads_whole() {
+        for backend in backends() {
+            for (name, text) in backend.shelf.seeded {
+                if !name.ends_with(profile::MEASURED_SUFFIX) {
+                    continue;
+                }
+                let file = (backend.registry)()
+                    .parse(text, name, profile::Strict::Measured)
+                    .unwrap_or_else(|e| panic!("{}: {name}: {e}", backend.name));
+                assert!(
+                    file.skipped_rates.is_empty(),
+                    "{}: {name} carries entries this build skips (re-export it): {:?}",
+                    backend.name,
+                    file.skipped_rates
+                );
+            }
+        }
+    }
 }

@@ -111,6 +111,8 @@ fn lse_of(q: &Value, head_dim: u32, lse: bool) -> Option<Value> {
 /// head) only its blocks; under a relative bias (`bias` over `extent`
 /// positions, `log_scaling` its log buckets) each key offset by its
 /// distance. With `lse`, each row's per-head log-sum-exp beside its output.
+/// With `mask` (the fire's masks, [`Input::mask`]), each lane reads its own
+/// mask, or none where it states none.
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     q: &Value,
@@ -126,6 +128,7 @@ pub fn decode(
     bias: Option<&Value>,
     extent: Option<u32>,
     log_scaling: Option<(u32, f32)>,
+    mask: Option<&Value>,
 ) -> (Value, Option<Value>) {
     let selected = blocks(selection, ratio, per_head);
     let rel = relative(bias, extent, log_scaling);
@@ -133,6 +136,7 @@ pub fn decode(
     let o = r.fresh(q.ty().clone());
     let lse = lse_of(q, head_dim, lse);
     let mut ins = vec![q, plan];
+    ins.extend(mask);
     ins.extend(selection);
     ins.extend(bias);
     r.push(
@@ -140,6 +144,7 @@ pub fn decode(
             q: q.id(),
             plan: plan.id(),
             cache: pages,
+            mask: mask.map(Value::id),
             selection: selection.map(Value::id),
             bias: bias.map(Value::id),
             window,
@@ -1114,16 +1119,19 @@ pub fn voxel_over(
 }
 
 /// Attention of `q` over the kv row `kv`, each lane by its kind: a lane
-/// `causal` does not hold for over every key it holds, a lane with its own
-/// mask by that mask (when the model opens `mask`), a lane querying one
-/// token by decode, and the rest by prefill. The kinds are taken in that order, each
-/// lane by the first that holds. With `sinks`, every kind is attended with
-/// its log-sum-exp and the sink logits folded in. With a `selection` (the
-/// key blocks an indexer picked a row, `ratio` keys a block, one pick a head
-/// when `per_head`), decode and prefill lanes read only those blocks; a
-/// masked lane reads every key. With `scores`, the lanes capturing scores
+/// `causal` does not hold for over every key it holds, a lane querying one
+/// token by decode, and the rest by prefill. The kinds are taken in that
+/// order, each lane by the first that holds. When the model opens `mask`,
+/// the decode and prefill arms read the fire's masks ([`Input::mask`]) as
+/// data: a lane stating one reads through it, a lane stating none reads
+/// every key its bounds give, both in one arm. A mask never parts lanes into
+/// kinds (nor classes: `attend` reads no `fact.Mask`). With `sinks`, every
+/// kind is attended with its log-sum-exp and the sink logits folded in. With
+/// a `selection` (the key blocks an indexer picked a row, `ratio` keys a
+/// block, one pick a head when `per_head`), decode and prefill lanes read
+/// only those blocks, under their masks too. With `scores`, the lanes capturing scores
 /// read theirs out as `attn.scores` ([`score_capture`]'s, over their last 32
-/// query rows and first 2048 keys).
+/// query rows and the keys of the load's context).
 ///
 /// The host plans are the compiler's: each kind's is built once a trace,
 /// over the lanes of that kind and outside any layer, and every layer asking
@@ -1179,9 +1187,6 @@ pub fn attend(
         let mut first = FirstMatch::default();
         let mut cases = Vec::new();
         cases.extend(wide.clone());
-        if mask {
-            cases.push(fact::has(fact::Mask));
-        }
         cases.push(fact::single_token());
         let mut picked = None;
         for case in &cases {
@@ -1244,33 +1249,8 @@ pub fn attend(
             None => o,
         });
     }
-    if mask && let Some(q) = rows_of(first.case(rec.guard_of(&fact::has(fact::Mask)))) {
-        let masks = inputs.whole_mask();
-        let p = plan(false, &lanes(Some(fact::has(fact::Mask))));
-        let (o, lse) = prefill(
-            &q,
-            &p,
-            pages,
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            sinks.is_some(),
-            Some(&masks),
-            true,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-        );
-        arms.push(match lse {
-            Some(lse) => sunk((o, lse)),
-            None => o,
-        });
-    }
+    // Every lane's mask, as data the decode and prefill arms read.
+    let masks = mask.then(|| inputs.whole_mask());
     let single = first.case(rec.guard_of(&fact::single_token()));
     if let Some(q) = rows_of(single.clone()) {
         let p = plan(true, &lanes(Some(fact::single_token())));
@@ -1292,6 +1272,7 @@ pub fn attend(
             None,
             None,
             None,
+            masks.as_ref(),
         );
         arms.push(match lse {
             Some(lse) => sunk((o, lse)),
@@ -1313,7 +1294,7 @@ pub fn attend(
             kv_heads,
             sm_scale,
             lse,
-            None,
+            masks.as_ref(),
             true,
             None,
             sel.as_ref(),
@@ -1334,18 +1315,51 @@ pub fn attend(
         Value::merge(arms)
     };
     if scores {
-        let captured = score_capture(
-            q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, 32, 2048,
-        );
-        crate::output("attn.scores", &captured, None);
+        capture_scores(q, inputs, kv, q_heads, kv_heads, head_dim, sm_scale, 32);
     }
     o
 }
 
-/// The attention mass of each lane capturing scores (`fact::scores`) over
-/// its first `kv_max` keys of `kv`, averaged over the lane's last `observe`
-/// query rows of `q`: `[lanes, q_heads * kv_max]`, a `kv_max` run per query
-/// head.
+/// This layer's [`score_capture`] of `q` over `kv`, added into the row the
+/// layers before it filled. The recorder reads the last one out when the
+/// trace is done (`attn.scores` and `attn.scores.pages`), so a trace has one
+/// key row however many layers capture.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_scores(
+    q: &Value,
+    inputs: &Input,
+    kv: &str,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+    observe: u32,
+) {
+    let rec = inputs.recorder();
+    let into = rec.carried(SCORE_ROW);
+    let captured = score_capture(
+        q,
+        inputs,
+        kv,
+        q_heads,
+        kv_heads,
+        head_dim,
+        sm_scale,
+        observe,
+        into.as_ref(),
+    );
+    rec.carry(SCORE_ROW, &captured);
+}
+
+/// The row a trace's score captures add into, layer after layer.
+pub(crate) const SCORE_ROW: &str = "attn.scores row";
+
+/// The attention mass a key of each lane capturing scores (`fact::scores`)
+/// over the keys of `kv` the load's context holds, averaged over the lane's
+/// last `observe` query rows of `q` and over its query heads, added to
+/// `into`'s row (an earlier layer's) or to a zeroed one: `[capturing,
+/// context]`, one row a capturing lane in lane order. No arena holds it:
+/// each row lies in the reading program's guest region.
 #[allow(clippy::too_many_arguments)]
 pub fn score_capture(
     q: &Value,
@@ -1356,7 +1370,7 @@ pub fn score_capture(
     head_dim: u32,
     sm_scale: f32,
     observe: u32,
-    kv_max: u32,
+    into: Option<&Value>,
 ) -> Value {
     let rec = inputs.recorder();
     let rows = poem_ir::Guard::and(q.cond(), rec.guard_of(&crate::fact::scores()));
@@ -1370,12 +1384,11 @@ pub fn score_capture(
     });
     let q = crate::record::Refine::refined(q, scoring.rows().clone());
     let scores = rec.fresh(Ty::Tensor {
-        shape: vec![
-            Dim::Lanes,
-            Dim::Const(u64::from(q_heads) * u64::from(kv_max)),
-        ],
+        shape: vec![Dim::Capturing, Dim::ContextTimes(1)],
         dtype: Dtype::F32,
     });
+    let mut ins = vec![&q, &plan];
+    ins.extend(into);
     rec.push(
         Attn::ScoreCapture {
             q: q.id(),
@@ -1383,14 +1396,33 @@ pub fn score_capture(
             cache: inputs.kv(kv),
             head_dim,
             kv_heads,
+            q_heads,
             sm_scale,
             observe,
-            kv_max,
+            into: into.map(Value::id),
             scores: scores.id(),
         },
-        &[&q, &plan],
+        &ins,
     );
     scores
+}
+
+/// Each capturing lane's key row `keys` summed a kv page of the load's:
+/// `[capturing, context pages]`.
+pub fn score_pages(keys: &Value) -> Value {
+    let rec = keys.rec();
+    let pages = rec.fresh(Ty::Tensor {
+        shape: vec![Dim::Capturing, Dim::ContextPages],
+        dtype: Dtype::F32,
+    });
+    rec.push(
+        Attn::ScorePages {
+            keys: keys.id(),
+            pages: pages.id(),
+        },
+        &[keys],
+    );
+    pages
 }
 
 /// Whether any row of `x` can be one `rows` holds for.

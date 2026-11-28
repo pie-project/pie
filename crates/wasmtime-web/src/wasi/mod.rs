@@ -5,7 +5,7 @@ pub mod p3;
 mod random;
 mod stdio;
 
-pub use clock::{fire_due_timers, now, set_clock, set_wall_clock};
+pub use clock::{fire_due_timers, next_timer, now, set_clock, set_wall_clock};
 pub use ctx::{I32Exit, Sink, WasiWebCtx, WasiWebCtxBuilder, WasiWebCtxView, WasiWebView};
 
 pub type WasiCtx = WasiWebCtx;

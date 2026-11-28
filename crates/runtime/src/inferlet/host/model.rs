@@ -28,6 +28,7 @@ fn output_decl(
         layers: output.layers,
         max_rows: u32::try_from(output_rows(output, limits)).unwrap_or(u32::MAX),
         readout: output.readout,
+        planes: output.planes.clone(),
     }
 }
 
@@ -67,6 +68,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 proposals_from: caps.draft_proposals_from,
             }),
         )
+    }
+
+    async fn draft_depth(&mut self) -> Result<u32> {
+        Ok(model::model().facts().draft_depth.unwrap_or(0))
     }
 
     async fn switches(&mut self) -> Result<Vec<pie::inferlet::model::SwitchDecl>> {
@@ -171,12 +176,12 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::configured_frame_size() as u32)
     }
 
-    async fn submit_deadline_us(&mut self) -> Result<u64> {
-        Ok(crate::scheduler::configured_submit_deadline().as_micros() as u64)
-    }
-
     async fn channel_capacity(&mut self) -> Result<u32> {
         Ok(crate::scheduler::channel_capacity() as u32)
+    }
+
+    async fn frames_in_flight(&mut self) -> Result<u32> {
+        Ok(crate::scheduler::configured_dispatch_depth().max(1) as u32)
     }
 
     async fn run_ahead_window(&mut self) -> Result<u32> {
@@ -224,11 +229,15 @@ mod tests {
     fn a_prefill_chunk_stops_at_the_rows_the_engine_prefers() {
         let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
             max_readouts: 0,
+            readout_store: 0,
+            max_replayed_rows: 0,
+            shapes: None,
             max_forward_requests: 8,
             max_forward_tokens,
             max_page_refs: 64,
             max_context: 0,
             prefill_rows,
+            prefill_lanes: 0,
         };
         assert_eq!(super::prefill_budget(limits(10240, 0)), 10240);
         assert_eq!(super::prefill_budget(limits(10240, 2048)), 2048);

@@ -246,6 +246,11 @@ pub struct Output {
     pub layer: Option<u32>,
     #[serde(default)]
     pub grid: Option<ValueId>,
+    /// How one entry's `width` values factor, outermost first (each run
+    /// contiguous): `[q_heads, kv_max]` for `attn.scores`. Empty: one flat
+    /// run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planes: Vec<u32>,
 }
 
 impl Output {
@@ -285,6 +290,19 @@ pub struct Trace {
     pub inputs: Vec<GuestInput>,
 }
 
+impl Trace {
+    /// The model's decoder layers: one past the deepest layer a node states,
+    /// 0 where none states one.
+    #[must_use]
+    pub fn decoder_layers(&self) -> u32 {
+        self.nodes
+            .iter()
+            .filter_map(|n| n.layer)
+            .max()
+            .map_or(0, |l| l + 1)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestInput {
     pub name: String,
@@ -322,7 +340,9 @@ impl InputDecl {
 /// An output as a lane reads it: `width` values of `dtype` per `axis` entry,
 /// stacked `layers` deep when it is written per layer (0 when it is not).
 /// `readout`: its rows are the lane's readout rows. `tail`: the last rows of
-/// a lane it is computed over, which a lane's last fire must hold.
+/// a lane it is computed over, which a lane's last fire must hold. `planes`:
+/// how one entry's `width` factors, outermost first ([`Output::planes`]);
+/// empty when flat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputDecl {
     pub name: String,
@@ -333,6 +353,8 @@ pub struct OutputDecl {
     pub readout: bool,
     #[serde(default)]
     pub tail: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

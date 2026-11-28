@@ -13,6 +13,10 @@ impl engine_gpu::Backend for Api {
 
     const COPY_GRAIN: u64 = 4;
 
+    /// The pool is laid whole at load and never resized, as XLA's: no
+    /// `yield` applies.
+    const RESIZES_POOL: bool = false;
+
     const STORAGE: checkpoint::types::BackendKind = checkpoint::types::BackendKind::Wgpu;
 
     type Context = Context;
@@ -61,24 +65,63 @@ impl engine_gpu::backend::Context<Api> for Context {
         Context::frame(self)
     }
 
+    fn spanned(&self) -> Result<Frame> {
+        Context::spanned(self)
+    }
+
+    fn idle(&self) -> bool {
+        Context::idle(self)
+    }
+
     fn max_buffer(&self) -> u64 {
         Context::max_buffer(self)
+    }
+
+    fn pool_segments(&self) -> u32 {
+        Context::pool_segments(self)
+    }
+
+    fn binds_overlap(&self) -> bool {
+        !crate::device::pipelines::exact_views(self.core().one_segment())
     }
 
     fn name(&self) -> &str {
         Context::name(self)
     }
 
+    /// The workgroups the device holds at once, as the load measured them
+    /// (`Context::resident`): every caller reads it past the load's rates
+    /// step, which refuses a load whose profile still lacks it.
     fn cores(&self) -> u32 {
-        Context::cores(self)
+        Context::resident(self).unwrap_or(1)
     }
 
-    fn working_set(&self) -> u64 {
-        Context::working_set(self)
+    fn resident(&self) -> Option<u32> {
+        Context::resident(self)
+    }
+
+    fn capacity(&self) -> u64 {
+        Context::capacity(self)
+    }
+
+    fn outside(&self) -> u64 {
+        Context::outside(self)
+    }
+
+    fn host_room(&self) -> Option<engine::HostRoom> {
+        Context::host_room(self)
+    }
+
+    fn memory(&self) -> engine::DeviceMemory {
+        Context::whose_memory(self)
     }
 
     fn left(&self) -> u64 {
         Context::left(self)
+    }
+
+    fn books(&self) -> &engine_gpu::Books {
+        Context::books(self)
     }
 
     fn bind_thread(&self) -> Result<()> {
@@ -106,12 +149,24 @@ impl engine_gpu::backend::Frame<Api> for Frame {
         Frame::update(self, into, at, bytes)
     }
 
+    fn dispatches(&self) -> u64 {
+        Frame::dispatches(self)
+    }
+
+    fn uniform_room(&self) -> Option<(u64, u64)> {
+        Some(Frame::uniform_room(self))
+    }
+
     fn flush(&self) -> Result<()> {
         Frame::flush(self)
     }
 
     fn flush_settled(&self) -> Result<()> {
         Frame::flush_settled(self)
+    }
+
+    fn submit_segment(&self) -> Result<()> {
+        Frame::submit_segment(self)
     }
 
     fn commit(self) -> Result<()> {
@@ -121,11 +176,19 @@ impl engine_gpu::backend::Frame<Api> for Frame {
     fn commit_async(self, on_done: Option<OnDone>) -> Result<Pending> {
         Frame::commit_async(self, on_done)
     }
+
+    fn commit_spanned(self) -> Result<Option<u64>> {
+        Frame::commit_spanned(self)
+    }
 }
 
 impl engine_gpu::backend::Pending for Pending {
     fn wait(&self) -> Result<()> {
         Pending::wait(self)
+    }
+
+    fn landed(&self) -> bool {
+        Pending::landed(self)
     }
 }
 

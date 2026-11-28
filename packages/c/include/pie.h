@@ -52,10 +52,9 @@ const char *pie_version(void);
    `*out`. `config` is JSON or TOML with any of these keys, or NULL for the
    defaults:
 
-     {"device_kv_budget": "1GiB", "max_forward_tokens": 512, "max_forward_requests": 8,
-      "max_model_len": 4096, "device_memory_share": 0.9,
+     {"budget_device": "2GiB", "max_context": 4096, "yield": null,
       "sandbox_memory_mb": 512, "max_concurrent_processes": null, "engine": true,
-      "frame_size": 8, "frame_dispatch_depth": 2, "verbose": false}
+      "frame_size": 4, "frame_dispatch_depth": 2, "verbose": false}
 
    `home` is a writable directory the runtime keeps its files under;
    `listen` (`"host:port"`, or NULL) also serves pie's gateway there. One

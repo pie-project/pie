@@ -215,10 +215,32 @@ pub fn classify_decode_envelope_why(
             ));
         }
     }
+    // Each beam's parent (beam search): device data beside slots the host
+    // places, over which the engine keeps the beams' own page lists.
+    let device_parents = device(Port::Parents);
+    if device_parents {
+        let declaration = container
+            .channels
+            .get(channel_index(Port::Parents).unwrap_or(usize::MAX))
+            .ok_or_else(|| "decode envelope parents channel is out of range".to_string())?;
+        if declaration.shape.dims() != [lane_count]
+            || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
+        {
+            return Err(format!(
+                "a device parents channel must be a [{lane_count}] u32 vector; this one is {:?}",
+                declaration.shape.dims()
+            ));
+        }
+    } else if channel_for(Port::Parents).is_some() {
+        return decline(
+            "it binds parents the host derives; a beam's parent is picked on the device"
+                .to_string(),
+        );
+    }
     if let Some(port) = taint.device_dependent_ports.iter().find(|port| {
         !matches!(
             port,
-            Port::EmbedTokens | Port::Positions | Port::Fold | Port::AttnMask
+            Port::EmbedTokens | Port::Positions | Port::Fold | Port::AttnMask | Port::Parents
         )
     }) {
         return decline(format!("{port:?} is computed on the device"));
@@ -232,6 +254,9 @@ pub fn classify_decode_envelope_why(
     }
     if device_mask {
         required = required.with(Port::AttnMask);
+    }
+    if device_parents {
+        required = required.with(Port::Parents);
     }
     Ok(Some(required))
 }
@@ -338,11 +363,40 @@ pub enum Fold {
 }
 
 impl Fold {
+    /// Lane `lane`'s fold as the host states it, `None` where the device
+    /// counts it. A list of one entry states every lane's fold, a longer
+    /// one a fold a lane: a lane never takes another lane's count, and a
+    /// list that leaves a lane without one never comes this far
+    /// ([`Fold::states`]).
     pub fn of(&self, lane: usize) -> Option<u32> {
         match self {
             Fold::None => Some(0),
-            Fold::Host(counts) => counts.get(lane).or(counts.first()).copied(),
+            Fold::Host(counts) => match counts.as_slice() {
+                [every] => Some(*every),
+                counts => counts.get(lane).copied(),
+            },
             Fold::Device => None,
+        }
+    }
+
+    /// Refuses the list the host states that leaves one of `lanes` lanes
+    /// without a fold: one of several entries and fewer than the lanes, or
+    /// of none. Such a lane has no count of its own, and a lane with none
+    /// reads as one the device counts.
+    pub fn states(&self, lanes: usize) -> Result<(), EvaluatedGeometryError> {
+        match self {
+            Fold::Host(counts) if counts.len() != 1 && counts.len() < lanes => {
+                Err(EvaluatedGeometryError::BadValue {
+                    port: Port::Fold,
+                    reason: format!(
+                        "it states {} fold(s) for {lanes} lanes; a list of one entry states \
+                         every lane's fold and a longer one a fold a lane, and a lane past it \
+                         takes no other lane's",
+                        counts.len()
+                    ),
+                })
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -354,6 +408,15 @@ pub struct Place {
     pub tail: Option<u32>,
     pub shared: bool,
     pub spans: Vec<(u32, u32, u32)>,
+    /// One past the slots the set holds written without a gap
+    /// ([`crate::inferlet::host::working_set::Cursor::readable`]).
+    pub readable: u32,
+    /// Whether the host knows that end: no fire whose rows the device
+    /// places is still to settle on the set. Where one is, its engine
+    /// holds the lane to what the set wrote ([`engine::extent`]).
+    pub readable_known: bool,
+    /// The set, as its lanes name it to the engine ([`engine::KvDelta::set`]).
+    pub set: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,13 +432,53 @@ impl Landing {
 }
 
 impl ReqGeometry {
+    /// A lane reads every slot of its set before its last row, so the rows
+    /// a set's lanes write in a fire run on from what the set holds written
+    /// without a gap: a page holds what its last owner left until its set
+    /// writes it. The lanes of one set in one fire read each other's rows
+    /// (each row's keys land before any row reads), so their writes count
+    /// together. A set a device-placed fire is still to settle on is held
+    /// to this by its engine, which knows where that fire's rows landed.
+    fn check_readable(places: &[Place], landings: &[Landing]) -> Result<(), String> {
+        let mut seen: Vec<u64> = Vec::new();
+        for (first, place) in places.iter().enumerate() {
+            if !place.readable_known || seen.contains(&place.set) {
+                continue;
+            }
+            seen.push(place.set);
+            let mut spans: Vec<(usize, Landing)> = places
+                .iter()
+                .zip(landings)
+                .enumerate()
+                .skip(first)
+                .filter(|(_, (other, _))| other.set == place.set)
+                .map(|(lane, (_, &landing))| (lane, landing))
+                .collect();
+            spans.sort_by_key(|(_, landing)| landing.start);
+            let mut end = place.readable;
+            for (lane, landing) in spans {
+                if landing.start > end {
+                    return Err(format!(
+                        "lane {lane} writes slots {}..{} of a working set that holds slots \
+                         0..{end} written; a lane reads every slot before its last row, and \
+                         the slots between were never written by its set. Write them first",
+                        landing.start,
+                        landing.end()
+                    ));
+                }
+                end = end.max(landing.end());
+            }
+        }
+        Ok(())
+    }
+
     /// Rows land at their slots or after the last slot written, and read every
     /// slot before their last.
     pub fn lanes(
         &self,
         places: &[Place],
         page: u32,
-    ) -> Result<(Vec<::engine::Lane>, Vec<Landing>), String> {
+    ) -> Result<(Vec<crate::engine::FireLane>, Vec<Landing>), String> {
         let cut_by = |values: &[u32], indptr: &[u32], lane: usize| -> Vec<u32> {
             let (Some(&start), Some(&end)) = (indptr.get(lane), indptr.get(lane + 1)) else {
                 return Vec::new();
@@ -471,25 +574,34 @@ impl ReqGeometry {
                 positions
             };
             let readout = cut_by(&self.sampling_indices, &self.sampling_indptr, lane);
-            lanes.push(::engine::Lane {
-                tokens,
-                positions,
-                kv: ::engine::KvDelta {
-                    held: start,
-                    pages: (0..kv_len.div_ceil(page)).collect(),
-                    ..Default::default()
-                },
-                rs: ::engine::RsVerb::Fold,
-                rs_reset: ::engine::RsReset::Inferred,
-                readout: match readout.as_slice() {
-                    [] => ::engine::Readout::None,
-                    [only] if *only + 1 == rows => ::engine::Readout::Last,
-                    rows => ::engine::Readout::Rows(rows.to_vec()),
-                },
-                ..::engine::Lane::default()
+            lanes.push(crate::engine::FireLane {
+                pages: (0..kv_len.div_ceil(page)).collect(),
+                ..crate::engine::FireLane::from(::engine::Lane {
+                    tokens,
+                    positions,
+                    kv: ::engine::KvDelta {
+                        held: start,
+                        // Where the set's commit stands as the pass is staged;
+                        // a piece of a cut pass restates it as it is prepared.
+                        folded: place.folded.min(start),
+                        // The host places these rows: no program does.
+                        write_end: 0,
+                        readable: place.readable,
+                        set: place.set,
+                    },
+                    rs: ::engine::RsVerb::Fold,
+                    rs_reset: ::engine::RsReset::Inferred,
+                    readout: match readout.as_slice() {
+                        [] => ::engine::Readout::None,
+                        [only] if *only + 1 == rows => ::engine::Readout::Last,
+                        rows => ::engine::Readout::Rows(rows.to_vec()),
+                    },
+                    ..::engine::Lane::default()
+                })
             });
             landings.push(Landing { start, rows });
         }
+        Self::check_readable(places, &landings)?;
         Ok((lanes, landings))
     }
 }
@@ -742,6 +854,7 @@ pub fn map_geometry_evaluated_with(
             });
         }
     }
+    g.fold.states(lanes)?;
     if let Some(kv_len) = &g.kv_len
         && kv_len.len() != lanes
     {
@@ -797,6 +910,10 @@ pub(crate) fn value_as_u32(value: &eta_compiler::eval::interp::Value) -> Vec<u32
         Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
         Value::F32(v) => v.iter().map(|&x| x as u32).collect(),
         Value::Bool(v) => v.iter().map(|&b| b as u32).collect(),
+        Value::Bf16(v) => v
+            .iter()
+            .map(|&b| eta_ir::types::bf16_to_f32(b) as u32)
+            .collect(),
     }
 }
 
@@ -858,6 +975,13 @@ mod tests {
             tail: Some(tail),
             shared: false,
             spans: Vec::new(),
+            readable: tail,
+            readable_known: true,
+            // Each place its own set; a clone names the same one.
+            set: {
+                static SETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                SETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         }
     }
 
@@ -933,6 +1057,7 @@ mod tests {
         rows_past_a_span_rotate_behind_their_slots();
         stated_slots_land_where_they_say();
         a_write_inside_the_frozen_prefix_is_refused();
+        a_lane_reads_no_slot_its_set_has_not_written();
         lanes_sharing_a_working_set_state_their_slots();
         a_host_lane_reads_up_to_its_last_row();
         masked_loop_carried_decode_is_pooled_device_geometry();
@@ -940,6 +1065,87 @@ mod tests {
         a_decode_whose_slots_the_host_states_keeps_the_envelope_path();
         a_decode_stating_no_slots_is_not_pooled();
         a_decode_another_pass_lays_out_is_pooled_device_geometry();
+        a_fold_list_states_every_lanes_fold_or_a_fold_a_lane();
+    }
+
+    /// A fold list of one entry is every lane's fold and a longer one a
+    /// fold a lane. One that leaves a lane without a count is refused by
+    /// name where the fire's geometry is evaluated: the lane takes neither
+    /// the first lane's count nor the device's.
+    fn a_fold_list_states_every_lanes_fold_or_a_fold_a_lane() {
+        use eta_compiler::eval::interp::Value;
+        use eta_ir::registry::EngineCaps;
+
+        let every = Fold::Host(vec![3]);
+        assert_eq!((every.of(0), every.of(5)), (Some(3), Some(3)));
+        assert!(every.states(6).is_ok());
+        let each = Fold::Host(vec![3, 4, 5]);
+        assert_eq!(
+            (each.of(0), each.of(2), each.of(3)),
+            (Some(3), Some(5), None),
+            "a lane past the list takes no other lane's count"
+        );
+        assert!(each.states(3).is_ok());
+        assert!(
+            each.states(2).is_ok(),
+            "a list past the lanes is left alone"
+        );
+        for (short, lanes) in [(vec![3, 4], 3), (Vec::new(), 1)] {
+            let stated = short.len();
+            let refused = Fold::Host(short).states(lanes).unwrap_err().to_string();
+            assert!(
+                refused.contains(&format!("it states {stated} fold(s) for {lanes} lanes")),
+                "{refused}"
+            );
+        }
+        assert!(Fold::Host(Vec::new()).states(0).is_ok());
+        assert!(Fold::None.states(3).is_ok() && Fold::Device.states(3).is_ok());
+
+        // Three lanes of a row each, their fold a list the host evaluates.
+        let mut container = decode(
+            3,
+            &[
+                (Port::EmbedIndptr, Shape::vector(4), Dtype::U32),
+                (Port::Fold, Shape::vector(3), Dtype::U32),
+            ],
+        );
+        container.stages[0].ops = vec![Op::ChanTake(0), Op::ChanPut { chan: 0, value: 0 }];
+        let logits = eta_ir::registry::OutputDecl {
+            name: "logits".into(),
+            axis: eta_ir::registry::Axis::Row,
+            width: 16,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        };
+        let bound = eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default())
+            .expect("the decode binds");
+        let mapped = |fold: Vec<u32>| {
+            let mut known = |channel: u32| {
+                Some(match channel {
+                    0 => Value::I32(vec![7, 8, 9]),
+                    1 => Value::U32(vec![0, 1, 2, 3]),
+                    _ => Value::U32(fold.clone()),
+                })
+            };
+            map_geometry_evaluated_with(&bound, &mut known, PortMask::NONE)
+                .map(|(geometry, _)| geometry.fold)
+        };
+        assert_eq!(mapped(vec![2]).ok(), Some(Fold::Host(vec![2])));
+        assert_eq!(mapped(vec![2, 0, 1]).ok(), Some(Fold::Host(vec![2, 0, 1])));
+        for short in [vec![2, 1], Vec::new()] {
+            let stated = short.len();
+            match mapped(short) {
+                Err(EvaluatedGeometryError::BadValue {
+                    port: Port::Fold,
+                    reason,
+                }) => assert!(
+                    reason.contains(&format!("it states {stated} fold(s) for 3 lanes")),
+                    "{reason}"
+                ),
+                other => panic!("a fold list short of its lanes maps: {other:?}"),
+            }
+        }
     }
 
     fn a_decode_another_pass_lays_out_is_pooled_device_geometry() {
@@ -1084,7 +1290,7 @@ mod tests {
         assert_eq!(landings, vec![Landing { start: 40, rows: 3 }]);
         assert_eq!(lanes[0].kv.held, 40);
         assert_eq!(
-            lanes[0].kv.pages,
+            lanes[0].pages,
             vec![0, 1, 2],
             "slots 0..43 span three pages"
         );
@@ -1119,7 +1325,7 @@ mod tests {
         let mut g = geometry(&[2, 1]);
         g.slots = Some(vec![5, 6, 9]);
         g.positions = Some(vec![5, 6, 2]);
-        let (lanes, landings) = g.lanes(&[place(7), place(0)], 4).unwrap();
+        let (lanes, landings) = g.lanes(&[place(7), place(9)], 4).unwrap();
         assert_eq!(
             landings,
             vec![Landing { start: 5, rows: 2 }, Landing { start: 9, rows: 1 }]
@@ -1132,10 +1338,41 @@ mod tests {
         );
         g.slots = Some(vec![5, 7, 9]);
         assert!(
-            g.lanes(&[place(7), place(0)], 4)
+            g.lanes(&[place(7), place(9)], 4)
                 .unwrap_err()
                 .contains("consecutive")
         );
+    }
+
+    fn a_lane_reads_no_slot_its_set_has_not_written() {
+        // Pages a set takes hold what their last owner left: a lane whose
+        // rows start past what its set wrote would read the slots between.
+        let mut g = geometry(&[2]);
+        g.slots = Some(vec![20, 21]);
+        let refused = g.lanes(&[place(8)], 16).unwrap_err();
+        assert!(refused.contains("slots 20..22") && refused.contains("0..8 written"));
+        g.slots = Some(vec![8, 9]);
+        assert!(g.lanes(&[place(8)], 16).is_ok(), "an append");
+        g.slots = Some(vec![3, 4]);
+        assert!(g.lanes(&[place(8)], 16).is_ok(), "a rewrite inside it");
+        // Lanes of one set write together: one fills what the other reads.
+        let shared = Place {
+            shared: true,
+            ..place(8)
+        };
+        let mut g = geometry(&[2, 2]);
+        g.slots = Some(vec![10, 11, 8, 9]);
+        assert!(g.lanes(&[shared.clone(), shared.clone()], 16).is_ok());
+        g.slots = Some(vec![10, 11, 12, 13]);
+        assert!(g.lanes(&[shared.clone(), shared.clone()], 16).is_err());
+        // A device-placed fire still to settle: its engine holds the lane.
+        let unknown = Place {
+            readable_known: false,
+            ..place(8)
+        };
+        let mut g = geometry(&[1]);
+        g.slots = Some(vec![20]);
+        assert!(g.lanes(&[unknown], 16).is_ok());
     }
 
     fn a_write_inside_the_frozen_prefix_is_refused() {

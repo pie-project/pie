@@ -19,9 +19,16 @@ eta-ir = { package = "pie-eta-ir", path = "../eta-ir", features = ["serde"] }
 serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",
+    "rc",
 ] }
 
+[features]
+# The guest-program contract cases (`contract`) every guest-capable
+# backend's tests run; test support, off in a serving build.
+contract = []
+
 [dev-dependencies]
+eta-compiler = { path = ".", features = ["contract"] }
 naga = { version = "30", default-features = false, features = [
     "wgsl-in",
     "spv-out",

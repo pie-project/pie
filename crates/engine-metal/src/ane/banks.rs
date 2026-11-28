@@ -200,6 +200,34 @@ pub fn host(buffer: &Buffer) -> Result<&mut [u8]> {
     }
 }
 
+/// The buffers an ANE load keeps alive, and how many of their bytes are the
+/// model's (weight and scale surfaces); the rest are a fire's (activation
+/// surfaces, partials, staging).
+#[derive(Debug, Default)]
+pub struct Keep {
+    pub buffers: Vec<Buffer>,
+    pub model: u64,
+    /// Of the rest, the staging tensors' ([`staging`]): plain buffers, not
+    /// surfaces, a ledger line of their own.
+    pub staging: u64,
+}
+
+impl Keep {
+    pub fn push(&mut self, buffer: Buffer) {
+        self.buffers.push(buffer);
+    }
+
+    /// The buffer pushed last.
+    pub fn last(&self) -> &Buffer {
+        self.buffers.last().expect("a buffer was kept")
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.buffers.iter().map(Buffer::bytes).sum()
+    }
+}
+
 /// A zeroed `rows x width` buffer of `dtype`, bound as a tensor.
 pub fn staging(
     device: &Context,
@@ -207,10 +235,15 @@ pub fn staging(
     rows: u32,
     width: u32,
     dtype: Dtype,
-    keep: &mut Vec<Buffer>,
+    keep: &mut Keep,
 ) -> Result<Tensor> {
     let bytes = u64::from(rows) * u64::from(width) * dtype.bits() / 8;
+    // A fixed buffer for the load's life, outside the pool by ruling: the
+    // staging tensors of the opt-in Neural Engine path, kept beside its
+    // IOSurfaces (the accepted exception) and entered in the ledger as a line
+    // of their own (`ane staging`), not laid in the tables run.
     let buffer = Buffer::zeroed(device, bytes)?;
+    keep.staging += bytes;
     let tensor = Tensor::new(handles.bind(&buffer, 0, bytes)?, rows, width, dtype);
     keep.push(buffer);
     Ok(tensor)

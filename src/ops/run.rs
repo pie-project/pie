@@ -300,7 +300,8 @@ pub async fn run(
 
     let target = target(args.inferlet.as_deref(), args.path.as_deref())?;
 
-    let (controller, gateway, mut worker) = worker::standalone::derive_standalone(&content)?;
+    let (controller, gateway, mut worker) =
+        worker::standalone::derive_standalone(&content, Some(&cfg_path))?;
     if let Some(words) = diag {
         worker.state_diagnostics(words)?;
     }
@@ -344,22 +345,9 @@ async fn fire_probes() {
     println!();
     println!("fires {fires}  tokens {}", s.total_tokens_processed);
     println!(
-        "  inter-fire        {:7.3} ms   = execute {:.3} + post-dispatch-to-fire {:.3}",
-        per(s.fire.inter_fire_us_sum),
-        per(s.fire.execute.total_us_sum),
-        per(s.fire.post_dispatch_to_fire_us_sum),
-    );
-    println!(
-        "    execute         {:7.3} ms   batch-build {:.3}  engine-fire {:.3}",
-        per(s.fire.execute.total_us_sum),
+        "  execute           batch-build {:.3} ms  engine-fire {:.3} ms",
         per(s.fire.execute.batch_build_us_sum),
         per(s.fire.execute.engine_fire_us_sum),
-    );
-    println!(
-        "    accumulate      {:7.3} ms   fire-prepare {:.3}  recv-block {:.3}",
-        per(s.fire.accumulate.accum_loop_us_sum),
-        per(s.fire.pre_dispatch.fire_prepare_us_sum),
-        per(s.fire.recv_block_wait_us_sum),
     );
     let submits = s.host_submit.submits.max(1);
     let sub = |sum: u64| sum as f64 / submits as f64 / 1000.0;
@@ -525,6 +513,20 @@ mod tests {
 
     #[test]
     fn run_every_case() {
+        // `curated_in` looks for builds under CARGO_TARGET_DIR where it is
+        // set: the cases lay their builds in a tree's own target, so they
+        // run in a process without it.
+        if std::env::var_os("CARGO_TARGET_DIR").is_some() {
+            let ran = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["ops::run::tests::run_every_case", "--exact"])
+                .env_remove("CARGO_TARGET_DIR")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&ran.stdout);
+            assert!(ran.status.success(), "{said}");
+            assert!(said.contains("1 passed"), "{said}");
+            return;
+        }
         a_curated_name_resolves_to_the_build_of_its_crate();
         an_unbuilt_curated_directory_is_found_without_a_wasm();
         a_script_twin_is_its_source_and_needs_no_build();

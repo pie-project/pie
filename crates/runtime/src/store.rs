@@ -3,14 +3,46 @@ pub(crate) mod genmap;
 pub(crate) mod kv;
 pub(crate) mod pool;
 pub(crate) mod registry;
+pub(crate) mod roles;
 pub(crate) mod rs;
 pub mod segments;
 pub mod shared;
 pub mod slots;
+pub mod waiting;
 pub mod weights;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineScopeId(u128);
+
+/// Why a pipeline did not take a working set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScopeRefusal {
+    /// Another pipeline holds the set, or the one asking is closed.
+    Held(PipelineScopeId),
+    /// The pipeline that owns the set failed, for `reason`, its first
+    /// failure. A fire that fails, refused or faulted, ends its pipeline
+    /// and the sets it owns.
+    Failed {
+        owner: PipelineScopeId,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for ScopeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScopeRefusal::Held(owner) => {
+                write!(formatter, "is already scoped to pipeline {owner:032x}")
+            }
+            ScopeRefusal::Failed { owner, reason } => write!(
+                formatter,
+                "ended with its pipeline {owner:032x}, which failed ({reason}): what \
+                 that pipeline's fires folded is frozen and did not run, so no pipeline \
+                 takes it"
+            ),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct PipelineScope {
@@ -86,19 +118,38 @@ impl PipelineScope {
         self.is_closed() && (self.state.drained)()
     }
 
+    /// Takes the set `owner` scopes: one no pipeline holds, or one whose
+    /// pipeline closed with every fire of it settled. Not one whose
+    /// pipeline failed. Its failed fire left the set's cursor past rows
+    /// that were never written, and its records wherever the step stopped,
+    /// whether the engine refused the step or the device faulted under it:
+    /// the set ends with its pipeline, and fires on no other.
     pub(crate) fn claim(
         &self,
         owner: &std::sync::Mutex<Option<PipelineScope>>,
-    ) -> Result<(), PipelineScopeId> {
+    ) -> Result<(), ScopeRefusal> {
         let mut owner = owner.lock().unwrap();
         match owner.as_ref() {
             Some(existing) if existing.id() == self.id() => Ok(()),
-            Some(existing) if !self.is_closed() && existing.is_releasable() => {
-                *owner = Some(self.clone());
-                Ok(())
+            // What a fire folds is frozen from its prepare: a set whose
+            // pipeline failed holds a fold whose fire never ran.
+            Some(existing) => {
+                // Read ahead of the failure: a pipeline that is drained has
+                // written every failure of its fires.
+                let released = existing.is_releasable();
+                match existing.failure() {
+                    Some(reason) => Err(ScopeRefusal::Failed {
+                        owner: existing.id(),
+                        reason,
+                    }),
+                    None if !self.is_closed() && released => {
+                        *owner = Some(self.clone());
+                        Ok(())
+                    }
+                    None => Err(ScopeRefusal::Held(existing.id())),
+                }
             }
-            Some(existing) => Err(existing.id()),
-            None if self.is_closed() => Err(self.id()),
+            None if self.is_closed() => Err(ScopeRefusal::Held(self.id())),
             None => {
                 *owner = Some(self.clone());
                 Ok(())
@@ -118,9 +169,7 @@ pub fn kv_tokens() -> (u64, u64) {
     // The report asks every 100 ms, and counting the cached pages walks every
     // cache entry under the kv lock every guest's fire waits on: the count
     // stands for a second.
-    static LAST: std::sync::Mutex<Option<(crate::rt::Instant, (u64, u64))>> =
-        std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
+    let mut last = KV_TOKENS_LAST.lock().unwrap();
     if let Some((at, tokens)) = *last
         && at.elapsed() < std::time::Duration::from_secs(1)
     {
@@ -186,10 +235,23 @@ pub fn kv_pressure_bucket() -> u8 {
     (f64::from(used) / f64::from(total) * 255.0).round() as u8
 }
 
+/// Prompt tokens served from cached KV that a fire brought back up from
+/// below the device (the host or disk tier), since the process started:
+/// `/metrics`' `pie_kv_cached_from_below_tokens_total`.
+pub static CACHED_FROM_BELOW_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Forgets the boot's stores and what their engines were set to, for
 /// [`crate::bootstrap::reset`].
 pub(crate) fn reset() {
     registry::reset();
     shared::reset();
-    weights::reset();
+    waiting::reset();
+    *KV_TOKENS_LAST.lock().unwrap() = None;
+    CACHED_FROM_BELOW_TOKENS.store(0, std::sync::atomic::Ordering::Relaxed);
+    kv::RELIST_COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// The last [`kv_tokens`] count and when it was taken.
+static KV_TOKENS_LAST: std::sync::Mutex<Option<(crate::rt::Instant, (u64, u64))>> =
+    std::sync::Mutex::new(None);

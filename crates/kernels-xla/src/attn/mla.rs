@@ -375,6 +375,7 @@ pub fn kv_append(
         write_page,
         write_offset,
         None,
+        super::paged::fire_lanes(pool),
     )?;
     Ok((planes[0], planes.get(1).copied()))
 }

@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-WASM_CRATES=(pie-browser runtime engine-wgpu kernels-slang web-std wasmtime-web
+WASM_CRATES=(pie-browser runtime engine-wgpu engine-gpu kernels-slang web-std wasmtime-web
   checkpoint ztensor ztensor-compat tokenizer grammar chat-template
   pie-poem-ir pie-poem pie-poem-compiler engine pie-poem-exec pie-eta-ir pie-eta-dsl eta-compiler
   eta-exec waker ids pie-dtype pie-client-api)
@@ -13,11 +13,15 @@ NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-slang web-std wasmtime-we
 pkgs() { for c in "$@"; do printf -- '-p %s ' "$c"; done; }
 
 echo "== wasm32: clippy"
+# The tab's lint: the workspace's, plus std's clocks, which panic there.
+export CLIPPY_CONF_DIR="$PWD/scripts/clippy-wasm32"
 CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
   $(pkgs "${WASM_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings
 # The worker the tab boots through: without `net`, its default.
 CARGO_TARGET_DIR=target-wasm cargo clippy --target wasm32-unknown-unknown \
   -p worker --no-default-features --features worker/wgpu -- -D warnings
+
+unset CLIPPY_CONF_DIR
 
 echo "== native, wgpu feature: clippy + tests"
 cargo clippy $(pkgs "${NATIVE_CRATES[@]}") --features runtime/wgpu,engine-wgpu/wgpu -- -D warnings

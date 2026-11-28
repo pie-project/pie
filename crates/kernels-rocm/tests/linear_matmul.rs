@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Gpu, close_bf16, round_bf16, values};
+use common::{Gpu, close_abs, close_bf16, round_bf16, values};
 use dtype::Dtype;
 use kernels_rocm::linear::gemm;
 
@@ -24,6 +24,14 @@ fn reference(a: &[f32], w: &[f32], bias: Option<&[f32]>, m: usize, n: usize, k: 
         }
     }
     y
+}
+
+/// The table that answers the turned kernel wherever it and the skinny
+/// kernel both cover a product: a test of the turned kernel runs under it.
+fn turned_table() -> std::sync::Arc<kernels_rocm::linear::routes::Routes> {
+    std::sync::Arc::new(kernels_rocm::linear::routes::Routes::all(
+        kernels_rocm::linear::routes::Kernel::Turned as u32,
+    ))
 }
 
 #[test]
@@ -84,7 +92,8 @@ fn linear_matmul() {
             .collect();
         let bt = gpu.tensor(&b, 1, n, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::Bf16);
-        gemm::matmul_bias(&ctx, at, wt, bt, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| gemm::matmul_bias(ctx, at, wt, bt, &mut y))
+            .unwrap();
         // The sum can cancel: hold it to the operands' scale, two bf16
         // roundings (the product's and the sum's) of the larger operand.
         let got = gpu.read(&y);
@@ -178,7 +187,8 @@ fn the_batch_engine_projection() {
         let at = gpu.tensor(&a, m, k, Dtype::Bf16);
         let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::Bf16);
-        gemm::matmul(&ctx, at, wt, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| gemm::matmul(ctx, at, wt, &mut y))
+            .unwrap();
         close_bf16(
             &format!("batch matmul {m}x{n}x{k}"),
             &gpu.read(&y),
@@ -225,9 +235,8 @@ fn the_turned_projection() {
     let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
     t.gemm_turn_from = 1;
     t.gemm_turn_wide_until = 32;
-    t.gemm_turn_min_n = 0;
     t.gemm_skinny_batch_min_n = 0;
-    let ctx = gpu.ctx().with_tuning(t);
+    let ctx = gpu.ctx().with_tuning(t).with_routes(turned_table());
     for (m, n, k) in [
         (1u32, 2056u32, 256u32),
         (8, 4096, 2048),
@@ -293,7 +302,8 @@ fn the_f32_projection_lands_unrounded() {
         let at = gpu.tensor(&a, m, k, Dtype::Bf16);
         let wt = gpu.tensor(&w, n, k, Dtype::Bf16);
         let mut y = gpu.zeros(m, n, Dtype::F32);
-        gemm::matmul_f32(&ctx, at, wt, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| gemm::matmul_f32(ctx, at, wt, &mut y))
+            .unwrap();
         let want = reference(&a, &w, None, m as usize, n as usize, k as usize);
         for (i, (h, w)) in gpu.read(&y).iter().zip(&want).enumerate() {
             assert!(
@@ -333,13 +343,170 @@ fn the_live_lm_head_multiplies_the_live_rows() {
     for live in [7u32, 40, 150, 192] {
         let count = gpu.upload(&[live], 1, 1, Dtype::I32);
         let mut y = gpu.tensor(&vec![3.0; (m * n) as usize], m, n, Dtype::Bf16);
-        gemm::lm_head_live(&ctx, at, wt, count.ptr, &mut y).unwrap();
+        gpu.laid(&ctx, |ctx| {
+            gemm::lm_head_live(ctx, at, wt, count.ptr, &mut y)
+        })
+        .unwrap();
         let got = gpu.read(&y);
         let rows = (live * n) as usize;
         close_bf16(&format!("live {live}"), &got[..rows], &want[..rows], 2.0);
         assert!(
             got[rows..].iter().all(|&v| v == 3.0),
             "live {live}: a padding row was written"
+        );
+    }
+}
+
+/// The residual norm folded into the skinny product
+/// (`ResidualAddRmsnormMatmul`): the sum lands in its own plane, the product
+/// is the normed rows' as the norm would land them, where the measured
+/// rates say the fold pays; where they say it does not, nothing lands.
+#[test]
+fn the_normed_skinny_product_is_the_norm_then_the_product() {
+    let Some(gpu) = Gpu::open() else { return };
+    // (m, n, k, plus_one, cached GB/s, folds): priced at device memory's
+    // rate (no cached rate), one row past a 304-block grid reads less than a
+    // launch's worth again, eight rows do not; at a cached rate every row
+    // count the kernel stages folds, and lands the unfused path's bits.
+    // Turned (the products from two rows on the turned kernel), the turned
+    // kernel stages them in its turn, the product apart taking it too: 16
+    // rows of 1,024 and their sums outgrow the turn and stay apart; a K past
+    // 2048 takes the skinny kernel still.
+    let (s, turned) = (false, true);
+    for (m, n, k, plus_one, cached, folds, turn) in [
+        (1u32, 4096u32, 1024u32, false, 0u32, true, s),
+        (1, 3000, 1024, true, 0, true, s),
+        (2, 6144, 1024, false, 0, true, s),
+        (8, 4096, 1024, false, 0, false, s),
+        (3, 4096, 1024, false, 1_000_000, true, s),
+        (4, 4096, 1024, true, 1_000_000, true, s),
+        (4, 6144, 1024, false, 1_000_000, true, s),
+        (5, 2048, 1024, false, 1_000_000, true, s),
+        (6, 2048, 1024, true, 1_000_000, true, s),
+        (8, 2048, 1024, false, 1_000_000, true, s),
+        (4, 2048, 3072, false, 1_000_000, true, s),
+        // 8 rows of K 4096 fill a block's 64 KiB of LDS on their own: the
+        // prologue's partial sums do not fit beside them, so the norm stays
+        // apart (the fold once asked for 65664 bytes and the dispatch faulted).
+        (8, 2048, 4096, false, 1_000_000, false, s),
+        (2, 6144, 1024, false, 1_000_000, true, turned),
+        (3, 4096, 1024, true, 1_000_000, true, turned),
+        (4, 4096, 1024, false, 1_000_000, true, turned),
+        (8, 4096, 1024, true, 1_000_000, true, turned),
+        (12, 4096, 1024, false, 1_000_000, true, turned),
+        (16, 4096, 1024, false, 1_000_000, false, turned),
+        (7, 2048, 2048, false, 1_000_000, true, turned),
+        (4, 3000, 512, false, 1_000_000, true, turned),
+        (4, 2048, 3072, false, 1_000_000, true, turned),
+    ] {
+        let mut t = kernels_rocm::tuning::Tuning::DEFAULT;
+        t.launch_ns = 1536;
+        t.hbm_gbps = 4090;
+        t.cached_gbps = cached;
+        t.gemm_turn_from = if turn { 2 } else { 0 };
+        let ctx = if turn {
+            gpu.ctx().with_tuning(t).with_routes(turned_table())
+        } else {
+            gpu.ctx().with_tuning(t)
+        };
+        let x: Vec<f32> = values((m * k) as usize, 41, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let y: Vec<f32> = values((m * k) as usize, 42, 1.0)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let nw: Vec<f32> = values(k as usize, 43, 0.5)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let w: Vec<f32> = values((n * k) as usize, 44, 0.05)
+            .into_iter()
+            .map(round_bf16)
+            .collect();
+        let (xt, yt, nwt, wt) = (
+            gpu.tensor(&x, m, k, Dtype::Bf16),
+            gpu.tensor(&y, m, k, Dtype::Bf16),
+            // The norm's weight as a load lays it: k rows of one.
+            gpu.tensor(&nw, k, 1, Dtype::Bf16),
+            gpu.tensor(&w, n, k, Dtype::Bf16),
+        );
+        let mut y_out = gpu.tensor(&vec![7.0; (m * k) as usize], m, k, Dtype::Bf16);
+        let mut z = gpu.tensor(&vec![7.0; (m * n) as usize], m, n, Dtype::Bf16);
+        let mut folded_normed = gpu.tensor(&vec![7.0; (m * k) as usize], m, k, Dtype::Bf16);
+        let landed = gpu
+            .laid(&ctx, |ctx| {
+                gemm::residual_add_rmsnorm_matmul(
+                    ctx,
+                    xt,
+                    yt,
+                    nwt,
+                    plus_one,
+                    1e-6,
+                    wt,
+                    &mut y_out,
+                    &mut folded_normed,
+                    &mut z,
+                )
+            })
+            .unwrap();
+        assert_eq!(landed, folds, "{m}x{n}x{k}: the fold's choice");
+        if !folds {
+            assert!(
+                gpu.read(&z).iter().all(|&v| v == 7.0),
+                "{m}x{n}x{k}: nothing lands"
+            );
+            continue;
+        }
+        let sums: Vec<f32> = y.iter().zip(&x).map(|(y, x)| round_bf16(y + x)).collect();
+        assert_eq!(
+            gpu.read(&y_out),
+            sums,
+            "{m}x{n}x{k}: the sum lands as it is"
+        );
+        // The norm then the product apart, on the same kernels: the same bits.
+        let mut apart_sum = gpu.zeros(m, k, Dtype::Bf16);
+        let mut normed = gpu.zeros(m, k, Dtype::Bf16);
+        let mut apart = gpu.zeros(m, n, Dtype::Bf16);
+        gpu.laid(&ctx, |ctx| {
+            kernels_rocm::elemwise::norm_residual::residual_add_rmsnorm_into(
+                ctx,
+                xt,
+                yt,
+                &mut apart_sum,
+                nwt,
+                plus_one,
+                1e-6,
+                &mut normed,
+            )?;
+            gemm::lm_head(ctx, normed, wt, &mut apart)
+        })
+        .unwrap();
+        assert_eq!(gpu.read(&apart_sum), sums, "{m}x{n}x{k}: the norm's sum");
+        assert_eq!(
+            gpu.read(&folded_normed),
+            gpu.read(&normed),
+            "{m}x{n}x{k}: the normed rows land for their other readers"
+        );
+        assert_eq!(
+            gpu.read(&z),
+            gpu.read(&apart),
+            "{m}x{n}x{k} plus_one={plus_one}: the folded product is the norm's then the product's"
+        );
+        let want = reference(
+            &gpu.read(&normed),
+            &w,
+            None,
+            m as usize,
+            n as usize,
+            k as usize,
+        );
+        close_abs(
+            &format!("{m}x{n}x{k} against the host"),
+            &gpu.read(&z),
+            &want,
+            2e-2,
         );
     }
 }

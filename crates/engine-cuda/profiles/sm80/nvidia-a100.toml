@@ -48,8 +48,6 @@ moe.mxfp4_mma_per_from = 0
 moe.mxfp4_select_lean = true
 moe.nvfp4_mma_from = 17
 moe.nvfp4_mma_until = 65536
-moe.bf16_mma_from = 16
-moe.bf16_mma_until = 65536
 sdpa.compressed_replay = true
 ssm.gdn_fused_scan = true
 ssm.conv_vec4 = true
@@ -64,11 +62,6 @@ ssm.gdn_step_blocks = 3
 prefill_lattice_from = 256
 prefill_lattice_steps = 8
 lattice_steps = 2
-# A decoding lane's next pages before a waiting prompt's, and admission held
-# to five sequences a declared-context sequence holds: Gemma-4-26B (bf16, a
-# 19.5 GiB pool) c512 2.6k -> 4.5k tok/s, c1024 2.5k -> 4.5k; Gemma-4-31B c128
-# 309 -> 465.
-seated_first = true
 
 # Independent chains on side streams: decode latency +5-11% (Gemma 4, Qwen3.6-A3B,
 # DeepSeek-V4, GLM-5.3, Hy4), outputs unchanged; a join's branches on them too.
@@ -78,6 +71,8 @@ branches = true
 
 [provenance]
 source = "end to end on MiMo-V2.6-Flash and Qwen3.6-27B miniatures and checkpoints, by hand"
+# `measured` names only what MiMo-V2.6-Flash or Qwen3.6-27B reads: indexed, MLA, hyper-connection, NVFP4 and KDA
+# decisions are dropped (their values above stand on the measurements their comments cite, not on these models).
 measured = [
   "kernel.gemm.fp8_gemv_until",
   "kernel.gemm.skinny_rows",
@@ -93,34 +88,18 @@ measured = [
   "kernel.sdpa.decode.grouped_prefill_lse",
   "kernel.sdpa.decode.grouped_prefill_window",
   "kernel.sdpa.fa2_live",
-  "kernel.sdpa.index_mma",
-  "kernel.sdpa.index_radix",
-  "kernel.sdpa.pool_mma",
-  "kernel.sdpa.selected_mma",
   "kernel.moe.mxfp4_mma_from",
   "kernel.moe.mxfp4_mma_until",
   "kernel.moe.mxfp4_mma_per_from",
   "kernel.moe.mxfp4_select_lean",
-  "kernel.moe.nvfp4_mma_from",
-  "kernel.moe.nvfp4_mma_until",
-  "kernel.moe.bf16_mma_from",
-  "kernel.moe.bf16_mma_until",
   "kernel.ssm.gdn_fused_scan",
   "kernel.ssm.gdn_step_blocks",
   "kernel.ssm.conv_vec4",
   "kernel.ssm.gdn_out_bf16",
-  "kernel.ssm.kda_chunked",
-  "kernel.ssm.kda_step_fused",
   "engine.prefill_lattice_from",
   "engine.lattice_steps",
-  "engine.seated_first",
   "compiler.dag_streams",
-  "kernel.elemwise.hc_tile",
-  "kernel.elemwise.hc_mma",
-  "kernel.elemwise.norm_emit",
   "kernel.sdpa.compressed_decode_until",
   "kernel.gemm.rows_m",
-  "kernel.mla.expanded_from",
-  "kernel.attn_res.fused_norm",
   "compiler.branches",
 ]

@@ -162,6 +162,7 @@ pub fn loop_on_rows(
                 extern_dir: None,
                 capacity: decl.capacity.max(1),
                 extern_name: Vec::new(),
+                slots: Vec::new(),
             })
             .expect("a channel registers");
         channels.push(id);
@@ -189,6 +190,7 @@ pub fn loop_on_rows(
                 query_len: total,
                 ..engine::program::BindExtents::default()
             },
+            ..Default::default()
         })
         .expect("the guest binds")
         .id;
@@ -246,6 +248,7 @@ pub fn loop_on_rows(
                 lanes: 2,
                 instance,
                 adapter_only: false,
+                scratch: Default::default(),
             }],
             media: Vec::new(),
             voxels: vec![StepVoxels {
@@ -253,6 +256,7 @@ pub fn loop_on_rows(
                 clips: vec![grid()],
                 payload: Vec::new(),
             }],
+            shape: None,
         });
         let t0 = std::time::Instant::now();
         let mut ticket = engine.submit(&frame).expect("the step runs");

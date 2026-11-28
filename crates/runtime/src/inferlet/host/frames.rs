@@ -54,12 +54,21 @@ impl std::fmt::Debug for Pcm {
     }
 }
 
+/// The CUDA device a media encode runs on ([`crate::bootstrap::ModelConfig::media_device`]).
+static MEDIA_DEVICE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The next boot states its own media device.
+pub(crate) fn reset() {
+    MEDIA_DEVICE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn set_media_device(device: u32) {
+    MEDIA_DEVICE.store(device, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(feature = "cuda")]
 fn nvenc_device() -> usize {
-    std::env::var("PIE_NVENC_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    MEDIA_DEVICE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 impl Frames {

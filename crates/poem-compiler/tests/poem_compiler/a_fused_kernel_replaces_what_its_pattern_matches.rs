@@ -194,6 +194,41 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
     assert!(ops(&fused).contains(&"elemwise.rope"), "{:?}", ops(&fused));
 }
 
+/// Qwen 3's attention prologue: q and k normed by their weights per head,
+/// v as it is, rotated whole.
+fn qwen_qkv_write(p: &Pattern) {
+    let positions = p.indices("positions");
+    let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
+    let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, 1e-6);
+    let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, 1e-6);
+    let (q, k) = both(elemwise::rope(
+        &q,
+        &positions,
+        64,
+        1_000_000.0,
+        Turn::Full { interleaved: false },
+        Some(&k),
+        None,
+    ));
+    let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+    attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
+    elemwise::silu(&q);
+}
+
+/// The padded rule (CUDA's) holds MiMo's forms alone: Qwen's and Gemma's
+/// prologues stay apart under it.
+#[test]
+fn the_padded_qkv_rule_folds_neither_qwens_nor_gemmas_prologue() {
+    let rule = poem_compiler::fuse::rules::qkv_fused_padded();
+    for (what, apart) in [
+        ("qwen", trace(qwen_qkv_write)),
+        ("gemma", trace(|p| qkv_write(p, 1e-6, 1e-6))),
+    ] {
+        let fused = poem_compiler::fuse::fuse(apart.clone(), [&rule]);
+        assert_eq!(ops(&fused), ops(&apart), "{what}: no op folds");
+    }
+}
+
 /// Muse Spark's form folds too: scaleless q and k norms, v as it is, and a
 /// global layer's rows unturned.
 #[test]
@@ -541,6 +576,7 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     None,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     None,
@@ -1248,4 +1284,71 @@ fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
 /// keys it was given, an attention's output and log-sum-exp.
 fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
     (q, k.expect("an output asked for lands"))
+}
+
+const NORM_PRODUCT: &[&str] = &[
+    "fused.residual_add_rmsnorm_matmul",
+    "fused.residual_add_rmsnorm",
+    "fused.matmul_swiglu_matmul",
+];
+
+/// Normed rows another op reads too (an adapter's correction beside the
+/// projection, a second product) fold with one product and land for the
+/// rest.
+#[test]
+fn a_residual_norm_read_elsewhere_too_folds_into_its_first_product() {
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            elemwise::silu(&linear::matmul(&normed, &p.weight("a", [256, 64])));
+            elemwise::silu(&linear::matmul(&normed, &p.weight("b", [256, 64])));
+        }),
+        NORM_PRODUCT,
+    );
+    let ops = ops(&fused);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| **op == "fused.residual_add_rmsnorm_matmul")
+            .count(),
+        1,
+        "{ops:?}"
+    );
+    assert_eq!(
+        ops.iter().filter(|op| **op == "linear.matmul").count(),
+        1,
+        "{ops:?}"
+    );
+    assert!(!ops.contains(&"fused.residual_add_rmsnorm"), "{ops:?}");
+}
+
+/// A residual norm feeding a dense MLP folds with the whole MLP where the
+/// norm-and-MLP rule runs.
+#[test]
+fn a_residual_norm_before_a_dense_mlp_folds_with_it() {
+    let rules = [
+        "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+        "fused.residual_add_rmsnorm_matmul",
+        "fused.residual_add_rmsnorm",
+        "fused.matmul_swiglu_matmul",
+    ];
+    let fused = fuse(
+        trace(|p| {
+            let y_out = elemwise::residual_add(&p.rows("x", 64), &p.rows("y", 64));
+            let normed = elemwise::rmsnorm(&y_out, &p.weight("norm", [64]), 1e-6);
+            let packed = linear::matmul(&normed, &p.weight("gate_up", [128, 64]));
+            let h = linear::glu(&packed, GluAct::Swiglu, Some(64), None, None, None);
+            elemwise::silu(&linear::matmul(&h, &p.weight("down", [64, 64])));
+            elemwise::silu(&y_out);
+        }),
+        &rules,
+    );
+    assert_eq!(
+        ops(&fused),
+        [
+            "fused.residual_add_rmsnorm_matmul_swiglu_matmul",
+            "elemwise.act",
+            "elemwise.act"
+        ]
+    );
 }

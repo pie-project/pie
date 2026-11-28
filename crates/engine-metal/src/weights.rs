@@ -31,13 +31,25 @@ pub struct AdapterPlane<'a> {
     pub bytes: &'a [u8],
 }
 
+/// The adapter ids a bank's address table holds: one a landed adapter
+/// (an item of `Adapter` slots) at a time.
+pub const ADAPTER_IDS: u32 = 256;
+
 #[derive(Debug)]
 pub struct Weights {
     store: Store,
     mapped: Vec<Buffer>,
     table: WeightTable,
     banks: BTreeMap<String, Bank>,
-    decoded: Vec<Buffer>,
+    /// The registered banks' region of the pool's tables run: the zero
+    /// plane and each bank's address table, laid once the pool is
+    /// ([`Weights::lay_banks`]).
+    bank_region: Option<crate::inputs::Region>,
+    /// The zero plane's GPU address: what an id no adapter holds reads.
+    zero_plane: u64,
+    /// Weights the load derives from the stored ones, each with what it is
+    /// (a ledger line of its own): fixed weights outside the pool.
+    decoded: Vec<(&'static str, Buffer)>,
     /// The tables the weight cache streams by their rows, each in an
     /// allocation of its own where the load lands them (the cold road), so
     /// a held set can give them back (`store::streamed`).
@@ -52,7 +64,11 @@ pub struct Weights {
 
 #[derive(Debug, Clone, Copy)]
 struct Bank {
-    offset: u64,
+    /// Its param: the handle its tensor binds.
+    param: usize,
+    /// Where its address table lies in the tables region: one GPU address
+    /// an adapter id ([`ADAPTER_IDS`]), what the correction reads through.
+    table_at: u64,
     adapters: u32,
     slot: u64,
     rows: u64,
@@ -70,7 +86,7 @@ pub struct BankSeat {
     pub elem: u64,
 }
 
-fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeMap<String, Bank> {
+fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
     trace
         .params
         .iter()
@@ -89,7 +105,8 @@ fn banks(trace: &Trace, places: &[Place], seat: impl Fn(usize) -> u64) -> BTreeM
             (
                 param.name.clone(),
                 Bank {
-                    offset: seat(at),
+                    param: at,
+                    table_at: 0,
                     adapters,
                     slot,
                     rows,
@@ -160,7 +177,7 @@ impl Weights {
             Err(None) => {}
             Err(Some(why)) => {
                 let held = std::fs::metadata(path).map(|it| it.len()).unwrap_or(0);
-                eprintln!(
+                tracing::warn!(
                     "engine-metal: {} loads cold — {why}.\n\
                      engine-metal: that road reads all {:.2} GiB of it through the executor; \
                      the warm arm would have read no weight byte at all.",
@@ -181,7 +198,8 @@ impl Weights {
             let mut at = 0u64;
             for (index, place) in packed.iter_mut().enumerate() {
                 place.offset = at;
-                if own.contains(&index) {
+                // A registered bank lies in the pool's tables run.
+                if own.contains(&index) || trace.params[index].source == ParamSource::Registered {
                     place.reserved = 0;
                 }
                 at += place.reserved;
@@ -214,6 +232,7 @@ impl Weights {
             landed
         };
 
+        let unlaid = Buffer::zeroed(device, 0)?;
         let mut weight_table = Vec::with_capacity(places.len());
         for (at, place) in places.iter().enumerate() {
             if !landed[at] && trace.params[at].source == ParamSource::Checkpoint {
@@ -226,6 +245,9 @@ impl Weights {
                 let place = &places[index];
                 let handle = match hosted.get(&index) {
                     Some(own) => handles.bind(own, 0, place.bytes)?,
+                    None if trace.params[index].source == ParamSource::Registered => {
+                        handles.bind(&unlaid, 0, 0)?
+                    }
                     None => store.bind(handles, place.offset, place.bytes)?,
                 };
                 Ok(Tensor::new(handle, place.rows, place.width, place.dtype))
@@ -263,7 +285,9 @@ impl Weights {
             store,
             mapped: Vec::new(),
             table: WeightTable(weight_table, Vec::new()),
-            banks: banks(trace, &places, |at| places[at].offset),
+            banks: banks(trace, &places),
+            bank_region: None,
+            zero_plane: 0,
             decoded: Vec::new(),
             hosted,
             filed: BTreeMap::new(),
@@ -281,57 +305,119 @@ impl Weights {
         self.mapped.len()
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        for plane in planes {
-            let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
-                bank: plane.bank.to_string(),
-                why: "not a bank this plan declares; a bank is a weight the model text \
-                      marked `registered`, and this plan marked none by that name"
-                    .to_string(),
+    /// The tables run's bytes the registered banks take: one zero plane
+    /// (what an id no adapter holds reads) and each bank's address table,
+    /// each on the arena's boundary. The model text's seat count is no
+    /// capacity: adapters land in `Adapter` slots.
+    #[must_use]
+    pub fn bank_bytes(&self) -> u64 {
+        if self.banks.is_empty() {
+            return 0;
+        }
+        crate::arena::room(self.widest_bank_plane())
+            + self.banks.len() as u64 * crate::arena::room(u64::from(ADAPTER_IDS) * 8)
+    }
+
+    /// Lays the zero plane and each bank's address table in one region
+    /// `table` hands out of the pool's tables run, every id pointing at the
+    /// zero plane, and points each bank's handle at its table.
+    pub fn lay_banks(
+        &mut self,
+        handles: &Handles,
+        table: impl FnOnce(u64) -> Result<crate::inputs::Region>,
+    ) -> Result<()> {
+        if self.banks.is_empty() {
+            return Ok(());
+        }
+        let mut region = table(self.bank_bytes())?;
+        let zero = region
+            .view()
+            .address_at(region.at(0))
+            .ok_or_else(|| Fault::Unbound {
+                what: "a GPU address for the banks' zero plane".to_string(),
             })?;
-            if id >= bank.adapters {
-                return Err(Fault::Adapter {
-                    bank: plane.bank.to_string(),
-                    why: format!(
-                        "seats {} adapters while this registration is id {id}; capacity \
-                         is a shape the model text declared, so the fix is the model \
-                         text and not a retry",
-                        bank.adapters
-                    ),
+        let mut table_at = crate::arena::room(self.widest_bank_plane());
+        let mut entries: Vec<(u64, u64)> = Vec::new();
+        for bank in self.banks.values_mut() {
+            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(bank.param).copied() else {
+                return Err(Fault::Unbound {
+                    what: format!("registered bank param {}'s plane", bank.param),
                 });
+            };
+            // The bank's tensor is its address table: an id a row.
+            handles.rebind_at(plane.buf, region.view(), region.at(table_at))?;
+            self.table.0[bank.param] = Some(WeightRow::Dense(Tensor::new(
+                plane.buf,
+                ADAPTER_IDS,
+                1,
+                Dtype::I64,
+            )));
+            bank.table_at = table_at;
+            for id in 0..u64::from(ADAPTER_IDS) {
+                entries.push((table_at + id * 8, zero));
             }
-            if plane.bytes.len() as u64 != bank.slot {
-                return Err(Fault::Adapter {
-                    bank: plane.bank.to_string(),
-                    why: format!(
-                        "seats {} bytes per adapter while this plane carries {}; a plane \
-                         is one whole slot, zero-padded by the caller past its own rank",
-                        bank.slot,
-                        plane.bytes.len()
-                    ),
-                });
-            }
+            table_at += crate::arena::room(u64::from(ADAPTER_IDS) * 8);
         }
-        for plane in planes {
-            let bank = self.banks[plane.bank];
-            let at = bank.offset + u64::from(id) * bank.slot;
-            self.store.zero_span(at, bank.slot)?;
-            self.store.write(at, plane.bytes)?;
+        for (at, address) in entries {
+            region.write(at, &address.to_le_bytes())?;
         }
+        self.zero_plane = zero;
+        self.bank_region = Some(region);
         Ok(())
     }
 
+    /// Points adapter id `id` of bank `name` at `address` (where that
+    /// adapter's plane of the bank lies), or at the zero plane (`None`):
+    /// what the correction reads from the next fire on.
+    pub fn point(&mut self, name: &str, id: u32, address: Option<u64>) -> Result<()> {
+        if id >= ADAPTER_IDS {
+            return Err(Fault::Ceiling {
+                what: "adapter ids a bank's table holds",
+                need: u64::from(id) + 1,
+                have: u64::from(ADAPTER_IDS),
+            });
+        }
+        let bank = self.banks.get(name).ok_or_else(|| Fault::Adapter {
+            bank: name.to_string(),
+            why: "not a bank this plan declares".to_string(),
+        })?;
+        let at = bank.table_at + u64::from(id) * 8;
+        let address = address.unwrap_or(self.zero_plane);
+        let region = self.bank_region.as_mut().ok_or_else(|| Fault::Unbound {
+            what: "the registered banks' tables, laid at the load".to_string(),
+        })?;
+        region.write(at, &address.to_le_bytes())
+    }
+
+    /// The widest plane of a registered bank: an `Adapter` slot's bytes.
+    #[must_use]
+    pub fn widest_bank_plane(&self) -> u64 {
+        self.banks.values().map(|bank| bank.slot).max().unwrap_or(0)
+    }
+
+    /// Why a reload cannot write this load's planes in place, as the whole
+    /// refusal: what the load holds and what serves a new checkpoint
+    /// instead. `None` where every plane lies in the weight store.
     #[must_use]
     pub fn unreloadable(&self) -> Option<&'static str> {
         if !self.mapped.is_empty() {
             Some(
-                "reads its planes in place out of the artifact's file mapping, which a \
-                 reload cannot write; serve the checkpoint's own directory to reload it",
+                "this load reads its planes in place from the imported artifact's file \
+                 mapping, which a reload cannot write: restart the server on the new \
+                 checkpoint, or serve the checkpoint's own directory (`[model] source` set \
+                 to its path) to make its weights reloadable",
             )
         } else if !self.hosted.is_empty() || !self.filed.is_empty() {
-            Some("streams embedding rows from a copy of their own")
+            Some(
+                "this load streams embedding rows from a copy of their own, which a reload \
+                 does not rewrite: restart the server on the new checkpoint",
+            )
         } else if !self.decoded.is_empty() {
-            Some("derives planes from the checkpoint's at load (decoded or repacked copies)")
+            Some(
+                "this load derives planes from the checkpoint's at load (decoded or repacked \
+                 copies), which a reload does not redo: restart the server on the new \
+                 checkpoint",
+            )
         } else {
             None
         }
@@ -345,10 +431,7 @@ impl Weights {
         torn: &mut bool,
     ) -> Result<(u32, u64)> {
         if let Some(why) = self.unreloadable() {
-            return Err(Fault::Load(LoadError::Unsupported(format!(
-                "this load {why}, which a reload does not redo: restart the server on the \
-                 new checkpoint instead"
-            ))));
+            return Err(Fault::Load(LoadError::Unsupported(why.to_string())));
         }
         serves_this_deployment(path, trace.platform.backend(), &trace.name)?;
         let held: Vec<Option<Held<'_>>> = trace
@@ -397,15 +480,6 @@ impl Weights {
                 elem: bank.elem,
             })
             .collect()
-    }
-
-    #[must_use]
-    pub fn adapter_seats(&self) -> u32 {
-        self.banks
-            .values()
-            .map(|bank| bank.adapters)
-            .min()
-            .unwrap_or(0)
     }
 
     /// Reads `param` through `rows` from the next fire on (the weight
@@ -555,7 +629,7 @@ impl Weights {
                 plane.width,
                 Dtype::Bf16,
             )));
-            self.decoded.push(buffer);
+            self.decoded.push(("relabelled conv weights", buffer));
         }
         Ok(())
     }
@@ -621,7 +695,7 @@ impl Weights {
             )?;
             frame.commit()?;
             bank.mpp_codes = Some(packed);
-            self.decoded.push(buffer);
+            self.decoded.push(("MPP-packed 4-bit banks", buffer));
         }
         Ok(())
     }
@@ -681,7 +755,7 @@ impl Weights {
                 u32::try_from(k).unwrap_or(u32::MAX),
                 Dtype::Bf16,
             )));
-            self.decoded.push(buffer);
+            self.decoded.push(("decoded absorbed weights", buffer));
         }
         if decoded_bytes > 0 && crate::diag::on().tier_trace {
             eprintln!(
@@ -697,8 +771,55 @@ impl Weights {
     pub fn bytes(&self) -> u64 {
         self.store.bytes()
             + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
-            + self.decoded.iter().map(Buffer::bytes).sum::<u64>()
+            + self
+                .decoded
+                .iter()
+                .map(|(_, buffer)| buffer.bytes())
+                .sum::<u64>()
             + self.hosted_bytes()
+    }
+
+    /// The weights by what they are, a ledger line each: the store, the
+    /// serving file's mapped windows, each kind the load derives, and the
+    /// row-streamed tables' own copies. All fixed weights outside the pool.
+    #[must_use]
+    pub fn lines(&self) -> Vec<(&'static str, u64)> {
+        let mut lines = vec![
+            ("weights: the store", self.store.bytes()),
+            (
+                "weights: the serving file's mapped windows",
+                self.mapped.iter().map(Buffer::bytes).sum(),
+            ),
+        ];
+        for kind in [
+            "relabelled conv weights",
+            "MPP-packed 4-bit banks",
+            "decoded absorbed weights",
+        ] {
+            let bytes = self
+                .decoded
+                .iter()
+                .filter(|(of, _)| *of == kind)
+                .map(|(_, buffer)| buffer.bytes())
+                .sum();
+            lines.push((
+                match kind {
+                    "relabelled conv weights" => {
+                        "weights derived at the load: relabelled conv weights"
+                    }
+                    "MPP-packed 4-bit banks" => {
+                        "weights derived at the load: MPP-packed 4-bit banks"
+                    }
+                    _ => "weights derived at the load: decoded absorbed weights",
+                },
+                bytes,
+            ));
+        }
+        lines.push((
+            "weights: row-streamed tables' own copies",
+            self.hosted_bytes(),
+        ));
+        lines
     }
 }
 
@@ -891,6 +1012,8 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
 enum Seat {
     Artifact(u64),
     Store(u64),
+    /// A registered bank: in the pool's tables run.
+    Tables,
     /// In the artifact at this offset, read through a window of its own.
     Apart(u64),
 }
@@ -948,9 +1071,10 @@ fn warm(
     for (index, param) in trace.params.iter().enumerate() {
         let place = &places[index];
         if param.source == ParamSource::Registered {
-            seats.push(Seat::Store(store_bytes));
+            // A registered bank lies in the pool's tables run, laid once
+            // the pool is (`Weights::lay_banks`).
+            seats.push(Seat::Tables);
             objects.push(param.name.as_str());
-            store_bytes += place.reserved;
             continue;
         }
         let object = locate(&param.name)
@@ -1059,7 +1183,7 @@ fn warm(
         .enumerate()
         .filter_map(|(index, place)| match seats[index] {
             Seat::Store(offset) => Some((offset, place.reserved)),
-            Seat::Artifact(_) | Seat::Apart(_) => None,
+            Seat::Artifact(_) | Seat::Apart(_) | Seat::Tables => None,
         })
         .collect();
     debug_assert_eq!(
@@ -1145,6 +1269,9 @@ fn warm(
     // (`Weights::open_filed`); a slot is filled from the file.
     let hosted = BTreeMap::new();
     let mut filed = BTreeMap::new();
+    // A row of the handle table a weight read apart binds until its window
+    // opens: one of the three tiny fixed buffers outside the pool (this, the
+    // keepalive sink, the shared empty buffer), left there by ruling.
     let placeholder = Buffer::zeroed(device, ALIGN).map_err(|why| Some(why.to_string()))?;
     for (index, seat) in seats.iter().enumerate() {
         let Seat::Apart(offset) = *seat else { continue };
@@ -1178,7 +1305,7 @@ fn warm(
                 handles.bind(&files[at], view, place.bytes)
             }
             Seat::Store(offset) => store.bind(handles, offset, place.bytes),
-            Seat::Apart(_) => handles.bind(&placeholder, 0, 0),
+            Seat::Apart(_) | Seat::Tables => handles.bind(&placeholder, 0, 0),
         }
         .map_err(|why| {
             Some(format!(
@@ -1226,17 +1353,13 @@ fn warm(
         };
         table.push(Some(entry));
     }
-    let seated: Vec<u64> = seats
-        .iter()
-        .map(|seat| match seat {
-            Seat::Store(offset) | Seat::Artifact(offset) | Seat::Apart(offset) => *offset,
-        })
-        .collect();
     Ok(Weights {
         store,
         mapped: files,
         table: WeightTable(table, Vec::new()),
-        banks: banks(trace, places, |at| seated[at]),
+        banks: banks(trace, places),
+        bank_region: None,
+        zero_plane: 0,
         decoded: Vec::new(),
         hosted,
         filed,

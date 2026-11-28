@@ -8,8 +8,6 @@ use std::sync::LazyLock;
 
 use profile::{Anywhere, Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 
-use crate::{Graphs, Recording};
-
 /// The fact a family file assumes: CUDA's compute capability as major * 10
 /// + minor (89 is sm_89), or AMD's gfx version the same way (94 is gfx94x).
 #[cfg(not(feature = "rocm"))]
@@ -24,35 +22,6 @@ pub const FACTS: &[Var] = &[
 ];
 
 pub const AXES: &[&str] = &["rows"];
-
-/// Whether fires are captured as CUDA graphs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.graphs", default = "on", tune = engine)]
-pub enum GraphMode {
-    /// Every fire launches eagerly: for diagnostics, not serving.
-    Off,
-    /// Fires are shaped for capture but launch eagerly.
-    Shaped,
-    /// Fires are captured and replayed.
-    On,
-}
-
-/// How captured fires are kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(
-    id = "engine.recording",
-    default = r#"{ use = "bodies", mem_mb = 4096 }"#,
-    tune = engine
-)]
-pub enum RecordingMode {
-    Off,
-    Shaped,
-    /// Recorded bodies are kept, up to `mem_mb` of device memory.
-    Bodies {
-        #[constant(range(0..=1_048_576), default = 4096)]
-        mem_mb: u32,
-    },
-}
 
 /// Whether a window that cannot be viewed in place is copied rather than
 /// split.
@@ -78,29 +47,6 @@ pub struct WorkingSetPercent(pub u32);
 #[decision(id = "engine.lattice_steps", constant(set(1, 2)), default = 1, tune = engine)]
 pub struct LatticeSteps(pub u32);
 
-/// Whether a decoding lane's next pages come before seating a waiting prompt,
-/// and a prompt waits rather than suspending a lane
-/// (`PoolFacts::seated_first`). Off keeps arrival order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seated_first", flag, default = false, tune = engine)]
-pub struct SeatedFirst;
-
-/// Whether a process starts only while the pools hold the started ones to
-/// the pages a finished one held (`PoolFacts::seat_to_end`), for a card
-/// whose pools seat fewer full lanes than the batch asks. Off starts each
-/// at once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_to_end", flag, default = false, tune = engine)]
-pub struct SeatToEnd;
-
-/// With `engine.seat_to_end`, whether more processes than the pools hold to
-/// the end at once start spread over a life (`PoolFacts::seat_spread`), so
-/// they finish apart and the pools hold more of them, each midway, than a
-/// wave started at once that runs to its end together. Off seats the wave.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.seat_spread", flag, default = false, tune = engine)]
-pub struct SeatSpread;
-
 /// Whether a windowed pool of short lanes takes a page a lane past its kv
 /// pages (`Paging::spare`), for a card whose ring, not its kv pages, runs
 /// dry first. Off cuts it 1:1.
@@ -108,23 +54,16 @@ pub struct SeatSpread;
 #[decision(id = "engine.window_spare", flag, default = false, tune = engine)]
 pub struct WindowSpare;
 
-/// The rows one fire takes when `[engine] max_forward_tokens` is not
-/// stated; 0 keeps the fixed 8192. Wider fires batch more prompts' chunks
-/// into one pass of the weights, and their activation arena grows with them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.forward_tokens", constant(range(0..=65536)), default = 0, tune = engine)]
-pub struct ForwardTokens(pub u32);
-
 /// Prompt rows a lane brings to a fire over chunked gated delta layers of `H`
 /// value heads when `max_forward_tokens` is unset: a fire takes at most
-/// `floor(SMs / H)` such lanes, so the walk runs in one wave. 0: `forward_tokens`.
+/// `floor(SMs / H)` such lanes, so the walk runs in one wave. 0: the fire top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.walk_fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct WalkFireRows(pub u32);
-/// The most rows a fire takes when `max_forward_tokens` is unset, below the
-/// fixed 8192 even over sparse experts: a batch's prompts then end over two
-/// fires, and those that finish in the first are answered, and replaced,
-/// while the second runs. 0: the fire width above.
+/// The fire top this device serves at, from a measured sweep of prefill at
+/// each top (`max_forward_tokens` unset): the widest feasible rung at or
+/// under it, the estimate not weighed; what the room leaves only lowers it.
+/// 0: the fire-top rule weighs it (`engine::load::fire_top`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "engine.fire_rows", constant(range(0..=65536)), default = 0, tune = engine)]
 pub struct FireRows(pub u32);
@@ -170,17 +109,11 @@ pub struct PrefillLatticeSteps(pub u32);
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("cuda", FACTS, AXES);
     kernels_cuda::tuning::register(&mut r);
-    r.add::<GraphMode>()
-        .add::<RecordingMode>()
-        .add::<Copies>()
+    r.add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
         .add::<LatticeSteps>()
-        .add::<SeatedFirst>()
-        .add::<SeatToEnd>()
-        .add::<SeatSpread>()
         .add::<WindowSpare>()
-        .add::<ForwardTokens>()
         .add::<WalkFireRows>()
         .add::<FireRows>()
         .add::<PrefillLanes>()
@@ -196,7 +129,8 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     // HIP graphs have no conditional node: one is priced past any launch it
     // could skip, so the compiler lowers every region to `AlwaysLaunch`. The
     // residual norms run as generated row kernels there too; the products'
-    // epilogues keep their hand rules until ROCm holds contraction skeletons.
+    // epilogues run on their hand rules (`FUSIONS`), ROCm holding no
+    // contraction skeletons.
     #[cfg(feature = "rocm")]
     poem_compiler::costs::register_regions_for(
         &mut r,
@@ -253,9 +187,22 @@ shelved!(
         "sm120/nvidia-rtx-pro-4500-blackwell.toml",
         "sm120/nvidia-rtx-pro-6000-blackwell-server-edition.toml",
         "sm121.toml",
+        // Committed measured profiles (`pie tune export --engine cuda`).
+        "nvidia-l40s.measured.toml",
     ],
-    rocm: ["gfx94.toml"],
+    rocm: [
+        "gfx94.toml",
+        "gfx94/amd-instinct-mi300x.toml",
+        // Committed measured profiles (`pie tune export --engine cuda`).
+        "amd-instinct-mi300x-vf.measured.toml",
+    ],
 );
+
+/// The host covers committed for this backend's devices
+/// (`profiles/<device>.covers.json`, `pie tune export --engine cuda`), each
+/// listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[include_str!("../profiles/nvidia-l40s.covers.json")];
 
 pub static SHELF: Shelf = Shelf {
     backend: "cuda",
@@ -273,17 +220,11 @@ pub fn facts(major: u32, minor: u32, sms: u32) -> Facts {
 /// The settings one load on this GPU runs under, read from its profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Engine {
-    pub graphs: Graphs,
-    pub recording: Recording,
     pub copies: bool,
     pub grouped: bool,
     pub working_set_percent: u32,
     pub lattice_steps: u32,
-    pub seated_first: bool,
-    pub seat_to_end: bool,
-    pub seat_spread: bool,
     pub window_spare: bool,
-    pub forward_tokens: u32,
     pub walk_fire_rows: u32,
     pub fire_rows: u32,
     pub prefill_lanes: u32,
@@ -297,27 +238,11 @@ impl Engine {
     #[must_use]
     pub fn of(profile: &Profile) -> Engine {
         Engine {
-            graphs: match profile.get::<GraphMode>() {
-                GraphMode::Off => Graphs::Off,
-                GraphMode::Shaped => Graphs::Shaped,
-                GraphMode::On => Graphs::On,
-            },
-            recording: match *profile.get::<RecordingMode>() {
-                RecordingMode::Off => Recording::Off,
-                RecordingMode::Shaped => Recording::Shaped,
-                RecordingMode::Bodies { mem_mb } => Recording::Bodies {
-                    mem_megabytes: mem_mb,
-                },
-            },
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
-            seated_first: profile.on::<SeatedFirst>(&Anywhere),
-            seat_to_end: profile.on::<SeatToEnd>(&Anywhere),
-            seat_spread: profile.on::<SeatSpread>(&Anywhere),
             window_spare: profile.on::<WindowSpare>(&Anywhere),
-            forward_tokens: profile.get::<ForwardTokens>().0,
             walk_fire_rows: profile.get::<WalkFireRows>().0,
             fire_rows: profile.get::<FireRows>().0,
             prefill_lanes: profile.get::<PrefillLanes>().0,
@@ -325,6 +250,16 @@ impl Engine {
             prefill_lattice_from: profile.get::<PrefillLatticeFrom>().0,
             prefill_lattice_steps: profile.get::<PrefillLatticeSteps>().0,
             fire_lanes: profile.get::<FireLanes>().0,
+        }
+    }
+
+    /// The lanes one fire of a load seating `max_lanes` carries
+    /// (`Shell::fire_lanes`): every one, or `engine.fire_lanes` where fewer.
+    #[must_use]
+    pub fn fire_lanes_of(&self, max_lanes: u32) -> u32 {
+        match self.fire_lanes {
+            0 => max_lanes,
+            cap => max_lanes.min(cap),
         }
     }
 }
@@ -400,50 +335,32 @@ pub fn profile(overrides: &str) -> Profile {
     registry().with_overrides(overrides)
 }
 
-/// The registry defaults with the graph mode, and the recording mode where
-/// given, pinned: for a test or a diagnostic that runs eagerly.
-#[must_use]
-pub fn pinned(graphs: Graphs, recording: Option<Recording>) -> Profile {
-    let mut text = format!(
-        "[engine]\ngraphs = \"{}\"\n",
-        match graphs {
-            Graphs::Off => "off",
-            Graphs::Shaped => "shaped",
-            Graphs::On => "on",
-        }
-    );
-    match recording {
-        None => {}
-        Some(Recording::Off) => text.push_str("recording = \"off\"\n"),
-        Some(Recording::Shaped) => text.push_str("recording = \"shaped\"\n"),
-        Some(Recording::Bodies { mem_megabytes }) => text.push_str(&format!(
-            "recording = {{ use = \"bodies\", mem_mb = {mem_megabytes} }}\n"
-        )),
-    }
-    profile(&text)
-}
-
-/// Whether the user's profile for `device` states `[engine] recording`: an
-/// operator's bodies allowance, a hard cap, where a checked-in profile's is
-/// a default the fit may stretch.
-#[must_use]
-pub fn states_recording(device: &str, profiles: Option<&Path>) -> bool {
-    let Some(profiles) = profiles else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(SHELF.user_path(profiles, device)) else {
-        return false;
-    };
-    registry()
-        .parse(&text, "user", profile::Strict::User)
-        .is_ok_and(|file| file.entries.contains_key("engine.recording"))
-}
-
 /// Resolve the profile one load runs under: its compute capability's
-/// family file, the file for this GPU, then the user's.
+/// family file, the file for this GPU, then the user's, each as it states
+/// itself (no stored measurement checked against a build): what `pie tune`
+/// and `pie profile` read.
 #[must_use]
 pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), device, facts, profiles)
+}
+
+/// [`resolve`] for a load: also the device's committed measured profile
+/// (`<device>.measured.toml`), and each stored measurement, the committed
+/// profile's and the user's, taken where its key matches this build on this
+/// device (`keys`) and dropped to be measured again where it does not, each
+/// drop said in the load log.
+#[must_use]
+pub fn resolve_keyed(
+    device: &str,
+    facts: &Facts,
+    profiles: Option<&Path>,
+    keys: &crate::stored::Keys,
+) -> (Profile, Report) {
+    let (profile, report) = SHELF.resolve_keyed(registry(), device, facts, profiles, keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
 }
 
 #[cfg(test)]
@@ -461,7 +378,8 @@ mod tests {
         SHELF
             .check_beside(registry(), &dir, BESIDE)
             .unwrap_or_else(|e| panic!("{e}"));
-        for (name, text) in SEEDED.iter().filter(|(n, _)| !n.contains('/')) {
+        let family = |n: &str| !n.contains('/') && !n.ends_with(".measured.toml");
+        for (name, text) in SEEDED.iter().filter(|(n, _)| family(n)) {
             let file = registry()
                 .parse(text, name, profile::Strict::CheckedIn)
                 .expect("checked above");
@@ -486,28 +404,11 @@ mod tests {
     }
 
     #[cfg(not(feature = "rocm"))]
-    use crate::DEFAULT_BODIES_MEGABYTES;
-
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        for (name, text) in SEEDED {
-            let p = registry()
-                .load(text, name)
-                .unwrap_or_else(|e| panic!("{e}"));
-            let dumped = profile::render::dump(&p);
-            let again = registry()
-                .parse(&dumped, "dump", profile::Strict::CheckedIn)
-                .unwrap_or_else(|e| panic!("{name}: {e}\n---\n{dumped}"));
-            for (spec, rungs, _) in p.entries() {
-                assert_eq!(
-                    again.entries.get(spec.id).map(Vec::as_slice),
-                    Some(rungs),
-                    "{name}: {}",
-                    spec.id
-                );
-            }
-            assert_eq!(again.target.assumes, p.target().assumes, "{name}");
-        }
+        SHELF
+            .check_dumps(registry())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[cfg(not(feature = "rocm"))]
@@ -555,9 +456,9 @@ mod tests {
             // other chip keeps FA2 and the decode kernel.
             assert_eq!(
                 (
-                    tuning.prefill_tc5,
-                    tuning.decode_grouped_prefill_from,
-                    tuning.decode_grouped_prefill_lse,
+                    tuning.prefill_tc5(),
+                    tuning.decode_grouped_prefill_from(),
+                    tuning.decode_grouped_prefill_lse(),
                 ),
                 if (major, minor) == (10, 0) {
                     (true, 4, true)
@@ -568,87 +469,91 @@ mod tests {
             );
             if major >= 10 {
                 // sm_100 alone reads dense latent attention on the FA2 arms.
-                assert!(tuning.gemv_narrow, "{gpu}");
-                assert_eq!(tuning.mla_naive, (major, minor) != (10, 0), "{gpu}");
+                assert!(tuning.gemv_narrow(), "{gpu}");
+                assert_eq!(tuning.mla_naive(), (major, minor) != (10, 0), "{gpu}");
                 // B200 alone also runs the tcgen05 selects and GLU epilogues.
                 let b200 = (major, minor) == (10, 0);
-                assert_eq!(tuning.moe_tc5, b200, "{gpu}");
+                assert_eq!(tuning.moe_tc5(), b200, "{gpu}");
                 assert_eq!(
-                    tuning.ssm_gdn_fused_scan,
+                    tuning.ssm_gdn_fused_scan(),
                     (major, minor) == (10, 0) || (major, minor) == (12, 0),
                     "{gpu}"
                 );
-                assert_eq!(tuning.ssm_gdn_tc5, b200, "{gpu}");
-                assert_eq!(tuning.rows_vec, b200, "{gpu}");
-                assert_eq!(tuning.hc_tile, b200, "{gpu}");
-                assert_eq!(tuning.ssm_conv_vec4, b200, "{gpu}");
-                assert_eq!(tuning.ssm_gdn_out_bf16, b200, "{gpu}");
-                assert_eq!(tuning.merge_warp, b200, "{gpu}");
-                assert_eq!(tuning.decode_gqa, b200, "{gpu}");
-                assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
-                assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
-                assert_eq!(tuning.index_fp4_tc5, major == 10 && minor == 0, "{gpu}");
-                assert_eq!(tuning.mla_sparse, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.ssm_gdn_tc5(), b200, "{gpu}");
+                assert_eq!(tuning.rows_vec(), b200, "{gpu}");
+                assert_eq!(tuning.hc_tile(), b200, "{gpu}");
+                assert_eq!(tuning.ssm_conv_vec4(), b200, "{gpu}");
+                assert_eq!(tuning.ssm_gdn_out_bf16(), b200, "{gpu}");
+                assert_eq!(tuning.merge_warp(), b200, "{gpu}");
+                assert_eq!(tuning.decode_gqa(), b200, "{gpu}");
+                assert_eq!(tuning.pool_mma(), major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.index_radix(), major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.index_fp4_tc5(), major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.mla_sparse(), major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
-                    tuning.compressed_prefill_from,
+                    tuning.compressed_prefill_from(),
                     if major == 10 && minor == 0 { 512 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.compressed_decode_until,
+                    tuning.compressed_decode_until(),
                     if major == 10 && minor == 0 { 64 } else { 0 },
                     "{gpu}"
                 );
-                assert_eq!(tuning.mxfp4_cvt, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.mxfp4_cvt(), major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
-                    tuning.mxfp4_a8_until,
+                    tuning.mxfp4_a8_until(),
                     if major == 10 && minor == 0 { 48 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.mxfp4_a8_from,
+                    tuning.mxfp4_a8_from(),
                     u32::from(major == 10 && minor == 0),
                     "{gpu}"
                 );
-                assert_eq!(tuning.fp8_o_down, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.fp8_o_down(), major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
-                    tuning.gemm_fp8_mma_gemv_until,
+                    tuning.gemm_fp8_mma_gemv_until(),
                     if major == 10 && minor == 0 { 8 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.gemm_fp8_mma_k_until,
+                    tuning.gemm_fp8_mma_k_until(),
                     if major == 10 && minor == 0 { 5120 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.mxfp4_cvt_ksplit_until,
+                    tuning.mxfp4_cvt_ksplit_until(),
                     if major == 10 && minor == 0 { 6 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.decode_gqa_from_64,
+                    tuning.decode_gqa_from_64(),
                     if b200 { 16 } else { 0 },
                     "{gpu}"
                 );
                 assert_eq!(
-                    tuning.decode_gqa_whole_window,
+                    tuning.decode_gqa_whole_window(),
                     if b200 { 128 } else { 0 },
                     "{gpu}"
                 );
-                assert_eq!(tuning.decode_gqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
-                assert_eq!(tuning.decode_gqa_deep_64, b200, "{gpu}");
+                assert_eq!(
+                    tuning.decode_gqa_cluster(),
+                    if b200 { 8 } else { 0 },
+                    "{gpu}"
+                );
+                assert_eq!(tuning.decode_gqa_deep_64(), b200, "{gpu}");
                 // B200 alone lands a hyper-connection seam in one launch,
                 // from 43 to 1120 rows.
-                assert_eq!(tuning.hc_mega_from, if b200 { 43 } else { 0 }, "{gpu}");
-                assert_eq!(tuning.hc_mega_until, if b200 { 1120 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.hc_mega_from(), if b200 { 43 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.hc_mega_until(), if b200 { 1120 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
                         mla_naive: false,
-                        moe_tc5: defaults.moe_tc5,
-                        moe_mega_until: defaults.moe_mega_until,
-                        moe_mega_bf16_from: defaults.moe_mega_bf16_from,
+                        moe_tc5: defaults.moe_tc5(),
+                        moe_mega_until: defaults.moe_mega_until(),
+                        moe_mega_bf16_from: defaults.moe_mega_bf16_from(),
                         ssm_gdn_fused_scan: false,
                         ssm_gdn_tc5: false,
                         rows_vec: false,
@@ -659,16 +564,16 @@ mod tests {
                         ssm_gdn_out_bf16: false,
                         compressed_decode_until: 0,
                         merge_warp: false,
-                        mxfp4_mma_until: defaults.mxfp4_mma_until,
-                        mxfp4_mma_from: defaults.mxfp4_mma_from,
+                        mxfp4_mma_until: defaults.mxfp4_mma_until(),
+                        mxfp4_mma_from: defaults.mxfp4_mma_from(),
                         prefill_tc5: false,
                         prefill_wide_sliding: false,
                         decode_grouped_prefill_from: 0,
                         moe_w4a4_fused_from: 65_536,
-                        moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
-                        moe_even_waves_from: defaults.moe_even_waves_from,
-                        moe_routes_sized: defaults.moe_routes_sized,
-                        moe_gather_ahead_until: defaults.moe_gather_ahead_until,
+                        moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout(),
+                        moe_even_waves_from: defaults.moe_even_waves_from(),
+                        moe_routes_sized: defaults.moe_routes_sized(),
+                        moe_gather_ahead_until: defaults.moe_gather_ahead_until(),
                         moe_w4a8_fused_from: 65_536,
                         mla_expanded_from: 65_536,
                         gemm_fp8_gemv_until: 0,
@@ -681,8 +586,8 @@ mod tests {
                         pdl: false,
                         gemm_rows_m: 0,
                         gemm_tc5_split_tickets: 0,
-                        nvfp4_mma_from: defaults.nvfp4_mma_from,
-                        nvfp4_mma_until: defaults.nvfp4_mma_until,
+                        nvfp4_mma_from: defaults.nvfp4_mma_from(),
+                        nvfp4_mma_until: defaults.nvfp4_mma_until(),
                         gate_tc5_until: 0,
                         decode_grouped_prefill_lse: false,
                         decode_gqa: false,
@@ -695,9 +600,9 @@ mod tests {
                         index_radix: false,
                         mla_sparse: false,
                         mla_dense_short: false,
-                        compressed_replay: defaults.compressed_replay,
-                        compressed_fp4_pass_from: defaults.compressed_fp4_pass_from,
-                        gemm_fp8_grouped_tc5_until: defaults.gemm_fp8_grouped_tc5_until,
+                        compressed_replay: defaults.compressed_replay(),
+                        compressed_fp4_pass_from: defaults.compressed_fp4_pass_from(),
+                        gemm_fp8_grouped_tc5_until: defaults.gemm_fp8_grouped_tc5_until(),
                         mxfp4_cvt: false,
                         mxfp4_a8_until: 0,
                         mxfp4_a8_from: 0,
@@ -709,7 +614,7 @@ mod tests {
                         index_tc5: false,
                         index_fp4_tc5: false,
                         norm_emit: false,
-                        qkv_rows_from: defaults.qkv_rows_from,
+                        qkv_rows_from: defaults.qkv_rows_from(),
                         ..tuning
                     },
                     defaults,
@@ -731,30 +636,27 @@ mod tests {
                         compressed_decode_until: 0,
                         gemm_rows_m: 0,
                         attn_res_fused_norm: false,
-                        mxfp4_mma_from: defaults.mxfp4_mma_from,
-                        mxfp4_mma_until: defaults.mxfp4_mma_until,
-                        nvfp4_mma_from: defaults.nvfp4_mma_from,
-                        nvfp4_mma_until: defaults.nvfp4_mma_until,
-                        bf16_mma_from: defaults.bf16_mma_from,
-                        bf16_mma_until: defaults.bf16_mma_until,
-                        selected_mma: defaults.selected_mma,
-                        gemm_fp8_gemv_until: defaults.gemm_fp8_gemv_until,
-                        mla_dense_short: defaults.mla_dense_short,
-                        gemm_skinny_rows: defaults.gemm_skinny_rows,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from(),
+                        mxfp4_mma_until: defaults.mxfp4_mma_until(),
+                        nvfp4_mma_from: defaults.nvfp4_mma_from(),
+                        nvfp4_mma_until: defaults.nvfp4_mma_until(),
+                        selected_mma: defaults.selected_mma(),
+                        gemm_fp8_gemv_until: defaults.gemm_fp8_gemv_until(),
+                        mla_dense_short: defaults.mla_dense_short(),
+                        gemm_skinny_rows: defaults.gemm_skinny_rows(),
                         ..tuning
                     },
                     defaults,
                     "{gpu}: Hopper takes the arch-generic arms alone"
                 );
                 assert!(
-                    tuning.ssm_gdn_fused_scan && tuning.pool_mma && tuning.pdl,
+                    tuning.ssm_gdn_fused_scan() && tuning.pool_mma() && tuning.pdl(),
                     "{gpu}"
                 );
                 assert_eq!(
-                    (tuning.mxfp4_mma_from, tuning.mxfp4_mma_until),
+                    (tuning.mxfp4_mma_from(), tuning.mxfp4_mma_until()),
                     (28, 16_777_216)
                 );
-                assert_eq!((tuning.bf16_mma_from, tuning.bf16_mma_until), (16, 65536));
             } else {
                 // The 99 KiB and A100 families take the two-launch gated
                 // delta scan and a prefill's MXFP4 selects on mma.sync
@@ -763,18 +665,18 @@ mod tests {
                     kernels_cuda::tuning::Tuning {
                         ssm_gdn_fused_scan: false,
                         ssm_kda_chunked: false,
-                        mxfp4_mma_from: defaults.mxfp4_mma_from,
-                        mxfp4_mma_until: defaults.mxfp4_mma_until,
-                        mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
+                        mxfp4_mma_from: defaults.mxfp4_mma_from(),
+                        mxfp4_mma_until: defaults.mxfp4_mma_until(),
+                        mxfp4_mma_per_from: defaults.mxfp4_mma_per_from(),
                         ..tuning
                     },
                     defaults,
                     "{gpu}"
                 );
-                assert_eq!(tuning.ssm_gdn_fused_scan, minor != 7, "{gpu}");
-                assert_eq!(tuning.ssm_kda_chunked, minor == 9, "{gpu}");
+                assert_eq!(tuning.ssm_gdn_fused_scan(), minor != 7, "{gpu}");
+                assert_eq!(tuning.ssm_kda_chunked(), minor == 9, "{gpu}");
                 assert_eq!(
-                    tuning.mxfp4_mma_until,
+                    tuning.mxfp4_mma_until(),
                     if minor == 7 { 0 } else { 16_777_216 },
                     "{gpu}"
                 );
@@ -802,19 +704,11 @@ mod tests {
         assert_eq!(
             engine,
             Engine {
-                graphs: Graphs::default(),
-                recording: Recording::Bodies {
-                    mem_megabytes: DEFAULT_BODIES_MEGABYTES
-                },
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
                 lattice_steps: 1,
-                seated_first: false,
-                seat_to_end: false,
-                seat_spread: false,
                 window_spare: false,
-                forward_tokens: 0,
                 walk_fire_rows: 0,
                 fire_rows: 0,
                 prefill_lanes: 0,
@@ -858,13 +752,14 @@ mod tests {
         assert!(!report.untuned());
         let tuning = kernels_cuda::tuning::Tuning::of(&b200);
         assert_eq!(
-            tuning.gemm_skinny_rows, 0,
+            tuning.gemm_skinny_rows(),
+            0,
             "cuBLAS beats the skinny GEMM on a B200"
         );
         let (family, _) = resolve("NVIDIA GB200", &facts(10, 0, 152), None);
         assert_eq!(
             kernels_cuda::tuning::Tuning {
-                gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows,
+                gemm_skinny_rows: kernels_cuda::tuning::Tuning::of(&family).gemm_skinny_rows(),
                 selected_mma: false,
                 selected_cluster: 0,
                 index_mma: false,
@@ -877,11 +772,9 @@ mod tests {
              clusters too) and the MXFP4 experts' fp16 differ from the family"
         );
         assert!(
-            tuning.selected_mma,
+            tuning.selected_mma(),
             "a B200 walks a selection on the tensor cores"
         );
-        assert!(Engine::of(&b200).seated_first);
-        assert_eq!(Engine::of(&b200).forward_tokens, 16384);
         assert_eq!(Engine::of(&b200).walk_fire_rows, 4096);
         assert!(Engine::of(&b200).host_planes);
         assert_eq!(Engine::of(&b200).lattice_steps, 2);
@@ -890,11 +783,7 @@ mod tests {
             Engine {
                 lattice_steps: 1,
                 prefill_lattice_from: Engine::of(&family).prefill_lattice_from,
-                seated_first: false,
-                seat_to_end: false,
-                seat_spread: false,
                 window_spare: false,
-                forward_tokens: 0,
                 walk_fire_rows: 0,
                 fire_rows: 0,
                 prefill_lanes: 0,
@@ -902,10 +791,9 @@ mod tests {
                 ..Engine::of(&b200)
             },
             Engine::of(&family),
-            "only the row lattice, the state seating, the planner's order, the fire width and \
+            "only the row lattice, the state seating, the fire width and \
              the host planes differ from the family's engine"
         );
-        assert!(!Engine::of(&family).seated_first);
         assert!(!Engine::of(&family).host_planes);
         assert_eq!(Engine::of(&family).lattice_steps, 1);
     }
@@ -927,7 +815,7 @@ mod tests {
         ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
             assert!(
-                kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
+                kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan(),
                 "{name}"
             );
         }
@@ -939,7 +827,7 @@ mod tests {
         ] {
             let (p, _) = resolve(name, &facts(major, minor, sms), None);
             assert!(
-                !kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan,
+                !kernels_cuda::tuning::Tuning::of(&p).ssm_gdn_fused_scan(),
                 "{name}"
             );
         }
@@ -952,23 +840,33 @@ mod tests {
     fn the_b200_moe_decisions_are_what_the_kernel_tests_run() {
         let b200 =
             kernels_cuda::tuning::Tuning::of(&resolve("NVIDIA B200", &facts(10, 0, 148), None).0);
-        assert_eq!((b200.moe_tc5, b200.moe_tc5_from), (true, 16));
+        assert_eq!((b200.moe_tc5(), b200.moe_tc5_from()), (true, 16));
         assert_eq!(
-            (b200.mxfp4_mma_from, b200.mxfp4_mma_until, b200.mxfp4_cvt),
+            (
+                b200.mxfp4_mma_from(),
+                b200.mxfp4_mma_until(),
+                b200.mxfp4_cvt()
+            ),
             (28, 1024, true)
         );
-        assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
-        assert_eq!(b200.gate_tc5_until, 256);
-        assert_eq!(b200.moe_w4a4_fused_from, 1);
-        assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
-        assert_eq!(b200.moe_gather_ahead_until, 128);
-        assert_eq!(b200.moe_w4a8_fused_from, 512);
-        assert_eq!((b200.moe_mega_until, b200.moe_mega_bf16_from), (4608, 64));
-        assert_eq!(b200.mla_expanded_from, 256);
-        assert_eq!(b200.gemm_fp8_gemv_until, 4);
-        assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));
-        assert_eq!(b200.mxfp4_cvt_ksplit_until, 6);
-        assert!(b200.attn_res_fused_norm);
+        assert_eq!((b200.nvfp4_mma_from(), b200.nvfp4_mma_until()), (32, 8192));
+        assert_eq!(b200.gate_tc5_until(), 256);
+        assert_eq!(b200.moe_w4a4_fused_from(), 1);
+        assert_eq!(
+            (b200.moe_even_waves_from(), b200.moe_routes_sized()),
+            (3, true)
+        );
+        assert_eq!(b200.moe_gather_ahead_until(), 128);
+        assert_eq!(b200.moe_w4a8_fused_from(), 512);
+        assert_eq!(
+            (b200.moe_mega_until(), b200.moe_mega_bf16_from()),
+            (4608, 64)
+        );
+        assert_eq!(b200.mla_expanded_from(), 256);
+        assert_eq!(b200.gemm_fp8_gemv_until(), 4);
+        assert_eq!((b200.mxfp4_a8_from(), b200.mxfp4_a8_until()), (1, 48));
+        assert_eq!(b200.mxfp4_cvt_ksplit_until(), 6);
+        assert!(b200.attn_res_fused_norm());
     }
 
     #[cfg(not(feature = "rocm"))]
@@ -980,20 +878,20 @@ mod tests {
             )
         };
         let b200 = tuning(10, 0, 148);
-        assert!(b200.moe_tc5);
-        assert_eq!((b200.mxfp4_mma_from, b200.mxfp4_mma_until), (28, 1024));
-        assert!(b200.merge_warp);
-        assert!(b200.pdl);
-        assert_eq!(b200.gemm_tc5_split_tickets, 8);
-        assert_eq!(b200.gemm_rows_m, 8);
+        assert!(b200.moe_tc5());
+        assert_eq!((b200.mxfp4_mma_from(), b200.mxfp4_mma_until()), (28, 1024));
+        assert!(b200.merge_warp());
+        assert!(b200.pdl());
+        assert_eq!(b200.gemm_tc5_split_tickets(), 8);
+        assert_eq!(b200.gemm_rows_m(), 8);
         // Hopper takes the register-dequant selects and none of tcgen05's.
         let h100 = tuning(9, 0, 132);
-        assert!(!h100.moe_tc5 && !h100.mxfp4_cvt && h100.gemm_tc5_split_tickets == 0);
+        assert!(!h100.moe_tc5() && !h100.mxfp4_cvt() && h100.gemm_tc5_split_tickets() == 0);
         assert_eq!(
-            (h100.mxfp4_mma_from, h100.mxfp4_mma_until),
+            (h100.mxfp4_mma_from(), h100.mxfp4_mma_until()),
             (28, 16_777_216)
         );
-        assert_eq!((h100.nvfp4_mma_from, h100.nvfp4_mma_until), (32, 8192));
+        assert_eq!((h100.nvfp4_mma_from(), h100.nvfp4_mma_until()), (32, 8192));
         for (major, minor) in [
             (8, 0),
             (8, 6),
@@ -1005,15 +903,15 @@ mod tests {
             (12, 1),
         ] {
             let other = tuning(major, minor, 132);
-            assert!(!other.moe_tc5, "sm_{major}{minor} keeps the old selects");
+            assert!(!other.moe_tc5(), "sm_{major}{minor} keeps the old selects");
             assert!(
-                !other.merge_warp,
+                !other.merge_warp(),
                 "sm_{major}{minor} keeps the staged merge"
             );
             // Ampere, Ada and the RTX Blackwells take a prefill's MXFP4
             // selects on mma.sync; the rest keep the GEMV.
             assert_eq!(
-                other.mxfp4_mma_until,
+                other.mxfp4_mma_until(),
                 if matches!((major, minor), (8, 0 | 6 | 9) | (12, 0)) {
                     16_777_216
                 } else {
@@ -1022,47 +920,55 @@ mod tests {
                 "sm_{major}{minor} MXFP4 selects"
             );
             assert_eq!(
-                other.gemm_split_launch_ns, 0,
+                other.gemm_split_launch_ns(),
+                0,
                 "sm_{major}{minor} charges a split's launch nothing"
             );
             assert_eq!(
-                other.nvfp4_mma_until, 0,
+                other.nvfp4_mma_until(),
+                0,
                 "sm_{major}{minor} keeps the NVFP4 W4A16 select off the register-dequant kernel"
             );
             assert_eq!(
-                other.gemm_tc5_raster, 8,
+                other.gemm_tc5_raster(),
+                8,
                 "sm_{major}{minor} rasters its dense tcgen05 GEMM 8 tiles a band"
             );
             assert_eq!(
-                other.gemm_rows_m, 0,
+                other.gemm_rows_m(),
+                0,
                 "sm_{major}{minor} keeps a few-row dense product on cuBLAS"
             );
             assert!(
-                other.gemm_tc5_split_tickets == 0,
+                other.gemm_tc5_split_tickets() == 0,
                 "sm_{major}{minor} sums a tcgen05 GEMM's splits in a finalize launch"
             );
             assert!(
-                !other.pdl,
+                !other.pdl(),
                 "sm_{major}{minor} launches no kernel as a programmatic dependent"
             );
             assert_eq!(
-                other.moe_w4a4_fused_from, 65_536,
+                other.moe_w4a4_fused_from(),
+                65_536,
                 "sm_{major}{minor} keeps the W4A4 routed MLP apart"
             );
             assert_eq!(
-                other.moe_w4a8_fused_from, 65_536,
+                other.moe_w4a8_fused_from(),
+                65_536,
                 "sm_{major}{minor} keeps the W4A8 routed MLP apart"
             );
             assert_eq!(
-                other.mla_expanded_from, 65_536,
+                other.mla_expanded_from(),
+                65_536,
                 "sm_{major}{minor} scores a latent prefill absorbed"
             );
             assert_eq!(
-                other.gemm_fp8_gemv_until, 0,
+                other.gemm_fp8_gemv_until(),
+                0,
                 "sm_{major}{minor} runs no FP8 projection as a GEMV"
             );
             assert!(
-                !other.attn_res_fused_norm,
+                !other.attn_res_fused_norm(),
                 "sm_{major}{minor} blends and norms apart"
             );
         }
@@ -1098,7 +1004,8 @@ mod tests {
             report.layers,
             [
                 profile::Source::Seeded("sm89.toml".into()),
-                profile::Source::Seeded("sm89/nvidia-l40s.toml".into())
+                profile::Source::Seeded("sm89/nvidia-l40s.toml".into()),
+                profile::Source::Committed("nvidia-l40s.measured.toml".into())
             ]
         );
         assert!(!report.untuned());
@@ -1111,48 +1018,40 @@ mod tests {
                 Engine {
                     prefill_lattice_from: 256,
                     prefill_lattice_steps: 8,
-                    forward_tokens: if std::ptr::eq(p, &l40s) { 2304 } else { 0 },
-                    seated_first: std::ptr::eq(p, &l40s),
-                    recording: if std::ptr::eq(p, &l40s) {
-                        Recording::Bodies {
-                            mem_megabytes: 1024,
-                        }
-                    } else {
-                        Engine::of(&registry().defaults()).recording
-                    },
                     ..Engine::of(&registry().defaults())
                 }
             );
-            assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan);
+            assert!(kernels_cuda::tuning::Tuning::of(p).ssm_gdn_fused_scan());
             let defaults = kernels_cuda::tuning::Tuning::of(&registry().defaults());
             assert_eq!(
                 kernels_cuda::tuning::Tuning {
                     ssm_gdn_fused_scan: false,
-                    gemm_rows_m: defaults.gemm_rows_m,
-                    mxfp4_mma_from: defaults.mxfp4_mma_from,
-                    mxfp4_mma_until: defaults.mxfp4_mma_until,
-                    mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
-                    nvfp4_mma_from: defaults.nvfp4_mma_from,
-                    nvfp4_mma_until: defaults.nvfp4_mma_until,
-                    gemm_fp8_shadow: defaults.gemm_fp8_shadow,
-                    selected_mma: defaults.selected_mma,
-                    rows_vec: defaults.rows_vec,
-                    hc_tile: defaults.hc_tile,
-                    hc_mma: defaults.hc_mma,
-                    merge_warp: defaults.merge_warp,
-                    norm_emit: defaults.norm_emit,
-                    pool_mma: defaults.pool_mma,
-                    index_mma: defaults.index_mma,
-                    index_radix: defaults.index_radix,
-                    decode_grouped_prefill_from: defaults.decode_grouped_prefill_from,
-                    bf16_mma_from: defaults.bf16_mma_from,
-                    bf16_mma_until: defaults.bf16_mma_until,
-                    mxfp4_fp8_from: defaults.mxfp4_fp8_from,
-                    ssm_kda_chunked: defaults.ssm_kda_chunked,
-                    decode_grouped_prefill_lse: defaults.decode_grouped_prefill_lse,
-                    decode_grouped_prefill_window: defaults.decode_grouped_prefill_window,
-                    fa2_live: defaults.fa2_live,
-                    compressed_replay: defaults.compressed_replay,
+                    gemm_rows_m: defaults.gemm_rows_m(),
+                    mxfp4_mma_from: defaults.mxfp4_mma_from(),
+                    mxfp4_mma_until: defaults.mxfp4_mma_until(),
+                    mxfp4_mma_per_from: defaults.mxfp4_mma_per_from(),
+                    nvfp4_mma_from: defaults.nvfp4_mma_from(),
+                    nvfp4_mma_until: defaults.nvfp4_mma_until(),
+                    gemm_fp8_shadow: defaults.gemm_fp8_shadow(),
+                    selected_mma: defaults.selected_mma(),
+                    rows_vec: defaults.rows_vec(),
+                    hc_tile: defaults.hc_tile(),
+                    hc_mma: defaults.hc_mma(),
+                    merge_warp: defaults.merge_warp(),
+                    norm_emit: defaults.norm_emit(),
+                    pool_mma: defaults.pool_mma(),
+                    index_mma: defaults.index_mma(),
+                    index_radix: defaults.index_radix(),
+                    decode_grouped_prefill_from: defaults.decode_grouped_prefill_from(),
+                    mxfp4_fp8_from: defaults.mxfp4_fp8_from(),
+                    ssm_kda_chunked: defaults.ssm_kda_chunked(),
+                    decode_grouped_prefill_lse: defaults.decode_grouped_prefill_lse(),
+                    decode_grouped_prefill_window: defaults.decode_grouped_prefill_window(),
+                    fa2_live: defaults.fa2_live(),
+                    compressed_replay: defaults.compressed_replay(),
+                    // The L40S's file states its measured rates; the
+                    // roofline is the device's, not a decision.
+                    roof: defaults.roof,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
@@ -1167,7 +1066,6 @@ mod tests {
                     || (spec.id == "kernel.sdpa.selected_mma" && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
-                    || (spec.id == "engine.forward_tokens" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_from"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.index_mma" && std::ptr::eq(p, &l40s))
@@ -1178,12 +1076,8 @@ mod tests {
                     || (spec.id == "kernel.elemwise.rows_vec" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.merge_warp" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.pool_mma" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "kernel.moe.bf16_mma_from" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "kernel.moe.bf16_mma_until" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.moe.mxfp4_fp8_from" && std::ptr::eq(p, &l40s))
                     || spec.id == "kernel.ssm.kda_chunked"
-                    || (spec.id == "engine.seated_first" && std::ptr::eq(p, &l40s))
-                    || (spec.id == "engine.recording" && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_lse"
                         && std::ptr::eq(p, &l40s))
                     || (spec.id == "kernel.sdpa.decode.grouped_prefill_window"
@@ -1216,18 +1110,31 @@ mod hip {
 
     #[test]
     fn a_cdna3_gpu_takes_its_family() {
-        for gpu in ["AMD Instinct MI300X", "AMD Instinct MI325X"] {
+        // The MI300X (the card and a cloud VF of it) reads its rates from its
+        // device file; the MI325X has none yet. The VF also carries its
+        // committed measured profile, under the device files.
+        for (gpu, device, committed) in [
+            ("AMD Instinct MI300X", true, false),
+            ("AMD Instinct MI300X VF", true, true),
+            ("AMD Instinct MI325X", false, false),
+        ] {
             let (profile, report) = resolve(gpu, &facts(9, 4, 304), None);
-            assert_eq!(
-                report.layers,
-                [profile::Source::Seeded("gfx94.toml".into())],
-                "{gpu}"
-            );
+            let mut layers = vec![profile::Source::Seeded("gfx94.toml".into())];
+            if device {
+                layers.push(profile::Source::Seeded(
+                    "gfx94/amd-instinct-mi300x.toml".into(),
+                ));
+            }
+            if committed {
+                layers.push(profile::Source::Committed(
+                    "amd-instinct-mi300x-vf.measured.toml".into(),
+                ));
+            }
+            assert_eq!(report.layers, layers, "{gpu}");
             assert!(report.untuned(), "{gpu}");
             assert_eq!(
                 Engine::of(&profile),
                 Engine {
-                    forward_tokens: 10240,
                     prefill_lattice_from: 2048,
                     prefill_lattice_steps: 8,
                     ..Engine::of(&registry().defaults())
@@ -1250,7 +1157,18 @@ mod hip {
             want.gemm_turn_from = 3;
             want.gemm_turn_wide_until = 32;
             want.ssm_gdn_wide_from = 512;
-            assert_eq!(kernels_cuda::tuning::Tuning::of(&profile), want, "{gpu}");
+            // The MI300X's own file measured one prefill block a CU; the
+            // MI325X, with none, keeps the default.
+            if device {
+                want.prefill_ctas_per_sm = 1;
+            }
+            // The rates are the device's own file's (the norm fold's pricing
+            // reads them), not the family's: not what this checks.
+            let got = kernels_cuda::tuning::Tuning::of(&profile);
+            want.launch_ns = got.launch_ns;
+            want.hbm_gbps = got.hbm_gbps;
+            want.cached_gbps = got.cached_gbps;
+            assert_eq!(got, want, "{gpu}");
         }
     }
 

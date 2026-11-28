@@ -43,12 +43,12 @@ pub struct Diagnostics {
     pub tier_trace: bool,
     pub rs_trace: bool,
     pub fire_trace: bool,
+    pub alloc_trace: bool,
     pub region_trace: bool,
     pub streamed_trace: bool,
     pub kernel_profile: Profile,
     pub kernel_dump: Option<PathBuf>,
     pub keepalive: bool,
-    pub scratch_no_zero: bool,
     pub host_rows: bool,
     pub nan_check: bool,
 
@@ -70,16 +70,20 @@ impl Default for Diagnostics {
             tier_trace: false,
             rs_trace: false,
             fire_trace: false,
+            alloc_trace: false,
             region_trace: false,
             streamed_trace: false,
             kernel_profile: Profile::Off,
             kernel_dump: None,
             keepalive: true,
-            scratch_no_zero: false,
             host_rows: false,
             nan_check: false,
             nan_limit: 3.0e38,
-            prefault: false,
+            // The warm road's zero-copy weights fault in page by page as the
+            // GPU first touches them (~1 GB/s); read ahead by many threads at
+            // load they land at the disk's rate (Gemma 4 E4B on the M1, 14.2
+            // GiB: ready 21-26 s -> 15.3 s). `prefault=off` keeps the lazy road.
+            prefault: true,
             copy_resident: true,
             keepalive_iters: None,
             window_ceiling: None,
@@ -115,10 +119,10 @@ fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<
         .map_err(|_| format!("`{word}` takes a number; `{value}` is not one"))
 }
 
-const WORDS: &str = "`tier-trace`, `rs-trace`, `fire-trace`, \
+const WORDS: &str = "`tier-trace`, `rs-trace`, `fire-trace`, `alloc-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
      `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, \
-     `keepalive=off`, `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
+     `keepalive=off`, `host-rows`, `prefault`, `copy-resident`, \
      `keepalive-iters=<n>`, \
      `window-ceiling=<bytes>`, `streamed-groups=<n>`, `streamed-repeat=<n>`, \
      `streamed-repeat-kind=<wide|partial|single|reduce|argmax>`, \
@@ -142,10 +146,10 @@ impl std::str::FromStr for Diagnostics {
                 "tier-trace" => diag.tier_trace = switch(word, value)?,
                 "rs-trace" => diag.rs_trace = switch(word, value)?,
                 "fire-trace" => diag.fire_trace = switch(word, value)?,
+                "alloc-trace" => diag.alloc_trace = switch(word, value)?,
                 "region-trace" => diag.region_trace = switch(word, value)?,
                 "streamed-trace" => diag.streamed_trace = switch(word, value)?,
                 "keepalive" => diag.keepalive = switch(word, value)?,
-                "scratch-no-zero" => diag.scratch_no_zero = switch(word, value)?,
                 "host-rows" => diag.host_rows = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "nan-limit" => {
@@ -230,7 +234,7 @@ static PUBLISHED: OnceLock<Diagnostics> = OnceLock::new();
 pub(crate) fn publish(stated: &Diagnostics) {
     let published = PUBLISHED.get_or_init(|| stated.clone());
     if published != stated {
-        eprintln!(
+        tracing::warn!(
             "engine-metal: this process already published a diagnostics record, \
              so the different one this boot states is ignored"
         );
@@ -243,6 +247,35 @@ pub fn on() -> &'static Diagnostics {
     PUBLISHED
         .get()
         .unwrap_or_else(|| OFF.get_or_init(Diagnostics::default))
+}
+
+/// `alloc-trace`: one stderr line per Metal object the engine makes (a
+/// buffer, a heap, a library, a pipeline state), with the wall clock in
+/// microseconds since the epoch (to set against the server's ready line),
+/// what was made, its bytes, and the engine-metal frames that asked. What a
+/// serve makes after its load is in the lines past ready.
+pub fn made(what: &str, bytes: u64) {
+    if !on().alloc_trace {
+        return;
+    }
+    let t_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let frames: Vec<&str> = trace
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.split_once(": ").map(|(_, name)| name))
+        .filter(|name| {
+            (name.starts_with("engine_metal::") || name.starts_with("<engine_metal::"))
+                && !name.contains("diag::made")
+        })
+        .take(6)
+        .collect();
+    eprintln!(
+        "[made t_us={t_us} what={what} bytes={bytes} at={}]",
+        frames.join(" < ")
+    );
 }
 
 #[cfg(test)]
@@ -274,6 +307,14 @@ mod tests {
         assert_eq!(diag.kernel_profile.rows(), 60);
         assert_eq!(diag.streamed_nop, 3);
         assert!(!diag.keepalive);
+        let diag: Diagnostics = "alloc-trace".parse().expect("alloc-trace parses");
+        assert!(diag.alloc_trace && diag.any());
+        assert!(
+            !"alloc-trace=off"
+                .parse::<Diagnostics>()
+                .expect("parses")
+                .alloc_trace
+        );
     }
 
     fn an_unknown_word_refuses_by_name() {

@@ -19,9 +19,16 @@ use super::batch::{self, AdmissionLimits};
 use super::frame::{self, FramePlan, FramePolicy, FrameStamp};
 use super::stats::{self, SchedulerStats};
 
-use super::lane::{ControlReplyRx, Lane, LaneCommit, LaunchRefusal, LaunchReplyRx, LaunchResult};
+use super::lane::{ControlReplyRx, Lane, LaneCommit, LaunchReplyRx, LaunchResult};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
+
+mod dispatch;
+mod dump;
+mod enqueue;
+mod handle;
+mod retire;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeaveKind {
     Terminate,
@@ -62,6 +69,48 @@ pub(crate) fn notify_lane_close(scope: ProcessId, owner: Option<ProcessId>) {
 
 pub(crate) fn notify_process_suspend(pid: ProcessId) {
     broadcast(|| SchedulerItem::PipelineLeave(pid, Some(pid), LeaveKind::Suspend, None));
+}
+
+/// `pid` is blocked on the planner or a store (a grant, its restore, room
+/// for a bind, a segment, a fire span, a rung): until it is through it
+/// submits nothing, so no frame on any engine waits on its lanes, and its
+/// complete frames go at once ([`super::frame::FramePolicy::on_owner_waits`]).
+/// Its next submit brings its lanes back.
+pub(crate) fn notify_owner_blocked(pid: ProcessId) {
+    #[cfg(test)]
+    OWNERS_BLOCKED.lock().unwrap().push(pid);
+    broadcast(|| SchedulerItem::OwnerWaits(pid));
+}
+
+/// `pid`'s wait on the planner or a store ended (told before control goes
+/// back to its guest): its fires are awaited at boundaries again.
+pub(crate) fn notify_owner_unblocked(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerUnblocked(pid));
+}
+
+/// The owners told blocked, in order; for a test.
+#[cfg(test)]
+pub(crate) static OWNERS_BLOCKED: std::sync::Mutex<Vec<ProcessId>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// `pid`'s guest waits on input from outside the runtime (a session
+/// receive, a timer, an HTTP response): no frame on any engine waits on its
+/// lanes until each submits again.
+pub(crate) fn notify_owner_away(pid: ProcessId) {
+    broadcast(|| SchedulerItem::OwnerAway(pid));
+}
+
+/// `lane`'s process on `engine` waits on the output of the fire
+/// `completion` settles, having submitted nothing since: no frame on
+/// `engine` waits on the lane until it submits again
+/// ([`super::frame::FramePolicy::on_lane_waits`]).
+pub(crate) fn notify_lane_waits(engine: usize, lane: ProcessId, completion: WorkItemCompletion) {
+    if completion.is_settled() {
+        return;
+    }
+    if let Ok(handle) = crate::scheduler::scheduler_handle(engine) {
+        let _ = handle.send(SchedulerItem::LaneWaits { lane, completion });
+    }
 }
 
 pub(crate) fn notify_process_resume(pid: ProcessId) {
@@ -108,6 +157,10 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     broadcast(|| SchedulerItem::ExecutionSlotConsumed(pid));
 }
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(dead_code, reason = "no policy runs in the browser")
+)]
 pub(crate) fn notify_schedule_changed() {
     broadcast(|| SchedulerItem::Nudge);
 }
@@ -125,6 +178,10 @@ static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,
+    /// When it was handed to the scheduler: a request's lanes name the
+    /// slots its stores held then (a debug check at the engine says how
+    /// long ago).
+    pub(crate) queued: crate::rt::wall::Instant,
     pub(crate) request: crate::engine::FireRequest,
     pub(crate) instance_id: ::engine::InstanceId,
     pub(crate) completion: WorkItemCompletion,
@@ -158,6 +215,7 @@ impl PendingRequest {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             logical_fire_id,
+            queued: crate::rt::wall::Instant::now(),
             request,
             instance_id,
             completion,
@@ -175,49 +233,6 @@ impl PendingRequest {
     }
 }
 
-pub(crate) fn wave_trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
-}
-
-pub(crate) fn wave_trace_emit(line: String) {
-    static BUFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    static LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let buffered = *BUFFERED.get_or_init(|| {
-        #[cfg(target_arch = "wasm32")]
-        let on = false;
-        #[cfg(not(target_arch = "wasm32"))]
-        let on = std::env::var_os("PIE_WAVE_TRACE").is_some_and(|v| v == "buffer");
-        #[cfg(not(target_arch = "wasm32"))]
-        if on {
-            std::thread::spawn(|| {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let drained: Vec<String> =
-                        std::mem::take(&mut *LINES.lock().expect("lines lock poisoned"));
-                    for line in drained {
-                        eprintln!("{line}");
-                    }
-                }
-            });
-        }
-        on
-    });
-    if buffered {
-        LINES.lock().expect("lines lock poisoned").push(line);
-    } else {
-        eprintln!("{line}");
-    }
-}
-
-pub(crate) fn wave_trace_us() -> u128 {
-    static START: std::sync::OnceLock<crate::rt::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(crate::rt::Instant::now)
-        .elapsed()
-        .as_micros()
-}
-
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
     request.lanes.iter().any(|lane| lane.mask.is_some())
 }
@@ -230,10 +245,28 @@ enum SchedulerItem {
     Launch {
         pending: PendingRequest,
     },
+    PrepareProgram {
+        program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    FinishProgram {
+        prepared: ::engine::Prepared,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
+    },
+    FireFacts {
+        key: crate::store::shared::programs::FireKey,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Asks the engine what its standing guest bytes would be once a
+    /// binding is bound, and answers what that adds to the pool's booked
+    /// total (`store::shared::programs`).
+    StandingAfter {
+        binding: Box<::engine::InstanceBinding>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
+    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
         response: tokio::sync::oneshot::Sender<
             Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
@@ -266,6 +299,22 @@ enum SchedulerItem {
     AdmissionQueued(ProcessId),
     AdmissionDequeued(ProcessId),
     ProcessResume(ProcessId),
+    /// The process waits on something the frame's firing would free (a
+    /// raise of the activation rung): its lanes go out of the frame
+    /// ([`super::frame::FramePolicy::on_owner_waits`]).
+    OwnerWaits(ProcessId),
+    /// The owner's wait on the planner or a store ended.
+    OwnerUnblocked(ProcessId),
+    /// The process's guest waits on outside input: its lanes go out of the
+    /// frame until each submits again
+    /// ([`super::frame::FramePolicy::on_owner_away`]).
+    OwnerAway(ProcessId),
+    /// The lane's process waits on the output of the fire the completion
+    /// settles ([`super::frame::FramePolicy::on_lane_waits`]).
+    LaneWaits {
+        lane: ProcessId,
+        completion: WorkItemCompletion,
+    },
     FrameTruncate {
         lane: ProcessId,
         seq: u64,
@@ -290,6 +339,19 @@ enum SchedulerItem {
     Stop,
 }
 
+/// The rows a frame may seal at: the fire cap, or, until the scheduler has
+/// granted the walk that cap (`granted`), the rung the engine still holds
+/// (`held`) where frames queued wider (`queued`) were cut under it. Frames
+/// cut before the cap came down go; the grant, and the rung's lower after
+/// it, wait for them.
+pub(super) fn seal_rows(cap: u32, held: u32, granted: Option<u32>, queued: usize) -> usize {
+    let cap = cap as usize;
+    if granted == Some(cap as u32) || queued <= cap {
+        return cap;
+    }
+    queued.min(held as usize).max(cap)
+}
+
 /// A change to how much of the pool has memory under it.
 #[derive(Debug, Clone)]
 pub(crate) enum PoolOp {
@@ -297,9 +359,48 @@ pub(crate) enum PoolOp {
     CommitSegments(u32),
     /// A shared pool gives back segments `n..` (`Pool::release`).
     ReleaseSegments(u32),
+    /// The activation rung moves (`Pool::set_rung`), where the span is
+    /// backed on demand: a raise before any fire of the wider rung, a lower
+    /// as a notice after its retire fence.
+    Rung { from: u32, to: u32 },
+    /// A shared pool whose span is backed on demand backs its top `n` span
+    /// segments (`Pool::commit_span`).
+    CommitSpan(u32),
+    /// A shared pool whose span is backed on demand keeps its top `n` span
+    /// segments and gives back the rest (`Pool::release_span`).
+    ReleaseSpan(u32),
     /// A shared pool's chunks move, ahead of every fire queued after it
     /// (`Pool::evacuate`).
     Evacuate(::engine::chunk::Evacuation),
+    /// An instance's tables or a ring were unparked into these slots
+    /// (`Programs::rebind`), ahead of every fire queued after it.
+    Rebind(::engine::Rebind),
+    /// Every copy submitted so far has landed (`Tiers::settle`):
+    /// what an aborted move waits for before it gives back slots a copy may
+    /// still be writing.
+    SettleCopies,
+    /// The engine's chunk table (`Pool::chunk_table`) checked against the
+    /// runtime's logical to physical map, by logical chunk: refused naming
+    /// the first chunk they place apart. What a refused evacuation is
+    /// checked by, the engine's word that nothing moved not taken on trust.
+    CheckTable(Vec<u32>),
+}
+
+impl PoolOp {
+    /// Its name, as a stall dump says the call a lane is in.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::CommitSegments(_) => "commit segments",
+            Self::ReleaseSegments(_) => "release segments",
+            Self::Rung { .. } => "set rung",
+            Self::CommitSpan(_) => "commit span",
+            Self::ReleaseSpan(_) => "release span",
+            Self::Evacuate(_) => "evacuate",
+            Self::Rebind(_) => "rebind",
+            Self::SettleCopies => "settle copies (waits every copy landed)",
+            Self::CheckTable(_) => "check chunk table",
+        }
+    }
 }
 
 /// A read or write of host kv slots' bytes, behind every copy queued before
@@ -314,23 +415,74 @@ pub(crate) enum HostKvOp {
     /// one item on the lane, with no completion to settle between.
     CopyRead(::engine::KvCopy, Vec<u32>),
     /// The bytes of host kv slots.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "the browser has no host or disk tier")
+    )]
     Read(Vec<u32>),
     /// The bytes of host tier slots, shape by shape (`Tiers::read`).
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "the browser has no host or disk tier")
+    )]
     ReadTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>),
+    #[cfg_attr(
+        target_arch = "wasm32",
+        allow(dead_code, reason = "the browser has no host or disk tier")
+    )]
     WriteTier(Vec<(::engine::chunk::ShapeId, Vec<u32>)>, Vec<u8>),
     /// The engine's tap groups (`Taps::groups`), as JSON.
     TapGroups,
-    /// The weight cache's resident set (`WeightCache::set_residency`), ahead
+    /// The weight cache's resident set (`WeightCache::set_residency`),
+    /// answered with the bytes the engine holds back once it took it, ahead
     /// of every fire queued after it.
     WeightResidency(::engine::chunk::WeightResidency),
     /// The engine's weight use record since it last answered
     /// (`WeightCache::uses`), as JSON.
     WeightUses,
+    /// A beam group's beam's page list (`Programs::beam_list`), little-endian
+    /// u32s: behind every fire queued before it.
+    BeamList(::engine::InstanceId, u32),
+    /// Overwrites the model's weights in place from a checkpoint
+    /// (`WeightCache::reload`), answering what it wrote as JSON.
     ReloadWeights(std::path::PathBuf),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 type SchedTx = tokio::sync::mpsc::UnboundedSender<SchedulerItem>;
+#[cfg(not(target_arch = "wasm32"))]
 type SchedRx = tokio::sync::mpsc::UnboundedReceiver<SchedulerItem>;
+
+/// The tab's scheduler mailbox: web_std's channel, as the lane's control
+/// queue is, so a send while the scheduler sleeps on it wakes it through the
+/// page's executor (a tokio mailbox's send there left it asleep).
+#[cfg(target_arch = "wasm32")]
+type SchedTx = crate::rt::channel::Sender<SchedulerItem>;
+#[cfg(target_arch = "wasm32")]
+struct SchedRx(crate::rt::channel::Receiver<SchedulerItem>);
+
+#[cfg(target_arch = "wasm32")]
+impl SchedRx {
+    async fn recv(&mut self) -> Option<SchedulerItem> {
+        self.0.recv_async().await.ok()
+    }
+
+    fn try_recv(&mut self) -> Result<SchedulerItem, crate::rt::channel::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
+fn sched_channel() -> (SchedTx, SchedRx) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        tokio::sync::mpsc::unbounded_channel::<SchedulerItem>()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let (tx, rx) = crate::rt::channel::unbounded::<SchedulerItem>();
+        (tx, SchedRx(rx))
+    }
+}
 #[derive(Default)]
 struct LaneReplies {
     next_control_id: u64,
@@ -411,6 +563,28 @@ pub(crate) enum PreLaunchCopy {
 }
 
 impl PreLaunchCopy {
+    /// What the copy moves, between which tiers: what a stall dump names
+    /// an unsettled copy by.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Self::Kv(copy) => format!(
+                "kv {:?}->{:?} {} pages",
+                copy.src,
+                copy.dst,
+                copy.src_page_ids.len().max(copy.moves.len())
+            ),
+            Self::State(_) => "recurrent state".to_string(),
+            Self::Slots(copy) => format!(
+                "shape {} {:?}->{:?} {} slots {} runs",
+                copy.shape.0,
+                copy.src,
+                copy.dst,
+                copy.slots.len(),
+                copy.runs.len()
+            ),
+        }
+    }
+
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Kv(_) => "KV copy",
@@ -423,7 +597,6 @@ impl PreLaunchCopy {
 pub(super) struct BindRespond {
     pub(super) registered: Vec<RegisteredChannel>,
     pub(super) program_id: ::engine::ProgramId,
-    pub(super) program_registered: bool,
     pub(super) response: tokio::sync::oneshot::Sender<
         Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
     >,
@@ -437,10 +610,36 @@ pub(super) enum QueuedItem {
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
     },
+    /// A program's registration, first step: the engine checks it and
+    /// hands back its compile (`Programs::prepare`), which runs off
+    /// the lane while the lane fires on.
+    PrepareProgram {
+        program: Box<ProgramRegistration>,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramCompile>>,
+    },
+    /// A program's registration, last step: the engine takes what its
+    /// compile made (`Programs::finish`), and the lane learns what an
+    /// instance of it holds in the pool.
+    FinishProgram {
+        prepared: ::engine::Prepared,
+        response: tokio::sync::oneshot::Sender<Result<::engine::ProgramId>>,
+    },
+    /// Asks the engine what fires of a program bound at given extents take
+    /// beside the model's activation, for the pool's rung arithmetic.
+    FireFacts {
+        key: crate::store::shared::programs::FireKey,
+        response: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Asks the engine what its standing guest bytes would be once a
+    /// binding is bound, and answers what that adds to the pool's booked
+    /// total (`store::shared::programs`).
+    StandingAfter {
+        binding: Box<::engine::InstanceBinding>,
+        response: tokio::sync::oneshot::Sender<Result<u64>>,
+    },
     RegisterChannelsBind {
         pipeline_id: Option<ProcessId>,
         plans: Vec<ChannelRegistration>,
-        program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
         response: tokio::sync::oneshot::Sender<
             Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
@@ -467,9 +666,95 @@ pub(super) enum QueuedItem {
     },
 }
 
+/// The rows the scheduler's queued and in-flight launches ask a fire to
+/// carry, held as a rung want: the most they asked since the scheduler
+/// last slept with nothing to do, so a batch that breathes between its
+/// steps does not move the rung back and forth each step.
+#[derive(Default)]
+struct BatchWant(Option<(usize, crate::store::shared::RungWant)>);
+
+impl BatchWant {
+    fn ask(&mut self, engine: usize, rows: usize) {
+        if rows == 0 || self.0.as_ref().is_some_and(|(held, _)| *held >= rows) {
+            return;
+        }
+        let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
+        let want = crate::store::shared::want_rows(engine, rows32);
+        self.0 = Some((rows, want));
+        // As a pass's ask does: the rung is raised at once where nothing
+        // moves, and a cap the walker lowered behind a rung still up is
+        // lifted back, so the batch is not cut while the walk catches up.
+        if let Some(shared) = crate::store::registry::try_get(0, engine).and_then(|s| s.shared) {
+            crate::store::shared::raise_now(&shared, engine, rows32);
+        }
+    }
+
+    /// Asks the rows one fire of `fires` (the queued and in-flight
+    /// launches) takes, no more than a step carries.
+    fn ask_for<'a>(
+        &mut self,
+        engine: usize,
+        count: &mut RowCount,
+        fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
+        max_forward_tokens: usize,
+    ) {
+        self.ask(engine, count.count(fires).min(max_forward_tokens));
+    }
+
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// The rows one fire of a set of launches takes: each lane's rows (a
+/// prompt's tokens, a verify's drafted rows, one a decode), summed over the
+/// lanes. A lane rides its seat in every launch it is queued or in flight
+/// in, and a fire carries one of them, so a lane counts the widest of its
+/// pipelined launches once; a seatless lane counts in the launch whose
+/// seatless lanes take the most rows. The rows a launch carries past its
+/// own ([`crate::engine::FireRequest::rung_rows`]) count as the widest such
+/// launch's.
+#[derive(Default)]
+struct RowCount {
+    seats: Vec<u32>,
+}
+
+impl RowCount {
+    fn count<'a>(
+        &mut self,
+        fires: impl IntoIterator<Item = &'a crate::engine::FireRequest>,
+    ) -> usize {
+        self.seats.fill(0);
+        let mut seatless = 0usize;
+        let mut carried = 0usize;
+        for fire in fires {
+            let mut here = 0usize;
+            for lane in &fire.lanes {
+                let rows = lane.tokens.len().max(1);
+                if lane.kv_less {
+                    here += rows;
+                    continue;
+                }
+                let seat = lane.slot as usize;
+                if seat >= self.seats.len() {
+                    self.seats.resize(seat + 1, 0);
+                }
+                let rows32 = u32::try_from(rows).unwrap_or(u32::MAX);
+                self.seats[seat] = self.seats[seat].max(rows32);
+            }
+            seatless = seatless.max(here);
+            carried = carried.max(fire.rung_rows().saturating_sub(fire.tokens()));
+        }
+        let seated: usize = self.seats.iter().map(|&rows| rows as usize).sum();
+        seated + seatless + carried
+    }
+}
+
 pub(super) struct QueuedLaunch {
     fire_id: u64,
     framed: bool,
+    /// Fired in a batch of its own ([`HeldForPlacement::solo`]).
+    solo: bool,
     request: Box<PendingRequest>,
 }
 
@@ -478,6 +763,7 @@ impl QueuedLaunch {
         Self {
             fire_id: request.logical_fire_id,
             framed: request.frame.is_some(),
+            solo: false,
             request,
         }
     }
@@ -497,7 +783,7 @@ impl std::ops::Deref for QueuedLaunch {
 enum LaunchState {
     Posted,
     Accepted(SubmissionCompletion),
-    Failed(LaunchRefusal),
+    Failed(String),
 }
 
 struct PendingLaunchBatch {
@@ -510,10 +796,46 @@ struct PendingLaunchBatch {
                   of those moves 8 bytes. Matches that function's signature"
     )]
     requests: Vec<Box<PendingRequest>>,
-    lanes_of: Vec<u32>,
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
+    /// What the batch takes of its rung: its tokens, or the recurrent rows
+    /// its requests carry where they are more.
+    rung_rows: usize,
+    /// Where the engine refused it for where state lies
+    /// (`engine::Error::Placement`), the logical chunks it named.
+    placement: Vec<u32>,
+    /// Refused so, its steps as the engine was handed them: the lanes its
+    /// requests go again by (`batch::restore_lanes`).
+    unfired: Vec<crate::engine::StepFire>,
+}
+
+/// Fires of a batch the engine refused for where state lies, held until
+/// the pool has moved that state down ([`crate::store::shared::evacuate_refused`]),
+/// then fired again; none fails for it.
+struct HeldForPlacement {
+    chunks: Vec<u32>,
+    #[allow(
+        clippy::vec_box,
+        reason = "as `PendingLaunchBatch::requests`: the box keeps each move of a 1408-byte request 8 bytes"
+    )]
+    requests: Vec<Box<PendingRequest>>,
+    /// Fired again one by one: refused again after the move landed, so
+    /// only the fires the engine still refuses alone fail.
+    solo: bool,
+    /// The planner was asked for the free chunks its move lacks.
+    funding: bool,
+    /// What its fires' pipelines queued behind them, in order: each reads
+    /// what they write, so it goes behind them ([`BatchScheduler::hold_behind`]).
+    later: Vec<QueuedItem>,
+}
+
+impl HeldForPlacement {
+    fn holds(&self, pipeline: ProcessId) -> bool {
+        self.requests
+            .iter()
+            .any(|request| request.pipeline_id == Some(pipeline))
+    }
 }
 
 enum ControlSlotState {
@@ -530,6 +852,10 @@ struct PendingControl {
     operation: &'static str,
     holds_launches: bool,
     prelaunch: bool,
+    /// What it moves, said by a stall dump (a copy's tiers and slots).
+    what: String,
+    /// When it was posted to the lane: how long a dump finds it unsettled.
+    since: crate::rt::Instant,
 }
 
 #[derive(Default)]
@@ -599,7 +925,12 @@ struct QueueScan {
     /// behind its copy.
     untracked: Vec<u64>,
     riding: HashSet<Option<ProcessId>>,
+    /// The pipelines with a framed launch queued: an unframed one behind it
+    /// does not ride ahead of it.
+    framed_ahead: HashSet<ProcessId>,
     drain_eligible: Vec<u64>,
+    /// The rider batch is one fire fired alone ([`QueuedLaunch::solo`]).
+    solo: bool,
 }
 
 impl QueueScan {
@@ -608,6 +939,8 @@ impl QueueScan {
         self.blocked_lanes.clear();
         self.untracked.clear();
         self.riding.clear();
+        self.framed_ahead.clear();
+        self.solo = false;
         self.drain_eligible.clear();
     }
 }
@@ -664,9 +997,33 @@ impl PendingQueue {
         idx
     }
 
-    fn rotate_launch_run_to_back(&mut self, run_len: usize) {
-        self.items.rotate_left(run_len);
+    /// The item at `at` comes to the front; every other keeps its order. A
+    /// launch never moves behind a later one: a cut pass's pieces, each
+    /// reading what the one before it writes, reach the device in the order
+    /// they were queued.
+    fn bring_to_front(&mut self, at: usize) {
+        if let Some(item) = self.items.remove(at) {
+            self.items.push_front(item);
+        }
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// A launch queued behind a later one of its pipeline, `(pipeline, the
+    /// later fire ahead, the fire behind it)`: a mover of the queue broke
+    /// their order.
+    fn out_of_order(&self) -> Option<(ProcessId, u64, u64)> {
+        let mut last: HashMap<ProcessId, u64> = HashMap::new();
+        self.items.iter().find_map(|item| {
+            let QueuedItem::Launch(launch) = item else {
+                return None;
+            };
+            let pipeline = launch.pipeline_id?;
+            let fire = launch.request.logical_fire_id;
+            match last.insert(pipeline, fire) {
+                Some(ahead) if ahead > fire => Some((pipeline, ahead, fire)),
+                _ => None,
+            }
+        })
     }
 
     fn insert_before_closes(&mut self, item: QueuedItem) {
@@ -727,232 +1084,79 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<
-        HashMap<
-            u64,
-            (
-                ::engine::ProgramId,
-                ::eta_compiler::codegen::launch::LaunchPackage,
-            ),
-        >,
-    >,
+    /// Each program registered or registering, by its content hash, with
+    /// its launch package (a hash collision is refused by name): one
+    /// registration a program, however many binds ask for it at once.
+    program_ids: Mutex<HashMap<u64, (Known, ::eta_compiler::codegen::launch::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     device_domain: ::engine::MemoryDomain,
-    compiler: Arc<std::sync::OnceLock<(::engine::ProgramCompiler, Option<String>)>>,
+    /// The backend a registration's host codegen emits for, off the
+    /// engine's thread (`EngineSpec::codegen_backend`).
+    codegen_backend: Option<String>,
+}
+
+/// What a bind finds of a program by its content hash.
+enum Known {
+    /// Registered: its id.
+    Ready(::engine::ProgramId),
+    /// Its registration under way: the answer every bind of it waits for.
+    Registering(tokio::sync::watch::Receiver<Option<Answer>>),
+}
+
+/// A registration's answer, as each bind waiting on it takes it.
+type Answer = std::result::Result<::engine::ProgramId, String>;
+
+/// Answers a registration's waiters when it is dropped unanswered (its
+/// task cancelled or panicking): the in-flight entry goes, and each waiter
+/// is refused by the program's hash, so a later bind registers it afresh.
+struct Unanswered {
+    handle: SchedulerHandle,
+    hash: u64,
+    answer: Option<tokio::sync::watch::Sender<Option<Answer>>>,
+}
+
+impl Unanswered {
+    fn answer(mut self, answer: Answer) {
+        {
+            let mut ids = self.handle.inner.program_ids.lock().unwrap();
+            match answer {
+                Ok(id) => {
+                    if let Some(entry) = ids.get_mut(&self.hash) {
+                        entry.0 = Known::Ready(id);
+                    }
+                }
+                Err(_) => {
+                    ids.remove(&self.hash);
+                }
+            }
+        }
+        if let Some(sender) = self.answer.take() {
+            let _ = sender.send(Some(answer));
+        }
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some(sender) = self.answer.take() {
+            self.handle
+                .inner
+                .program_ids
+                .lock()
+                .unwrap()
+                .remove(&self.hash);
+            let _ = sender.send(Some(Err(format!(
+                "program 0x{:016x}: its registration ended unanswered",
+                self.hash
+            ))));
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct SchedulerHandle {
     inner: Arc<SchedulerControl>,
-}
-
-impl SchedulerHandle {
-    pub(crate) fn device_domain(&self) -> ::engine::MemoryDomain {
-        self.inner.device_domain
-    }
-
-    fn send(&self, item: SchedulerItem) -> Result<()> {
-        if !self.inner.accepting.load(Ordering::SeqCst) {
-            return Err(anyhow!("scheduler shutting down"));
-        }
-        self.inner.active_senders.fetch_add(1, Ordering::SeqCst);
-        if !self.inner.accepting.load(Ordering::SeqCst) {
-            self.finish_send();
-            return Err(anyhow!("scheduler shutting down"));
-        }
-        let result = self
-            .inner
-            .tx
-            .send(item)
-            .map_err(|_| anyhow!("scheduler channel closed"));
-        self.finish_send();
-        result
-    }
-
-    fn finish_send(&self) {
-        if self.inner.active_senders.fetch_sub(1, Ordering::SeqCst) == 1
-            && !self.inner.accepting.load(Ordering::SeqCst)
-        {
-            let _guard = self.inner.shutdown_gate.lock().unwrap();
-            self.inner.shutdown_wait.notify_all();
-        }
-    }
-
-    fn begin_shutdown(&self) {
-        if !self.inner.accepting.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        let mut guard = self.inner.shutdown_gate.lock().unwrap();
-        while self.inner.active_senders.load(Ordering::SeqCst) != 0 {
-            guard = self.inner.shutdown_wait.wait(guard).unwrap();
-        }
-        let _ = self.inner.tx.send(SchedulerItem::Stop);
-    }
-
-    async fn request<T>(
-        &self,
-        make: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> SchedulerItem,
-    ) -> Result<T> {
-        let (response, receiver) = tokio::sync::oneshot::channel();
-        self.send(make(response))?;
-        receiver
-            .await
-            .map_err(|_| anyhow!("scheduler channel closed"))
-    }
-
-    pub(crate) fn stats(&self) -> Arc<SchedulerStats> {
-        Arc::clone(&self.inner.stats)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_prebuilt_tracked_with_copy(
-        &self,
-        request: crate::engine::FireRequest,
-        instance_id: ::engine::InstanceId,
-        completion: WorkItemCompletion,
-        process_id: ProcessId,
-        pipeline_id: ProcessId,
-        prelaunch_copy: Option<::engine::KvCopy>,
-        prelaunch_state_copy: Option<StateCopy>,
-        frame: Option<FrameStamp>,
-        lora_program: bool,
-    ) -> Result<()> {
-        self.send(SchedulerItem::Launch {
-            pending: PendingRequest::direct(
-                request,
-                instance_id,
-                completion,
-                Some(process_id),
-                Some(pipeline_id),
-                prelaunch_copy,
-                prelaunch_state_copy,
-                frame,
-                lora_program,
-            ),
-        })
-    }
-
-    pub fn frame_truncate(&self, lane: ProcessId, seq: u64, submitted: u32) -> Result<()> {
-        self.send(SchedulerItem::FrameTruncate {
-            lane,
-            seq,
-            submitted,
-        })
-    }
-
-    pub(crate) fn nudge(&self) -> Result<()> {
-        self.send(SchedulerItem::Nudge)
-    }
-
-    pub async fn register_channels_bind(
-        &self,
-        pipeline_id: Option<ProcessId>,
-        plans: Vec<ChannelRegistration>,
-        program: ProgramRegistration,
-        mut bind: InstanceBindingPlan,
-    ) -> Result<(Vec<RegisteredChannel>, BoundInstance)> {
-        let program_hash = program.program_hash;
-        let cached = {
-            let program_ids = self.inner.program_ids.lock().unwrap();
-            match program_ids.get(&program_hash) {
-                Some((program_id, launch)) => {
-                    if launch != &program.launch {
-                        return Err(anyhow!("program hash collision for 0x{program_hash:016x}"));
-                    }
-                    Some(*program_id)
-                }
-                None => None,
-            }
-        };
-        if cached.is_none()
-            && let Some((compile, backend)) = self.inner.compiler.get().cloned()
-        {
-            let plan = program.clone();
-            let (done, compiled) = tokio::sync::oneshot::channel::<()>();
-            let spawned = crate::rt::thread::Builder::new()
-                .name("pie-compile".to_string())
-                .spawn(move || {
-                    let plan =
-                        crate::pipeline::program::with_host_codegen(&plan, backend.as_deref());
-                    compile(&plan);
-                    let _ = done.send(());
-                });
-            if spawned.is_ok() {
-                let _ = compiled.await;
-            }
-        }
-        let (program_field, cache_fill) = match cached {
-            Some(program_id) => {
-                bind.binding.program = program_id;
-                (None, None)
-            }
-            None => (Some(Box::new(program.clone())), Some(program.launch)),
-        };
-        let (registered, program_id, bound) = self
-            .request(|response| SchedulerItem::RegisterChannelsBind {
-                pipeline_id,
-                plans,
-                program: program_field,
-                bind,
-                response,
-            })
-            .await??;
-        if let Some(launch) = cache_fill {
-            self.inner
-                .program_ids
-                .lock()
-                .unwrap()
-                .insert(program_hash, (program_id, launch));
-        }
-        Ok((registered, bound))
-    }
-
-    pub(crate) fn copy_tracked(&self, plan: PreLaunchCopy) -> Result<ControlCompletion> {
-        let completion = ControlCompletion::new();
-        self.send(SchedulerItem::CopyTracked {
-            plan,
-            completion: completion.clone(),
-        })?;
-        Ok(completion)
-    }
-
-    pub(crate) async fn host_kv(&self, op: HostKvOp) -> Result<Vec<u8>> {
-        self.request(|response| SchedulerItem::HostKv { op, response })
-            .await?
-    }
-
-    /// Queues `op` on the lane without waiting on it: what the lane answers
-    /// arrives on the receiver.
-    pub(crate) fn host_kv_queued(
-        &self,
-        op: HostKvOp,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<Vec<u8>>>> {
-        let (response, receiver) = tokio::sync::oneshot::channel();
-        self.send(SchedulerItem::HostKv { op, response })?;
-        Ok(receiver)
-    }
-
-    /// Between frames, on the lane that owns the engine.
-    pub(crate) async fn pool(&self, op: PoolOp) -> Result<()> {
-        self.request(|response| SchedulerItem::Pool { op, response })
-            .await?
-    }
-
-    pub fn close_instance(&self, id: ::engine::InstanceId, pacing_wait_id: u64) -> Result<()> {
-        self.send(SchedulerItem::CloseInstance { id, pacing_wait_id })
-    }
-
-    pub fn close_channel(&self, id: ::engine::ChannelId) -> Result<()> {
-        self.send(SchedulerItem::CloseChannel { id })
-    }
-
-    pub fn close_channels(&self, ids: Vec<::engine::ChannelId>) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        self.send(SchedulerItem::CloseChannels { ids })
-    }
 }
 
 pub struct BatchScheduler {
@@ -969,10 +1173,8 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         frame_size: usize,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SchedulerItem>();
+        let (tx, rx) = sched_channel();
         let stats = Arc::new(SchedulerStats::default());
-        let compiler = Arc::new(std::sync::OnceLock::new());
-        let compiler_for_loop = Arc::clone(&compiler);
         let handle = SchedulerHandle {
             inner: Arc::new(SchedulerControl {
                 tx,
@@ -983,7 +1185,9 @@ impl BatchScheduler {
                 accepting: AtomicBool::new(true),
                 stats: Arc::clone(&stats),
                 device_domain: crate::scheduler::device_domain(engine_idx),
-                compiler,
+                codegen_backend: crate::engine::get_spec(engine_idx)
+                    .ok()
+                    .and_then(|spec| spec.codegen_backend),
             }),
         };
         crate::scheduler::install_scheduler_handle(engine_id, handle.clone());
@@ -1000,7 +1204,6 @@ impl BatchScheduler {
                     limits,
                     stats_for_loop,
                     frame_size,
-                    compiler_for_loop,
                 ));
             })
             .expect("spawn pie-sched thread");
@@ -1025,10 +1228,6 @@ impl BatchScheduler {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the scheduler thread's whole start, handed over once from `new`"
-    )]
     async fn run(
         engine_id: EngineId,
         mut rx: SchedRx,
@@ -1037,15 +1236,8 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
         frame_size: usize,
-        compiler: Arc<std::sync::OnceLock<(::engine::ProgramCompiler, Option<String>)>>,
     ) {
-        let mut engine = crate::engine::take_engine_backend(engine_id).ok();
-        if let Some(engine) = engine.as_mut()
-            && let Some(compile) = engine.programs().and_then(|programs| programs.compiler())
-        {
-            let backend = crate::engine::verbs::codegen_backend(engine).map(str::to_owned);
-            let _ = compiler.set((compile, backend));
-        }
+        let engine = crate::engine::take_engine_backend(engine_id).ok();
         let mut lane = Lane::spawn(engine_id, engine, Arc::clone(&stats));
         let mut replies = LaneReplies::default();
         let mut instances = HashMap::new();
@@ -1054,6 +1246,10 @@ impl BatchScheduler {
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
+        let mut held_for_placement: Vec<HeldForPlacement> = Vec::new();
+        let mut refused_once: HashSet<u32> = HashSet::new();
+        let mut batch_want = BatchWant::default();
+        let mut row_count = RowCount::default();
         let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         let mut frame_policy = FramePolicy::new(
@@ -1067,6 +1263,12 @@ impl BatchScheduler {
             .preload_free_slots(crate::inferlet::process::execution_slot_capacity().unwrap_or(0));
         let mut stall_since: Option<crate::rt::Instant> = None;
         let mut stall_dumps: u32 = 0;
+        // The cap the scheduler last told the walk it holds nothing wider
+        // than ([`crate::store::shared::grant_rung`]), and what was said of
+        // frames held under the cap.
+        let mut granted_cap: Option<u32> = None;
+        let mut held_cap_said: Option<u32> = None;
+        let mut owed_said = 0usize;
 
         loop {
             let mut progress = false;
@@ -1078,6 +1280,7 @@ impl BatchScheduler {
                     &mut in_flight_control,
                     &mut frame_policy,
                     &nudge_tx,
+                    engine_id,
                 );
                 progress = true;
             }
@@ -1096,40 +1299,88 @@ impl BatchScheduler {
                     item,
                 );
             }
-            let mut apart = Vec::new();
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
                 &mut instances,
                 &stats,
                 &mut frame_policy,
-                &mut apart,
+                &mut held_for_placement,
+                &mut refused_once,
+                engine_id,
             );
-            if !apart.is_empty() {
-                progress |= Self::launch_apart(
-                    apart,
-                    &lane,
-                    &mut replies,
-                    &mut instances,
-                    &mut in_flight_launches,
-                    page_size,
-                    limits,
-                    &stats,
-                );
-            }
+            Self::hold_behind(&mut held_for_placement, &mut pending);
+            progress |= Self::release_held(&mut held_for_placement, &mut pending, engine_id);
             progress |= Self::retire_ready_control(&mut in_flight_control);
             // A step's tokens stay within the pool's activation rung (SPEC
             // decision 6): smaller while the system is critical.
+            // What is queued and in flight asks the rung of the rows one
+            // fire of it takes (REDESIGN 2.5): a decode batch's lane count,
+            // a prompt wave's tokens summed over its lanes, so a frame is
+            // never cut to a narrower rung for want of asking. A pass asks
+            // for its own rows besides ([`crate::store::shared::want_rows`]).
+            let queued = pending.items.iter().filter_map(|item| match item {
+                QueuedItem::Launch(launch) => Some(&launch.request.request),
+                _ => None,
+            });
+            let flying = in_flight_launches
+                .iter()
+                .flat_map(|batch: &PendingLaunchBatch| batch.requests.iter())
+                .map(|request| &request.request);
+            batch_want.ask_for(
+                engine_id,
+                &mut row_count,
+                queued.chain(flying),
+                limits.max_forward_tokens,
+            );
             let cap = crate::store::shared::fire_cap(engine_id);
+            // A grant is of one cap: moved since, it is granted again.
+            if granted_cap.is_some_and(|granted| granted != cap) {
+                granted_cap = None;
+            }
             let mut stepped = limits;
-            stepped.max_forward_tokens = stepped.max_forward_tokens.min(cap as usize).max(1);
-            // No launch past the cap is submitted from here (`post_frame`
-            // holds it): once none in flight is either, the pool may lower
-            // its rung.
+            // Frames queued before the cap came down were cut at the rung the
+            // engine still holds: they seal under it, and the rung comes down
+            // once they have gone (the grant below waits on them). Capped
+            // there, a complete frame would sit unsealed on a raise the
+            // pressure that lowered the cap cannot fund. Past the grant (none
+            // wider queued then), nothing wider seals: the rung may be coming
+            // down.
+            let seal = seal_rows(
+                cap,
+                crate::store::shared::engine_rows(engine_id),
+                granted_cap,
+                frame_policy.queued_widest(),
+            );
+            if seal > cap as usize && held_cap_said != Some(cap) {
+                held_cap_said = Some(cap);
+                tracing::info!(
+                    engine_id,
+                    cap,
+                    queued = frame_policy.queued_widest(),
+                    "the activation rung's cap came down under frames already cut wider: they \
+                     seal under the rung the engine holds, and the rung comes down once they \
+                     have gone"
+                );
+            }
+            stepped.max_forward_tokens = stepped.max_forward_tokens.min(seal).max(1);
+            // No frame past the cap is sealed from here, and no unframed
+            // launch past it posted (`post_frame` holds it): once none in
+            // flight is either, nor a frame sealed before still to go, the
+            // pool may lower its rung.
+            frame_policy.cap_fires(stepped.max_forward_tokens);
+            // Nor while a complete frame cut wider than the cap waits
+            // unsealed (capped): lowered under it, the frame goes only once
+            // raised again, a raise its owner's eviction cannot fund while
+            // that eviction waits on the frame. Kept, the walk lifts the cap
+            // to the frame with no raise at all.
             if in_flight_launches
                 .iter()
-                .all(|batch| batch.total_tokens <= cap as usize)
+                .all(|batch| batch.rung_rows <= cap as usize)
+                && frame_policy.sealed_widest() <= cap as usize
+                && frame_policy.queued_widest() <= cap as usize
             {
                 crate::store::shared::grant_rung(engine_id, cap);
+                granted_cap = Some(cap);
             }
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
@@ -1146,6 +1397,41 @@ impl BatchScheduler {
                 &mut slot_buffer,
                 stopping,
             );
+            // A raise to held frames refused by name (it never fits beside
+            // its owner's own state): the frames held for it leave, their
+            // fires failed by that name, never held for good.
+            if let Some((owner, why)) = crate::store::shared::take_refused_owed(engine_id) {
+                let fires = frame_policy.refuse_held(owner);
+                Self::reject_fires_queued(&mut pending, &fires, &why);
+                progress |= !fires.is_empty();
+            }
+            // Frames held out under the cap are owed a raise: the cap's
+            // owner is told, its walk raising the rung to them (a hold with
+            // nothing in flight waited on a raise nothing asked for).
+            let (owed, owed_by) = frame_policy.cut_owed_by();
+            // A frame queued wider after the lower was granted waits on a
+            // raise to it: said once a width, never silent.
+            if owed > 0 && owed_said != owed {
+                tracing::info!(
+                    engine_id,
+                    owed,
+                    cap,
+                    owner = ?owed_by,
+                    "a frame cut wider than the activation rung's cap waits unsealed for a raise \
+                     to it, asked of the cap's owner"
+                );
+            }
+            owed_said = owed;
+            crate::store::shared::owe_cut_rows(
+                engine_id,
+                u32::try_from(owed).unwrap_or(u32::MAX),
+                owed_by,
+            );
+            // The cap this turn sealed under is read again after the hold
+            // is told: a cap the walk moved meanwhile (raised back before
+            // the report it would have nudged on) is the next turn's at
+            // once, never a cached value the scheduler parks on.
+            progress |= crate::store::shared::cap_moved(engine_id, cap);
             progress |= dispatched;
             if stopping
                 && pending.is_empty()
@@ -1176,6 +1462,10 @@ impl BatchScheduler {
                 && replies.is_empty()
                 && !stopping
             {
+                // Nothing queued or in flight: the batch's ask goes while
+                // the scheduler sleeps.
+                batch_want.release();
+                lane.parks().parking();
                 match rx.recv().await {
                     Some(item) => Some(item),
                     None => {
@@ -1218,6 +1508,9 @@ impl BatchScheduler {
                 let have_settle = front_launch.is_some();
                 let have_control_settles = !control_settles.is_empty();
                 let mut reply_answer = None;
+                // The lane stays awake for this turn's launches only until
+                // the scheduler parks (`Lane::next_request`).
+                lane.parks().parking();
                 let parked = {
                     let settle_wait = async {
                         match front_launch {
@@ -1258,6 +1551,7 @@ impl BatchScheduler {
                         &mut in_flight_control,
                         &mut frame_policy,
                         &nudge_tx,
+                        engine_id,
                     );
                 }
                 tracing::debug!(
@@ -1267,7 +1561,7 @@ impl BatchScheduler {
                     ?wait_hint,
                     "scheduler parked"
                 );
-                if parked.is_err() && crate::planner::trace_enabled() {
+                if parked.is_err() && tracing::enabled!(tracing::Level::DEBUG) {
                     static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
                     let mut last = LAST.lock().unwrap();
                     let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
@@ -1276,11 +1570,10 @@ impl BatchScheduler {
                         || !in_flight_launches.is_empty();
                     if due && owed {
                         *last = Some(Instant::now());
-                        println!(
-                            "[sched-stall t_us={}] pending={} in_flight={} {}",
-                            crate::scheduler::fire_timing_now_us(),
-                            pending.len(),
-                            in_flight_launches.len(),
+                        tracing::debug!(
+                            pending = pending.len(),
+                            in_flight = in_flight_launches.len(),
+                            "scheduler stalled: {}",
                             frame_policy.debug_summary()
                         );
                     }
@@ -1294,35 +1587,6 @@ impl BatchScheduler {
                             .quorum
                             .idle_park_control_us
                             .fetch_add(slept, Relaxed);
-                        if slept >= frame::idle_dump_threshold_us() {
-                            let who: Vec<String> = in_flight_control
-                                .iter()
-                                .filter(|c| c.holds_launches)
-                                .map(|c| {
-                                    format!(
-                                        "{}({})",
-                                        c.operation,
-                                        match &c.state {
-                                            ControlSlotState::Posted { .. } => "posted",
-                                            ControlSlotState::Ready(comp) =>
-                                                if comp.is_settled() {
-                                                    "ready-settled"
-                                                } else {
-                                                    "ready-unsettled"
-                                                },
-                                        }
-                                    )
-                                })
-                                .collect();
-                            println!(
-                                "[idle-park] {slept}us woke={} holders=[{}]",
-                                match &parked {
-                                    Ok(_) => "channel",
-                                    Err(_) => "backstop",
-                                },
-                                who.join(",")
-                            );
-                        }
                     } else {
                         stats
                             .fire
@@ -1359,10 +1623,12 @@ impl BatchScheduler {
                                 .saturating_add(Duration::from_secs(60) * stall_dumps)
                         {
                             stall_dumps += 1;
-                            eprintln!(
-                                "[pie-sched] engine {engine_id} stalled for {stalled_for:?} \
-                                 (no progress, work queued or in flight); state:\n{}",
+                            tracing::error!(
+                                engine_id,
+                                "stalled for {stalled_for:?} (no progress, work queued or \
+                                 in flight); state:\n{}",
                                 Self::render_debug_dump(
+                                    engine_id,
                                     &pending,
                                     &in_flight_launches,
                                     &in_flight_control,
@@ -1397,363 +1663,16 @@ impl BatchScheduler {
         drop(engine.take());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_debug_dump(
-        pending: &VecDeque<QueuedItem>,
-        in_flight_launches: &VecDeque<PendingLaunchBatch>,
-        in_flight_control: &InFlightControls,
-        instances: &HashMap<::engine::InstanceId, TrackedInstance>,
-        frame_policy: &FramePolicy,
-    ) -> String {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        let describe = |request: &PendingRequest| {
-            format!(
-                "fire {} instance {} pipeline {:?} tracked={} settled={} cancelled={}",
-                request.logical_fire_id,
-                request.instance_id,
-                request.pipeline_id,
-                instances.contains_key(&request.instance_id),
-                request.completion.is_settled(),
-                request.completion.cancel_requested(),
-            )
-        };
-        let _ = writeln!(out, "pending ({}):", pending.len());
-        for item in pending {
-            let line = match item {
-                QueuedItem::Launch(request) => format!("Launch: {}", describe(request)),
-                QueuedItem::PreLaunchCopy {
-                    plan, pipeline_id, ..
-                } => format!("PreLaunchCopy({}) pipeline {pipeline_id:?}", plan.label()),
-                QueuedItem::RegisterChannelsBind { .. } => "RegisterChannelsBind".to_string(),
-                QueuedItem::CopyTracked { plan, .. } => format!("CopyTracked({})", plan.label()),
-                QueuedItem::HostKv { op, .. } => format!("HostKv({op:?})"),
-                QueuedItem::Pool { op, .. } => format!("Pool({op:?})"),
-                QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
-                QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
-            };
-            let _ = writeln!(out, "  {line}");
-        }
-        let _ = writeln!(out, "in_flight_launches ({}):", in_flight_launches.len());
-        for batch in in_flight_launches {
-            let state = match &batch.state {
-                LaunchState::Posted => "posted".to_string(),
-                LaunchState::Accepted(c) => format!("settled={}", c.is_settled()),
-                LaunchState::Failed(refused) => format!("failed({})", refused.message),
-            };
-            let _ = writeln!(
-                out,
-                "  batch of {} ({state}, age={:?})",
-                batch.requests.len(),
-                batch.started.elapsed(),
-            );
-        }
-        if in_flight_control.is_empty() {
-            let _ = writeln!(out, "in_flight_control: none");
-        }
-        for control in in_flight_control.iter() {
-            let state = match &control.state {
-                ControlSlotState::Posted { id } => format!("posted(id={id})"),
-                ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
-            };
-            let _ = writeln!(
-                out,
-                "in_flight_control: {} pipeline {:?} {state}",
-                control.operation, control.pipeline_id,
-            );
-        }
-        let _ = write!(out, "{}", frame_policy.debug_summary());
-        out
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn enqueue_item(
-        pending: &mut PendingQueue,
-        terminated_processes: &mut HashSet<ProcessId>,
-        in_flight_control: &mut InFlightControls,
-        instances: &HashMap<::engine::InstanceId, TrackedInstance>,
-        limits: SchedulerLimits,
-        page_size: u32,
-        stopping: &mut bool,
-        frame_policy: &mut FramePolicy,
-        item: SchedulerItem,
-    ) {
-        match item {
-            SchedulerItem::Stop => {
-                *stopping = true;
-            }
-            SchedulerItem::Nudge => {}
-            SchedulerItem::ExecutionSlotReleased(pid) => {
-                frame_policy.on_execution_slot_released(pid);
-            }
-            SchedulerItem::ProcessQuiesced(pid) => {
-                terminated_processes.remove(&pid);
-            }
-            SchedulerItem::ExecutionSlotConsumed(pid) => {
-                frame_policy.on_execution_slot_consumed(pid);
-            }
-            SchedulerItem::AdmissionQueued(pid) => {
-                frame_policy.on_admission_queued(pid);
-            }
-            SchedulerItem::AdmissionDequeued(pid) => {
-                frame_policy.on_admission_dequeued(pid);
-            }
-            SchedulerItem::PipelineLeave(pid, owner, kind, response) => {
-                if kind == LeaveKind::Terminate {
-                    if !terminated_processes.insert(pid) {
-                        if let Some(response) = response {
-                            let _ = response.send(());
-                        }
-                        return;
-                    }
-                    frame_policy.on_slotted_terminate(pid);
-                    let protected = in_flight_control
-                        .iter()
-                        .find(|control| control.process_id == Some(pid))
-                        .and_then(|control| control.logical_completion.clone());
-                    if let Some(completion) = &protected {
-                        completion.request_cancel();
-                    }
-                    Self::reject_pipeline_queued(pending, pid, protected.as_ref());
-                }
-                match kind {
-                    LeaveKind::Close => {
-                        frame_policy.on_lane_leave(pid, owner, false);
-                    }
-                    LeaveKind::Suspend => {
-                        frame_policy.on_process_suspend(pid);
-                    }
-                    LeaveKind::Terminate => {
-                        frame_policy.on_lane_leave(pid, owner.or(Some(pid)), true);
-                        frame_policy.on_process_leave(pid);
-                    }
-                }
-                if let Some(response) = response {
-                    let _ = response.send(());
-                }
-            }
-            SchedulerItem::Launch {
-                pending: mut launch,
-            } => {
-                let validation = AdmissionLimits::new(limits, page_size);
-                let rejection = if launch.completion.cancel_requested() {
-                    Some("logical fire cancelled before scheduler admission".to_string())
-                } else if launch
-                    .process_id
-                    .is_some_and(|pid| terminated_processes.contains(&pid))
-                {
-                    Some("process terminated before scheduler admission".to_string())
-                } else if !instances.contains_key(&launch.instance_id) {
-                    Some(format!(
-                        "instance {} is unknown or stale",
-                        launch.instance_id
-                    ))
-                } else if let Some(message) = validation.single_request_limit_error(&launch) {
-                    Some(message)
-                } else if *stopping {
-                    Some("scheduler shutting down".to_string())
-                } else {
-                    None
-                };
-                if let Some(message) = rejection {
-                    if let Some(stamp) = launch.frame
-                        && !launch
-                            .process_id
-                            .is_some_and(|pid| terminated_processes.contains(&pid))
-                    {
-                        frame_policy.on_fire_rejected_at_admission(stamp, launch.process_id);
-                    }
-                    launch.completion.reject_unsubmitted(message);
-                } else {
-                    if frame_policy.single_slot()
-                        && launch.frame.is_none()
-                        && let Some(lane) = launch.pipeline_id
-                    {
-                        launch.frame = Some(FrameStamp {
-                            lane,
-                            seq: launch.logical_fire_id,
-                            slot: 0,
-                            fires: 1,
-                        });
-                    }
-                    if wave_trace() {
-                        wave_trace_emit(format!(
-                            "[wave-trace] t={}us enq fire={} framed={} mask={} masks={} stm={} pipe={}",
-                            wave_trace_us(),
-                            launch.logical_fire_id,
-                            launch.frame.is_some(),
-                            launch.request.has_user_mask,
-                            has_wire_masks(&launch.request),
-                            launch.request.single_token_mode,
-                            launch.pipeline_id.is_some()
-                        ));
-                    }
-                    if let Some(stamp) = launch.frame {
-                        frame_policy.on_fire_reading(
-                            stamp,
-                            launch.process_id,
-                            launch.logical_fire_id,
-                            launch.request.tokens(),
-                            launch.wire_row_count(),
-                            launch.request.readouts(),
-                        );
-                    }
-                    Self::queue_attempt(pending, launch);
-                }
-            }
-
-            SchedulerItem::ProcessResume(pid) => {
-                frame_policy.on_process_resume(pid);
-            }
-            SchedulerItem::FrameTruncate {
-                lane,
-                seq,
-                submitted,
-            } => {
-                frame_policy.on_frame_truncated(lane, seq, submitted);
-            }
-            SchedulerItem::LaneOpen { lane, owner } => {
-                if !terminated_processes.contains(&owner) && !terminated_processes.contains(&lane) {
-                    frame_policy.on_lane_open(lane, owner);
-                }
-            }
-            SchedulerItem::LanePark { lane, seq } => {
-                frame_policy.on_lane_park(lane, seq);
-            }
-            SchedulerItem::RegisterChannelsBind {
-                pipeline_id,
-                plans,
-                program,
-                bind,
-                response,
-            } => {
-                if pipeline_id.is_some_and(|pid| terminated_processes.contains(&pid)) {
-                    Lane::release_wait_slots([bind.pacing_wait_id]);
-                    let _ = response.send(Err(anyhow!(
-                        "process departed before channel bind admission"
-                    )));
-                    return;
-                }
-                frame_policy.on_bind_enqueued(pipeline_id);
-                pending.insert_before_closes(QueuedItem::RegisterChannelsBind {
-                    pipeline_id,
-                    plans,
-                    program,
-                    bind,
-                    response,
-                });
-            }
-            SchedulerItem::CopyTracked { plan, completion } => {
-                pending.push_back(QueuedItem::CopyTracked { plan, completion });
-            }
-            SchedulerItem::Pool { op, response } => {
-                pending.push_back(QueuedItem::Pool { op, response });
-            }
-            SchedulerItem::HostKv { op, response } => {
-                pending.push_back(QueuedItem::HostKv { op, response });
-            }
-            SchedulerItem::CloseInstance { id, pacing_wait_id } => {
-                pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
-            }
-            SchedulerItem::CloseChannel { id } => Self::queue_close_channel(pending, id),
-            SchedulerItem::CloseChannels { ids } => {
-                for id in ids {
-                    Self::queue_close_channel(pending, id);
-                }
-            }
-        }
-    }
-
-    fn reject_pipeline_queued(
-        pending: &mut PendingQueue,
-        pid: ProcessId,
-        protected: Option<&WorkItemCompletion>,
-    ) {
-        let has_queued = pending.iter().any(|item| match item {
-            QueuedItem::Launch(request) => request.process_id == Some(pid),
-            QueuedItem::PreLaunchCopy { process_id, .. } => *process_id == Some(pid),
-            _ => false,
-        });
-        if !has_queued {
-            return;
-        }
-        let mut kept = VecDeque::with_capacity(pending.len());
-        while let Some(item) = pending.pop_front() {
-            let reject = match &item {
-                QueuedItem::Launch(request) => {
-                    request.process_id == Some(pid)
-                        && protected
-                            .is_none_or(|completion| !request.completion.same_request(completion))
-                }
-                QueuedItem::PreLaunchCopy {
-                    process_id,
-                    logical_completion,
-                    ..
-                } => {
-                    *process_id == Some(pid)
-                        && protected
-                            .is_none_or(|completion| !logical_completion.same_request(completion))
-                }
-                _ => false,
-            };
-            if reject {
-                match item {
-                    QueuedItem::Launch(request) => {
-                        request
-                            .completion
-                            .reject_unsubmitted("pipeline left while queued");
-                    }
-                    QueuedItem::PreLaunchCopy {
-                        logical_completion, ..
-                    } => logical_completion
-                        .reject_unsubmitted("pipeline left before pre-launch copy"),
-                    _ => unreachable!("rejected item kind checked above"),
-                }
-            } else {
-                kept.push_back(item);
-            }
-        }
-        pending.replace(kept);
-    }
-
-    fn queue_attempt(pending: &mut PendingQueue, mut request: PendingRequest) {
-        let mut copies = Vec::with_capacity(2);
-        if let Some(plan) = request.prelaunch_copy.take() {
-            copies.push(QueuedItem::PreLaunchCopy {
-                plan: PreLaunchCopy::Kv(plan),
-                logical_completion: request.completion.clone(),
-                process_id: request.process_id,
-                pipeline_id: request.pipeline_id,
-            });
-        }
-        if let Some(plan) = request.prelaunch_state_copy.take() {
-            copies.push(QueuedItem::PreLaunchCopy {
-                plan: PreLaunchCopy::State(plan),
-                logical_completion: request.completion.clone(),
-                process_id: request.process_id,
-                pipeline_id: request.pipeline_id,
-            });
-        }
-        for copy in copies {
-            pending.push_back(copy);
-        }
-        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(request))));
-    }
-
-    fn instance_has_queued_work(
-        pending: &VecDeque<QueuedItem>,
-        instance_id: ::engine::InstanceId,
-    ) -> bool {
-        pending.iter().any(|item| match item {
-            QueuedItem::Launch(request) => request.instance_id == instance_id,
-            _ => false,
-        })
-    }
-
     const fn standalone_copy(item: &QueuedItem) -> bool {
         matches!(
             item,
-            QueuedItem::CopyTracked { .. } | QueuedItem::HostKv { .. } | QueuedItem::Pool { .. }
+            QueuedItem::CopyTracked { .. }
+                | QueuedItem::HostKv { .. }
+                | QueuedItem::Pool { .. }
+                | QueuedItem::PrepareProgram { .. }
+                | QueuedItem::FinishProgram { .. }
+                | QueuedItem::FireFacts { .. }
+                | QueuedItem::StandingAfter { .. }
         )
     }
 
@@ -1783,934 +1702,6 @@ impl BatchScheduler {
                 | QueuedItem::CloseInstance { .. }
                 | QueuedItem::CloseChannels { .. }
         )
-    }
-
-    fn queue_close_channel(pending: &mut PendingQueue, id: ::engine::ChannelId) {
-        const CLOSE_CHANNEL_BATCH_MAX: usize = 512;
-        if let Some(QueuedItem::CloseChannels { ids }) = pending.back_mut()
-            && ids.len() < CLOSE_CHANNEL_BATCH_MAX
-        {
-            ids.push(id);
-        } else {
-            pending.push_back(QueuedItem::CloseChannels { ids: vec![id] });
-        }
-    }
-
-    fn rotate_launch_for_wave_work(
-        pending: &mut PendingQueue,
-        allow_slot: bool,
-        allow_lifecycle: bool,
-    ) -> bool {
-        if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
-            return false;
-        }
-        let Some(run_len) = pending.first_other() else {
-            return false;
-        };
-        let work = &pending[run_len];
-        if !(Self::standalone_copy(work)
-            || (allow_lifecycle && Self::lifecycle_control(work))
-            || (allow_slot && matches!(work, QueuedItem::PreLaunchCopy { .. })))
-        {
-            return false;
-        }
-        pending.rotate_launch_run_to_back(run_len);
-        true
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_ready_items(
-        engine_loop: &Lane,
-        replies: &mut LaneReplies,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        pending: &mut PendingQueue,
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut InFlightControls,
-        page_size: u32,
-        limits: SchedulerLimits,
-        stats: &Arc<SchedulerStats>,
-        frame_policy: &mut FramePolicy,
-        scan_cache: &mut ScanCache,
-        slot_buffer: &mut SlotBuffer,
-        stopping: bool,
-    ) -> (bool, Option<Duration>) {
-        let (mut progress, wait_hint) = Self::dispatch_frame_work(
-            scan_cache,
-            slot_buffer,
-            frame_policy,
-            engine_loop,
-            replies,
-            instances,
-            pending,
-            in_flight_launches,
-            in_flight_control,
-            page_size,
-            limits,
-            stats,
-            stopping,
-        );
-        let mut close_rotations = 0usize;
-        let mut rotated = false;
-        let hold_closes = !stopping && frame_policy.has_pending_binds();
-        let slot_blocks_lifecycle = in_flight_control.holds_launches();
-        while let Some(item) = pending.front() {
-            match item {
-                QueuedItem::Launch(_) => {
-                    if Self::rotate_launch_for_wave_work(
-                        pending,
-                        in_flight_control.copies_only(),
-                        !slot_blocks_lifecycle,
-                    ) {
-                        rotated = true;
-                        continue;
-                    }
-                    break;
-                }
-                QueuedItem::CloseInstance { id, .. } => {
-                    if slot_blocks_lifecycle {
-                        break;
-                    }
-                    let id = *id;
-                    if hold_closes {
-                        let rot_stop = close_rotations >= pending.len()
-                            || !pending.iter().skip(1).any(Self::rotation_target);
-                        if rot_stop {
-                            break;
-                        }
-                        close_rotations += 1;
-                        let item = pending.pop_front().expect("close front");
-                        pending.push_back(item);
-                        continue;
-                    }
-                    let busy = instances
-                        .get(&id)
-                        .is_some_and(|tracked| tracked.in_flight != 0)
-                        || Self::instance_has_queued_work(pending, id);
-                    if !busy {
-                        let item = pending.pop_front().expect("close front");
-                        Self::post_control(
-                            engine_loop,
-                            replies,
-                            instances,
-                            in_flight_control,
-                            item,
-                        );
-                        progress = true;
-                        continue;
-                    }
-                    // Launches and this close would swap places until its batch
-                    // lands, and a browser lands it only after the worker parks.
-                    rotated = false;
-                    let rot_stop = close_rotations >= pending.len()
-                        || !pending.iter().skip(1).any(|item| {
-                            !matches!(
-                                item,
-                                QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
-                            )
-                        });
-                    if rot_stop {
-                        break;
-                    }
-                    close_rotations += 1;
-                    let item = pending.pop_front().expect("close front");
-                    pending.push_back(item);
-                }
-                QueuedItem::CloseChannels { .. } if hold_closes => {
-                    let rot_stop = close_rotations >= pending.len()
-                        || !pending.iter().skip(1).any(Self::rotation_target);
-                    if rot_stop {
-                        break;
-                    }
-                    close_rotations += 1;
-                    let item = pending.pop_front().expect("close front");
-                    pending.push_back(item);
-                }
-                _ if !in_flight_control.admits(item) => break,
-                _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
-                    break;
-                }
-                _ => {
-                    let item = pending.pop_front().expect("front item present");
-                    Self::post_control(engine_loop, replies, instances, in_flight_control, item);
-                    progress = true;
-                }
-            }
-        }
-        while in_flight_control.admits_copy() {
-            let Some(index) = pending.iter().position(Self::standalone_copy) else {
-                break;
-            };
-            let Some(item) = pending.remove(index) else {
-                break;
-            };
-            Self::post_control(engine_loop, replies, instances, in_flight_control, item);
-            progress = true;
-        }
-        (progress || rotated, wait_hint)
-    }
-
-    fn post_control(
-        engine_loop: &Lane,
-        replies: &mut LaneReplies,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        in_flight_control: &mut InFlightControls,
-        item: QueuedItem,
-    ) {
-        match &item {
-            QueuedItem::Launch(_) => unreachable!(),
-            QueuedItem::PreLaunchCopy {
-                logical_completion, ..
-            } if logical_completion.is_settled() => return,
-            QueuedItem::PreLaunchCopy {
-                logical_completion, ..
-            } if logical_completion.cancel_requested() => {
-                logical_completion
-                    .reject_unsubmitted("logical fire cancelled before pre-launch copy");
-                return;
-            }
-            QueuedItem::CloseInstance {
-                id, pacing_wait_id, ..
-            } => {
-                let error = match instances.get(id) {
-                    Some(instance) if instance.pacing_wait_id == *pacing_wait_id => {
-                        (instance.in_flight != 0).then(|| format!("instance {id} is busy"))
-                    }
-                    _ => Some(format!("instance {id} is unknown or stale")),
-                };
-                if let Some(message) = error {
-                    tracing::warn!(
-                        instance_id = id.0,
-                        error = %message,
-                        "scheduler close_instance skipped"
-                    );
-                    return;
-                }
-            }
-            _ => {}
-        }
-        let id = replies.next_control_id();
-        let holds_launches = !Self::standalone_copy(&item);
-        match &item {
-            QueuedItem::PreLaunchCopy {
-                plan,
-                logical_completion,
-                process_id,
-                pipeline_id,
-            } => {
-                in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { id },
-                    logical_completion: Some(logical_completion.clone()),
-                    process_id: *process_id,
-                    pipeline_id: *pipeline_id,
-                    tracked_completion: None,
-                    operation: plan.label(),
-                    holds_launches,
-                    prelaunch: true,
-                });
-            }
-            QueuedItem::CopyTracked { completion, .. } => {
-                in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { id },
-                    logical_completion: None,
-                    process_id: None,
-                    pipeline_id: None,
-                    tracked_completion: Some(completion.clone()),
-                    operation: "tracked KV copy",
-                    holds_launches,
-                    prelaunch: false,
-                });
-            }
-            _ => {}
-        }
-        replies.post_control(id, engine_loop.control(item));
-    }
-
-    fn scan_queue<'a>(
-        cache: &'a mut ScanCache,
-        pending: &PendingQueue,
-        stopping: bool,
-    ) -> &'a QueueScan {
-        if cache.taken_at == Some((pending.epoch(), stopping)) {
-            return &cache.scan;
-        }
-        let scan = &mut cache.scan;
-        scan.clear();
-        for item in pending.iter() {
-            match item {
-                QueuedItem::Launch(launch) => {
-                    if stopping {
-                        scan.drain_eligible.push(launch.fire_id);
-                    }
-                    // A launch never overtakes a copy its pipeline queued
-                    // ahead of it: the copy fills what the launch reads.
-                    let behind_copy = launch
-                        .pipeline_id
-                        .is_some_and(|pipeline| scan.blocked_lanes.contains(&pipeline));
-                    if launch.framed {
-                        scan.queued_ids.push(launch.fire_id);
-                    } else if !behind_copy && scan.riding.insert(launch.pipeline_id) {
-                        // Pieces of different prompts' passes (cut at their
-                        // checkpoints) share a fire rather than taking one each.
-                        scan.untracked.push(launch.fire_id);
-                    }
-                }
-                QueuedItem::PreLaunchCopy {
-                    pipeline_id: Some(pipeline_id),
-                    ..
-                } => {
-                    scan.blocked_lanes.insert(*pipeline_id);
-                }
-                _ => {}
-            }
-        }
-        scan.queued_ids.seal();
-        cache.taken_at = Some((pending.epoch(), stopping));
-        &cache.scan
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_frame_work(
-        scan_cache: &mut ScanCache,
-        slot_buffer: &mut SlotBuffer,
-        frame_policy: &mut FramePolicy,
-        engine_loop: &Lane,
-        replies: &mut LaneReplies,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        pending: &mut PendingQueue,
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &InFlightControls,
-        page_size: u32,
-        limits: SchedulerLimits,
-        stats: &Arc<SchedulerStats>,
-        stopping: bool,
-    ) -> (bool, Option<Duration>) {
-        let mut progress = false;
-        let mut wait_hint: Option<Duration> = None;
-        let merge_hint = |hint: &mut Option<Duration>, hold: Duration| {
-            *hint = Some(hint.map_or(hold, |old| old.min(hold)));
-        };
-        loop {
-            if in_flight_control.holds_launches() {
-                if wave_trace() {
-                    wave_trace_emit(format!(
-                        "[wave-trace] t={}us hold control in_flight={}",
-                        wave_trace_us(),
-                        in_flight_launches.len()
-                    ));
-                }
-                if in_flight_launches.is_empty() {
-                    stats
-                        .fire
-                        .quorum
-                        .idle_break_control
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                break;
-            }
-            if in_flight_launches.len() >= frame::configured_dispatch_depth() {
-                if wave_trace() {
-                    wave_trace_emit(format!(
-                        "[wave-trace] t={}us hold depth in_flight={} depth={}",
-                        wave_trace_us(),
-                        in_flight_launches.len(),
-                        frame::configured_dispatch_depth()
-                    ));
-                }
-                if in_flight_launches.is_empty() {
-                    stats
-                        .fire
-                        .quorum
-                        .idle_break_depth
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                break;
-            }
-            let now = Instant::now();
-            let scan = Self::scan_queue(scan_cache, pending, stopping);
-            if wave_trace() {
-                wave_trace_emit(format!(
-                    "[wave-trace] t={}us plan in_flight={}",
-                    wave_trace_us(),
-                    in_flight_launches.len()
-                ));
-            }
-            let mut rider_batch = false;
-            let waves: Vec<Vec<u64>> = if stopping {
-                if scan.drain_eligible.is_empty() {
-                    break;
-                }
-                vec![scan.drain_eligible.clone()]
-            } else if !scan.untracked.is_empty() {
-                rider_batch = true;
-                if wave_trace() {
-                    wave_trace_emit(format!(
-                        "[wave-trace] t={}us rider fires={:?}",
-                        wave_trace_us(),
-                        scan.untracked
-                    ));
-                }
-                vec![scan.untracked.clone()]
-            } else {
-                match frame_policy.plan_dispatch(
-                    &scan.queued_ids,
-                    &scan.blocked_lanes,
-                    !in_flight_launches.is_empty(),
-                    now,
-                ) {
-                    FramePlan::Dispatch(waves) => {
-                        if wave_trace() {
-                            wave_trace_emit(format!(
-                                "[wave-trace] t={}us dispatch waves={:?}",
-                                wave_trace_us(),
-                                waves.iter().map(Vec::len).collect::<Vec<_>>()
-                            ));
-                        }
-                        waves
-                    }
-                    FramePlan::Hold(hold) => {
-                        merge_hint(&mut wait_hint, hold);
-                        break;
-                    }
-                    FramePlan::Park => break,
-                    FramePlan::Terminate(doomed) => {
-                        for pid in doomed {
-                            let reason = super::frame::ABANDONED;
-                            tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
-                            crate::inferlet::process::terminate_by(
-                                pid,
-                                Err(reason.to_string()),
-                                crate::policy::By::Host,
-                            );
-                        }
-                        continue;
-                    }
-                }
-            };
-            let (frame_progress, posted) = Self::post_frame(
-                slot_buffer,
-                engine_loop,
-                replies,
-                instances,
-                pending,
-                in_flight_launches,
-                page_size,
-                limits,
-                stats,
-                &waves,
-            );
-            progress |= frame_progress;
-            if !posted {
-                if stopping || !frame_progress {
-                    break;
-                }
-                continue;
-            }
-            if rider_batch {
-                frame_policy.record_rider_wave();
-            }
-        }
-        (progress, wait_hint)
-    }
-
-    fn admits_to_frame(
-        request: &PendingRequest,
-        instances: &HashMap<::engine::InstanceId, TrackedInstance>,
-    ) -> bool {
-        if request.completion.is_settled() || request.completion.cancel_requested() {
-            if !request.completion.is_settled() {
-                request
-                    .completion
-                    .reject_unsubmitted("logical fire cancelled before native launch");
-            }
-            return false;
-        }
-        if !instances.contains_key(&request.instance_id) {
-            request.completion.reject_unsubmitted(format!(
-                "instance {} is unknown or stale",
-                request.instance_id
-            ));
-            return false;
-        }
-        true
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the worker loop's state, borrowed piece by piece on purpose: six of \
-                  these are independent `&mut` borrows of fields the caller owns, and \
-                  passing them separately is what lets the borrow checker see they are \
-                  disjoint. Wrapping them in one `&mut` context struct would collapse \
-                  that into a single borrow and stop this from compiling"
-    )]
-    fn post_frame(
-        slot_buffer: &mut SlotBuffer,
-        engine_loop: &Lane,
-        replies: &mut LaneReplies,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        pending: &mut PendingQueue,
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        page_size: u32,
-        limits: SchedulerLimits,
-        stats: &Arc<SchedulerStats>,
-        waves: &[Vec<u64>],
-    ) -> (bool, bool) {
-        let mut progress = false;
-        let mut slot_of: HashMap<u64, (usize, usize)> =
-            HashMap::with_capacity(waves.iter().map(Vec::len).sum());
-        for (index, wave) in waves.iter().enumerate() {
-            for (position, &fire_id) in wave.iter().enumerate() {
-                slot_of.insert(fire_id, (index, position));
-            }
-        }
-        let mut kept: VecDeque<QueuedItem> = VecDeque::with_capacity(pending.len());
-        slot_buffer.resize_with(waves.len(), Vec::new);
-        for (slots, wave) in slot_buffer.iter_mut().zip(waves) {
-            debug_assert!(slots.iter().all(Option::is_none));
-            if slots.len() < wave.len() {
-                slots.resize_with(wave.len(), || None);
-            }
-        }
-        let mut collisions: Vec<(usize, Box<PendingRequest>)> = Vec::new();
-        while let Some(item) = pending.pop_front() {
-            match item {
-                // Past the pool's activation rung (SPEC decision 6): it waits
-                // until the rung is back.
-                QueuedItem::Launch(launch)
-                    if launch.request.request.tokens() > limits.max_forward_tokens =>
-                {
-                    kept.push_back(QueuedItem::Launch(launch));
-                }
-                QueuedItem::Launch(launch) => match slot_of.get(&launch.fire_id) {
-                    Some(&(wave, position)) => {
-                        let slot = &mut slot_buffer[wave][position];
-                        if slot.is_none() {
-                            *slot = Some(launch.into_request());
-                        } else {
-                            collisions.push((wave, launch.into_request()));
-                        }
-                    }
-                    None => kept.push_back(QueuedItem::Launch(launch)),
-                },
-                item => kept.push_back(item),
-            }
-        }
-        pending.replace(kept);
-        let mut survivors: Vec<Vec<Box<PendingRequest>>> = Vec::with_capacity(waves.len());
-        for slots in slot_buffer.iter_mut() {
-            let mut kept_wave = Vec::with_capacity(slots.len());
-            for request in slots.iter_mut().filter_map(Option::take) {
-                if Self::admits_to_frame(&request, instances) {
-                    kept_wave.push(request);
-                } else {
-                    progress = true;
-                }
-            }
-            survivors.push(kept_wave);
-        }
-        for (wave, request) in collisions {
-            if Self::admits_to_frame(&request, instances) {
-                survivors[wave].push(request);
-            } else {
-                progress = true;
-            }
-        }
-        if survivors.iter().all(Vec::is_empty) {
-            return (progress, false);
-        }
-        Self::launch(
-            survivors,
-            engine_loop,
-            replies,
-            instances,
-            in_flight_launches,
-            page_size,
-            limits,
-            stats,
-        );
-        (true, true)
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::vec_box,
-        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it, \
-                  and the requests boxed as `batch::build_frame_submission` takes them"
-    )]
-    fn launch(
-        waves: Vec<Vec<Box<PendingRequest>>>,
-        engine_loop: &Lane,
-        replies: &mut LaneReplies,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        page_size: u32,
-        limits: SchedulerLimits,
-        stats: &Arc<SchedulerStats>,
-    ) {
-        // Counted before the build moves the lanes into the fire.
-        let total_tokens = waves
-            .iter()
-            .flatten()
-            .map(|req| req.request.tokens())
-            .sum::<usize>();
-        let (submission, requests) = batch::build_frame_submission(waves, limits, page_size, stats);
-        let lanes_of = submission
-            .steps
-            .iter()
-            .flat_map(|step| step.member_lanes.iter().copied())
-            .collect();
-        let batch_size = requests.len() as u64;
-        for request in &requests {
-            if let Some(instance) = instances.get_mut(&request.instance_id) {
-                instance.in_flight += 1;
-            }
-        }
-        replies.post_launch(engine_loop.fire(submission, total_tokens > batch_size as usize));
-        in_flight_launches.push_back(PendingLaunchBatch {
-            state: LaunchState::Posted,
-            requests,
-            lanes_of,
-            started: Instant::now(),
-            batch_size,
-            total_tokens,
-        });
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::vec_box,
-        reason = "the worker loop's state, borrowed piece by piece as `post_frame` borrows it, \
-                  and the requests boxed as `batch::build_frame_submission` takes them"
-    )]
-    fn launch_apart(
-        refused: Vec<Box<PendingRequest>>,
-        engine_loop: &Lane,
-        replies: &mut LaneReplies,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        page_size: u32,
-        limits: SchedulerLimits,
-        stats: &Arc<SchedulerStats>,
-    ) -> bool {
-        let mut launched = false;
-        for request in refused {
-            if !Self::admits_to_frame(&request, instances) {
-                continue;
-            }
-            Self::launch(
-                vec![vec![request]],
-                engine_loop,
-                replies,
-                instances,
-                in_flight_launches,
-                page_size,
-                limits,
-                stats,
-            );
-            launched = true;
-        }
-        launched
-    }
-
-    #[allow(
-        clippy::vec_box,
-        reason = "the requests boxed as `batch::build_frame_submission` takes them"
-    )]
-    fn retire_ready_launches(
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        stats: &Arc<SchedulerStats>,
-        frame_policy: &mut FramePolicy,
-        apart: &mut Vec<Box<PendingRequest>>,
-    ) -> bool {
-        let mut progress = false;
-        while let Some(front) = in_flight_launches.front() {
-            let result = match &front.state {
-                LaunchState::Posted => break,
-                LaunchState::Failed(_) => None,
-                LaunchState::Accepted(completion) => {
-                    let Some(result) = completion.check() else {
-                        break;
-                    };
-                    Some(result)
-                }
-            };
-            let mut retired = in_flight_launches.pop_front().expect("front batch exists");
-            if wave_trace() {
-                wave_trace_emit(format!(
-                    "[wave-trace] t={}us retire lanes={}",
-                    wave_trace_us(),
-                    retired.requests.len()
-                ));
-            }
-            for request in &retired.requests {
-                if let Some(instance) = instances.get_mut(&request.instance_id) {
-                    instance.in_flight = instance.in_flight.saturating_sub(1);
-                }
-            }
-            if let LaunchState::Failed(refused) =
-                std::mem::replace(&mut retired.state, LaunchState::Posted)
-            {
-                let message = format!("direct launch rejected: {}", refused.message);
-                let unsettled = refused.unlaunched.is_some();
-                let again = refused.unlaunched.is_some_and(|steps| {
-                    retired.requests.len() > 1
-                        && batch::unbuild_frame(steps, &mut retired.requests, &retired.lanes_of)
-                });
-                for request in retired.requests {
-                    let overtaken = || {
-                        in_flight_launches.iter().any(|later| {
-                            later.requests.iter().any(|other| {
-                                other.instance_id == request.instance_id
-                                    || (request.pipeline_id.is_some()
-                                        && other.pipeline_id == request.pipeline_id)
-                            })
-                        })
-                    };
-                    if again && !overtaken() {
-                        apart.push(request);
-                        continue;
-                    }
-                    frame_policy.on_frame_retired(request.pipeline_id);
-                    if unsettled {
-                        crate::engine::completion::settle(
-                            &[request.completion.terminal_cell_ptr()],
-                            crate::engine::completion::TERMINAL_OUTCOME_FAILED,
-                        );
-                    }
-                    request.completion.reject_unsubmitted(message.clone());
-                }
-                progress = true;
-                continue;
-            }
-            frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
-            let result = result.expect("accepted batch carries a settled result");
-            match result {
-                Ok(()) => {
-                    for request in &retired.requests {
-                        request.completion.mark_native_retired();
-                    }
-                    // A fire its step resolved as it landed is resolved.
-                    crate::engine::completion::settle_batched(|| {
-                        for request in retired
-                            .requests
-                            .iter()
-                            .filter(|r| !r.completion.is_settled())
-                        {
-                            request.completion.resolve_landed("frame settle");
-                        }
-                    });
-                    stats::record_fire_stats(
-                        stats,
-                        retired.started.elapsed(),
-                        retired.batch_size,
-                        retired.total_tokens,
-                    )
-                }
-
-                Err(err) => {
-                    tracing::warn!(?err, "direct launch completion closed before callback");
-                    for request in &retired.requests {
-                        request.completion.reject(format!(
-                            "direct launch batch callback closed before terminal settlement: {err:#}"
-                        ));
-                        if let Some(instance) = instances.get(&request.instance_id) {
-                            instance.wait_slots.close();
-                        }
-                    }
-                }
-            }
-            progress = true;
-        }
-        progress
-    }
-
-    fn retire_ready_control(in_flight_control: &mut InFlightControls) -> bool {
-        let mut retired = false;
-        let mut index = 0;
-        while index < in_flight_control.settling.len() {
-            let ready = match &in_flight_control.settling[index].state {
-                ControlSlotState::Posted { .. } => None,
-                ControlSlotState::Ready(completion) => completion.check(),
-            };
-            let Some(result) = ready else {
-                index += 1;
-                continue;
-            };
-            let pending = in_flight_control.settling.remove(index);
-            let operation = pending.operation;
-            if let Some(tracked) = pending.tracked_completion.as_ref() {
-                tracked.resolve(&result);
-            }
-            if let Err(ref err) = result {
-                tracing::warn!(
-                    ?err,
-                    operation,
-                    "direct control completion closed before callback"
-                );
-                if let Some(logical) = pending.logical_completion.as_ref() {
-                    logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
-                }
-            }
-            retired = true;
-        }
-        retired
-    }
-
-    fn accept_launch_reply(
-        batch: &mut PendingLaunchBatch,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        result: LaunchResult,
-    ) {
-        match result {
-            Ok(completion) => {
-                for request in &batch.requests {
-                    if let Some(instance) = instances.get_mut(&request.instance_id) {
-                        let epoch = instance.next_target_epoch;
-                        request.completion.commit_target_epoch(epoch);
-                        instance.next_target_epoch = epoch + 1;
-                    }
-                }
-                batch.state = LaunchState::Accepted(completion);
-            }
-            Err(message) => {
-                batch.state = LaunchState::Failed(message);
-            }
-        }
-    }
-
-    fn apply_lane_reply(
-        reply: LaneReply,
-        in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        in_flight_control: &mut InFlightControls,
-        frame_policy: &mut FramePolicy,
-        rollback_tx: &SchedTx,
-    ) {
-        match reply {
-            LaneReply::Launch(result) => {
-                let batch = in_flight_launches
-                    .iter_mut()
-                    .find(|batch| matches!(batch.state, LaunchState::Posted))
-                    .expect("a launch answer arrives only while its batch is posted");
-                Self::accept_launch_reply(batch, instances, result);
-            }
-            LaneReply::Control { id, commit } => Self::apply_control_commit(
-                id,
-                commit,
-                in_flight_control,
-                instances,
-                frame_policy,
-                rollback_tx,
-            ),
-        }
-    }
-
-    fn apply_control_commit(
-        id: u64,
-        commit: LaneCommit,
-        in_flight_control: &mut InFlightControls,
-        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
-        frame_policy: &mut FramePolicy,
-        rollback_tx: &SchedTx,
-    ) {
-        match commit {
-            LaneCommit::None => {}
-            LaneCommit::BindFinished { pipeline_id } => {
-                frame_policy.on_bind_completed(pipeline_id);
-            }
-            LaneCommit::BindInstance {
-                pipeline_id,
-                bound,
-                respond:
-                    BindRespond {
-                        registered,
-                        program_id,
-                        program_registered,
-                        response,
-                    },
-            } => {
-                frame_policy.on_bind_completed(pipeline_id);
-                if instances.contains_key(&bound.instance_id) {
-                    tracing::error!(
-                        instance_id = bound.instance_id.0,
-                        "bind committed an already-bound instance id"
-                    );
-                    let error = anyhow!("instance {} is already bound", bound.instance_id);
-                    let _ = response.send(Err(error));
-                    return;
-                }
-                let instance_id = bound.instance_id;
-                instances.insert(instance_id, TrackedInstance::from_bound(&bound));
-                if let Err(Ok((registered, _, bound))) =
-                    response.send(Ok((registered, program_id, bound)))
-                {
-                    tracing::warn!(
-                        operation = "register_channels_bind",
-                        instance_id = bound.instance_id.0,
-                        channel_count = registered.len(),
-                        "scheduler cancellation rollback enqueued bound instance and channels"
-                    );
-                    if program_registered {
-                        tracing::warn!(
-                            operation = "register_channels_bind",
-                            program_id = program_id.0,
-                            "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
-                        );
-                    }
-                    Lane::release_registered_channel_wait_slots(&registered);
-                    let instance_id = bound.instance_id;
-                    if rollback_tx
-                        .send(SchedulerItem::CloseInstance {
-                            id: instance_id,
-                            pacing_wait_id: bound.pacing_wait_id,
-                        })
-                        .is_err()
-                    {
-                        tracing::error!(
-                            operation = "register_channels_bind",
-                            instance_id = instance_id.0,
-                            "scheduler cancellation rollback close_instance enqueue failed"
-                        );
-                    }
-                    for channel in registered {
-                        let channel_id = channel.binding.channel_id;
-                        if rollback_tx
-                            .send(SchedulerItem::CloseChannel { id: channel_id })
-                            .is_err()
-                        {
-                            tracing::error!(
-                                operation = "register_channels_bind",
-                                channel_id = channel_id.0,
-                                "scheduler cancellation rollback close_channel enqueue failed"
-                            );
-                        }
-                    }
-                }
-            }
-            LaneCommit::CloseInstance { id } => {
-                if let Some(instance) = instances.remove(&id) {
-                    instance.close_wait_slots();
-                }
-            }
-            LaneCommit::AsyncControl { result } => {
-                let Some(index) = in_flight_control.position_posted(id) else {
-                    tracing::error!(
-                        id,
-                        "lane async-control reply without a matching control slot"
-                    );
-                    return;
-                };
-                match result {
-                    Ok(completion) => {
-                        in_flight_control.settling[index].state =
-                            ControlSlotState::Ready(completion);
-                    }
-                    Err(_) => {
-                        in_flight_control.settling.remove(index);
-                    }
-                }
-            }
-        }
     }
 
     fn shutdown_instances(
@@ -2757,6 +1748,8 @@ impl Drop for BatchScheduler {
 }
 
 struct TrackedInstance {
+    /// The program it runs, as the seal trace names a fire's.
+    program_id: ::engine::ProgramId,
     pacing_wait_id: u64,
     wait_slots: Arc<crate::engine::BoundWaitSlots>,
     in_flight: usize,
@@ -2766,6 +1759,7 @@ struct TrackedInstance {
 impl TrackedInstance {
     fn from_bound(bound: &BoundInstance) -> Self {
         Self {
+            program_id: bound.program_id,
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
@@ -2779,438 +1773,12 @@ impl TrackedInstance {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    struct PanickingEngine;
-
-    impl engine::Engine for PanickingEngine {
-        fn kind(&self) -> &'static str {
-            "panicking"
-        }
-
-        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
-            Err(engine::Error::Load("no model".into()))
-        }
-
-        fn submit(
-            &mut self,
-            _frame: &engine::FrameSubmission,
-        ) -> engine::Result<engine::FrameTicket> {
-            panic!("the shape of an interpreter reading lane zero of an empty cell");
-        }
-
-        fn settle_frame(&mut self, _ticket: &mut engine::FrameTicket) -> engine::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn worker_every_case() {
-        a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight();
-        a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying();
-        a_launch_waits_for_the_copy_queued_ahead_of_it();
-        a_pass_that_only_reorders_lets_the_worker_park();
-        a_refused_pass_fails_alone_and_its_frame_mates_land();
-    }
-
-    struct RefusingEngine {
-        offender: ::engine::InstanceId,
-        frames: Arc<Mutex<Vec<Vec<u64>>>>,
-        next: u64,
-    }
-
-    impl engine::Engine for RefusingEngine {
-        fn kind(&self) -> &'static str {
-            "refusing"
-        }
-
-        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
-            Err(engine::Error::Load("no model".into()))
-        }
-
-        fn submit(
-            &mut self,
-            frame: &engine::FrameSubmission,
-        ) -> engine::Result<engine::FrameTicket> {
-            let passes: Vec<u64> = frame
-                .steps
-                .iter()
-                .flat_map(|step| step.attachments.iter().map(|a| a.instance.0))
-                .collect();
-            let refused = passes.contains(&self.offender.0);
-            self.frames.lock().unwrap().push(passes);
-            if refused {
-                return Err(engine::Error::Program(
-                    "serve::prepare refused: lane 0 states a readout list that is not one \
-                     ascending run"
-                        .into(),
-                ));
-            }
-            self.next += 1;
-            Ok(engine::FrameTicket {
-                id: engine::FrameId(self.next),
-                steps: frame
-                    .steps
-                    .iter()
-                    .map(|_| engine::FireTicket {
-                        id: engine::FireId(self.next),
-                        readouts: Vec::new(),
-                    })
-                    .collect(),
-            })
-        }
-
-        fn refused_unlaunched(&self) -> bool {
-            true
-        }
-
-        fn settle_frame(&mut self, _ticket: &mut engine::FrameTicket) -> engine::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn a_refused_pass_fails_alone_and_its_frame_mates_land() {
-        let frames = Arc::new(Mutex::new(Vec::new()));
-        let stats = Arc::new(SchedulerStats::default());
-        let mut lane = Lane::spawn(
-            0,
-            Some(Box::new(RefusingEngine {
-                offender: ::engine::InstanceId(2),
-                frames: Arc::clone(&frames),
-                next: 0,
-            })),
-            Arc::clone(&stats),
-        );
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 64,
-            max_page_refs: 64,
-            max_context: 0,
-            prefill_rows: 0,
-            max_readouts: 0,
-        };
-        let mut instances = HashMap::new();
-        let mut passes = Vec::new();
-        for id in 1..=3u64 {
-            let bound = crate::engine::BoundInstance::new(
-                &::engine::BoundInstance {
-                    id: ::engine::InstanceId(id),
-                    program: ::engine::ProgramId(id),
-                    geometry: eta_ir::registry::GeometryClass::Host,
-                },
-                id,
-            );
-            instances.insert(
-                ::engine::InstanceId(id),
-                TrackedInstance::from_bound(&bound),
-            );
-            let mut request = crate::engine::FireRequest::one(crate::engine::fire::lane_of(
-                id as u32,
-                vec![7],
-                0,
-                vec![id as u32],
-            ));
-            request.boundary_program = true;
-            passes.push(Box::new(PendingRequest {
-                lora_program: false,
-                logical_fire_id: id,
-                request,
-                instance_id: ::engine::InstanceId(id),
-                completion: crate::engine::WorkItemCompletion::new(id, 0),
-                process_id: None,
-                pipeline_id: Some(ProcessId::from_u128(u128::from(id))),
-                prelaunch_copy: None,
-                prelaunch_state_copy: None,
-                frame: None,
-            }));
-        }
-        let completions: Vec<_> = passes.iter().map(|p| p.completion.clone()).collect();
-        let mut replies = LaneReplies::default();
-        let mut in_flight = VecDeque::new();
-        let mut policy = FramePolicy::new(1, 64, 4096, None);
-        BatchScheduler::launch(
-            vec![passes],
-            &lane,
-            &mut replies,
-            &mut instances,
-            &mut in_flight,
-            16,
-            limits,
-            &stats,
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !in_flight.is_empty() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "every launch retires, the refused frame's passes fired again apart"
-            );
-            while let Some(LaneReply::Launch(result)) = replies.try_next() {
-                let batch = in_flight
-                    .iter_mut()
-                    .find(|batch| matches!(batch.state, LaunchState::Posted))
-                    .expect("an answer arrives for a posted launch");
-                BatchScheduler::accept_launch_reply(batch, &mut instances, result);
-            }
-            let mut apart = Vec::new();
-            BatchScheduler::retire_ready_launches(
-                &mut in_flight,
-                &mut instances,
-                &stats,
-                &mut policy,
-                &mut apart,
-            );
-            BatchScheduler::launch_apart(
-                apart,
-                &lane,
-                &mut replies,
-                &mut instances,
-                &mut in_flight,
-                16,
-                limits,
-                &stats,
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(completions.iter().all(|c| c.is_settled()));
-        let landed: Vec<std::result::Result<(), String>> = completions
-            .iter()
-            .map(|c| crate::rt::block_on(c.clone()).map_err(|error| error.to_string()))
-            .collect();
-        assert!(landed[0].is_ok() && landed[2].is_ok(), "{landed:?}");
-        assert!(
-            landed[1]
-                .as_ref()
-                .is_err_and(|error| error.contains("not one ascending run")),
-            "the refused pass fails with its refusal: {landed:?}"
-        );
-        assert_eq!(
-            *frames.lock().unwrap(),
-            [vec![1, 2, 3], vec![1], vec![2], vec![3]],
-            "the frame is offered once, then each of its passes alone, in order"
-        );
-        let _ = lane.shutdown();
-    }
-
-    /// A browser's single thread lands the batch a close waits on only after
-    /// the worker parks, so a pass that reports progress here never ends.
-    fn a_pass_that_only_reorders_lets_the_worker_park() {
-        let instance = ::engine::InstanceId(1);
-        let mut pending = PendingQueue::default();
-        pending.push_back(QueuedItem::CloseInstance {
-            id: instance,
-            pacing_wait_id: 0,
-        });
-        pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(
-            PendingRequest {
-                lora_program: false,
-                logical_fire_id: 9,
-                request: crate::engine::FireRequest::default(),
-                instance_id: instance,
-                completion: crate::engine::WorkItemCompletion::new(1, 0),
-                process_id: None,
-                pipeline_id: None,
-                prelaunch_copy: None,
-                prelaunch_state_copy: None,
-                frame: Some(FrameStamp {
-                    lane: ProcessId::from_u128(5),
-                    seq: 0,
-                    slot: 0,
-                    fires: 1,
-                }),
-            },
-        ))));
-        let stats = Arc::new(SchedulerStats::default());
-        let mut lane = Lane::spawn(0, Some(Box::new(PanickingEngine)), Arc::clone(&stats));
-        let (progress, _) = BatchScheduler::dispatch_ready_items(
-            &lane,
-            &mut LaneReplies::default(),
-            &mut HashMap::new(),
-            &mut pending,
-            &mut VecDeque::new(),
-            &mut InFlightControls::default(),
-            16,
-            SchedulerLimits {
-                max_forward_requests: 8,
-                max_forward_tokens: 64,
-                max_page_refs: 64,
-                max_context: 0,
-                prefill_rows: 0,
-                max_readouts: 0,
-            },
-            &stats,
-            &mut FramePolicy::new(1, 64, 4096, None),
-            &mut ScanCache::default(),
-            &mut SlotBuffer::new(),
-            false,
-        );
-        assert!(!progress, "nothing left the queue");
-        assert_eq!(pending.len(), 2);
-        lane.shutdown();
-    }
-
-    fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
-        let pipeline = ProcessId::from_u128(5);
-        let request = PendingRequest {
-            lora_program: false,
-            logical_fire_id: 9,
-            request: crate::engine::FireRequest::default(),
-            instance_id: ::engine::InstanceId(1),
-            completion: crate::engine::WorkItemCompletion::new(1, 0),
-            process_id: None,
-            pipeline_id: Some(pipeline),
-            prelaunch_copy: None,
-            prelaunch_state_copy: Some(StateCopy::default()),
-            frame: None,
-        };
-        let mut pending = PendingQueue::default();
-        BatchScheduler::queue_attempt(&mut pending, request);
-        let mut cache = ScanCache::default();
-        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
-        assert!(scan.untracked.is_empty(), "behind its copy");
-        // The copy is dispatched: the launch rides.
-        let copy = pending.pop_front();
-        assert!(matches!(copy, Some(QueuedItem::PreLaunchCopy { .. })));
-        let mut cache = ScanCache::default();
-        let scan = BatchScheduler::scan_queue(&mut cache, &pending, false);
-        assert_eq!(scan.untracked, [9]);
-    }
-
-    fn a_panicking_engine_fails_its_launch_instead_of_leaving_it_in_flight() {
-        let mut lane = Lane::spawn(
-            0,
-            Some(Box::new(PanickingEngine)),
-            Arc::new(SchedulerStats::default()),
-        );
-
-        let mut answers = Vec::new();
-        for token in [7_u64, 8] {
-            let answer_rx = lane.fire(
-                crate::engine::FrameFire {
-                    steps: vec![crate::engine::StepFire {
-                        submission: ::engine::Step {
-                            lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
-                            attachments: Vec::new(),
-                            media: Vec::new(),
-                            voxels: Vec::new(),
-                        },
-                        terminal_cells: Vec::new(),
-                        completions: Vec::new(),
-                        instances: vec![::engine::InstanceId(0)],
-                        member_lanes: vec![1],
-                    }],
-                },
-                false,
-            );
-            answers.push((token, answer_rx));
-        }
-
-        for (want, answer_rx) in answers {
-            let result = crate::rt::block_on(async {
-                crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
-            })
-            .unwrap_or_else(|_| panic!("token {want} was never answered"))
-            .unwrap_or_else(|_| panic!("token {want} was never answered"));
-            let Err(err) = result else {
-                panic!("a panicking engine cannot have launched anything");
-            };
-            assert!(
-                err.message.contains("panic"),
-                "the failure must say what happened, so an operator restarts \
-                 rather than retries: {}",
-                err.message
-            );
-        }
-
-        let (engine, channels) = lane.shutdown();
-        assert!(engine.is_none(), "a poisoned lane hands back no engine");
-        assert!(channels.is_empty());
-    }
-
-    struct ExhaustedEngine {
-        submits: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl engine::Engine for ExhaustedEngine {
-        fn kind(&self) -> &'static str {
-            "exhausted"
-        }
-
-        fn load(&mut self, _request: engine::LoadRequest) -> engine::Result<engine::Loaded> {
-            Err(engine::Error::Load("no model".into()))
-        }
-
-        fn submit(
-            &mut self,
-            _frame: &engine::FrameSubmission,
-        ) -> engine::Result<engine::FrameTicket> {
-            self.submits.fetch_add(1, Ordering::Relaxed);
-            Err(engine::Error::Exhausted {
-                resource: "guest channel cells",
-                wanted: 2,
-                available: 1,
-            })
-        }
-
-        fn settle_frame(&mut self, _ticket: &mut engine::FrameTicket) -> engine::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
-        let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut lane = Lane::spawn(
-            0,
-            Some(Box::new(ExhaustedEngine {
-                submits: Arc::clone(&submits),
-            })),
-            Arc::new(SchedulerStats::default()),
-        );
-
-        let answer_rx = lane.fire(
-            crate::engine::FrameFire {
-                steps: vec![crate::engine::StepFire {
-                    submission: ::engine::Step {
-                        lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
-                        attachments: Vec::new(),
-                        media: Vec::new(),
-                        voxels: Vec::new(),
-                    },
-                    terminal_cells: Vec::new(),
-                    completions: Vec::new(),
-                    instances: vec![::engine::InstanceId(0)],
-                    member_lanes: vec![1],
-                }],
-            },
-            false,
-        );
-
-        let result = crate::rt::block_on(async {
-            crate::rt::time::timeout(Duration::from_secs(10), answer_rx).await
-        })
-        .expect("the launch must be answered, not slept on")
-        .expect("the launch must be answered, not slept on");
-        let Err(error) = result else {
-            panic!("an engine that refuses everything cannot have admitted a frame");
-        };
-        assert!(
-            error.message.contains("frame contract forbids"),
-            "the failure must say which promise was broken, so the fix is to \
-             static admission rather than to the retry budget: {}",
-            error.message
-        );
-        assert!(
-            error.message.contains("guest channel cells"),
-            "{}",
-            error.message
-        );
-        assert_eq!(
-            submits.load(Ordering::Relaxed),
-            1,
-            "the frame is offered ONCE; a second offer is the sleep-retry loop \
-             growing back"
-        );
-
-        let (_engine, _channels) = lane.shutdown();
-    }
-}
+/// A test's own lane for an engine: the copies its planner and stores
+/// submit (`copy_tier_tracked`) are handed to the test, which lands each
+/// one (or refuses it) when it chooses; the pool requests a move waits on
+/// (`settle_copies`, a rebind) are answered at once. Installed for this
+/// thread alone ([`crate::scheduler::set_test_handle`]).
+#[cfg(test)]
+pub(crate) mod test_lane;

@@ -1,121 +1,101 @@
-//! Keeps a completed process's working set for its `keep-ms`, between a
-//! session's turns (after Continuum).
+//! Keeps a completed process's KV for its session's next turn (after
+//! Continuum), over what `default` does.
+//!
+//! - Hint `keep-ms` (int, above 0): the KV the process leaves as it
+//!   completes is kept above every other for that long, on any tier, and
+//!   dropped then. A session keeps only its latest turn: the one before is
+//!   cache a process left, as any other.
 
 use std::collections::HashMap;
 
-use policy::{By, Change, Exit, Id, Outcome, Retain, Subject, attr, prop, set_alarm, worker};
+use plex::prelude::*;
+use worker_defaults::{Defaults, IdleCache, wake};
 
-/// Above any key the worker gives a working set this policy does not name.
+/// Above any key this worker gives a working set named nowhere here.
 const KEEP: i64 = 1 << 40;
 
 struct Kept {
-    session: Option<String>,
-    due_ms: Option<u64>,
-    keep_ms: u64,
+    session: Option<SessionId>,
+    /// Its prompt tokens, for the rows it has once it is not kept.
+    prompt: Option<u32>,
+    due: Mark,
+    /// Which of the sets kept came first.
+    nth: u64,
 }
 
 #[derive(Default)]
 struct KeepSession {
-    keep_ms: HashMap<Id, u64>,
-    completed: HashMap<Id, u64>,
-    kept: HashMap<Id, Kept>,
+    defaults: Defaults,
+    /// Completed processes not yet retained, and how long to keep them.
+    completed: HashMap<ProcessId, Duration>,
+    kept: HashMap<WorkingSetId, Kept>,
+    nth: u64,
 }
 
-impl KeepSession {
-    fn read(&mut self, process: &Id) {
-        match prop(&Subject::Process(process.clone()), "keep-ms").int() {
-            Some(ms) if ms > 0 => {
-                self.keep_ms.insert(process.clone(), ms as u64);
-            }
-            _ => {
-                self.keep_ms.remove(process);
-            }
-        }
-    }
-}
-
-impl worker::Policy for KeepSession {
-    fn on_arrived(&mut self, process: &Id) {
-        self.read(process);
-    }
-
-    fn on_prop_changed(&mut self, change: &Change) {
-        if let Subject::Process(process) = &change.subject
-            && change.names.iter().any(|n| n == "keep-ms")
-        {
-            self.read(process);
+impl Policy for KeepSession {
+    fn on_exited(&mut self, exit: &Exit, _now: Mark) {
+        self.defaults.cache.on_exited(exit);
+        let keep = hint(&exit.process, "keep-ms")
+            .int()
+            .and_then(|ms| u64::try_from(ms).ok())
+            .filter(|&ms| ms > 0 && exit.outcome == Outcome::Completed);
+        if let Some(ms) = keep {
+            self.completed
+                .insert(exit.process.clone(), ms.saturating_mul(MILLISECOND));
         }
     }
 
-    fn on_exited(&mut self, exit: &Exit) {
-        if let Some(ms) = self.keep_ms.remove(&exit.process)
-            && exit.outcome == Outcome::Completed
-        {
-            self.completed.insert(exit.process.clone(), ms);
-        }
+    fn on_retained(&mut self, retention: &Retention, now: Mark) {
+        let set = &retention.working_set;
+        let Some(keep) = self.completed.remove(set) else {
+            self.defaults.cache.on_retained(retention);
+            return;
+        };
+        let prompt = self.defaults.cache.left(retention).flatten();
+        self.nth += 1;
+        self.kept.insert(
+            set.clone(),
+            Kept {
+                session: snapshot::get_working_set(set).and_then(|set| set.session),
+                prompt,
+                due: now.saturating_add(keep),
+                nth: self.nth,
+            },
+        );
+        retention::priority::set(&Prefix::all(set.as_str()), KEEP).ok();
     }
 
-    fn on_retained(&mut self, working_set: &Id) {
-        // A working-set has its owner's id.
-        if let Some(keep_ms) = self.completed.remove(working_set) {
-            let session = attr(&Subject::WorkingSet(working_set.clone()), "session")
-                .text()
-                .map(str::to_string);
-            self.kept.insert(
-                working_set.clone(),
-                Kept {
-                    session,
-                    due_ms: None,
-                    keep_ms,
-                },
-            );
-        }
+    fn on_evicted(&mut self, eviction: &Eviction, _now: Mark) {
+        self.kept.remove(&eviction.working_set);
     }
 
-    fn on_discarded(&mut self, working_set: &Id, _by: By) {
-        self.kept.remove(working_set);
-    }
+    fn plan(&mut self, now: Mark) {
+        let again = self.defaults.plan(now, |_| 0);
+        self.completed
+            .retain(|process, _| self.defaults.cache.awaits(process));
 
-    fn plan(&mut self, now_ms: u64) {
-        self.completed.clear();
-        // A session keeps only its latest turn.
-        let mut latest: HashMap<String, (u64, Id)> = HashMap::new();
-        for (ws, kept) in &mut self.kept {
-            let due = *kept.due_ms.get_or_insert(now_ms + kept.keep_ms);
+        let mut latest: HashMap<SessionId, u64> = HashMap::new();
+        for kept in self.kept.values() {
             if let Some(session) = &kept.session {
-                let newest = latest.entry(session.clone()).or_insert((due, ws.clone()));
-                if due > newest.0 {
-                    *newest = (due, ws.clone());
-                }
+                let nth = latest.entry(session.clone()).or_default();
+                *nth = (*nth).max(kept.nth);
             }
         }
-        self.kept.retain(|ws, kept| {
-            kept.session
-                .as_ref()
-                .is_none_or(|session| latest[session].1 == *ws)
+        self.kept.retain(|set, kept| {
+            let whole = Prefix::all(set.as_str());
+            if kept.due <= now {
+                retention::priority::delete(&whole);
+                retention::tiers::set(&whole, &[]).ok();
+                return false;
+            }
+            let newest = kept.session.as_ref().is_none_or(|s| latest[s] == kept.nth);
+            if !newest {
+                IdleCache::write(set, kept.prompt);
+            }
+            newest
         });
-
-        let (due, kept): (Vec<_>, Vec<_>) = self
-            .kept
-            .iter()
-            .partition(|(_, kept)| kept.due_ms.is_some_and(|due| due <= now_ms));
-        for (ws, _) in &due {
-            worker::discard(ws);
-        }
-        let entries: Vec<_> = kept
-            .iter()
-            .map(|(ws, _)| Retain::all((*ws).clone(), KEEP))
-            .collect();
-        let next = kept.iter().filter_map(|(_, k)| k.due_ms).min();
-        worker::install_retention(&entries);
-        if let Some(next) = next {
-            set_alarm(next);
-        }
-        let discarded: Vec<Id> = due.into_iter().map(|(ws, _)| ws.clone()).collect();
-        for ws in discarded {
-            self.kept.remove(&ws);
-        }
+        wake([again, self.kept.values().map(|kept| kept.due).min()]);
     }
 }
 
-policy::worker!(KeepSession);
+plex::export!(KeepSession);

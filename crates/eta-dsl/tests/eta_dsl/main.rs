@@ -2,8 +2,10 @@
 
 mod a_float_lane_program_traces_from_its_inputs;
 mod a_released_channel_is_gone;
+mod a_sampler_knob_is_data;
 mod authoring_errors;
 mod beam_search;
+mod bf16;
 mod inferlet_goldens;
 mod lowering;
 mod op_reachability;

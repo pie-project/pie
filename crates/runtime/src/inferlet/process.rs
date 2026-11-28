@@ -5,6 +5,7 @@ mod output;
 pub(crate) mod residency;
 pub(crate) mod teardown;
 
+pub(crate) use ctx::Keying;
 pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
@@ -176,6 +177,190 @@ pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().flatten()
 }
 
+/// How long a process waits at one step of a fire's path before it says
+/// so, and again after each such span.
+const STEP_SAYS_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A wait said once an episode: at INFO when it is first known, at DEBUG
+/// while it repeats, and at INFO again as it ends, with how long it ran.
+#[derive(Debug, Default)]
+pub(crate) struct WaitEpisode {
+    since: Option<Instant>,
+}
+
+impl WaitEpisode {
+    /// The wait is seen now: true the first time in its episode, the one
+    /// said at INFO.
+    pub(crate) fn seen(&mut self) -> bool {
+        if self.since.is_some() {
+            return false;
+        }
+        self.since = Some(Instant::now());
+        true
+    }
+
+    /// The wait is over: how long since its episode was first seen, `None`
+    /// where none was under way (nothing to say).
+    pub(crate) fn end(&mut self) -> Option<std::time::Duration> {
+        self.since.take().map(|since| since.elapsed())
+    }
+}
+
+/// Whether a wait stage is one on the planner or a store (its process
+/// blocked until room, a grant, its restore, a segment, a fire span or a
+/// rung comes), not a request the engine's lane answers on its own.
+pub(crate) fn blocks_on_planner(stage: &str) -> bool {
+    matches!(
+        stage,
+        "plan: the planner's grant"
+            | "plan: resident again"
+            | "bind: resident again"
+            | "bind: room for its guest state"
+            | "bind: a segment for its guest state"
+            | "bind: the program's fire span"
+            | "enqueue: the activation rung"
+            | "bind: its pair's move"
+            | "seat the lanes"
+            | "plan: pages another pass computes"
+    )
+}
+
+/// Awaits `wait`, input from outside the runtime that `pid`'s guest
+/// blocks on: a session receive, a timer, an HTTP response. Ready at once,
+/// it parks nothing. Pending, the process's lanes are parked first: no
+/// frame waits on a guest that waits on the outside, and each lane rejoins
+/// with its own next submit. A guest that computes, or waits on its own
+/// fires and channels, never comes here and stays awaited.
+pub(crate) async fn away_while<F: std::future::Future>(pid: ProcessId, wait: F) -> F::Output {
+    let mut wait = std::pin::pin!(wait);
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(wait.as_mut().poll(cx))).await;
+    if let std::task::Poll::Ready(output) = first {
+        return output;
+    }
+    crate::scheduler::worker::notify_owner_away(pid);
+    wait.await
+}
+
+/// Awaits `step`, saying once [`STEP_SAYS_AFTER`] has passed that process
+/// `pid` waits at `stage` (each span after that at DEBUG), and once more as
+/// the wait ends, with its duration: what a stall on the way from a process
+/// to the lane is read from (seats, bind, plan, enqueue). Outside a runtime
+/// it only awaits.
+pub(crate) async fn said<F: std::future::Future>(
+    stage: &'static str,
+    pid: ProcessId,
+    step: F,
+) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return step.await;
+    }
+    tokio::pin!(step);
+    // A wait on the planner or a store: the owner is blocked only where the
+    // planner or the store actually parks it ([`parks_here`]: queued for
+    // room, a restore turn, a pair's move, a rung, a segment), and no frame
+    // waits on its lanes meanwhile (the soaks' self-cycle: a frame held for
+    // lanes whose owners waited on grants, an eviction waiting on that
+    // frame's fire, the grants on the eviction). A wait that is merely not
+    // ready on its first poll parks nothing (marked so, microsecond waits
+    // flapped owners in and out of a frame's expected lanes).
+    if blocks_on_planner(stage) {
+        return WAITING_OWNER
+            .scope(pid, said_waiting(stage, pid, step))
+            .await;
+    }
+    said_waiting(stage, pid, step).await
+}
+
+tokio::task_local! {
+    /// The process whose wait on the planner or a store this task is in
+    /// ([`said`]), for [`parks_here`].
+    static WAITING_OWNER: ProcessId;
+}
+
+/// How many parks each process stands in now ([`parks_here`]).
+static PARKED: std::sync::LazyLock<std::sync::Mutex<HashMap<ProcessId, u32>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The planner or a store parks the wait this task is in ([`said`]) until
+/// the returned guard drops: its owner is told blocked (no frame waits on
+/// its lanes) at its first park, and unblocked as its last ends, before
+/// control goes back to its guest. `None` outside such a wait.
+#[must_use]
+pub(crate) fn parks_here() -> Option<Parked> {
+    let pid = WAITING_OWNER.try_with(|pid| *pid).ok()?;
+    let first = {
+        let mut parked = PARKED.lock().unwrap();
+        let count = parked.entry(pid).or_default();
+        *count += 1;
+        *count == 1
+    };
+    if first {
+        crate::scheduler::worker::notify_owner_blocked(pid);
+    }
+    Some(Parked(pid))
+}
+
+/// A park of a process's wait ([`parks_here`]); its end unblocks the owner
+/// once no other park of it stands.
+pub(crate) struct Parked(ProcessId);
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        let last = {
+            let mut parked = PARKED.lock().unwrap();
+            match parked.get_mut(&self.0) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                _ => {
+                    parked.remove(&self.0);
+                    true
+                }
+            }
+        };
+        if last {
+            crate::scheduler::worker::notify_owner_unblocked(self.0);
+        }
+    }
+}
+
+async fn said_waiting<F: std::future::Future>(
+    stage: &'static str,
+    pid: ProcessId,
+    mut step: std::pin::Pin<&mut F>,
+) -> F::Output {
+    let started = Instant::now();
+    let mut episode = WaitEpisode::default();
+    loop {
+        match crate::rt::time::timeout(STEP_SAYS_AFTER, &mut step).await {
+            Ok(output) => {
+                if episode.end().is_some() {
+                    tracing::info!(
+                        stage,
+                        %pid,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "a process waited on its way to a fire"
+                    );
+                }
+                return output;
+            }
+            Err(_) if episode.seen() => tracing::info!(
+                stage,
+                %pid,
+                waited_s = started.elapsed().as_secs(),
+                "a process waits on its way to a fire"
+            ),
+            Err(_) => tracing::debug!(
+                stage,
+                %pid,
+                waited_s = started.elapsed().as_secs(),
+                "a process still waits on its way to a fire"
+            ),
+        }
+    }
+}
+
 pub fn live_count() -> usize {
     SERVICES.len()
 }
@@ -189,8 +374,6 @@ pub fn seats() -> (usize, usize) {
     .min(live);
     (running, live - running)
 }
-
-const UNCAPPED_PREWARM_PROCESSES: usize = 64;
 
 static PROCESS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PROCESS_ADMISSION_WAIT_US: AtomicU64 = AtomicU64::new(0);
@@ -265,14 +448,31 @@ pub fn get_runtime_stats() -> RuntimeProcessStats {
 
 pub fn init_admission(max_concurrent: Option<usize>) {
     let limit = max_concurrent.filter(|&n| n > 0);
-    // Only the first gate, prewarm, holds below the floor.
-    let sem = limit.map(|n| OrderedSemaphore::new(n, false));
+    // Passed in this order: none passes a gate ahead of a higher key
+    // waiting at an earlier one. Only the first gate, prewarm, holds below
+    // the floor. With no count stated it counts nothing: over-demand is the
+    // planner's contention to settle.
     let prewarm = Some(OrderedSemaphore::new(
-        limit.unwrap_or(UNCAPPED_PREWARM_PROCESSES),
+        "prewarm",
+        limit.unwrap_or(usize::MAX / 2),
         true,
     ));
     const STAGED_COHORTS: usize = 1;
-    let bind_ahead = limit.map(|n| OrderedSemaphore::new(n, false));
+    let earlier = |gates: &[&Option<Arc<OrderedSemaphore>>]| -> Vec<Arc<OrderedSemaphore>> {
+        gates
+            .iter()
+            .filter_map(|gate| gate.as_ref().map(Arc::clone))
+            .collect()
+    };
+    let bind_ahead = limit.map(|n| OrderedSemaphore::after("bind", n, false, earlier(&[&prewarm])));
+    // Execution looks back at bind alone: what waits before bind is bind's
+    // to order, and a process there may wait on bind permits that
+    // execution's own waiters hold.
+    let sem = limit.map(|n| {
+        // A held process is not started: it waits here, bound, until its
+        // row lets it, and the others pass it.
+        OrderedSemaphore::after("execution", n, true, earlier(&[&bind_ahead]))
+    });
     BIND_STAGED_RESERVE.store(
         limit.map_or(0, |n| n.saturating_mul(STAGED_COHORTS)),
         Relaxed,
@@ -384,6 +584,22 @@ pub(crate) fn reset() {
     RESTARTABLE.write().unwrap().clear();
     RESTART_REQUESTED.write().unwrap().clear();
     RESTART_ALIAS.write().unwrap().clear();
+    RESTART_TOTAL.store(0, Relaxed);
+    PARKED.lock().unwrap().clear();
+    for count in [
+        &PROCESS_COMPLETED,
+        &PROCESS_ADMISSION_WAIT_US,
+        &PROCESS_INSTANTIATE_US,
+        &PROCESS_CONTEXT_REGISTER_US,
+        &PROCESS_WASM_RUN_US,
+        &PROCESS_LAST_ADMISSION_WAIT_US,
+        &PROCESS_LAST_INSTANTIATE_US,
+        &PROCESS_LAST_CONTEXT_REGISTER_US,
+        &PROCESS_LAST_WASM_RUN_US,
+    ] {
+        count.store(0, Relaxed);
+    }
+    crate::inferlet::host::frames::reset();
     residency::reset();
 }
 
@@ -425,6 +641,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     if let Some(planner) = crate::planner::planner_of(ctx.id()) {
         planner.note_admitted(ctx.id());
     }
+    crate::store::waiting::left(ctx.id());
     crate::policy::report(crate::policy::Event::Started(ctx.id()));
 }
 
@@ -457,7 +674,46 @@ pub(crate) fn spawn(
         lease,
         arrival,
         executors,
+        false,
     )
+    .map(|(id, _)| id)
+}
+
+/// [`spawn`], with a watch on the process's full departure taken as its id
+/// is made, before it holds anything or runs: its departure cannot be
+/// missed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one spawn request, as its callers have it"
+)]
+pub(crate) fn spawn_watched(
+    username: String,
+    program: Program,
+    input: String,
+    files: Arc<client_api::Files>,
+    client_id: Option<ClientId>,
+    capture_outputs: bool,
+    result_tx: Option<oneshot::Sender<Result<String, String>>>,
+    lease: Option<crate::handle::Lease>,
+    arrival: Arrival,
+    executors: Vec<String>,
+) -> Result<(ProcessId, crate::planner::DepartureWatch)> {
+    let (id, watch) = spawn_inner(
+        username,
+        program,
+        input,
+        files,
+        client_id,
+        capture_outputs,
+        Arc::new(Mutex::new(result_tx)),
+        None,
+        None,
+        lease,
+        arrival,
+        executors,
+        true,
+    )?;
+    Ok((id, watch.expect("a watch was asked for")))
 }
 
 #[allow(
@@ -477,9 +733,12 @@ fn spawn_inner(
     lease: Option<crate::handle::Lease>,
     arrival: Arrival,
     executors: Vec<String>,
-) -> Result<ProcessId> {
+    watch_departure: bool,
+) -> Result<(ProcessId, Option<crate::planner::DepartureWatch>)> {
     let _weights = crate::model::reload::launching()?;
     let id = Uuid::new_v4();
+    // Before anything is held under the id, so no departure is missed.
+    let watch = watch_departure.then(|| crate::planner::DepartureWatch::new(id));
     // The workers the cluster names to run its passes, best first: the
     // offload's alone, before the process can run one.
     crate::offload::executors::set(id, executors.clone());
@@ -520,7 +779,7 @@ fn spawn_inner(
         return Err(error);
     }
 
-    Ok(id)
+    Ok((id, watch))
 }
 
 pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
@@ -657,6 +916,15 @@ enum Message {
 
 const OUTPUT_BUFFER_CAP: usize = 4096;
 
+/// A guest's trap as its error: the trap with its cause and wasm backtrace,
+/// and what the guest last wrote to stderr (a Rust guest's panic message).
+fn trapped(call_err: &impl std::fmt::Debug, stderr: Option<String>) -> String {
+    match stderr {
+        Some(said) => format!("Call error: {call_err:?}\nguest stderr:\n{said}"),
+        None => format!("Call error: {call_err:?}"),
+    }
+}
+
 struct Process {
     process_id: ProcessId,
     client_pid: ProcessId,
@@ -781,7 +1049,28 @@ impl Process {
         // A process arrives, as a policy sees it, before it waits: every gate
         // below orders by its key.
         let props = arrival.props.clone();
+        let keying = match arrival.keys_under {
+            Some(domain) => Keying::OnBehalf(domain),
+            None => Keying::Asker(crate::policy::share::Asker {
+                tenant: crate::policy::share::TenantId(arrival.tenant.clone()),
+                session: match &arrival.session {
+                    Some(session) => crate::policy::share::SessionId::Named(session.clone()),
+                    None => crate::policy::share::SessionId::Process(process_id),
+                },
+            }),
+        };
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
+        crate::store::waiting::arrived(
+            process_id,
+            &props,
+            match &keying {
+                Keying::Asker(asker) => crate::policy::share::ShareAs::Scope(
+                    crate::policy::share::ShareScope::Tenant,
+                    asker.clone(),
+                ),
+                Keying::OnBehalf(domain) => crate::policy::share::ShareAs::OnBehalf(*domain),
+            },
+        );
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
         if let Some(planner) = crate::planner::planner_of(process_id) {
@@ -807,6 +1096,7 @@ impl Process {
                 .map_err(|e| e.to_string())?;
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
+            store.data_mut().set_keying(keying);
             store.data_mut().set_props(props);
             store.data_mut().set_files(files);
             if let Some(lease) = lease {
@@ -854,14 +1144,33 @@ impl Process {
                 }
                 Err(call_err) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
-                    Err(format!("Call error: {call_err}"))
+                    let text = trapped(&call_err, store.data().stderr_said());
+                    // A planner error in the trap's chain leads the text
+                    // with its code, found by type.
+                    Err(
+                        match call_err
+                            .chain()
+                            .find_map(|cause| cause.downcast_ref::<crate::planner::PlannerError>())
+                        {
+                            Some(error) => error.lead(text),
+                            None => text,
+                        },
+                    )
                 }
             };
             admission_wait_us = store.data().admission_wait_us();
+            tracing::debug!(
+                target: "pie::launch",
+                %program, %process_id, instantiate_us, wasm_run_us,
+                "guest returned"
+            );
             drop(store);
             result
         }
         .await;
+        // However the guest or the pipeline wrapped it, a failure the
+        // planner coded leads with its code.
+        let result = result.map_err(|text| crate::planner::lead_result(process_id, text));
         record_process_timing(
             admission_wait_us,
             instantiate_us,
@@ -872,17 +1181,15 @@ impl Process {
         if let Err(ref err) = result {
             tracing::info!("Process {process_id} failed: {err}");
         }
-        if crate::planner::trace_enabled() {
-            println!(
-                "[process t_us={} pid={}] guest finished ok={} restart_requested={} \
-                 admission_wait_us={admission_wait_us} instantiate_us={instantiate_us} \
-                 wasm_run_us={wasm_run_us}",
-                crate::scheduler::fire_timing_now_us(),
-                process_id,
-                result.is_ok(),
-                restart_requested(process_id)
-            );
-        }
+        tracing::debug!(
+            pid = %process_id,
+            ok = result.is_ok(),
+            restart_requested = restart_requested(process_id),
+            admission_wait_us,
+            instantiate_us,
+            wasm_run_us,
+            "guest finished"
+        );
 
         if !restart_requested(process_id)
             && let Some(tx) = result_tx.lock().unwrap().take()
@@ -909,9 +1216,13 @@ impl Process {
             None,
             self.arrival.clone(),
             self.executors.clone(),
-        );
+            false,
+        )
+        .map(|(id, _)| id);
         match spawned {
             Ok(new_id) => {
+                // A watch on its departure follows the new run.
+                crate::planner::follow_restart(self.process_id, new_id);
                 RESTART_ALIAS
                     .write()
                     .unwrap()
@@ -950,19 +1261,17 @@ impl Process {
                 (Err(_), true, _) | (_, false, By::Host) => Outcome::Failed,
                 (_, false, By::Client | By::Policy) => Outcome::Cancelled,
             };
+            crate::store::waiting::left(self.client_pid);
             crate::policy::report(crate::policy::Event::Exited(self.client_pid, outcome));
             if let Some(tx) = self.result_tx.lock().unwrap().take() {
                 let _ = tx.send(result.clone());
             }
 
-            if crate::planner::trace_enabled() {
-                println!(
-                    "[process t_us={} pid={}] delivering {}",
-                    crate::scheduler::fire_timing_now_us(),
-                    self.process_id,
-                    if result.is_ok() { "return" } else { "error" }
-                );
-            }
+            tracing::debug!(
+                pid = %self.process_id,
+                "delivering {}",
+                if result.is_ok() { "return" } else { "error" }
+            );
             match result {
                 Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
                 Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
@@ -1094,6 +1403,25 @@ pub(crate) mod probe {
 mod tests {
     use super::*;
 
+    /// A trap says its cause and the guest's last stderr, its panic message.
+    #[test]
+    fn a_trap_says_the_guest_panic_message() {
+        let tail = output::StderrTail::default();
+        let err = output::LogStream::new_stderr(ProcessId::new_v4(), tail.clone(), false);
+        err.write_bytes(b"\nthread '<unnamed>' panicked at crates/inferlet/src/eta.rs:164:14:\n");
+        err.write_bytes(b"stage seed on a fresh channel: channel is closed\n");
+        let trap = anyhow!("wasm trap: wasm `unreachable` instruction executed")
+            .context("error while executing at wasm backtrace:\n    0: 0x7d0f - beam_search.wasm!teacher_forced");
+        let said = trapped(&trap, tail.said());
+        assert!(said.contains("0x7d0f"), "{said}");
+        assert!(said.contains("unreachable"), "the cause: {said}");
+        assert!(
+            said.contains("panicked at crates/inferlet/src/eta.rs:164:14:\nstage seed on a fresh channel: channel is closed"),
+            "{said}"
+        );
+        assert!(!trapped(&trap, None).contains("guest stderr"));
+    }
+
     fn idle(process_id: ProcessId, client_pid: ProcessId, result_tx: SharedResultTx) -> Process {
         Process {
             process_id,
@@ -1171,5 +1499,95 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
         assert_eq!(result.unwrap().unwrap(), Err("closed".to_string()));
         assert!(!RESTART_ALIAS.read().unwrap().contains_key(&pid));
+    }
+}
+
+#[cfg(test)]
+mod blocked_tests {
+    use super::*;
+
+    /// Every wait on the planner or a store parks its process's lanes once
+    /// the planner or the store actually parks it ([`parks_here`]): one case
+    /// per wait kind. A wait merely not ready on its first poll, or one that
+    /// ends at once (a grant at hand), parks nothing, and a lane request (the
+    /// engine answering on its own) never does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_wait_on_the_planner_or_a_store_parks_its_process_once_it_blocks() {
+        use crate::scheduler::frame::FramePolicy;
+        let kinds = [
+            "plan: the planner's grant",
+            "plan: resident again",
+            "bind: resident again",
+            "bind: room for its guest state",
+            "bind: a segment for its guest state",
+            "bind: the program's fire span",
+            "enqueue: the activation rung",
+            "bind: its pair's move",
+            "seat the lanes",
+            "plan: pages another pass computes",
+        ];
+        let told = |pid: ProcessId| {
+            crate::scheduler::worker::OWNERS_BLOCKED
+                .lock()
+                .unwrap()
+                .contains(&pid)
+        };
+        for stage in kinds {
+            assert!(blocks_on_planner(stage), "{stage}");
+            // Parked by the planner or the store: told at once, before any
+            // clock.
+            let pid = ProcessId::new_v4();
+            let waiting = tokio::spawn(said(stage, pid, async {
+                let _parked = parks_here();
+                std::future::pending::<()>().await
+            }));
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert!(told(pid), "{stage}: a parked wait parks its process");
+            waiting.abort();
+            let _ = waiting.await;
+            assert!(
+                !PARKED.lock().unwrap().contains_key(&pid),
+                "{stage}: unparked as it ends"
+            );
+            // Pending but parked nowhere (a lock, a microsecond's turn):
+            // nothing.
+            let brief = ProcessId::new_v4();
+            let pending = tokio::spawn(said(stage, brief, std::future::pending::<()>()));
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!told(brief), "{stage}: not ready at once is no park");
+            pending.abort();
+            // Its complete frame is waited on by no one.
+            assert!(
+                FramePolicy::parked_owner_frame_goes_at_once(pid),
+                "{stage}: its complete frame waits only on lanes still expected"
+            );
+            // A wait that ends at once parks nothing.
+            let quick = ProcessId::new_v4();
+            said(stage, quick, std::future::ready(())).await;
+            assert!(!told(quick));
+        }
+        assert!(parks_here().is_none(), "outside a wait, no park");
+        // Evicted while its guest is between waits (in no said() at all):
+        // the eviction's suspension parks its lanes, and its complete frame
+        // goes at once all the same (the od-2 dump: its bind wait had ended
+        // 6 s before its eviction began).
+        assert!(
+            FramePolicy::parked_owner_frame_goes_at_once_by(ProcessId::new_v4(), true),
+            "suspended between waits: its complete frame waits on no boundary"
+        );
+        for request in [
+            "bind",
+            "bind: the lane's bind",
+            "bind: register the program",
+        ] {
+            assert!(
+                !blocks_on_planner(request),
+                "{request} is the engine's lane, no wait on the planner"
+            );
+        }
     }
 }

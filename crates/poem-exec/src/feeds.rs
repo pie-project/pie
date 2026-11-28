@@ -227,8 +227,16 @@ pub struct ClassOutput {
 }
 
 /// Every output by the classes writing it. Classes writing the same values
-/// of a name share one; a name written at several layers stacks them.
-pub fn class_outputs(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<ClassOutput>, String> {
+/// of a name share one; a name written at several layers stacks them. A
+/// width the load states is read at its `context` (the keys a lane of the
+/// load may hold, [`Dim::ContextTimes`]) and its `page_size` (the context's
+/// pages, [`Dim::ContextPages`]).
+pub fn class_outputs(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    context: u32,
+    page_size: u32,
+) -> Result<Vec<ClassOutput>, String> {
     // A class whose words all set two values of one switch is no lane's.
     let table = &compiled.classes;
     let landed = ClassSet::of((0..table.classes.len()).filter(|&class| {
@@ -268,7 +276,7 @@ pub fn class_outputs(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<Clas
                 out.classes.insert(class);
                 continue;
             }
-            let decl = output_decl(trace, name, &values)?;
+            let decl = output_decl(trace, name, &values, &mine, context, page_size)?;
             outs.push(ClassOutput {
                 decl,
                 values,
@@ -280,17 +288,38 @@ pub fn class_outputs(trace: &Trace, compiled: &CompiledModel) -> Result<Vec<Clas
     Ok(outs)
 }
 
-fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDecl, String> {
+fn output_decl(
+    trace: &Trace,
+    name: &str,
+    values: &[ValueId],
+    outputs: &[&poem_ir::Output],
+    context: u32,
+    page_size: u32,
+) -> Result<OutputDecl, String> {
     let shape = |value: ValueId| match trace.values.get(value.0 as usize).map(|decl| &decl.ty) {
         Some(Ty::Tensor { shape, dtype }) => Ok((shape.first().copied(), *dtype)),
         _ => Err(format!("output `{name}` reads out no tensor")),
     };
     let (first, dtype) = shape(values[0])?;
-    let width = crate::store::kv::width_of(trace, values[0])
-        .map_err(|why| format!("output `{name}`: {why}"))?;
+    // A row as wide as the load makes it: `runs` runs of its context, or
+    // its context's pages; stated as the runs it is.
+    let context_runs =
+        |value: ValueId| match trace.values.get(value.0 as usize).map(|decl| &decl.ty) {
+            Some(Ty::Tensor { shape, .. }) => match shape[..] {
+                [_, Dim::ContextTimes(runs)] => Some((runs, context)),
+                [_, Dim::ContextPages] => Some((1, context.div_ceil(page_size.max(1)))),
+                _ => None,
+            },
+            _ => None,
+        };
+    let width_of = |value: ValueId| match context_runs(value) {
+        Some((runs, run)) => Ok(u64::from(runs) * u64::from(run)),
+        None => crate::store::kv::width_of(trace, value)
+            .map_err(|why| format!("output `{name}`: {why}")),
+    };
+    let width = width_of(values[0])?;
     for value in &values[1..] {
-        let width_here = crate::store::kv::width_of(trace, *value)
-            .map_err(|why| format!("output `{name}`: {why}"))?;
+        let width_here = width_of(*value)?;
         if shape(*value)? != (first, dtype) || width_here != width {
             return Err(format!(
                 "output `{name}` is written at {} layers in different shapes",
@@ -299,7 +328,7 @@ fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDe
         }
     }
     let axis = match first {
-        Some(Dim::Lanes | Dim::LanesPlus(_)) => InputAxis::Lane,
+        Some(Dim::Lanes | Dim::LanesPlus(_) | Dim::Capturing) => InputAxis::Lane,
         Some(Dim::Voxels | Dim::VoxelsScaled(..)) => InputAxis::Voxel,
         Some(Dim::Tokens | Dim::TokensTimes(_) | Dim::Readouts) => InputAxis::Row,
         other => {
@@ -319,6 +348,26 @@ fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDe
     } else {
         0
     };
+    // How one entry factors: every layer's write states the same, and the
+    // runs multiply to the width.
+    let planes = match context_runs(values[0]) {
+        Some((runs, run)) => vec![runs, run],
+        None => outputs
+            .first()
+            .map(|output| output.planes.clone())
+            .unwrap_or_default(),
+    };
+    if context_runs(values[0]).is_none() && outputs.iter().any(|output| output.planes != planes) {
+        return Err(format!(
+            "output `{name}` is written at different planes by its layers"
+        ));
+    }
+    if !planes.is_empty() && planes.iter().map(|&p| u64::from(p)).product::<u64>() != width {
+        return Err(format!(
+            "output `{name}` states its {width} values an entry as planes {planes:?}, whose \
+             product differs"
+        ));
+    }
     let tail = values
         .iter()
         .filter_map(|value| observed(trace, *value))
@@ -332,6 +381,7 @@ fn output_decl(trace: &Trace, name: &str, values: &[ValueId]) -> Result<OutputDe
         layers,
         readout: first == Some(Dim::Readouts),
         tail,
+        planes,
     })
 }
 

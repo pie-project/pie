@@ -6,19 +6,9 @@ use std::sync::LazyLock;
 use crate::tuning::{AXES, FACTS};
 use profile::{Facts, Profile, Registry, Report, Shelf};
 
-/// Rows from which a step is submitted a layer at a time rather than in one
-/// submit: in one, a long prefill on a slow GPU outlasts the driver's
-/// watchdog (about 2 s on Adreno, which a 64-row prefill reaches) and loses
-/// the device. A split step is not recorded, so a desktop GPU, with no such
-/// watchdog, says 0, never (the derived profile).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, profile::Decision)]
-#[decision(id = "engine.submit.split_rows", constant(range(0..=1_048_576)), default = 32, tune = engine)]
-pub struct SubmitSplitRows(pub u32);
-
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     let mut r = Registry::new("vulkan", FACTS, AXES);
     crate::tuning::register(&mut r);
-    r.add::<SubmitSplitRows>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // One queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
@@ -38,7 +28,26 @@ macro_rules! seeded {
     };
 }
 
-seeded!("qualcomm.toml", "imagination.toml");
+seeded!(
+    "qualcomm.toml",
+    "imagination.toml",
+    "nvidia.toml",
+    "nvidia/nvidia-rtx-pro-4500-blackwell.toml",
+    // Committed measured profiles (`pie tune export --engine vulkan`).
+    "nvidia-rtx-pro-4500-blackwell.measured.toml",
+    "adreno-tm-840.measured.toml",
+    "nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.measured.toml",
+);
+
+/// The host covers committed for this backend's devices
+/// (`profiles/<device>.covers.json`, `pie tune export --engine vulkan`),
+/// each listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[
+    include_str!("../profiles/nvidia-rtx-pro-4500-blackwell.covers.json"),
+    include_str!("../profiles/nvidia-rtx-spark-n1x-6144-core-blackwell-rtx-gpu.covers.json"),
+    include_str!("../profiles/adreno-tm-840.covers.json"),
+];
 
 /// What a device no family file applies to runs.
 pub const DERIVED: &str = include_str!("derived.toml");
@@ -48,9 +57,6 @@ pub static SHELF: Shelf = Shelf {
     seeded: SEEDED,
     derived: Some(|_, _| DERIVED.to_string()),
 };
-
-/// The cores a device is sized by when no extension reports a count.
-pub const UNREPORTED_CORES: u32 = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
@@ -77,11 +83,6 @@ impl Device {
             None => facts,
         }
     }
-
-    #[must_use]
-    pub fn pricing_cores(&self) -> u32 {
-        self.cores.unwrap_or(UNREPORTED_CORES)
-    }
 }
 
 /// The vendor's family file, or the derived profile, then the user's file.
@@ -90,13 +91,62 @@ pub fn resolve(device: &Device, profiles: Option<&Path>) -> (Profile, Report) {
     SHELF.resolve(registry(), &device.name, &device.facts(), profiles)
 }
 
+/// [`resolve`] for a load on the device `on` names (its vendor, device id
+/// and driver): the measurements the user's file stores kept where their
+/// keys match this build on this device, the rest dropped to be measured
+/// again ([`profile::rates::Rates::sift`]), each said in the load log.
+#[must_use]
+pub fn resolve_stored(device: &Device, on: &str, profiles: Option<&Path>) -> (Profile, Report) {
+    engine_gpu::stored::resolve(
+        &SHELF,
+        registry(),
+        &device.name,
+        &device.facts(),
+        profiles,
+        on,
+        <crate::device::Api as engine_gpu::serve::Serve>::TARGET,
+    )
+}
+
 #[must_use]
 pub fn probe() -> Option<(String, Facts)> {
-    let context = crate::device::Context::bind(
-        &crate::api::DeviceBoot::default(),
-        engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-    )
-    .ok()?;
+    probe_at(0)
+}
+
+/// What this build keys device `index`'s stored measurements by
+/// (`profile::rates::Now`: its device and driver, each kernel's code): what a
+/// committed entry is checked against before an export carries it.
+#[must_use]
+pub fn now_at(index: u32) -> Option<Box<dyn profile::rates::Now>> {
+    measured_on_at(index).map(|on| {
+        Box::new(engine_gpu::stored::Keys::new(
+            on,
+            kernels_slang::Target::Spirv,
+        )) as Box<dyn profile::rates::Now>
+    })
+}
+
+/// The device and driver device `index`'s measurements are keyed as taken
+/// on (`Context::measured_on`): what a home's host covers of it name.
+#[must_use]
+pub fn measured_on_at(index: u32) -> Option<String> {
+    let boot = crate::api::DeviceBoot {
+        device_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
+    Some(context.measured_on())
+}
+
+/// [`probe`] of the device `index` names, in the order the engine numbers
+/// them (`vulkan:<n>`).
+#[must_use]
+pub fn probe_at(index: u32) -> Option<(String, Facts)> {
+    let boot = crate::api::DeviceBoot {
+        device_index: index,
+        ..crate::api::DeviceBoot::default()
+    };
+    let context = crate::device::Context::bind(&boot, engine::Allowance::WHOLE).ok()?;
     let device = context.chip();
     Some((device.name.clone(), device.facts()))
 }
@@ -144,7 +194,7 @@ mod tests {
     }
 
     fn tuning(d: &Device) -> Tuning {
-        let cores = d.pricing_cores();
+        let cores = d.cores.unwrap_or(Limits::ASSUMED.cores);
         Tuning::new(
             resolve(d, None).0,
             Limits {
@@ -158,8 +208,9 @@ mod tests {
     fn a_device_runs_its_vendors_files_or_what_its_facts_derive() {
         let qualcomm = "qualcomm.toml";
         let imagination = "imagination.toml";
+        let nvidia = "nvidia.toml";
         for (d, files) in [
-            (device("nvidia", 32, Some(142), true), &[][..]),
+            (device("nvidia", 32, Some(142), true), &[nvidia][..]),
             (device("amd", 64, Some(60), false), &[]),
             (device("intel", 16, None, false), &[]),
             (device("qualcomm", 32, None, true), &[]),
@@ -260,7 +311,7 @@ mod tests {
                 "{d:?}"
             );
             assert_eq!(t.sdpa_split_min_keys(), if qualcomm { 128 } else { 256 });
-            assert_eq!(t.gemm_coopmat() && t.moe_coopmat(), d.coopmat, "{d:?}");
+            assert_eq!(t.gemm_coopmat(2048) && t.moe_coopmat(), d.coopmat, "{d:?}");
             assert_eq!(t.sdpa_tile_rows_per_request(), 32);
             for (pairs, experts, tile) in [
                 (0, 8, 1),
@@ -322,7 +373,7 @@ mod device_probe {
     fn the_probe_reads_the_device_it_names() {
         let bound = crate::device::Context::bind(
             &crate::api::DeviceBoot::default(),
-            engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+            engine::Allowance::WHOLE,
         );
         let Ok(context) = bound else {
             eprintln!("not asked: {:?}", bound.err());

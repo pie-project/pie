@@ -139,6 +139,13 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    allow(
+        clippy::disallowed_methods,
+        reason = "available_parallelism is Err on wasm32, so one worker: the serial branch returns before the scope"
+    )
+)]
 pub fn cast_elements(bytes: &[u8], from: DType, to: DType) -> Result<Vec<u8>, Error> {
     let in_width = from.bytes_ceil() as usize;
     let out_width = to.bytes_ceil() as usize;

@@ -124,7 +124,10 @@ fn emit(
     };
     writer.set_attributes(attributes);
     writer.finish().map_err(Error::from)?;
-    std::fs::File::open(target)
+    // Flushing a file asks for write access on Windows; unix takes either.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(target)
         .and_then(|file| file.sync_all())
         .map_err(|why| Error::Checkpoint(format!("syncing {}: {why}", target.display())))
 }

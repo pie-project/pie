@@ -1,22 +1,193 @@
 #![allow(unsafe_code)]
+use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use eta_compiler::codegen::lane_scratch::LaneScratch;
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
+use eta_compiler::codegen::metal::StepNodes;
 use eta_exec::{
     Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape, NO_TICKET,
-    OpParams, SCRATCH_ALIGN, Status, ValueDesc, describe, layout,
+    OpParams, SCRATCH_ALIGN, Status, ValueDesc, describe,
 };
+use eta_exec::{Launch, Launches, Layout, TooLarge};
+
+/// The stage as Metal runs it, region by region as each was compiled: a
+/// streamed region's launches are its steps as the emitter published their
+/// nodes, each dispatched after the one before it, so a value whose last
+/// reader's last step has run gives its bytes to one a later step writes,
+/// and a view no step computes takes no bytes (its readers read its
+/// source's); any other form runs its region as one dispatch, one launch.
+/// Every other value a region names takes bytes (Metal's streamed form
+/// writes them all); the temporary area is what each region's kernel
+/// publishes it takes ([`temporary_needs`]), below it the select's reserve
+/// as before.
+fn launches<'a>(
+    plan: &'a LaunchStagePlan,
+    regions: &'a [Region],
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Launches<'a>, eta_exec::TemporaryRefused> {
+    let published: Vec<Option<&StepNodes>> = (0..plan.fused.len())
+        .map(|index| {
+            regions
+                .iter()
+                .find(|compiled| compiled.region_index as usize == index)
+                .filter(|compiled| compiled.form == Form::Streamed)
+                .map(|compiled| &*compiled.launches)
+        })
+        .collect();
+    published_launches(plan, &published, descriptors)
+}
+
+/// [`launches`] from what each region of `plan` published: a streamed
+/// region's step lists (empty where it is one launch), `None` for a region
+/// of another form.
+pub(crate) fn published_launches<'a>(
+    plan: &'a LaunchStagePlan,
+    published: &[Option<&'a StepNodes>],
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Launches<'a>, eta_exec::TemporaryRefused> {
+    let mut each = Vec::new();
+    let mut idle = Vec::new();
+    for (index, region) in plan.fused.iter().enumerate() {
+        let published = published
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|published| !published.steps.is_empty());
+        if let Some(published) = published {
+            // The streamed form dispatches its steps one after another, a
+            // launch a step; a node two steps compute lies in both.
+            let first = each.len();
+            each.extend(published.steps.iter().map(|nodes| Launch {
+                nodes,
+                stepwise: false,
+                blocks: 1,
+                row_value: None,
+                row_alias: None,
+                held: Vec::new(),
+                keeps: None,
+            }));
+            idle.extend_from_slice(&published.views);
+            // A folded node's step computes it in another form: its results
+            // take no bytes (idle, so hollow), and what it reads is held
+            // through that step.
+            for &(step, node) in &published.folded {
+                idle.push(node);
+                if let (Some(launch), Some(op)) = (
+                    each.get_mut(first + step as usize),
+                    plan.ops.get(node as usize),
+                ) {
+                    launch.held.extend(op.reads());
+                }
+            }
+        } else {
+            each.push(Launch {
+                nodes: &region.nodes,
+                stepwise: false,
+                ..Launch::of_region(region, 1)
+            });
+        }
+    }
+    let hollow = idle
+        .iter()
+        .flat_map(|&node| results_of(plan, node))
+        .collect();
+    let streamed: Vec<usize> = (0..plan.fused.len())
+        .filter(|&index| published.get(index).copied().flatten().is_some())
+        .collect();
+    Ok(Launches {
+        each,
+        idle,
+        hollow,
+        // Held clear below the temporary area as the whole-value layout held
+        // it: a one-row select keeps its state there.
+        reserve: eta_exec::SELECT_RESERVE,
+        temporary: eta_exec::stage_temporaries(descriptors, &temporary_needs(plan, &streamed))?,
+        ..Launches::default()
+    })
+}
+
+/// What each streamed region's kernel takes of a lane's temporary area, as
+/// Metal's emitter publishes it: a top-k's histograms and candidates a row
+/// of its input, or each select's state below the reductions' planes, for
+/// the regions `streamed` names. The other forms take the whole-value rule
+/// alone.
+pub(crate) fn temporary_needs(
+    plan: &LaunchStagePlan,
+    streamed: &[usize],
+) -> Vec<eta_exec::TemporaryNeed> {
+    use eta_compiler::codegen::metal::{streamed_temporary_need, streamed_topk_temporary_need};
+    streamed
+        .iter()
+        .map(|&index| {
+            streamed_topk_temporary_need(plan, index)
+                .unwrap_or_else(|| streamed_temporary_need(plan, index))
+        })
+        .collect()
+}
+
+/// The values node `node` of `plan` results in.
+fn results_of(plan: &LaunchStagePlan, node: u32) -> std::ops::Range<u32> {
+    let base: u32 = plan
+        .ops
+        .iter()
+        .take(node as usize)
+        .map(|op| u32::from(op.result_count))
+        .sum();
+    let count = plan
+        .ops
+        .get(node as usize)
+        .map_or(0, |op| u32::from(op.result_count));
+    base..base + count
+}
+
+/// A stage's scratch as Metal lays it ([`launches`]): what the kernels'
+/// offsets, `FireFacts::a_lane` and the stride all read, the same at
+/// every call. A view takes its source's offset.
+fn layout_of(
+    plan: &LaunchStagePlan,
+    regions: &[Region],
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Layout, String> {
+    let launches = launches(plan, regions, descriptors).map_err(|why| why.to_string())?;
+    lay_out_launches(plan, &launches, descriptors).map_err(|why: TooLarge| format!("{why:?}"))
+}
+
+/// The layout [`layout_of`] takes, over `run`: a view's offset its
+/// source's.
+pub(crate) fn lay_out_launches(
+    plan: &LaunchStagePlan,
+    run: &Launches<'_>,
+    descriptors: &[ValueDesc],
+) -> std::result::Result<Layout, TooLarge> {
+    let mut laid = eta_exec::lay_out(plan, descriptors, run)?;
+    for &node in &run.idle {
+        let Some(&source) = plan.ops.get(node as usize).and_then(|op| op.args.first()) else {
+            continue;
+        };
+        for result in results_of(plan, node) {
+            if let Some(&at) = laid.values.get(source as usize)
+                && let Some(slot) = laid.values.get_mut(result as usize)
+            {
+                *slot = at;
+            }
+        }
+    }
+    Ok(laid)
+}
 use eta_ir::Dtype;
 use eta_ir::op::tags;
 
-use crate::device::alloc::DeferredZeroBuffer;
+use crate::device::Buffer;
 use crate::device::ctx::Frame;
-use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region, StreamedStep};
+use super::held::{self, Cells, Held, Tables};
 use super::shared::SharedRing;
+use crate::store::Pools;
+use crate::store::layout::CHANNEL;
 use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -48,6 +219,25 @@ const STORAGE_F32: u32 = 0;
 const STORAGE_BF16: u32 = 1;
 
 const STORAGE_I32: u32 = 2;
+
+/// A seat whose `at` is a table of row addresses (a `ulong` a row), each
+/// row bf16: a lane-0 read whose rows are seated at the instance's lanes,
+/// row r at lane r's seat.
+const STORAGE_BF16_ROWS: u32 = 3;
+
+/// As [`STORAGE_BF16_ROWS`], each row f32.
+const STORAGE_F32_ROWS: u32 = 4;
+
+/// The row tables a stage of `plan` takes: one for each float output read,
+/// `rows` addresses each (the load's readout rows a lane bound them).
+fn row_table_bytes(plan: &LaunchStagePlan, rows: u32) -> u64 {
+    let reads = plan
+        .ops
+        .iter()
+        .filter(|op| op.tag == tags::OUTPUT && op.dtype != Dtype::I32)
+        .count() as u64;
+    (reads * u64::from(rows.max(1)) * 8).max(8)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelShape {
@@ -82,22 +272,65 @@ impl ChannelShape {
             .next_multiple_of(CELL_ALIGN)
             .max(CELL_ALIGN)
     }
+
+    /// The ring's cells: `capacity + 1` of them.
+    #[must_use]
+    pub fn cell_count(&self) -> u64 {
+        u64::from(self.capacity) + 1
+    }
+
+    /// The `Channel` slots this ring takes with its cells packed a slot, or
+    /// `None` where its cell is larger than a slot (it then takes a run).
+    #[must_use]
+    pub fn ring_slots(&self, slot_bytes: u64) -> Option<u32> {
+        held::ring_slots(self.cell_count(), self.cell_stride() as u64, slot_bytes)
+    }
+
+    /// Zeroed cells for this ring in `slots`, the `Channel` slot refs the
+    /// runtime took for it. A ring whose cells pass a slot lies in one run,
+    /// which lies in one chunk: a ring past that is refused, never held
+    /// beside the pool.
+    pub fn cells(&self, pools: &Pools, slots: &[u32]) -> Result<Cells> {
+        let stride = self.cell_stride() as u64;
+        let slot = pools.slot_bytes(CHANNEL)?;
+        let per_chunk = pools.slots_per_chunk(CHANNEL)?;
+        let fits = self.ring_slots(slot).is_some()
+            || held::ring_run(self.cell_count(), stride, slot, per_chunk).is_some();
+        if fits {
+            return Cells::pooled(pools, CHANNEL, slots, self.cell_count(), stride);
+        }
+        Err(Fault::program(
+            "program::launch",
+            format!(
+                "a ring of {} cells of {stride} bytes: its cells pass a {slot}-byte channel slot, \
+                 so it lies in one run of adjacent slots, and the run's {} bytes pass a chunk \
+                 of {per_chunk} slots; declare fewer cells or a smaller cell",
+                self.cell_count(),
+                self.cell_count() * stride,
+            ),
+        ))
+    }
 }
 
 #[derive(Debug)]
 pub struct Rings {
-    slabs: Vec<Buffer>,
+    /// Each channel's cells this instance holds itself; `None` for an
+    /// adopted shared ring, whose cells are the ring's.
+    own: Vec<Option<Cells>>,
     shapes: Vec<ChannelShape>,
     shared: Vec<Option<Arc<SharedRing>>>,
 }
 
 impl Rings {
+    /// `rings`: the `Channel` slots the runtime took for each ring this
+    /// instance holds itself, by channel.
     pub fn allocate(
-        device: &Context,
         shapes: &[ChannelShape],
         adopted: &[Option<Arc<SharedRing>>],
+        pools: &Pools,
+        rings: &[engine::program::RingSlots],
     ) -> Result<Rings> {
-        let mut slabs = Vec::with_capacity(shapes.len());
+        let mut own = Vec::with_capacity(shapes.len());
         let mut shared = Vec::with_capacity(shapes.len());
         for (channel, shape) in shapes.iter().enumerate() {
             if let Some(ring) = adopted.get(channel).and_then(Option::as_ref) {
@@ -118,24 +351,52 @@ impl Rings {
                         ),
                     ));
                 }
-                slabs.push(ring.slab());
+                own.push(None);
                 shared.push(Some(Arc::clone(ring)));
                 continue;
             }
-            let cells = u64::from(shape.capacity) + 1;
-            let bytes = cells
-                .checked_mul(shape.cell_stride() as u64)
-                .ok_or_else(|| {
-                    Fault::program("program::launch", "a ring past what a u64 counts")
-                })?;
-            slabs.push(Buffer::zeroed(device, bytes.max(1))?);
+            let slots = rings
+                .iter()
+                .find(|ring| ring.channel as usize == channel)
+                .map_or(&[][..], |ring| ring.slots.as_slice());
+            own.push(Some(shape.cells(pools, slots)?));
             shared.push(None);
         }
         Ok(Rings {
-            slabs,
+            own,
             shapes: shapes.to_vec(),
             shared,
         })
+    }
+
+    /// Points every pooled ring this instance holds at the chunks its
+    /// slots sit in now.
+    pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        self.own
+            .iter_mut()
+            .flatten()
+            .try_for_each(|cells| cells.rebind(pools))
+    }
+
+    /// Moves the pooled rings `rings` names to their new slots.
+    pub fn retarget(&mut self, pools: &Pools, rings: &[engine::program::RingSlots]) -> Result<()> {
+        for ring in rings {
+            let cells = self
+                .own
+                .get_mut(ring.channel as usize)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    Fault::program(
+                        "program::launch",
+                        format!(
+                            "channel {} is not a ring this instance holds itself",
+                            ring.channel
+                        ),
+                    )
+                })?;
+            cells.retarget(pools, &ring.slots)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -145,12 +406,12 @@ impl Rings {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.slabs.len()
+        self.shapes.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.slabs.is_empty()
+        self.shapes.is_empty()
     }
 
     #[must_use]
@@ -158,28 +419,43 @@ impl Rings {
         self.shapes.get(channel).copied()
     }
 
-    pub fn cell_offset(&self, channel: usize, sequence: u64) -> Result<u64> {
+    fn index(&self, channel: usize, sequence: u64) -> Result<u64> {
         let shape = self.shape(channel).ok_or_else(|| {
             Fault::program(
                 "program::launch",
                 format!("channel {channel} is not one this instance carries"),
             )
         })?;
-        let cells = u64::from(shape.capacity) + 1;
-        Ok((sequence % cells) * shape.cell_stride() as u64)
+        Ok(sequence % (u64::from(shape.capacity) + 1))
     }
 
-    pub(crate) fn slab(&self, channel: usize) -> Result<&Buffer> {
-        self.slabs.get(channel).ok_or_else(|| {
-            Fault::program(
+    /// Runs `with` on channel `channel`'s cells, its own or its shared
+    /// ring's.
+    fn with_cells<T>(&self, channel: usize, with: impl FnOnce(&Cells) -> Result<T>) -> Result<T> {
+        if let Some(ring) = self.shared(channel) {
+            return ring.with_cells(with);
+        }
+        match self.own.get(channel).and_then(Option::as_ref) {
+            Some(cells) => with(cells),
+            None => Err(Fault::program(
                 "program::launch",
                 format!("channel {channel} is not one this instance carries"),
-            )
+            )),
+        }
+    }
+
+    /// The buffer and byte the cell of `sequence` lies at, as a kernel
+    /// binds it.
+    pub fn cell_at(&self, channel: usize, sequence: u64) -> Result<(Buffer, u64)> {
+        let index = self.index(channel, sequence)?;
+        self.with_cells(channel, |cells| {
+            let (held, at) = cells.locate(index)?;
+            Ok((held.buffer().clone(), held.offset() + at))
         })
     }
 
     pub fn write_cell(&mut self, channel: usize, sequence: u64, bytes: &[u8]) -> Result<()> {
-        let at = self.cell_offset(channel, sequence)?;
+        let index = self.index(channel, sequence)?;
         let width = self.shape(channel).map_or(0, |shape| shape.cell_bytes());
         if bytes.len() != width {
             return Err(Fault::program(
@@ -190,14 +466,23 @@ impl Rings {
                 ),
             ));
         }
-        self.slabs[channel].write(at, bytes)
+        if let Some(ring) = self.shared(channel) {
+            return ring.write_cell(index, bytes);
+        }
+        match self.own.get_mut(channel).and_then(Option::as_mut) {
+            Some(cells) => cells.write(index, bytes),
+            None => Err(Fault::program(
+                "program::launch",
+                format!("channel {channel} is not one this instance carries"),
+            )),
+        }
     }
 
     pub fn read_cell(&self, channel: usize, sequence: u64) -> Result<Vec<u8>> {
-        let at = self.cell_offset(channel, sequence)?;
+        let index = self.index(channel, sequence)?;
         let width = self.shape(channel).map_or(0, |shape| shape.cell_bytes());
         let mut cell = vec![0u8; width];
-        self.slabs[channel].read(at, &mut cell)?;
+        self.with_cells(channel, |cells| cells.read(index, &mut cell))?;
         Ok(cell)
     }
 }
@@ -214,6 +499,26 @@ struct Slot {
     base: Buffer,
     offset: u64,
     width: u32,
+    /// Its row pitch, in elements, and how it is stored.
+    stride: u32,
+    storage: u32,
+    /// The rows from `offset`, a `stride` apart, that are its lane's own:
+    /// no read of it reaches past them into another lane's (another
+    /// request's) rows.
+    rows_held: u32,
+}
+
+impl Slot {
+    /// The GPU address of row `row` of this seat.
+    fn row_at(&self, row: u32) -> Result<u64> {
+        let element = if matches!(self.storage, STORAGE_BF16 | STORAGE_BF16_ROWS) {
+            2
+        } else {
+            4
+        };
+        Ok(address_of(&self.base, self.offset)?
+            + u64::from(row) * u64::from(self.stride.max(self.width)) * element)
+    }
 }
 
 /// How a stage reads an output slot: through the readout plane, or its
@@ -232,6 +537,9 @@ struct OutputSeat {
     at: u64,
     storage: u32,
     stride: u32,
+    /// The rows from `at` that are its lane's own (a table's: its rows).
+    rows: u32,
+    reserved: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -269,15 +577,25 @@ struct RowMeta {
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Grouped {
-    table: Buffer,
+    /// The lane table, the flags, indices and rows, and each fused
+    /// region's layout: the instance's, in its `Instance` slots.
+    table: Held,
     shape: LaneShape,
-    layouts: Vec<Buffer>,
-    bindings: Buffer,
-    pending_flags: Buffer,
-    lane_indices: Buffer,
-    row_meta: Buffer,
-    row_indices: Buffer,
+    layouts: Vec<Held>,
+    bindings: Held,
+    pending_flags: Held,
+    lane_indices: Held,
+    /// The lane's scratch base, a device address
+    /// ([`LANE_SCRATCH`](eta_compiler::codegen::lane_scratch::LANE_SCRATCH)), written where a fire seats its scratch.
+    lane_scratch: Held,
+    row_meta: Held,
+    row_indices: Held,
     readout_rows: u32,
+    /// Each readout row's first element on the readout plane, from
+    /// `logits_base`: a row a pitch where the lane's rows lie one after
+    /// another; where the rows are seated at the instance's lanes, each
+    /// row's own, wherever it lies.
+    row_at: Vec<u32>,
     layout_words: Vec<GroupLayout>,
     record: LaneRecord,
 }
@@ -287,19 +605,67 @@ const GROUPED_LANES: u32 = 1;
 const THE_LANE: u32 = 0;
 
 impl Grouped {
+    /// Every table, in the order [`Prepared::table_sizes`] states them.
+    fn helds(&mut self) -> impl Iterator<Item = &mut Held> {
+        [
+            &mut self.bindings,
+            &mut self.table,
+            &mut self.pending_flags,
+            &mut self.lane_indices,
+            &mut self.lane_scratch,
+            &mut self.row_meta,
+            &mut self.row_indices,
+        ]
+        .into_iter()
+        .chain(self.layouts.iter_mut())
+    }
+
+    /// The lane record's commit slot names the status word where it lies
+    /// now, after the instance's slots moved.
+    fn recommit(&mut self, status: &Held) -> Result<()> {
+        self.record.commit_slot = status.address_at(0).ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "the status word has no GPU address, so a grouped kernel would have \
+                 nothing to write its verdict through",
+            )
+        })?;
+        self.write_record()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
-        device: &Context,
         plan: &LaunchStagePlan,
+        regions: &[Region],
         descriptors: &[ValueDesc],
         shape: LaneShape,
-        status: &Buffer,
+        status: &Held,
         extents: Extents,
-        readout_rows: u32,
+        (readout_rows, rows_bound): (u32, u32),
+        tables: &mut Tables<'_>,
     ) -> Result<Option<Grouped>> {
         if !plan.needs.grouped_valid {
             return Ok(None);
         }
+        if readout_rows > rows_bound.max(1) {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "this bind reads {readout_rows} readout rows a lane, and its tables are \
+                     laid for {} (the rows its extents state, `Plane::rows_for`)",
+                    rows_bound.max(1)
+                ),
+            ));
+        }
+        let stride = u32::try_from(plan.channel_bindings.len())
+            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
+        let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
+            .flat_map(|_| plan.channel_bindings.iter().copied())
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut bindings = tables.take(binding_bytes.len().max(4) as u64)?;
+        bindings.write(0, &binding_bytes)?;
+
         let Some(bytes) = shape.bytes() else {
             return Err(Fault::program(
                 "program::launch",
@@ -307,7 +673,7 @@ impl Grouped {
                  lane count multiply past what an allocation can be",
             ));
         };
-        let mut table = Buffer::zeroed(device, bytes)?;
+        let mut table = tables.take(bytes)?;
         table.write(
             0,
             &record_bytes(&LaneHeader {
@@ -339,40 +705,28 @@ impl Grouped {
         })?;
         table.write(at, &record_bytes(&record))?;
 
-        let stride = u32::try_from(plan.channel_bindings.len())
-            .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
-        let binding_bytes: Vec<u8> = (0..GROUPED_LANES)
-            .flat_map(|_| plan.channel_bindings.iter().copied())
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        let mut bindings = Buffer::zeroed(device, binding_bytes.len().max(4) as u64)?;
-        bindings.write(0, &binding_bytes)?;
-
         let flags = u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane);
-        let pending_flags = Buffer::zeroed(device, flags.max(1))?;
+        let pending_flags = tables.take(flags.max(1))?;
 
         let index_bytes: Vec<u8> = (0..GROUPED_LANES).flat_map(u32::to_le_bytes).collect();
-        let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
+        let mut lane_indices = tables.take(index_bytes.len() as u64)?;
         lane_indices.write(0, &index_bytes)?;
+        let lane_scratch = tables.take(LaneScratch::bytes(GROUPED_LANES))?;
 
-        let row_meta =
-            Buffer::zeroed(device, (GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
-        let row_indices = Buffer::zeroed(
-            device,
-            u64::from(readout_rows).max(1) * size_of::<u32>() as u64,
-        )?;
+        let row_meta = tables.take((GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
+        let row_indices = tables.take(u64::from(rows_bound.max(1)) * size_of::<u32>() as u64)?;
 
-        let scratch_layout = layout(descriptors).map_err(|why| {
+        let scratch_layout = layout_of(plan, regions, descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
+                format!("this fire's scratch does not fit: {why}"),
             )
         })?;
         let base = GroupLayout {
             lane_count: GROUPED_LANES,
             value_count: u32::try_from(plan.value_types.len()).unwrap_or(u32::MAX),
-            scratch_stride: u32::try_from(scratch_layout.total).unwrap_or(u32::MAX),
-            temporary_offset: u32::try_from(scratch_layout.temporary).unwrap_or(u32::MAX),
+            scratch_stride: lane_word(LANE_SCRATCH, scratch_layout.total)?,
+            temporary_offset: lane_word(LANE_TEMPORARY, scratch_layout.temporary)?,
             vocab: 0,
             reserved0: stride,
             reserved1: 1,
@@ -393,7 +747,7 @@ impl Grouped {
                 reserved1: rows,
                 ..base
             };
-            let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
+            let mut buffer = tables.take(size_of::<GroupLayout>() as u64)?;
             buffer.write(0, &record_bytes(&words))?;
             layout_words.push(words);
             layouts.push(buffer);
@@ -406,9 +760,11 @@ impl Grouped {
             bindings,
             pending_flags,
             lane_indices,
+            lane_scratch,
             row_meta,
             row_indices,
             readout_rows,
+            row_at: Vec::new(),
             layout_words,
             record,
         }))
@@ -423,7 +779,12 @@ impl Grouped {
     }
 
     fn set_rows(&mut self) -> Result<()> {
-        let bytes: Vec<u8> = (0..self.readout_rows).flat_map(u32::to_le_bytes).collect();
+        let bytes: Vec<u8> = self
+            .row_at
+            .iter()
+            .copied()
+            .flat_map(u32::to_le_bytes)
+            .collect();
         if !bytes.is_empty() {
             self.row_indices.write(0, &bytes)?;
         }
@@ -474,20 +835,60 @@ impl Grouped {
     }
 }
 
+const LANE_SCRATCH: &str = "bytes of one lane's value scratch (the kernels' `uint scratch_stride`)";
+const LANE_TEMPORARY: &str =
+    "bytes before one lane's temporaries (the kernels' `uint temporary_offset`)";
+
+/// A lane's scratch extent as the generated kernels' layout word holds it:
+/// a `uint`, refused past one. A lane's base is its own entry of the lane
+/// scratch table, a device address, so no lane's bytes are reached as an
+/// offset from another's.
+fn lane_word(what: &'static str, bytes: u64) -> Result<u32> {
+    u32::try_from(bytes).map_err(|_| Fault::Ceiling {
+        what,
+        need: bytes,
+        have: u64::from(u32::MAX),
+    })
+}
+
+/// Where a fire's value scratch lies: the activation span's guest region,
+/// laid per fire under the model's carve (guest programs), or
+/// nowhere before a fire seats it.
+#[derive(Debug, Clone)]
+pub struct ScratchAt {
+    pub buffer: Buffer,
+    pub offset: u64,
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Prepared {
-    status: Buffer,
-    descriptors: Buffer,
-    params: Buffer,
-    offsets: Buffer,
-    scratch: DeferredZeroBuffer,
+    /// The status word and the output address table: the instance's, in
+    /// its `Instance` slots, as the tables below.
+    status: Held,
+    /// The bind-time tables (the instance's state): in
+    /// `Instance` slots where the runtime took them.
+    descriptors: Held,
+    params: Held,
+    offsets: Held,
+    /// The value scratch this fire seated ([`Prepared::seat_scratch`]),
+    /// `scratch_bytes` of it.
+    scratch: Option<ScratchAt>,
+    scratch_bytes: u64,
     /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
     /// what is bound there and its table entry.
     reads: Vec<Option<Read>>,
     outputs: Vec<Option<Slot>>,
     seats: Vec<OutputSeat>,
-    addresses: Buffer,
+    addresses: Held,
+    /// By output slot: the rows the stage's read there covers, and where
+    /// its row table lies in `row_tables` (a float read's).
+    read_rows: Vec<u32>,
+    row_table_at: Vec<Option<u64>>,
+    row_tables: Held,
+    /// Rows past 0 of a lane-0 read, seated at the instance's lanes: row r
+    /// at lane r's seat, by (lane-0 slot, row).
+    row_seats: BTreeMap<(usize, u32), Slot>,
     /// The one slot read through the readout plane.
     readout: Option<usize>,
     /// The stage's names and the slots a lane takes in its table.
@@ -509,15 +910,34 @@ pub struct Prepared {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-struct StepWord {
+pub(crate) struct StepWord {
     index: u32,
     level: u32,
     groups: u32,
     reserved: u32,
 }
 
-fn scratch_zeroing_skipped() -> bool {
-    crate::diag::on().scratch_no_zero
+/// Test builds (`test-slot-fill`): `len` bytes of guest scratch from `at`
+/// set to 0xFF (NaN in every float width) in `frame`, so a value read
+/// before its step writes it fails the test that reads it. Elsewhere
+/// nothing: every guest value is written before it is read (a streamed
+/// step writes each node it publishes, the lay_out gives a value's bytes on
+/// only after its last reader, and the kernels that accumulate clear their
+/// own buffers), so the scratch goes unfilled.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn poison_scratch(
+    frame: &mut Frame,
+    slab: &crate::device::alloc::Slab,
+    at: u64,
+    len: u64,
+) -> Result<()> {
+    #[cfg(feature = "test-slot-fill")]
+    {
+        frame.fill_with(slab, at, len, 0xff)?;
+        frame.next_pass()?;
+    }
+    let _ = (frame, slab, at, len);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -614,8 +1034,11 @@ fn streamed_dispatches(
                         count = count.div_ceil(32);
                         at += 1;
                     }
+                    // A row's groups, for every row (the kernel folds the
+                    // rows side by side).
                     let chunks = count.div_ceil(32).max(1);
-                    let groups = chunks.div_ceil(32 * REDUCE_CHUNKS_PER_GROUP).max(1);
+                    let groups =
+                        chunks.div_ceil(32 * REDUCE_CHUNKS_PER_GROUP).max(1) * desc.rows.max(1);
                     for _ in 0..repeats(StepKind::Reduce) {
                         out.push((StepWord { level, ..word }, groups));
                     }
@@ -704,11 +1127,161 @@ pub struct BatchKey {
 }
 
 impl Prepared {
-    pub fn build(
-        device: &Context,
+    /// Moves each pooled table to the ref `to` maps its slot to.
+    pub fn retarget(&mut self, pools: &Pools, to: &impl Fn(u32) -> Result<u32>) -> Result<()> {
+        let grouped = self.grouped.as_mut().into_iter().flat_map(Grouped::helds);
+        for held in [
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.status,
+            &mut self.addresses,
+            &mut self.row_tables,
+        ]
+        .into_iter()
+        .chain(grouped)
+        {
+            if let Some(slot) = held.slot() {
+                held.retarget(pools, to(slot)?)?;
+            }
+        }
+        self.recommit()
+    }
+
+    /// Points the pooled bind-time tables at the chunks their slots sit in
+    /// now.
+    pub fn rebind(&mut self, pools: &Pools) -> Result<()> {
+        let grouped = self.grouped.as_mut().into_iter().flat_map(Grouped::helds);
+        for held in [
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.status,
+            &mut self.addresses,
+            &mut self.row_tables,
+        ]
+        .into_iter()
+        .chain(grouped)
+        {
+            held.rebind(pools)?;
+        }
+        self.recommit()
+    }
+
+    /// Whether the lane table, as the pool holds it, names the status word
+    /// where it lies now; `None` for a stage with no lane table.
+    #[cfg(test)]
+    pub fn commit_slot_names_status(&self) -> Result<Option<bool>> {
+        let Some(grouped) = self.grouped.as_ref() else {
+            return Ok(None);
+        };
+        let at = grouped.shape.record_offset(THE_LANE).ok_or_else(|| {
+            Fault::program("program::launch", "the one lane is outside the lane table")
+        })?;
+        let mut word = [0u8; 8];
+        grouped.table.read(
+            at + std::mem::offset_of!(LaneRecord, commit_slot) as u64,
+            &mut word,
+        )?;
+        Ok(Some(
+            Some(u64::from_le_bytes(word)) == self.status.address_at(0),
+        ))
+    }
+
+    /// The lane record names the status word where it lies now: its GPU
+    /// address is baked into the lane table.
+    fn recommit(&mut self) -> Result<()> {
+        match self.grouped.as_mut() {
+            Some(grouped) => grouped.recommit(&self.status),
+            None => Ok(()),
+        }
+    }
+
+    /// The value scratch one lane of a stage of `plan` takes in a fire at
+    /// `extents`: its stride, aligned, as [`Prepared::build`] lays it.
+    pub fn scratch_for(
         plan: &LaunchStagePlan,
+        regions: &[Region],
+        extents: &Extents,
+    ) -> Result<u64> {
+        Ok(u64::from(Self::stride_for(plan, regions, extents)?)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN))
+    }
+
+    /// One lane's value scratch for a stage of `plan` at `extents`, as its
+    /// kernels stride it (`uint scratch_stride`): what a batch's lanes hold
+    /// a stride each of.
+    pub fn stride_for(
+        plan: &LaunchStagePlan,
+        regions: &[Region],
+        extents: &Extents,
+    ) -> Result<u32> {
+        let descriptors: Vec<ValueDesc> = plan
+            .value_types
+            .iter()
+            .map(|value| {
+                describe(value, extents).map_err(|why| {
+                    Fault::program(
+                        "program::launch",
+                        format!("a value's shape does not resolve against these extents: {why:?}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total = layout_of(plan, regions, &descriptors)
+            .map_err(|why| {
+                Fault::program(
+                    "program::launch",
+                    format!("a stage's scratch does not fit: {why}"),
+                )
+            })?
+            .total;
+        lane_word(LANE_SCRATCH, total)
+    }
+
+    /// The bind-time tables a stage of `plan` takes, in the order `build`
+    /// takes them from its [`Tables`]: params, descriptors, offsets, the
+    /// status word, the output addresses and the float reads' row tables
+    /// and, for a grouped stage, the
+    /// channel bindings, the lane table (`channels` slots a lane), its
+    /// flags, indices, row meta, `rows` readout rows and each fused
+    /// region's layout. Counts alone size them, so a program states them
+    /// at registration.
+    #[must_use]
+    pub fn table_sizes(plan: &LaunchStagePlan, channels: u32, rows: u32) -> Vec<u64> {
+        let mut sizes = vec![
+            (plan.ops.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
+            (plan.value_types.len() * size_of::<ValueDesc>()).max(1) as u64,
+            (plan.value_types.len() * size_of::<u32>()).max(size_of::<u32>()) as u64,
+            eta_exec::STATUS_BYTES as u64,
+            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            row_table_bytes(plan, rows),
+        ];
+        if plan.needs.grouped_valid {
+            let shape = LaneShape::of(GROUPED_LANES, channels);
+            sizes.extend([
+                (GROUPED_LANES as usize * plan.channel_bindings.len() * size_of::<u32>()).max(4)
+                    as u64,
+                shape.bytes().unwrap_or(u64::MAX),
+                (u64::from(GROUPED_LANES) * u64::from(shape.channel_slots_per_lane)).max(1),
+                u64::from(GROUPED_LANES) * size_of::<u32>() as u64,
+                LaneScratch::bytes(GROUPED_LANES),
+                u64::from(GROUPED_LANES) * size_of::<RowMeta>() as u64,
+                u64::from(rows.max(1)) * size_of::<u32>() as u64,
+            ]);
+            sizes.extend(plan.fused.iter().map(|_| size_of::<GroupLayout>() as u64));
+        }
+        sizes
+    }
+
+    pub fn build(
+        plan: &LaunchStagePlan,
+        regions: &[Region],
         shapes: &[ChannelShape],
         extents: Extents,
+        rows: u32,
+        tables: &mut Tables<'_>,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -727,20 +1300,21 @@ impl Prepared {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let scratch_layout = layout(&descriptors).map_err(|why| {
+        let scratch_layout = layout_of(plan, regions, &descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
-                format!("this fire's scratch does not fit: {why:?}"),
+                format!("this fire's scratch does not fit: {why}"),
             )
         })?;
-        let scratch_stride = u32::try_from(scratch_layout.total)
-            .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
-        let temporary_offset = u32::try_from(scratch_layout.temporary)
-            .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
+        let scratch_stride = lane_word(LANE_SCRATCH, scratch_layout.total)?;
+        let temporary_offset = lane_word(LANE_TEMPORARY, scratch_layout.temporary)?;
 
         let mut records = Vec::with_capacity(plan.ops.len());
         let pitch = plan.output_pitch as usize;
         let mut reads: Vec<Option<Read>> = vec![None; pitch];
+        let mut read_rows: Vec<u32> = vec![1; pitch];
+        let mut row_table_at: Vec<Option<u64>> = vec![None; pitch];
+        let mut float_reads = 0u64;
         let mut readout = None;
         let mut readout_rows = 0u32;
         let mut result_base = 0u32;
@@ -804,20 +1378,29 @@ impl Prepared {
                 if let Some(seat) = reads.get_mut(slot) {
                     *seat = Some(read);
                 }
+                if let Some(at) = read_rows.get_mut(slot) {
+                    *at = descriptors
+                        .get(record.o0 as usize)
+                        .map_or(1, |out| out.rows.max(1));
+                }
+                if op.dtype != Dtype::I32 {
+                    if let Some(at) = row_table_at.get_mut(slot) {
+                        *at = Some(float_reads * u64::from(rows.max(1)) * 8);
+                    }
+                    float_reads += 1;
+                }
             }
             records.push(record);
             result_base += u32::from(op.result_count);
         }
 
         let param_bytes = records_bytes(&records);
-        let mut params = Buffer::zeroed(
-            device,
-            (records.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64,
-        )?;
+        let mut params = tables
+            .take((records.len() * size_of::<OpParams>()).max(size_of::<OpParams>()) as u64)?;
         params.write(0, &param_bytes)?;
 
         let descriptor_bytes: Vec<u8> = descriptors.iter().flat_map(record_bytes).collect();
-        let mut descriptor_buffer = Buffer::zeroed(device, descriptor_bytes.len().max(1) as u64)?;
+        let mut descriptor_buffer = tables.take(descriptor_bytes.len().max(1) as u64)?;
         descriptor_buffer.write(0, &descriptor_bytes)?;
 
         let offset_bytes: Vec<u8> = scratch_layout
@@ -826,12 +1409,15 @@ impl Prepared {
             .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
             .flat_map(u32::to_le_bytes)
             .collect();
-        let mut offsets = Buffer::zeroed(device, offset_bytes.len().max(size_of::<u32>()) as u64)?;
+        let mut offsets = tables.take(offset_bytes.len().max(size_of::<u32>()) as u64)?;
         offsets.write(0, &offset_bytes)?;
 
-        let scratch_bytes = u64::from(scratch_stride).max(SCRATCH_ALIGN);
-        let scratch = DeferredZeroBuffer::new(device, scratch_bytes)?;
-        let status = Buffer::zeroed(device, eta_exec::STATUS_BYTES as u64)?;
+        let scratch_bytes = u64::from(scratch_stride)
+            .max(SCRATCH_ALIGN)
+            .next_multiple_of(SCRATCH_ALIGN);
+        let status = tables.take(eta_exec::STATUS_BYTES as u64)?;
+        let addresses = tables.take((pitch.max(1) * size_of::<OutputSeat>()) as u64)?;
+        let row_tables = tables.take(row_table_bytes(plan, rows))?;
 
         let lanes = LaneShape::of(
             GROUPED_LANES,
@@ -840,13 +1426,14 @@ impl Prepared {
             })?,
         );
         let grouped = Grouped::build(
-            device,
             plan,
+            regions,
             &descriptors,
             lanes,
             &status,
             extents,
-            readout_rows,
+            (readout_rows, rows),
+            tables,
         )?;
 
         Ok(Prepared {
@@ -854,11 +1441,16 @@ impl Prepared {
             descriptors: descriptor_buffer,
             params,
             offsets,
-            scratch,
+            scratch: None,
+            scratch_bytes,
             reads,
             outputs: vec![None; pitch],
             seats: vec![OutputSeat::default(); pitch],
-            addresses: Buffer::zeroed(device, (pitch.max(1) * size_of::<OutputSeat>()) as u64)?,
+            addresses,
+            read_rows,
+            row_table_at,
+            row_tables,
+            row_seats: BTreeMap::new(),
             readout,
             names: plan.names.clone(),
             output_slots: plan.output_slots,
@@ -897,26 +1489,56 @@ impl Prepared {
     }
 
     pub fn refresh(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
-        self.refresh_cells(rings, cursors)?;
-        if scratch_zeroing_skipped() {
-            return Ok(());
-        }
-        self.scratch.clear()
+        self.refresh_cells(rings, cursors)
     }
 
-    pub fn zero_scratch(&mut self) -> Result<()> {
-        self.scratch.clear()
+    /// The value scratch one fire of this stage takes: its stride, aligned.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> u64 {
+        self.scratch_bytes
     }
 
-    #[cfg(target_vendor = "apple")]
-    pub fn zero_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
-        if scratch_zeroing_skipped() {
-            return Ok(());
+    /// Seats this fire's value scratch at `at` (the guest region under the
+    /// fire's model carve); a later fire seats its own. A grouped kernel
+    /// finds it by its address in the lane scratch table.
+    pub fn seat_scratch(&mut self, at: ScratchAt) -> Result<()> {
+        // Off Apple nothing encodes (a grouped encode is `Deviceless`), and
+        // no reservation has an address to write.
+        #[cfg(target_vendor = "apple")]
+        if let Some(grouped) = self.grouped.as_mut() {
+            let base = address_of(&at.buffer, at.offset)?;
+            grouped.lane_scratch.write(0, &base.to_le_bytes())?;
         }
-        let scratch = self.scratch.get()?;
-        frame.fill(scratch.slab(), 0, scratch.bytes())?;
-        frame.next_pass()?;
+        self.scratch = Some(at);
         Ok(())
+    }
+
+    /// Where this fire's value scratch lies: what a batch's lane scratch
+    /// table holds for this member.
+    pub fn scratch_at(&self) -> Result<ScratchAt> {
+        self.scratch().cloned()
+    }
+
+    fn scratch(&self) -> Result<&ScratchAt> {
+        self.scratch.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a stage fired before its fire seated its value scratch in the span",
+            )
+        })
+    }
+
+    /// Test builds: poisons the seated scratch ([`poison_scratch`]) ahead
+    /// of the stage's passes.
+    #[cfg(target_vendor = "apple")]
+    pub fn poison_scratch_on(&mut self, frame: &mut Frame) -> Result<()> {
+        let scratch = self.scratch()?.clone();
+        poison_scratch(
+            frame,
+            scratch.buffer.slab(),
+            scratch.offset,
+            self.scratch_bytes,
+        )
     }
 
     pub fn refresh_cells(&mut self, rings: &Rings, cursors: &[Cursor]) -> Result<()> {
@@ -933,10 +1555,13 @@ impl Prepared {
                     ),
                 )
             })?;
+            // A ring's cells lie in one buffer: its own, or the pool's view.
+            let (slab, committed) = rings.cell_at(channel, cursor.head)?;
+            let (_, pending) = rings.cell_at(channel, cursor.tail)?;
             self.bound.push(Bound {
-                slab: rings.slab(channel)?.clone(),
-                committed: rings.cell_offset(channel, cursor.head)?,
-                pending: rings.cell_offset(channel, cursor.tail)?,
+                slab,
+                committed,
+                pending,
             });
         }
         let ready = Status {
@@ -953,7 +1578,28 @@ impl Prepared {
     }
 
     /// Points this stage's reads of output `name` for `lane` at `offset` of
-    /// `base`; an output the stage does not read is let go.
+    /// `base`. A lane past 0 that the stage reads no output at is a row of
+    /// its lane-0 read where that read covers rows: row r is lane r's
+    /// readout row. Returns whether the stage reads the seat; one it does
+    /// not is let go here, and the session refuses a seat no stage reads.
+    #[allow(clippy::too_many_arguments)]
+    /// Whether this stage reads output `name` at `lane` (what
+    /// [`Self::bind_output`] would bind), without binding it.
+    #[must_use]
+    pub fn reads_output(&self, name: &str, lane: u32) -> bool {
+        let Some(named) = self.names.iter().position(|named| named == name) else {
+            return false;
+        };
+        let slot = named + (self.output_slots * lane) as usize;
+        match self.reads.get(slot).copied().flatten() {
+            Some(_) => true,
+            None => {
+                self.reads.get(named).copied().flatten().is_some()
+                    && (lane > 0 && lane < self.read_rows[named])
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn bind_output(
         &mut self,
@@ -964,28 +1610,29 @@ impl Prepared {
         dtype: Dtype,
         width: u32,
         stride: u32,
-    ) -> Result<()> {
-        let Some(slot) = self
-            .names
-            .iter()
-            .position(|named| named == name)
-            .map(|index| index + (self.output_slots * lane) as usize)
-        else {
-            return Ok(());
+        rows_held: u32,
+    ) -> Result<bool> {
+        let Some(named) = self.names.iter().position(|named| named == name) else {
+            return Ok(false);
         };
-        let Some(read) = self.reads.get(slot).copied().flatten() else {
-            return Ok(());
+        let slot = named + (self.output_slots * lane) as usize;
+        let (read, first) = match self.reads.get(slot).copied().flatten() {
+            Some(read) => (read, slot),
+            None => match self.reads.get(named).copied().flatten() {
+                Some(read) if lane > 0 && lane < self.read_rows[named] => (read, named),
+                _ => return Ok(false),
+            },
         };
         let storage = match (read, dtype) {
             (Read::Plane, Dtype::Bf16) | (Read::Floats, Dtype::Bf16) => STORAGE_BF16,
             (Read::Floats, Dtype::F32) => STORAGE_F32,
-            (Read::Ids, Dtype::I32) => STORAGE_I32,
+            (Read::Ids, Dtype::I32) if first == slot => STORAGE_I32,
             _ => {
                 return Err(Fault::program(
                     "program::launch",
                     format!(
-                        "output `{name}` landed as {dtype:?}, which this stage's {read:?} read \
-                         of it has no gather for"
+                        "output `{name}` landed as {dtype:?} at lane {lane}, which this \
+                         stage's {read:?} read of it has no gather for"
                     ),
                 ));
             }
@@ -996,42 +1643,242 @@ impl Prepared {
                 format!("output `{name}`'s readout rows are not one row after another"),
             ));
         }
-        self.seats[slot] = OutputSeat {
-            at: address_of(base, offset)?,
-            storage,
-            stride,
-        };
-        self.addresses.write(
-            (slot * size_of::<OutputSeat>()) as u64,
-            &record_bytes(&self.seats[slot]),
-        )?;
-        self.outputs[slot] = Some(Slot {
+        let seated = Slot {
             base: base.clone(),
             offset,
             width,
-        });
-        self.regroup()
+            stride,
+            storage,
+            rows_held,
+        };
+        if first == slot {
+            self.seats[slot] = OutputSeat {
+                at: address_of(base, offset)?,
+                storage,
+                stride,
+                rows: rows_held,
+                reserved: 0,
+            };
+            self.addresses.write(
+                (slot * size_of::<OutputSeat>()) as u64,
+                &record_bytes(&self.seats[slot]),
+            )?;
+            self.outputs[slot] = Some(seated);
+        } else {
+            self.row_seats.insert((first, lane), seated);
+        }
+        self.seat_rows(first)?;
+        self.regroup()?;
+        Ok(true)
+    }
+
+    /// Whether this stage's lane-0 read of output `name` covers the row of
+    /// the instance's lane `lane`: that lane's seat is where the row is
+    /// read from, bound though the program names no read at that lane.
+    #[must_use]
+    pub fn covers(&self, name: &str, lane: u32) -> bool {
+        self.names
+            .iter()
+            .position(|named| named == name)
+            .is_some_and(|named| {
+                lane > 0
+                    && self.reads.get(named).copied().flatten().is_some()
+                    && lane < self.read_rows.get(named).copied().unwrap_or(1)
+            })
+    }
+
+    /// Why a read of this stage reaches past the rows its seats hold, if
+    /// one does: a read of `n` rows takes row `r` from the instance's lane
+    /// `r` seat or from rows the seat itself holds, and a row neither holds
+    /// would be another lane's, another request's (a guest declaring more
+    /// rows than its lane holds read its neighbours' rows on Metal).
+    pub fn rows_unbounded(&self) -> Option<String> {
+        let readout_rows = self
+            .grouped
+            .as_ref()
+            .map_or(0, |grouped| grouped.readout_rows);
+        for (slot, seat) in self.outputs.iter().enumerate() {
+            let Some(seat) = seat else {
+                continue;
+            };
+            if self.reads.get(slot).copied().flatten().is_none() {
+                continue;
+            }
+            let mut rows = self.read_rows.get(slot).copied().unwrap_or(1).max(1);
+            if self.readout == Some(slot) {
+                rows = rows.max(readout_rows);
+            }
+            let name = &self.names[slot % self.output_slots as usize];
+            if let Some(row) = (0..rows)
+                .find(|&row| row >= seat.rows_held && !self.row_seats.contains_key(&(slot, row)))
+            {
+                return Some(format!(
+                    "a read of {rows} rows of output `{name}`, whose seat holds {} and no lane \
+                     {row} seat holds row {row}: past them it would read another lane's rows",
+                    seat.rows_held
+                ));
+            }
+        }
+        None
+    }
+
+    /// Every seat this stage reads, its lanes' rows among them.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    fn seated(&self) -> impl Iterator<Item = &Slot> {
+        self.outputs.iter().flatten().chain(self.row_seats.values())
+    }
+
+    /// The row seats of the lane-0 read at `first`, by row; empty where
+    /// its rows lie one after another from lane 0's seat.
+    fn rows_of(&self, first: usize) -> Vec<(u32, &Slot)> {
+        self.row_seats
+            .range((first, 0)..(first + 1, 0))
+            .map(|(&(_, row), seat)| (row, seat))
+            .collect()
+    }
+
+    /// Each row's address of the lane-0 read at `first`: row 0 at lane 0's
+    /// seat, a row seated at its lane there, a row lane 0 holds on its
+    /// pitch, and a row no seat holds (yet: its lane binds later, or never)
+    /// at lane 0's own first row. Never another lane's row on lane 0's
+    /// pitch: that row is another request's. A read whose rows its seats do
+    /// not hold is refused before it launches ([`Self::rows_unbounded`]).
+    fn row_addresses(&self, first: usize) -> Result<Option<Vec<u64>>> {
+        let seated = self.rows_of(first);
+        let Some(zero) = self.outputs.get(first).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        if seated.is_empty() {
+            return Ok(None);
+        }
+        (0..self.read_rows[first])
+            .map(|row| match seated.iter().find(|(at, _)| *at == row) {
+                Some((_, seat)) => seat.row_at(0),
+                None if row < zero.rows_held => zero.row_at(row),
+                None => zero.row_at(0),
+            })
+            .collect::<Result<Vec<u64>>>()
+            .map(Some)
+    }
+
+    /// Seats a float read's rows through its row table where its lanes'
+    /// rows are seated apart: the table holds each row's address and the
+    /// read's seat names the table ([`STORAGE_BF16_ROWS`]).
+    fn seat_rows(&mut self, first: usize) -> Result<()> {
+        if self.reads.get(first).copied().flatten() != Some(Read::Floats) {
+            return Ok(());
+        }
+        let Some(rows) = self.row_addresses(first)? else {
+            return Ok(());
+        };
+        let at = self.row_table_at[first].ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                "a float read with no row table laid for it",
+            )
+        })?;
+        let zero = self.outputs[first]
+            .as_ref()
+            .expect("row_addresses saw lane 0's seat");
+        let storage = if zero.storage == STORAGE_BF16 {
+            STORAGE_BF16_ROWS
+        } else {
+            STORAGE_F32_ROWS
+        };
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flat_map(|address| address.to_le_bytes())
+            .collect();
+        self.row_tables.write(at, &bytes)?;
+        self.seats[first] = OutputSeat {
+            at: self.row_tables.address_at(at).ok_or_else(|| {
+                Fault::program("program::launch", "a row table with no GPU address")
+            })?,
+            storage,
+            stride: 0,
+            rows: u32::try_from(rows.len()).unwrap_or(u32::MAX),
+            reserved: 0,
+        };
+        self.addresses.write(
+            (first * size_of::<OutputSeat>()) as u64,
+            &record_bytes(&self.seats[first]),
+        )
     }
 
     fn regroup(&mut self) -> Result<()> {
-        let Some(grouped) = self.grouped.as_mut() else {
+        if self.grouped.is_none() {
+            return Ok(());
+        }
+        let Some(slot) = self.readout else {
             return Ok(());
         };
-        let Some(plane) = self.readout.and_then(|slot| self.outputs[slot].as_ref()) else {
+        let Some(plane) = self.outputs[slot].as_ref() else {
             return Ok(());
         };
-        grouped.set_vocab(plane.width)?;
-        grouped.set_logits(
-            address_of(&plane.base, plane.offset)?,
-            0,
-            grouped.readout_rows,
-        )?;
+        let width = plane.width;
+        // Each row's first element on the plane: from lane 0's seat one
+        // after another, or, where the lanes' rows are seated apart, each
+        // row's own from the lowest.
+        let element = |apart: u64| -> Result<u32> {
+            u32::try_from(apart / 2).map_err(|_| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "output `{}`'s rows lie {apart} bytes apart, past a u32 of \
+                         elements the grouped kernels address rows by",
+                        self.names[slot % self.output_slots as usize]
+                    ),
+                )
+            })
+        };
+        let pitch = u64::from(width) * 2;
+        let readout_rows = self
+            .grouped
+            .as_ref()
+            .map_or(0, |grouped| grouped.readout_rows);
+        let (base, rows) = match self.row_addresses(slot)? {
+            None => (
+                address_of(&plane.base, plane.offset)?,
+                (0..u64::from(readout_rows))
+                    .map(|row| element(row * pitch))
+                    .collect::<Result<Vec<u32>>>()?,
+            ),
+            Some(addresses) => {
+                let low = addresses.iter().copied().min().unwrap_or(0);
+                (
+                    low,
+                    addresses
+                        .iter()
+                        .map(|&address| element(address - low))
+                        .collect::<Result<Vec<u32>>>()?,
+                )
+            }
+        };
+        let grouped = self.grouped.as_mut().expect("checked above");
+        grouped.set_vocab(width)?;
+        grouped.set_logits(base, 0, grouped.readout_rows)?;
+        grouped.row_at = rows;
         grouped.set_rows()
     }
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        if crate::encode::profiling() {
+            let (_, seconds) = frame.timed(|| self.encode_one_region(frame, region))?;
+            if let Some(seconds) = seconds {
+                crate::encode::record_kernel(&guest_key(region, 1), seconds);
+            }
+            return Ok(());
+        }
+        self.encode_one_region(frame, region)
+    }
+
+    fn encode_one_region(&self, frame: &Frame, region: &Region) -> Result<()> {
         match region.form {
-            Form::Fused => self.encode_fused(frame, region, self.scratch.get()?, 0),
+            Form::Fused => {
+                let scratch = self.scratch()?;
+                self.encode_fused(frame, region, &scratch.buffer, scratch.offset)
+            }
             Form::Streamed => self.encode_streamed(frame, region),
             Form::Grouped | Form::GroupedLibrary => self.encode_grouped(frame, region),
         }
@@ -1041,81 +1888,56 @@ impl Prepared {
     fn encode_streamed(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-            };
-            let grouped = self.grouped.as_ref().ok_or_else(|| {
-                Fault::program(
-                    "program::launch",
-                    "a region was compiled for the streamed form and this stage carries no \
-                     lane table; the plan said the grouped path could not cover it",
-                )
-            })?;
-            let layout = grouped
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!("region {} has no group layout", region.region_index),
-                    )
-                })?;
             let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset is zero.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    0,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            resident(
-                &self.status,
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            let (dispatches, threads) = self.bind_streamed(&encoder, region)?;
+            dispatch_streamed(
+                &encoder,
+                &dispatches,
+                threads,
+                GROUPED_LANES as usize,
+                region,
             );
-            for cell in &self.bound {
-                resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-            }
-            for held in self.outputs.iter().flatten() {
-                resident(&held.base, MTLResourceUsage::Read);
-            }
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (frame, region);
+            Err(Fault::Deviceless)
+        }
+    }
+
+    /// Binds this member's state for a streamed region on `encoder` and
+    /// returns its steps' dispatches (step word, threadgroups) and threads
+    /// a threadgroup, for the caller to dispatch: all at once, or one step
+    /// at a time interleaved with other members' ([`dispatch_streamed_step`]).
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn bind_streamed(
+        &self,
+        encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        region: &Region,
+    ) -> Result<(Vec<(StepWord, u32)>, usize)> {
+        {
+            use objc2_metal::MTLComputePipelineState;
+            let (grouped, layout) = self.group_layout(region, "streamed")?;
+            bind_group(
+                encoder,
+                region,
+                self.group_tables(grouped, layout),
+                [&self.scratch()?.buffer],
+                [self],
+            );
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
             let temporary_bytes =
                 u64::from(self.scratch_stride.saturating_sub(self.temporary_offset));
-            dispatch_streamed(
-                &encoder,
-                &streamed_dispatches(
+            Ok((
+                streamed_dispatches(
                     &region.steps,
                     &self.descriptor_table,
                     u32::try_from(threads).unwrap_or(1),
                     temporary_bytes,
                 ),
                 threads,
-                GROUPED_LANES as usize,
-            );
-            Ok(())
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Err(Fault::Deviceless)
+            ))
         }
     }
 
@@ -1134,7 +1956,7 @@ impl Prepared {
 
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
-            for held in self.outputs.iter().flatten() {
+            for held in self.seated() {
                 let resource: &ProtocolObject<dyn MTLResource> =
                     ProtocolObject::from_ref(&**held.base.slab());
                 encoder.useResource_usage(resource, MTLResourceUsage::Read);
@@ -1142,16 +1964,45 @@ impl Prepared {
             let scratch_at = usize::try_from(scratch_at).unwrap_or(usize::MAX);
             // SAFETY: every buffer is retained by `self`/`region`/the batch; every offset was bounds-checked.
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.status.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.status.raw()),
+                    self.status.offset() as usize,
+                    0,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.descriptors.raw()),
+                    self.descriptors.offset() as usize,
+                    1,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.params.raw()),
+                    self.params.offset() as usize,
+                    2,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.offsets.raw()),
+                    self.offsets.offset() as usize,
+                    3,
+                );
                 encoder.setBuffer_offset_atIndex(Some(scratch.raw()), scratch_at, 4);
                 encoder.setBuffer_offset_atIndex(
                     Some(scratch.raw()),
                     scratch_at + self.temporary_offset as usize,
                     5,
                 );
+                if let Some(slot) = self.readout
+                    && !self.rows_of(slot).is_empty()
+                {
+                    return Err(Fault::program(
+                        "program::launch",
+                        format!(
+                            "output `{}`'s rows are seated at the instance's lanes, and \
+                             this stage's fused form reads the readout plane's rows one \
+                             after another from lane 0's",
+                            self.names[slot % self.output_slots as usize]
+                        ),
+                    ));
+                }
                 match self.readout.and_then(|slot| self.outputs[slot].as_ref()) {
                     Some(bound) => encoder.setBuffer_offset_atIndex(
                         Some(bound.base.raw()),
@@ -1166,7 +2017,7 @@ impl Prepared {
                 }
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
-                    0,
+                    self.addresses.offset() as usize,
                     eta_compiler::codegen::metal::M2_INTRINSIC_TABLE_BUFFER,
                 );
                 for (local, bound) in self.bound.iter().enumerate() {
@@ -1201,100 +2052,20 @@ impl Prepared {
     fn encode_grouped(&self, frame: &Frame, region: &Region) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-                MTLSize,
-            };
-
-            let grouped = self.grouped.as_ref().ok_or_else(|| {
-                Fault::program(
-                    "program::launch",
-                    "a region was compiled for the grouped form and this stage carries no \
-                     lane table; the plan said the grouped path could not cover it",
-                )
-            })?;
-            let layout = grouped
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!(
-                            "region {} has no group layout, so its library sampler would \
-                             decompose its grid by a row count nobody stated",
-                            region.region_index
-                        ),
-                    )
-                })?;
-
+            let (grouped, layout) = self.group_layout(region, "grouped")?;
             let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every reservation is retained by `self`; every offset is zero (the kernel strides off `layout`).
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grouped.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.get()?.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(grouped.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(grouped.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    0,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            resident(
-                &self.status,
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
+            bind_group(
+                &encoder,
+                region,
+                self.group_tables(grouped, layout),
+                [&self.scratch()?.buffer],
+                [self],
             );
-            for cell in &self.bound {
-                resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-            }
-            for held in self.outputs.iter().flatten() {
-                resident(&held.base, MTLResourceUsage::Read);
-            }
-
             let rows = grouped
                 .layout_words
                 .get(region.region_index as usize)
                 .map_or(1, |words| words.reserved1 as usize);
-            let (groups, threads) = match region.form {
-                Form::Fused | Form::Streamed => {
-                    unreachable!("`encode_into` routes the single-lane and streamed forms")
-                }
-                Form::GroupedLibrary => ((GROUPED_LANES as usize) * rows, LIBRARY_SAMPLER_THREADS),
-                Form::Grouped => (
-                    GROUPED_LANES as usize,
-                    region
-                        .pipeline()
-                        .maxTotalThreadsPerThreadgroup()
-                        .clamp(1, REGION_THREADS as usize),
-                ),
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: groups.max(1),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threads,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            dispatch_grouped(&encoder, region, GROUPED_LANES as usize, rows);
             Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -1303,25 +2074,84 @@ impl Prepared {
         }
     }
 
-    pub fn launch_region(
-        &self,
-        device: &Context,
-        pipelines: &crate::device::Pipelines,
-        rings: &Rings,
-        region: &Region,
-    ) -> Result<()> {
+    /// This member's lane table and region `region`'s group layout, which a
+    /// region compiled for the `form` (grouped or streamed) reads.
+    #[cfg(target_vendor = "apple")]
+    fn group_layout(&self, region: &Region, form: &str) -> Result<(&Grouped, &Held)> {
+        let grouped = self.grouped.as_ref().ok_or_else(|| {
+            Fault::program(
+                "program::launch",
+                format!(
+                    "a region was compiled for the {form} form and this stage carries no \
+                     lane table; the plan said the grouped path could not cover it"
+                ),
+            )
+        })?;
+        let layout = grouped
+            .layouts
+            .get(region.region_index as usize)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "region {} has no group layout, so its kernel would stride its \
+                         lanes by a layout nobody stated",
+                        region.region_index
+                    ),
+                )
+            })?;
+        Ok((grouped, layout))
+    }
+
+    /// This member's tables at the slots a grouped or streamed region binds
+    /// ([`GROUP_SLOTS`]).
+    #[cfg(target_vendor = "apple")]
+    fn group_tables<'a>(&'a self, grouped: &'a Grouped, layout: &'a Held) -> [Bind<'a>; 12] {
+        let at = |held: &'a Held| (held.raw(), held.offset());
+        [
+            at(&grouped.table),
+            at(&self.descriptors),
+            at(&self.params),
+            at(&self.offsets),
+            at(&grouped.lane_scratch),
+            at(layout),
+            at(&grouped.bindings),
+            at(&grouped.pending_flags),
+            at(&grouped.lane_indices),
+            at(&grouped.row_meta),
+            at(&grouped.row_indices),
+            at(&self.addresses),
+        ]
+    }
+
+    /// Fires `region` in a frame of its own; `zero` (a stage's first
+    /// region) first poisons the seated scratch in test builds.
+    /// `region` encoded into `frame` as a pass of its own after what the
+    /// frame holds (a stage's first poisons its scratch first): in order
+    /// with the regions before it, as a command buffer each was.
+    pub fn encode_region(&mut self, frame: &mut Frame, region: &Region, zero: bool) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            let _ = (pipelines, rings);
-            let frame = device.frame()?;
-            self.encode_into(&frame, region)?;
-            frame.commit()
+            if zero {
+                self.poison_scratch_on(frame)?;
+            }
+            frame.next_pass()?;
+            self.encode_into(frame, region)?;
+            frame.next_pass()?;
+            Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (device, pipelines, rings, region);
+            let _ = (frame, region, zero);
             Err(Fault::Deviceless)
         }
+    }
+
+    /// The status word's region, as a completion handler reads it
+    /// ([`super::session::EpilogueCheck`]).
+    #[must_use]
+    pub(crate) fn status_region(&self) -> Held {
+        self.status.clone()
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -1357,25 +2187,151 @@ pub struct Batch {
     key: BatchKey,
     lanes: u32,
     shape: LaneShape,
-    table: Buffer,
-    descriptors: Buffer,
-    params: Buffer,
-    offsets: Buffer,
-    bindings: Buffer,
-    pending_flags: Buffer,
-    lane_indices: Buffer,
-    row_meta: Buffer,
-    row_indices: Buffer,
-    scratch: Buffer,
-    addresses: Buffer,
+    /// Every table, a region of the span's batch area ([`Batch::lay`]):
+    /// this batch's frame in flight writes them, and no other frame reads
+    /// them while it is airborne.
+    table: SpanRegion,
+    descriptors: SpanRegion,
+    params: SpanRegion,
+    offsets: SpanRegion,
+    bindings: SpanRegion,
+    pending_flags: SpanRegion,
+    lane_indices: SpanRegion,
+    /// Each lane's scratch base, a device address ([`LANE_SCRATCH`](eta_compiler::codegen::lane_scratch::LANE_SCRATCH)),
+    /// written where a fire seats its scratch.
+    lane_scratch: SpanRegion,
+    row_meta: SpanRegion,
+    row_indices: SpanRegion,
+    /// This fire's lanes' value scratch, each its member's own
+    /// ([`Batch::seat_scratch`]): what the lane scratch table addresses.
+    scratch: Vec<ScratchAt>,
+    addresses: SpanRegion,
     table_bytes: u64,
-    layouts: Vec<Buffer>,
+    layouts: Vec<SpanRegion>,
     layout_words: Vec<GroupLayout>,
     rows_per_lane: u32,
+    /// What [`Batch::lay`] writes again wherever the batch is laid: the
+    /// template's tables, a copy a lane where they are per lane.
+    descriptor_bytes: Vec<u8>,
+    param_bytes: Vec<u8>,
+    offset_bytes: Vec<u8>,
+    binding_bytes: Vec<u8>,
+}
+
+/// A batch table's region of the span.
+type SpanRegion = crate::inputs::Region;
+
+/// A batch's tables' bytes, in the order [`Batch::lay`] lays them: the lane
+/// table, descriptors, params, offsets, bindings, pending flags, lane
+/// indices, lane scratch bases, row meta, row indices, output addresses and
+/// each fused region's layout.
+#[allow(clippy::too_many_arguments)]
+fn batch_pieces(
+    lanes: u32,
+    channel_slots: u32,
+    (descriptor, param, offset, binding): (u64, u64, u64, u64),
+    rows: u32,
+    table_bytes: u64,
+    fused: usize,
+) -> Vec<u64> {
+    let lanes64 = u64::from(lanes);
+    let mut pieces = vec![
+        LaneShape::of(lanes, channel_slots)
+            .bytes()
+            .unwrap_or(u64::MAX),
+        (descriptor * lanes64).max(4),
+        (param * lanes64).max(4),
+        offset.max(4),
+        (binding * lanes64).max(4),
+        (lanes64 * u64::from(channel_slots)).max(1),
+        lanes64 * size_of::<u32>() as u64,
+        LaneScratch::bytes(lanes),
+        lanes64 * size_of::<RowMeta>() as u64,
+        (lanes64 * u64::from(rows) * size_of::<u32>() as u64).max(4),
+        lanes64 * table_bytes,
+    ];
+    pieces.extend((0..fused).map(|_| size_of::<GroupLayout>() as u64));
+    pieces
+}
+
+/// The span bytes `pieces` take, each on the arena's boundary.
+fn batch_area(pieces: &[u64]) -> u64 {
+    pieces.iter().map(|&bytes| crate::arena::room(bytes)).sum()
 }
 
 impl Batch {
-    pub fn build(device: &Context, template: &Prepared, lanes: u32) -> Result<Batch> {
+    /// The span bytes this batch's tables take where it is laid.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.regions()
+            .map(|region| crate::arena::room(region.bytes()))
+            .sum()
+    }
+
+    /// The span bytes a batch of `lanes` lanes of a stage of `plan` takes,
+    /// its instances carrying `channels` channels and reading at most
+    /// `rows` readout rows a lane: what a fire term states before any is
+    /// laid; 0 for a stage with no grouped seat.
+    #[must_use]
+    pub fn bytes_for(plan: &LaunchStagePlan, channels: u32, lanes: u32, rows: u32) -> u64 {
+        if !plan.needs.grouped_valid {
+            return 0;
+        }
+        let values = plan.value_types.len() as u64;
+        batch_area(&batch_pieces(
+            lanes.max(1),
+            LaneShape::of(GROUPED_LANES, channels).channel_slots_per_lane,
+            (
+                values * size_of::<ValueDesc>() as u64,
+                (plan.ops.len() * size_of::<OpParams>()) as u64,
+                values * size_of::<u32>() as u64,
+                (plan.channel_bindings.len() * size_of::<u32>()) as u64,
+            ),
+            rows.max(1),
+            ((plan.output_pitch as usize).max(1) * size_of::<OutputSeat>()) as u64,
+            plan.fused.len(),
+        ))
+    }
+
+    fn regions(&self) -> impl Iterator<Item = &SpanRegion> {
+        [
+            &self.table,
+            &self.descriptors,
+            &self.params,
+            &self.offsets,
+            &self.bindings,
+            &self.pending_flags,
+            &self.lane_indices,
+            &self.lane_scratch,
+            &self.row_meta,
+            &self.row_indices,
+            &self.addresses,
+        ]
+        .into_iter()
+        .chain(&self.layouts)
+    }
+
+    fn regions_mut(&mut self) -> impl Iterator<Item = &mut SpanRegion> {
+        [
+            &mut self.table,
+            &mut self.descriptors,
+            &mut self.params,
+            &mut self.offsets,
+            &mut self.bindings,
+            &mut self.pending_flags,
+            &mut self.lane_indices,
+            &mut self.lane_scratch,
+            &mut self.row_meta,
+            &mut self.row_indices,
+            &mut self.addresses,
+        ]
+        .into_iter()
+        .chain(self.layouts.iter_mut())
+    }
+
+    /// A batch of `lanes` lanes of `template`'s stage, its tables sized and
+    /// not yet laid ([`Batch::lay`]): nothing binds or writes them before.
+    pub fn plan(template: &Prepared, lanes: u32, empty: &Buffer) -> Result<Batch> {
         let key = template.batch_key().ok_or_else(|| {
             Fault::program(
                 "program::launch",
@@ -1390,84 +2346,151 @@ impl Batch {
         let lanes = lanes.max(1);
         let table_bytes = (template.seats.len().max(1) * size_of::<OutputSeat>()) as u64;
         let shape = LaneShape::of(lanes, grouped.shape.channel_slots_per_lane);
-        let bytes = shape.bytes().ok_or_else(|| {
-            Fault::program(
+        if shape.bytes().is_none() {
+            return Err(Fault::program(
                 "program::launch",
                 "a batch lane table whose size does not fit a u64",
-            )
-        })?;
-        let mut table = Buffer::zeroed(device, bytes)?;
-        table.write(
-            0,
-            &record_bytes(&LaneHeader {
-                abi_version: LANE_ABI_VERSION,
-                lane_count: lanes,
-                channel_slots_per_lane: shape.channel_slots_per_lane,
-                flags: 0,
-            }),
-        )?;
-        let replicate = |device: &Context, bytes: &[u8]| -> Result<Buffer> {
-            let mut buffer =
-                Buffer::zeroed(device, (bytes.len() as u64 * u64::from(lanes)).max(4))?;
-            for lane in 0..lanes {
-                buffer.write(u64::from(lane) * bytes.len() as u64, bytes)?;
-            }
-            Ok(buffer)
-        };
-        let descriptors = replicate(device, &template.descriptor_bytes)?;
-        let params = replicate(device, &template.param_bytes)?;
-        let mut offsets = Buffer::zeroed(device, template.offset_bytes.len().max(4) as u64)?;
-        offsets.write(0, &template.offset_bytes)?;
+            ));
+        }
         let binding_bytes: Vec<u8> = template
             .bindings
             .iter()
             .copied()
             .flat_map(u32::to_le_bytes)
             .collect();
-        let bindings = replicate(device, &binding_bytes)?;
-        let pending_flags = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(shape.channel_slots_per_lane)).max(1),
-        )?;
-        let index_bytes: Vec<u8> = (0..lanes).flat_map(u32::to_le_bytes).collect();
-        let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
-        lane_indices.write(0, &index_bytes)?;
-        let row_meta = Buffer::zeroed(device, u64::from(lanes) * size_of::<RowMeta>() as u64)?;
         let rows_per_lane = grouped.readout_rows;
-        let row_indices = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(rows_per_lane) * size_of::<u32>() as u64).max(4),
-        )?;
-        let scratch = Buffer::zeroed(
-            device,
-            (u64::from(lanes) * u64::from(template.scratch_stride)).max(SCRATCH_ALIGN),
-        )?;
-        let mut layouts = Vec::with_capacity(grouped.layout_words.len());
-        for words in &grouped.layout_words {
-            let mut buffer = Buffer::zeroed(device, size_of::<GroupLayout>() as u64)?;
-            buffer.write(0, &record_bytes(words))?;
-            layouts.push(buffer);
-        }
+        let pieces = batch_pieces(
+            lanes,
+            grouped.shape.channel_slots_per_lane,
+            (
+                template.descriptor_bytes.len() as u64,
+                template.param_bytes.len() as u64,
+                template.offset_bytes.len() as u64,
+                binding_bytes.len() as u64,
+            ),
+            rows_per_lane,
+            table_bytes,
+            grouped.layout_words.len(),
+        );
+        let mut regions = pieces
+            .iter()
+            .map(|&bytes| SpanRegion::unplaced(bytes, empty.clone()));
+        let mut next = || regions.next().expect("a region a piece");
         Ok(Batch {
             key,
             lanes,
             shape,
-            table,
-            descriptors,
-            params,
-            offsets,
-            bindings,
-            pending_flags,
-            lane_indices,
-            row_meta,
-            row_indices,
-            scratch,
-            addresses: Buffer::zeroed(device, u64::from(lanes) * table_bytes)?,
+            table: next(),
+            descriptors: next(),
+            params: next(),
+            offsets: next(),
+            bindings: next(),
+            pending_flags: next(),
+            lane_indices: next(),
+            lane_scratch: next(),
+            row_meta: next(),
+            row_indices: next(),
+            scratch: Vec::new(),
+            addresses: next(),
             table_bytes,
-            layouts,
+            layouts: (0..grouped.layout_words.len()).map(|_| next()).collect(),
             layout_words: grouped.layout_words.clone(),
             rows_per_lane,
+            descriptor_bytes: template.descriptor_bytes.clone(),
+            param_bytes: template.param_bytes.clone(),
+            offset_bytes: template.offset_bytes.clone(),
+            binding_bytes,
         })
+    }
+
+    /// Lays the batch's tables from `at` of `view` (the span's buffer)
+    /// upward, written through `host` (`(at, bytes)` to its host runs), and
+    /// writes what a batch holds from its first fire; the caller drained
+    /// every frame that read where it was. Returns where the next lies.
+    #[allow(clippy::type_complexity)]
+    pub fn lay(
+        &mut self,
+        view: &Buffer,
+        at: u64,
+        host: &dyn Fn(u64, u64) -> Result<Vec<(u64, u64, std::ptr::NonNull<u8>)>>,
+    ) -> Result<u64> {
+        let mut next = at;
+        for region in self.regions_mut() {
+            let bytes = region.bytes();
+            region.place(view.clone(), next);
+            region.rehost(if bytes > 0 {
+                host(next, bytes)?
+            } else {
+                Vec::new()
+            })?;
+            next += crate::arena::room(bytes);
+        }
+        self.table.write(
+            0,
+            &record_bytes(&LaneHeader {
+                abi_version: LANE_ABI_VERSION,
+                lane_count: self.lanes,
+                channel_slots_per_lane: self.shape.channel_slots_per_lane,
+                flags: 0,
+            }),
+        )?;
+        for lane in 0..u64::from(self.lanes) {
+            let descriptor = self.descriptor_bytes.len() as u64;
+            self.descriptors
+                .write(lane * descriptor, &self.descriptor_bytes)?;
+            let param = self.param_bytes.len() as u64;
+            self.params.write(lane * param, &self.param_bytes)?;
+            let binding = self.binding_bytes.len() as u64;
+            self.bindings.write(lane * binding, &self.binding_bytes)?;
+        }
+        self.offsets.write(0, &self.offset_bytes)?;
+        let index_bytes: Vec<u8> = (0..self.lanes).flat_map(u32::to_le_bytes).collect();
+        self.lane_indices.write(0, &index_bytes)?;
+        for (words, region) in self.layout_words.iter().zip(self.layouts.iter_mut()) {
+            region.write(0, &record_bytes(words))?;
+        }
+        Ok(next)
+    }
+
+    /// Writes each lane's scratch address into the lane scratch table:
+    /// lane `i` fires in `lanes[i]`, its member's own scratch, wherever the
+    /// pool laid it. No lane's bytes are reached from another's.
+    pub fn seat_scratch(&mut self, lanes: &[ScratchAt]) -> Result<()> {
+        if lanes.len() as u64 > u64::from(self.lanes) {
+            return Err(Fault::Ceiling {
+                what: "lanes of a batch's lane scratch table",
+                need: lanes.len() as u64,
+                have: u64::from(self.lanes),
+            });
+        }
+        // Off Apple nothing encodes (a batch's encode is `Deviceless`), and
+        // no reservation has an address to write.
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut bases = Vec::with_capacity(LaneScratch::bytes(self.lanes) as usize);
+            for at in lanes {
+                bases.extend(address_of(&at.buffer, at.offset)?.to_le_bytes());
+            }
+            self.lane_scratch.write(0, &bases)?;
+        }
+        self.scratch = lanes.to_vec();
+        Ok(())
+    }
+
+    /// This fire's lanes' scratch, one a member: refused where the fire
+    /// seated other than `count` lanes.
+    #[cfg(target_vendor = "apple")]
+    fn lanes_scratch(&self, count: u32) -> Result<&[ScratchAt]> {
+        if self.scratch.len() as u64 != u64::from(count) {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "a batch fires {count} lanes and seated {} lanes' scratch",
+                    self.scratch.len()
+                ),
+            ));
+        }
+        Ok(&self.scratch)
     }
 
     #[must_use]
@@ -1497,19 +2520,15 @@ impl Batch {
         if count == 0 {
             return Ok(());
         }
+        #[cfg(target_vendor = "apple")]
         let stride = u64::from(self.key.scratch_stride);
         self.pending_flags.zero_span(
             0,
             u64::from(count) * u64::from(self.shape.channel_slots_per_lane),
         )?;
-        if !scratch_zeroing_skipped() {
-            #[cfg(target_vendor = "apple")]
-            {
-                frame.fill(self.scratch.slab(), 0, u64::from(count) * stride)?;
-                frame.next_pass()?;
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            self.scratch.zero_span(0, u64::from(count) * stride)?;
+        #[cfg(target_vendor = "apple")]
+        for lane in self.lanes_scratch(count)? {
+            poison_scratch(frame, lane.buffer.slab(), lane.offset, stride)?;
         }
         let frame: &Frame = frame;
         let vocab = members[0]
@@ -1579,7 +2598,10 @@ impl Batch {
                 u64::from(lane) * size_of::<RowMeta>() as u64,
                 &record_bytes(&meta),
             )?;
-            let rows: Vec<u8> = (0..grouped.readout_rows)
+            let rows: Vec<u8> = grouped
+                .row_at
+                .iter()
+                .copied()
                 .flat_map(u32::to_le_bytes)
                 .collect();
             if !rows.is_empty() {
@@ -1593,10 +2615,34 @@ impl Batch {
             buffer.write(0, &record_bytes(words))?;
         }
         for region in regions {
+            #[cfg(target_vendor = "apple")]
+            if crate::encode::profiling() {
+                let (_, seconds) =
+                    frame.timed(|| self.encode_batched_region(frame, region, members, count))?;
+                if let Some(seconds) = seconds {
+                    crate::encode::record_kernel(&guest_key(region, count), seconds);
+                }
+                continue;
+            }
+            self.encode_batched_region(frame, region, members, count)?;
+        }
+        Ok(())
+    }
+
+    fn encode_batched_region(
+        &self,
+        frame: &Frame,
+        region: &Region,
+        members: &[&mut Prepared],
+        count: u32,
+    ) -> Result<()> {
+        {
             match region.form {
                 Form::Fused => {
-                    for (index, member) in members.iter().enumerate() {
-                        member.encode_fused(frame, region, &self.scratch, index as u64 * stride)?;
+                    // A fused region fires each member in its own scratch.
+                    for member in members.iter() {
+                        let own = member.scratch_at()?;
+                        member.encode_fused(frame, region, &own.buffer, own.offset)?;
                     }
                 }
                 Form::Grouped | Form::GroupedLibrary => {
@@ -1620,60 +2666,16 @@ impl Batch {
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-            };
-            let layout = self
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!(
-                            "region {} has no group layout in this batch",
-                            region.region_index
-                        ),
-                    )
-                })?;
+            use objc2_metal::MTLComputePipelineState;
+            let layout = self.layout(region)?;
             let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
-            // SAFETY: every buffer is retained by `self`; every offset is zero.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    0,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            for member in members {
-                resident(
-                    &member.status,
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
-                for cell in &member.bound {
-                    resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-                }
-                for held in member.outputs.iter().flatten() {
-                    resident(&held.base, MTLResourceUsage::Read);
-                }
-            }
+            bind_group(
+                &encoder,
+                region,
+                self.group_tables(layout),
+                self.scratch.iter().map(|lane| &lane.buffer),
+                members.iter().map(|member| &**member),
+            );
             let template = members
                 .first()
                 .ok_or_else(|| Fault::program("program::launch", "a batch with no members"))?;
@@ -1694,6 +2696,7 @@ impl Batch {
                 ),
                 threads,
                 count as usize,
+                region,
             );
             Ok(())
         }
@@ -1750,93 +2753,23 @@ impl Batch {
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2::runtime::ProtocolObject;
-            use objc2_metal::{
-                MTLComputeCommandEncoder, MTLComputePipelineState, MTLResource, MTLResourceUsage,
-                MTLSize,
-            };
-            let layout = self
-                .layouts
-                .get(region.region_index as usize)
-                .ok_or_else(|| {
-                    Fault::program(
-                        "program::launch",
-                        format!(
-                            "region {} has no group layout in this batch",
-                            region.region_index
-                        ),
-                    )
-                })?;
-            let encoder = frame.encoder();
-            encoder.setComputePipelineState(region.pipeline());
+            let layout = self.layout(region)?;
             if let Some(template) = members.first() {
                 self.dump_streamed_tables(region, template)?;
             }
-            // SAFETY: every buffer is retained by `self`; every offset is zero (the kernel strides off `layout`).
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(self.table.raw()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(self.descriptors.raw()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(self.params.raw()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(self.offsets.raw()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(self.scratch.raw()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(layout.raw()), 0, 5);
-                encoder.setBuffer_offset_atIndex(Some(self.bindings.raw()), 0, 6);
-                encoder.setBuffer_offset_atIndex(Some(self.pending_flags.raw()), 0, 7);
-                encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
-                encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
-                encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
-                encoder.setBuffer_offset_atIndex(
-                    Some(self.addresses.raw()),
-                    0,
-                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
-                );
-            }
-            let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
-                let resource: &ProtocolObject<dyn MTLResource> =
-                    ProtocolObject::from_ref(&**buffer.slab());
-                encoder.useResource_usage(resource, usage);
-            };
-            for member in members {
-                resident(
-                    &member.status,
-                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                );
-                for cell in &member.bound {
-                    resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
-                }
-                for held in member.outputs.iter().flatten() {
-                    resident(&held.base, MTLResourceUsage::Read);
-                }
-            }
+            let encoder = frame.encoder();
+            bind_group(
+                &encoder,
+                region,
+                self.group_tables(layout),
+                self.scratch.iter().map(|lane| &lane.buffer),
+                members.iter().map(|member| &**member),
+            );
             let rows = self
                 .layout_words
                 .get(region.region_index as usize)
                 .map_or(1, |words| words.reserved1 as usize);
-            let (groups, threads) = match region.form {
-                Form::Fused | Form::Streamed => {
-                    unreachable!("`Batch::encode` routes the single-lane and streamed forms")
-                }
-                Form::GroupedLibrary => ((count as usize) * rows, LIBRARY_SAMPLER_THREADS),
-                Form::Grouped => (
-                    count as usize,
-                    region
-                        .pipeline()
-                        .maxTotalThreadsPerThreadgroup()
-                        .clamp(1, REGION_THREADS as usize),
-                ),
-            };
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: groups.max(1),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: threads,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            dispatch_grouped(&encoder, region, count as usize, rows);
             Ok(())
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -1844,6 +2777,160 @@ impl Batch {
             Err(Fault::Deviceless)
         }
     }
+
+    /// Region `region`'s group layout in this batch.
+    #[cfg(target_vendor = "apple")]
+    fn layout(&self, region: &Region) -> Result<&SpanRegion> {
+        self.layouts
+            .get(region.region_index as usize)
+            .ok_or_else(|| {
+                Fault::program(
+                    "program::launch",
+                    format!(
+                        "region {} has no group layout in this batch",
+                        region.region_index
+                    ),
+                )
+            })
+    }
+
+    /// The batch's tables at the slots a grouped or streamed region binds
+    /// ([`GROUP_SLOTS`]).
+    #[cfg(target_vendor = "apple")]
+    fn group_tables<'a>(&'a self, layout: &'a SpanRegion) -> [Bind<'a>; 12] {
+        let at = |region: &'a SpanRegion| (region.view().raw(), region.at(0));
+        [
+            at(&self.table),
+            at(&self.descriptors),
+            at(&self.params),
+            at(&self.offsets),
+            at(&self.lane_scratch),
+            at(layout),
+            at(&self.bindings),
+            at(&self.pending_flags),
+            at(&self.lane_indices),
+            at(&self.row_meta),
+            at(&self.row_indices),
+            at(&self.addresses),
+        ]
+    }
+}
+
+/// A buffer and the byte a kernel binds it at.
+#[cfg(target_vendor = "apple")]
+type Bind<'a> = (
+    &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    u64,
+);
+
+/// The slots a grouped or streamed region reads its tables at: the lane
+/// table, descriptors, params, offsets, lane scratch, group layout,
+/// bindings, pending flags, lane indices, row meta, row indices and the
+/// intrinsic address table.
+#[cfg(target_vendor = "apple")]
+const GROUP_SLOTS: [usize; 12] = [
+    0,
+    1,
+    2,
+    3,
+    eta_compiler::codegen::lane_scratch::LANE_SCRATCH.metal_buffer,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
+];
+
+/// Binds a grouped or streamed region on `encoder`: its pipeline, `tables`
+/// at [`GROUP_SLOTS`], and as resident the lanes' `scratch` (which they
+/// reach by the addresses in the lane scratch table) and each member's
+/// status, bound cells and seated rows. One member ([`Prepared`]) or a
+/// batch's ([`Batch`]) bind alike.
+#[cfg(target_vendor = "apple")]
+fn bind_group<'m>(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    region: &Region,
+    tables: [Bind<'_>; 12],
+    scratch: impl IntoIterator<Item = &'m Buffer>,
+    members: impl IntoIterator<Item = &'m Prepared>,
+) {
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLComputeCommandEncoder, MTLResource, MTLResourceUsage};
+    encoder.setComputePipelineState(region.pipeline());
+    for (slot, (buffer, offset)) in GROUP_SLOTS.into_iter().zip(tables) {
+        // SAFETY: the caller retains every table; every offset lies inside its region (the kernel strides off the layout).
+        unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), offset as usize, slot) };
+    }
+    let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
+        let resource: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**buffer.slab());
+        encoder.useResource_usage(resource, usage);
+    };
+    for buffer in scratch {
+        resident(buffer, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    }
+    for member in members {
+        resident(
+            member.status.buffer(),
+            MTLResourceUsage::Read | MTLResourceUsage::Write,
+        );
+        for cell in &member.bound {
+            resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
+        }
+        for held in member.seated() {
+            resident(&held.base, MTLResourceUsage::Read);
+        }
+    }
+}
+
+/// Dispatches a grouped region bound by [`bind_group`] over `lanes` lanes:
+/// a library sampler takes a threadgroup per lane row (`rows` a lane, from
+/// its group layout), a region kernel one per lane.
+#[cfg(target_vendor = "apple")]
+fn dispatch_grouped(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    region: &Region,
+    lanes: usize,
+    rows: usize,
+) {
+    use objc2_metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
+    let (groups, threads) = match region.form {
+        Form::Fused | Form::Streamed => {
+            unreachable!("the single-lane and streamed forms encode by their own paths")
+        }
+        Form::GroupedLibrary => (lanes * rows, LIBRARY_SAMPLER_THREADS),
+        Form::Grouped => (
+            lanes,
+            region
+                .pipeline()
+                .maxTotalThreadsPerThreadgroup()
+                .clamp(1, REGION_THREADS as usize),
+        ),
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: groups.max(1),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// One streamed step of a member bound on `encoder` ([`Prepared::bind_streamed`]).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn dispatch_streamed_step(
+    encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    step: (StepWord, u32),
+    threads: usize,
+    region: &Region,
+) {
+    dispatch_streamed(encoder, &[step], threads, GROUPED_LANES as usize, region);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -1852,9 +2939,23 @@ fn dispatch_streamed(
     dispatches: &[(StepWord, u32)],
     threads: usize,
     lanes: usize,
+    region: &Region,
 ) {
     use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+    // Each step on its own pipeline where the region was built one a step
+    // (only its case compiled in), else every step on the region's.
+    let own = region.module.step_pipelines();
+    let mut bound: Option<usize> = None;
     for (word, groups) in dispatches {
+        let step = word.index as usize;
+        let want = (step < own.len()).then_some(step);
+        if want != bound {
+            match want {
+                Some(at) => encoder.setComputePipelineState(&own[at]),
+                None => encoder.setComputePipelineState(region.pipeline()),
+            }
+            bound = want;
+        }
         // SAFETY: `word` lives for the call; Metal copies the bytes.
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -1889,9 +2990,37 @@ fn records_bytes<T: Copy>(records: &[T]) -> Vec<u8> {
     records.iter().flat_map(record_bytes).collect()
 }
 
+/// The kernel profile's row for a guest region: its entry, form, steps
+/// and the lanes it ran for.
+#[cfg(target_vendor = "apple")]
+fn guest_key(region: &Region, lanes: u32) -> String {
+    format!(
+        "guest {} {:?} steps={} lanes={lanes}",
+        region.module.entry(),
+        region.form,
+        region.steps.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane's scratch past a `uint` is refused by name, not clamped: the
+    /// kernels' layout word would hold another stride than the one laid.
+    #[test]
+    fn a_lane_scratch_past_a_uint_is_refused_by_name() {
+        assert_eq!(
+            lane_word(LANE_SCRATCH, u64::from(u32::MAX)).ok(),
+            Some(u32::MAX)
+        );
+        let refused = lane_word(LANE_SCRATCH, 1 << 32).expect_err("past a uint");
+        assert!(
+            matches!(refused, Fault::Ceiling { what, need, .. }
+                if what == LANE_SCRATCH && need == 1 << 32),
+            "{refused}"
+        );
+    }
 
     #[test]
     fn launch_every_case() {
@@ -1904,12 +3033,12 @@ mod tests {
 
     fn a_channel_this_instance_does_not_carry_is_refused_by_number() {
         let rings = Rings {
-            slabs: Vec::new(),
+            own: Vec::new(),
             shapes: Vec::new(),
             shared: Vec::new(),
         };
         let said = rings
-            .cell_offset(2, 0)
+            .cell_at(2, 0)
             .expect_err("no such channel")
             .to_string();
         assert!(said.contains('2'), "the refusal names the channel: {said}");
@@ -1971,11 +3100,11 @@ mod tests {
         let runtime = eta_compiler::codegen::metal::RUNTIME_TEMPLATE;
         assert!(
             runtime.contains(
-                "struct M1OutputSeat {\n  ulong at;\n  uint storage;\n  uint stride;\n};"
+                "struct M1OutputSeat {\n  ulong at;\n  uint storage;\n  uint stride;\n  uint rows;\n  uint reserved;\n};"
             ),
             "`OutputSeat` in this file is the host half of the emitted `M1OutputSeat`"
         );
-        assert_eq!(size_of::<OutputSeat>(), 16);
+        assert_eq!(size_of::<OutputSeat>(), 24);
     }
 
     fn the_grouped_samplers_take_the_bindings_this_file_writes() {
@@ -1984,7 +3113,7 @@ mod tests {
             "all_descriptors",
             "params",
             "offsets",
-            "all_scratch",
+            eta_compiler::codegen::lane_scratch::LANE_SCRATCH.name,
             "layout",
             "channel_bindings",
             "pending_flags",

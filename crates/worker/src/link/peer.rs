@@ -1,6 +1,6 @@
 //! The worker-to-worker link: this worker serves [`Peer`] on
-//! `offload.listen`, and dials the workers named in `offload.peers` to
-//! prefill passes on them.
+//! `offload.listen`, and dials the workers the cluster names its helpers
+//! (`placement/helpers`) to prefill passes on them.
 //!
 //! A peer is taken only when it serves the same model, in the same class and
 //! page layout: v1 moves a page's bytes as they are. The bytes ride the bulk
@@ -18,9 +18,6 @@ use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
 use worker_api::dispatch_codec;
 use worker_api::peer::{Hello, PEER_MAX_FRAME_BYTES, Pages, Peer, PeerClient, Prefill};
-
-/// A prefill may run long; the link waits this long for it.
-const PREFILL_DEADLINE: Duration = Duration::from_secs(300);
 
 /// What this worker says of itself. Its class is the engine and the
 /// deployment, which names the served variant; the page size rides in the
@@ -212,6 +209,7 @@ impl Peer for PeerServer {
         let started = Instant::now();
         let bulk = listen().ok_or("this worker serves no bulk link")?;
         let pages = runtime::offload::prefill::serve(
+            request.domain,
             request.tokens,
             request.from_page,
             request.home,
@@ -349,6 +347,7 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
 
     fn prefill(
         &self,
+        domain: [u8; 32],
         tokens: Vec<u32>,
         from_page: u32,
         delivery: runtime::offload::prefill::Delivery,
@@ -357,13 +356,15 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
         let home = self.home.clone();
         let broken = self.broken.clone();
         Box::pin(async move {
-            let mut ctx = tarpc::context::current();
-            ctx.deadline = Instant::now() + PREFILL_DEADLINE;
+            // A prefill may wait on the peer's capacity: it fails only when
+            // the link goes.
+            let ctx = worker_api::until_link_lost();
             let t0 = Instant::now();
             let pages = client
                 .prefill(
                     ctx,
                     Prefill {
+                        domain,
                         tokens,
                         from_page,
                         home,
@@ -387,20 +388,6 @@ impl runtime::offload::prefill::PrefillPeer for Dialed {
             })
         })
     }
-}
-
-/// Dials `addr` and, if it can take this worker's passes, makes it the
-/// runtime's prefill peer.
-pub async fn dial(addr: &str, ours: &Hello, listen: Option<String>) -> Result<()> {
-    let dialed = greet(addr, ours, listen).await?;
-    tracing::info!(
-        peer = %addr,
-        worker = %dialed.worker,
-        in_place = dialed.kv.is_some(),
-        "prefilling passes on a peer"
-    );
-    runtime::offload::prefill::set_peer(Some(Arc::new(dialed)));
-    Ok(())
 }
 
 /// A link to the peer at `addr`, greeted: one of this worker's model, class
@@ -482,6 +469,9 @@ impl<C: crate::ControlLink> Lookup for C {
 struct ControlDialer {
     lookup: Arc<dyn Lookup>,
     dialed: Arc<Mutex<Reached>>,
+    /// This worker: a default that names every helper names it too, and a
+    /// pass is not sent to where it already runs.
+    own: WorkerId,
 }
 
 /// The workers reached so far, by id: where each was, and its link.
@@ -495,8 +485,12 @@ impl runtime::offload::executors::Dialer for ControlDialer {
         let lookup = self.lookup.clone();
         let kept = self.dialed.lock().unwrap().get(&worker).cloned();
         let cache = self.dialed.clone();
+        let own = self.own;
         Box::pin(async move {
             let id: u64 = worker.parse().context("a worker id")?;
+            if id == own.0 {
+                bail!("worker {worker} is this one");
+            }
             let addr = lookup
                 .link(WorkerId(id))
                 .await
@@ -516,7 +510,7 @@ impl runtime::offload::executors::Dialer for ControlDialer {
                 .lock()
                 .unwrap()
                 .insert(worker.clone(), (addr.clone(), dialed.clone()));
-            tracing::info!(%worker, peer = %addr, "an executor reached");
+            tracing::info!(%worker, peer = %addr, greeted = %dialed.worker, "an executor reached");
             Ok(dialed as Arc<dyn runtime::offload::prefill::PrefillPeer>)
         })
     }
@@ -564,6 +558,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
     runtime::offload::executors::set_dialer(Some(Arc::new(ControlDialer {
         lookup,
         dialed: Arc::default(),
+        own: worker,
     })));
     let peer = listen();
     let mut generation = control.generation();
@@ -573,7 +568,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
     let mut full = true;
     let mut said_published = Vec::new();
     let mut said_disk: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut said_hints = Vec::new();
+    let mut said_off: std::collections::HashMap<[u8; 32], bool> = Default::default();
     loop {
         // A controller dialed again has heard none of it.
         if control.generation() != generation {
@@ -583,7 +578,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
         let walk = std::time::Instant::now();
         let now = runtime::offload::directory::sealed_keys();
         let disk = runtime::offload::directory::persisted_keys();
-        let hints = runtime::offload::directory::persist_hints();
+        let off = runtime::offload::directory::off_device_keys();
         let published: Vec<(String, String)> = runtime::policy::published()
             .into_iter()
             .map(|(name, value)| (name, value.to_string()))
@@ -634,8 +629,19 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
             } else {
                 said_disk.difference(&disk).copied().collect()
             },
-            persist_hints: (full || hints != said_hints).then(|| hints.clone()),
             disk_tier: full.then(runtime::offload::directory::disk_tier).flatten(),
+            off_device: (full || off != said_off).then(|| {
+                off.iter()
+                    .map(|(key, on_disk)| {
+                        let tier = if *on_disk {
+                            controller_api::OffDevice::Disk
+                        } else {
+                            controller_api::OffDevice::Host
+                        };
+                        (*key, tier)
+                    })
+                    .collect()
+            }),
         };
         match control.report_state(worker, report).await {
             Ok(()) => {
@@ -643,7 +649,7 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
                 said_runs = runs;
                 said_published = published;
                 said_disk = disk;
-                said_hints = hints;
+                said_off = off;
                 full = false;
             }
             Err(error) => {
@@ -656,48 +662,4 @@ pub async fn report_state<C: crate::ControlLink>(control: C, worker: WorkerId) {
         // little later, and fires keep the kv lock.
         tokio::time::sleep(REPORT_EVERY.max(walk * 50)).await;
     }
-}
-
-/// Sends every run this worker keeps to `pools`, each from the first page a
-/// pool has not been sent, for as long as the process lives: a cache that
-/// outlives this worker's, for any worker to fetch from. Each goes named
-/// whole from token 0, so a pool keeps it as a run, at retention key 0, and
-/// reports it as its group.
-pub async fn push_to_pools(pools: Vec<String>) {
-    let mut sent: std::collections::HashMap<String, std::collections::HashSet<[u8; 32]>> =
-        std::collections::HashMap::new();
-    loop {
-        tokio::time::sleep(REPORT_EVERY).await;
-        let runs = runtime::offload::directory::cached_runs();
-        for pool in &pools {
-            let sent = sent.entry(pool.clone()).or_default();
-            for run in &runs {
-                let Some(from) = run.iter().position(|key| !sent.contains(key)) else {
-                    continue;
-                };
-                match push(pool, run, from).await {
-                    Ok(pages) => {
-                        sent.extend(run[from..].iter().copied());
-                        tracing::debug!(target: "pie::offload", %pool, pages, "sent a run to a pool");
-                    }
-                    Err(error) => {
-                        tracing::debug!(target: "pie::offload", %pool, %error, "a run not sent to a pool");
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn push(pool: &str, run: &[[u8; 32]], from: usize) -> Result<usize> {
-    let stream = runtime::offload::prefill::fetch(run.to_vec(), from as u32).await?;
-    let pages = wire(stream)
-        .collect()
-        .await
-        .map_err(|why| anyhow::anyhow!(why))?;
-    let count = pages.count;
-    transport::tcp::put(pool, run, from as u32, &pages)
-        .await
-        .map_err(|why| anyhow::anyhow!(why))?;
-    Ok(count)
 }

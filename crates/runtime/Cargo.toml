@@ -21,6 +21,7 @@ profile = { package = "pie-profile", path = "../profile" }
 eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 eta-compiler = { path = "../eta-compiler" }
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
 engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
 engine-metal = { path = "../engine-metal", optional = true }
 
@@ -66,6 +67,8 @@ engine-cerebras = { path = "../engine-cerebras", optional = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The PLEX 1.1 policy host the worker port embeds.
+plex-host = { path = "../plex-host" }
 tokio = { version = "1.53", features = ["full"] }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 tracing-appender = "0.2"
@@ -98,6 +101,10 @@ wasmtime-wasi-http = { version = "49.0.2", default-features = false, features = 
     "p3",
     "default-send-request",
 ] }
+http-body-util = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.53", default-features = false, features = ["sync", "macros"] }
@@ -129,9 +136,6 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 [target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
 wasmtime = { version = "49.0.2", default-features = false, features = ["pulley"] }
 
-[target.'cfg(windows)'.dependencies]
-winapi-util = "0.1.11"
-
 [target.'cfg(target_vendor = "apple")'.dependencies]
 engine-metal = { path = "../engine-metal", optional = true }
 
@@ -147,6 +151,8 @@ wgpu = ["dep:engine-wgpu", "engine-wgpu/wgpu", "dep:wgpu"]
 xla = ["dep:engine-xla"]
 cerebras = ["dep:engine-cerebras"]
 profile-fire = []
+# Test fills of memory nothing should read (engine-cuda's and engine-metal's).
+test-slot-fill = ["engine-cuda?/test-slot-fill", "engine-metal?/test-slot-fill"]
 
 [dev-dependencies]
 tempfile = "3"

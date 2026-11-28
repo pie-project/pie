@@ -605,6 +605,10 @@ pub fn matmul_fp8b32_lanes(
 /// stage). Up to 64 rows (`kernel.fp8.decode_until` for `e4m3tile128`) on
 /// the decode tile (`dense_fp8_mfma`), past them on the prefill tiles
 /// (`dense_fp8_tiles`).
+/// The bytes one buffer descriptor reaches (`batch_plane`'s clamp in
+/// `linear/moe_kit.hip`): a plane read through one must lie under it.
+const FP8_CODES_REACH: u64 = 0xffff_f000;
+
 #[allow(clippy::too_many_arguments)]
 fn fire_fp8_dense(
     ctx: &Ctx,
@@ -618,6 +622,19 @@ fn fire_fp8_dense(
 ) -> Result<(), Error> {
     let act = q;
     let (n, k) = (codes.rows, codes.width);
+    // Both tiles read the codes through one buffer descriptor, whose reach
+    // stops short of 4 GiB (`batch_plane`, `linear/moe_kit.hip`) and whose
+    // offsets are 32-bit: a weight past it would read zeros, not fail.
+    if u64::from(n) * u64::from(k) >= FP8_CODES_REACH {
+        return Err(refuse(
+            op,
+            format!(
+                "an FP8 weight of {n} x {k} codes is {} bytes, and the FP8 tiles read a weight \
+                 under {FP8_CODES_REACH} bytes through one buffer descriptor",
+                u64::from(n) * u64::from(k)
+            ),
+        ));
+    }
     let stages = k / FP8_BLOCK;
     // SB 0: the rows a factor covers, by the factors' own shape.
     let fr = if sb == 0 {
@@ -626,7 +643,7 @@ fn fire_fp8_dense(
         FP8_BLOCK
     };
     let decode_until = if sb == 0 {
-        ctx.tuning().fp8_decode_until
+        ctx.tuning().fp8_decode_until()
     } else {
         64
     };
@@ -718,8 +735,8 @@ impl PrefillTile {
 /// where those leave more than two fifths of a round of CUs idle; up to
 /// `kernel.fp8.narrow_until` rows 64 x 128 at three a SIMD, a wave a strip,
 /// so a short prefill's tiles fill the card.
-fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
-    if sb == 0 && rows <= ctx.tuning().fp8_narrow_until {
+fn prefill_tile(ctx: &Ctx, cus: u32, sb: u32, rows: u32, n: u32) -> PrefillTile {
+    if sb == 0 && rows <= ctx.tuning().fp8_narrow_until() {
         return PrefillTile {
             nb: 3,
             wn: 8,
@@ -747,7 +764,6 @@ fn prefill_tile(ctx: &Ctx, sb: u32, rows: u32, n: u32) -> PrefillTile {
         ms: 8,
         occ: 2,
     };
-    let cus = ctx.multiprocessors().unwrap_or(304);
     let tiles = rows.div_ceil(wide.rows()) * n.div_ceil(wide.cols());
     if 5 * tiles < 3 * cus * wide.held_a_cu() {
         PrefillTile { ms: 4, ..wide }
@@ -786,9 +802,10 @@ fn fire_fp8_tiles(
         ));
     }
     let stages = k / FP8_BLOCK;
-    let t = prefill_tile(ctx, sb, q.rows, n);
+    let cus = ctx.multiprocessors(op)?;
+    let t = prefill_tile(ctx, cus, sb, q.rows, n);
     let tiles = q.rows.div_ceil(t.rows()) * n.div_ceil(t.cols());
-    let held = ctx.multiprocessors().unwrap_or(304) * t.held_a_cu();
+    let held = cus * t.held_a_cu();
     let rem = if tiles < held { tiles } else { tiles % held };
     // The slices that finish the last round soonest: its rounds of blocks
     // times a slice's stages and the three a block spends filling and

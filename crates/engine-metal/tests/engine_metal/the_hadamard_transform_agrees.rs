@@ -193,6 +193,7 @@ fn agrees_signed(
 
 #[test]
 fn the_hadamard_transform_agrees() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         eprintln!("not asked: no Metal device");
         return;

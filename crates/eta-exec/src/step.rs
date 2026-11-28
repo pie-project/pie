@@ -4,9 +4,9 @@ use eta_ir::registry::Stage;
 use eta_ir::validate::Direction;
 
 use eta_compiler::codegen::launch::{LaunchValue, ValueOrigin};
+use eta_compiler::eval::interp::{Evaled, eval_op};
 
 use super::channel::InterpInstance;
-use super::op::eval_op;
 use super::plan::{ExecPlan, StagePlan, port_consumes};
 use super::value::Value;
 use crate::{Error, Result, shape_numel};
@@ -117,10 +117,52 @@ impl StageRunner for Interpreted {
         _wanted: &[u32],
         vals: &mut [Value],
     ) -> Result<()> {
-        let stage = &plan.package.stages[sp.stage_index];
+        let no_outputs = eta_compiler::eval::interp::PassInputs::default();
+        let ty_of = |id: u32| plan.types[id as usize];
         for &id in &sp.value_ids {
-            if let Some(&op_idx) = sp.op_by_result.get(&id) {
-                eval_op(&stage.ops[op_idx], &plan.package, vals)?;
+            let Some(&op_idx) = sp.op_by_result.get(&id) else {
+                continue;
+            };
+            let Some(op) = sp.ops.get(op_idx) else {
+                return Err(Error {
+                    message: format!(
+                        "value {id}'s op is not one the interpreter evaluates (the plan is \
+                         not executable)"
+                    ),
+                });
+            };
+            // A stage's ops read their outputs, constants and channels as
+            // roots and put through the stage's puts: what is left is
+            // compute, the plane's kernel boundary and its sinks.
+            let evaled =
+                eval_op(op, vals, &ty_of, &no_outputs, &plan.package.names).map_err(|fault| {
+                    Error {
+                        message: fault.to_string(),
+                    }
+                })?;
+            let result = id as usize;
+            match evaled {
+                Evaled::One(value) => vals[result] = value,
+                Evaled::Two(first, second) => {
+                    vals[result] = first;
+                    vals[result + 1] = second;
+                }
+                // The one kernel a plan admits (`Boundaries`) is the
+                // identity over its one argument.
+                Evaled::Kernel { args, .. } => match args[..] {
+                    [arg] => vals[result] = vals[arg as usize].clone(),
+                    _ => {
+                        return Err(Error {
+                            message: format!("value {id}: the identity boundary takes one value"),
+                        });
+                    }
+                },
+                Evaled::Sink { .. } => {}
+                Evaled::Chan(_) => {
+                    return Err(Error {
+                        message: format!("value {id}: a channel op among a stage's ops"),
+                    });
+                }
             }
         }
         Ok(())
@@ -214,151 +256,13 @@ fn finish_stage(plan: &ExecPlan, sp: &StagePlan, overlay: &mut Overlay, vals: &[
     }
 }
 
-/// Runs the stages of several instances of one program in lockstep: every
-/// stage once, for every lane that is still stepping (a device program
-/// carrying the lanes as rows, say).
-pub trait BatchRunner {
-    /// Computes stage `sp` for `lanes`, the instances still stepping (each
-    /// with its index in the batch and its values: roots resolved, puts to
-    /// be written). An error faults every lane.
-    fn run(&mut self, plan: &ExecPlan, sp: &StagePlan, lanes: &mut [Lane<'_>]) -> Result<()>;
-
-    /// Whether the runner binds the output `root` reads for lane `lane` itself.
-    fn binds(&self, _lane: usize, _root: &LaunchValue) -> bool {
-        false
-    }
-}
-
-/// One lane of a `BatchRunner`'s stage: the instance's index in the batch
-/// and its values.
-pub struct Lane<'v> {
-    pub index: usize,
-    pub vals: &'v mut [Value],
-}
-
-/// One pass of each of `insts` (instances of `plan`) with the stages run in
-/// lockstep by `runner`: lane `l` of a stage's batch is `insts[l]` while
-/// that instance is still stepping. A blocked or poisoned instance leaves
-/// the batch before its first stage, a faulted one when it faults; the
-/// others step on. Returns each instance's outcome, in order.
-#[must_use]
-pub fn step_many(
-    insts: &mut [&mut InterpInstance],
-    plan: &ExecPlan,
-    inputs: &PassInputs,
-    runner: &mut dyn BatchRunner,
-    at: Stage,
-) -> Vec<StepOutcome> {
-    let n = insts.len();
-    let mut outcomes: Vec<Option<StepOutcome>> = vec![None; n];
-    for (l, inst) in insts.iter().enumerate() {
-        if inst.poisoned {
-            outcomes[l] = Some(StepOutcome::Faulted("instance is poisoned".to_string()));
-            continue;
-        }
-        if let Some(channel) = blocked(inst, plan, at) {
-            outcomes[l] = Some(StepOutcome::Blocked(channel));
-        }
-    }
-    let mut overlays: Vec<Overlay> = insts
-        .iter()
-        .map(|inst| Overlay::new(inst.channels.len()))
-        .collect();
-    let mut vals: Vec<Vec<Value>> = (0..n)
-        .map(|_| vec![Value::F32(vec![]); plan.package.values.len()])
-        .collect();
-    fn fault(
-        outcomes: &mut [Option<StepOutcome>],
-        insts: &mut [&mut InterpInstance],
-        l: usize,
-        why: String,
-    ) {
-        insts[l].poisoned = true;
-        outcomes[l] = Some(StepOutcome::Faulted(why));
-    }
-    for kind in [Stage::Prologue, Stage::Epilogue] {
-        if kind == Stage::Epilogue && at != Stage::Prologue {
-            for (l, inst) in insts.iter().enumerate() {
-                if outcomes[l].is_some() {
-                    continue;
-                }
-                for port in &plan.package.ports {
-                    if port.is_const {
-                        continue;
-                    }
-                    if port_consumes(port.port) {
-                        let _ = overlays[l].take(inst, port.channel);
-                    }
-                }
-            }
-        }
-        for sp in &plan.stages {
-            if plan.package.stages[sp.stage_index].stage != kind
-                || !plan.runs_at(sp.stage_index, at)
-            {
-                continue;
-            }
-            for l in 0..n {
-                if outcomes[l].is_some() {
-                    continue;
-                }
-                let prepared = prepare_stage(
-                    insts[l],
-                    plan,
-                    sp,
-                    inputs,
-                    &mut overlays[l],
-                    &mut vals[l],
-                    &|root| matches!(root.source, ValueOrigin::Output) && runner.binds(l, root),
-                );
-                if let Err(why) = prepared {
-                    fault(&mut outcomes, insts, l, why.to_string());
-                }
-            }
-            let mut lanes: Vec<Lane<'_>> = vals
-                .iter_mut()
-                .enumerate()
-                .filter(|(l, _)| outcomes[*l].is_none())
-                .map(|(index, v)| Lane {
-                    index,
-                    vals: v.as_mut_slice(),
-                })
-                .collect();
-            if lanes.is_empty() {
-                break;
-            }
-            if let Err(why) = runner.run(plan, sp, &mut lanes) {
-                for l in 0..n {
-                    if outcomes[l].is_none() {
-                        fault(&mut outcomes, insts, l, why.to_string());
-                    }
-                }
-                break;
-            }
-            for l in 0..n {
-                if outcomes[l].is_none() {
-                    finish_stage(plan, sp, &mut overlays[l], &vals[l]);
-                }
-            }
-        }
-    }
-    for l in 0..n {
-        if outcomes[l].is_none() {
-            outcomes[l] = Some(commit(insts[l], &overlays[l]));
-        }
-    }
-    outcomes
-        .into_iter()
-        .map(|o| o.unwrap_or(StepOutcome::Committed))
-        .collect()
-}
-
 fn const_root_value(root: &LaunchValue) -> Value {
     match root.dtype {
         eta_ir::Dtype::I32 => Value::I32(vec![root.literal_bits as i32]),
         eta_ir::Dtype::U32 => Value::U32(vec![root.literal_bits]),
-        eta_ir::Dtype::Bool => Value::Bool(vec![u8::from(root.literal_bits != 0)]),
+        eta_ir::Dtype::Bool => Value::Bool(vec![root.literal_bits != 0]),
         eta_ir::Dtype::F32 => Value::F32(vec![f32::from_bits(root.literal_bits)]),
+        // No literal is bf16 (`eta_ir::types`): a constant is an f32.
         other => crate::value::no_lane(other),
     }
 }
@@ -553,10 +457,102 @@ fn apply_commit(inst: &InterpInstance, overlay: &Overlay, words: &CommitWords) -
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{EngineCaps, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
     use super::*;
     use crate::channel::ChannelState;
+    use crate::{HostOp, Value, adopt_launch_package, host_put, host_take, make_host_instance};
+
+    /// Integers scan in their own dtype, wrapping, through the plane's
+    /// interpreter (eta-compiler's `eval_op`): an i32 cumsum past
+    /// `i32::MAX` and a u32 cumprod past `u32::MAX` wrap, and each comes
+    /// back in its dtype, not as f32.
+    #[test]
+    fn an_integer_scan_wraps_in_its_dtype() {
+        let decl = |dtype: Dtype, host_role: HostRole| ChannelDecl {
+            shape: Shape::matrix(1, 4),
+            dtype: ChanDType::Concrete(dtype),
+            capacity: 1,
+            host_role,
+            seeded: false,
+        };
+        let container = TraceContainer {
+            names: Vec::new(),
+            channels: vec![
+                decl(Dtype::I32, HostRole::Writer),
+                decl(Dtype::I32, HostRole::Reader),
+                decl(Dtype::U32, HostRole::Writer),
+                decl(Dtype::U32, HostRole::Reader),
+            ],
+            ports: Vec::new(),
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::CumSum(0),
+                    Op::ChanPut { chan: 1, value: 1 },
+                    Op::ChanTake(2),
+                    Op::CumProd(2),
+                    Op::ChanPut { chan: 3, value: 3 },
+                ],
+            }],
+            externs: Vec::new(),
+            inputs: Vec::new(),
+        };
+        let bound = eta_ir::validate::bind(container, vec![Vec::new()], EngineCaps::default())
+            .expect("the scans bind");
+        let stages = eta_compiler::plan::compile_bound(&bound);
+        let plan = adopt_launch_package(eta_compiler::codegen::launch::build(&bound, &stages))
+            .expect("the package adopts");
+        assert!(plan.executable, "{:?}", plan.reject_reason);
+        let mut inst = make_host_instance(&plan, &BTreeMap::new(), &BTreeMap::new());
+
+        let ints = [i32::MAX, 1, -5, 7];
+        let words = [0x1_0000u32, 0x1_0000, 3, 2];
+        assert_eq!(
+            host_put(&inst, &plan, 0, &Value::I32(ints.to_vec())),
+            HostOp::Ok
+        );
+        assert_eq!(
+            host_put(&inst, &plan, 2, &Value::U32(words.to_vec())),
+            HostOp::Ok
+        );
+        assert_eq!(
+            step(&mut inst, &plan, &PassInputs::none()),
+            StepOutcome::Committed
+        );
+
+        let mut sum = 0i32;
+        let sums: Vec<i32> = ints
+            .iter()
+            .map(|&x| {
+                sum = sum.wrapping_add(x);
+                sum
+            })
+            .collect();
+        let mut product = 1u32;
+        let products: Vec<u32> = words
+            .iter()
+            .map(|&x| {
+                product = product.wrapping_mul(x);
+                product
+            })
+            .collect();
+        assert_eq!(
+            host_take(&inst, &plan, 1),
+            (HostOp::Ok, Some(Value::I32(sums)))
+        );
+        assert_eq!(
+            host_take(&inst, &plan, 3),
+            (HostOp::Ok, Some(Value::U32(products)))
+        );
+    }
 
     #[test]
     fn a_host_take_during_a_step_survives_its_commit() {

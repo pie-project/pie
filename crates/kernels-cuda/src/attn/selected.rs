@@ -26,7 +26,7 @@ const MMA_THREADS: u32 = 128;
 /// profile asks for it (`kernel.sdpa.selected_mma`) and a kv head's query
 /// heads fill at most one mma's 16 rows; `None` keeps the scalar walk.
 fn mma_dim(ctx: &Ctx, head_dim: i32, group: i32) -> Option<i32> {
-    (ctx.tuning().selected_mma && matches!(head_dim, 128 | 256) && (1..=16).contains(&group))
+    (ctx.tuning().selected_mma() && matches!(head_dim, 128 | 256) && (1..=16).contains(&group))
         .then_some(head_dim)
 }
 
@@ -55,7 +55,7 @@ fn mma_warps(ctx: &Ctx, blocks: u32, head_dim: i32) -> u32 {
 /// while the fire's clustered blocks would fill more than a quarter of the
 /// SMs, so a decode's lone row takes the most; one where it is off.
 fn mma_ranks(ctx: &Ctx, blocks: u32, head_dim: i32) -> u32 {
-    let mut ranks = ctx.tuning().selected_cluster;
+    let mut ranks = ctx.tuning().selected_cluster();
     let sms = ctx.multiprocessors().unwrap_or(108);
     if crate::jit::compute_capability_major().is_none_or(|major| major < 9)
         || !ctx.smem_fits(mma_smem_bytes(head_dim, 8) + mma_fold_bytes(head_dim))

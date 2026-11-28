@@ -1,10 +1,10 @@
 //! A process's fires on their way through the engine: while one is, the
 //! process is not stalled, whatever else of it is parked.
 //!
-//! A process whose lanes ask apart (text-completion-bench's batch) parked one
-//! lane while the others' fires ran; read as stalled, the fleet looked
-//! wedged and the process was reclaimed and replayed, often thousands of
-//! times, before the ask that could never fit parked and failed. A fire
+//! A process whose lanes ask apart parks one lane while the others' fires
+//! run; read as stalled, the fleet would look wedged and the process be
+//! reclaimed and replayed, often thousands of times, before the ask that
+//! could never fit parked and failed. A fire
 //! settles once the engine runs it, and its settling pokes the planner, so a
 //! parked lane waits for it instead.
 //!
@@ -41,14 +41,37 @@ impl ResidencyPlanner {
     /// `pid` binds a fire's slots: it counts as in flight until the token
     /// drops.
     pub fn fire_in_flight(self: &Arc<Self>, pid: ProcessId) -> FireInFlight {
-        let counted = self.with_counts(|inner| {
-            inner.procs.get_mut(&pid).is_some_and(|proc| {
-                proc.fires += 1;
-                proc.fired_at = crate::rt::Instant::now();
-                proc.fire_lapsed = false;
-                true
-            })
+        let (counted, eligible) = self.with_counts(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return (false, false);
+            };
+            proc.fires += 1;
+            proc.fired_at = crate::rt::Instant::now();
+            proc.fire_lapsed = false;
+            // It runs: an eviction candidate again, and no head of its
+            // holds a restore back any more.
+            let first = std::mem::replace(&mut proc.unfired, false);
+            // Firing: a bind it was restored for went through.
+            let bound = inner.bind_restoring == Some(pid);
+            if bound {
+                inner.bind_restoring = None;
+            }
+            (true, first || bound)
         });
+        // Its first fire since a restore or a bind's serve ends what held
+        // waiters behind it (a victim's restore held for the head it was
+        // evicted for, the next bind-suspended restore): they plan now, not
+        // when this fire lands, and not never where its landing is quiet
+        // ([`Self::head_refused_on_room_unmoved`]).
+        if eligible
+            && self
+                .returns
+                .waiters
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
+            self.poke();
+        }
         FireInFlight {
             planner: Arc::downgrade(self),
             pid,
@@ -64,9 +87,19 @@ impl ResidencyPlanner {
                 proc.fire_lapsed = false;
             }
         });
+        self.stats
+            .fires_landed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // After the count drops: a poke read before it would see the fire
-        // still in flight and wait on a settling that has passed.
-        self.pages_freed();
+        // still in flight and wait on a settling that has passed. A head
+        // refused on room that has not moved since is not planned again
+        // for it: fire landings would re-plan such a head at hundreds a
+        // second.
+        if self.head_refused_on_room_unmoved() {
+            self.pages_freed_quietly();
+        } else {
+            self.pages_freed();
+        }
     }
 
     /// A parked process whose fires have stood unsettled past

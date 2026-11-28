@@ -21,8 +21,6 @@ struct Input {
     page_budget: u32,
     #[serde(default)]
     enforce_tokens: Option<usize>,
-    #[serde(default = "default_heads")]
-    heads: u32,
 }
 
 fn default_prompt() -> String {
@@ -39,10 +37,6 @@ fn default_seed() -> u32 {
 }
 fn default_page_budget() -> u32 {
     4
-}
-/// Qwen3.5-0.8B: 8 query heads.
-fn default_heads() -> u32 {
-    8
 }
 
 /// Four orders of magnitude below one layer-fire's 1.0, so one observation dominates the ramp.
@@ -63,8 +57,6 @@ struct Output {
     kv_len: u32,
     page_budget: u32,
     live_pages: u32,
-    layers_observed: u32,
-    layers_per_fire: u32,
     /// Slots inside the live prefix that carry a finite, non-negative score.
     live_scored: usize,
     tail_polluted: usize,
@@ -106,27 +98,15 @@ async fn main(input: Input) -> Result<Output> {
     if input.page_budget == 0 {
         return Err("page_budget must be at least 1".into());
     }
-    if input.heads == 0 {
-        return Err("heads must be at least 1".into());
-    }
     let scores = model::lane_of(&[])?
         .outputs
         .into_iter()
         .find(|output| output.name == "attn.scores")
         .ok_or("this model reads out no attention scores")?;
-    let layers = scores.layers.max(1);
-    let heads = input.heads;
-    let score_kv = scores.width / heads;
-    if score_kv * heads != scores.width {
-        return Err(format!(
-            "the {}-wide score row does not split into {heads} heads",
-            scores.width
-        ));
-    }
-    let Some(planes) = layers.checked_mul(heads) else {
-        return Err("layers * heads overflows the plane count".into());
-    };
-    let heads_f = heads as f32;
+    // One row a lane: the attention mass a key of the load's context,
+    // summed over the layers and averaged over the query heads; the guest
+    // folds nothing.
+    let score_kv = scores.width;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -166,7 +146,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(&[&ws], StateGeometry::folding())?;
+    fwd_p.state(&[&ws], StateGeometry::default())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::output(0, "logits");
@@ -185,8 +165,6 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut last_scores: Vec<f32> = Vec::new();
     let mut last_page_mass: Vec<f32> = Vec::new();
-    let mut layers_observed = 0u32;
-    let layers_per_fire = layers;
     let mut last_kv_len = n + 1;
     let mut trace: Vec<(u32, usize)> = Vec::new();
     let mut mass_trace: Vec<f32> = Vec::new();
@@ -217,7 +195,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
 
         fwd.epilogue(move || {
             let r = rng.take();
@@ -228,9 +206,7 @@ async fn main(input: Input) -> Result<Output> {
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
 
-            // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-            let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
-            let fire_row = &reduce_sum(transpose(&rect)) / heads_f;
+            let fire_row = reshape(intrinsics::output(0, "attn.scores"), [score_kv]);
             let prev = acc.take();
             let folded = &prev + &gather(&fire_row, iota(kv_max));
             scores_out.put(&folded);
@@ -255,7 +231,6 @@ async fn main(input: Input) -> Result<Output> {
                 .with_context(|| format!("@{}", generated.len()))?;
             // The prompt plus every token committed before this fire was live.
             last_kv_len = n + generated.len() as u32;
-            layers_observed += layers_per_fire;
             mass_trace.push(last_scores.iter().filter(|s| s.is_finite()).sum());
             trace.push((
                 last_kv_len,
@@ -321,7 +296,7 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.mask(&mask)?;
-        fwd.state(&[&ws], StateGeometry::folding())?;
+        fwd.state(&[&ws], StateGeometry::default())?;
         fwd.epilogue(move || {
             let length = fill.take();
             let r = rng.take();
@@ -369,8 +344,6 @@ async fn main(input: Input) -> Result<Output> {
         kv_len: last_kv_len,
         page_budget,
         live_pages,
-        layers_observed,
-        layers_per_fire,
         live_scored: last_scores[..live]
             .iter()
             .filter(|s| s.is_finite() && **s >= 0.0)

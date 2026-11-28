@@ -330,19 +330,21 @@ fn run_dense(
     } else {
         mla::attention_prefill
     };
-    f(
-        &ctx,
-        q.q,
-        &p,
-        q.q_pe,
-        &c.pool,
-        heads as u32,
-        rank as u32,
-        scale,
-        window,
-        &mut o,
-        with_lse.then_some(&mut lse),
-    )
+    gpu.laid(&ctx, |ctx| {
+        f(
+            ctx,
+            q.q,
+            &p,
+            q.q_pe,
+            &c.pool,
+            heads as u32,
+            rank as u32,
+            scale,
+            window,
+            &mut o,
+            with_lse.then_some(&mut lse),
+        )
+    })
     .unwrap();
     let got = gpu.read(&o);
     let got_lse = gpu.read(&lse);
@@ -530,19 +532,21 @@ fn run_selected(
     } else {
         mla::attention_prefill_selected
     };
-    f(
-        &ctx,
-        q.q,
-        &p,
-        q.q_pe,
-        selection,
-        &c.pool,
-        heads as u32,
-        rank as u32,
-        scale,
-        &mut o,
-        Some(&mut lse),
-    )
+    gpu.laid(&ctx, |ctx| {
+        f(
+            ctx,
+            q.q,
+            &p,
+            q.q_pe,
+            selection,
+            &c.pool,
+            heads as u32,
+            rank as u32,
+            scale,
+            &mut o,
+            Some(&mut lse),
+        )
+    })
     .unwrap();
     let got = gpu.read(&o);
     let got_lse = gpu.read(&lse);
@@ -930,19 +934,21 @@ fn selected_decode_under_a_window() {
     let mut o = gpu.zeros(3, (heads * rank) as u32, Dtype::Bf16);
     let win = gpu.ints(&[2, 1, 2, 0]);
     ctx.arm_stage(win.ptr);
-    mla::attention_decode_selected(
-        &ctx,
-        q,
-        &p,
-        q_pe,
-        selection,
-        &c.pool,
-        heads as u32,
-        rank as u32,
-        0.05,
-        &mut o,
-        None,
-    )
+    gpu.laid(&ctx, |ctx| {
+        mla::attention_decode_selected(
+            ctx,
+            q,
+            &p,
+            q_pe,
+            selection,
+            &c.pool,
+            heads as u32,
+            rank as u32,
+            0.05,
+            &mut o,
+            None,
+        )
+    })
     .unwrap();
     ctx.disarm_stage();
     let got = gpu.read(&o);
@@ -1032,28 +1038,32 @@ fn absorb_into_and_out_of_the_latent() {
             .collect();
         let kv_b = gpu.tensor(&kvb, (heads * (nope + v)) as u32, rank as u32, Dtype::Bf16);
         let mut q_latent = gpu.zeros(tokens as u32, (heads * rank) as u32, Dtype::Bf16);
-        mla::absorb_q(
-            &ctx,
-            gpu.tensor(&qn, tokens as u32, (heads * nope) as u32, Dtype::Bf16),
-            kv_b,
-            heads as u32,
-            rank as u32,
-            nope as u32,
-            v as u32,
-            &mut q_latent,
-        )
+        gpu.laid(&ctx, |ctx| {
+            mla::absorb_q(
+                ctx,
+                gpu.tensor(&qn, tokens as u32, (heads * nope) as u32, Dtype::Bf16),
+                kv_b,
+                heads as u32,
+                rank as u32,
+                nope as u32,
+                v as u32,
+                &mut q_latent,
+            )
+        })
         .unwrap();
         let mut o = gpu.zeros(tokens as u32, (heads * v) as u32, Dtype::Bf16);
-        mla::absorb_out(
-            &ctx,
-            gpu.tensor(&lat, tokens as u32, (heads * rank) as u32, Dtype::Bf16),
-            kv_b,
-            heads as u32,
-            rank as u32,
-            v as u32,
-            nope as u32,
-            &mut o,
-        )
+        gpu.laid(&ctx, |ctx| {
+            mla::absorb_out(
+                ctx,
+                gpu.tensor(&lat, tokens as u32, (heads * rank) as u32, Dtype::Bf16),
+                kv_b,
+                heads as u32,
+                rank as u32,
+                v as u32,
+                nope as u32,
+                &mut o,
+            )
+        })
         .unwrap();
         let (gq, go) = (gpu.read(&q_latent), gpu.read(&o));
         let w =

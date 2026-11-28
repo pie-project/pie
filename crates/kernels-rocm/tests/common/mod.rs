@@ -7,6 +7,7 @@
 
 use dtype::Dtype;
 use kernels_rocm::hip::{self, blas};
+use kernels_rocm::jit::{SlabKey, Slabs};
 use kernels_rocm::{Ctx, KvPool, RecurrentPool, Snapshots, Tensor};
 
 pub mod spread;
@@ -15,6 +16,10 @@ pub struct Gpu {
     pub stream: hip::Stream,
     blas: blas::Handle,
     buffers: std::cell::RefCell<Vec<hip::Buffer>>,
+    /// This `Gpu`'s slab arena, and each slab laid in it so far at its
+    /// bytes ([`Gpu::laid`]).
+    slabs: Slabs,
+    laid: std::cell::RefCell<std::collections::HashMap<SlabKey, usize>>,
 }
 
 impl Gpu {
@@ -24,20 +29,51 @@ impl Gpu {
             return None;
         }
         hip::set_device(0).ok()?;
-        // An instantiation that will not compile fails its test instead of
-        // falling back unseen.
-        kernels_rocm::jit::strict_kernels();
         Some(Self {
             stream: hip::Stream::new().ok()?,
             blas: blas::Handle::new().ok()?,
             buffers: std::cell::RefCell::new(Vec::new()),
+            slabs: Slabs::open(),
+            laid: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 
     pub fn ctx(&self) -> Ctx {
         // SAFETY: the stream and handle live as long as `self`, which every
         // test holds past its last fire.
-        unsafe { Ctx::on(self.stream.raw()).with_blas(self.blas.raw()) }
+        unsafe {
+            Ctx::on(self.stream.raw())
+                .with_blas(self.blas.raw())
+                .with_slabs(self.slabs)
+        }
+    }
+
+    /// `launch` on `ctx` as the engine fires it: walked size-only first
+    /// (`kernels_rocm::sizing`), the slabs it asks for laid zeroed in memory
+    /// this `Gpu` keeps, then fired. A slab laid before at as many bytes
+    /// keeps its place, so a later launch reads what an earlier one left in
+    /// a stream's tile.
+    pub fn laid<T>(&self, ctx: &Ctx, mut launch: impl FnMut(&Ctx) -> T) -> T {
+        kernels_rocm::sizing::begin();
+        let _ = launch(ctx);
+        let walked = kernels_rocm::sizing::end();
+        let fresh: Vec<(SlabKey, usize)> = {
+            let laid = self.laid.borrow();
+            walked
+                .placed()
+                .into_iter()
+                .filter(|(key, bytes)| laid.get(key).is_none_or(|have| have < bytes))
+                .collect()
+        };
+        if !fresh.is_empty() {
+            let base = self
+                .keep(hip::Buffer::from_slice(&vec![0u8; Slabs::placed_bytes(&fresh)]).unwrap());
+            // SAFETY: `base` is zeroed device memory of the slabs' bytes,
+            // kept as long as this `Gpu`, whose arena they are laid in.
+            unsafe { Slabs::place(base as *mut core::ffi::c_void, &fresh) };
+            self.laid.borrow_mut().extend(fresh);
+        }
+        launch(ctx)
     }
 
     /// Mean device microseconds per call of `f` over `reps` calls, after one
@@ -96,7 +132,61 @@ impl Gpu {
         assert_eq!(code, hip::sys::HIP_SUCCESS, "hipMemset");
     }
 
-    fn keep(&self, buffer: hip::Buffer) -> u64 {
+    /// `values` written at device address `at`, after the stream's work: a
+    /// fire's inputs rewritten in place, as a captured body's are.
+    pub fn write<T: Copy>(&self, at: u64, values: &[T]) {
+        self.sync();
+        // SAFETY: the caller names live device memory at `at` holding at
+        // least `values`' bytes; the copy is synchronous.
+        let code = unsafe {
+            hip::rt::hipMemcpy(
+                at as usize as *mut core::ffi::c_void,
+                values.as_ptr().cast(),
+                size_of_val(values),
+                hip::sys::MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        assert_eq!(code, hip::sys::HIP_SUCCESS, "hipMemcpy H2D");
+    }
+
+    /// What `fire` launches on this `Gpu`'s stream, captured into a graph
+    /// (relaxed mode) and instantiated, to replay with [`Graph::replay`].
+    /// `fire` must already have run once (its kernels compiled).
+    pub fn capture(&self, fire: impl FnOnce()) -> Graph {
+        self.sync();
+        let stream = self.stream.raw();
+        let (mut graph, mut exec): (hip::rt::Graph, hip::rt::GraphExec) =
+            (core::ptr::null_mut(), core::ptr::null_mut());
+        // SAFETY: the stream is this `Gpu`'s, idle; capture records the
+        // launches `fire` makes on it.
+        assert_eq!(
+            unsafe { hip::rt::hipStreamBeginCapture(stream, 2) },
+            0,
+            "begin capture"
+        );
+        fire();
+        // SAFETY: the capture begun above; the graph and its instance are
+        // owned by the returned `Graph` and destroyed on its drop.
+        unsafe {
+            assert_eq!(
+                hip::rt::hipStreamEndCapture(stream, &mut graph),
+                0,
+                "end capture"
+            );
+            assert_eq!(
+                hip::rt::hipGraphInstantiateWithFlags(&mut exec, graph, 0),
+                0,
+                "instantiate"
+            );
+        }
+        Graph {
+            graph,
+            exec,
+            stream,
+        }
+    }
+
+    pub fn keep(&self, buffer: hip::Buffer) -> u64 {
         let ptr = buffer.device_ptr();
         self.buffers.borrow_mut().push(buffer);
         ptr
@@ -390,4 +480,45 @@ pub fn report_err(what: &str, got: &[f32], want: &[f32]) {
         "KERR {} max_abs={abs} max_rel={rel}",
         what.replace(' ', "_")
     );
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+        // SAFETY: the stream is drained and no context over this arena
+        // outlives the `Gpu`.
+        unsafe { self.slabs.release() };
+    }
+}
+
+/// A captured, instantiated graph on a `Gpu`'s stream ([`Gpu::capture`]).
+pub struct Graph {
+    graph: hip::rt::Graph,
+    exec: hip::rt::GraphExec,
+    stream: hip::sys::Stream,
+}
+
+impl Graph {
+    /// One replay, after the stream's earlier work; synchronize (or read) to
+    /// see it.
+    pub fn replay(&self) {
+        // SAFETY: the instance lives as long as `self` and its launches read
+        // the buffers its capture's caller holds.
+        assert_eq!(
+            unsafe { hip::rt::hipGraphLaunch(self.exec, self.stream) },
+            0,
+            "replay"
+        );
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        // SAFETY: a replay in flight completes before the instance goes.
+        unsafe {
+            hip::rt::hipStreamSynchronize(self.stream);
+            hip::rt::hipGraphExecDestroy(self.exec);
+            hip::rt::hipGraphDestroy(self.graph);
+        }
+    }
 }

@@ -14,7 +14,7 @@ const POOL_LSE_SM80: &str = "attn/compressed/pool_lse_sm80.cu";
 const POOL_MMA_WIDTHS: [i32; 3] = [128, 256, 512];
 
 pub(crate) fn pool_mma_takes(ctx: &Ctx, head_dim: i32) -> bool {
-    ctx.tuning().pool_mma && POOL_MMA_WIDTHS.contains(&head_dim)
+    ctx.tuning().pool_mma() && POOL_MMA_WIDTHS.contains(&head_dim)
 }
 
 /// `pool_lse` (or its selected form, with `selection`) on tensor cores: a

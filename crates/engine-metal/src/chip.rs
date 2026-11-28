@@ -10,7 +10,7 @@ use profile::{Decision, Domain, Facts, Profile, Registry, Report, Shelf, Var};
 const FACTS: &[Var] = &[
     Var::fixed("family", Domain::COUNT),
     Var::fixed("cores", Domain::COUNT),
-    Var::fixed("cores_from", Domain::Enum(&["registry", "model"])),
+    Var::fixed("cores_from", Domain::Enum(&["registry", "model", "probe"])),
     Var::fixed("perf_cores", Domain::COUNT),
     Var::fixed("ane", Domain::Bool),
 ];
@@ -93,16 +93,12 @@ pub enum KeepAliveSpin {
     Idle,
 }
 
-/// The GPU cores the compiler prices a device at that does not say its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "compiler.unreported_cores", constant(range(1..=1024)), default = 32, tune = price)]
-pub struct UnreportedCores(pub u32);
-
-/// The GPU cores the compiler prices at: the device's, or where it does not
-/// say, the profile's stand-in.
+/// The GPU cores the compiler prices at: the device's, stated or measured
+/// as it opened (`device::CoresFrom::Probe`). A device that neither states
+/// nor yields its cores is priced at one, which no Apple GPU has fewer than.
 #[must_use]
-pub fn pricing_cores(profile: &Profile, cores: Option<u32>) -> u32 {
-    cores.unwrap_or_else(|| profile.get::<UnreportedCores>().0)
+pub fn pricing_cores(_profile: &Profile, cores: Option<u32>) -> u32 {
+    cores.unwrap_or(1)
 }
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
@@ -113,8 +109,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<WeightsLayout>()
         .add::<AneMinRows>()
         .add::<AneMinColumns>()
-        .add::<KeepAliveSpin>()
-        .add::<UnreportedCores>();
+        .add::<KeepAliveSpin>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // Metal forks no side streams: one queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
@@ -139,9 +134,20 @@ seeded!(
     "apple7.toml",
     "apple8.toml",
     "apple9.toml",
+    "apple7/apple-m1-max.toml",
     "apple9/apple-m4-pro.toml",
     "apple10.toml",
+    "apple10/apple-m5-pro.toml",
+    // Committed measured profiles (`pie tune export --engine metal`).
+    "apple-m5-pro.measured.toml",
+    "apple-m1-max.measured.toml",
 );
+
+/// The host covers committed for this backend's devices
+/// (`profiles/<device>.covers.json`, `pie tune export --engine metal`),
+/// each listed here: the runtime takes a cover whose key matches where the
+/// home's own cache holds none (`engine::Engine::committed_covers`).
+pub const COVERS: &[&str] = &[include_str!("../profiles/apple-m5-pro.covers.json")];
 
 pub static SHELF: Shelf = Shelf {
     backend: "metal",
@@ -230,6 +236,23 @@ pub fn resolve(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile
     SHELF.resolve(registry(), device, facts, profiles)
 }
 
+/// [`resolve`] with the stored measurements keyed: each `[rates]` entry and
+/// dense curve is taken from the user's file where its key matches this
+/// build on this device (`crate::stored`), else from the device's
+/// committed measured profile where its key matches, else left for the
+/// load to measure; each is said once, by the layer and key that decided it.
+#[must_use]
+pub fn resolve_keyed(device: &str, facts: &Facts, profiles: Option<&Path>) -> (Profile, Report) {
+    let keys = crate::stored::Keys {
+        on: crate::stored::measured_on(device),
+    };
+    let (profile, report) = SHELF.resolve_keyed(registry(), device, facts, profiles, &keys);
+    for line in &report.stored {
+        tracing::info!("{line}");
+    }
+    (profile, report)
+}
+
 #[must_use]
 pub fn user_path(profiles: &Path, device: &str) -> PathBuf {
     SHELF.user_path(profiles, device)
@@ -266,24 +289,9 @@ mod tests {
 
     #[test]
     fn every_checked_in_profile_dumps_to_a_file_that_reads_back_strictly() {
-        for (name, text) in SEEDED {
-            let p = registry()
-                .load(text, name)
-                .unwrap_or_else(|e| panic!("{e}"));
-            let dumped = profile::render::dump(&p);
-            let again = registry()
-                .parse(&dumped, "dump", profile::Strict::CheckedIn)
-                .unwrap_or_else(|e| panic!("{name}: {e}\n---\n{dumped}"));
-            for (spec, rungs, _) in p.entries() {
-                assert_eq!(
-                    again.entries.get(spec.id).map(Vec::as_slice),
-                    Some(rungs),
-                    "{name}: {}",
-                    spec.id
-                );
-            }
-            assert_eq!(again.target.assumes, p.target().assumes, "{name}");
-        }
+        SHELF
+            .check_dumps(registry())
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[cfg(target_vendor = "apple")]
@@ -302,7 +310,10 @@ mod tests {
                 .parse(text, name, profile::Strict::CheckedIn)
                 .unwrap_or_else(|e| panic!("{e}"))
         };
-        for (name, _) in SEEDED {
+        for (name, _) in SEEDED
+            .iter()
+            .filter(|(name, _)| !name.ends_with(profile::MEASURED_SUFFIX))
+        {
             let family = name
                 .split_once('/')
                 .map(|(dir, _)| parse(&format!("{dir}.toml")));
@@ -341,6 +352,8 @@ mod tests {
         );
     }
 
+    /// The M4 Pro's file runs over its family's, its values held; its
+    /// provenance names no check model, so none is called measured.
     #[test]
     fn the_m4_pro_runs_its_family_and_what_it_measured() {
         let (profile, report) = resolve("Apple M4 Pro", &facts(9, Some(20), 10, true), None);
@@ -351,15 +364,7 @@ mod tests {
                 profile::Source::Seeded("apple9/apple-m4-pro.toml".into())
             ]
         );
-        assert_eq!(
-            report.measured,
-            [
-                "kernel.ane.mlp",
-                "kernel.moe.tile_rows",
-                "kernel.qmm_splitk"
-            ]
-        );
-        assert!(!report.untuned());
+        assert!(report.measured.is_empty(), "{:?}", report.measured);
         assert_eq!(*profile.get::<AneMlp>(), AneMlp::Share { percent: 74 });
         assert_eq!(*profile.get::<AneProjections>(), AneProjections::Gpu);
         assert_eq!(profile.get::<AneMinRows>().0, 512);

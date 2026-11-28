@@ -2,11 +2,13 @@
 //! continued verbatim, with no chat template.
 //!
 //! Supported: `prompt` (one string, or a one-element array), `max_tokens`
+//! (default 16), `temperature`, `top_p`, `top_k`, `stop`, `seed`, `echo`,
 //! the penalties, `stream`, `stream_options.include_usage`, `ignore_eos`
 //! (vLLM's and SGLang's extension), vLLM's `min_tokens` and `min_p`, `n`,
 //! vLLM's `response_format` (as chat completions take it, `structural_tag`
 //! among them),
 //! and `logprobs` (an integer, up to 20: the legacy `tokens`,
+//! `token_logprobs`, `top_logprobs`, `text_offset` lists).
 //!
 //! With `echo`, `logprobs` covers the prompt too, as OpenAI's did: the
 //! echoed text's tokens come first, scored under the tokens before them,
@@ -16,15 +18,20 @@
 //! prefix among them, in a choice's `prompt_logprobs` in vLLM's shape.
 //! Either costs a prefill read out row by row, apart from the prefix cache.
 //!
-//! Refused with 400: more than one prompt, token-array prompts and
+//! A prompt may be token ids (one array, or an array of one array), used as
+//! they are.
+//!
+//! Refused with 400: more than one prompt, `echo` on token ids, `suffix` and
+//! a non-empty `logit_bias`. Anything a thinking model emits as a thinking block is returned
+//! as text: this API has no other place for it.
 
 use compat::{ApiError, Envelope, Event, Finish, Request, emit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    alternatives, choices, invalid, run_choices, stop_reason, stop_sequences, token_label,
-    token_text, usage_of,
+    alternatives, choices, invalid, no_logit_bias, run_choices, stop_reason, stop_sequences,
+    token_label, token_text, usage_of,
 };
 
 #[derive(Deserialize, Default)]
@@ -56,6 +63,7 @@ struct Body {
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
+    logit_bias: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -87,27 +95,41 @@ impl Parsed {
 fn parse(body: Value) -> Result<Parsed, ApiError> {
     let body: Body =
         serde_json::from_value(body).map_err(|e| invalid(format!("request body: {e}"), None))?;
-    let prompt = match body.prompt {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s,
+    let ids = |items: &[Value]| -> Option<Vec<u32>> {
+        items
+            .iter()
+            .map(|v| v.as_u64().and_then(|t| u32::try_from(t).ok()))
+            .collect()
+    };
+    let (prompt, prompt_tokens) = match body.prompt {
+        None | Some(Value::Null) => (String::new(), None),
+        Some(Value::String(s)) => (s, None),
         Some(Value::Array(items)) => match items.as_slice() {
-            [Value::String(s)] => s.clone(),
-            [] => String::new(),
-            [_, _, ..] => {
-                return Err(invalid(
-                    "only one prompt per request is supported",
-                    Some("prompt"),
-                ));
-            }
+            [Value::String(s)] => (s.clone(), None),
+            [] => (String::new(), None),
+            [Value::Array(one)] => match ids(one) {
+                Some(tokens) => (String::new(), Some(tokens)),
+                None => return Err(invalid("token ids must be integers", Some("prompt"))),
+            },
+            items if items.iter().all(Value::is_number) => match ids(items) {
+                Some(tokens) => (String::new(), Some(tokens)),
+                None => return Err(invalid("token ids must be integers", Some("prompt"))),
+            },
             _ => {
                 return Err(invalid(
-                    "token-array prompts are not supported; send text",
+                    "only one prompt per request is supported",
                     Some("prompt"),
                 ));
             }
         },
         Some(_) => return Err(invalid("`prompt` must be a string", Some("prompt"))),
     };
+    if prompt_tokens.is_some() && body.echo {
+        return Err(invalid(
+            "`echo` with a token-array prompt is not supported",
+            Some("echo"),
+        ));
+    }
     let n = choices(body.n)?;
     let logprobs = match body.logprobs {
         None | Some(Value::Null) => None,
@@ -117,11 +139,15 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
                 .ok_or_else(|| invalid("`logprobs` must be an integer", Some("logprobs")))?,
         ),
     };
+    no_logit_bias(&body.logit_bias)?;
     if body.suffix.is_some() {
         return Err(invalid("`suffix` is not supported", Some("suffix")));
     }
     let mut req = Request::new(Vec::new());
-    req.raw_prompt = Some(prompt.clone());
+    match prompt_tokens {
+        Some(tokens) => req.prompt_tokens = Some(tokens),
+        None => req.raw_prompt = Some(prompt.clone()),
+    }
     req.stream = body.stream;
     req.return_token_ids = body.return_token_ids;
     req.max_tokens = body.max_tokens.unwrap_or(16);
@@ -180,6 +206,7 @@ fn finish_reason(finish: Finish) -> &'static str {
     match finish {
         Finish::Stop | Finish::StopSequence | Finish::ToolCalls => "stop",
         Finish::Length => "length",
+        Finish::Abort => "abort",
     }
 }
 

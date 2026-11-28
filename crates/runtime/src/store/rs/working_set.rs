@@ -96,7 +96,7 @@ impl RsWorkingSet {
     pub fn claim_pipeline_scope(
         &self,
         scope: &crate::store::PipelineScope,
-    ) -> Result<(), crate::store::PipelineScopeId> {
+    ) -> Result<(), crate::store::ScopeRefusal> {
         scope.claim(&self.lifecycle.pipeline_scope)
     }
 }
@@ -130,9 +130,10 @@ mod tests {
         let other = crate::store::PipelineScope::new(|| true);
         assert_eq!(ws.claim_pipeline_scope(&first), Ok(()));
         assert_eq!(ws.claim_pipeline_scope(&first), Ok(()));
-        assert_eq!(ws.claim_pipeline_scope(&other), Err(first.id()));
+        let held = Err(crate::store::ScopeRefusal::Held(first.id()));
+        assert_eq!(ws.claim_pipeline_scope(&other), held);
         first.close();
-        assert_eq!(ws.claim_pipeline_scope(&other), Err(first.id()));
+        assert_eq!(ws.claim_pipeline_scope(&other), held);
         drained.store(true, Ordering::Release);
         assert_eq!(ws.claim_pipeline_scope(&other), Ok(()));
     }

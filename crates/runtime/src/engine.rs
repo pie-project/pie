@@ -5,11 +5,16 @@ pub mod fire;
 pub mod instance;
 pub mod load;
 pub mod profiles;
+/// Guest regions compiled in processes of their own: a host program of ROCm
+/// answers [`region_compiler::main_if_asked`] first in its `main` and calls
+/// [`region_compiler::register`].
+#[cfg(feature = "rocm")]
+pub use engine_cuda::program::helper as region_compiler;
 
 pub use waker;
 
 pub use backend::{
-    EngineBox, EngineSpec, SchedulerLimits, get_spec, open, register_engine_backend,
+    EngineBox, EngineSpec, SchedulerLimits, fire_limits, get_spec, open, register_engine_backend,
     take_engine_backend, unregister_engine,
 };
 pub use channel::{
@@ -22,7 +27,7 @@ pub use completion::{
 };
 pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceId, ProgramId};
 
-pub use fire::{FireRequest, FrameFire, MaskWords, StepFire, bitmask_words};
+pub use fire::{FireLane, FireRequest, FrameFire, MaskWords, StepFire, bitmask_words};
 
 pub mod rs_flag {
     pub const RESET: u8 = 1 << 0;
@@ -46,13 +51,42 @@ pub mod verbs {
             .and_then(|facts| facts.codegen_backend.as_deref())
     }
 
-    pub fn serve<'a, F: ?Sized>(
-        engine: &'a mut EngineBox,
+    /// An engine as the runtime holds it: boxed on its lane, or borrowed.
+    pub trait EngineMut {
+        fn engine_mut(&mut self) -> &mut dyn Engine;
+    }
+
+    impl EngineMut for EngineBox {
+        fn engine_mut(&mut self) -> &mut dyn Engine {
+            self.as_mut()
+        }
+    }
+
+    impl<'x> EngineMut for dyn Engine + 'x {
+        fn engine_mut(&mut self) -> &mut dyn Engine {
+            self
+        }
+    }
+
+    /// `engine`'s family `family`, or `Unsupported` naming `verb` where
+    /// the engine serves none.
+    pub fn serve<'a, E: EngineMut + ?Sized, F: ?Sized>(
+        engine: &'a mut E,
         family: fn(&'a mut dyn Engine) -> Option<&'a mut F>,
         verb: &'static str,
     ) -> engine::Result<&'a mut F> {
+        let engine = engine.engine_mut();
         let kind = engine.kind();
-        family(engine.as_mut()).ok_or(engine::Error::unsupported(kind, verb))
+        family(engine).ok_or(engine::Error::unsupported(kind, verb))
+    }
+
+    /// Whether `engine` lands its steps after `submit` returns
+    /// ([`::engine::Completion::asynchronous`]); one that tells no sink
+    /// settles inside `submit`.
+    pub fn settles_asynchronously(engine: &mut dyn Engine) -> bool {
+        engine
+            .completion()
+            .is_some_and(|completion| completion.asynchronous())
     }
 
     pub fn register_adapter(
@@ -71,18 +105,42 @@ pub mod verbs {
     }
 
     pub fn register_channel(
-        engine: &mut EngineBox,
+        engine: &mut dyn ::engine::Engine,
         engine_id: EngineId,
         registration: &ChannelRegistration,
     ) -> Result<RegisteredChannel> {
         let table = waker::WakerTable::global();
+        // What the engine stated it holds is what the bind took rings by
+        // (`Channels::holds`): an answer past it would leave a ring with no
+        // slots, or slots taken twice.
+        let holds = engine
+            .channels()
+            .is_some_and(|channels| channels.holds(registration));
         let answered = match serve(engine, Engine::channels, "register_channel")
             .and_then(|channels| channels.open(registration))
         {
+            Ok(answer) if !holds => {
+                if let Some(channels) = engine.channels() {
+                    let _ = channels.close(registration.id);
+                }
+                return Err(anyhow::anyhow!(
+                    "channel {}: the engine states it leaves the registration to the runtime \
+                     and took it",
+                    answer.id
+                ));
+            }
             Ok(answer) => Some(answer),
+            Err(engine::Error::Unsupported { .. }) if holds => {
+                return Err(anyhow::anyhow!(
+                    "channel {}: the engine states it holds the registration and answered it \
+                     unsupported",
+                    registration.id
+                ));
+            }
             Err(engine::Error::Unsupported { .. }) => None,
             Err(error) => return Err(anyhow::Error::from(error)),
         };
+        let engine_registered = answered.is_some();
         let mint = |id: u64| if id == 0 { table.alloc() } else { id };
         let (reader_wait_id, writer_wait_id) = answered.as_ref().map_or_else(
             || (table.alloc(), table.alloc()),
@@ -125,14 +183,17 @@ pub mod verbs {
                     writer_wait_id,
                 ))
             }
-            None => Ok(RegisteredChannel::new(
-                engine_id,
-                registration.id,
-                cell_bytes,
-                registration.capacity,
-                reader_wait_id,
-                writer_wait_id,
-            )),
+            None => Ok(RegisteredChannel {
+                engine_registered,
+                ..RegisteredChannel::new(
+                    engine_id,
+                    registration.id,
+                    cell_bytes,
+                    registration.capacity,
+                    reader_wait_id,
+                    writer_wait_id,
+                )
+            }),
         }
     }
 }

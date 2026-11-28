@@ -36,15 +36,21 @@ pub fn pie_init(log_filter: Option<String>) {
     console_error_panic_hook::set_once();
     crate::log::install(log_filter.as_deref().unwrap_or("info"));
     web_std::time::set_clock(clock_ms);
+    web_std::time::set_wall_clock(js_sys::Date::now);
     web_std::executor::set_wake_hook(wake);
     wasmtime_web::set_clock(clock_ns);
+    wasmtime_web::set_wall_clock(|| (js_sys::Date::now() * 1_000_000.0) as u64);
     tracing::info!("pie web host initialised");
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pie_tick() -> f64 {
-    let wasi_next = wasmtime_web::fire_due_timers();
+    wasmtime_web::fire_due_timers();
     let next = web_std::tick(100_000);
+    // Read after the tick: a guest the tick ran may have set a timer (a WASI
+    // clock wait), which the page must wake for; read before it, that timer
+    // went unseen and the page slept with no tick to come.
+    let wasi_next = wasmtime_web::next_timer();
     let now = wasmtime_web::now();
     let wasi_ms = wasi_next.map(|deadline| deadline.saturating_sub(now) as f64 / 1_000_000.0);
     let rt_ms = next.map(|d| d.as_secs_f64() * 1000.0);

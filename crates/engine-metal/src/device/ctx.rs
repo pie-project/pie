@@ -69,7 +69,15 @@ pub enum CoresFrom {
     Registry,
     /// The checked-in model table, by this model identifier.
     Model(&'static str),
+    /// Measured as the device opened: the full workgroups it keeps resident
+    /// at once ([`Context::resident_groups`]), [`RESIDENT_PER_CORE`] a core.
+    Probe,
 }
+
+/// The full workgroups (1024 threads, 32 KiB of threadgroup memory each) an
+/// Apple GPU core keeps resident at once: 48 on a 24-core M1 Max (Apple7),
+/// whatever the groups' count or length (`the_resident_probe_counts_the_cores`).
+pub const RESIDENT_PER_CORE: u32 = 2;
 
 impl CoresFrom {
     /// Its value of the `cores_from` fact.
@@ -78,6 +86,7 @@ impl CoresFrom {
         match self {
             CoresFrom::Registry => "registry",
             CoresFrom::Model(_) => "model",
+            CoresFrom::Probe => "probe",
         }
     }
 }
@@ -87,6 +96,7 @@ impl std::fmt::Display for CoresFrom {
         match self {
             CoresFrom::Registry => write!(f, "from the IORegistry"),
             CoresFrom::Model(id) => write!(f, "from the model table, as {id}"),
+            CoresFrom::Probe => write!(f, "measured from the workgroups it keeps resident"),
         }
     }
 }
@@ -107,10 +117,19 @@ pub struct Context {
     /// tile, and a second command queue is a scheduler context in the
     /// driver. `None` inside once opened means the device is not Metal 4.
     #[cfg(target_vendor = "apple")]
-    sparse: std::cell::OnceCell<Option<std::sync::Arc<super::sparse::Sparse>>>,
+    sparse: std::cell::OnceCell<std::sync::Arc<super::sparse::Sparse>>,
     /// What [`Frame::barrier`] signals and waits on, and the value it last set.
     #[cfg(target_vendor = "apple")]
     barrier: (Retained<ProtocolObject<dyn MTLEvent>>, std::cell::Cell<u64>),
+    /// Buffers kernels reach through an address in another (the pool's
+    /// buffers past the first): every compute pass declares them
+    /// (`useResource`), so Metal orders their writes and reads as it does a
+    /// bound buffer's.
+    #[cfg(target_vendor = "apple")]
+    indirect: RefCell<Vec<super::alloc::Slab>>,
+    /// The shared empty binding ([`Context::empty`]).
+    #[cfg(target_vendor = "apple")]
+    empty: std::cell::OnceCell<super::alloc::Slab>,
 }
 
 // SAFETY: `MTLDevice` and `MTLCommandQueue` are documented thread-safe.
@@ -171,7 +190,7 @@ impl Context {
                 call: "newEvent",
                 why: "the device would not open an event".to_string(),
             })?;
-            Ok(Context {
+            let mut context = Context {
                 device,
                 queue,
                 name,
@@ -181,7 +200,18 @@ impl Context {
                 family,
                 sparse: std::cell::OnceCell::new(),
                 barrier: (barrier, std::cell::Cell::new(0)),
-            })
+                indirect: RefCell::new(Vec::new()),
+                empty: std::cell::OnceCell::new(),
+            };
+            // A device that states no cores is measured: the compiler prices
+            // its parallelism, and the tuner fills it, at what it runs.
+            if context.cores.is_none() {
+                context.cores = context
+                    .resident_groups()
+                    .filter(|&groups| groups >= RESIDENT_PER_CORE)
+                    .map(|groups| (groups / RESIDENT_PER_CORE, CoresFrom::Probe));
+            }
+            Ok(context)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
@@ -194,30 +224,84 @@ impl Context {
         &self.name
     }
 
+    /// What this process may place on the GPU now: the GPU's wired-memory
+    /// limit where the operator set one (`iogpu.wired_limit_mb`), else the
+    /// working set Metal recommends less what the process holds on the host
+    /// beside its GPU memory ([`host_resident`]: its guests, staging, the
+    /// weights' host side). On unified memory the device and the host are
+    /// one pool, so a load sized to the recommended working set alone,
+    /// beside a large host side, outgrows what the GPU can wire (the M1's
+    /// "Insufficient Memory" command buffers under gemma-4-E4B at c256).
+    /// Read now, not at bind: the host side grows as guests bind.
     #[must_use]
     pub fn working_set(&self) -> u64 {
+        derived_working_set(self.working_set, self.allocated())
+    }
+
+    /// The working set Metal recommends for this process, as the device
+    /// states it.
+    #[must_use]
+    pub fn recommended_working_set(&self) -> u64 {
         self.working_set
     }
 
-    /// The working set other processes hold now: what of it the system
-    /// could not hand this one (app memory, wired and compressed pages; the
-    /// file cache is counted as handed). Measured before a load wires anything,
-    /// it is what `device_memory_share` yields to, as on CUDA. 0
-    /// where the system does not say, and where memory is mapped as it is
-    /// asked for: a pool sized by what others hold at the moment of the load
-    /// would serve differently for it, and the Governor answers them as they
-    /// change.
+    /// The GPU memory every other process holds now: the system memory the
+    /// GPU driver has allocated for all of them together (IORegistry,
+    /// `Alloc system memory`) less what this process holds
+    /// ([`Self::allocated`]). The working set Metal recommends is shared
+    /// with it: a load that takes the whole of it beside them is refused for
+    /// memory at the edge. 0 where the registry does not say.
     #[must_use]
-    pub fn held_elsewhere(&self) -> u64 {
-        // the sparse mapping is Metal 4's, so only an Apple build asks for it
+    pub fn others_allocated(&self) -> u64 {
         #[cfg(target_vendor = "apple")]
-        if matches!(self.sparse(), Ok(Some(_))) {
-            return 0;
+        {
+            super::iokit::gpu_system_allocated()
+                .map_or(0, |system| system.saturating_sub(self.allocated()))
         }
-        available_memory().map_or(0, |available| {
-            self.working_set
-                .saturating_sub(available.min(self.working_set))
-        })
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
+    /// The bytes this device holds for the process now
+    /// (`currentAllocatedSize`): every buffer, heap and the driver's own
+    /// allocations on our behalf.
+    #[must_use]
+    pub fn allocated(&self) -> u64 {
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2_metal::MTLDevice as _;
+            self.device().currentAllocatedSize() as u64
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            0
+        }
+    }
+
+    /// What the host can still give this process's GPU memory now (the
+    /// governor's `host_room`, read on its tick): [`Context::working_set`]'s
+    /// rule over a fresh read of the device, less what every process's GPU
+    /// memory holds of it and the driver's floor. Negative where they
+    /// already hold more: the pool gives the difference back.
+    pub fn host_room() -> std::result::Result<i64, String> {
+        #[cfg(target_vendor = "apple")]
+        {
+            let device = MTLCreateSystemDefaultDevice()
+                .ok_or_else(|| "no Metal device to read the room of".to_string())?;
+            let mine = device.currentAllocatedSize() as u64;
+            let all = super::iokit::gpu_system_allocated()
+                .unwrap_or(mine)
+                .max(mine);
+            let usable = derived_working_set(device.recommendedMaxWorkingSetSize(), mine);
+            let held = all.saturating_add(crate::store::accounting::DRIVER_FLOOR);
+            Ok(i64::try_from(usable).unwrap_or(i64::MAX) - i64::try_from(held).unwrap_or(i64::MAX))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err("no Metal device off Apple platforms".to_string())
+        }
     }
 
     #[must_use]
@@ -251,6 +335,48 @@ impl Context {
     }
 
     #[must_use]
+    /// The full workgroups the GPU keeps resident at once, measured: a probe
+    /// launch of many groups that each take a group's most threads and
+    /// threadgroup memory, counting the most in at once. `None` where the
+    /// probe did not run.
+    pub fn resident_groups(&self) -> Option<u32> {
+        #[cfg(target_vendor = "apple")]
+        {
+            const GROUPS: u32 = 1024;
+            const ITERS: u32 = 20_000;
+            let handles = super::Handles::new();
+            let pipelines = super::Pipelines::new();
+            let mut counters = super::Buffer::zeroed(self, 16).ok()?;
+            counters.write(0, &[0u8; 16]).ok()?;
+            let sink = super::Buffer::zeroed(self, 16).ok()?;
+            let counted = kernels_metal::Tensor::new(
+                handles.bind(&counters, 0, 16).ok()?,
+                1,
+                4,
+                poem_ir::Dtype::U32,
+            );
+            let sunk = kernels_metal::Tensor::new(
+                handles.bind(&sink, 0, 16).ok()?,
+                1,
+                4,
+                poem_ir::Dtype::F32,
+            );
+            let frame = self.frame().ok()?;
+            let encoder = crate::encode::Sink::new(self, &frame, &pipelines, &handles);
+            kernels_metal::runtime::resident::resident_groups(
+                &encoder, counted, sunk, GROUPS, ITERS,
+            )
+            .ok()?;
+            frame.commit().ok()?;
+            let bytes = handles.read(counted.buf, 8).ok()?;
+            Some(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            None
+        }
+    }
+
     pub fn cores(&self) -> Option<u32> {
         self.cores.map(|(n, _)| n)
     }
@@ -286,6 +412,7 @@ impl Context {
                 need: bytes,
                 have: self.max_buffer,
             })?;
+            crate::diag::made("buffer", bytes);
             self.device
                 .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
                 .ok_or(Fault::Device {
@@ -315,6 +442,7 @@ impl Context {
                 have: self.max_buffer,
             });
         }
+        crate::diag::made("no-copy buffer", bytes);
         // SAFETY: the caller's contract is exactly this call's — an aligned
         // live mapping of `span` readable bytes that outlives the buffer —
         // and a nil deallocator is what leaves the pages theirs.
@@ -333,14 +461,24 @@ impl Context {
         }
     }
 
+    /// The one empty binding every zero-byte buffer shares, made on first
+    /// ask: an empty bind allocates nothing after that.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn empty(&self) -> super::alloc::Slab {
-        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_vendor = "apple")]
         {
-            self.device
-                .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
-                .expect("one byte of shared storage")
+            // One byte every empty binding shares: one of the three tiny
+            // fixed buffers outside the pool (this, the keepalive sink, the
+            // warm-load bind placeholder), left there by ruling.
+            self.empty
+                .get_or_init(|| {
+                    RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::diag::made("empty buffer", 1);
+                    self.device
+                        .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
+                        .expect("one byte of shared storage")
+                })
+                .clone()
         }
         #[cfg(not(target_vendor = "apple"))]
         {}
@@ -351,23 +489,11 @@ impl Context {
         &self.device
     }
 
-    /// Whether this device can map sparse buffer tiles: `MTLGPUFamilyMetal4`.
-    #[must_use]
-    pub fn supports_elastic(&self) -> bool {
-        #[cfg(target_vendor = "apple")]
-        {
-            super::sparse::Sparse::supported(&self.device)
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            false
-        }
-    }
-
-    /// The mapping side, opened on first ask; `None` when the device is not
-    /// Metal 4. Its residency set is attached to this context's frame queue.
+    /// The mapping side, opened on first ask: every pool and span is a
+    /// placement sparse buffer over it. Its residency set is attached to
+    /// this context's frame queue.
     #[cfg(target_vendor = "apple")]
-    pub fn sparse(&self) -> Result<Option<std::sync::Arc<super::sparse::Sparse>>> {
+    pub fn sparse(&self) -> Result<std::sync::Arc<super::sparse::Sparse>> {
         if let Some(opened) = self.sparse.get() {
             return Ok(opened.clone());
         }
@@ -386,10 +512,7 @@ impl Context {
     ) -> Result<bool> {
         #[cfg(target_vendor = "apple")]
         {
-            let Some(sparse) = self.sparse()? else {
-                return Ok(false);
-            };
-            sparse.hold(slabs, keep);
+            self.sparse()?.hold(slabs, keep);
             Ok(true)
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -399,6 +522,17 @@ impl Context {
         }
     }
 
+    /// Declares `slabs` to every compute pass from now on: buffers kernels
+    /// reach through an address in another (the pool's past the first).
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn reach_indirectly(&self, slabs: Vec<super::alloc::Slab>) {
+        *self.indirect.borrow_mut() = slabs;
+    }
+
+    /// No device off Apple: no pass to declare anything to.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn reach_indirectly(&self, _slabs: Vec<super::alloc::Slab>) {}
+
     pub fn frame(&self) -> Result<Frame> {
         #[cfg(target_vendor = "apple")]
         {
@@ -406,11 +540,25 @@ impl Context {
                 call: "commandBuffer",
                 why: "the queue would not open a command buffer".to_string(),
             })?;
+            // `hold_next_frame`: the frame's first pass waits for the host.
+            #[cfg(feature = "fault-injection")]
+            if HOLD_NEXT.with(|next| next.replace(false)) {
+                use objc2_metal::MTLDevice as _;
+                let event = self.device().newSharedEvent().ok_or(Fault::Device {
+                    call: "newSharedEvent",
+                    why: "the device would not make a shared event".to_string(),
+                })?;
+                buffer.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+                HELD.with(|held| *held.borrow_mut() = Some(event));
+            }
             let encoder = buffer.computeCommandEncoder().ok_or(Fault::Device {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a compute pass".to_string(),
             })?;
+            let indirect = self.indirect.borrow().clone();
+            declare(&encoder, &indirect);
             Ok(Frame {
+                indirect,
                 buffer: RefCell::new(buffer),
                 encoder: RefCell::new(Some(encoder)),
                 blit: None,
@@ -430,6 +578,9 @@ impl Context {
 /// the buffer, and opens the next pass. The cells let a fence happen
 /// through a shared `&Frame`, which is all a live encode holds.
 pub struct Frame {
+    /// [`Context`]'s indirect buffers, declared in every compute pass.
+    #[cfg(target_vendor = "apple")]
+    indirect: Vec<super::alloc::Slab>,
     #[cfg(target_vendor = "apple")]
     buffer: RefCell<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     #[cfg(not(target_vendor = "apple"))]
@@ -475,6 +626,29 @@ impl Frame {
         self.committed.borrow_mut().push(then);
     }
 
+    /// Runs `body`'s encoding in a command buffer of its own (the frame's work
+    /// before it flushed ahead, the frame's after it in the next buffer) and
+    /// waits for it: its device seconds, or `None` where a blit pass is open
+    /// and the frame can't flush. The kernel profile's guest regions.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn timed<R>(&self, body: impl FnOnce() -> Result<R>) -> Result<(R, Option<f64>)> {
+        if !self.flush()? {
+            return Ok((body()?, None));
+        }
+        let out = body()?;
+        if !self.flush()? {
+            return Ok((out, None));
+        }
+        let buffer = self
+            .flushed
+            .borrow()
+            .last()
+            .cloned()
+            .expect("a flush keeps its buffer");
+        buffer.waitUntilCompleted();
+        Ok((out, Some(buffer.GPUEndTime() - buffer.GPUStartTime())))
+    }
+
     /// Commits what is encoded so far and opens a fresh buffer on the same
     /// queue for the rest, so the device starts on the head of a long fire
     /// while its tail is still being encoded. The queue runs the two in
@@ -497,6 +671,7 @@ impl Frame {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a compute pass".to_string(),
         })?;
+        declare(&encoder, &self.indirect);
         head.commit();
         for then in self.committed.borrow_mut().drain(..) {
             then();
@@ -528,6 +703,13 @@ impl Frame {
         }
     }
 
+    /// No device off Apple: no pass to open.
+    #[cfg(not(target_vendor = "apple"))]
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    pub(crate) fn next_pass(&mut self) -> Result<()> {
+        Err(Fault::Deviceless)
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(crate) fn next_pass(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.end_pass();
@@ -539,8 +721,37 @@ impl Frame {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not open a second compute pass".to_string(),
             })?;
+        declare(&encoder, &self.indirect);
         *self.encoder.get_mut() = Some(encoder);
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
+    }
+
+    /// Ends the pass here and opens a concurrent one: its dispatches may
+    /// run together, ordered only by [`Frame::level`] barriers between them.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn concurrent_pass(&mut self) -> Result<()> {
+        use objc2_metal::MTLDispatchType;
+        self.end_pass();
+        let encoder = self
+            .buffer
+            .get_mut()
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+            .ok_or(Fault::Device {
+                call: "computeCommandEncoderWithDispatchType",
+                why: "the command buffer would not open a concurrent compute pass".to_string(),
+            })?;
+        declare(&encoder, &self.indirect);
+        *self.encoder.get_mut() = Some(encoder);
+        Ok(())
+    }
+
+    /// In a concurrent pass: every dispatch before this one is done with the
+    /// pass's buffers before any after it starts.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn level(&self) {
+        use objc2_metal::{MTLBarrierScope, MTLComputeCommandEncoder};
+        self.encoder()
+            .memoryBarrierWithScope(MTLBarrierScope::Buffers);
     }
 
     /// Ends the pass here and opens the next once the GPU has done all the
@@ -559,6 +770,7 @@ impl Frame {
             call: "computeCommandEncoder",
             why: "the command buffer would not open a compute pass after a barrier".to_string(),
         })?;
+        declare(&encoder, &self.indirect);
         *self.encoder.get_mut() = Some(encoder);
         Ok(())
     }
@@ -603,13 +815,23 @@ impl Frame {
                 call: "computeCommandEncoder",
                 why: "the command buffer would not reopen a compute pass after a fence".to_string(),
             })?;
+        declare(&reopened, &self.indirect);
         *self.encoder.borrow_mut() = Some(reopened);
         Ok(())
     }
 
+    /// `len` bytes of `slab` from `at` set to `value`, in a blit pass
+    /// (test builds: the guest scratch's poison).
+    #[cfg(feature = "test-slot-fill")]
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-    pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
+    pub(crate) fn fill_with(
+        &mut self,
+        slab: &super::alloc::Slab,
+        at: u64,
+        len: u64,
+        value: u8,
+    ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
             if len == 0 {
@@ -633,7 +855,7 @@ impl Frame {
                     location: at as usize,
                     length: len as usize,
                 },
-                0,
+                value,
             );
             Ok(())
         }
@@ -798,6 +1020,8 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             let flushed = std::mem::take(self.flushed.get_mut());
+            #[cfg(feature = "fault-injection")]
+            let injected = FAIL_NEXT.with(|next| next.replace(false));
             if let Some(on_done) = on_done {
                 let heads = Flushed(flushed.clone());
                 let handler = block2::RcBlock::new(
@@ -813,7 +1037,14 @@ impl Frame {
                             .iter()
                             .find_map(|head| head.error())
                             .or_else(|| buffer.error());
-                        on_done(refused.map(|error| error.localizedDescription().to_string()));
+                        let refused = refused.map(|error| error.localizedDescription().to_string());
+                        #[cfg(feature = "fault-injection")]
+                        let refused = if injected {
+                            Some(INJECTED.to_string())
+                        } else {
+                            refused
+                        };
+                        on_done(refused);
                     },
                 );
                 // SAFETY: `addCompletedHandler:` copies the block, so the
@@ -828,6 +1059,8 @@ impl Frame {
             Ok(Pending {
                 buffer: self.commit_buffer(),
                 flushed,
+                #[cfg(feature = "fault-injection")]
+                injected,
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -864,9 +1097,58 @@ pub struct Pending {
     /// The heads a flushed frame committed ahead of `buffer`.
     #[cfg(target_vendor = "apple")]
     flushed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Answers as failed whatever the device did ([`fail_next_frame`]).
+    #[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+    injected: bool,
     #[cfg(not(target_vendor = "apple"))]
     #[allow(dead_code)]
     buffer: (),
+}
+
+#[cfg(feature = "fault-injection")]
+thread_local! {
+    static FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+const INJECTED: &str = "a failure injected by `fail_next_frame`";
+
+/// Answers the next frame this thread commits with a completion handler
+/// ([`Frame::commit_async`]) as failed, to its handler and to its
+/// [`Pending::wait`], whatever the device did: tests of what a failed
+/// command buffer leaves, which a real device fault can't be made to give.
+///
+/// A test seam only, compiled under the `fault-injection` feature (off by
+/// default; engine-metal's tests turn it on): a served binary has no such
+/// path, and nothing in serving, no config, env var or protocol, reaches
+/// it. Its flag is per thread and inert unless this is called there.
+#[cfg(feature = "fault-injection")]
+pub fn fail_next_frame() {
+    FAIL_NEXT.with(|next| next.set(true));
+}
+
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+thread_local! {
+    static HOLD_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HELD: RefCell<Option<Retained<ProtocolObject<dyn objc2_metal::MTLSharedEvent>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Holds the next frame this thread opens on the device until
+/// [`release_held_frame`]: its first pass waits for the host, so a test can
+/// stage the next frame while this one is genuinely still to run. A test
+/// seam only, under the `fault-injection` feature, as [`fail_next_frame`].
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+pub fn hold_next_frame() {
+    HOLD_NEXT.with(|next| next.set(true));
+}
+
+/// Lets the frame [`hold_next_frame`] held run.
+#[cfg(all(target_vendor = "apple", feature = "fault-injection"))]
+pub fn release_held_frame() {
+    use objc2_metal::MTLSharedEvent as _;
+    if let Some(event) = HELD.with(|held| held.borrow_mut().take()) {
+        event.setSignaledValue(1);
+    }
 }
 
 // SAFETY: what a `Pending` does to its command buffer is `status`, `error`
@@ -919,6 +1201,13 @@ impl Pending {
         #[cfg(target_vendor = "apple")]
         {
             self.buffer.waitUntilCompleted();
+            #[cfg(feature = "fault-injection")]
+            if self.injected {
+                return Err(Fault::Device {
+                    call: "waitUntilCompleted",
+                    why: INJECTED.to_string(),
+                });
+            }
             for buffer in self.flushed.iter().chain([&self.buffer]) {
                 if let Some(error) = buffer.error() {
                     return Err(Fault::Device {
@@ -1009,45 +1298,6 @@ pub(crate) fn nsstring(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
 }
 
-/// Unified memory the system could hand a process now, where it says: the
-/// host VM statistics are a macOS interface.
-fn available_memory() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `vm_statistics64` is a C struct of integers, for which all
-        // zero bytes is a valid value.
-        let mut stats: libc::vm_statistics64 = unsafe { core::mem::zeroed() };
-        let mut count = libc::HOST_VM_INFO64_COUNT;
-        // SAFETY: `stats` is a live vm_statistics64 and `count` states its
-        // size in words, as HOST_VM_INFO64 asks; the call writes at most that.
-        #[allow(deprecated, reason = "libc's mach bindings are what this crate links")]
-        let rc = unsafe {
-            libc::host_statistics64(
-                libc::mach_host_self(),
-                libc::HOST_VM_INFO64,
-                (&raw mut stats).cast(),
-                &raw mut count,
-            )
-        };
-        // SAFETY: a plain query.
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        // What the system cannot hand out is what Activity Monitor calls
-        // used: app memory (anonymous pages a process may not give back),
-        // wired and compressed. The file cache, active or not, is handed out
-        // on demand, and a model's own weights sit in it after a read.
-        let used = (u64::from(stats.internal_page_count)
-            .saturating_sub(u64::from(stats.purgeable_count))
-            + u64::from(stats.wire_count)
-            + u64::from(stats.compressor_page_count))
-            * page;
-        (rc == libc::KERN_SUCCESS).then(|| Context::physical_memory().saturating_sub(used))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
-}
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
@@ -1060,5 +1310,84 @@ mod tests {
             cores >= 7,
             "no Apple Silicon GPU has fewer than 7 cores: {cores}"
         );
+    }
+}
+
+/// Declares `slabs` read and written through addresses in `encoder`'s
+/// dispatches, so Metal tracks their hazards as a bound buffer's.
+#[cfg(target_vendor = "apple")]
+fn declare(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, slabs: &[super::alloc::Slab]) {
+    for slab in slabs {
+        encoder.useResource_usage(
+            ProtocolObject::from_ref(&**slab),
+            objc2_metal::MTLResourceUsage::Read | objc2_metal::MTLResourceUsage::Write,
+        );
+    }
+}
+
+/// [`Context::working_set`]'s rule: the operator's GPU wired limit where
+/// set, else `recommended` less this process's host-resident memory beside
+/// the `gpu` bytes Metal holds for it.
+#[must_use]
+pub fn derived_working_set(recommended: u64, gpu: u64) -> u64 {
+    match wired_limit() {
+        Some(limit) => limit,
+        None => recommended.saturating_sub(host_resident(gpu)),
+    }
+}
+
+/// The GPU's wired-memory limit the operator set (`sysctl
+/// iogpu.wired_limit_mb`), in bytes; `None` at the system's default (0).
+#[must_use]
+pub fn wired_limit() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mb: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: `iogpu.wired_limit_mb` is an int sysctl; `len` states the
+        // out buffer's size and the call writes at most that many bytes.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"iogpu.wired_limit_mb".as_ptr(),
+                (&raw mut mb).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && mb > 0).then(|| u64::try_from(mb).unwrap_or(0) << 20)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// What this process holds on the host beside the `gpu` bytes Metal holds
+/// for it: its physical footprint (which counts its GPU memory on unified
+/// memory) less those. 0 where the footprint cannot be read: off macOS (iOS
+/// offers no `proc_pid_rusage`).
+#[must_use]
+pub fn host_resident(gpu: u64) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `rusage_info_v2` is a plain C struct of integers, for
+        // which all-zero bytes are a valid value.
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a `rusage_info_v2`, the struct the
+        // RUSAGE_INFO_V2 flavor writes, owned here for the call.
+        let rc = unsafe {
+            libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, (&raw mut info).cast())
+        };
+        if rc == 0 {
+            info.ri_phys_footprint.saturating_sub(gpu)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = gpu;
+        0
     }
 }

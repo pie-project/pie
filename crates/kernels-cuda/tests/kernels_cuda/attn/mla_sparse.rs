@@ -531,6 +531,7 @@ fn decode_rows(reqs: usize, tc: bool) -> Vec<u16> {
         )
         .expect("the decode's selected attention fires");
     };
+    gpu.lay(&ctx, |_| fire());
     fire();
     gpu.sync();
     gpu.down(out, reqs * HEADS * RANK)
@@ -722,6 +723,7 @@ fn decode_heads(
         )
         .expect("the decode's selected attention fires");
     };
+    gpu.lay(&ctx, |_| fire(&pool));
     fire(&pool);
     gpu.sync();
     let landed = (

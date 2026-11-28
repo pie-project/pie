@@ -3,8 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::common::fnv;
 use checkpoint::contract::ModelContract;
-use engine_cuda::{Boot, Lane, Seated, Shell};
+use engine_cuda::{Lane, Seated, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
 use poem_ir::{ParamSource, Trace};
@@ -19,15 +20,6 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-fn fnv(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn write_checkpoint(path: &Path, trace: &Trace) {
@@ -65,27 +57,14 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
 }
 
 fn load(trace: &Trace, contract: &ModelContract, container: &Path) -> Shell {
-    Shell::load(Boot {
-        trace: trace.clone(),
+    Shell::load(crate::common::boot(
+        trace.clone(),
         contract,
-        checkpoint: container,
-        budget: Budget::new(1, TOKENS),
-        patches: None,
-        voxels: None,
-        page_size: PAGE,
-        context: CONTEXT,
-        slots: 1,
-        kv_budget: None,
-        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-        ordinal: 0,
-        knobs: engine_cuda::Knobs::default(),
-        cache_dir: None,
-        runahead: engine::runahead::Runahead::F1,
-        residency: engine_cuda::experts::Plan::default(),
-        world: engine_cuda::World::default(),
-        expert: engine_cuda::World::default(),
-        comm: core::ptr::null_mut(),
-    })
+        container,
+        Budget::new(1, TOKENS),
+        CONTEXT,
+        1,
+    ))
     .expect("the micro trace loads")
 }
 
@@ -116,8 +95,15 @@ fn a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it() {
     drop(source);
 
     let mut shell = load(&trace, &contract, &container);
+    let ring = engine_cuda::store::staging_ring_for(
+        None,
+        1,
+        engine::runahead::Runahead::DEFAULT_FRAMES_IN_FLIGHT,
+    )
+    .and_then(|bytes| bytes.map(engine_cuda::store::Ring::pin).transpose())
+    .expect("the staging ring pins");
     shell
-        .seat_host_kv(None, 1, CONTEXT, 1)
+        .seat_host_kv(None, 1, CONTEXT, 1, ring)
         .expect("a host tier seats");
     let groups = shell.tap_groups().expect("a full-attention load taps");
     let told: Arc<Mutex<Vec<engine::Tapped>>> = Arc::default();

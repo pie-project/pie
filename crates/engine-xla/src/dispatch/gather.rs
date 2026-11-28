@@ -88,6 +88,31 @@ impl Run<'_> {
                     l.land(pool.state, next)
                 })
             }
+            // A streamed table: each token row's row of the pool, as the
+            // host placed it (`crate::store::streamed`).
+            Gather::Embed {
+                ids,
+                table,
+                y,
+                weights: None,
+                scales: None,
+                concat: false,
+                ..
+            } if self.streamed_rows(*table).is_some() => {
+                let (view, idx) = self.streamed_rows(*table).expect("checked");
+                let ids_t = self.tensor(*ids);
+                let skip = self.handles().locate(ids_t.buf).map_or(0, |(_, at)| at);
+                let idx = self.handles().cut(idx, skip, ids_t.rows);
+                crate::lower::lower(self.ctx(), |l| {
+                    let idx_v = l.read(idx)?;
+                    let view_v = l.read(view)?;
+                    let o_y = self.tensor(*y);
+                    let f = l.f();
+                    let at = f.reshape(idx_v.val, &[i64::from(idx.rows)])?;
+                    let v = f.take_rows(view_v.val, at)?;
+                    l.land(o_y, v)
+                })
+            }
             Gather::Embed {
                 ids,
                 table,

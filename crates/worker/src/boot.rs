@@ -43,6 +43,8 @@ pub(crate) fn load_model_engines(
     home: &Path,
     mut opened: Option<runtime::engine::EngineBox>,
 ) -> Result<LoadedModelEngines> {
+    #[cfg(feature = "net")]
+    engine::memory::on_return_freed_heap(crate::return_freed_heap);
     let (mut engine_groups, metadata) = {
         let m = &user_cfg.model;
         let e = &user_cfg.engine;
@@ -107,7 +109,7 @@ pub(crate) fn load_model_engines(
         let mut group_engines: Vec<GroupEngine> = Vec::with_capacity(topology.len());
         #[cfg(feature = "engine-cuda")]
         if ep_degree > 1 {
-            let mut residency = m.residency();
+            let mut residency = user_cfg.engine.memory.residency();
             residency.kv_seats = user_cfg
                 .runtime
                 .max_concurrent_processes
@@ -123,12 +125,9 @@ pub(crate) fn load_model_engines(
                 &rank_opts,
                 &snapshot_dir,
                 home,
-                m.adapter_mount().as_deref(),
                 u8::try_from(user_cfg.runtime.dispatch_depth(0)).unwrap_or(u8::MAX),
-                &m.adapters,
                 residency,
-                m.patch_ceilings(),
-                m.voxel_ceilings(),
+                e.max_context,
                 &overrides,
             )
             .with_context(|| {
@@ -143,7 +142,7 @@ pub(crate) fn load_model_engines(
                 break;
             }
             // The default swap tiers hold every seat the runtime admits.
-            let mut residency = m.residency();
+            let mut residency = user_cfg.engine.memory.residency();
             residency.kv_seats = user_cfg
                 .runtime
                 .max_concurrent_processes
@@ -243,10 +242,19 @@ impl Embedded {
 
 /// A model on its engine, the runtime not yet booted over it.
 pub struct Loaded {
-    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "net"),
+        allow(
+            dead_code,
+            reason = "only the networked worker names its model to peers"
+        )
+    )]
     pub(crate) model: String,
     /// The kv the engine exported, for peers to read in place.
-    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "net"),
+        allow(dead_code, reason = "only the networked worker offers its kv to peers")
+    )]
     pub(crate) kv_handle: Option<engine::KvHandle>,
     summary: Summary,
     config: runtime::bootstrap::Config,
@@ -274,6 +282,10 @@ fn load(
     engine: Engine,
     builtins: Vec<runtime::bootstrap::BuiltinProgram>,
 ) -> Result<Loaded> {
+    // Before any engine loads: what the sandbox pool leaves the rest of
+    // the process to grow by (what an engine maps does not grow after its
+    // load).
+    runtime::bootstrap::note_maps_before_engines();
     runtime::catalog::install(&home.join("models"));
     let opened = match engine {
         Engine::None => return load_without_engine(user_cfg, home, builtins),
@@ -293,8 +305,8 @@ fn load(
         deployment: group.deployment.clone(),
         trace: group.facts.trace_name.clone(),
         weight_bytes: group.facts.weight_bytes,
-        kv_pages: caps.pools.kv_pages,
-        kv_page_size: caps.pools.kv_page_size,
+        kv_pages: u32::try_from(caps.chunks.kv_device_pages()).unwrap_or(u32::MAX),
+        kv_page_size: caps.chunks.page_tokens(),
         max_lanes: caps.limits.max_lanes,
         max_tokens: caps.limits.max_tokens,
     };
@@ -390,13 +402,10 @@ fn create_engine_group(
                 &rank_opts,
                 snapshot_dir,
                 home,
-                m.adapter_mount().as_deref(),
                 group_idx,
                 frames_in_flight,
-                &m.adapters,
                 residency.clone(),
-                m.patch_ceilings(),
-                m.voxel_ceilings(),
+                cfg.engine.max_context,
                 &m.overrides()?,
             )
             .with_context(|| {
@@ -424,13 +433,11 @@ fn create_engine_group(
         &opts,
         snapshot_dir,
         home,
-        m.adapter_mount().as_deref(),
         group_idx,
         frames_in_flight,
-        &m.adapters,
         residency,
-        m.patch_ceilings(),
-        m.voxel_ceilings(),
+        cfg.engine.max_context,
+        cfg.engine.measure,
         &m.overrides()?,
         opened,
     )

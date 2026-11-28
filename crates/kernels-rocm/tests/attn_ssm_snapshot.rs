@@ -120,13 +120,13 @@ fn fire(gpu: &Gpu, scan: Scan, inputs: &[Vec<f32>], slab: Tensor, f: &Fire) -> V
     let indptr = gpu.column(&indptr);
     let mut y = gpu.zeros(rows, HEADS * D, Dtype::F32);
     let ctx = gpu.ctx();
-    match scan {
+    gpu.laid(&ctx, |ctx| match scan {
         Scan::Delta { serial } => (if serial {
             ssm::gated_delta_chunked_serial
         } else {
             ssm::gated_delta_chunked
         })(
-            &ctx,
+            ctx,
             RaggedTensor {
                 data: planes[0],
                 indptr,
@@ -145,7 +145,7 @@ fn fire(gpu: &Gpu, scan: Scan, inputs: &[Vec<f32>], slab: Tensor, f: &Fire) -> V
         } else {
             ssm::kda_chunked
         })(
-            &ctx,
+            ctx,
             RaggedTensor {
                 data: planes[0],
                 indptr,
@@ -166,7 +166,7 @@ fn fire(gpu: &Gpu, scan: Scan, inputs: &[Vec<f32>], slab: Tensor, f: &Fire) -> V
             0.0,
             &mut y,
         ),
-    }
+    })
     .unwrap();
     gpu.read(&y)
 }

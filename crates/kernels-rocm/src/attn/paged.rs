@@ -34,6 +34,8 @@ struct Args {
     kv_tile_indices: u64,
     kv_chunk_size: u64,
     block_valid: u64,
+    /// A captured prefill grid's live work items, staged each fire (null: all).
+    block_live: u64,
     o: u64,
     lse: u64,
     num_qo_heads: i32,
@@ -53,7 +55,7 @@ struct Args {
     stride_page: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<Args>() == 184);
+const _: () = assert!(core::mem::size_of::<Args>() == 192);
 
 /// A learned relative-position bias and Inkling's logit growth, as the
 /// matrix-core walks read it: `bias` f32 `[rows, heads · extent]`.
@@ -173,6 +175,21 @@ pub fn decode_max_grid_size(num_kv_heads: u32, num_cus: u32) -> u32 {
     (num_cus.max(1) * BLOCKS_PER_CU / num_kv_heads.max(1)).max(1)
 }
 
+/// `pie::attn::DecodeMask`, field for field: a fire's per-lane masks as a
+/// decode reads them (a lane's boundary word and its plane of bits).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodeMask {
+    /// The packed bits, request r's plane from byte `indptr[r]`.
+    pub bits: u64,
+    /// i64 byte offsets, a request each.
+    pub indptr: u64,
+    /// u32 words, a request each: its boundary (bit 31 the wide bit).
+    pub origin: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<DecodeMask>() == 24);
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx,
@@ -185,6 +202,7 @@ pub fn decode(
     o: &Tensor,
     lse: u64,
     rel: Option<Rel>,
+    mask: Option<DecodeMask>,
 ) -> Result<(), Error> {
     let shape = &plan.shape;
     head_dim_built(op, shape.head_dim)?;
@@ -241,37 +259,36 @@ pub fn decode(
     // The matrix-core decode takes a group within one 16-column tile; a
     // wider group takes the vector decode.
     let blocks = (info.padded_batch_size as u32).saturating_mul(shape.num_kv_heads);
-    let (entry, threads) = if group <= 16 && shape.head_dim >= 512 && !info.split_kv {
-        // An unsplit batch at the widest heads fills the grid: the decode
-        // whose columns split over its wavefronts keeps more blocks a CU
-        // (and their reads) in flight.
-        (
-            format!(
-                "::pie::attn::paged_decode_cols<{}, {group}, {hnd}, {fp8}>",
-                shape.head_dim
-            ),
-            256,
-        )
-    } else if group <= 16 && shape.head_dim.is_multiple_of(32) {
-        // A group of eight or more weighs its values on the matrix core too
-        // (`PVM`), whose staged value rows hold four wavefronts' rounds at
-        // 256-wide heads.
-        let pvm = group >= 8 && shape.head_dim <= 256;
-        // Four wavefronts at 512-wide heads; below, eight, or four (three
-        // or four blocks a CU, not one) once the grid is two blocks a CU.
-        let waves = if shape.head_dim >= 512
-            || blocks >= 2 * plan.device.num_sm
-            || (pvm && shape.head_dim > 128)
-        {
+    let (entry, threads) = if group <= 16 && shape.head_dim.is_multiple_of(32) {
+        // The values are weighed on the matrix core too (`PVM`) where a
+        // lane's vector form would cost more: its G·8 accumulators past the
+        // key row's D/32 raws and a round's value reads (D/8 VGPRs each),
+        // 32·G > D, where its G·D/8 FMAs a lane a round exceed the D/16
+        // MFMAs. At the boundary (32·G = D) the two tie and the keys decide
+        // (on an MI300X, D=128 at G=4 over 64 lanes: PVM 15-25% slower
+        // under 128 keys, 4-8% faster past 512), so the vector form keeps
+        // it; past it PVM wins at every length (D=64: 20-61% from G=4;
+        // D=128: 18-30% at G=8). And wherever the vector form's registers
+        // reach half a lane's 256, 8·G + D/4 >= 128, past which it spills
+        // into scratch (every 512-wide head, D=256 at G=8, 128 or 64 at
+        // G=16): there the matrix core's accumulator tiles sit in the
+        // AGPRs, the round's value rows staged in LDS a column half at a
+        // time past 256-wide heads.
+        let (g, d) = (group, shape.head_dim);
+        let pvm = 32 * g > d || 8 * g + d / 4 >= 128;
+        // Eight wavefronts, or four (three or four blocks a CU, not one)
+        // once the grid is two blocks a CU; four where the staged rows are
+        // 256 columns wide.
+        let waves = if blocks >= 2 * plan.device.num_sm || (pvm && shape.head_dim > 128) {
             4
         } else {
             8
         };
         (
             format!(
-                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, {}, {pvm}, {fp8}>",
+                "::pie::attn::paged_decode_mfma<{}, {group}, {hnd}, {waves}, true, {pvm}, {fp8}, {}>",
                 shape.head_dim,
-                shape.head_dim < 512
+                mask.is_some()
             ),
             64 * waves,
         )
@@ -279,8 +296,9 @@ pub fn decode(
         let waves = decode_waves(group, shape.head_dim);
         (
             format!(
-                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}, {fp8}>",
-                shape.head_dim
+                "::pie::attn::paged_decode<{}, {group}, {waves}, {hnd}, {fp8}, {}>",
+                shape.head_dim,
+                mask.is_some()
             ),
             64 * waves,
         )
@@ -291,7 +309,7 @@ pub fn decode(
             [info.padded_batch_size as u32, shape.num_kv_heads, 1],
             [threads, 1, 1],
         )),
-        &[ArgValue::of(&args)],
+        &[ArgValue::of(&args), ArgValue::of(&mask.unwrap_or_default())],
     )?;
     match split {
         Some(parts) => merge(ctx, op, &parts),
@@ -323,7 +341,56 @@ pub fn prefill(
         o,
         lse,
         None,
+        None,
         rel,
+    )
+}
+
+/// `pie::attn::PrefillMask`, field for field: a masked prefill's two
+/// segments, a request each (its committed run read whole, its buffer read
+/// by the bits of its plane past `origin`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PrefillMask {
+    /// The packed bits, a request's plane from byte `indptr[req]`.
+    pub bits: u64,
+    /// i64 byte offsets, a request each.
+    pub indptr: u64,
+    /// u32 words, a request each: its origin, the wide bit at 31; 0 for none
+    /// (origin 0, wide).
+    pub origin: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<PrefillMask>() == 24);
+
+/// The prefill over `plan` whose rows read their committed runs whole and
+/// their buffers by `mask` (`paged_prefill_masked`).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_masked(
+    ctx: &Ctx,
+    op: &'static str,
+    q: RaggedTensor,
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    window_left: i32,
+    sm_scale: f32,
+    o: &Tensor,
+    lse: u64,
+    mask: PrefillMask,
+) -> Result<(), Error> {
+    prefill_walk(
+        ctx,
+        op,
+        q,
+        plan,
+        pool,
+        window_left,
+        sm_scale,
+        o,
+        lse,
+        None,
+        Some(mask),
+        None,
     )
 }
 
@@ -361,7 +428,20 @@ pub fn prefill_selected(
     o: &Tensor,
     sel: PrefillSel,
 ) -> Result<(), Error> {
-    prefill_walk(ctx, op, q, plan, pool, -1, sm_scale, o, 0, Some(sel), None)
+    prefill_walk(
+        ctx,
+        op,
+        q,
+        plan,
+        pool,
+        -1,
+        sm_scale,
+        o,
+        0,
+        Some(sel),
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,6 +456,7 @@ fn prefill_walk(
     o: &Tensor,
     lse: u64,
     sel: Option<PrefillSel>,
+    mask: Option<PrefillMask>,
     rel: Option<Rel>,
 ) -> Result<(), Error> {
     let shape = &plan.shape;
@@ -425,6 +506,7 @@ fn prefill_walk(
     });
     if info.enable_cuda_graph {
         args.block_valid = at(int, info.block_valid_mask_offset);
+        args.block_live = at(int, info.block_live_offset);
     }
     match &split {
         Some(parts) => {
@@ -443,7 +525,47 @@ fn prefill_walk(
         [512, 1, 1],
     );
     let fp8 = kv::native_e4m3(pool);
-    if let Some(sel) = sel {
+    if let Some(mask) = mask {
+        if fp8 || rel.is_some() {
+            return Err(refuse(
+                op,
+                "the masked prefill walks bf16 pages, with no relative bias",
+            ));
+        }
+        // The same two families the unmasked prefill picks between; the
+        // narrow one in the plan's block order, as the unmasked one is.
+        let entry = if matches!(shape.head_dim, 128 | 256) {
+            // A causal one first runs its requests that read no bit on the
+            // unmasked body (`paged_prefill_unmasked_of`); the masked kernel
+            // then skips exactly those. Each request's word, staged per
+            // fire, picks its kernel, so no body is keyed by it.
+            if plan.causal {
+                let plain = format!(
+                    "::pie::attn::paged_prefill_unmasked_of<{}, {hnd}>",
+                    shape.head_dim
+                );
+                ctx.fire(
+                    op,
+                    Fire::at(kernel(FILE, &plain)).apply(launch),
+                    &[ArgValue::of(&args), ArgValue::of(&mask)],
+                )?;
+            }
+            format!(
+                "::pie::attn::paged_prefill_masked<{}, {hnd}, {causal}>",
+                shape.head_dim
+            )
+        } else {
+            format!(
+                "::pie::attn::paged_prefill_wide_masked<{}, {hnd}>",
+                shape.head_dim
+            )
+        };
+        ctx.fire(
+            op,
+            Fire::at(kernel(FILE, &entry)).apply(launch),
+            &[ArgValue::of(&args), ArgValue::of(&mask)],
+        )?;
+    } else if let Some(sel) = sel {
         if !matches!(shape.head_dim, 128 | 256) || !plan.causal || fp8 {
             return Err(refuse(
                 op,

@@ -73,21 +73,18 @@ impl Settlement {
         })
     }
 
-    pub fn claim(&self) -> Result<u32> {
-        self.free.take().ok_or(crate::error::Fault::Ceiling {
-            what: "settlement events (one per in-flight step)",
-            need: self.events.len() as u64 + 1,
-            have: self.events.len() as u64,
-        })
+    /// A settle event, as [`Free::claim`] claims: waited for while a step's
+    /// landing holds one, refused by name at once where the claimant's own
+    /// steps hold them all.
+    pub fn claim(&self) -> Result<crate::inputs::SlotGuard> {
+        self.free.claim(
+            "settlement events (one per in-flight step; every one held by a step not yet \
+             handed to its landing)",
+        )
     }
 
     #[must_use]
     pub fn event(&self, at: u32) -> &Event {
         &self.events[at as usize]
-    }
-
-    #[must_use]
-    pub fn recycler(&self) -> Arc<Free> {
-        Arc::clone(&self.free)
     }
 }

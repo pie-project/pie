@@ -16,27 +16,19 @@ fn set(name: &str, v: u32) {
     crate::common_llm::set_knob(name, v);
 }
 
-/// Loads with the warm ladder run (as a server with `prewarm` does), unless
-/// `PIE_XLA_SPEED_WARM=0`; with `PIE_XLA_WARM_STRICT=1` a fire outside the
-/// ladder fails the probe.
-fn warm() {
-    let on = std::env::var("PIE_XLA_SPEED_WARM").as_deref() != Ok("0");
-    set("PREWARM", u32::from(on));
-}
-
 fn quiet(lane: &mut engine::fire::Lane) {
     lane.readout = Readout::None;
 }
 
 /// Decode tok/s at `lanes` lanes, each holding `held` prompt rows.
 fn decode(name: &str, lanes: u32, held: u32, steps: u32) -> f64 {
-    // a lane holds `held` + 103 rows at most
+    // a lane holds `held` + 103 rows at most; fires of up to 512 rows (a
+    // budget the canonical layouts pad within)
     let context = 512;
-    warm();
     set("SLOTS", lanes.max(4));
     set("LANES", lanes.max(8));
-    set("TOKENS", (2 * lanes).max(held).max(128));
-    let mut model = Model::load(name, None, context, 7);
+    set("TOKENS", (2 * lanes).max(held).max(512));
+    let mut model = load(name, context);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let mut seqs: Vec<Seq> = (0..lanes).map(Seq::new).collect();
@@ -88,12 +80,11 @@ fn median(xs: &mut [f64]) -> f64 {
 /// Prefill tok/s of one `len`-token prompt.
 fn prefill(name: &str, len: u32, runs: u32) -> f64 {
     let context = (len + 64).next_power_of_two();
-    warm();
     set("SLOTS", runs + 3);
     // `runs` prompts after two warm ones, each a working set of its own
     set("LANES", 8);
     set("TOKENS", len);
-    let mut model = Model::load(name, None, context, 7);
+    let mut model = load(name, context);
     let vocab = model.vocab;
     let mut refs = Refs::of(&model);
     let fire = |model: &mut Model, refs: &mut Refs, slot: u32| {
@@ -111,6 +102,21 @@ fn prefill(name: &str, len: u32, runs: u32) -> f64 {
         times.push(t.elapsed().as_secs_f64());
     }
     f64::from(len) / median(&mut times)
+}
+
+/// The model as the gate loads it: streaming its weights, or held with
+/// `PIE_XLA_WEIGHTS_HELD=1` (what the worker loads unless streaming is on);
+/// cut to `PIE_XLA_SPEED_LAYERS` layers where set (a whole model's widths
+/// at a depth one chip holds).
+fn load(name: &str, context: u32) -> Model {
+    let layers = std::env::var("PIE_XLA_SPEED_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if std::env::var("PIE_XLA_WEIGHTS_HELD").is_ok_and(|v| v == "1") {
+        Model::load_held(name, layers, context, 7)
+    } else {
+        Model::load(name, layers, context, 7)
+    }
 }
 
 #[test]

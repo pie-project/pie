@@ -191,7 +191,7 @@ pub fn absorb_q(
 ) -> Result<(), Error> {
     const OP: &str = "attn.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
-    if q_nope.rows <= ctx.tuning().mla_absorb_q_until {
+    if q_nope.rows <= ctx.tuning().mla_absorb_q_until() {
         return absorb_native(
             ctx,
             OP,
@@ -235,6 +235,7 @@ pub fn absorb_q(
             heads * rank,
             i64::from(rank),
             heads,
+            &mut ctx.blas_workspace(OP),
         )
         .map_err(|why| refuse(OP, why.to_string()))
     }
@@ -259,7 +260,7 @@ pub fn absorb_out(
     const OP: &str = "attn.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
     let t = ctx.tuning();
-    if (t.mla_absorb_out_from..=t.mla_absorb_out_until).contains(&latent.rows) {
+    if (t.mla_absorb_out_from()..=t.mla_absorb_out_until()).contains(&latent.rows) {
         return absorb_native(
             ctx,
             OP,
@@ -308,6 +309,7 @@ pub fn absorb_out(
             heads * v_dim,
             i64::from(v_dim),
             heads,
+            &mut ctx.blas_workspace(OP),
         )
         .map_err(|why| refuse(OP, why.to_string()))
     }
@@ -342,7 +344,8 @@ unsafe fn absorb(
     ldc: i32,
     stride_c: i64,
     heads: i32,
-) -> Result<(), crate::hip::blas::Refused> {
+    workspace: &mut crate::hip::blas::Workspace<'_>,
+) -> Result<(), crate::Error> {
     use crate::hip::blas::{self, Operand};
     use crate::hip::sys;
 
@@ -361,6 +364,7 @@ unsafe fn absorb(
             Operand::new(b, sys::BLAS_BF16, ldb).strided(stride_b),
             Operand::new(c, sys::BLAS_BF16, ldc).strided(stride_c),
             heads,
+            workspace,
         )
     }
 }
@@ -475,13 +479,14 @@ pub(crate) mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::{Arg, kernel};
 
+    /// The walk's block (`mla_naive::kBlock`).
     pub const NAIVE_BLOCK: u32 = 256;
 
+    /// Latent and rope elements a lane holds in registers
+    /// (`mla_naive::kMaxPer` / `kMaxPe`): latent rows up to 1024, rope up to
+    /// 256.
     pub const NAIVE_MAX_PER: i32 = 16;
-
     pub const NAIVE_MAX_PE_PER: i32 = 4;
-
-    pub const WAVE_TARGET: i64 = 296;
 
     /// Wavefronts in the MLA walk's block.
     const WAVES: i32 = NAIVE_BLOCK as i32 / 64;
@@ -498,17 +503,18 @@ pub(crate) mod naive {
     }
 
     /// Query heads a block of the MLA walk takes: as many as its wavefronts
-    /// while the grid still fills the device.
+    /// while the grid still holds a block for each of the device's `cus`
+    /// compute units.
     #[must_use]
-    pub fn wave_group(num_heads: i32, total_tokens: i32) -> i32 {
-        group_of(WAVES, num_heads, total_tokens)
+    pub fn wave_group(num_heads: i32, total_tokens: i32, cus: u32) -> i32 {
+        group_of(WAVES, num_heads, total_tokens, cus)
     }
 
-    fn group_of(most: i32, num_heads: i32, total_tokens: i32) -> i32 {
+    fn group_of(most: i32, num_heads: i32, total_tokens: i32, cus: u32) -> i32 {
         let mut g = most;
         while g > 1
             && (num_heads % g != 0
-                || i64::from(total_tokens) * i64::from(num_heads / g) < WAVE_TARGET)
+                || i64::from(total_tokens) * i64::from(num_heads / g) < i64::from(cus))
         {
             g >>= 1;
         }
@@ -573,7 +579,11 @@ pub(crate) mod naive {
                 format!("the rope width {kpe} is not one this walk holds (0..={MAX_ROPE})"),
             ));
         }
-        let g = wave_group(shape.num_heads, shape.total_tokens);
+        let g = wave_group(
+            shape.num_heads,
+            shape.total_tokens,
+            ctx.multiprocessors(op)?,
+        );
         #[allow(clippy::cast_sign_loss)]
         let launch = Launch::grid(
             [
@@ -838,8 +848,8 @@ pub(crate) mod latent {
     /// How many splits a gathered walk cuts each row's key list into: enough
     /// blocks to fill the device twice over, no split under two tiles.
     #[must_use]
-    pub fn splits(ctx: &Ctx, rows: u32, heads: i32, max_list: i64) -> i32 {
-        let cus = u64::from(ctx.multiprocessors().unwrap_or(304).max(1));
+    pub fn splits(cus: u32, rows: u32, heads: i32, max_list: i64) -> i32 {
+        let cus = u64::from(cus);
         let base = u64::from(rows).max(1) * u64::from(heads.unsigned_abs().div_ceil(BLOCK_ROWS));
         let want = (2 * cus).div_ceil(base.max(1));
         let cap = max_list.max(1).unsigned_abs().div_ceil(MIN_SHARE);
@@ -1003,7 +1013,12 @@ fn dispatch_dense(
                 num_heads,
                 page_size: layer.page_size,
                 ratio: 1,
-                splits: latent::splits(ctx, o.rows, num_heads, i64::from(window)),
+                splits: latent::splits(
+                    ctx.multiprocessors(op)?,
+                    o.rows,
+                    num_heads,
+                    i64::from(window),
+                ),
                 causal: i32::from(causal),
                 scale_log2: layer.scale_log2(sm_scale),
                 window,
@@ -1174,7 +1189,7 @@ fn selected(
                 num_heads: heads,
                 page_size: layer.page_size,
                 ratio: 1,
-                splits: latent::splits(ctx, o.rows, heads, i64::from(top_k)),
+                splits: latent::splits(ctx.multiprocessors(op)?, o.rows, heads, i64::from(top_k)),
                 causal: i32::from(causal),
                 scale_log2: layer.scale_log2(sm_scale),
                 ..latent::Gather::default()
@@ -1291,8 +1306,8 @@ mod tests {
 
     #[test]
     fn a_head_group_divides_the_heads_and_fits_the_block() {
-        assert_eq!(wave_group(64, 1), 1);
-        assert_eq!(wave_group(64, 4096), 4);
-        assert_eq!(wave_group(6, 4096), 2);
+        assert_eq!(wave_group(64, 1, 304), 1);
+        assert_eq!(wave_group(64, 4096, 304), 4);
+        assert_eq!(wave_group(6, 4096, 304), 2);
     }
 }

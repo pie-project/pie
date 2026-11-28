@@ -5,8 +5,9 @@
 //! processes to the host. Past that, room is the policy's to make: a short
 //! waiter stays parked and its planner says, through
 //! [`crate::policy::pressure::raise`], how short each tier is. The waiter is
-//! released by a discard or new retention keys, by the governor's growth, or,
-//! at its deadline, by an explicit error. Nothing here drops anything.
+//! released by a discard or new retention keys, by the governor's growth, or
+//! by the planner's own moves as completions and evictions land; no clock
+//! and no answer of the policy refuses it. Nothing here drops anything.
 //!
 //! Streamed weights go before any kv or state: a device shortfall first
 //! sheds the weight cache to its floor ([`WeightShed`]), and the policy
@@ -16,7 +17,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::policy::pressure::{self, Tier};
-use crate::rt::Instant;
 
 /// Says that `tier` is short of `bytes` in all now (0 once it is not).
 pub type Sink = Arc<dyn Fn(Tier, u64) + Send + Sync>;
@@ -30,11 +30,10 @@ pub fn sink(engine: usize) -> Sink {
     Arc::new(move |tier, bytes| pressure::raise(tier, engine, bytes))
 }
 
-/// What one waiter lacks on each tier, and since when it has lacked any.
+/// What one waiter lacks on each tier.
 #[derive(Debug, Clone, Copy)]
 struct Short {
     bytes: [u64; 2],
-    since: Instant,
 }
 
 /// The shortfalls one planner reports.
@@ -48,8 +47,8 @@ pub(super) struct Shortfall {
 }
 
 impl Shortfall {
-    /// Waiter `id` lacks `bytes` (device, host) now. Its clock runs from the
-    /// first note that says it lacks anything, and stops when one says not.
+    /// Waiter `id` lacks `bytes` (device, host) now; once a note says it
+    /// lacks nothing, it is forgotten.
     pub(super) fn note(&mut self, id: u64, bytes: [u64; 2]) {
         if bytes == [0, 0] {
             self.waiters.remove(&id);
@@ -58,10 +57,7 @@ impl Shortfall {
         self.waiters
             .entry(id)
             .and_modify(|short| short.bytes = bytes)
-            .or_insert(Short {
-                bytes,
-                since: Instant::now(),
-            });
+            .or_insert(Short { bytes });
     }
 
     /// Waiter `id` lacks `bytes` on the host, whatever it lacks on the
@@ -81,32 +77,9 @@ impl Shortfall {
         self.waiters.retain(|&id, _| waiting(id));
     }
 
-    /// Since when waiter `id` has been short, if it is.
-    /// Waiter `id`'s clock runs again from now.
-    pub(super) fn restart(&mut self, id: u64) {
-        if let Some(short) = self.waiters.get_mut(&id) {
-            short.since = Instant::now();
-        }
-    }
-
-    pub(super) fn since(&self, id: u64) -> Option<Instant> {
-        self.waiters.get(&id).map(|short| short.since)
-    }
-
-    /// Whether waiter `id` lacks room on the host.
-    pub(super) fn host_short(&self, id: u64) -> bool {
-        self.waiters
-            .get(&id)
-            .is_some_and(|short| short.bytes[Tier::Host.index()] > 0)
-    }
-
-    /// What waiter `id` lacks most of: the tier and its bytes.
-    pub(super) fn worst(&self, id: u64) -> Option<(Tier, u64)> {
-        let short = self.waiters.get(&id)?;
-        Tier::ALL
-            .into_iter()
-            .map(|tier| (tier, short.bytes[tier.index()]))
-            .max_by_key(|&(tier, bytes)| (bytes, std::cmp::Reverse(tier)))
+    /// Whether waiter `id` lacks anything now.
+    pub(super) fn is_short(&self, id: u64) -> bool {
+        self.waiters.contains_key(&id)
     }
 
     /// What each tier is short of in all.

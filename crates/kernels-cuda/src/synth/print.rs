@@ -147,32 +147,24 @@ pub struct Packing {
 }
 
 impl Packing {
-    /// The vector slot `s` holds: the turned ones first, then the rest in
-    /// order.
-    #[must_use]
-    pub fn vector(&self, s: u32) -> u32 {
-        let k = self.turned.len() as u32;
-        if s < k {
-            return self.turned[s as usize];
-        }
-        let mut rest = s - k;
-        for v in 0..self.vectors {
-            if !self.turned.contains(&v) {
-                if rest == 0 {
-                    return v;
-                }
-                rest -= 1;
+    /// The vector each slot holds, slot by slot: the turned ones first, then
+    /// the rest in order.
+    fn slots(&self) -> impl Iterator<Item = u32> + '_ {
+        let mut turned = vec![false; self.vectors as usize];
+        for &v in &self.turned {
+            if let Some(t) = turned.get_mut(v as usize) {
+                *t = true;
             }
         }
-        s
+        let rest = (0..self.vectors).filter(move |&v| !turned[v as usize]);
+        self.turned.iter().copied().chain(rest)
     }
 
-    /// `vector` as a C++ function of the slot: piecewise over the runs of
-    /// consecutive slots that hold consecutive vectors.
+    /// [`Packing::slots`] as a C++ function `vector` of the slot: piecewise
+    /// over the runs of consecutive slots that hold consecutive vectors.
     fn source(&self) -> String {
         let mut runs: Vec<(u32, u32, u32)> = Vec::new(); // (first slot, slots, first vector)
-        for slot in 0..self.vectors {
-            let v = self.vector(slot);
+        for (slot, v) in (0..self.vectors).zip(self.slots()) {
             match runs.last_mut() {
                 Some((first, n, at)) if *first + *n == slot && *at + *n == v => *n += 1,
                 _ => runs.push((slot, 1, v)),

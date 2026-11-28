@@ -244,7 +244,7 @@ pub fn gather(
     let pitch = count(OP, "the state plane's row pitch", state_kv.width)?;
     // One pass over 16-byte runs, the window split across the block.
     let run = head_dim / 8;
-    if ctx.tuning().rows_vec
+    if ctx.tuning().rows_vec()
         && head_dim % 8 == 0
         && run > 0
         && 256 % run == 0
@@ -638,7 +638,7 @@ pub fn compress(
     };
     let run = head_dim / 8;
     let pitch = state_kv.width;
-    let fits = ctx.tuning().rows_vec
+    let fits = ctx.tuning().rows_vec()
         && forward_interleaved
         && head_dim.is_multiple_of(8)
         && run > 0

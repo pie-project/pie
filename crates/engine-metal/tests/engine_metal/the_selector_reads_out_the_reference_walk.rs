@@ -1,5 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16_bytes, bf16_round};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
@@ -23,19 +24,6 @@ fn noise(at: u64) -> u32 {
 
 fn unit(at: u64) -> f32 {
     (noise(at) as f32 / u32::MAX as f32) * 2.0 - 1.0
-}
-
-fn bf16_round(v: f32) -> f32 {
-    let bits = v.to_bits();
-    let rounding = 0x7fff + ((bits >> 16) & 1);
-    f32::from_bits(((bits + rounding) >> 16) << 16)
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .map(|f| ((f.to_bits() + 0x7fff + ((f.to_bits() >> 16) & 1)) >> 16) as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -95,6 +83,7 @@ impl Dev {
 
 #[test]
 fn the_selector_reads_out_the_reference_walk_every_case() {
+    let _device = crate::device_alone();
     topk_answers_the_host_sort_with_ties_low_and_nans_never();
     the_walk_picks_what_the_reference_picks();
 }
@@ -154,7 +143,6 @@ fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
         !indices[2 * K as usize..].contains(&5),
         "the NaN was chosen"
     );
-    eprintln!("topk: three rows of {WIDE} agree with the host sort; tie low, NaN never");
 }
 
 fn the_walk_picks_what_the_reference_picks() {
@@ -270,10 +258,6 @@ fn the_walk_picks_what_the_reference_picks() {
     );
     assert_eq!(picks, want, "the walk parts from the reference");
     assert_ne!(picks, unary_only, "the walk is the unary argmax");
-    eprintln!(
-        "walk: {} rows over two requests agree with the reference; the bilinear decided at least one slot",
-        rows
-    );
 
     let picks = walk(&dev, None, 0);
     let mut want = vec![0i32; rows as usize];
@@ -300,8 +284,4 @@ fn the_walk_picks_what_the_reference_picks() {
         }
     }
     assert_eq!(picks, want, "the bigram walk parts from the reference");
-    eprintln!(
-        "bigram walk: {} rows agree, the anchor row proposing too",
-        rows
-    );
 }

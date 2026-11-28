@@ -19,9 +19,15 @@ pub struct Sink<'a> {
     /// load hands work to the Neural Engine.
     #[cfg(target_vendor = "apple")]
     handoff: Option<&'a kernels_metal::ane::Handoff>,
+    /// The frame is dropped uncommitted: a hand-off's fences are left out.
+    #[cfg(target_vendor = "apple")]
+    dry: bool,
     /// Launches left before the borrowed frame commits its head and goes on
     /// in a fresh buffer; zero never.
     flush_in: std::cell::Cell<u32>,
+    /// The workgroups the direct dispatches encoded so far launch.
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    groups: std::cell::Cell<u64>,
 }
 
 impl<'a> Sink<'a> {
@@ -39,8 +45,19 @@ impl<'a> Sink<'a> {
             handles,
             #[cfg(target_vendor = "apple")]
             handoff: None,
+            #[cfg(target_vendor = "apple")]
+            dry: false,
             flush_in: std::cell::Cell::new(0),
+            groups: std::cell::Cell::new(0),
         }
+    }
+
+    /// The workgroups the direct dispatches encoded through this sink launch,
+    /// together: what a kernel's grid fills the device with (the rates
+    /// step's `workgroups_per_core`).
+    #[must_use]
+    pub fn groups(&self) -> u64 {
+        self.groups.get()
     }
 
     fn refuse(fire: Fire, fault: Fault) -> Error {
@@ -54,9 +71,20 @@ impl<'a> Sink<'a> {
 static KERNEL_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The kernel profile switched on by `pie tune --check-estimate` for the
+/// fires it dissects, beside the boot's `kernel-profile` diagnostic.
+static PROFILE_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Time each dispatch on the device (its own committed command buffer)
+/// while `on`, whatever the diagnostics say.
+pub fn profile_kernels(on: bool) {
+    PROFILE_FORCED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(target_vendor = "apple")]
-fn profiling() -> bool {
+pub(crate) fn profiling() -> bool {
     crate::diag::on().kernel_profile.on()
+        || PROFILE_FORCED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[must_use]
@@ -95,7 +123,7 @@ fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
 }
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-fn record_kernel(name: &str, seconds: f64) {
+pub(crate) fn record_kernel(name: &str, seconds: f64) {
     let ns = (seconds * 1e9).max(0.0) as u64;
     let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     let row = table.entry(name.to_string()).or_insert((0, 0));
@@ -103,8 +131,34 @@ fn record_kernel(name: &str, seconds: f64) {
     row.1 += 1;
 }
 
+thread_local! {
+    /// The Metal source files fired on this thread since [`record_fired`]
+    /// started recording; `None` while not recording.
+    static FIRED: std::cell::RefCell<Option<std::collections::BTreeSet<&'static str>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Starts (`true`) or stops (`false`) keeping the source file of every fire
+/// a [`Sink`] encodes on this thread, and returns what was kept since the
+/// last start: what a measurement fired, its key's kernels
+/// ([`crate::stored::by`]).
+pub fn record_fired(on: bool) -> Vec<&'static str> {
+    FIRED.with(|fired| {
+        fired
+            .replace(on.then(std::collections::BTreeSet::new))
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    })
+}
+
 impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
+        FIRED.with(|fired| {
+            if let Some(fired) = fired.borrow_mut().as_mut() {
+                fired.insert(fire.file);
+            }
+        });
         #[cfg(target_vendor = "apple")]
         {
             let pipeline = self
@@ -188,6 +242,15 @@ impl<'a> Sink<'a> {
         self
     }
 
+    /// Leaves a hand-off's fences out, for a frame that is dropped
+    /// uncommitted.
+    #[cfg(target_vendor = "apple")]
+    #[must_use]
+    pub fn dry(mut self, dry: bool) -> Self {
+        self.dry = dry;
+        self
+    }
+
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
     fn fence(&self, stamp: u64, signal: bool) -> Result<(), Error> {
         let op = if signal {
@@ -197,6 +260,9 @@ impl<'a> Sink<'a> {
         };
         #[cfg(target_vendor = "apple")]
         {
+            if self.dry {
+                return Ok(());
+            }
             let handoff = self.handoff.ok_or(Error::Backend {
                 op,
                 detail: "no Neural Engine hand-off is armed for this encode".to_string(),
@@ -240,6 +306,14 @@ impl Sink<'_> {
     ) -> Result<(), Error> {
         let group = crate::device::ctx::group_of(pipeline, fire)
             .map_err(|fault| Sink::refuse(fire, fault))?;
+        if fire.threadgroup_bytes > 0 {
+            // SAFETY: index 0 is the kernel's one `[[threadgroup(0)]]`
+            // block; Metal checks the length against the device's limit
+            // with the pipeline's own, which the caller sized under.
+            unsafe {
+                encoder.setThreadgroupMemoryLength_atIndex(fire.threadgroup_bytes as usize, 0)
+            };
+        }
         if let Some(indirect) = fire.indirect {
             let binding = self.handles.get(indirect.buf).ok_or_else(|| {
                 Sink::refuse(
@@ -270,6 +344,15 @@ impl Sink<'_> {
             height: fire.lanes[1].max(1) as usize,
             depth: fire.lanes[2].max(1) as usize,
         };
+        let launched = [
+            (lanes.width, group.width),
+            (lanes.height, group.height),
+            (lanes.depth, group.depth),
+        ]
+        .iter()
+        .map(|&(n, per)| n.div_ceil(per.max(1)) as u64)
+        .product::<u64>();
+        self.groups.set(self.groups.get() + launched);
         encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
         Ok(())
     }

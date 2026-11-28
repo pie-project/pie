@@ -9,7 +9,13 @@
 // keys from word `k_origin + p * k_page_stride`, its values likewise.
 
 [[vk::binding(0)]] StructuredBuffer<uint> k_new;
+#if defined(PIE_KV_SHARED)
+// One plane written as both (`kv_append_shared`): read through its one
+// binding, where a host refuses two views of a buffer that overlap.
+#define v_new k_new
+#else
 [[vk::binding(1)]] StructuredBuffer<uint> v_new;
+#endif
 [[vk::binding(2)]] StructuredBuffer<uint> w_page;
 [[vk::binding(3)]] StructuredBuffer<uint> w_off;
 PIE_POOL_SEGMENTS(RWStructuredBuffer, uint, 4)
@@ -24,8 +30,12 @@ struct Params {
     uint v_origin;
     uint k_page_stride;
     uint v_page_stride;
+    // The window's first row in the bound source rows, and in the bound
+    // write tables (each the fire's whole): the fire's data.
+    uint row0;
+    uint w0;
 };
-PIE_PARAMS(8, Params, params);
+PIE_PARAMS_FIRED(8, Params, params);
 PIE_POOL_READ(uint, params.seg_words)
 PIE_POOL_WRITE(uint, params.seg_words)
 PIE_POOL_VIEW(k_pages, uint, params.k_origin)
@@ -34,18 +44,23 @@ PIE_POOL_VIEW(v_pages, uint, params.v_origin)
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID) {
+    // The fire block's reads first, ahead of the address math they feed.
+    uint i = PIE_FIRE(row0) + gid.z;
+    uint w = PIE_FIRE(w0) + gid.z;
     uint head_dim = uint(params.head_dim);
     uint d = 2u * gid.x;
     uint h = gid.y;
-    uint i = gid.z;
-    if (d >= head_dim) {
+    // A padding row's write entry is -1: it writes nothing.
+    if (d >= head_dim || w_page[w] == 0xFFFFFFFFu) {
         return;
     }
     uint row = uint(params.n_kv_heads) * head_dim;
-    uint dst = w_off[i] * row + h * head_dim + d;
+    uint dst = w_off[w] * row + h * head_dim + d;
     uint src = i * (params.src_row_stride > 0 ? uint(params.src_row_stride) : row) + h * head_dim + d;
-    k_pages[w_page[i] * params.k_page_stride + (dst >> 1)] = k_new[src >> 1];
-    v_pages[w_page[i] * params.v_page_stride + (dst >> 1)] = v_new[src >> 1];
+    k_pages[w_page[w] * params.k_page_stride + (dst >> 1)] = k_new[src >> 1];
+    v_pages[w_page[w] * params.v_page_stride + (dst >> 1)] = v_new[src >> 1];
 }
 
 // pie:instantiate attn_kv_append_bf16 PIE_GROUP_X=64
+// The shared form, for the tab (`Encode::binds_overlap` false there).
+// pie:instantiate attn_kv_append_shared_bf16 PIE_GROUP_X=64 PIE_KV_SHARED=1 PIE_TARGET=wgsl

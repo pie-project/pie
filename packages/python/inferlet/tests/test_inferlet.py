@@ -408,6 +408,40 @@ class TestForwardPassState:
         assert fwd.wit.checkpoint_slots == [16, 32]
 
 
+class TestFinalRows:
+    """A pass is final unless the program states it retractable."""
+
+    @staticmethod
+    def _pass():
+        from inferlet.eta import ForwardPass, StateGeometry, WorkingSet
+
+        fwd = ForwardPass()
+        fwd.state([WorkingSet()], StateGeometry.folding())
+        return fwd
+
+    def test_a_pass_is_final_unless_retractable(self):
+        from inferlet.eta import InferletError
+
+        fwd = self._pass()
+        assert fwd.is_final()
+        fwd.attach_program()
+        fwd.attach_program()
+        assert fwd.wit.final_stated == 1
+
+        lagged = self._pass()
+        lagged.retractable()
+        assert not lagged.is_final()
+        lagged.attach_program()
+        assert lagged.wit.final_stated == 0
+        with pytest.raises(InferletError, match="already attached"):
+            lagged.retractable()
+
+        beam = self._pass()
+        beam.wit.final_refusal = "a beam"
+        with pytest.raises(InferletError, match=r"final-rows: a beam .*ForwardPass\.retractable\(\)"):
+            beam.attach_program()
+
+
 class TestDiffusionSurface:
     def test_model_facts(self):
         from inferlet import model

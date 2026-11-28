@@ -43,7 +43,6 @@ pub struct AdapterPlane<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankSeat {
     pub name: String,
-    pub adapters: u32,
     pub slot: u64,
 
     pub rows: u64,
@@ -52,17 +51,38 @@ pub struct BankSeat {
     pub elem: u64,
 }
 
+/// A bank the model text marked `registered`, `[slots, rows, cols]`: one
+/// plane of an adapter a slot of it, landed in the pool's `Adapter` slots.
 #[derive(Debug, Clone)]
 struct AdapterBank {
-    param: usize,
-    adapters: u32,
+    /// One adapter's plane of it, in bytes.
     slot: u64,
     rows: u64,
     cols: u64,
     elem: u64,
-    /// The whole bank on the host; a registration rewrites one slot of it
-    /// and lands the bank again.
-    host: Vec<u8>,
+}
+
+/// The model's registered banks, by name.
+fn adapter_banks(trace: &Trace) -> BTreeMap<String, AdapterBank> {
+    trace
+        .params
+        .iter()
+        .filter(|p| p.source == ParamSource::Registered)
+        .map(|p| {
+            let plane = p.shape.get(1..).unwrap_or(&[]);
+            let (rows, cols) = rectangle(plane);
+            let elem = poem_compiler::arena::elem_bytes(p.dtype).unwrap_or(0);
+            (
+                p.name.clone(),
+                AdapterBank {
+                    slot: plane.iter().product::<u64>() * elem,
+                    rows,
+                    cols,
+                    elem,
+                },
+            )
+        })
+        .collect()
 }
 
 pub struct Weights {
@@ -117,6 +137,7 @@ pub(crate) fn plane_bytes(name: &str, dtype: Dtype, shape: &[u64]) -> Result<u64
 }
 
 impl Weights {
+    #[allow(clippy::too_many_arguments)]
     pub fn resident(
         device: &Device,
         handles: &Handles,
@@ -125,7 +146,10 @@ impl Weights {
         path: &Path,
         device_cap: u64,
         engine: &Engine,
+        streamed: Option<&mut crate::store::streamed::Streamed>,
     ) -> Result<Weights> {
+        let streamed_params = streamed.as_ref().map(|s| s.params()).unwrap_or_default();
+        let streams = |at: usize| streamed_params.contains(&at);
         if let Some(param) = trace.params.iter().find(|p| p.dtype == Dtype::U4g64tiled) {
             return Err(Fault::Param {
                 name: param.name.clone(),
@@ -183,9 +207,20 @@ impl Weights {
         let sizes: Vec<u64> = trace
             .params
             .iter()
-            .map(|p| plane_bytes(&p.name, p.dtype, &p.shape))
+            .map(|p| match p.source {
+                // An adapter bank's planes land in the pool's `Adapter`
+                // slots at the bind that carries them: no buffer of its own.
+                ParamSource::Registered => Ok(0),
+                _ => plane_bytes(&p.name, p.dtype, &p.shape),
+            })
             .collect::<Result<_>>()?;
-        let total: u64 = sizes.iter().sum();
+        // A streamed plane lands in the pool, not as a buffer of its own.
+        let total: u64 = sizes
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| !streams(at))
+            .map(|(_, b)| b)
+            .sum();
         if total > device_cap {
             return Err(Fault::Residency(format!(
                 "the weights are {} MiB and the device budget for them is {} MiB; this \
@@ -195,24 +230,6 @@ impl Weights {
                 device_cap >> 20
             )));
         }
-
-        let banks_of: BTreeMap<usize, (u32, u64, u64, u64, u64)> = trace
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.source == ParamSource::Registered)
-            .map(|(at, p)| {
-                let adapters = u32::try_from(p.shape.first().copied().unwrap_or(0)).unwrap_or(0);
-                let slot = if adapters == 0 {
-                    0
-                } else {
-                    sizes[at] / u64::from(adapters)
-                };
-                let (rows, cols) = rectangle(p.shape.get(1..).unwrap_or(&[]));
-                let elem = poem_compiler::arena::elem_bytes(p.dtype).unwrap_or(0);
-                (at, (adapters, slot, rows, cols, elem))
-            })
-            .collect();
 
         // An mxfp4 bank lands pre-scaled (e5m2 weights, `kernels_xla::pack`)
         // when the weights still fit at its doubled size; otherwise, or when
@@ -257,6 +274,9 @@ impl Weights {
         // `gather_only`.
         let mut folded: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
         for at in gather_only(trace, &codes_planes, engine) {
+            if streams(at) {
+                continue;
+            }
             let Some(&pairing) = pairings.get(trace.params[at].name.as_str()) else {
                 let (rows, width) = rectangle(&trace.params[at].shape);
                 folded.insert(at, fold_of(rows, width));
@@ -289,6 +309,8 @@ impl Weights {
             transposed: &transposed,
             tied_gemm: &tied_gemm,
             folded: &folded,
+            streamed,
+            kept: std::collections::BTreeSet::new(),
         };
         Execution::new(&streaming, snapshot)
             .streaming()
@@ -300,6 +322,7 @@ impl Weights {
                 why: "is half of an mxfp4 bank whose other plane never landed",
             });
         }
+        let kept = std::mem::take(&mut sink.kept);
         let stored = sink.stored;
         // A pre-scaled mxfp4 plane holds a byte per code, twice its codes.
         let total = total
@@ -308,37 +331,34 @@ impl Weights {
                 .map(|at| sizes[at])
                 .sum::<u64>()
             + tied_gemm.iter().map(|&at| sizes[at]).sum::<u64>();
-        let mut buffers = sink.buffers;
+        let buffers = sink.buffers;
         let gemm_buffers = sink.gemm_buffers;
 
-        let mut banks = BTreeMap::new();
-        for (&at, &(adapters, slot, rows, cols, elem)) in &banks_of {
-            let param = &trace.params[at];
-            let (r, w) = rectangle(&param.shape);
-            let host = vec![0u8; usize::try_from(sizes[at]).unwrap_or(0)];
-            buffers[at] = Some(device.upload(
-                param.dtype,
-                u32::try_from(r).unwrap_or(u32::MAX),
-                u32::try_from(w).unwrap_or(u32::MAX),
-                &host,
-            )?);
-            banks.insert(
-                param.name.clone(),
-                AdapterBank {
-                    param: at,
-                    adapters,
-                    slot,
-                    rows,
-                    cols,
-                    elem,
-                    host,
-                },
-            );
-        }
+        let banks = adapter_banks(trace);
 
         let mut table = Vec::with_capacity(trace.params.len());
         let mut gemm_table = Vec::with_capacity(trace.params.len());
         for (at, param) in trace.params.iter().enumerate() {
+            if kept.contains(&at) {
+                // Read through the pool (`crate::store::streamed`): a root no
+                // program may read whole.
+                let (rows, width) = shape_of(at);
+                table.push(Some(WeightRow::Dense(handles.root(Root {
+                    source: Source::Streamed { param: at as u32 },
+                    dtype: param.dtype,
+                    rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                    width: u32::try_from(width).unwrap_or(u32::MAX),
+                }))));
+                gemm_table.push(None);
+                continue;
+            }
+            if param.source == ParamSource::Registered {
+                // An adapter bank: its planes lie in the pool's `Adapter`
+                // slots and a fire gathers its own adapters' planes there.
+                table.push(None);
+                gemm_table.push(None);
+                continue;
+            }
             if buffers[at].is_none() {
                 return Err(Fault::Param {
                     name: param.name.clone(),
@@ -438,86 +458,18 @@ impl Weights {
         self.bytes
     }
 
-    pub fn register_adapter(
-        &mut self,
-        device: &Device,
-        trace: &Trace,
-        id: u32,
-        planes: &[AdapterPlane<'_>],
-    ) -> Result<()> {
-        for plane in planes {
-            let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
-                bank: plane.bank.to_string(),
-                why: "not a bank this plan declares; a bank is a weight the model text \
-                      marked `registered`, and this plan marked none by that name"
-                    .to_string(),
-            })?;
-            if id >= bank.adapters {
-                return Err(Fault::Adapter {
-                    bank: plane.bank.to_string(),
-                    why: format!(
-                        "seats {} adapters while this registration is id {id}",
-                        bank.adapters
-                    ),
-                });
-            }
-            if plane.bytes.len() as u64 != bank.slot {
-                return Err(Fault::Adapter {
-                    bank: plane.bank.to_string(),
-                    why: format!(
-                        "seats {} bytes per adapter while this plane carries {}",
-                        bank.slot,
-                        plane.bytes.len()
-                    ),
-                });
-            }
-        }
-        for plane in planes {
-            let bank = self.banks.get_mut(plane.bank).expect("checked above");
-            let at = (u64::from(id) * bank.slot) as usize;
-            bank.host[at..at + plane.bytes.len()].copy_from_slice(plane.bytes);
-            let param = &trace.params[bank.param];
-            let (r, w) = rectangle(&param.shape);
-            self.buffers[bank.param] = Some(device.upload(
-                param.dtype,
-                u32::try_from(r).unwrap_or(u32::MAX),
-                u32::try_from(w).unwrap_or(u32::MAX),
-                &bank.host,
-            )?);
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
-        self.banks
-            .iter()
-            .map(|(name, bank)| (name.as_str(), bank.adapters, bank.slot))
-            .collect()
-    }
-
     #[must_use]
     pub fn bank_seats(&self) -> Vec<BankSeat> {
         self.banks
             .iter()
             .map(|(name, bank)| BankSeat {
                 name: name.clone(),
-                adapters: bank.adapters,
                 slot: bank.slot,
                 rows: bank.rows,
                 cols: bank.cols,
                 elem: bank.elem,
             })
             .collect()
-    }
-
-    #[must_use]
-    pub fn adapter_seats(&self) -> u32 {
-        self.banks
-            .values()
-            .map(|bank| bank.adapters)
-            .min()
-            .unwrap_or(0)
     }
 }
 
@@ -997,6 +949,10 @@ struct Landing<'a> {
     /// The planes of gather-only tables: the `[rows, width]` each lands
     /// folded as (`gather_only`).
     folded: &'a BTreeMap<usize, (u64, u64)>,
+    /// The streamed weights: their planes are kept on the host, the pool
+    /// holds them (`crate::store::streamed`).
+    streamed: Option<&'a mut crate::store::streamed::Streamed>,
+    kept: std::collections::BTreeSet<usize>,
 }
 
 impl Landing<'_> {
@@ -1123,6 +1079,13 @@ impl TensorSink for Landing<'_> {
                 self.sizes[at]
             )));
         }
+        if let Some(streamed) = self.streamed.as_deref_mut()
+            && streamed.streams(at)
+        {
+            streamed.keep(at, bytes);
+            self.kept.insert(at);
+            return Ok(());
+        }
         let landed = if let Some(&scales_at) = self.prescale.get(&at) {
             match self.held.remove(&scales_at) {
                 Some(scales) => self.prescaled(at, bytes, &scales),
@@ -1170,7 +1133,12 @@ impl Weights {
         let sizes: Vec<u64> = trace
             .params
             .iter()
-            .map(|p| plane_bytes(&p.name, p.dtype, &p.shape))
+            .map(|p| match p.source {
+                // An adapter bank's planes land in the pool's `Adapter`
+                // slots at the bind that carries them: no buffer of its own.
+                ParamSource::Registered => Ok(0),
+                _ => plane_bytes(&p.name, p.dtype, &p.shape),
+            })
             .collect::<Result<_>>()?;
         let mut pairings: BTreeMap<usize, Pairing> = BTreeMap::new();
         for (at, param) in trace.params.iter().enumerate() {
@@ -1261,30 +1229,14 @@ impl Weights {
                 stored[at] = Dtype::U8;
             }
         }
-        let mut banks = BTreeMap::new();
+        let banks = adapter_banks(trace);
         let mut table = Vec::with_capacity(trace.params.len());
         let mut gemm_table = Vec::with_capacity(trace.params.len());
-        for (at, param) in trace.params.iter().enumerate() {
-            if param.source == ParamSource::Registered {
-                let adapters =
-                    u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(0);
-                let (rows, cols) = rectangle(param.shape.get(1..).unwrap_or(&[]));
-                banks.insert(
-                    param.name.clone(),
-                    AdapterBank {
-                        param: at,
-                        adapters,
-                        slot: if adapters == 0 {
-                            0
-                        } else {
-                            sizes[at] / u64::from(adapters)
-                        },
-                        rows,
-                        cols,
-                        elem: poem_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
-                        host: Vec::new(),
-                    },
-                );
+        for at in 0..trace.params.len() {
+            if trace.params[at].source == ParamSource::Registered {
+                table.push(None);
+                gemm_table.push(None);
+                continue;
             }
             let dense = |at: usize| -> Tensor {
                 let p = &trace.params[at];

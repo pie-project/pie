@@ -10,6 +10,10 @@
 //! too; one lane holding the rest otherwise). A padding lane reads and writes
 //! only the sink page and the sink slot.
 
+mod evict;
+pub(crate) mod ring;
+mod size;
+mod stream;
 mod warm;
 
 use std::collections::BTreeMap;
@@ -70,15 +74,21 @@ pub struct Boot<'a> {
 
     pub slots: u32,
 
-    /// Device bytes the kv pages and state slots take (`[model]
-    /// device_kv_budget`); `None` fills what `memory_share` leaves.
+    /// Device bytes the kv pages and state slots take, where a test fixes
+    /// them (`Residency::device_kv_budget`); `None` fills what `allowance`
+    /// leaves.
     pub kv_budget: Option<u64>,
 
-    /// The share of the device's memory the load may take (`[model]
-    /// device_memory_share`).
-    pub memory_share: f64,
+    /// What the load may take of the device (`[engine.memory]
+    /// budget_device`).
+    pub allowance: engine::Allowance,
 
     pub device: &'a crate::api::DeviceBoot,
+
+    /// The rules the runtime forms steps by (`LoadRequest::steps`): the
+    /// stage-only pass sizes the slab over the ladder the load's step set
+    /// lays. `None`: a load stating no set (a test's).
+    pub steps: Option<&'a engine::StepRules>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +128,28 @@ pub struct PatchSeat {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// The share of a device's memory an XLA load takes for itself; the rest is
+/// left to what XLA allocates beside it (compiled programs, scratch it
+/// plans none of). XLA's own, and provisional: it stands until that term
+/// is measured. No other engine reads it.
+const XLA_DEVICE_SHARE: f64 = 0.9;
+
+/// What an XLA load may take of a device of `total` bytes, `held` of which
+/// are taken already: [`XLA_DEVICE_SHARE`] of it less those, and no more
+/// than the `allowance`'s stated budget.
+fn share_room(allowance: engine::Allowance, total: u64, held: u64) -> u64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a device's byte count is far inside f64's exact integer range, and \
+                  the product is floored back into u64 deliberately"
+    )]
+    let share = (total as f64 * XLA_DEVICE_SHARE) as u64;
+    let room = share.saturating_sub(held);
+    allowance.budget.map_or(room, |budget| room.min(budget))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
@@ -126,6 +158,12 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
+
+    /// The lane's set's committed boundary (`KvDelta::folded`, numbered as
+    /// `held`): column `c` of its mask is slot `folded + c`, and the slots
+    /// below it are read under the causal bound and no mask bit. 0 where
+    /// nothing is committed.
+    pub folded: u32,
 
     pub mask: Option<&'a Masking>,
 
@@ -140,8 +178,6 @@ pub struct Seated<'a> {
     pub quiet: bool,
 
     pub rs_reset: engine::fire::RsReset,
-
-    pub rs_slot: Option<u32>,
 
     pub rs: &'a engine::fire::RsVerb,
 
@@ -160,12 +196,19 @@ pub struct Seated<'a> {
     /// of the ones this shell derives from the extent and the page table.
     pub writes: Option<(&'a [u32], &'a [u32])>,
 
+    /// The lane is a beam of a group whose head resolved its page entries
+    /// past `f0` and its write page this fire.
+    pub beam: Option<crate::beam::BeamLane>,
+
     pub first: Option<u32>,
 
-    /// The lane's slot refs of the window list, in its token order (its
-    /// slots hold the kv page's tokens), 0 where trimmed; empty for a lane
-    /// handed none.
+    /// The lane's window-buffer table: its slot refs in
+    /// token order from [`Seated::window_fold`]'s `base`, every one a real
+    /// slot; empty for a lane buffering none.
     pub window: &'a [u32],
+    /// The lane's windowed layers as state + buffer: its buffer's base and
+    /// how far the fire folds.
+    pub window_fold: Option<engine::fire::WindowFold>,
 
     /// The lane's record: one `[run, cow]` slot ref a piece of each fixed
     /// shape (`engine::fire::Lane::fixed`).
@@ -174,6 +217,11 @@ pub struct Seated<'a> {
     /// Whole-slot copies `[src, dst]` of list shapes made before the fire
     /// (`engine::fire::Lane::slot_copies`).
     pub copies: &'a [(engine::chunk::ShapeId, Vec<[u32; 2]>)],
+
+    /// The lane's replay as the runtime counted it
+    /// (`engine::fire::Lane::replay_stated`), held against this shell's own
+    /// count at prepare (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
 }
 
 const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
@@ -185,28 +233,31 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            folded: 0,
             mask: None,
             adapter: None,
             positions: &[],
             readout: None,
             quiet: false,
             rs_reset: engine::fire::RsReset::Inferred,
-            rs_slot: None,
             rs: &FOLD,
             media: None,
             inputs: &[],
             group: None,
             kv_less: false,
             writes: None,
+            beam: None,
             first: None,
             window: &[],
+            window_fold: None,
             fixed: &[],
             copies: &[],
+            replay_stated: None,
         }
     }
 }
 
-/// Where a slot of the pool's shapes lies (CONTRACT-BC 22).
+/// Where a slot of the pool's shapes lies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Device,
@@ -221,21 +272,86 @@ fn no_disk() -> Fault {
 }
 
 /// A fire the warm ladder traced and has not compiled yet.
+/// A warm program the load compiled and parked in the disk cache (the host
+/// held no more in memory): what the first fire of its shape loads it from.
+#[derive(Clone)]
+pub(crate) struct Parked {
+    code: crate::device::Code,
+    sig: crate::trace::Signature,
+    probed: Vec<ValueId>,
+    /// Where it loads behind serving: (a masked fire's program, its ladder
+    /// part's rank, the fire's lanes, its rows), ascending (`warm::use_rank`):
+    /// the programs only masked fires run after every plain one.
+    order: (bool, u8, u32, u32),
+}
+
 pub(crate) struct Deferred {
     key: [u8; 32],
     shape_key: Option<[u8; 32]>,
-    text: String,
+    code: crate::device::Code,
     sig: crate::trace::Signature,
     probed: Vec<ValueId>,
+    rows: u32,
+    /// Set by the ladder as it traces the fire (`Parked::order`).
+    order: (bool, u8, u32, u32),
+}
+
+/// The width a load's cached programs load behind serving at
+/// (`Shell::load_behind`): `stated` by the device's profile under a key
+/// matching this plugin on this device, else measured where the load
+/// measures (`[engine] measure`) and kept in the user's file `keep` names
+/// (its path and the device as the key states it).
+#[derive(Clone, Debug)]
+pub(crate) struct LoadWidth {
+    pub(crate) stated: Option<u32>,
+    pub(crate) measure: bool,
+    pub(crate) keep: Option<(std::path::PathBuf, String)>,
+}
+
+/// The cached programs loading behind serving (`Shell::load_behind`): the
+/// loader's thread, stopped and joined before the shell's other fields drop.
+#[derive(Default)]
+pub(crate) struct Behind {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<u64>>,
+    begun: bool,
+}
+
+impl Drop for Behind {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// What a ladder fire's key traced to, kept for this build's later loads
+/// (`Device::trace_record`): its program's text hash, disk cache name and
+/// length, signature and probed values. A load whose fire finds its record
+/// and its program on disk builds no text.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct TraceRecord {
+    pub(crate) hash: [u8; 32],
+    pub(crate) name: String,
+    pub(crate) len: usize,
+    /// The program file's length in the disk cache as it was kept: a file
+    /// of another length (or none) is no record's, and its fire is traced
+    /// and built again before ready.
+    pub(crate) file_len: u64,
+    /// What compiling the text takes of the host (`device::compile_need`).
+    pub(crate) need: u64,
+    pub(crate) sig: crate::trace::Signature,
+    pub(crate) probed: Vec<ValueId>,
 }
 
 /// Fields drop in order: every buffer (weights, pools) goes before the
 /// device whose client made it.
 pub struct Shell {
+    /// First, so it stops before anything it loads into drops.
+    behind: Behind,
     tuning: kernels_xla::tuning::Tuning,
     pad: crate::chip::Pad,
-    /// `chip::Engine::seats`.
-    seats: [bool; 3],
     tpu: crate::chip::Tpu,
     handles: Handles,
     trace: Trace,
@@ -243,22 +359,56 @@ pub struct Shell {
     budgets: Budgets,
     weights: Weights,
     pools: Pools,
-    /// The host tier (CONTRACT-BC 22): chunks of the pool's size.
+    /// The weights streamed through the pool (`crate::store::streamed`);
+    /// empty where the load holds its weights.
+    streamed: crate::store::streamed::Streamed,
+    /// The fire being traced reads its streamed weights through these.
+    fire_streamed: Option<std::sync::Arc<crate::store::streamed::Fire>>,
+    /// The warm ladder's second pass: every fire traced as one that stages
+    /// expert misses (`crate::store::streamed::Fire::stages`).
+    pub(crate) stage_all: bool,
+    /// A fire on scratch slots every lane shares (the warm ladder's): what it
+    /// writes is never read back, so its rows may lay a page in two runs.
+    pub(crate) scratch_fire: bool,
+    /// The fire being traced is a mixed one the load states laid
+    /// (`Shell::mixed_lanes`): a program missing for it after the ladder
+    /// fails the fire by name, never compiles on its path.
+    laid_mixed: bool,
+    /// The fire limits the load stated beside its mixed lanes
+    /// (`Capabilities::limits`), as the runtime's cutter reads them.
+    stated_limits: Option<engine::FireLimits>,
+    /// The stage-only pass (`size`): a fire stops once its inputs are
+    /// staged, before anything is traced, leaving their rows here.
+    /// The budget the load asked (`Boot::budget`), before the padding room
+    /// the ladder adds: what its step set is stated over.
+    asked: Budget,
+    sizing: Option<u32>,
+    /// The bucket the fire `sizing` measured ran at.
+    sized_bucket: u32,
+    /// What this load stages its fires' inputs in.
+    staging_facts: StagingFacts,
+    /// The host tier: chunks of the pool's size.
     host: crate::store::tier::Host,
     /// The slot file below it, kv list slots.
     disk: Option<crate::store::tier::Disk>,
     /// The outputs the plan's classes write, and per class the one its
     /// lanes read back to the host: the last float row or voxel output.
     exports: Vec<poem_exec::feeds::ClassOutput>,
+    /// Per export, whether a matmul writes every value of it: v6e's matmul
+    /// flushes denormal results, so such a plane holds none, and a guest
+    /// stage reading it rounds it to bf16 without the denormal form
+    /// (`readout::Plane::normal`, `guest::lower::Lower::denormal`).
+    normal_exports: Vec<bool>,
     readback: Vec<Option<usize>>,
     dit: crate::dit::Dit,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     masked: poem_ir::ClassSet,
     wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
+    /// The classes whose lanes read kv (`poem_ir::LaneClass::reads_kv`).
+    kv_classes: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
-    adapters: crate::adapter::Slots,
-    blobs: crate::blob::Store,
+    adapters: crate::adapter::Landings,
     held: Vec<u32>,
     states_mrope: bool,
     patch_seat: Option<PatchSeat>,
@@ -267,12 +417,31 @@ pub struct Shell {
     gathers_readout: bool,
     /// Set for one `fire_kept`: the readout stays on the device.
     keep_readout: bool,
+    /// The stated shape of the fire about to run (`engine::fire::Step::shape`),
+    /// for that fire alone: a buffered one pads up to its shape's rung.
+    fire_shape: Option<engine::FireShape>,
     /// For the next fire: lanes whose tokens the device supplies.
     token_feeds: Vec<TokenFeed>,
     /// Values a debugging reader asked for (`Shell::probe`), and per traced
     /// program which of them its trailing outputs hold.
     probes: Vec<ValueId>,
     probed: std::collections::HashMap<[u8; 32], Vec<ValueId>>,
+    /// The width cached programs load behind serving at (`load_behind`).
+    load_width: LoadWidth,
+    /// The scope this load's traced fires' records lie in (`trace_scope`),
+    /// set as the warm ladder starts; `None`: none kept or read.
+    trace_scope: Option<String>,
+    /// The step compositions the runtime's builder forms over this load
+    /// (`engine::StepShapes`), set before the warm ladder:
+    /// it lays a fire's buffered treatment where the set states it.
+    steps: Option<engine::StepShapes>,
+    /// Whether this load's first record was checked against its trace (a
+    /// record traced again and its text's hash compared), and whether the
+    /// records still hold: a parted one stops their use for the load.
+    record_checked: bool,
+    records_hold: bool,
+    /// The fires this load took from records, building no text.
+    records_used: u64,
     /// Programs by the fire shape that traced them: a fire whose shape was
     /// seen skips the walk and runs what the first one compiled.
     traced: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
@@ -280,20 +449,65 @@ pub struct Shell {
     /// windows, lane counts and input shapes, not how its rows fall to its
     /// lanes, which reach the program only as input values.
     shaped: std::collections::HashMap<[u8; 32], std::sync::Arc<crate::device::Program>>,
+    /// The warm programs parked in the disk cache, by full key, and their
+    /// shape keys: a fire of a parked shape loads its program from the
+    /// disk (`Device::load_parked`), a load and not a build.
+    parked: std::collections::HashMap<[u8; 32], Parked>,
+    /// The host memory the load holds compiled programs in, where it states
+    /// one (`engine::Residency::host_programs`); `None` the host's free.
+    host_programs: Option<u64>,
+    parked_shapes: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    /// Programs a fire loaded from the disk cache (`load_parked`): what each
+    /// parks again as, its shape key, and when a fire last took it, in fires
+    /// (`evict`).
+    #[allow(clippy::type_complexity)]
+    evictable: std::collections::HashMap<[u8; 32], (Parked, Option<[u8; 32]>, u64)>,
+    /// Fires so far, the clock `evictable` is read by.
+    fires: u64,
+    /// The host memory a held program takes a KiB of its text, as the
+    /// loader behind serving measured one alone (0: none measured).
+    hold_per_kib: u64,
+    dropper: evict::Dropper,
+    /// The host memory the load may hold (`budget_host`): the host tier's
+    /// kv and the programs held, one sum; programs yield to kv (`evict`).
+    host_bound: Option<u64>,
     /// While the warm ladder traces (`warm.rs`): fires whose program is new
     /// are traced, kept here and not run, and compiled together after.
     deferred: Option<Vec<Deferred>>,
     /// The readout rows of every fire shape traced, the rows a guest stage's
     /// readout plane comes in (`Shell::readouts`).
     readouts: std::collections::BTreeSet<u32>,
+    /// The warm ladder walked this load: a fire of the lanes it lays fires
+    /// of is refused when its program was not built before ready.
+    laddered: bool,
+    /// The classes of the drafting lanes the ladder lays, every row read out.
+    drafting: Vec<usize>,
+    /// The drafts a drafting lane's window carries past its token.
+    draft_depth: u32,
     /// The programs that gather a readout plane's host-read rows apart, by
     /// the plane's rows and width, and every such plane the ladder traced.
-    gathers: std::collections::HashMap<(u32, u32), std::sync::Arc<crate::device::Program>>,
+    gathers: std::collections::HashMap<(u32, u32, u32), std::sync::Arc<crate::device::Program>>,
     gather_shapes: std::collections::BTreeSet<(u32, u32)>,
+    /// The readout rings the load laid (`fixed_readouts`), by ring index.
+    readout_specs: Vec<FixedReadout>,
     /// Token-declared values on a readout-rowed path (`crate::rows`), and
     /// a readout-rowed value that tells their rows.
     readout_rowed: (std::sync::Arc<Vec<bool>>, Option<ValueId>),
-    device: Device,
+    /// Each readout output a lane may read every row of: the values its
+    /// readout program reads (the final hidden rows), which a fire with
+    /// prompt rows returns beside its planes (`crate::rows::readout_slice`).
+    readout_entries: Vec<ValueId>,
+    /// The readout outputs' slice (`crate::rows::readout_slice`): its nodes
+    /// in trace order, and the exports it lands.
+    readout_slice: (Vec<usize>, Vec<usize>),
+    /// The readout program of each fire row count, traced once.
+    readout_programs: std::collections::HashMap<u32, std::sync::Arc<crate::device::Program>>,
+    /// The row counts of the warm ladder's fires that return the readout
+    /// entries: the readout programs it lays (`lay_readouts`).
+    entry_rows: std::collections::BTreeSet<u32>,
+    /// Shared: a guest program's registration compiles its stages off the
+    /// engine thread (`Engine::prepare_program`) while fires go on.
+    device: std::sync::Arc<Device>,
 }
 
 impl std::fmt::Debug for Shell {
@@ -351,10 +565,31 @@ impl Shell {
         self.readouts.iter().copied().collect()
     }
 
-    /// `engine.seated_first`, `engine.seat_to_end`, `engine.seat_spread`.
+    /// Every plane a fire of this load can return, as a guest stage reads
+    /// it: output, rows, width, layers, readout flag and dtype. Every
+    /// fire's plane of an output has one shape, its ring's (`Shell::planes`:
+    /// the ring's rows, the output's width, an I32 output as I32 and any
+    /// other as F32), so the load states them all before any fire, and a
+    /// program's registration compiles each stage for them
+    /// (`Stages::compile_all`). An output no ring holds lands no plane.
     #[must_use]
-    pub fn seats(&self) -> [bool; 3] {
-        self.seats
+    pub fn guest_planes(&self) -> Vec<(String, u32, u32, u32, bool, Dtype, bool)> {
+        (self.readout_specs.iter())
+            .flat_map(|spec| {
+                spec.exports.iter().map(|&export| {
+                    let decl = &self.exports[export].decl;
+                    (
+                        decl.name.clone(),
+                        spec.cap,
+                        spec.width,
+                        decl.layers,
+                        decl.readout,
+                        spec.dtype,
+                        self.normal_exports[export],
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Loads with the voxel ladder derived from the plan (engine-cuda's
@@ -366,7 +601,7 @@ impl Shell {
 
     pub fn load_with(boot: Boot<'_>, voxels: Option<poem_compiler::VoxelLadder>) -> Result<Shell> {
         let device = Device::open(boot.device.plugin.as_deref(), boot.device.ordinal as usize)?;
-        Shell::load_on(boot, voxels, device)
+        Shell::load_on(boot, voxels, device, true)
     }
 
     /// A shell over a dry device (`Device::dry`): it traces every fire and
@@ -381,16 +616,79 @@ impl Shell {
         let device = Device::dry(
             compile.then_some((boot.device.plugin.as_deref(), boot.device.ordinal as usize)),
         )?;
-        Shell::load_on(boot, voxels, device)
+        Shell::load_on(boot, voxels, device, true)
     }
 
+    /// What a load of `boot` stages: a stage-only pass over a dry shell of
+    /// the same boot (`size`), its sets as the slab, ring and rungs.
+    fn staging_of(
+        boot: &Boot<'_>,
+        voxels: Option<poem_compiler::VoxelLadder>,
+    ) -> Result<crate::store::Staging> {
+        let started = std::time::Instant::now();
+        let dry = Boot {
+            trace: boot.trace.clone(),
+            budget: boot.budget.clone(),
+            patches: boot.patches.clone(),
+            ..*boot
+        };
+        let mut shell = Shell::load_on(dry, voxels, Device::quiet()?, false)?;
+        if let Some(rules) = boot.steps {
+            let stated = shell.stated_steps(rules);
+            shell.set_steps(stated.shapes);
+        }
+        let rungs = shell.staged_sets()?;
+        let rows = rungs.iter().map(|&(_, rows)| rows).max().unwrap_or(0);
+        let staging = crate::store::Staging {
+            rows,
+            slots: boot.device.staging_slots.max(1),
+            rungs,
+        };
+        tracing::info!(
+            ms = started.elapsed().as_secs_f64() * 1e3,
+            slab_rows = staging.rows,
+            slab_bytes = u64::from(staging.rows) * crate::store::layout::ROW_BYTES,
+            ring_slots = staging.slots,
+            ring_bytes = u64::from(staging.rows) * crate::store::layout::ROW_BYTES * u64::from(staging.slots),
+            rungs = ?staging.rungs,
+            "xla staged inputs sized: a slab in the pool, a pinned ring on the host"
+        );
+        Ok(staging)
+    }
+
+    /// `sized`: the load stages its fires' inputs in a slab the stage-only
+    /// pass sized ([`Shell::staging_of`]); the pass's own shell is not.
     fn load_on(
         boot: Boot<'_>,
         voxels: Option<poem_compiler::VoxelLadder>,
         device: Device,
+        sized: bool,
     ) -> Result<Shell> {
-        let (chip, chip_report) =
-            crate::chip::resolve(device.kind(), boot.device.profiles.as_deref());
+        let pass = std::time::Instant::now();
+        let staging = if sized {
+            Shell::staging_of(&boot, voxels.clone())?
+        } else {
+            crate::store::Staging::default()
+        };
+        let pass_ms = pass.elapsed().as_secs_f64() * 1e3;
+        let (chip, chip_report) = crate::chip::resolve_keyed(
+            device.kind(),
+            device.platform(),
+            boot.device.profiles.as_deref(),
+        );
+        // The width cached programs load behind serving at: stated (the
+        // user's measured file, or the device's committed one, its key
+        // matching), else measured as they load and kept in the user's file.
+        let load_width = LoadWidth {
+            stated: chip.rates().load_width,
+            measure: boot.device.measure,
+            keep: boot.device.profiles.as_deref().map(|profiles| {
+                (
+                    crate::chip::SHELF.user_path(profiles, device.kind()),
+                    crate::stored::measured_on(device.kind(), device.platform()),
+                )
+            }),
+        };
         if !device.kind().is_empty() {
             crate::chip::SHELF.tell_untuned(device.kind(), &chip_report);
         }
@@ -415,21 +713,34 @@ impl Shell {
         // The row ladder every fire is padded up to (powers of two to
         // `max_tokens`, as the CUDA shell arms its graphs), and lane room
         // for the padding lanes that fill a decode up to its rung.
+        // the budget the load asked, before the ladder's padding room
+        let asked = boot.budget.clone();
         let mut budget = boot.budget.clone();
         if budget.buckets.is_empty() {
             budget.buckets = pad.ladder(budget.max_tokens);
-            // One rung past the fire limit, for the padding lanes that
-            // bring a full prefill fire's lane counts to their rungs
-            // (`fire_inner`); the runtime still sends at most `max_tokens`.
-            if pad.room > 0 && budget.max_tokens >= 4 * pad.room {
-                budget.max_tokens += pad.room;
-                budget.buckets.push(budget.max_tokens);
+        }
+        // One rung past the fire limit, for the padding lanes that bring a
+        // full prefill fire's lane counts to their rungs (`fire_inner`); the
+        // runtime still sends at most `max_tokens`. Stated rungs take it too:
+        // without it, prompts filling the top rung have no rows for their
+        // padding lanes, and no layout.
+        if pad.room > 0 {
+            budget.max_tokens += pad.room;
+            budget.buckets.push(budget.max_tokens);
+            if !asked.buckets.is_empty() {
+                tracing::info!(
+                    stated = ?asked.buckets,
+                    laid = budget.max_tokens,
+                    "xla row rungs: the stated ones and one past them, for the padding lanes of a fire filling the top one"
+                );
             }
         }
         // Lane room for the padding lanes: a decode's up to its rung, and a
-        // prefill beside a decode's up to the mixed fire's host rung.
+        // prefill beside a decode's up to the mixed fire's host rung; never
+        // past the fire's rows (a lane carries one at least).
         budget.max_lanes = poem_exec::fire::rung_of(&budget.buckets, budget.max_lanes)
-            .saturating_add(pad.mixed_host_rung);
+            .saturating_add(pad.mixed_host_rung)
+            .min(budget.max_tokens);
         let budgets = match boot.patches.clone() {
             None => Budgets::of(budget),
             Some(ladder) => Budgets::of(budget).with_patches(ladder),
@@ -449,8 +760,7 @@ impl Shell {
             weight_floor
         };
         let room = device.memory().map_or(u64::MAX, |bytes| {
-            ((bytes as f64 * boot.memory_share) as u64)
-                .saturating_sub(device.held())
+            share_room(boot.allowance, bytes, device.held())
                 .saturating_sub(weight_floor)
                 .saturating_sub(headroom)
                 / 2
@@ -486,6 +796,11 @@ impl Shell {
                         selection: None,
                         bias: None,
                         lse: Some(_),
+                        ..
+                    } | poem_ir::Attn::Decode {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
                         ..
                     }
                 )
@@ -523,11 +838,7 @@ impl Shell {
 
         // Windowed kv rows live in their own pool, a window per sequence
         // (engine-cuda `serve/load.rs`).
-        let window = if boot.device.window_pool {
-            crate::store::window_of(&boot.trace)?
-        } else {
-            None
-        };
+        let window = crate::store::window_of(&boot.trace)?;
         let paging_at = |pages: u64, slots: u32| -> Result<Paging> {
             Ok(Paging::of(boot.page_size, boot.context, slots, pages)?
                 .windowed(window, boot.budget.max_tokens)
@@ -536,17 +847,24 @@ impl Shell {
         let rs_layout = crate::rs::Layout::read(&boot.trace)?.map(std::sync::Arc::new);
         // The chunk the compiler picks for this trace on a TPU, where it
         // packs one; the store lays its own runs around it.
-        let target = poem_compiler::chunk::plan(
+        // Windowed layers as ring + buffer: the recipe
+        // asks the store's ring hook where the rings lie.
+        let recipe = poem_compiler::chunk::plan_windowed(
             &boot.trace,
             &budgets,
             &poem_compiler::DeviceProfile {
                 chunk: poem_compiler::chunk::ChunkProfile::TPU.paged(boot.page_size, boot.context),
                 ..poem_compiler::DeviceProfile::default()
             },
+            &crate::store::Rings,
         )
-        .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
-            recipe.chunk_bytes
-        });
+        .ok();
+        let target = recipe
+            .as_ref()
+            .map_or(crate::store::layout::TARGET_CHUNK, |recipe| {
+                recipe.chunk_bytes
+            });
+        let windowed_recipe = recipe.and_then(|recipe| recipe.windowed);
         // The null and sink chunks the pool lays past its pages, which a
         // budget of kv pages and state slots does not pay for: off the room.
         let reserved = crate::store::reserved_bytes(
@@ -558,6 +876,81 @@ impl Shell {
             rs_layout.as_deref(),
             target,
         )?;
+        // The staging slab is pool bytes past the pages, as the null and
+        // sink are: counted before the pages are fit. It holds a fire's
+        // inputs and a maintenance program's index list, a chunk's worth of
+        // entries and their count (`Pools::units`): a pair a one-row unit at
+        // most.
+        let fit_paging = paging_at(
+            u64::from(boot.context.div_ceil(boot.page_size.max(1))),
+            boot.slots,
+        )?;
+        let chunk_rows =
+            crate::store::layout_of(&boot.trace, fit_paging, rs_layout.as_deref(), target)?
+                .chunk_bytes
+                / crate::store::layout::ROW_BYTES;
+        let listed_rows = u32::try_from(
+            (2 * chunk_rows + 1)
+                .div_ceil(crate::inputs::ROW_WORDS as u64)
+                .next_multiple_of(u64::from(crate::inputs::TILE_ROWS)),
+        )
+        .unwrap_or(u32::MAX);
+        let mut staging = staging;
+        staging.rows = staging.rows.max(listed_rows);
+        let slab = crate::store::slab_bytes(
+            &boot.trace,
+            fit_paging,
+            rs_layout.as_deref(),
+            target,
+            staging.rows,
+        )?;
+        let reserved = reserved + slab;
+        // Each readout output lands in a plane laid here for a readout row
+        // a lane at the most lanes a fire holds (at its rung), one a frame
+        // in flight and one: a fire writes its readout rows into the next
+        // in place, and every fire's plane has one shape, so the guest
+        // stages and host gathers reading it take one shape too. No fire
+        // reads out more: the load states the ring's rows as its store
+        // (`ReadoutFacts::store_rows`), and the runtime cuts a fire's
+        // sequence lanes to them (a drafter's verify, up to
+        // `readouts_per_lane` rows a lane, fires fewer lanes). A float
+        // output (a kv-less lane's rows, token-shaped) lands in a ring of
+        // the top row rung's rows. Nothing is laid per fire.
+        let readout_cap =
+            poem_exec::fire::rung_of(&budgets.tokens.buckets, budgets.tokens.max_lanes);
+        let readout_exports =
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
+                .map_err(|why| Fault::Unbound { what: why })?;
+        let top_tokens = budgets.tokens.buckets.last().copied().unwrap_or(0);
+        let readout_specs = fixed_readouts(&boot.trace, &readout_exports, readout_cap, top_tokens);
+        // As many fires as can be outstanding: the frames in flight of at
+        // most `STEPS_MAX` fires each, and the one being written
+        // (`Runahead::staging_depth`, the staging ring's own count). A ring
+        // that deep never comes round to a plane a fire still outstanding
+        // holds; the device orders a plane's reuse after its last reader by
+        // the donation itself. (Four deep, a fire four back was still read
+        // when two frames were in flight across a compile stall.)
+        let frames_in_flight =
+            u8::try_from(boot.device.staging_slots.saturating_sub(1).max(1)).unwrap_or(u8::MAX);
+        let readout_depth = engine::runahead::Runahead::of(frames_in_flight).staging_depth();
+        let readout_bytes: u64 = readout_specs
+            .iter()
+            .map(|spec| readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4)
+            .sum();
+        let reserved = reserved + readout_bytes;
+        let staging_facts = StagingFacts {
+            pass_ms,
+            slab_rows: staging.rows,
+            slab_bytes: slab,
+            ring_slots: staging.slots,
+            ring_bytes: u64::from(staging.rows)
+                * crate::store::layout::ROW_BYTES
+                * u64::from(staging.slots),
+            rungs: staging.rungs.clone(),
+            // The bulk ring's pinned host bytes, once the pool lays it.
+            bulk_bytes: 0,
+            maintenance: (0, 0.0),
+        };
         // The pool buffers are program parameters, so the pages are fixed
         // before anything traces: what the budget buys, or with none what
         // the share leaves past what others held at open, the weights (at
@@ -565,7 +958,7 @@ impl Shell {
         // since it plans none of its own.
         let working = device
             .memory()
-            .map(|bytes| ((bytes as f64 * boot.memory_share) as u64).saturating_sub(device.held()));
+            .map(|bytes| share_room(boot.allowance, bytes, device.held()));
         let weight_floor = boot.trace.params.iter().try_fold(0u64, |sum, p| {
             crate::weights::plane_bytes(&p.name, p.dtype, &p.shape).map(|b| sum + b)
         })?;
@@ -616,9 +1009,9 @@ impl Shell {
         };
         // A hybrid's state slots balance against the pages a seat takes: at
         // the tokens a sequence is expected to hold where the operator says
-        // (`seat_tokens`), else at the context. The pool holds one sequence
-        // at the context either way: seats it would not hold fall back to
-        // seats at the context.
+        // (`seat_tokens`), else at the context. The pool must hold one
+        // sequence at the context: a seat that leaves it fewer pages is
+        // refused, not fitted again at another seat.
         // The tokens a seat is balanced at are the power of two nearest those
         // asked (448 and 592 both seat 512): a load's shapes that differ a
         // little share one pool, so one compiled ladder (Qwen3.6-35B-A3B's v5e
@@ -632,13 +1025,15 @@ impl Shell {
             };
             u64::from(tokens.div_ceil(boot.page_size.max(1))).clamp(1, least)
         });
-        let fitted = |one_slot: u64| {
-            engine::fit::pool_for(boot.kv_budget, boot.slots, one_slot, room, demand)
-        };
-        let (fit, slots) = match fitted(seat) {
-            Ok((fit, slots)) if fit >= least => (fit, slots),
-            _ => fitted(least).map_err(|short| Fault::Residency(short.to_string()))?,
-        };
+        let (fit, slots) = engine::fit::pool_for(boot.kv_budget, boot.slots, seat, room, demand)
+            .map_err(|short| Fault::Residency(short.to_string()))?;
+        if fit < least {
+            return Err(Fault::Residency(format!(
+                "seats of {seat} page(s) (`seat_tokens`) leave the pool {fit} page(s), fewer \
+                 than the {least} one sequence at the context takes: name fewer slots or \
+                 more seat tokens"
+            )));
+        }
         tracing::info!(
             pages = fit,
             slots,
@@ -655,6 +1050,24 @@ impl Shell {
                 .saturating_sub(reserved)
                 .saturating_sub(headroom)
         });
+        // A load told its weights are held streams nothing: every plane
+        // lands as the base build lands it, and its programs are the base
+        // build's. Else the streamable weights live in the pool, seated
+        // whole at load (`crate::store::streamed`). The stage-only pass's
+        // shell (`sized` false) plans them as the real load does and seats
+        // nothing, so its fires stage what the real load's stage (a streamed
+        // table's row a token is one more per-row table).
+        let mut streamed = if boot.device.stream_weights && (!device.is_dry() || !sized) {
+            crate::store::streamed::Streamed::plan(&boot.trace, 0, budgets.tokens.max_tokens)?
+        } else {
+            crate::store::streamed::Streamed::default()
+        };
+        let streamed_bytes: u64 = streamed
+            .shapes
+            .iter()
+            .map(|s| s.slot_bytes * u64::from(s.count))
+            .sum();
+        let device_cap = device_cap.saturating_sub(streamed_bytes);
         let weights = if device.is_dry() {
             // A device of the target's size would pre-scale an mxfp4 bank
             // when the weights leave room for it: under 5/8 of its HBM (20 of
@@ -674,6 +1087,7 @@ impl Shell {
                 boot.checkpoint,
                 device_cap,
                 &engine,
+                (!streamed.is_empty()).then_some(&mut streamed),
             )?
         };
         let pools = Pools::reserve(
@@ -685,11 +1099,90 @@ impl Shell {
             rs_layout.as_deref(),
             demand(fit, slots),
             target,
+            Some(&mut streamed),
+            boot.device.pool_extra_chunks,
+            &staging,
         )?;
+        let mut pools = pools;
+        if let Some(windowed) = &windowed_recipe {
+            pools.set_windowed(windowed);
+        }
+        let mut staging_facts = staging_facts;
+        staging_facts.bulk_bytes = pools.bulk_ring().1;
+        streamed.renumber(narrow(pools.layout().shapes.len() as u64) as u32);
+        pools.view_weights(&handles, &streamed)?;
+        pools.land_host_banks(&device, &handles, &streamed)?;
+        streamed.release_expert_copies();
+        let rings: Vec<(Tensor, Dtype, u32, u32)> = readout_specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let root = handles.root(Root {
+                    source: Source::Readout {
+                        index: u16::try_from(index).unwrap_or(u16::MAX),
+                    },
+                    dtype: spec.dtype,
+                    rows: spec.rows,
+                    width: spec.width,
+                });
+                (root, spec.dtype, spec.rows, spec.width)
+            })
+            .collect();
+        for spec in &readout_specs {
+            let names: Vec<&str> = spec
+                .exports
+                .iter()
+                .map(|&e| readout_exports[e].decl.name.as_str())
+                .collect();
+            tracing::info!(
+                outputs = ?names,
+                rows = spec.rows,
+                width = spec.width,
+                layers = spec.layers,
+                mib = (readout_depth as u64 * u64::from(spec.rows) * u64::from(spec.width) * 4)
+                    >> 20,
+                "xla readout ring laid"
+            );
+        }
+        pools.lay_readouts(&device, &rings, readout_depth)?;
+        tracing::info!(
+            outputs = readout_specs.len(),
+            rows = readout_cap,
+            planes = readout_depth,
+            mib = readout_bytes >> 20,
+            "xla readout planes laid: one shape a fire, held outside the pool"
+        );
         handles.seal();
+        if !streamed.is_empty() {
+            for at in 0..streamed.shapes.len() {
+                let shape = &streamed.shapes[at];
+                let atoms: Vec<(u32, u32)> = (0..shape.count)
+                    .map(|atom| (atom, shape.slots[atom as usize]))
+                    .collect();
+                stream::fill(&streamed, &mut pools, &device, &handles, at, &atoms)?;
+            }
+            tracing::info!(
+                shapes = ?streamed
+                    .shapes
+                    .iter()
+                    .map(|s| (s.id.0, s.name.as_str(), s.count, s.slot_bytes, s.per_chunk))
+                    .collect::<Vec<_>>(),
+                first_chunk = pools.weight_start(),
+                "xla weights streamed: every atom seated in the pool"
+            );
+        }
 
-        let exports = poem_exec::feeds::class_outputs(&boot.trace, &compiled)
-            .map_err(|why| Fault::Unbound { what: why })?;
+        let exports =
+            poem_exec::feeds::class_outputs(&boot.trace, &compiled, boot.context, boot.page_size)
+                .map_err(|why| Fault::Unbound { what: why })?;
+        let normal_exports = normal_exports(&boot.trace, &exports);
+        tracing::info!(
+            planes = ?(exports.iter().zip(&normal_exports))
+                .filter(|(_, n)| **n)
+                .map(|(e, _)| e.decl.name.as_str())
+                .collect::<Vec<_>>(),
+            "xla readout planes a matmul writes, free of denormals"
+        );
         if exports.is_empty() {
             return Err(Fault::Unbound {
                 what: "no output, so a fire would compute nothing a reader can take".to_string(),
@@ -759,25 +1252,77 @@ impl Shell {
             )
         });
         let adapter_fact = compiled.classes.adapter_fact(&corrected);
-        let adapters = crate::adapter::Slots::new(weights.adapter_seats());
+        let adapters = crate::adapter::Landings::default();
+        let (readout_entries, readout_slice) = {
+            let mut entries = Vec::new();
+            let (mut nodes, mut covered) = (Vec::new(), Vec::new());
+            for (export, e) in exports.iter().enumerate() {
+                if !e.decl.readout {
+                    continue;
+                }
+                match crate::rows::readout_slice(&boot.trace, &e.decl.name) {
+                    Ok((values, slice)) => {
+                        for v in values {
+                            if !entries.contains(&v) {
+                                entries.push(v);
+                            }
+                        }
+                        for n in slice {
+                            if !nodes.contains(&n) {
+                                nodes.push(n);
+                            }
+                        }
+                        covered.push(export);
+                    }
+                    Err(why) => tracing::info!(
+                        output = %e.decl.name,
+                        %why,
+                        "xla readout: no lane reads every row of it"
+                    ),
+                }
+            }
+            nodes.sort_unstable();
+            (entries, (nodes, covered))
+        };
         let readout_rowed = (
             std::sync::Arc::new(crate::rows::readout_rowed(&boot.trace)),
             crate::rows::readout_probe(&boot.trace),
         );
+        // the classes whose lanes read kv: a lane of another (a float lane,
+        // an encoder's or a DiT's) reads its every row out through the
+        // readout planes, with no final hidden rows to read again
+        let kv_classes = poem_ir::ClassSet::of(
+            poem_exec::feeds::lane_classes(&boot.trace, &compiled, &exports)
+                .classes
+                .iter()
+                .enumerate()
+                .filter(|(_, class)| class.reads_kv)
+                .map(|(at, _)| at),
+        );
         Ok(Shell {
             tuning,
             pad,
-            seats: engine.seats,
             tpu,
-            device,
+            device: std::sync::Arc::new(device),
             handles,
             trace: boot.trace,
             compiled,
             budgets,
             weights,
             pools,
+            streamed,
+            fire_streamed: None,
+            stage_all: false,
+            scratch_fire: false,
+            laid_mixed: false,
+            stated_limits: None,
+            sizing: None,
+            sized_bucket: 0,
+            asked,
+            staging_facts: staging_facts.clone(),
             host: crate::store::tier::Host::default(),
             disk: None,
+            normal_exports,
             exports,
             readback,
             dit,
@@ -785,9 +1330,9 @@ impl Shell {
             masked,
             wide,
             corrected,
+            kv_classes,
             adapter_fact,
             adapters,
-            blobs: crate::blob::Store::new(),
             held: vec![0; slots as usize],
             states_mrope,
             patch_seat,
@@ -795,22 +1340,71 @@ impl Shell {
             drops_patch_rows,
             gathers_readout,
             keep_readout: false,
+            fire_shape: None,
             token_feeds: Vec::new(),
             probes: Vec::new(),
             probed: std::collections::HashMap::new(),
+            trace_scope: None,
+            steps: None,
+            load_width,
+            record_checked: false,
+            records_hold: true,
+            records_used: 0,
+            behind: Behind::default(),
             traced: std::collections::HashMap::new(),
             shaped: std::collections::HashMap::new(),
+            parked: std::collections::HashMap::new(),
+            host_programs: None,
+            parked_shapes: std::collections::HashMap::new(),
+            evictable: std::collections::HashMap::new(),
+            fires: 0,
+            hold_per_kib: 0,
+            dropper: evict::Dropper::default(),
+            host_bound: None,
             deferred: None,
             readouts: std::collections::BTreeSet::new(),
+            laddered: false,
+            drafting: Vec::new(),
+            draft_depth: 0,
             gathers: std::collections::HashMap::new(),
             gather_shapes: std::collections::BTreeSet::new(),
+            readout_specs: readout_specs.clone(),
             readout_rowed,
+            readout_entries,
+            readout_slice,
+            readout_programs: std::collections::HashMap::new(),
+            entry_rows: std::collections::BTreeSet::new(),
         })
     }
 
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// Compiles (and runs on the null chunk) every maintenance program:
+    /// the slot copy, write and zero at each slot size the pool states.
+    pub fn warm_maintenance(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let before = self.device.compiled();
+        self.pools.warm_copies(&self.device, &self.handles)?;
+        self.staging_facts.maintenance = (
+            self.device.compiled() - before,
+            started.elapsed().as_secs_f64() * 1e3,
+        );
+        tracing::info!(
+            programs = self.staging_facts.maintenance.0,
+            ms = self.staging_facts.maintenance.1,
+            bulk_ring_bytes = self.staging_facts.bulk_bytes,
+            "xla maintenance programs warmed: one a slot size, any count"
+        );
+        Ok(())
+    }
+
+    /// What this load stages its fires' inputs in.
+    #[must_use]
+    pub fn staging_facts(&self) -> &StagingFacts {
+        &self.staging_facts
     }
 
     #[must_use]
@@ -831,6 +1425,39 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Whether this load serves its windowed layers as ring + buffer
+    /// (`engine::Capabilities::windowed_state`): it does
+    /// wherever it holds windowed layers.
+    #[must_use]
+    pub fn serves_windowed_state(&self) -> bool {
+        self.pools.layout().ring().is_some()
+    }
+
+    /// The device, shared: what a registration's compile, off the engine
+    /// thread, holds.
+    #[must_use]
+    pub fn device_shared(&self) -> std::sync::Arc<Device> {
+        std::sync::Arc::clone(&self.device)
+    }
+
+    /// The device and the pool buffer at once: a guest pass's programs take
+    /// the pool (its carried cells' `Channel` slots).
+    pub fn device_and_pool(&mut self) -> (&Device, &mut Option<crate::pjrt::Buffer>) {
+        (&self.device, self.pools.buffer_mut())
+    }
+
+    /// The pool's rows and its sink's first row.
+    #[must_use]
+    pub fn pool_geometry(&self) -> (i64, u32) {
+        (self.pools.rows(), self.pools.sink_row())
+    }
+
+    /// The pool row a `Channel` slot ref starts at.
+    #[must_use]
+    pub fn channel_row(&self, slot: u32) -> Option<u32> {
+        self.pools.channel_row(slot)
     }
 
     /// The patch element the plan's image tower reads, if it has one.
@@ -857,6 +1484,41 @@ impl Shell {
     #[must_use]
     pub fn input_seat(&self, id: u32) -> Option<poem_exec::feeds::Seat> {
         self.dit.seat(id)
+    }
+
+    /// The step compositions the runtime's builder forms over this load,
+    /// for the warm ladder (`Shell::prewarm`).
+    pub fn set_steps(&mut self, steps: engine::StepShapes) {
+        self.steps = Some(steps);
+    }
+
+    /// The step set the runtime's `rules` form over this load's stated
+    /// facts: its activation rungs, the asked lanes and
+    /// tokens, the rows a fire reads out, its attachments and the mixed
+    /// steps it lays out at its lane rungs (`Shell::mixed_lanes`).
+    #[must_use]
+    pub fn stated_steps(&self, rules: &engine::StepRules) -> engine::StatedSteps {
+        let max_readouts =
+            u32::try_from(poem_compiler::arena::readouts_ceiling(&self.asked)).unwrap_or(u32::MAX);
+        engine::StatedSteps::of(
+            rules,
+            &engine::StepFacts::of(
+                &self.tiered_facts(),
+                self.asked.max_lanes,
+                self.asked.max_tokens,
+                engine::ReadoutFacts {
+                    landing: engine::ReadoutLanding::InSpan,
+                    store_rows: Shell::readout_store_rows(self),
+                }
+                .fire_rows(max_readouts),
+                engine::Attachments::served(
+                    true,
+                    !self.input_decls().is_empty(),
+                    self.snapshots() > 0,
+                ),
+            )
+            .with_mixed(self.mixed_lanes()),
+        )
     }
 
     #[must_use]
@@ -896,6 +1558,14 @@ impl Shell {
     }
 
     #[must_use]
+    pub fn streams_experts(&self) -> bool {
+        self.streamed
+            .shapes
+            .iter()
+            .any(|s| matches!(s.form, crate::store::streamed::Form::Experts { .. }))
+    }
+
+    #[must_use]
     pub fn has_state(&self) -> bool {
         self.pools.has_state()
     }
@@ -928,12 +1598,41 @@ impl Shell {
         self.pools.evacuate(&self.device, &self.handles, evacuation)
     }
 
+    /// Lands `bytes` in slots `(shape, ref)` of one shape, each whole, in
+    /// order.
+    pub fn write_slot_bytes(
+        &mut self,
+        slots: &[(engine::chunk::ShapeId, u32)],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let Some(&(id, _)) = slots.first() else {
+            return Ok(());
+        };
+        if slots.iter().any(|&(other, _)| other != id) {
+            return Err(Fault::Unbound {
+                what: "slots of two shapes in one write".to_string(),
+            });
+        }
+        let refs: Vec<u32> = slots.iter().map(|&(_, r)| r).collect();
+        self.pools
+            .write_slots(&self.device, &self.handles, id, &refs, bytes)
+    }
+
     /// The bytes of slots `(shape, ref)`, in order.
     pub fn slot_bytes(&self, slots: &[(engine::chunk::ShapeId, u32)]) -> Result<Vec<u8>> {
         self.pools.read(slots)
     }
 
     #[must_use]
+    /// The rows a fire's sequence readouts land in (their ring's rows a
+    /// layer, `ReadoutFacts::store_rows`); `None` where the load reads out
+    /// no sequence rows.
+    pub fn readout_store_rows(&self) -> Option<u32> {
+        (self.readout_specs.iter())
+            .find(|spec| spec.exports.iter().any(|&e| self.exports[e].decl.readout))
+            .map(|spec| spec.cap)
+    }
+
     pub fn pools(&self) -> &Pools {
         &self.pools
     }
@@ -948,7 +1647,24 @@ impl Shell {
     ) -> Result<()> {
         let chunk = self.pools.layout().chunk_bytes;
         let chunks = match host {
-            Some(bytes) => u32::try_from(bytes / chunk.max(1)).unwrap_or(u32::MAX),
+            // the bound holds the worker's resident memory: the tier is what
+            // it leaves beside what the worker holds now with the largest
+            // program loaded, so the kv fits the bound with every other
+            // program dropped and a fire's program fits beside it; past its
+            // seats the runtime moves kv a tier down, else names tiers_full
+            Some(bound) => {
+                let grew = self.load_largest();
+                let held = crate::device::resident_bytes();
+                let tier = held.map_or(bound, |held| evict::tier_room(bound, held));
+                tracing::info!(
+                    bound_gib = bound >> 30,
+                    tier_mib = tier >> 20,
+                    held_mib = held.unwrap_or(0) >> 20,
+                    largest_load_mib = grew >> 20,
+                    "xla host tier: what budget_host leaves beside the worker's resident memory, the largest program loaded"
+                );
+                u32::try_from(tier / chunk.max(1)).unwrap_or(u32::MAX)
+            }
             None => self.pools.chunks().saturating_sub(2),
         };
         self.host = crate::store::tier::Host::new(chunks, chunk);
@@ -961,10 +1677,43 @@ impl Shell {
         Ok(())
     }
 
+    /// Loads the largest parked program not held (kept held: the loader
+    /// would load it first or later), so the worker's resident memory has
+    /// it in it; answers the resident growth (its first load's own costs
+    /// too), 0 with none to load.
+    fn load_largest(&mut self) -> u64 {
+        let Some(parked) = (self.parked.values())
+            .filter(|p| !self.device.holds_key(&p.code.hash()))
+            .max_by_key(|p| p.code.len())
+        else {
+            return 0;
+        };
+        let (code, sig) = (parked.code.clone(), parked.sig.clone());
+        let before = crate::device::resident_bytes();
+        let loaded = self.device.load_behind(&code, sig);
+        match (loaded, before, crate::device::resident_bytes()) {
+            (Ok(Some(_)), Some(before), Some(after)) => after.saturating_sub(before),
+            _ => 0,
+        }
+    }
+
+    /// The snapshots a lane lands in one fire (`crate::snapshot`), where
+    /// the load holds recurrent state.
+    #[must_use]
+    pub fn snapshots(&self) -> u32 {
+        if self.pools.has_state() {
+            crate::snapshot::MOST
+        } else {
+            0
+        }
+    }
+
     /// The pool's facts with its tiers.
     #[must_use]
     pub fn tiered_facts(&self) -> engine::chunk::ChunkFacts {
         let mut facts = self.pools.facts();
+        facts.record_bytes = self.pools.state_slot_bytes();
+        facts.weights = self.streamed.facts();
         facts.host_chunks = self.host.chunks();
         if let (Some(disk), Some(kv)) = (&self.disk, self.pools.layout().kv()) {
             let spc = self.pools.layout().slots_per_chunk(kv).max(1);
@@ -976,7 +1725,7 @@ impl Shell {
     }
 
     /// Moves whole slots of shape `id` between the device, the host tier and
-    /// the slot file (CONTRACT-BC 22): `(src, dst)` refs of each side's own
+    /// the slot file: `(src, dst)` refs of each side's own
     /// space, in order.
     pub fn copy_tier(
         &mut self,
@@ -1033,6 +1782,14 @@ impl Shell {
                     .write_slots(&self.device, &self.handles, id, &dsts, &data)?
             }
             Tier::Host => {
+                // the slots landing anew take host memory: programs yield it
+                let new = (dsts.iter())
+                    .filter(|&&slot| self.host.lands_new(shape.tier_offset(chunk, slot)))
+                    .count() as u64
+                    * len;
+                if new > 0 {
+                    self.make_host_room(new, None)?;
+                }
                 for (at, &slot) in dsts.iter().enumerate() {
                     let bytes = &data[at * len as usize..(at + 1) * len as usize];
                     self.host.write(shape.tier_offset(chunk, slot), bytes)?;
@@ -1099,6 +1856,13 @@ impl Shell {
         for &(offset, len) in &spans {
             self.host.read(offset, len)?;
         }
+        let new: u64 = (spans.iter())
+            .filter(|&&(offset, _)| self.host.lands_new(offset))
+            .map(|&(_, len)| len)
+            .sum();
+        if new > 0 {
+            self.make_host_room(new, None)?;
+        }
         let mut at = 0usize;
         for (offset, len) in spans {
             let len = usize::try_from(len).unwrap_or(usize::MAX);
@@ -1108,88 +1872,123 @@ impl Shell {
         Ok(())
     }
 
-    pub fn register_adapter(
-        &mut self,
-        id: u32,
-        planes: &[crate::weights::AdapterPlane<'_>],
-    ) -> Result<()> {
-        self.weights
-            .register_adapter(&self.device, &self.trace, id, planes)
-    }
-
     #[must_use]
     pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
         self.weights.bank_seats()
     }
 
-    #[must_use]
-    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
-        self.weights.banks()
-    }
-
-    pub fn bind_adapter(
+    /// Lands the adapter `instance` carries: `planes` (bank, bytes), in
+    /// [`crate::adapter::plane_banks`] order, one an `Adapter` slot of
+    /// `slots`. Where the runtime handed slots another instance landed (the
+    /// same content key) it joins that landing. Its id, what its lanes route
+    /// by: the first slot.
+    pub fn land_adapter(
         &mut self,
-        source: crate::adapter::Source<'_>,
-    ) -> Result<crate::adapter::Binding> {
-        let key = match source {
-            crate::adapter::Source::Own { instance, .. } => crate::adapter::Key::Instance(instance),
-            crate::adapter::Source::Shared { name } => {
-                crate::adapter::Key::Shared(self.blobs.stamp(name)?)
-            }
-        };
-        let shared = matches!(source, crate::adapter::Source::Shared { .. });
-        let grant = self.adapters.acquire(key.clone())?;
-        if !grant.fresh {
-            return Ok(crate::adapter::Binding {
-                slot: grant.slot,
-                shared,
-                landed: false,
-                key,
+        instance: engine::program::InstanceId,
+        slots: &[u32],
+        planes: &[(String, Vec<u8>)],
+    ) -> Result<u32> {
+        if slots.len() != planes.len() || slots.is_empty() {
+            return Err(Fault::Adapter {
+                bank: planes
+                    .first()
+                    .map_or_else(String::new, |(name, _)| name.clone()),
+                why: format!(
+                    "lands {} planes and the runtime took {} `Adapter` slots for it; the \
+                     facts state one slot a plane",
+                    planes.len(),
+                    slots.len()
+                ),
             });
         }
-        let landed = match source {
-            crate::adapter::Source::Own { planes, .. } => {
-                self.weights
-                    .register_adapter(&self.device, &self.trace, grant.slot, planes)
-            }
-            crate::adapter::Source::Shared { name } => {
-                let seats = self.weights.bank_seats();
-                match self.blobs.planes(name, &seats) {
-                    Ok((built, _fingerprint)) => {
-                        let planes: Vec<crate::weights::AdapterPlane<'_>> = built
-                            .iter()
-                            .map(|(bank, bytes)| crate::weights::AdapterPlane {
-                                bank: bank.as_str(),
-                                bytes,
-                            })
-                            .collect();
-                        self.weights.register_adapter(
-                            &self.device,
-                            &self.trace,
-                            grant.slot,
-                            &planes,
-                        )
-                    }
-                    Err(why) => Err(why),
-                }
-            }
-        };
-        match landed {
-            Ok(()) => Ok(crate::adapter::Binding {
-                slot: grant.slot,
-                shared,
-                landed: true,
-                key,
-            }),
-            Err(why) => {
-                self.adapters.abandon(&key);
-                Err(why)
-            }
+        if let Some(id) = self.adapters.join(instance, slots) {
+            return Ok(id);
         }
+        let slot_bytes = self.pools.adapter_slot();
+        if let Some((bank, bytes)) = planes.iter().find(|(_, b)| b.len() as u64 > slot_bytes) {
+            return Err(Fault::Adapter {
+                bank: bank.clone(),
+                why: format!(
+                    "a plane of {} bytes past an `Adapter` slot of {slot_bytes}",
+                    bytes.len()
+                ),
+            });
+        }
+        let fills: Vec<(u32, &[u8])> = slots
+            .iter()
+            .zip(planes)
+            .map(|(&slot, (_, bytes))| (slot, bytes.as_slice()))
+            .collect();
+        self.pools
+            .write_adapter(&self.device, &self.handles, &fills)?;
+        let banks: Vec<String> = planes.iter().map(|(bank, _)| bank.clone()).collect();
+        Ok(self.adapters.land(instance, slots, banks))
     }
 
-    pub fn release_adapter(&mut self, binding: &crate::adapter::Binding) {
-        self.adapters.release(&binding.key);
+    /// The planes a fire of `adapters` (its distinct adapters, as its lanes
+    /// route) reads: the pool, and for each registered bank the first pool
+    /// row of each adapter's plane of it, `k` of them, `k` the power of two
+    /// at or past the count (the padding repeats the first: no lane routes
+    /// to it).
+    fn adapter_planes(
+        &self,
+        handles: &Handles,
+        inputs: &mut crate::inputs::Inputs,
+        adapters: &[u32],
+    ) -> Result<crate::run::AdapterPlanes> {
+        let pool = self.pools.root();
+        let k = adapters.len().max(1).next_power_of_two();
+        let mut banks = Vec::new();
+        for (param, p) in self.trace.params.iter().enumerate() {
+            if p.source != poem_ir::ParamSource::Registered {
+                continue;
+            }
+            let plane: u64 = p.shape.get(1..).unwrap_or(&[]).iter().product();
+            let mut starts = Vec::with_capacity(k);
+            for &id in adapters {
+                let slot = self
+                    .adapters
+                    .slot_of(id, &p.name)
+                    .ok_or_else(|| Fault::Adapter {
+                        bank: p.name.clone(),
+                        why: format!(
+                            "a lane routes to adapter {id}, which landed no plane of this bank"
+                        ),
+                    })?;
+                let row = self.pools.adapter_row(slot).ok_or_else(|| Fault::Unbound {
+                    what: format!("Adapter slot {slot}, which lies past the pool"),
+                })?;
+                starts.push(i32::try_from(row).map_err(|_| Fault::Ceiling {
+                    what: "pool rows an adapter view row names",
+                    need: u64::from(row),
+                    have: i32::MAX as u64,
+                })?);
+            }
+            let first = starts.first().copied().unwrap_or(0);
+            starts.resize(k, first);
+            banks.push((
+                param,
+                u32::try_from(plane).unwrap_or(u32::MAX),
+                inputs.i32s(handles, &starts, 1),
+            ));
+        }
+        Ok((pool, banks))
+    }
+
+    /// `instance` lets go of adapter `id`.
+    pub fn release_adapter(&mut self, instance: engine::program::InstanceId, id: u32) {
+        self.adapters.release(instance, id);
+    }
+
+    /// Adapter `id` moved to `slots`; its id now.
+    pub fn rebind_adapter(&mut self, id: u32, slots: &[u32]) -> Option<u32> {
+        match self.adapters.slots(id) {
+            Some(_) => self.adapters.rebind(id, slots),
+            None => slots
+                .first()
+                .copied()
+                .filter(|&first| self.adapters.slots(first).is_some()),
+        }
     }
 
     #[must_use]
@@ -1227,6 +2026,190 @@ impl Shell {
         fired
     }
 
+    /// The program of a shape the warm ladder parked in the disk cache, by
+    /// the fire's shape key or full key, loaded and held as a laid one is;
+    /// `None` for a shape it did not park. Gone from the disk (the cache
+    /// cleared under the load), refused by name.
+    /// The host memory the warm ladder holds compiled programs in
+    /// (`engine::Residency::host_programs`), set before it runs.
+    pub fn set_host_programs(&mut self, bytes: Option<u64>) {
+        self.host_programs = bytes;
+    }
+
+    /// The host memory the load may hold, kv tier and programs together
+    /// (`Residency::host_kv_budget`, `budget_host`).
+    pub fn set_host_bound(&mut self, bytes: Option<u64>) {
+        self.host_bound = bytes;
+    }
+
+    /// The host memory the held programs take, by the measured hold.
+    fn programs_held(&self) -> u64 {
+        self.hold_per_kib
+            .saturating_mul(self.device.held_text_bytes())
+            / 1024
+    }
+
+    fn load_parked(
+        &mut self,
+        shape_key: Option<[u8; 32]>,
+        key: Option<[u8; 32]>,
+    ) -> Result<Option<std::sync::Arc<crate::device::Program>>> {
+        let at = shape_key
+            .and_then(|k| self.parked_shapes.get(&k).copied())
+            .or(key.filter(|k| self.parked.contains_key(k)));
+        let Some(at) = at else {
+            return Ok(None);
+        };
+        let Some(parked) = self.parked.remove(&at) else {
+            return Ok(None);
+        };
+        if let Err(fault) = self.make_host_room(self.hold_of(&parked), Some(at)) {
+            self.parked.insert(at, parked);
+            return Err(fault);
+        }
+        let kept = parked.clone();
+        let resident = crate::device::resident_bytes();
+        let Some(program) = self.device.load_parked_code(&parked.code, parked.sig)? else {
+            // Not loading from the disk cache though its file stood as it
+            // was kept at the ladder (corrupt within its length): nothing is
+            // built after ready, so the fire is refused; its record is
+            // dropped with the file, and the next load builds it before ready.
+            let file = match &parked.code {
+                crate::device::Code::Cached { name, .. } => {
+                    if let Some(scope) = self.trace_scope.as_deref() {
+                        self.device.mend_record(scope, &at, name);
+                    }
+                    name.clone()
+                }
+                crate::device::Code::Text(text) => {
+                    self.device.cached_name(text).unwrap_or_default()
+                }
+            };
+            return Err(Fault::Program {
+                at: "serve::ladder",
+                why: format!(
+                    "the program record {} names does not load from the disk cache (file {file}): \
+                     nothing is built after ready, so this fire is refused; the record is \
+                     dropped and the next load builds the program before ready",
+                    crate::device::hex(&at)
+                ),
+            });
+        };
+        self.probed.insert(at, parked.probed);
+        self.traced.insert(at, std::sync::Arc::clone(&program));
+        // unmeasured by the loader: this load's own growth
+        if self.hold_per_kib == 0
+            && let (Some(before), Some(after)) = (resident, crate::device::resident_bytes())
+            && !kept.code.is_empty()
+        {
+            self.hold_per_kib =
+                after.saturating_sub(before).saturating_mul(1024) / kept.code.len() as u64;
+        }
+        if self.device.code_on_disk(&kept.code) {
+            self.evictable.insert(at, (kept, shape_key, self.fires));
+        }
+        Ok(Some(program))
+    }
+
+    /// The host memory `parked`'s program would hold, by the loader's
+    /// measured hold a KiB of text (0 where none was measured).
+    fn hold_of(&self, parked: &Parked) -> u64 {
+        self.hold_per_kib.saturating_mul(parked.code.len() as u64) / 1024
+    }
+
+    /// Parks again, least recently fired first (a program the loader holds
+    /// and no fire took yet first of all), programs held in host memory
+    /// while `need` more bytes do not fit: the host's free memory beside
+    /// what the guest stages' compiles take, and the stated host bound (the
+    /// host tier's kv and the programs together: the worker's resident
+    /// memory, less the drops under way, beside `need`). Waits on the drops
+    /// it needs. With none left to drop, the stated bound is never passed:
+    /// refused by name (the tier is seated so the kv fits it with every
+    /// program dropped, and one program beside: `Shell::seat_tiers`); the
+    /// host's free memory alone short, the caller goes ahead. `at` is never
+    /// dropped (the program about to load).
+    fn make_host_room(&mut self, need: u64, at: Option<[u8; 32]>) -> Result<()> {
+        let bound = self.host_bound;
+        // with `freed` more bytes on their way out
+        let fits_freed = |shell: &Shell, freed: u64| {
+            let pending = shell.dropper.pending().saturating_add(freed);
+            crate::device::available_memory().is_none_or(|free| {
+                free.saturating_add(pending)
+                    >= need.saturating_add(crate::guest::run::guest_reserve())
+            }) && bound.is_none_or(|bound| {
+                crate::device::resident_bytes()
+                    .is_none_or(|held| held.saturating_sub(pending).saturating_add(need) <= bound)
+            })
+        };
+        let fits = |shell: &Shell| fits_freed(shell, 0);
+        let within = |shell: &Shell| {
+            crate::device::resident_bytes()
+                .is_none_or(|held| evict::within_bound(bound, held, shell.dropper.pending(), need))
+        };
+        // the droppable ones: a fired program by its last fire, one the
+        // loader holds and no fire took before any (`evict::choose`)
+        let candidates: Vec<evict::Droppable> = (self.evictable.iter())
+            .map(|(key, (p, _, used))| evict::Droppable {
+                key: *key,
+                used: *used + 1,
+                bytes: self.hold_of(p),
+            })
+            .chain(
+                (self.parked.iter())
+                    .filter(|(_, p)| self.device.holds_key(&p.code.hash()))
+                    .map(|(key, p)| evict::Droppable {
+                        key: *key,
+                        used: 0,
+                        bytes: self.hold_of(p),
+                    }),
+            )
+            .collect();
+        let (victims, _) = evict::choose(candidates, at, |freed| fits_freed(self, freed));
+        let dropped = victims.len();
+        for victim in victims {
+            let mut held = Vec::new();
+            let bytes = if let Some((again, shape, _)) = self.evictable.remove(&victim) {
+                held.extend(self.traced.remove(&victim));
+                if let Some(shape) = shape {
+                    held.extend(self.shaped.remove(&shape));
+                }
+                held.extend(self.device.take_key(&again.code.hash()));
+                let bytes = self.hold_of(&again);
+                self.parked.insert(victim, again);
+                bytes
+            } else if let Some(parked) = self.parked.get(&victim) {
+                held.extend(self.device.take_key(&parked.code.hash()));
+                self.hold_of(parked)
+            } else {
+                continue;
+            };
+            self.dropper.drop_later(held, bytes);
+        }
+        // the room the drops under way free, before the caller takes it
+        while !fits(self) && self.dropper.pending() > 0 {
+            self.dropper.wait();
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                need,
+                "xla programs parked again: the host's memory, or its stated bound, held no more"
+            );
+        }
+        if let Some(bound) = bound
+            && !within(self)
+        {
+            return Err(Fault::Ceiling {
+                what: "bytes of the worker's resident memory under budget_host, every program but the one loading dropped",
+                need: crate::device::resident_bytes()
+                    .unwrap_or(0)
+                    .saturating_add(need),
+                have: bound,
+            });
+        }
+        Ok(())
+    }
+
     pub fn fire_full(&mut self, lanes: &[Seated<'_>]) -> Result<Fired> {
         self.fire_full_with(lanes, &[])
     }
@@ -1234,6 +2217,7 @@ impl Shell {
     /// One fire whose lanes may carry clips on the voxel axis.
     pub fn fire_full_with(&mut self, lanes: &[Seated<'_>], clips: &[Clips<'_>]) -> Result<Fired> {
         let result = self.fire_inner(lanes, clips);
+        self.fire_shape = None;
         self.handles.rewind();
         result
     }
@@ -1255,11 +2239,50 @@ impl Shell {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// States the shape of the next fire (`engine::fire::Step::shape`).
+    pub fn shape_next(&mut self, shape: Option<engine::FireShape>) {
+        self.fire_shape = shape;
+    }
+
+    /// The rung a buffered fire pads up to: its stated shape's
+    /// (`engine::StepFacts::buffered_rungs`, coarser than the folded rungs,
+    /// so the buffered programs are laid at those alone). `None` for a
+    /// folded fire or one stating no shape.
+    fn buffered_rung(&self) -> Option<u32> {
+        let shape = self.fire_shape?;
+        if shape.treatment != engine::Treatment::Buffers {
+            return None;
+        }
+        let stated = self.steps.as_ref()?.shapes.get(shape.id as usize)?;
+        debug_assert!(
+            self.budgets.tokens.buckets.contains(&stated.rung),
+            "a stated rung {} is a bucket of the load's",
+            stated.rung
+        );
+        Some(stated.rung)
+    }
+
     fn fire_inner(&mut self, lanes: &[Seated<'_>], clips: &[Clips<'_>]) -> Result<Fired> {
         if lanes.is_empty() {
             return Ok(Fired::default());
         }
         let real_rows: u32 = lanes.iter().map(|s| s.lane.tokens.len() as u32).sum();
+        // A mixed fire the load states laid, counted as the runtime's cutter
+        // counts it (a prompt a lane of more than one row, a decode one).
+        let (prompts, prompt_rows) = lanes
+            .iter()
+            .filter(|s| s.lane.tokens.len() > 1)
+            .fold((0u32, 0u32), |(n, r), s| {
+                (n + 1, r + s.lane.tokens.len() as u32)
+            });
+        let decodes = lanes.iter().filter(|s| s.lane.tokens.len() == 1).count() as u32;
+        self.laid_mixed = prompts > 0
+            && decodes > 0
+            && clips.is_empty()
+            && self.stated_limits.is_some_and(|limits| {
+                self.mixed_lanes()
+                    .fits(&limits, prompts, prompt_rows, decodes)
+            });
         let decode = lanes.iter().all(|s| s.lane.tokens.len() == 1);
         if !decode
             && clips.is_empty()
@@ -1267,7 +2290,8 @@ impl Shell {
         {
             return self.fire_padded(lanes, clips, &pads, true);
         }
-        let bucket = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, real_rows);
+        let bucket = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, real_rows)
+            .max(self.buffered_rung().unwrap_or(0));
         let pad = bucket.saturating_sub(real_rows);
         let pad_word = lanes[lanes.len() - 1].lane.word;
         let pad_lanes: Vec<(u32, u64)> = if pad == 0 {
@@ -1292,30 +2316,159 @@ impl Shell {
     /// by how the runtime happened to cut its lanes. `None` when a class
     /// present reads more than tokens (a mask, an adapter, media),
     /// or the padding does not fit the rows or the lanes.
-    fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
+    /// The class of a lane the warm ladder lays fires of: one that reads
+    /// only tokens and its mask (no adapter, media or guest input) and its last row
+    /// or every row, in a class that reads no more. `None` for any other.
+    fn ladder_class(&self, seated: &Seated<'_>) -> Option<usize> {
         let classes = &self.compiled.classes;
+        // (a lane's mask is data: it stages the load's mask plane)
+        if seated.media.is_some()
+            || seated.adapter.is_some()
+            || seated.kv_less
+            // a lane reads its last row, or every row (a drafting lane's
+            // window or prompt)
+            || seated.readout.is_some_and(|r| {
+                r.len() != 1 && !r.iter().copied().eq(0..seated.lane.tokens.len() as u32)
+            })
+            || !seated.inputs.is_empty()
+        {
+            return None;
+        }
+        let class = classes.class_of(seated.lane.word & classes.mask)?;
+        let reads_input =
+            (self.dit.feeds().inputs.iter()).any(|(_, readers)| readers.contains(class));
+        (!self.wide.contains(class) && !self.corrected.contains(class) && !reads_input)
+            .then_some(class)
+    }
+
+    /// Whether the warm ladder lays every fire of these lanes' kind: lanes
+    /// of ladder classes that each take a token and its drafts at most (a
+    /// decode, a drafting lane's window), laid at every page bound. A
+    /// prompt's fire takes the page bound of the context its lanes hold,
+    /// which the ladder lays one of (it lays prompts fresh), and a plain
+    /// lane reading every row puts the fire's readout count at any rung:
+    /// those are built and counted until both are data.
+    fn ladder_lays(&self, lanes: &[Seated<'_>]) -> bool {
+        lanes.iter().all(|seated| {
+            self.ladder_class(seated).is_some_and(|class| {
+                if self.drafting.contains(&class) {
+                    seated.lane.tokens.len() as u32 <= 1 + self.draft_depth
+                } else {
+                    seated.lane.tokens.len() == 1 && seated.readout.is_none_or(|r| r.len() == 1)
+                }
+            })
+        })
+    }
+
+    /// The decode lanes a fire beside prompt rows is laid with: the warm
+    /// ladder's largest decode rung, the lanes left beside the smallest
+    /// prompt rung (`mixed_host_rung`) on the seats held. A mixed fire of
+    /// as many decodes or fewer pads them to it, so one program a row
+    /// bucket and prompt rung holds every decode count.
+    pub(crate) fn mixed_decode_capacity(&self) -> u32 {
+        let pad = self.pad;
+        let lanes_cap = self
+            .budgets
+            .tokens
+            .max_lanes
+            .saturating_sub(pad.mixed_host_rung)
+            .min(self.held.len() as u32);
+        let top = pad.rung(lanes_cap);
+        self.budgets
+            .tokens
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&d| d <= top && pad.rung(d) == d)
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// The mixed fires the load lays, as the runtime's cutter reads them
+    /// (`engine::MixedLanes`): each prompt lane rung from the mixed host rung
+    /// up, with the decode lanes beside it (`mixed_decode_lanes`), the
+    /// pairs the warm ladder lays.
+    pub fn mixed_lanes(&self) -> engine::MixedLanes {
+        let pad = self.pad;
+        let max = self.budgets.tokens.max_lanes;
+        let mut rungs = Vec::new();
+        let mut p = pad.mixed_host_rung;
+        while p < max {
+            let d = self.mixed_decode_lanes(p);
+            if d == 0 {
+                break;
+            }
+            rungs.push(engine::MixedRung {
+                prompt_lanes: p,
+                decode_lanes: d,
+            });
+            p = pad.next(p);
+        }
+        engine::MixedLanes::Laid(rungs)
+    }
+
+    /// The most prompts a fire of prompts alone lays out with: their count
+    /// and a rest lane padded to their lane rung (`canonical_pads`), within
+    /// the lanes a fire takes (`FireLimits::prefill_lanes`).
+    pub fn prefill_lanes(&self) -> u32 {
+        let max = self.budgets.tokens.max_lanes;
+        (1..=max)
+            .rev()
+            .find(|&n| self.pad.rung(n + 1) <= max)
+            .unwrap_or(0)
+    }
+
+    /// Holds the fire limits the load stated (`Capabilities::limits`): a
+    /// mixed fire within them and [`Self::mixed_lanes`] is one the load
+    /// states laid.
+    pub fn state_limits(&mut self, limits: engine::FireLimits) {
+        self.stated_limits = Some(limits);
+    }
+
+    /// The decode lanes beside `prompt_lanes` prompt lanes (their rung, the
+    /// rest lane counted): the largest decode rung within the capacity
+    /// ([`Self::mixed_decode_capacity`]) that fits in the lanes they leave.
+    pub(crate) fn mixed_decode_lanes(&self, prompt_lanes: u32) -> u32 {
+        let pad = self.pad;
+        let left = self.budgets.tokens.max_lanes.saturating_sub(prompt_lanes);
+        let cap = self.mixed_decode_capacity().min(left);
+        self.budgets
+            .tokens
+            .buckets
+            .iter()
+            .copied()
+            .filter(|&d| d <= cap && pad.rung(d) == d)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn canonical_pads(&self, lanes: &[Seated<'_>], real_rows: u32) -> Option<Vec<(u32, u64)>> {
+        let plain = lanes
+            .iter()
+            .map(|seated| {
+                Some((
+                    self.ladder_class(seated)?,
+                    seated.lane.word,
+                    seated.lane.tokens.len() as u32,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.canonical_layout(&plain, real_rows, self.buffered_rung())
+    }
+
+    /// [`Self::canonical_pads`] of lanes as `(class, word, rows)`, a
+    /// buffered fire's stated rung `buffered`: what the load-time walk of the
+    /// compositions the runtime forms maps each through
+    /// (`Shell::unlaid_compositions`).
+    pub(crate) fn canonical_layout(
+        &self,
+        lanes: &[(usize, u64, u32)],
+        real_rows: u32,
+        buffered: Option<u32>,
+    ) -> Option<Vec<(u32, u64)>> {
         // (class, word, lanes, rows)
         let mut by: Vec<(usize, u64, u32, u32)> = Vec::new();
-        for seated in lanes {
-            if seated.media.is_some()
-                || seated.mask.is_some()
-                || seated.adapter.is_some()
-                || seated.kv_less
-                || seated.readout.is_some_and(|r| r.len() != 1)
-                || !seated.inputs.is_empty()
-                || seated.writes.is_some()
-            {
-                return None;
-            }
-            let word = seated.lane.word;
-            let class = classes.class_of(word & classes.mask)?;
-            if self.masked.contains(class)
-                || self.wide.contains(class)
-                || self.corrected.contains(class)
-            {
-                return None;
-            }
-            let rows = seated.lane.tokens.len() as u32;
+        for &(class, word, rows) in lanes {
             match by.iter_mut().find(|(c, ..)| *c == class) {
                 Some(entry) => {
                     entry.2 += 1;
@@ -1367,9 +2520,11 @@ impl Shell {
                 })
                 .collect();
             let exact = real_rows + ones.len() as u32;
+            // (a buffered fire fills its stated rung, not a folded bucket)
             if !mixed
                 && exact >= pad.prefill_floor
                 && buckets.contains(&exact)
+                && buffered.is_none_or(|rung| rung == exact)
                 && lanes.len() + ones.len() <= self.budgets.tokens.max_lanes as usize
             {
                 return Some(ones);
@@ -1395,9 +2550,16 @@ impl Shell {
             .tokens
             .max_lanes
             .saturating_sub(pad.rung(by[host].2 + 1).max(host_floor));
-        for (at, &(_, word, n, _)) in by.iter().enumerate() {
+        // A fire's decodes beside its prompt rows (a class of one row a lane)
+        // pad to the decode lanes their prompts' rung leaves
+        // (`mixed_decode_lanes`): every decode count up to it then shares the
+        // bucket's program at that prompt rung.
+        let beside = self.mixed_decode_lanes(pad.rung(by[host].2 + 1).max(host_floor));
+        for (at, &(_, word, n, rows)) in by.iter().enumerate() {
             let want = if at == host {
                 pad.rung(n + 1).max(host_floor) - 1
+            } else if mixed && rows == n && n <= beside {
+                beside
             } else if by.len() == 2 && pad.rung(n) > left && n <= left {
                 left
             } else {
@@ -1430,6 +2592,8 @@ impl Shell {
         } else {
             bucket
         };
+        // a buffered fire at its stated rung
+        let bucket = bucket.max(buffered.unwrap_or(0));
         pads.push((bucket - real_rows - ones, by[host].1));
         if lanes.len() + pads.len() > self.budgets.tokens.max_lanes as usize {
             return None;
@@ -1447,6 +2611,42 @@ impl Shell {
     ) -> Result<Fired> {
         let t0 = std::time::Instant::now();
         let real = lanes.len();
+        // A plain lane reading every row of itself (prompt logprobs) is
+        // fired reading its last row: the forward is the plain fire's
+        // program, and a readout program reads its readout rows again
+        // from the final hidden rows the forward returns (`trace_readout`).
+        let full: Vec<Seated<'_>> = lanes.to_vec();
+        // A float lane (its class reads no kv: an encoder's, a DiT's) reads
+        // its every row out through the readout planes as it always did: it
+        // has no final hidden rows to read again.
+        let reads_again = |s: &Seated<'_>| {
+            s.readout.is_some_and(|r| r.len() > 1)
+                && (self.compiled.classes)
+                    .class_of(s.lane.word & self.compiled.classes.mask)
+                    .is_some_and(|class| {
+                        !self.drafting.contains(&class) && self.kv_classes.contains(class)
+                    })
+        };
+        let every_row = lanes.iter().any(reads_again);
+        if every_row && (self.readout_slice.1.is_empty() || self.readout_store_rows().is_none()) {
+            return Err(Fault::Program {
+                at: "serve::readout_program",
+                why: "a lane reads every row of itself and this load reads no readout output \
+                      again (no readout store, or every readout output's slice writes a cache)"
+                    .into(),
+            });
+        }
+        let cut: Vec<Seated<'_>> = lanes
+            .iter()
+            .map(|s| match s.readout {
+                Some(r) if reads_again(s) => Seated {
+                    readout: Some(&r[r.len() - 1..]),
+                    ..*s
+                },
+                _ => *s,
+            })
+            .collect();
+        let lanes: &[Seated<'_>] = &cut;
         let token_feeds = std::mem::take(&mut self.token_feeds);
         self.check_media(lanes)?;
         let clips_of = clips_by_lane(clips, lanes)?;
@@ -1506,25 +2706,110 @@ impl Shell {
         // record piece, its rs verb's pages.
         let mut lane_records: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_verbs: Vec<engine::fire::RsVerb> = Vec::with_capacity(lanes.len());
+        // Each lane's own rows and the buffered rows it replays ahead of them
+        // (a decode lane's included).
+        let mut replays: Vec<(u32, u32)> = Vec::with_capacity(lanes.len());
         let mut lane_pages: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
         let mut lane_windows: Vec<Vec<u32>> = Vec::with_capacity(lanes.len());
+        // The windowed state: each windowed lane's
+        // table composed of its ring, buffer and own-row pages, the pages
+        // filled before the fire and folded into the rings after it.
+        let ring_shape = self.pools.layout().ring().map(|s| s.id);
+        let ring_of = |seated: &Seated<'_>| -> Option<Vec<u32>> {
+            let id = ring_shape?;
+            let (_, pairs) = seated.fixed.iter().find(|(held, _)| *held == id)?;
+            Some(pairs.iter().map(|&[_, cow]| cow).collect())
+        };
+        let rings_named: Vec<Option<Vec<u32>>> = lanes.iter().map(ring_of).collect();
+        let own_grains = self.pools.own_grains();
+        let mut own_taken = 0usize;
+        let mut ring_fills: Vec<(u32, u32)> = Vec::new();
+        let mut ring_folds: Vec<(u32, u32)> = Vec::new();
+        let widest = paging.window.map_or(0, |w| w.tokens);
         for (at, seated) in lanes.iter().enumerate() {
             let pages = match kv_shape {
                 Some(id) if !seated.kv_less => self.pools.grains(id, seated.pages)?,
                 _ => seated.pages.to_vec(),
             };
-            let window = match window_shape {
-                Some(id) if !seated.kv_less && !seated.window.is_empty() => {
-                    self.pools.grains(id, seated.window)?
-                }
-                Some(_) if !seated.kv_less && !seated.pages.is_empty() => {
-                    return Err(Fault::Program {
+            let window = match (window_shape, ring_shape) {
+                (Some(buffer_id), Some(ring_id)) if !seated.kv_less => {
+                    let refuse = |why: String| Fault::Program {
                         at: "serve::prepare",
-                        why: format!(
-                            "lane {at} names kv slots and no window list table, which this \
-                             load's windowed rows read"
+                        why: format!("lane {at}: {why}"),
+                    };
+                    let have = match seated.held {
+                        Some(held) => held,
+                        None => self
+                            .held
+                            .get(seated.lane.slot as usize)
+                            .copied()
+                            .unwrap_or(0),
+                    };
+                    let rows = seated.lane.tokens.len() as u32;
+                    // A lane the engine fires for itself (the staging pass,
+                    // a ladder fire) folds every row it computes; one the
+                    // runtime fires states its fold (`api`, refused there
+                    // without one).
+                    let (fold, folded) = match seated.window_fold {
+                        Some(fold) => (fold, seated.folded),
+                        None => (
+                            engine::fire::WindowFold {
+                                base: (have + rows) / paging.page_size.max(1)
+                                    * paging.page_size.max(1),
+                                fold: engine::fire::FoldLen::Host(rows),
+                                lineage: engine::fire::Lineage::Set,
+                            },
+                            have,
                         ),
-                    });
+                    };
+                    let fold_rows = match fold.fold {
+                        engine::fire::FoldLen::Host(rows) => rows,
+                        engine::fire::FoldLen::Device => {
+                            return Err(refuse(
+                                "folds by a device count, which this engine's rings do not take yet".into(),
+                            ));
+                        }
+                    };
+                    let ring_refs = rings_named[at].clone().ok_or_else(|| {
+                        refuse(format!(
+                            "names no ring piece of shape {ring_id} in its record"
+                        ))
+                    })?;
+                    let ring = self.pools.grains(ring_id, &ring_refs)?;
+                    let buffer = self.pools.grains(buffer_id, seated.window)?;
+                    let alone = rings_named
+                        .iter()
+                        .filter(|r| r.as_ref() == Some(&ring_refs))
+                        .count()
+                        == 1;
+                    let mut own = || -> Result<u32> {
+                        let page = own_grains.get(own_taken).copied().ok_or(Fault::Ceiling {
+                            what: "own-row pages of a windowed fire",
+                            need: own_taken as u64 + 1,
+                            have: own_grains.len() as u64,
+                        })?;
+                        own_taken += 1;
+                        Ok(page)
+                    };
+                    let composed = ring::compose(
+                        &ring::RingLane {
+                            ring: &ring,
+                            buffer: &buffer,
+                            base: fold.base,
+                            have,
+                            rows,
+                            folded,
+                            fold: fold_rows,
+                            alone,
+                        },
+                        paging.page_size,
+                        widest,
+                        0,
+                        &mut own,
+                    )?;
+                    ring_fills.extend(composed.fills);
+                    ring_folds.extend(composed.folds);
+                    composed.table
                 }
                 _ => Vec::new(),
             };
@@ -1576,6 +2861,7 @@ impl Shell {
                     base,
                     folded,
                     fold,
+                    lineage,
                 } => {
                     let id = rs_shape.ok_or_else(|| Fault::Program {
                         at: "serve::rs",
@@ -1586,13 +2872,67 @@ impl Shell {
                         base: *base,
                         folded: *folded,
                         fold: *fold,
+                        lineage: *lineage,
                     }
                 }
                 engine::fire::RsVerb::Fold => engine::fire::RsVerb::Fold,
             });
+            let replayed = if let engine::fire::RsVerb::Buffer {
+                folded, lineage, ..
+            } = seated.rs
+            {
+                let first = seated.first.unwrap_or(have);
+                let reads = engine::fire::buffered_reads(seated.mask, *folded, first, *lineage)
+                    .map_err(|e| Fault::Program {
+                        at: "serve::rs",
+                        why: format!("lane {at}: {e}"),
+                    })?;
+                reads.iter().map(|r| r.len() as u32).sum::<u32>()
+            } else {
+                0
+            };
+            replays.push((seated.lane.tokens.len() as u32, replayed));
+        }
+        // The fire's replay against its rung's, as the load stated it and the
+        // runtime chose the rung by (`crate::rs::rung_replay`,
+        // `engine::fire::rung_holds`): every lane's replayed rows lie in the
+        // window scratch, so it is never compact. One past it is refused
+        // here, before the fire writes anything.
+        let rung = crate::rs::rung_replay(descriptor.bucket);
+        let count = engine::ReplayRows::of_lanes(replays.iter().copied(), false);
+        if engine::fire::replay_check_on() {
+            engine::fire::replay_agrees(
+                lanes
+                    .iter()
+                    .zip(&replays)
+                    .map(|(seated, &(own, _))| (own, seated.replay_stated)),
+                &rung,
+                count,
+                false,
+                false,
+                false,
+                false,
+            )
+            .map_err(|why| Fault::Program {
+                at: "serve::rs",
+                why,
+            })?;
+        }
+        if let Err(past) = engine::fire::rung_holds(&rung, count) {
+            return Err(Fault::Ceiling {
+                what: "rows a fire's lanes own and replay (its rung's own rows and carried room)",
+                need: past.rows,
+                have: past.max,
+            });
         }
         if !copies.is_empty() {
             self.pools.copy(&self.device, &self.handles, &copies)?;
+        }
+        // own-row pages holding folded rows below the fire: the ring's,
+        // after any record's copy-on-first-fold above
+        if !ring_fills.is_empty() {
+            self.pools
+                .copy_pages(&self.device, &self.handles, &ring_fills)?;
         }
         if !fresh.is_empty() {
             self.pools.zero(&self.device, &self.handles, &fresh)?;
@@ -1616,6 +2956,14 @@ impl Shell {
         let mut record_rows: Vec<Vec<i32>> = vec![Vec::with_capacity(rows as usize); records.len()];
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(submitted.len());
         let any_adapter = lanes.iter().any(|s| s.adapter.is_some());
+        // The fire's distinct adapters, in lane order: a lane routes by its
+        // adapter's place here, and the fire gathers these planes alone.
+        let mut fire_adapters: Vec<u32> = Vec::new();
+        for id in lanes.iter().filter_map(|s| s.adapter) {
+            if !fire_adapters.contains(&id) {
+                fire_adapters.push(id);
+            }
+        }
         let mut adapter_routes: Vec<i32> = Vec::new();
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(submitted.len());
         let mut rs_active = false;
@@ -1640,6 +2988,7 @@ impl Shell {
                 masks.push(crate::mask::LaneMask {
                     mask: None,
                     have: 0,
+                    folded: 0,
                     rows: row.rows,
                     wide: false,
                 });
@@ -1703,16 +3052,18 @@ impl Shell {
             if kv_mask.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if kv_mask.is_some() != runs_masked_arm {
-                return Err(Fault::MaskWord {
+            // The mask is per-lane data: a lane stating none reads every key
+            // in a masked arm too. One stated where no arm applies it is refused.
+            if kv_mask.is_some() && !runs_masked_arm {
+                return Err(Fault::MaskUnread {
                     lane: row.source,
                     word: lane.word,
-                    runs_masked_arm,
                 });
             }
             masks.push(crate::mask::LaneMask {
                 mask: kv_mask,
                 have,
+                folded: seated.folded.min(have),
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
             });
@@ -1721,10 +3072,13 @@ impl Shell {
                 return Err(Fault::Adapterless { lane: row.source });
             }
             if any_adapter {
-                let id = seated
-                    .adapter
-                    .map_or(-1, |id| i32::try_from(id).unwrap_or(-1));
-                adapter_routes.extend(std::iter::repeat_n(id, row.rows as usize));
+                let route = seated.adapter.map_or(-1, |id| {
+                    fire_adapters
+                        .iter()
+                        .position(|&a| a == id)
+                        .map_or(-1, |at| i32::try_from(at).unwrap_or(-1))
+                });
+                adapter_routes.extend(std::iter::repeat_n(route, row.rows as usize));
             }
             let _ = runs_correction;
             if !matches!(seated.rs, engine::fire::RsVerb::Fold) {
@@ -1905,11 +3259,30 @@ impl Shell {
         let mut inputs = Inputs::new();
         windows.bind(handles, &mut inputs)?;
 
-        let staged = crate::mask::stage(&masks)?;
+        // The mask plane's columns are the load's: every key a lane can hold,
+        // at a power of two, so a masked fire's program is keyed by its shape
+        // and not by how far its lanes have read.
+        let mask_width = (paging.pages_per_slot.max(1) * paging.page_size.max(1))
+            .max(256)
+            .next_power_of_two();
+        let staged = crate::mask::stage(&masks, mask_width)
+            .map_err(|fault| fault.of_rows(composition.lanes()))?;
         // The mask plane is one row of `stride` key bytes per token row (at
         // least one column), and the enable flags one byte per token row.
+        // A mixed fire (prompt rows beside decodes) on a load whose classes
+        // read a mask stages the whole plane whether a lane of it is masked
+        // or not, every row's flag off where none is: the mask is data of
+        // the fire's shape, so a masked lane's mixed fire (a beam's rescore
+        // beside other groups' decodes) is the program the warm ladder laid
+        // for the plain one. Its own lanes say so, not its padding: a
+        // padding lane of one row is no decode. A prompt alone stages it
+        // where a lane of it is masked (its program is the ladder's masked
+        // twin of the plain one).
+        let mixed = lanes.iter().any(|s| s.lane.tokens.len() > 1)
+            && lanes.iter().any(|s| s.lane.tokens.len() == 1);
         let (mask_bytes, enabled_bytes, mask_stride) = match &staged {
             Some(staged) => (staged.bytes.clone(), staged.enabled.clone(), staged.stride),
+            None if mixed && !self.masked.is_empty() => (Vec::new(), Vec::new(), mask_width),
             None => (Vec::new(), Vec::new(), 0),
         };
         let columns = mask_stride.max(1);
@@ -1920,11 +3293,79 @@ impl Shell {
         let mask = inputs.raw(handles, Dtype::U8, rows, columns, mask_bytes);
         let mask_enabled = inputs.raw(handles, Dtype::U8, rows, 1, enabled_bytes);
 
-        let (readout_rows, readout_layout, readout_indptr) =
+        let (mut readout_rows, readout_layout, readout_indptr) =
             readout_table(&composition, lanes, real)?;
-        self.readouts.insert(readout_rows.len() as u32);
-        let tokens_at = inputs.pack_offset();
+        // Every lane's readout rows as its submitter asked, the readout
+        // program's pick (the store's rows, in lane order) and each lane's
+        // place in it.
+        let full_table = if every_row {
+            let store = self.readout_store_rows().unwrap_or(0);
+            let (full_rows, full_layout, _) = readout_table(&composition, &full, real)?;
+            let mut pick: Vec<i32> = Vec::new();
+            let mut placed = vec![(0u32, 0u32); real];
+            for (source, &(first, count)) in full_layout.iter().enumerate().take(real) {
+                placed[source] = (pick.len() as u32, count);
+                pick.extend_from_slice(&full_rows[first as usize..(first + count) as usize]);
+            }
+            if pick.len() > store as usize {
+                return Err(Fault::Program {
+                    at: "serve::readout_plane",
+                    why: format!(
+                        "the fire's lanes read out {} rows, past the {store} the load's store \
+                         holds (`ReadoutFacts::store_rows`)",
+                        pick.len()
+                    ),
+                });
+            }
+            if let Some(&last) = pick.last() {
+                pick.resize(store as usize, last);
+            }
+            Some((full_rows, full_layout, placed, pick))
+        } else {
+            None
+        };
+        // The fire's readout count at a rung, so the program is keyed by the
+        // rung and not by how many rows its lanes read (prompt logprobs, a
+        // draft block): the rows past the count repeat the last, read by no
+        // lane.
+        let want =
+            poem_exec::fire::rung_of(&self.budgets.tokens.buckets, readout_rows.len() as u32);
+        if let Some(&last) = readout_rows.last() {
+            readout_rows.resize((want as usize).max(readout_rows.len()), last);
+        }
+        // A fire whose lanes read more than their last row, padded, lands
+        // its real lanes' readouts alone, in lane order: its padding lanes'
+        // rows (a row each) are read out and dropped, so the planes hold no
+        // more than the runtime's cut lets the real lanes read
+        // (`ReadoutFacts::store_rows`).
+        let compacts = lanes[..real]
+            .iter()
+            .any(|s| s.readout.is_some_and(|r| r.len() > 1))
+            && composition
+                .lanes()
+                .iter()
+                .any(|row| row.source as usize >= real);
+        let mut plane_layout = readout_layout.clone();
+        let readout_pick = compacts.then(|| {
+            let mut pick: Vec<i32> = Vec::new();
+            for (source, &(first, count)) in readout_layout.iter().enumerate() {
+                plane_layout[source] = (pick.len() as u32, count);
+                pick.extend((first..first + count).map(|at| at as i32));
+            }
+            let want = poem_exec::fire::rung_of(&self.budgets.tokens.buckets, pick.len() as u32);
+            if let Some(&last) = pick.last() {
+                pick.resize((want as usize).max(pick.len()), last);
+            }
+            pick
+        });
+        let plane_rows = readout_pick.as_ref().map_or(readout_rows.len(), Vec::len) as u32;
+        self.readouts.insert(plane_rows);
+        let readout_pick = readout_pick.map(|pick| inputs.i32s(handles, &pick, 1));
         let tokens_t = inputs.i32s(handles, &tokens, 1);
+        // Tokens a guest pass put on the device: the pool row and lane the
+        // fire gathers each from (row `-1`: the host's own).
+        let mut token_rows = vec![-1i32; tokens.len()];
+        let mut token_lanes = vec![0i32; tokens.len()];
         for feed in &token_feeds {
             let Some(row) = composition
                 .lanes()
@@ -1939,25 +3380,68 @@ impl Shell {
                     ),
                 });
             };
-            if row.rows as usize != feed.words.len() {
+            if row.rows as usize != feed.at.len() {
                 return Err(Fault::Program {
                     at: "serve::tokens",
                     why: format!(
                         "lane {} is fed {} token(s) off the device and seats {} row(s)",
                         feed.lane,
-                        feed.words.len(),
+                        feed.at.len(),
                         row.rows
                     ),
                 });
             }
-            for (i, &word) in feed.words.iter().enumerate() {
-                inputs.patch(
-                    tokens_at + row.row_offset + i as u32,
-                    std::sync::Arc::clone(&feed.src),
-                    word,
-                );
+            for (i, &(r, l)) in feed.at.iter().enumerate() {
+                let at = (row.row_offset + i as u32) as usize;
+                token_rows[at] = i32::try_from(r).map_err(|_| Fault::Ceiling {
+                    what: "pool rows an i32 addresses",
+                    need: u64::from(r),
+                    have: i32::MAX as u64,
+                })?;
+                token_lanes[at] = l as i32;
             }
         }
+        let token_words = (
+            inputs.i32s(handles, &token_rows, 1),
+            inputs.i32s(handles, &token_lanes, 1),
+        );
+        // The streamed weights this fire reads: each streamed table's row
+        // for every token row, each streamed bank's expert places
+        // (`crate::store::streamed`).
+        let feed_rows: Vec<(u32, usize)> = token_feeds
+            .iter()
+            .map(|feed| {
+                composition
+                    .lanes()
+                    .iter()
+                    .find(|row| row.source as usize == feed.lane)
+                    .map_or((0, feed.lane), |row| (row.row_offset, feed.lane))
+            })
+            .collect();
+        let mut real_rows = vec![false; tokens.len()];
+        for row in composition.lanes() {
+            if (row.source as usize) < real {
+                let from = row.row_offset as usize;
+                for r in real_rows.iter_mut().skip(from).take(row.rows as usize) {
+                    *r = true;
+                }
+            }
+        }
+        let runs_now = self.deferred.is_none() && !self.device.is_dry();
+        let staged_weights = stream::stream_fire(
+            &mut self.streamed,
+            &mut self.pools,
+            &self.device,
+            handles,
+            &mut inputs,
+            &tokens,
+            &token_feeds,
+            &feed_rows,
+            &real_rows,
+            runs_now,
+            self.stage_all,
+        )?;
+        self.fire_streamed = staged_weights.fire.clone();
         // **THE STATED POSITION IS A ROTATION, NOT A ROW.** The rotary ops
         // read `positions` (what the lane states: shifted past an attention
         // sink, rewound by a StreamingLLM inferlet, or M-RoPE's text rotating
@@ -1977,6 +3461,10 @@ impl Shell {
             .map(|rows| inputs.i32s(handles, rows, 1))
             .collect();
         let adapter_t = any_adapter.then(|| inputs.i32s(handles, &adapter_routes, 1));
+        let adapter_planes = match any_adapter {
+            true => Some(self.adapter_planes(handles, &mut inputs, &fire_adapters)?),
+            false => None,
+        };
         let mrope_t = self.states_mrope.then(|| {
             let mut triples = vec![0i32; rows as usize * 3];
             for row in composition.lanes() {
@@ -2024,6 +3512,15 @@ impl Shell {
         let mut table_seats = Vec::with_capacity(table_windowed.len());
         let mut geometry = Vec::with_capacity(table_windowed.len());
         for (g, &in_window) in geometries.iter().zip(&table_windowed) {
+            let sink = if in_window { window_sink } else { sink_page };
+            append_runs(
+                &g.write_page,
+                &g.write_offset,
+                narrow(u64::from(sink)),
+                paging.page_size,
+                g.indptr.len().saturating_sub(1),
+                self.scratch_fire || self.sizing.is_some(),
+            )?;
             let mut indices = g.indices.clone();
             let padded = (lane_count as usize) * (max_pages as usize);
             let sink = if in_window { window_sink } else { sink_page };
@@ -2047,6 +3544,56 @@ impl Shell {
                 write_offset: Some(inputs.i32s(handles, &g.write_offset, 1)),
             });
         }
+        // Each beam lane's entries past `f0` and its write page, where its
+        // group's head resolved them (BEAM-PAGE-LISTS §6.5); -1 elsewhere.
+        // Staged at every fire, so a beam fire is the plain fire's program.
+        let beam_words = {
+            let padded = geometries
+                .first()
+                .map_or(0, |_| (lane_count as usize) * (max_pages as usize));
+            let first = geometries.first();
+            let entries_n = first.map_or(0, |g| g.indices.len().max(padded)).max(1);
+            let mut entry_rows = vec![-1i32; entries_n];
+            let mut entry_lanes = vec![0i32; entries_n];
+            let mut write_rows = vec![-1i32; rows as usize];
+            let mut write_lanes = vec![0i32; rows as usize];
+            if let Some(g) = first
+                && lanes.iter().any(|s| s.beam.is_some())
+            {
+                if table_windowed.first() == Some(&true) {
+                    return Err(Fault::Program {
+                        at: "serve::beam",
+                        why: "a beam group's lists resolve over full-context tables, and this \
+                              load's first table is windowed"
+                            .to_string(),
+                    });
+                }
+                for (seat, row) in composition.lanes().iter().enumerate() {
+                    let Some(beam) = lanes.get(row.source as usize).and_then(|s| s.beam) else {
+                        continue;
+                    };
+                    let from = g.indptr[seat] as usize;
+                    let to = g.indptr[seat + 1] as usize;
+                    for (j, at) in (from..to).enumerate() {
+                        if let Some((r, l)) = beam.entry(j as u32) {
+                            entry_rows[at] = r;
+                            entry_lanes[at] = l;
+                        }
+                    }
+                    let (r, l) = beam.write();
+                    for at in row.row_offset..row.row_offset + row.rows {
+                        write_rows[at as usize] = r;
+                        write_lanes[at as usize] = l;
+                    }
+                }
+            }
+            (
+                inputs.i32s(handles, &entry_rows, 1),
+                inputs.i32s(handles, &entry_lanes, 1),
+                inputs.i32s(handles, &write_rows, 1),
+                inputs.i32s(handles, &write_lanes, 1),
+            )
+        };
         if geometry.is_empty() {
             // A plan with no kv row still reads the All axis's token tables
             // (`request_of_token`, `row_valid`): table 0 binds them alone.
@@ -2062,6 +3609,13 @@ impl Shell {
             (Some(layout), true) => {
                 let replay: Vec<i32> = rs_plans.iter().map(|p| p.replay as i32).collect();
                 let commit: Vec<i32> = rs_plans.iter().map(|p| p.commit as i32).collect();
+                // A buffered fire (a lane of it buffers: the step's stated
+                // treatment, `engine::Treatment::Buffers`) lays each window's
+                // scratch for the rung's own rows and its stated carried room
+                // (`crate::rs::rung_replay`), whether it carries any this time
+                // or not: one program a shape, the one the warm ladder lays
+                // for a shape the step set states buffered.
+                let replays = true;
                 let mut maps = std::collections::HashMap::new();
                 for window in windows.all() {
                     if window.indptr_host.is_empty() {
@@ -2077,6 +3631,7 @@ impl Shell {
                         &window.indptr_host,
                         span.lane_offset,
                         paging.page_size.max(1),
+                        replays.then_some(descriptor.bucket),
                     )?;
                     maps.insert(
                         key,
@@ -2119,17 +3674,20 @@ impl Shell {
             readouts,
         };
         let slots = self.slots(fire_rows);
-        let planes = self.planes(&composition, &slots, readout_rows.len() as u32)?;
+        let planes = self.planes(&composition, &slots, plane_rows)?;
         // The host readers' readout rows, gathered apart after the fire.
-        let host = self.host_table(&composition, &planes, &readout_layout, lanes, real);
-        if let Some(table) = &host {
+        let host = self.host_tables(&composition, &planes, &plane_layout, lanes, real);
+        for table in &host {
             let plane = &planes[table.plane];
             self.gather_shapes.insert((plane.rows, plane.width));
         }
 
-        // Each window's readouts (its lanes'): a window short of every lane
-        // cuts its readout-rowed values to them, so they reach the text.
-        let readout_spans: Vec<(u32, u32)> = windows
+        // Each window's readouts (its lanes'), as the walk cuts them
+        // (`Run::readout_span`): a window short of every lane cuts its
+        // readout-rowed values to them, so they reach the text; a window over
+        // all of them cuts nothing, whatever their count (a draft block's six
+        // lanes or nine at one lane rung read out alike, one program).
+        let readout_spans: Vec<Option<(u32, u32)>> = windows
             .all()
             .iter()
             .map(|w| {
@@ -2140,19 +3698,25 @@ impl Shell {
                         .copied()
                         .unwrap_or(0)
                 };
-                (
+                let (first, end) = (
                     at(w.span.lane_offset),
                     at(w.span.lane_offset + w.span.lanes),
-                )
+                );
+                let all = readout_indptr.last().copied().unwrap_or(0);
+                (first > 0 || end < all).then_some((first, end - first))
             })
             .collect();
         let bindings = FireBindings {
             tokens: tokens_t,
+            token_words,
+            beam_words,
             positions: positions_t,
             cache_rows: cache_rows_t,
             readout_rows: readout_t,
             readout_indptr,
+            readout_pick,
             adapter_routes: adapter_t,
+            adapter_planes,
             mrope_positions: mrope_t,
             patches: patch_bindings,
             clip_slots,
@@ -2167,16 +3731,22 @@ impl Shell {
             dit: dit_bindings,
         };
 
+        if let Some(rows) = self.sizing.as_mut() {
+            *rows = inputs.rows();
+            self.sized_bucket = descriptor.bucket;
+            return Ok(Fired::default());
+        }
         let t1 = std::time::Instant::now();
         // Everything the program text depends on: the walk's windows and
         // descriptor, every input's shape, the page bound and the readout.
         // Formatted only where the shape key misses: at 256 lanes the
         // descriptor's text is a tenth of a decode's host time.
         let gathers_readout = self.gathers_readout;
+        let stages = self.fire_streamed.as_ref().is_some_and(|f| f.stages);
         let full_key = |probes: &[ValueId]| -> [u8; 32] {
             *blake3::hash(
                 format!(
-                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}",
+                    "{descriptor:?}|{windows:?}|{}|{max_pages}|{}|{}|{rs_active}|{dit_key}|{:?}|{readout_spans:?}|{stages}",
                     inputs.shapes(),
                     readout_rows.len(),
                     gathers_readout,
@@ -2198,7 +3768,7 @@ impl Shell {
                 descriptor.lanes.iter().map(|l| (l.class, l.word)).collect();
             *blake3::hash(
                 format!(
-                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}",
+                    "{:?}|{}|{}|{lanes:?}|{}|{}|{max_pages}|{}|{}|{rs_active}|{readout_spans:?}|{stages}",
                     descriptor.classes,
                     descriptor.rows,
                     descriptor.bucket,
@@ -2211,6 +3781,7 @@ impl Shell {
             )
             .as_bytes()
         });
+        self.fires += 1;
         let hit = shape_key
             .and_then(|k| self.shaped.get(&k))
             .map(std::sync::Arc::clone)
@@ -2224,40 +3795,147 @@ impl Shell {
                 self.traced.get(&k).map(std::sync::Arc::clone)
             }
         };
+        // the fire's program is the most recently fired (`evict`)
+        if found.is_some() {
+            let at = shape_key
+                .and_then(|k| self.parked_shapes.get(&k).copied())
+                .or(key);
+            if let Some(entry) = at.and_then(|at| self.evictable.get_mut(&at)) {
+                entry.2 = self.fires;
+            }
+        }
         // a miss, which every path below that reads it is, keyed it
         let missed = |key: Option<[u8; 32]>| key.expect("a missed fire's key");
         if found.is_none() && self.deferred.is_some() {
-            let (text, sig, probed) = self.trace_text(
-                &slots,
-                &caches,
-                bindings,
-                &windows,
-                &descriptor,
-                readout_t,
-                readout_rows.len() as i64,
-                &planes,
-                rs_seat,
-                inputs.pack_len(),
-                &lands,
-                pixels_seat.as_ref(),
-            )?;
+            // A fire this build traced before, its program on disk: the
+            // record names it, and no text is built (a warm load's tracing
+            // was most of its time: dense Qwen3-0.6B, 67 of 105 s).
+            let full = missed(key);
+            // Records are read while they hold, and kept whatever: a load
+            // whose record parted rewrites the scope's records as it traces.
+            let scope = self.trace_scope.clone();
+            let recorded = scope
+                .as_deref()
+                .filter(|_| self.records_hold)
+                .and_then(|scope| self.device.trace_record(scope, &full))
+                .and_then(|bytes| serde_json::from_slice::<TraceRecord>(&bytes).ok())
+                .map(|r| {
+                    let code = crate::device::Code::Cached {
+                        hash: r.hash,
+                        name: r.name,
+                        len: r.len,
+                        need: r.need,
+                        file_len: r.file_len,
+                    };
+                    (code, r.sig, r.probed)
+                })
+                // a record whose file is gone or of another length: its fire
+                // is traced and built here, before ready
+                .filter(|(code, ..)| {
+                    let kept = self.device.code_on_disk(code);
+                    if !kept && let crate::device::Code::Cached { name, .. } = code {
+                        self.device.note_mended();
+                        tracing::warn!(
+                            record = %crate::device::hex(&full),
+                            file = %name,
+                            "xla traced-fire record's program file is gone from the disk cache or \
+                             not as it was kept: its fire is traced and built again before ready"
+                        );
+                    }
+                    kept
+                });
+            // The load's first record is traced again and checked: the
+            // scope's hash must cover all a program's text depends on, and a
+            // record its text parts from stops the records for this load.
+            let check = recorded.is_some() && !self.record_checked;
+            let recorded_hash = recorded.as_ref().map(|(code, ..)| code.hash());
+            let (code, sig, probed) = match recorded.filter(|_| !check) {
+                Some(found) => {
+                    self.records_used += 1;
+                    found
+                }
+                None => {
+                    let (text, sig, probed) = self.trace_text(
+                        &slots,
+                        &caches,
+                        bindings,
+                        &windows,
+                        &descriptor,
+                        readout_t,
+                        readout_rows.len() as i64,
+                        &planes,
+                        rs_seat,
+                        self.pools.stage_at(inputs.rows()),
+                        &lands,
+                        pixels_seat.as_ref(),
+                    )?;
+                    if check {
+                        self.record_checked = true;
+                        let hash = *blake3::hash(text.as_bytes()).as_bytes();
+                        if recorded_hash.is_some_and(|h| h != hash) {
+                            self.records_hold = false;
+                            tracing::warn!(
+                                scope = scope.as_deref().unwrap_or_default(),
+                                "xla traced-fire record parts from its fire's trace: this load \
+                                 traces every fire in full and rewrites the scope's records (the \
+                                 scope misses an input of the tracer, or a record is stale)"
+                            );
+                        }
+                    }
+                    (crate::device::Code::Text(text), sig, probed)
+                }
+            };
             if let Some(deferred) = self.deferred.as_mut() {
                 deferred.push(Deferred {
-                    key: missed(key),
+                    key: full,
                     shape_key,
-                    text,
+                    code,
                     sig,
                     probed,
+                    rows: descriptor.rows,
+                    order: (true, u8::MAX, 0, descriptor.rows),
                 });
+            }
+            // A fire returning the readout entries: its row count's readout
+            // program is laid with the ladder (`lay_readouts`).
+            if self.returns_entries(&descriptor)
+                && let Some(&entry) = self.readout_entries.first()
+                && let Some(t) = slots.0[entry.0 as usize]
+            {
+                self.entry_rows.insert(t.rows);
             }
             return Ok(Fired {
                 rows: vec![Vec::new(); real],
                 ..Fired::default()
             });
         }
+        // a shape the ladder parked in the disk cache: loaded, not built
+        let found = match found {
+            Some(program) => Some(program),
+            None => self.load_parked(shape_key, key)?,
+        };
         let program = match found {
             Some(program) => program,
             None => {
+                // After the seal, a fire of lanes the warm ladder lays fires
+                // of is one it laid: a program built now is a shape the
+                // ladder missed, refused by name rather than compiled on the
+                // serving path. (A masked, adapted or media lane's fire is
+                // built and counted.)
+                if self.laddered && self.device.is_sealed() && self.ladder_lays(lanes) {
+                    let lane_rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+                    return Err(Fault::Program {
+                        at: "serve::ladder",
+                        why: format!(
+                            "a fire of {} rows (bucket {}) over {} lanes, lane rows {lane_rows:?}, \
+                             page bound {max_pages}, is outside the warm ladder the load \
+                             built: no program is built after ready",
+                            descriptor.rows,
+                            descriptor.bucket,
+                            descriptor.lanes.len()
+                        ),
+                    });
+                }
                 let program = self.trace_fire(
                     &slots,
                     &caches,
@@ -2268,7 +3946,7 @@ impl Shell {
                     readout_rows.len() as i64,
                     &planes,
                     rs_seat.clone(),
-                    inputs.pack_len(),
+                    self.pools.stage_at(inputs.rows()),
                     &lands,
                     pixels_seat.as_ref(),
                 )?;
@@ -2309,11 +3987,25 @@ impl Shell {
             &inputs,
             timing(),
         )?;
+        // The fold: each page the next window reads, from its buffer or
+        // own-row page into its ring page, on the stream behind the fire.
+        if !ring_folds.is_empty() {
+            self.pools
+                .copy_pages(&self.device, &self.handles, &ring_folds)?;
+        }
         let t3 = std::time::Instant::now();
         // The program's outputs: a plane per output the fire's classes
         // write, then a decoder's pixel plane and its grid, then the probes.
         let keep = self.keep_readout;
         let mut outs = outs;
+        // The readout entries (the final hidden rows) come last.
+        let mut entries = Vec::new();
+        if self.returns_entries(&descriptor) {
+            for _ in &self.readout_entries {
+                entries.extend(outs.pop());
+            }
+            entries.reverse();
+        }
         // A shape-key hit is a plain fire's, which probes nothing.
         let probed_ids = key
             .and_then(|key| self.probed.get(&key).cloned())
@@ -2353,17 +4045,17 @@ impl Shell {
             }
             None => Vec::new(),
         };
-        if outs.len() != planes.len() {
+        if !outs.is_empty() {
             return Err(Fault::Unbound {
                 what: format!(
-                    "{} output planes, of which the program returned {}",
-                    planes.len(),
+                    "{} output planes the program returned, past the rings every plane lands in",
                     outs.len()
                 ),
             });
         }
         tracing::debug!(
             rows,
+            buffered = rs_active,
             stage_ms = (t1 - t0).as_secs_f64() * 1e3,
             trace_ms = (t2 - t1).as_secs_f64() * 1e3,
             enqueue_ms = (t3 - t2).as_secs_f64() * 1e3,
@@ -2390,19 +4082,97 @@ impl Shell {
                 *slot = seat.have + seat.rows;
             }
         }
-        let host = match host.filter(|table| table.at.iter().any(Option::is_some)) {
-            Some(table) => Some(self.host_rows(table, &planes, &outs)?),
-            None => None,
+        // A fire with a lane reading every row reads its readout rows again
+        // from the hidden rows its forward returned: the readout program's
+        // planes are the fire's.
+        if let Some((_, _, _, pick)) = &full_table {
+            let uncovered = (planes.iter()).find(|plane| {
+                self.exports[plane.export].decl.readout
+                    && !self.readout_slice.1.contains(&plane.export)
+            });
+            if let Some(plane) = uncovered {
+                return Err(Fault::Program {
+                    at: "serve::readout_program",
+                    why: format!(
+                        "a lane reads every row of itself and this fire reads out `{}`, which no \
+                         readout program reads again (its slice writes a cache)",
+                        self.exports[plane.export].decl.name
+                    ),
+                });
+            }
+            let rows = match entries.first() {
+                Some(b) => b.dims()?.first().copied().unwrap_or(0) as u32,
+                None => {
+                    return Err(Fault::Unbound {
+                        what: "the final hidden rows a fire with prompt rows returns".into(),
+                    });
+                }
+            };
+            let mut staged = Inputs::new();
+            let program = match self.readout_programs.get(&rows) {
+                Some(program) => {
+                    let _ = staged.i32s(&self.handles, pick, 1);
+                    std::sync::Arc::clone(program)
+                }
+                None => {
+                    let (text, sig) = self.trace_readout(rows, &mut staged, pick)?;
+                    let program = self.device.program_for(&text, sig, &|| {
+                        format!("the readout program of {rows} rows")
+                    })?;
+                    self.readout_programs
+                        .insert(rows, std::sync::Arc::clone(&program));
+                    program
+                }
+            };
+            crate::exec::run_readout(
+                &self.device,
+                &program,
+                Some(&self.weights),
+                &mut self.pools,
+                &staged,
+                &entries,
+            )?;
+        }
+        // Each plane's buffer: the ring's plane the fire wrote.
+        let mut buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>> =
+            Vec::with_capacity(planes.len());
+        for plane in &planes {
+            let (ring, _) = plane.fixed;
+            buffers.push(
+                self.pools
+                    .readout_current(ring)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!("readout ring {ring}'s plane, which the fire did not write"),
+                    })?,
+            );
+        }
+        let host = if full_table.is_none() {
+            host.into_iter()
+                .map(|table| self.host_rows(table, &planes, &buffers))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
         };
-        let kept = self.kept(
-            &composition,
-            &planes,
-            outs,
-            (&readout_rows, &readout_layout),
-            &pixels,
-            real,
-            host,
-        );
+        let kept = match &full_table {
+            Some((full_rows, full_layout, placed, _)) => self.kept(
+                &composition,
+                &planes,
+                buffers,
+                (full_rows, full_layout, placed),
+                &pixels,
+                real,
+                Vec::new(),
+            ),
+            None => self.kept(
+                &composition,
+                &planes,
+                buffers,
+                (&readout_rows, &readout_layout, &plane_layout),
+                &pixels,
+                real,
+                host,
+            ),
+        };
         let rows_out = match &kept {
             Some(kept) if !keep => (0..real)
                 .map(|lane| {
@@ -2454,13 +4224,48 @@ impl Shell {
                     })
                 })
                 .collect::<Result<Vec<Tensor>>>()?;
+            // The rows this fire writes: its readout rows, or every row of a
+            // float output.
+            let rows = if out.decl.readout {
+                readouts
+            } else {
+                handles[0].rows
+            };
+            let Some(ring) =
+                (self.readout_specs.iter()).position(|spec| spec.exports.contains(&export))
+            else {
+                // An output whose row grows with the keys a row attends
+                // (`attn.scores`): a program's term at the rung its guest cut
+                // allows, a family the ladder does not enumerate yet. Refused,
+                // never laid for one fire.
+                return Err(Fault::Program {
+                    at: "serve::scored_fire",
+                    why: format!(
+                        "this fire reads output `{}` ({} layers of {} columns a row), whose \
+                         row grows with the keys it attends: a program's term, which no load \
+                         lays and the warm ladder does not enumerate yet",
+                        out.decl.name, out.decl.layers, out.decl.width
+                    ),
+                });
+            };
+            let cap = self.readout_specs[ring].cap;
+            if rows > cap {
+                return Err(Fault::Program {
+                    at: "serve::readout_plane",
+                    why: format!(
+                        "output `{}` reads out {rows} rows of a fire of {} lanes, past the {cap} \
+                         its ring holds: the load's store bounds a fire's readouts \
+                         (`ReadoutFacts::store_rows`)",
+                        out.decl.name,
+                        composition.lanes().len()
+                    ),
+                });
+            }
+            let fixed = (u16::try_from(ring).unwrap_or(u16::MAX), rows);
             planes.push(PlaneShape {
                 export,
-                rows: if out.decl.readout {
-                    readouts
-                } else {
-                    handles[0].rows
-                },
+                fixed,
+                rows: cap,
                 width: handles[0].width,
                 dtype: if out.decl.dtype == Dtype::I32 {
                     Dtype::I32
@@ -2473,60 +4278,67 @@ impl Shell {
         Ok(planes)
     }
 
-    /// The readout rows this fire's host-reading lanes read, when its planes
-    /// hold one readout plane of one layer deeper than the short plane
-    /// (`HOST_ROWS`): every lane's start there, all `None` when the readers'
-    /// rows do not fit.
-    fn host_table(
+    /// The readout rows this fire's host-reading lanes read, per readout
+    /// plane of one layer they read back fewer rows of than it has: every
+    /// reader's start among them. The rows are padded to a power of two (one
+    /// gather program a count of each plane shape), and a plane's short
+    /// plane is laid only when that is still fewer rows than the plane's (a
+    /// prefill lane reading 1 of a 32-row plane of 151936 logits: 0.6 MB
+    /// copied out in place of 19.4 MB).
+    fn host_tables(
         &self,
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
         readout_layout: &[(u32, u32)],
         lanes: &[Seated<'_>],
         real: usize,
-    ) -> Option<HostTable> {
-        let mut readout = planes.iter().enumerate().filter(|(_, plane)| {
+    ) -> Vec<HostTable> {
+        let readouts = planes.iter().enumerate().filter(|(_, plane)| {
             let decl = &self.exports[plane.export].decl;
             decl.readout && decl.layers <= 1 && plane.dtype == Dtype::F32
         });
-        let (plane, shape) = readout.next()?;
-        if readout.next().is_some() || i64::from(shape.rows) <= HOST_ROWS {
-            return None;
-        }
-        let mut table: Vec<i32> = Vec::new();
-        let mut at = vec![None; real];
-        for row in composition.lanes() {
-            let source = row.source as usize;
-            if source >= real || lanes.get(source).is_none_or(|seated| seated.quiet) {
+        let mut tables = Vec::new();
+        for (plane, shape) in readouts {
+            let mut table: Vec<i32> = Vec::new();
+            let mut at = vec![None; real];
+            for row in composition.lanes() {
+                let source = row.source as usize;
+                if source >= real || lanes.get(source).is_none_or(|seated| seated.quiet) {
+                    continue;
+                }
+                let class = row.class as usize;
+                let reads = self.readback.get(class).copied().flatten() == Some(shape.export)
+                    && self.exports[shape.export].classes.contains(class);
+                if !reads || at[source].is_some() {
+                    continue;
+                }
+                let (first, count) = readout_layout[source];
+                at[source] = Some(table.len() as u32);
+                table.extend((first..first + count).map(|r| r as i32));
+            }
+            if at.iter().all(Option::is_none) {
                 continue;
             }
-            let class = row.class as usize;
-            let reads = self.readback.get(class).copied().flatten() == Some(shape.export)
-                && self.exports[shape.export].classes.contains(class);
-            if !reads || at[source].is_some() {
+            let count = table.len().next_power_of_two();
+            if count >= shape.rows as usize {
                 continue;
             }
-            let (first, count) = readout_layout[source];
-            at[source] = Some(table.len() as u32);
-            table.extend((first..first + count).map(|r| r as i32));
+            table.resize(count, 0);
+            tables.push(HostTable { plane, table, at });
         }
-        if table.len() as i64 > HOST_ROWS {
-            table.clear();
-            at.iter_mut().for_each(|a| *a = None);
-        }
-        table.resize(HOST_ROWS as usize, 0);
-        Some(HostTable { plane, table, at })
+        tables
     }
 
-    /// The program that gathers `HOST_ROWS` rows of a `[rows, width]` f32
+    /// The program that gathers `count` rows of a `[rows, width]` f32
     /// plane: built while the warm ladder runs (`gather_shapes`), else
     /// where a fire first needs it.
     pub(crate) fn gather_program(
         &mut self,
         rows: u32,
         width: u32,
+        count: u32,
     ) -> Result<std::sync::Arc<crate::device::Program>> {
-        if let Some(program) = self.gathers.get(&(rows, width)) {
+        if let Some(program) = self.gathers.get(&(rows, width, count)) {
             return Ok(std::sync::Arc::clone(program));
         }
         use kernels_xla::hlo::{Elem, Func, Ty};
@@ -2535,7 +4347,7 @@ impl Shell {
             Ty::new(Elem::F32, &[i64::from(rows), i64::from(width)]),
             None,
         );
-        let ids = f.param(Ty::new(Elem::I32, &[HOST_ROWS]), None);
+        let ids = f.param(Ty::new(Elem::I32, &[i64::from(count)]), None);
         let picked = f.take_rows(plane, ids).map_err(|e| Fault::Program {
             at: "serve::gather_program",
             why: e.to_string(),
@@ -2548,15 +4360,20 @@ impl Shell {
             },
         )?;
         self.gathers
-            .insert((rows, width), std::sync::Arc::clone(&program));
+            .insert((rows, width, count), std::sync::Arc::clone(&program));
         Ok(program)
     }
 
-    /// Compiles the gather program of every readout plane the ladder traced.
+    /// Compiles the gather programs of every readout plane the ladder
+    /// traced: one a power of two of rows short of the plane's.
     pub(crate) fn warm_gathers(&mut self) -> Result<()> {
         let shapes: Vec<(u32, u32)> = self.gather_shapes.iter().copied().collect();
         for (rows, width) in shapes {
-            self.gather_program(rows, width)?;
+            let mut count = 1;
+            while count < rows {
+                self.gather_program(rows, width, count)?;
+                count *= 2;
+            }
         }
         Ok(())
     }
@@ -2568,20 +4385,24 @@ impl Shell {
         &mut self,
         table: HostTable,
         planes: &[PlaneShape],
-        outs: &[crate::pjrt::Buffer],
+        outs: &[std::sync::Arc<crate::pjrt::Buffer>],
     ) -> Result<(HostTable, crate::pjrt::Buffer)> {
         let shape = &planes[table.plane];
-        let program = self.gather_program(shape.rows, shape.width)?;
+        let count = u32::try_from(table.table.len()).unwrap_or(u32::MAX);
+        let program = self.gather_program(shape.rows, shape.width, count)?;
         let bytes: Vec<u8> = table.table.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let ids = self
-            .device
-            .upload_flat(crate::pjrt::ElementType::S32, &bytes, HOST_ROWS)?;
+        let ids =
+            self.device
+                .upload_flat(crate::pjrt::ElementType::S32, &bytes, i64::from(count))?;
         let plane = outs.get(table.plane).ok_or_else(|| Fault::Unbound {
             what: "the readout plane, which the program did not return".to_string(),
         })?;
         let mut got = self.device.run(
             &program,
-            vec![crate::pjrt::Arg::Keep(plane), crate::pjrt::Arg::Keep(&ids)],
+            vec![
+                crate::pjrt::Arg::Keep(plane.as_ref()),
+                crate::pjrt::Arg::Keep(&ids),
+            ],
             false,
         )?;
         let buffer = got.pop().ok_or_else(|| Fault::Unbound {
@@ -2592,15 +4413,16 @@ impl Shell {
 
     /// The fire's returned planes as each real lane reads them.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn kept(
         &self,
         composition: &poem_exec::fire::Composition,
         planes: &[PlaneShape],
-        buffers: Vec<crate::pjrt::Buffer>,
-        (readout_rows, readout_layout): (&[i32], &[(u32, u32)]),
+        buffers: Vec<std::sync::Arc<crate::pjrt::Buffer>>,
+        (readout_rows, readout_layout, plane_layout): (&[i32], &[(u32, u32)], &[(u32, u32)]),
         pixels: &[Pixels],
         real: usize,
-        host: Option<(HostTable, crate::pjrt::Buffer)>,
+        host: Vec<(HostTable, crate::pjrt::Buffer)>,
     ) -> Option<std::sync::Arc<crate::readout::Kept>> {
         use crate::readout::{Plane, Seat};
         use poem_ir::InputAxis;
@@ -2615,13 +4437,17 @@ impl Shell {
                 continue;
             }
             let (first, count) = readout_layout[source];
+            let (on_plane, _) = plane_layout[source];
             for (p, plane) in planes.iter().enumerate() {
                 let out = &self.exports[plane.export];
                 if !out.classes.contains(row.class as usize) {
                     continue;
                 }
                 seats[source][p] = Some(match out.decl.axis {
-                    _ if out.decl.readout => Seat { first, count },
+                    _ if out.decl.readout => Seat {
+                        first: on_plane,
+                        count,
+                    },
                     InputAxis::Row => Seat {
                         first: row.row_offset,
                         count: row.rows,
@@ -2667,6 +4493,7 @@ impl Shell {
                     out.decl.layers,
                     plane.dtype,
                 )
+                .with_normal(self.normal_exports[plane.export])
             })
             .collect();
         Some(std::sync::Arc::new(crate::readout::Kept {
@@ -2677,10 +4504,190 @@ impl Shell {
                 self.pixels_name(),
                 pixels.iter().map(|(values, _)| values.clone()).collect(),
             ),
-            host: host.map(|(table, buffer)| {
-                crate::readout::HostRows::new(table.plane, buffer, table.at)
-            }),
+            host: host
+                .into_iter()
+                .map(|(table, buffer)| crate::readout::HostRows::new(table.plane, buffer, table.at))
+                .collect(),
         }))
+    }
+
+    /// The readout program of fires of `rows` rows: the readout outputs'
+    /// slice (`crate::rows::readout_slice`) over the forward's entries (its
+    /// final hidden rows, `Source::Entry`), at the store's rows, picked by
+    /// the staged rows `pick` (`inputs`' only input), its planes landing in
+    /// their rings as a forward's do.
+    fn trace_readout(
+        &self,
+        rows: u32,
+        inputs: &mut Inputs,
+        pick: &[i32],
+    ) -> Result<(String, crate::trace::Signature)> {
+        let store = self.readout_store_rows().ok_or_else(|| Fault::Program {
+            at: "serve::readout_program",
+            why: "a lane reads every row of itself and the load lays no readout store".into(),
+        })?;
+        let pick_t = inputs.i32s(&self.handles, pick, 1);
+        let mut slots = self.slots(FireRows {
+            tokens: u64::from(rows),
+            lanes: 1,
+            patches: 0,
+            images: 0,
+            voxels: 0,
+            clips: 0,
+            readouts: u64::from(store),
+        });
+        for (index, &value) in self.readout_entries.iter().enumerate() {
+            let t = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "value {}, a readout entry, which the carve gave no rectangle",
+                    value.0
+                ),
+            })?;
+            slots.0[value.0 as usize] = Some(self.handles.root(Root {
+                source: Source::Entry {
+                    index: u16::try_from(index).unwrap_or(u16::MAX),
+                },
+                dtype: t.dtype,
+                rows: t.rows,
+                width: t.width,
+            }));
+        }
+        let none = self.handles.root(Root {
+            source: Source::Temp,
+            dtype: Dtype::I32,
+            rows: 1,
+            width: 1,
+        });
+        let bindings = FireBindings {
+            tokens: none,
+            token_words: (none, none),
+            beam_words: (none, none, none, none),
+            positions: none,
+            cache_rows: none,
+            readout_rows: pick_t,
+            readout_indptr: vec![0, store],
+            readout_pick: None,
+            adapter_routes: None,
+            adapter_planes: None,
+            mrope_positions: None,
+            clip_slots: None,
+            patches: None,
+            geometry: Vec::new(),
+            window_table: 0,
+            tables: crate::run::FireTables {
+                request_of_token: none,
+                mask: none,
+                mask_enabled: none,
+                mask_stride: 0,
+            },
+            dit: crate::run::DitBindings::default(),
+        };
+        let span = poem_exec::fire::compose::MaskSpan {
+            lanes: 1,
+            rows,
+            ..Default::default()
+        };
+        let windows = Windows::single(span, vec![0, rows as i32]);
+        let place = At::new();
+        let caches = crate::store::CacheTable::default();
+        let tracer = Tracer::new(&self.handles)
+            .with_tuning(self.tuning)
+            .with_stage(self.pools.stage_at(inputs.rows()));
+        {
+            let mut run = Run::new(
+                &tracer,
+                &self.handles,
+                &self.trace.values,
+                self.weights.table(),
+                &slots,
+                &caches,
+                bindings,
+                &windows,
+                &place,
+            )
+            .with_readout_rowed(&self.readout_rowed)
+            .with_streamed(self.fire_streamed.clone());
+            for &node in &self.readout_slice.0 {
+                poem_exec::dispatch::Dispatch::exec(&mut run, &self.trace.nodes[node]).map_err(
+                    |e| Fault::Program {
+                        at: "serve::readout_program",
+                        why: format!("node {node}: {e}"),
+                    },
+                )?;
+            }
+        }
+        for &export in &self.readout_slice.1 {
+            let out = &self.exports[export];
+            let ring = (self.readout_specs.iter())
+                .position(|spec| spec.exports.contains(&export))
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!("the readout ring of output `{}`", out.decl.name),
+                })?;
+            let cap = i64::from(self.readout_specs[ring].cap);
+            let elem = if out.decl.dtype == Dtype::I32 {
+                kernels_xla::hlo::Elem::I32
+            } else {
+                kernels_xla::hlo::Elem::F32
+            };
+            let mut layers = Vec::with_capacity(out.values.len());
+            for value in &out.values {
+                let handle = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!("value {}, of output `{}`", value.0, out.decl.name),
+                })?;
+                let whole = tracer.value(handle)?;
+                layers.push(tracer.with(|f| f.convert(whole, elem)));
+            }
+            let root = self.pools.readouts()[ring].root;
+            crate::emit::Emit::emit(&tracer, &mut |cx| {
+                let mut whole = cx.read(root)?;
+                for (layer, &rows) in layers.iter().enumerate() {
+                    let f = cx.func();
+                    let at = f.const_i(kernels_xla::hlo::Elem::I32, layer as i64 * cap, &[]);
+                    let col = f.const_i(kernels_xla::hlo::Elem::I32, 0, &[]);
+                    whole = f.dynamic_update_slice(whole, rows, &[at, col])?;
+                }
+                cx.write(root, whole)
+            })?;
+        }
+        Ok(tracer.finish(&[]))
+    }
+
+    /// Lays the readout program of every row count a laid fire returns the
+    /// readout entries at: a fire with a lane reading every row of itself
+    /// fires as the plain fire of its rows and reads its readout rows again
+    /// with its row count's program, laid here.
+    pub(crate) fn lay_readouts(&mut self) -> Result<usize> {
+        let Some(store) = self.readout_store_rows() else {
+            return Ok(0);
+        };
+        if self.readout_slice.1.is_empty() {
+            return Ok(0);
+        }
+        let pick = vec![0i32; store as usize];
+        let rows: Vec<u32> = self.entry_rows.iter().copied().collect();
+        for rows in &rows {
+            if self.readout_programs.contains_key(rows) {
+                continue;
+            }
+            let mut staged = Inputs::new();
+            let (text, sig) = self.trace_readout(*rows, &mut staged, &pick)?;
+            let program = self.device.program_for(&text, sig, &|| {
+                format!("the readout program of {rows} rows")
+            })?;
+            self.readout_programs.insert(*rows, program);
+        }
+        Ok(self.readout_programs.len())
+    }
+
+    /// Whether a fire of `descriptor` returns its readout entries (the final
+    /// hidden rows) beside its planes: a fire with a plain lane of prompt
+    /// rows, whose lanes may read every row of themselves.
+    fn returns_entries(&self, descriptor: &FireDescriptor) -> bool {
+        !self.readout_entries.is_empty()
+            && descriptor
+                .lanes
+                .iter()
+                .any(|l| l.rows > 1 && !self.drafting.contains(&(l.class as usize)))
     }
 
     /// Walks the plan once for this fire's shape and compiles what it
@@ -2697,15 +4704,33 @@ impl Shell {
         n: i64,
         planes: &[PlaneShape],
         rs: Option<std::rc::Rc<crate::rs::Seat>>,
-        pack_len: u32,
+        stage: crate::trace::StageAt,
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(std::sync::Arc<crate::device::Program>, Vec<ValueId>)> {
         let (text, sig, probed) = self.trace_text(
-            slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, pack_len,
-            lands, pixels,
+            slots, caches, bindings, windows, descriptor, readout_t, n, planes, rs, stage, lands,
+            pixels,
         )?;
-        Ok((self.device.program(&text, sig)?, probed))
+        let fire = || {
+            let rows: Vec<u32> = descriptor.lanes.iter().map(|l| l.rows).collect();
+            format!(
+                "rows {} bucket {} lanes {} lane rows {rows:?}",
+                descriptor.rows,
+                descriptor.bucket,
+                descriptor.lanes.len()
+            )
+        };
+        if self.laddered && self.laid_mixed && !self.device.holds(&text) {
+            return Err(Fault::Program {
+                at: "serve::mixed_lanes",
+                why: format!(
+                    "a mixed fire the load states laid ({}) has no program from the warm ladder",
+                    fire()
+                ),
+            });
+        }
+        Ok((self.device.program_for(&text, sig, &fire)?, probed))
     }
 
     /// The values a trace's unweighted per-head rms norms read, with their head
@@ -2739,15 +4764,98 @@ impl Shell {
         n: i64,
         planes: &[PlaneShape],
         rs: Option<std::rc::Rc<crate::rs::Seat>>,
-        pack_len: u32,
+        stage: crate::trace::StageAt,
         lands: &[crate::dit::Land],
         pixels: Option<&crate::dit::PixelsSeat>,
     ) -> Result<(String, crate::trace::Signature, Vec<ValueId>)> {
         let tracer = Tracer::new(&self.handles)
-            .with_pack(pack_len)
+            .with_stage(stage)
             .with_tuning(self.tuning);
         let place = At::new();
+        let pick = bindings.readout_pick;
         crate::dit::land(&tracer, &self.handles, slots, lands)?;
+        // The tokens a guest pass put in the pool, gathered over the host's
+        // stand-ins before anything reads them (a read of the pool: no
+        // write, so the fire's placement is untouched).
+        {
+            let (token_rows, token_lanes) = bindings.token_words;
+            use crate::emit::Emit as _;
+            let (root, tokens) = (self.pools.root(), bindings.tokens);
+            tracer.emit(&mut |cx| {
+                let pool = cx.read(root)?;
+                let at = cx.read(token_rows)?;
+                let col = cx.read(token_lanes)?;
+                let host = cx.read(tokens)?;
+                let n = i64::from(tokens.rows) * i64::from(tokens.width);
+                let at = cx.reshape(at, &[n])?;
+                let col = cx.reshape(col, &[n])?;
+                let zero = cx.const_i(kernels_xla::hlo::Elem::I32, 0, &[n]);
+                let fed = cx.compare(kernels_xla::hlo::Cmp::Ge, at, zero)?;
+                let row = cx.max(at, zero)?;
+                let rows = cx.take_rows(pool, row)?;
+                let col = cx.reshape(col, &[n, 1])?;
+                let col = cx.broadcast(col, &[n, 128], &[0, 1])?;
+                let iota = cx.iota(kernels_xla::hlo::Elem::I32, &[n, 128], 1);
+                let hit = cx.compare(kernels_xla::hlo::Cmp::Eq, col, iota)?;
+                let none = cx.const_i(kernels_xla::hlo::Elem::U32, 0, &[n, 128]);
+                let picked = cx.select(hit, rows, none)?;
+                let picked = cx.reduce(picked, &[1], kernels_xla::hlo::Fold::Sum)?;
+                let picked = cx.bitcast(picked, kernels_xla::hlo::Elem::I32)?;
+                let host = cx.reshape(host, &[n])?;
+                let v = cx.select(fed, picked, host)?;
+                let v = cx.reshape(v, &[i64::from(tokens.rows), i64::from(tokens.width)])?;
+                cx.write(tokens, v)
+            })?;
+        }
+        // A beam lane's entries past `f0` and its write page, as its group's
+        // head resolved them (the head ran on the pool before this fire).
+        if let Some(cache) = bindings.geometry.first() {
+            use crate::emit::Emit as _;
+            let (entry_rows, entry_lanes, write_rows, write_lanes) = bindings.beam_words;
+            let root = self.pools.root();
+            let picks: Vec<(Tensor, Tensor, Tensor)> = [
+                cache.indices.map(|t| (t, entry_rows, entry_lanes)),
+                cache.write_page.map(|t| (t, write_rows, write_lanes)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for (staged, rows_t, lanes_t) in picks {
+                tracer.emit(&mut |cx| {
+                    use kernels_xla::hlo::{Cmp, Elem};
+                    let pool = cx.read(root)?;
+                    let n = i64::from(staged.rows) * i64::from(staged.width);
+                    let at = cx.read(rows_t)?;
+                    let at = cx.reshape(at, &[n])?;
+                    let col = cx.read(lanes_t)?;
+                    let col = cx.reshape(col, &[n])?;
+                    let zero = cx.const_i(Elem::I32, 0, &[n]);
+                    let fed = cx.compare(Cmp::Ge, at, zero)?;
+                    let row = cx.max(at, zero)?;
+                    let row = cx.reshape(row, &[n, 1])?;
+                    let col = cx.reshape(col, &[n, 1])?;
+                    let idx = cx.concat(&[row, col], 1)?;
+                    let got = cx.gather(
+                        pool,
+                        idx,
+                        &kernels_xla::hlo::GatherDims {
+                            offset_dims: vec![],
+                            collapsed_slice_dims: vec![0, 1],
+                            start_index_map: vec![0, 1],
+                            index_vector_dim: 1,
+                            ..kernels_xla::hlo::GatherDims::default()
+                        },
+                        &[1, 1],
+                    )?;
+                    let got = cx.bitcast(got, Elem::I32)?;
+                    let was = cx.read(staged)?;
+                    let was = cx.reshape(was, &[n])?;
+                    let v = cx.select(fed, got, was)?;
+                    let v = cx.reshape(v, &[i64::from(staged.rows), i64::from(staged.width)])?;
+                    cx.write(staged, v)
+                })?;
+            }
+        }
         let probed = {
             let mut run = Run::new(
                 &tracer,
@@ -2764,7 +4872,8 @@ impl Shell {
             .with_rs(rs)
             .with_readout_rowed(&self.readout_rowed)
             .with_probes(self.probes.clone())
-            .with_head_norms(Self::head_norms(&self.trace));
+            .with_head_norms(Self::head_norms(&self.trace))
+            .with_streamed(self.fire_streamed.clone());
             walk(
                 &self.trace,
                 &self.compiled,
@@ -2783,7 +4892,12 @@ impl Shell {
         } else {
             Some(tracer.value(readout_t)?)
         };
+        let pick = match pick {
+            Some(t) => Some((tracer.value(t)?, i64::from(t.rows))),
+            None => None,
+        };
         let mut extras = Vec::new();
+        let mut landed: Vec<u16> = Vec::new();
         for plane in planes {
             let readout = self.exports[plane.export].decl.readout;
             let elem = if plane.dtype == Dtype::I32 {
@@ -2803,15 +4917,43 @@ impl Shell {
                             f.take_rows(whole, ids)?
                         }
                     };
+                    // the real lanes' readouts alone, where the fire drops
+                    // its padding lanes'
+                    let picked = match (readout, pick) {
+                        (true, Some((at, m))) => {
+                            let at = f.reshape(at, &[m])?;
+                            f.take_rows(picked, at)?
+                        }
+                        _ => picked,
+                    };
                     // f32 comes back faster than bf16: the device relayouts a
                     // bf16 plane on its way to a row-major host buffer.
                     Ok(f.convert(picked, elem))
                 })?);
             }
-            extras.push(match layers.as_slice() {
-                [one] => *one,
-                _ => tracer.with(|f| f.concat(&layers, 0))?,
-            });
+            {
+                let (ring, _) = plane.fixed;
+                // Into the ring's next plane, in place: each layer's rows at
+                // the top of its `cap` rows (outputs of one value share a
+                // ring, written once).
+                if !landed.contains(&ring) {
+                    landed.push(ring);
+                    let root = self.pools.readouts()[usize::from(ring)].root;
+                    let cap = i64::from(self.readout_specs[usize::from(ring)].cap);
+                    crate::emit::Emit::emit(&tracer, &mut |cx| {
+                        let mut whole = cx.read(root)?;
+                        for (layer, &rows) in layers.iter().enumerate() {
+                            let f = cx.func();
+                            let row = layer as i64 * cap;
+                            let at = f.const_i(kernels_xla::hlo::Elem::I32, row, &[]);
+                            let col = f.const_i(kernels_xla::hlo::Elem::I32, 0, &[]);
+                            whole = f.dynamic_update_slice(whole, rows, &[at, col])?;
+                        }
+                        cx.write(root, whole)
+                    })?;
+                }
+                continue;
+            }
         }
         if let Some(seat) = pixels {
             for (value, what) in [(seat.plane, "plane"), (seat.grid, "grid")] {
@@ -2831,6 +4973,17 @@ impl Shell {
         }
         let probed_ids: Vec<ValueId> = probed.iter().map(|(value, _)| *value).collect();
         extras.extend(probed.into_iter().map(|(_, read)| read));
+        if self.returns_entries(descriptor) {
+            for &value in &self.readout_entries {
+                let handle = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, a readout entry, which the carve gave no rectangle",
+                        value.0
+                    ),
+                })?;
+                extras.push(tracer.value(handle)?);
+            }
+        }
         let (text, sig) = tracer.finish(&extras);
         Ok((text, sig, probed_ids))
     }
@@ -3011,17 +5164,91 @@ struct PlaneShape {
     rows: u32,
     width: u32,
     dtype: Dtype,
+    /// The readout ring this plane lands in, and the readout rows the fire
+    /// writes there (`rows` is then the ring's plane rows a layer).
+    fixed: (u16, u32),
+}
+
+/// One readout ring: the exports landing in it (outputs of one value share
+/// one), `rows` a plane (`layers` of `cap` rows), `width` of `dtype`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FixedReadout {
+    pub exports: Vec<usize>,
+    pub dtype: Dtype,
+    pub cap: u32,
+    pub layers: u32,
+    pub rows: u32,
+    pub width: u32,
+}
+
+/// The rings a load lays: every output a fire returns as a plane (f32 or
+/// i32 on the device, no clips of its own), outputs of one value sharing a
+/// ring. A sequence readout's ring holds `cap` rows a layer (the rows a
+/// fire's sequence lanes read out, `ReadoutFacts::store_rows`). Past them,
+/// what makes a ring sizeable at load: an output whose row width is fixed by
+/// the model (token-shaped, whatever its class: a DiT's or encoder's
+/// outputs, a beam's device-read logits) gets a ring of `tokens` rows, the
+/// top row rung's, its bytes on the load line; an output whose row grows
+/// with the keys a row attends (`attn.scores`: layers x keys, written by
+/// `Attn::ScoreCapture`) is a program's term, cut by the guest cut, never a
+/// load's, and a fire reading one is refused by name until the scored
+/// family is in the warm ladder. No fire writes a plane of its own.
+fn fixed_readouts(
+    trace: &poem_ir::Trace,
+    exports: &[poem_exec::feeds::ClassOutput],
+    cap: u32,
+    tokens: u32,
+) -> Vec<FixedReadout> {
+    // The values a score capture writes: rows as wide as the keys attended.
+    let keyed: Vec<ValueId> = (trace.nodes.iter())
+        .filter_map(|node| match &node.op {
+            poem_ir::Operation::Attn(poem_ir::ops::attn::Attn::ScoreCapture { scores, .. }) => {
+                Some(*scores)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out: Vec<FixedReadout> = Vec::new();
+    let mut values: Vec<Vec<ValueId>> = Vec::new();
+    for (at, export) in exports.iter().enumerate() {
+        let decl = &export.decl;
+        if !decl.readout && export.values.iter().any(|v| keyed.contains(v)) {
+            continue;
+        }
+        let cap = if decl.readout { cap } else { tokens };
+        if export.grid.is_some()
+            || !matches!(decl.dtype, Dtype::Bf16 | Dtype::F32 | Dtype::I32)
+            || cap == 0
+        {
+            continue;
+        }
+        if let Some(k) = values.iter().position(|v| *v == export.values) {
+            out[k].exports.push(at);
+            continue;
+        }
+        let layers = decl.layers.max(1);
+        values.push(export.values.clone());
+        out.push(FixedReadout {
+            exports: vec![at],
+            dtype: if decl.dtype == Dtype::I32 {
+                Dtype::I32
+            } else {
+                Dtype::F32
+            },
+            cap,
+            layers,
+            rows: layers * cap,
+            width: decl.width,
+        });
+    }
+    out
 }
 
 type ReadoutTable = (Vec<i32>, Vec<(u32, u32)>, Vec<u32>);
 
-/// The most readout rows a fire's host readers have gathered apart, into a
-/// plane of their own (past them, the whole readout plane comes back).
-const HOST_ROWS: i64 = 8;
-
 /// A fire's host readers' readout rows: the readout plane's index among its
-/// planes, the plane's rows they read (padded with row 0) and per real lane
-/// where its rows start among them.
+/// planes, the plane's rows they read (padded with row 0 to a power of two)
+/// and per real lane where its rows start among them.
 struct HostTable {
     plane: usize,
     table: Vec<i32>,
@@ -3109,13 +5336,35 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
+/// What a load stages its fires' inputs in, as its load line states it.
+#[derive(Debug, Clone, Default)]
+pub struct StagingFacts {
+    /// The stage-only pass's wall time.
+    pub pass_ms: f64,
+    /// The slab's rows and bytes in the pool (whole chunks).
+    pub slab_rows: u32,
+    pub slab_bytes: u64,
+    /// The ring's pinned host slots and their bytes.
+    pub ring_slots: u32,
+    pub ring_bytes: u64,
+    /// `(rung tokens, rows)` each rung's fires stage.
+    pub rungs: Vec<(u32, u32)>,
+    /// The bulk ring's pinned host bytes (slots of a chunk each): what a
+    /// maintenance program lands comes from there, nothing beside the
+    /// pool on the device.
+    pub bulk_bytes: u64,
+    /// The maintenance programs the load compiled, and the time it took.
+    pub maintenance: (usize, f64),
+}
+
 /// Lane `lane` of the next fire reads its tokens off the device
 /// (`Shell::feed_tokens`).
 #[derive(Debug, Clone)]
+/// A lane's tokens the device put: the pool row and lane each lies at, in
+/// the fed ring's slots (`crate::program::Tokens::Device`).
 pub struct TokenFeed {
     pub lane: usize,
-    pub src: std::sync::Arc<crate::pjrt::Buffer>,
-    pub words: Vec<u32>,
+    pub at: Vec<(u32, u32)>,
 }
 
 /// `PIE_XLA_TIMING=1` prints where each fire's host time goes.
@@ -3135,4 +5384,250 @@ fn timing_epoch() -> &'static std::time::Instant {
 pub(crate) fn timing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PIE_XLA_TIMING").is_some_and(|v| v != "0"))
+}
+
+/// Refuses a fire whose kv rows the append does not take, before it is
+/// dispatched: a tall fire's rows land by page runs (`kernels_xla`'s
+/// `append_run_capacity`), and the device lays at most the capacity's runs,
+/// each a page's consecutive offsets, no page in two. Runs are found as the
+/// device finds them: a row bound for the sink (padding) is no run's, and a
+/// run opens wherever a live row's page differs from the row before it. A
+/// kernel handed more runs than its scratch holds halts the chip, so this is
+/// never left to the device. A `scratch` fire (lanes sharing scratch slots,
+/// nothing read back) is held to the capacity alone: its lanes lay the same
+/// pages, which only the data it never reads depends on.
+fn append_runs(
+    page: &[i32],
+    offset: &[i32],
+    sink: i32,
+    page_size: u32,
+    lanes: usize,
+    scratch: bool,
+) -> Result<()> {
+    let n = page.len();
+    let ps = i64::from(page_size);
+    let Some(m) = kernels_xla::attn::paged::append_run_capacity(n as i64, ps, lanes as i64) else {
+        return Ok(());
+    };
+    let refuse = |why: String| Fault::Program {
+        at: "serve::append_runs",
+        why,
+    };
+    let mut runs = 0i64;
+    let mut pages = std::collections::HashSet::new();
+    let mut prev = -1i32;
+    let mut open = (0usize, 0i32);
+    for (i, (&p, &o)) in page.iter().zip(offset).enumerate() {
+        let live = p != sink && p >= 0 && o >= 0 && i64::from(o) < ps;
+        let key = if live { p } else { -1 };
+        if live && key != prev {
+            runs += 1;
+            if !pages.insert(p) && !scratch {
+                return Err(refuse(format!(
+                    "this fire's kv rows lay page {p} in two runs (row {i}): the append \
+                     lands a page's rows as one run"
+                )));
+            }
+            open = (i, o);
+        }
+        if live && !scratch && i64::from(o) != i64::from(open.1) + (i - open.0) as i64 {
+            return Err(refuse(format!(
+                "this fire's kv row {i} lands at offset {o} of page {p}, not the next offset \
+                 of its run: the append lands a run's rows consecutively"
+            )));
+        }
+        prev = key;
+    }
+    if runs > m {
+        return Err(refuse(format!(
+            "this fire's runs exceed the append's capacity m: its {n} kv rows over {lanes} \
+             lanes lay {runs} page runs, and the append lays at most {m}"
+        )));
+    }
+    Ok(())
+}
+
+/// Per export, whether every value of it is a matmul's result
+/// (`Operation::Linear`): v6e's matmul flushes denormal results to zero,
+/// so such a plane holds no denormal. Any other writer (an elementwise
+/// op, a gather, a transcendental) leaves it as one that may.
+fn normal_exports(trace: &poem_ir::Trace, exports: &[poem_exec::feeds::ClassOutput]) -> Vec<bool> {
+    use poem_ir::Operands;
+    let mut linear = std::collections::HashSet::new();
+    let mut outs = Vec::new();
+    for node in &trace.nodes {
+        if matches!(node.op, poem_ir::Operation::Linear(_)) {
+            outs.clear();
+            node.op.outputs(&mut outs);
+            linear.extend(outs.iter().copied());
+        }
+    }
+    exports
+        .iter()
+        .map(|e| !e.values.is_empty() && e.values.iter().all(|v| linear.contains(v)))
+        .collect()
+}
+
+impl Shell {
+    /// What the runtime's host cover depends on here
+    /// (`engine::Engine::cover_fingerprint`): the TPU, the kernels its
+    /// fires' programs lower through (kernels-xla's sources, fingerprinted
+    /// at build), the tuning and chip they are laid by, and the compiler's
+    /// flags. Not the binary: a build that changes none of these reuses an
+    /// earlier boot's cover, and a cover committed for the device
+    /// (`chip::COVERS`) holds while they are unchanged.
+    #[must_use]
+    pub fn cover_fingerprint(&self) -> String {
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            })
+        };
+        let flags: String = crate::device::COMPILER_ENV
+            .iter()
+            .map(|var| format!("{var}={};", std::env::var(var).unwrap_or_default()))
+            .collect();
+        format!(
+            "xla|{}|kernels {}|tuning {:016x}|chip {:016x}|flags {:016x}",
+            self.device.kind(),
+            kernels_xla::SOURCE_FINGERPRINT,
+            fnv(format!("{:?}", self.tuning).as_bytes()),
+            fnv(format!("{:?}|{:?}", self.tpu, self.pad).as_bytes()),
+            fnv(flags.as_bytes()),
+        )
+    }
+}
+
+/// The version of the traced-fire records' method: a change to what a
+/// record holds or how its scope is made bumps it.
+const TRACE_RECORDS: &str = "xla-traced-fires-3";
+
+impl Shell {
+    /// The scope a load's traced fires' records lie in: a hash of all a
+    /// fire's program text depends on beside the fire's own key, namely
+    /// the records' method, the code that emits programs (this crate's and
+    /// kernels-xla's sources), the model's trace, the budgets, tuning and
+    /// chip, the pool's and the streamed weights' layouts, the staging and
+    /// the compiler's flags. Not the pie version: an upgrade that changes
+    /// none of these reuses every record.
+    /// This load's traced-fire records: the fires taken from them, whether
+    /// they held (`false`: one parted from its trace, and the load traced
+    /// every fire), and how many named a program that would not load (each
+    /// traced and built again).
+    #[must_use]
+    pub fn trace_records(&self) -> (u64, bool, u64) {
+        (
+            self.records_used,
+            self.records_hold,
+            self.device.records_mended(),
+        )
+    }
+
+    /// The folder this load's traced-fire records lie in, if it keeps any.
+    #[must_use]
+    pub fn trace_records_dir(&self) -> Option<std::path::PathBuf> {
+        self.device.trace_records_dir(self.trace_scope.as_deref()?)
+    }
+
+    pub(crate) fn trace_scope(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(TRACE_RECORDS.as_bytes());
+        h.update(env!("XLA_LOWERING_FINGERPRINT").as_bytes());
+        h.update(format!("{:?}", self.trace).as_bytes());
+        h.update(format!("{:?}", self.budgets).as_bytes());
+        h.update(format!("{:?}|{:?}|{:?}", self.tuning, self.pad, self.tpu).as_bytes());
+        h.update(format!("{:?}", self.pools.layout()).as_bytes());
+        h.update(format!("{:?}", self.streamed).as_bytes());
+        // the staging's layout (its facts' times differ run to run)
+        let st = &self.staging_facts;
+        h.update(
+            format!(
+                "{}|{}|{}|{}|{:?}|{}",
+                st.slab_rows, st.slab_bytes, st.ring_slots, st.ring_bytes, st.rungs, st.bulk_bytes
+            )
+            .as_bytes(),
+        );
+        h.update(format!("{:?}", self.rs_layout).as_bytes());
+        h.update(
+            format!(
+                "{}|{}|{}|{:?}|{:?}",
+                self.gathers_readout,
+                self.states_mrope,
+                self.drops_patch_rows,
+                self.adapter_fact,
+                self.patch_seat
+            )
+            .as_bytes(),
+        );
+        for var in crate::device::COMPILER_ENV {
+            h.update(b"|");
+            h.update(std::env::var_os(var).unwrap_or_default().as_encoded_bytes());
+        }
+        h.finalize().to_hex().to_string()
+    }
+}
+
+#[cfg(test)]
+mod append_runs_tests {
+    use super::append_runs;
+
+    const SINK: i32 = 999;
+
+    /// One prompt's rows from offset `start` of page `first` on.
+    fn prompt(rows: usize, first: i32, start: i32) -> (Vec<i32>, Vec<i32>) {
+        (0..rows as i32)
+            .map(|r| (first + (start + r) / 16, (start + r) % 16))
+            .unzip()
+    }
+
+    #[test]
+    fn a_fire_within_the_run_capacity_is_taken() {
+        let (page, off) = prompt(256, 3, 5);
+        append_runs(&page, &off, SINK, 16, 1, false).expect("one prompt's runs fit");
+        // Padding rows bound for the sink are no run's.
+        let (mut page, mut off) = prompt(240, 0, 0);
+        page.extend([SINK; 16]);
+        off.extend([0; 16]);
+        append_runs(&page, &off, SINK, 16, 2, false).expect("padding lays no run");
+        // A short fire lands row by row, whatever its layout.
+        append_runs(&[7; 64], &[0; 64], SINK, 16, 64, false)
+            .expect("a short fire is not run-checked");
+    }
+
+    #[test]
+    fn a_fire_past_the_run_capacity_is_refused_on_the_host() {
+        // 256 rows, each on its own page, stated as one lane: 256 runs
+        // against a capacity of 256 / 16 + 2.
+        let page: Vec<i32> = (0..256).collect();
+        let off = vec![7; 256];
+        let why = append_runs(&page, &off, SINK, 16, 1, false)
+            .expect_err("more runs than the capacity is refused")
+            .to_string();
+        assert!(why.contains("exceed the append's capacity m"), "{why}");
+        assert!(
+            why.contains("256 page runs") && why.contains("at most 18"),
+            "{why}"
+        );
+        // The same rows as 256 lanes of one row each fit.
+        append_runs(&page, &off, SINK, 16, 256, false).expect("a decode-wide fire's runs fit");
+    }
+
+    #[test]
+    fn a_page_in_two_runs_or_a_skipped_offset_is_refused() {
+        let (mut page, mut off) = prompt(128, 0, 0);
+        page[100] = 0;
+        let why = append_runs(&page, &off, SINK, 16, 4, false)
+            .expect_err("page 0 twice")
+            .to_string();
+        assert!(why.contains("in two runs"), "{why}");
+        // A scratch fire's lanes share pages: held to the capacity alone.
+        append_runs(&page, &off, SINK, 16, 4, true).expect("a scratch fire may share pages");
+        let (page, _) = prompt(128, 0, 0);
+        off = (0..128).map(|r| r % 16).collect();
+        off[20] = 9;
+        let why = append_runs(&page, &off, SINK, 16, 4, false)
+            .expect_err("a skipped offset")
+            .to_string();
+        assert!(why.contains("not the next offset"), "{why}");
+    }
 }

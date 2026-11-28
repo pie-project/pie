@@ -78,14 +78,18 @@ export function main(input) {
 
   const pipe = new Pipeline();
   pipe.submit(fwdP);
-  generated.push(tokOutP.takeScalar());
+  // A stop token ends the text and is not part of it, as `top-a-sampling` ends it.
+  const stop = new Set(chat.stopTokens());
+  const g0 = tokOutP.takeScalar();
   s1.push(s1OutP.takeScalar());
   s2.push(s2OutP.takeScalar());
+  const stopped = stop.has(g0);
+  if (!stopped) generated.push(g0);
 
   // ── DECODE LOOP (1-wide, run-ahead) ──
-  if (generated.length < maxTokens) {
+  if (!stopped && generated.length < maxTokens) {
     const cap = channelCapacity();
-    const tokIn = Channel.from([generated[0]], dtype.i32);
+    const tokIn = Channel.from([g0], dtype.i32);
     const rng = Channel.from([seed ^ 0x5bd1, 0], dtype.u32);
     const tokOut = new Channel([1], dtype.i32).capacity(cap);
     const s1Out = new Channel([1], dtype.f32).capacity(cap);
@@ -108,9 +112,13 @@ export function main(input) {
     });
 
     pipe.runAhead(fwd, maxTokens - 1, () => {
-      generated.push(tokOut.takeScalar());
-      s1.push(s1Out.takeScalar());
-      s2.push(s2Out.takeScalar());
+      const t = tokOut.takeScalar();
+      const kept = s1Out.takeScalar();
+      const mass = s2Out.takeScalar();
+      if (stop.has(t)) return false;
+      generated.push(t);
+      s1.push(kept);
+      s2.push(mass);
       return true;
     });
   }

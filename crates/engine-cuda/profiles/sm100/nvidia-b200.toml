@@ -17,19 +17,17 @@ sdpa.selected_mma = true
 sdpa.selected_cluster = 8
 moe.mxfp4_f16 = true
 
-# Host-mapped `host` planes, 16384-row fires, a decoding
-# lane's pages before a waiting prompt, a lattice bucket between powers of
-# two (four from 4096 rows), and a gated delta fire at most 4096 rows.
+# Host-mapped `host` planes, a lattice bucket between powers of two (four
+# from 4096 rows), and a gated delta fire at most 4096 rows.
 [engine]
 lattice_steps = 2
 prefill_lattice_from = 4096
 host_planes = true
-seated_first = true
-forward_tokens = 16384
 walk_fire_rows = 4096
 
 [provenance]
 source = "pie tune (quick, gemma4-31b) and the fixed points, end to end"
+# `measured` names only what dense gemma4-31b, the tune's model, reads: no routed decision.
 measured = [
   "kernel.gemm.heuristics",
   "kernel.gemm.narrow_n",
@@ -37,25 +35,17 @@ measured = [
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
   "kernel.gemv.splitk_max_n",
-  "kernel.moe.mxfp4_grouped_reuse",
-  "kernel.moe.tc5_from",
   "kernel.qmm.gemm_from",
   "kernel.qmm.long_rows",
   "kernel.qmm.split_thin_max",
   "kernel.qmm.split_warps_per_sm",
   "kernel.qmm.split_wide_max",
-  "kernel.sdpa.decode.chunk_floor_128",
-  "kernel.sdpa.decode.split_small",
-  "kernel.sdpa.decode.split_window",
-  "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.index_mma",
   "kernel.sdpa.prefill.ctas_per_sm",
   "kernel.sdpa.selected_mma",
   "engine.copies",
-  "engine.forward_tokens",
   "engine.host_planes",
   "engine.lattice_steps",
-  "engine.seated_first",
   "engine.walk_fire_rows",
   "engine.working_set_percent",
 ]

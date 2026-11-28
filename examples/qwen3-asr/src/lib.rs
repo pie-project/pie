@@ -26,7 +26,7 @@ const MELS: usize = 128;
 const CHUNK: usize = 100;
 const WINDOW_CHUNKS: usize = 8;
 /// Chunks a convolution pass takes: its clip is `MELS * CHUNK` rows a chunk,
-/// and the engine's voxel ceiling (`max_voxels`) must hold them.
+/// and the engine's voxel rung must hold them.
 const CHUNKS_PER_PASS: usize = 2;
 
 #[derive(Deserialize)]
@@ -441,6 +441,7 @@ impl Kv {
                 slots: Some(&slots),
                 kv_len: Some(&kv_len),
                 fold: Fold::All,
+                ..StateGeometry::default()
             },
         )?;
         let next = sample.then(|| Channel::new([1], dtype::i32));

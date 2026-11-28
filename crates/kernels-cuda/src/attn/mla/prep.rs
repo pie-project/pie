@@ -5,7 +5,9 @@ use crate::error::Error;
 
 use super::rms;
 use crate::attn::kv::{lanes_of, page_elems};
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, flat_wide, kernel, refuse, stated,
+};
 use crate::tensor::{KvPool, Tensor};
 
 const PREP: &str = "attn/mla/prep.cu";
@@ -40,7 +42,7 @@ pub(crate) fn split_kv_a_norm(
             PREP,
             &format!("::pie::attn::mla::mla_latents<{t}, 256>"),
         ))
-        .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl)),
+        .apply(rms(kv_a.rows).programmatic(ctx.tuning().pdl())),
         &[
             kv_a.arg(),
             weight.arg(),
@@ -83,7 +85,7 @@ pub fn split_q_b(
                 PREP,
                 &format!("::pie::attn::mla::mla_split_q_b_vec8<{t}>"),
             ))
-            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl())),
             &[
                 q_b.arg(),
                 q_nope.arg(),
@@ -97,19 +99,13 @@ pub fn split_q_b(
         );
     }
     let total = i64::from(q_b.rows) * width;
-    let total = i32::try_from(total).map_err(|_| {
-        refuse(
-            OP,
-            format!("{total} split elements do not fit the kernel's int"),
-        )
-    })?;
     ctx.fire(
         OP,
         Fire::at(kernel(
             PREP,
             &format!("::pie::attn::mla::mla_split_q_b<{t}>"),
         ))
-        .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
+        .apply(flat_wide(OP, total.unsigned_abs(), BLOCK)?),
         &[
             q_b.arg(),
             q_nope.arg(),

@@ -1,5 +1,6 @@
 #![cfg(target_vendor = "apple")]
 
+use crate::common::{bf16, noise};
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
@@ -7,27 +8,15 @@ use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
-fn noise(at: u64) -> u8 {
-    let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    (x >> 40) as u8
-}
-
-fn bf16(v: f32) -> [u8; 2] {
-    let bits = v.to_bits();
-    [(bits >> 16) as u8, (bits >> 24) as u8]
-}
-
 #[test]
 fn every_prefill_row_answers_an_exact_affine_reference() {
+    let _device = crate::device_alone();
     let Ok(device) = Context::bind() else {
         return;
     };
     let tuning = engine_metal::chip::tuning("[kernel]\nqmm = [\"mpp\", \"qmv\"]", false);
     let handles = Handles::new();
     let pipelines = Pipelines::new();
-    let mut checked = 0;
     let cases = [
         (64u32, 128u32),
         (192, 256),
@@ -232,13 +221,9 @@ fn every_prefill_row_answers_an_exact_affine_reference() {
                                 "random M={m} K={k} N={n} row={row} col={col}: {actual_f32} vs {want}"
                             );
                         }
-                        checked += 1;
                     }
                 }
             }
         }
     }
-    eprintln!(
-        "checked {checked} prefill outputs against exact and random affine dots, including row tails and a fallback column width"
-    );
 }

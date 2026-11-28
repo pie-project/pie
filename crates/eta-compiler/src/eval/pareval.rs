@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::eval::interp::{Evaled, PassInputs, Value, const_value, eval_op};
+use crate::eval::interp::{Evaled, PassInputs, Value, const_value, eval_op, value_matches};
 use eta_ir::container::PortSource;
 use eta_ir::op::{Op, ValueSource};
 use eta_ir::registry::{Port, Stage};
@@ -55,6 +55,26 @@ pub fn fold_stage(
     };
     let ops = &bound.container.stages[index].ops;
     let types = &bound.stage_types[index];
+    // Every value this fold holds is one `types` declares, read off a
+    // channel at its declared length or evaluated from such: within the
+    // budget the bind held the stage to, which is checked again here
+    // before anything is allocated.
+    if let Some(budget) = bound.budget {
+        let bytes = eta_ir::validate::values_bytes(types).ok_or_else(|| {
+            EvalBlocker::Fault(alloc::format!(
+                "stage {}: its values' bytes pass a u64",
+                stage.name()
+            ))
+        })?;
+        if bytes > budget.room_bytes {
+            return Err(EvalBlocker::Fault(alloc::format!(
+                "stage {}: its values take {bytes} bytes, past the {} an instance's \
+                 state room holds",
+                stage.name(),
+                budget.room_bytes
+            )));
+        }
+    }
     let (demand, known_cache) = demand_set(ops, types.len(), known);
     let known = &mut |chan: u32| -> Option<Value> {
         known_cache
@@ -94,9 +114,21 @@ pub fn fold_stage(
             Op::ChanTake(chan) | Op::ChanRead(chan) => {
                 let slot = match fold.puts.get(chan) {
                     Some(pending) => pending.clone(),
-                    None => known(*chan)
-                        .map(Ok)
-                        .unwrap_or(Err(EvalBlocker::UnknownChannel(*chan))),
+                    None => match known(*chan) {
+                        // A value off a channel at another length than its
+                        // decl's would size what the fold evaluates from it
+                        // past the type the bind held to its budget.
+                        Some(value) if !value_matches(&value, types[next_id]) => {
+                            return Err(EvalBlocker::Fault(alloc::format!(
+                                "channel {chan} holds {} {:?} element(s); its decl is {:?}",
+                                value.len(),
+                                value.dtype(),
+                                types[next_id]
+                            )));
+                        }
+                        Some(value) => Ok(value),
+                        None => Err(EvalBlocker::UnknownChannel(*chan)),
+                    },
                 };
                 push(&mut blocked_at, &mut dense, next_id, slot);
             }
@@ -232,6 +264,7 @@ fn placeholder(ty: eta_ir::types::ValueType) -> Value {
         eta_ir::types::Dtype::I32 => Value::I32(alloc::vec::Vec::new()),
         eta_ir::types::Dtype::U32 => Value::U32(alloc::vec::Vec::new()),
         eta_ir::types::Dtype::Bool => Value::Bool(alloc::vec::Vec::new()),
+        eta_ir::types::Dtype::Bf16 => Value::Bf16(alloc::vec::Vec::new()),
         _ => crate::eval::interp::no_interpreter_lane(ty.dtype),
     }
 }
@@ -545,6 +578,112 @@ mod tests {
         unknown_tokens_block_derived_ports_only();
         keyed_rng_is_only_as_tainted_as_its_state();
         seeded_prefill_is_host_derivable();
+        the_fold_allocates_only_within_its_budget();
+        a_bf16_value_the_host_cannot_know_folds_as_unknown();
+    }
+
+    /// A bf16 value the host cannot know (here a cast of a channel it has
+    /// no cell of) holds its place in the fold as unknown, and what is put
+    /// from it is blocked by that channel, never a panic: the runtime folds
+    /// every registered program's stages this way.
+    fn a_bf16_value_the_host_cannot_know_folds_as_unknown() {
+        let c = TraceContainer {
+            channels: vec![
+                chan(Shape::vector(4), Dtype::F32, 1),
+                chan(Shape::vector(4), Dtype::F32, 1),
+                chan(Shape::vector(4), Dtype::F32, 1),
+            ],
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Cast {
+                        value: 0,
+                        dtype: Dtype::Bf16,
+                    },
+                    Op::Cast {
+                        value: 1,
+                        dtype: Dtype::F32,
+                    },
+                    Op::ChanPut { chan: 1, value: 2 },
+                    Op::ChanTake(2),
+                    Op::Cast {
+                        value: 3,
+                        dtype: Dtype::Bf16,
+                    },
+                    Op::Cast {
+                        value: 4,
+                        dtype: Dtype::F32,
+                    },
+                    Op::ChanPut { chan: 2, value: 5 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let bound = bind(c, vec![vec![]], EngineCaps::default()).unwrap();
+        // Channel 2's cell is known; channel 0's is not.
+        let known = Value::F32(alloc::vec![1.0, 1.003_906_3, 3.0, -0.5]);
+        let fold = fold_stage(&bound, Stage::Prologue, &mut |chan| {
+            (chan == 2).then(|| known.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            fold.puts.get(&1),
+            Some(&Err(EvalBlocker::UnknownChannel(0)))
+        );
+        assert_eq!(
+            fold.puts.get(&2),
+            Some(&Ok(Value::F32(alloc::vec![1.0, 1.0, 3.0, -0.5]))),
+            "a known bf16 value folds rounded to nearest even"
+        );
+    }
+
+    /// The host's fold of a stage holds only what the bind held to its
+    /// budget: a stage past the budget it carries, or a channel value at
+    /// another length than its decl's, is refused by name before anything
+    /// is evaluated.
+    fn the_fold_allocates_only_within_its_budget() {
+        let c = TraceContainer {
+            channels: vec![chan(Shape::vector(4), Dtype::F32, 1)],
+            stages: vec![StageProgram {
+                stage: Stage::Prologue,
+                ops: vec![
+                    Op::ChanTake(0),
+                    Op::Neg(0),
+                    Op::ChanPut { chan: 0, value: 1 },
+                ],
+            }],
+            ..TraceContainer::default()
+        };
+        let room = eta_ir::validate::Budget {
+            room_bytes: 32,
+            submit: None,
+        };
+        let mut bound =
+            eta_ir::validate::bind_within(c, vec![vec![]], EngineCaps::default(), room).unwrap();
+        let four = Value::F32(alloc::vec![1.0, 2.0, 3.0, 4.0]);
+        let fold = fold_stage(&bound, Stage::Prologue, &mut |_| Some(four.clone())).unwrap();
+        assert_eq!(
+            fold.puts.get(&0),
+            Some(&Ok(Value::F32(alloc::vec![-1.0, -2.0, -3.0, -4.0])))
+        );
+
+        let long = Value::F32(alloc::vec![0.0; 1 << 10]);
+        let refused = fold_stage(&bound, Stage::Prologue, &mut |_| Some(long.clone())).unwrap_err();
+        assert!(
+            matches!(&refused, EvalBlocker::Fault(why) if why.contains("its decl is")),
+            "{refused}"
+        );
+
+        bound.budget = Some(eta_ir::validate::Budget {
+            room_bytes: 31,
+            submit: None,
+        });
+        let refused = fold_stage(&bound, Stage::Prologue, &mut |_| Some(four.clone())).unwrap_err();
+        assert!(
+            matches!(&refused, EvalBlocker::Fault(why) if why.contains("state room")),
+            "{refused}"
+        );
     }
 
     fn unknown_tokens_block_derived_ports_only() {

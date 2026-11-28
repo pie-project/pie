@@ -100,6 +100,8 @@ pub fn begin_fire(store: &mut KvStore) -> KvTxn {
 }
 
 pub fn settle(store: &mut KvStore, txn: KvTxn) {
+    // What the fire wrote seals: pages may join the cache.
+    store.note_cached();
     store.settle(txn.seq);
 }
 

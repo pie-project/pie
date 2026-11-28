@@ -38,11 +38,16 @@ struct M1OpParams {
 };
 
 // An output's slot: its lane's first element, how it is stored
-// (0 f32, 1 bf16, 2 i32) and its row pitch in elements (0: its width).
+// (0 f32, 1 bf16, 2 i32; 3 bf16 and 4 f32 rows through a table of row
+// addresses at `at`, a lane-0 read's rows seated at the instance's lanes)
+// its row pitch in elements (0: its width) and the rows from `at` that are
+// its lane's own (a read past them is another request's rows: refused).
 struct M1OutputSeat {
   ulong at;
   uint storage;
   uint stride;
+  uint rows;
+  uint reserved;
 };
 
 struct M1ArgmaxCandidate {
@@ -58,14 +63,39 @@ struct M1IntArgmaxCandidate {
   uint have;
 };
 
+// A bf16 element (wire tag 5): two bytes, the upper half of an f32's bits,
+// widened exactly.
+inline float m1_load_bf16(const device uchar* data, uint index) {
+  return as_type<float>(uint(reinterpret_cast<const device ushort*>(data)[index]) << 16);
+}
+
+// `value` rounded to bf16, round-to-nearest-even, as its 16 bits: eta-ir's
+// `bf16_bits`, bit for bit (a NaN stays a quiet NaN of its sign; past the
+// largest bf16 rounds to infinity).
+inline ushort m1_bf16_bits(float value) {
+  const uint bits = as_type<uint>(value);
+  if ((bits & 0x7fffffffu) > 0x7f800000u) return ushort((bits >> 16) | 0x0040u);
+  return ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
 inline float m1_load_f(const device uchar* data, uint index, uint dtype) {
+  if (dtype == 5) return m1_load_bf16(data, index);
   if (dtype == 0) return reinterpret_cast<const device float*>(data)[index];
   if (dtype == 1) return float(reinterpret_cast<const device int*>(data)[index]);
   if (dtype == 2) return float(reinterpret_cast<const device uint*>(data)[index]);
   return data[index] != 0 ? 1.0f : 0.0f;
 }
 
+// A 32-bit element's bits, already loaded, as m1_load_f reads it.
+inline float m1_bits_f(uint bits, uint dtype) {
+  if (dtype == 0) return as_type<float>(bits);
+  if (dtype == 1) return float(as_type<int>(bits));
+  if (dtype == 2) return float(bits);
+  return bits != 0 ? 1.0f : 0.0f;
+}
+
 inline int m1_load_i(const device uchar* data, uint index, uint dtype) {
+  if (dtype == 5) return int(m1_load_bf16(data, index));
   if (dtype == 0) return int(reinterpret_cast<const device float*>(data)[index]);
   if (dtype == 1) return reinterpret_cast<const device int*>(data)[index];
   if (dtype == 2) return int(reinterpret_cast<const device uint*>(data)[index]);
@@ -73,6 +103,7 @@ inline int m1_load_i(const device uchar* data, uint index, uint dtype) {
 }
 
 inline uint m1_load_u(const device uchar* data, uint index, uint dtype) {
+  if (dtype == 5) return uint(m1_load_bf16(data, index));
   if (dtype == 0) return uint(reinterpret_cast<const device float*>(data)[index]);
   if (dtype == 1) return uint(reinterpret_cast<const device int*>(data)[index]);
   if (dtype == 2) return reinterpret_cast<const device uint*>(data)[index];
@@ -80,6 +111,7 @@ inline uint m1_load_u(const device uchar* data, uint index, uint dtype) {
 }
 
 inline bool m1_load_b(const device uchar* data, uint index, uint dtype) {
+  if (dtype == 5) return m1_load_bf16(data, index) != 0.0f;
   if (dtype == 0) return reinterpret_cast<const device float*>(data)[index] != 0.0f;
   if (dtype == 1) return reinterpret_cast<const device int*>(data)[index] != 0;
   if (dtype == 2) return reinterpret_cast<const device uint*>(data)[index] != 0u;
@@ -89,6 +121,37 @@ inline bool m1_load_b(const device uchar* data, uint index, uint dtype) {
 inline void m1_store_f(device uchar* data, uint index, float value) {
   reinterpret_cast<device float*>(data)[index] = value;
 }
+// A float result stored at its value's dtype: a bf16 value rounds once.
+inline void m1_store_fd(device uchar* data, uint index, float value, uint dtype) {
+  if (dtype == 5) {
+    reinterpret_cast<device ushort*>(data)[index] = m1_bf16_bits(value);
+  } else {
+    reinterpret_cast<device float*>(data)[index] = value;
+  }
+}
+
+// `value` as a bf16 store keeps it, widened back: what a register holding
+// a bf16 value holds.
+inline float m1_round_bf16(float value) {
+  return as_type<float>(uint(m1_bf16_bits(value)) << 16);
+}
+
+inline void m1_store_h(device uchar* data, uint index, float value) {
+  reinterpret_cast<device ushort*>(data)[index] = m1_bf16_bits(value);
+}
+
+// Whether a value of `dtype` is a float (f32, or bf16 computed as one).
+inline bool m1_is_float(uint dtype) {
+  return dtype == 0 || dtype == 5;
+}
+
+// A value's bytes: a bool's bits packed, a bf16's two bytes an element,
+// every other dtype's four.
+inline uint m1_value_bytes(uint len, uint dtype) {
+  if (dtype == 3) return (len + 7u) / 8u;
+  return len * (dtype == 5 ? 2u : 4u);
+}
+
 inline void m1_store_i(device uchar* data, uint index, int value) {
   reinterpret_cast<device int*>(data)[index] = value;
 }
@@ -186,8 +249,144 @@ inline uint m1_desc_key(float value) {
   return ~ascending;
 }
 
+// A probability's fixed-point mass for the top-p cut: floor(p * 2^32).
+#define M4_SEL_SCALE 4294967296.0f
+inline ulong m4_sel_fixed(float p) {
+  if (!(p > 0.0f)) return 0ul;
+  return ulong(p * M4_SEL_SCALE);
+}
+
+inline ulong m4_sel_pair(uint lo, uint hi) { return (ulong(hi) << 32) | ulong(lo); }
+
+// The value a descending key stands for (the inverse of m1_desc_key).
+inline float m4_sel_value(uint key) {
+  const uint ascending = ~key;
+  const uint bits = (ascending & 0x80000000u) != 0u ? (ascending & 0x7FFFFFFFu) : ~ascending;
+  return as_type<float>(bits);
+}
+// The fixed-point mass of the cut key's value, low and high words.
+inline uint m4_sel_fixed_lo(uint digit, uint key) {
+  (void)digit;
+  return uint(m4_sel_fixed(m4_sel_value(key)));
+}
+inline uint m4_sel_fixed_hi(uint key) { return uint(m4_sel_fixed(m4_sel_value(key)) >> 32); }
+
+// Two-word (64-bit) mass arithmetic in 32-bit halves. The pick's walk keeps
+// its sums this way: the AGX compiler on Apple7 fails building a loop that
+// adds and compares `ulong`s with an early exit.
+struct M4Mass {
+  uint lo;
+  uint hi;
+};
+
+inline M4Mass m4_mass(uint lo, uint hi) { return M4Mass{lo, hi}; }
+
+inline M4Mass m4_mass_add(M4Mass a, M4Mass b) {
+  const uint lo = a.lo + b.lo;
+  return M4Mass{lo, a.hi + b.hi + (lo < a.lo ? 1u : 0u)};
+}
+
+inline M4Mass m4_mass_sub(M4Mass a, M4Mass b) {
+  return M4Mass{a.lo - b.lo, a.hi - b.hi - (a.lo < b.lo ? 1u : 0u)};
+}
+
+inline bool m4_mass_ge(M4Mass a, M4Mass b) {
+  return a.hi > b.hi || (a.hi == b.hi && a.lo >= b.lo);
+}
+
+// `v * j` for a token's mass `v` and a tie count `j`.
+inline M4Mass m4_mass_mul(M4Mass v, uint j) {
+  const uint lo = v.lo * j;
+  return M4Mass{lo, mulhi(v.lo, j) + v.hi * j};
+}
+
 inline uint m1_pick(uint len, uint index) {
   return len == 1 ? 0u : index;
+}
+
+// One row's top-k (mode 0) / top-p (mode 1) cut on one thread: four radix
+// passes over the descending key, by count and by fixed-point mass, then the
+// mask, the cut key's ties in index order.
+inline void m1_cut_select_row(
+    const device uchar* a0, const device uchar* a1, device uchar* o0, const M1ValueDesc d0,
+    const M1ValueDesc d1, uint mode, uint row) {
+  const uint n = d0.last;
+  const uint base = row * n;
+  uint k = 0u;
+  ulong target64 = 0ul;
+  if (mode == 0u) {
+    const int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
+    k = signed_k <= 0 ? 0u : uint(signed_k);
+  } else {
+    target64 = m4_sel_fixed(m1_load_f(a1, m1_pick(d1.len, row), d1.dtype));
+  }
+  const M4Mass target = m4_mass(uint(target64), uint(target64 >> 32));
+  bool all = mode == 0u && k >= n;
+  bool none = !all && (n == 0u || (mode == 0u ? k == 0u : target64 == 0ul));
+  uint prefix = 0u, before = 0u, ties = 0u, take = 0u;
+  M4Mass mass = m4_mass(0u, 0u);
+  for (uint pass = 0u; pass < 4u && !all && !none; ++pass) {
+    const uint shift = 24u - 8u * pass;
+    uint count[256];
+    M4Mass bucket[256];
+    for (uint b = 0u; b < 256u; ++b) { count[b] = 0u; bucket[b] = m4_mass(0u, 0u); }
+    for (uint i = 0u; i < n; ++i) {
+      const float value = m1_load_f(a0, base + i, d0.dtype);
+      const uint key = m1_desc_key(value);
+      if (pass != 0u && (key >> (shift + 8u)) != (prefix >> (shift + 8u))) continue;
+      const uint digit = (key >> shift) & 255u;
+      ++count[digit];
+      const ulong v = m4_sel_fixed(value);
+      bucket[digit] = m4_mass_add(bucket[digit], m4_mass(uint(v), uint(v >> 32)));
+    }
+    uint digit = 256u;
+    for (uint d = 0u; d < 256u; ++d) {
+      const bool here = count[d] != 0u &&
+          (mode == 0u ? (before + count[d] >= k) : m4_mass_ge(m4_mass_add(mass, bucket[d]), target));
+      if (digit == 256u && here) digit = d;
+      if (digit == 256u) {
+        before += count[d];
+        mass = m4_mass_add(mass, bucket[d]);
+      }
+    }
+    if (digit == 256u) {
+      all = true;
+      break;
+    }
+    prefix |= digit << shift;
+    if (pass == 3u) {
+      ties = count[digit];
+      take = ties;
+      if (mode == 0u) {
+        take = k - before;
+      } else {
+        const M4Mass v = m4_mass(m4_sel_fixed_lo(digit, prefix), m4_sel_fixed_hi(prefix));
+        if (v.lo != 0u || v.hi != 0u) {
+          const M4Mass room = m4_mass_sub(target, mass);
+          uint low = 0u, high = ties;
+          while (low < high) {
+            const uint mid = low + (high - low) / 2u;
+            if (m4_mass_ge(m4_mass_mul(v, mid), room)) high = mid; else low = mid + 1u;
+          }
+          take = low;
+        }
+      }
+      take = min(take, ties);
+    }
+  }
+  uint tied = 0u;
+  for (uint i = 0u; i < n; ++i) {
+    bool taken = all;
+    if (!all && !none) {
+      const uint key = m1_desc_key(m1_load_f(a0, base + i, d0.dtype));
+      taken = key < prefix;
+      if (key == prefix) {
+        taken = tied < take;
+        ++tied;
+      }
+    }
+    m1_store_b(o0, base + i, taken);
+  }
 }
 
 inline void m1_fault(device M1Status* status, uint code) {
@@ -211,6 +410,12 @@ inline void m1_copy_typed_range(
     uint step) {
   if (dtype == 3) {
     for (uint i = begin; i < len; i += step) output[i] = input[i];
+    return;
+  }
+  if (dtype == 5) {
+    const device ushort* src = reinterpret_cast<const device ushort*>(input);
+    device ushort* dst = reinterpret_cast<device ushort*>(output);
+    for (uint i = begin; i < len; i += step) dst[i] = src[i];
     return;
   }
   const bool aligned =
@@ -239,11 +444,10 @@ inline void m1_reduce_float(
     device uchar* temporary,
     const M1ValueDesc in_desc) {
   device float* work = reinterpret_cast<device float*>(temporary);
-  const device float* values = reinterpret_cast<const device float*>(input);
   device float* result = reinterpret_cast<device float*>(output);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
-    for (uint i = 0; i < in_desc.last; ++i) work[i] = values[base + i];
+    for (uint i = 0; i < in_desc.last; ++i) work[i] = m1_load_f(input, base + i, in_desc.dtype);
     uint count = in_desc.last;
     if (count == 0) {
       result[row] = tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY);
@@ -345,7 +549,7 @@ inline void m1_reduce_argmax(
     const M1ValueDesc in_desc) {
   (void)temporary;
   device int* result = reinterpret_cast<device int*>(output);
-  if (in_desc.dtype != 0) {
+  if (!m1_is_float(in_desc.dtype)) {
     for (uint row = 0; row < in_desc.rows; ++row) {
       const uint base = row * in_desc.last;
       M1IntArgmaxCandidate best = {0l, 0u, 0u};
@@ -359,9 +563,6 @@ inline void m1_reduce_argmax(
     }
     return;
   }
-
-  const device float* values =
-      reinterpret_cast<const device float*>(input);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
 
@@ -370,8 +571,8 @@ inline void m1_reduce_argmax(
         {-INFINITY, 0u, 0u, 0u}, {-INFINITY, 0u, 0u, 0u}};
     uint i = 0;
     for (; i + 4u <= in_desc.last; i += 4u) {
-      const float v0 = values[base + i + 0], v1 = values[base + i + 1];
-      const float v2 = values[base + i + 2], v3 = values[base + i + 3];
+      const float v0 = m1_load_f(input, base + i + 0, in_desc.dtype), v1 = m1_load_f(input, base + i + 1, in_desc.dtype);
+      const float v2 = m1_load_f(input, base + i + 2, in_desc.dtype), v3 = m1_load_f(input, base + i + 3, in_desc.dtype);
       best[0] = m1_argmax_combine(
           best[0], M1ArgmaxCandidate{v0, i + 0u, isnan(v0) ? 0u : 1u, 0u});
       best[1] = m1_argmax_combine(
@@ -382,7 +583,7 @@ inline void m1_reduce_argmax(
           best[3], M1ArgmaxCandidate{v3, i + 3u, isnan(v3) ? 0u : 1u, 0u});
     }
     for (; i < in_desc.last; ++i) {
-      const float value = values[base + i];
+      const float value = m1_load_f(input, base + i, in_desc.dtype);
       best[0] = m1_argmax_combine(
           best[0], M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
@@ -401,18 +602,17 @@ inline void m1_reduce_argmax_mt(
     uint tid,
     uint nthreads,
     threadgroup M1ArgmaxCandidate* tgbuf) {
-  if (in_desc.dtype != 0) {
+  if (in_desc.dtype != 0 && in_desc.dtype != 5) {
 
     if (tid == 0) m1_reduce_argmax(input, output, temporary, in_desc);
     return;
   }
   device int* result = reinterpret_cast<device int*>(output);
-  const device float* values = reinterpret_cast<const device float*>(input);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
     M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
     for (uint i = tid; i < in_desc.last; i += nthreads) {
-      const float value = values[base + i];
+      const float value = m1_load_f(input, base + i, in_desc.dtype);
       best = m1_argmax_combine(
           best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
@@ -445,7 +645,6 @@ inline void m1_reduce_float_part(
       tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY);
   device float* plane_a = reinterpret_cast<device float*>(temporary);
   device float* plane_b = plane_a + in_desc.last;
-  const device float* values = reinterpret_cast<const device float*>(input);
   device float* result = reinterpret_cast<device float*>(output);
   for (uint row = 0; row < in_desc.rows; ++row) {
     const uint base = row * in_desc.last;
@@ -455,7 +654,9 @@ inline void m1_reduce_float_part(
       continue;
     }
 
-    const device float* src = values + base;
+    // The first round reads the row at its dtype, every later one a plane.
+    bool first = true;
+    const device float* src = plane_a;
     device float* dst = plane_a;
     while (count > 1) {
       const uint chunks = (count + 31) / 32;
@@ -463,7 +664,8 @@ inline void m1_reduce_float_part(
         float lanes[32];
         for (uint lane = 0; lane < 32; ++lane) {
           const uint index = chunk * 32 + lane;
-          lanes[lane] = index < count ? src[index] : identity;
+          lanes[lane] = index >= count ? identity
+              : (first ? m1_load_f(input, base + index, in_desc.dtype) : src[index]);
         }
         for (uint offset = 16; offset > 0; offset >>= 1) {
           for (uint lane = 0; lane < offset; ++lane) {
@@ -478,10 +680,11 @@ inline void m1_reduce_float_part(
       }
       threadgroup_barrier(mem_flags::mem_device);
       count = chunks;
+      first = false;
       src = dst;
       dst = (dst == plane_a) ? plane_b : plane_a;
     }
-    if (tid == 0) result[row] = src[0];
+    if (tid == 0) result[row] = first ? m1_load_f(input, base, in_desc.dtype) : src[0];
     threadgroup_barrier(mem_flags::mem_device);
   }
 }
@@ -579,9 +782,9 @@ inline void m1_scatter_rmw(
     for (uint r = 0; r < rest; ++r) {
       const uint dst = uint(index) * rest + r;
       const uint src = scalar ? 0u : k * rest + r;
-      if (d0.dtype == 0) {
+      if (d0.dtype == 0 || d0.dtype == 5) {
         const float value = m1_load_f(a2, src, d2.dtype);
-        m1_store_f(o0, dst, tag == 0x62 ? m1_load_f(o0, dst, 0) + value : value);
+        m1_store_fd(o0, dst, tag == 0x62 ? m1_load_f(o0, dst, d0.dtype) + value : value, d0.dtype);
       } else if (d0.dtype == 1) {
         const int value = m1_load_i(a2, src, d2.dtype);
         m1_store_i(o0, dst, tag == 0x62 ? int(uint(m1_load_i(o0, dst, 1)) + uint(value)) : value);
@@ -619,7 +822,7 @@ inline void ptir_m1_execute_part(
 
   if (p.tag == 0x81) {
     for (uint i = tid; i < out0.len; i += nthreads) {
-      if (p.lit_dtype == 0) m1_store_f(o0, i, as_type<float>(p.lit_bits));
+      if (p.lit_dtype == 0) m1_store_fd(o0, i, as_type<float>(p.lit_bits), out0.dtype);
       else if (p.lit_dtype == 1) m1_store_i(o0, i, int(p.lit_bits));
       else if (p.lit_dtype == 2) m1_store_u(o0, i, p.lit_bits);
       else m1_store_b(o0, i, p.lit_bits != 0);
@@ -636,19 +839,24 @@ inline void ptir_m1_execute_part(
     return;
   }
   if (p.tag == 0x92) {
-    const uint logical_bytes =
-        d0.dtype == 3 ? (d0.len + 7u) / 8u : d0.len * 4u;
+    const uint logical_bytes = m1_value_bytes(d0.len, d0.dtype);
     if (logical_bytes > p.sink_bytes) {
       if (tid == 0) m1_fault_op(status, 1u, p);
       return;
     }
     if (d0.dtype == 3) {
-
-      if (tid != 0) return;
-      for (uint i = 0; i < logical_bytes; ++i) o0[i] = 0;
-      for (uint i = 0; i < d0.len; ++i)
-        if (a0[i] != 0) o0[i >> 3] |= uchar(1u << (i & 7));
-      for (uint i = logical_bytes; i < p.sink_bytes; ++i) o0[i] = 0;
+      // One packed byte a thread, from its eight bools: no thread writes a
+      // byte another touches, so the pack runs across the whole grid (a
+      // single thread setting bits one read-modify-write at a time cost a
+      // beam step's mask ~0.1 ms).
+      for (uint b = tid; b < p.sink_bytes; b += nthreads) {
+        uchar packed = 0;
+        for (uint j = 0; j < 8u; ++j) {
+          const uint i = b * 8u + j;
+          if (i < d0.len && a0[i] != 0) packed |= uchar(1u << j);
+        }
+        o0[b] = packed;
+      }
       return;
     }
     m1_copy_typed_range(a0, o0, d0.len, d0.dtype, tid, nthreads);
@@ -686,19 +894,19 @@ inline void ptir_m1_execute_part(
   if (p.tag == 0x01 || p.tag == 0x02 || p.tag == 0x04) {
     for (uint i = tid; i < out0.len; i += nthreads) {
       const float value = m1_load_f(a0, m1_pick(d0.len, i), d0.dtype);
-      if (p.tag == 0x01) m1_store_f(o0, i, precise::exp(value));
-      else if (p.tag == 0x02) m1_store_f(o0, i, precise::log(value));
-      else m1_store_f(o0, i, 1.0f / value);
+      if (p.tag == 0x01) m1_store_fd(o0, i, precise::exp(value), out0.dtype);
+      else if (p.tag == 0x02) m1_store_fd(o0, i, precise::log(value), out0.dtype);
+      else m1_store_fd(o0, i, 1.0f / value, out0.dtype);
     }
     return;
   }
   if (p.tag >= 0x08 && p.tag <= 0x0B) {
     for (uint i = tid; i < out0.len; i += nthreads) {
       const float value = m1_load_f(a0, m1_pick(d0.len, i), d0.dtype);
-      if (p.tag == 0x08) m1_store_f(o0, i, precise::sin(value));
-      else if (p.tag == 0x09) m1_store_f(o0, i, precise::cos(value));
-      else if (p.tag == 0x0A) m1_store_f(o0, i, sqrt(value));
-      else m1_store_f(o0, i, 1.0f / sqrt(value));
+      if (p.tag == 0x08) m1_store_fd(o0, i, precise::sin(value), out0.dtype);
+      else if (p.tag == 0x09) m1_store_fd(o0, i, precise::cos(value), out0.dtype);
+      else if (p.tag == 0x0A) m1_store_fd(o0, i, sqrt(value), out0.dtype);
+      else m1_store_fd(o0, i, 1.0f / sqrt(value), out0.dtype);
     }
     return;
   }
@@ -709,14 +917,14 @@ inline void ptir_m1_execute_part(
     }
     for (uint i = tid; i < out0.len; i += nthreads) {
       const uint source = m1_pick(d0.len, i);
-      if (d0.dtype == 0) {
+      if (m1_is_float(d0.dtype)) {
         const float value = m1_load_f(a0, source, d0.dtype);
         const float result =
             p.tag == 0x03 ? -value
                           : (p.tag == 0x05
                                  ? abs(value)
                                  : (value > 0 ? 1.0f : (value < 0 ? -1.0f : 0.0f)));
-        m1_store_f(o0, i, result);
+        m1_store_fd(o0, i, result, out0.dtype);
       } else if (d0.dtype == 1) {
         const int value = m1_load_i(a0, source, d0.dtype);
         int result = value;
@@ -737,7 +945,7 @@ inline void ptir_m1_execute_part(
   if (p.tag == 0x07) {
     for (uint i = tid; i < out0.len; i += nthreads) {
       const uint source = m1_pick(d0.len, i);
-      if (out0.dtype == 0) m1_store_f(o0, i, m1_load_f(a0, source, d0.dtype));
+      if (out0.dtype == 0 || out0.dtype == 5) m1_store_fd(o0, i, m1_load_f(a0, source, d0.dtype), out0.dtype);
       else if (out0.dtype == 1) m1_store_i(o0, i, m1_load_i(a0, source, d0.dtype));
       else if (out0.dtype == 2) m1_store_u(o0, i, m1_load_u(a0, source, d0.dtype));
       else m1_store_b(o0, i, m1_load_b(a0, source, d0.dtype));
@@ -754,7 +962,7 @@ inline void ptir_m1_execute_part(
           const bool x = m1_load_b(a0, xindex, d0.dtype);
           const bool y = m1_load_b(a1, yindex, d1.dtype);
           result = p.tag == 0x1C ? x && y : x || y;
-        } else if (d0.dtype == 0) {
+        } else if (m1_is_float(d0.dtype)) {
           const float x = m1_load_f(a0, xindex, d0.dtype);
           const float y = m1_load_f(a1, yindex, d1.dtype);
           if (p.tag == 0x16) result = x > y;
@@ -783,7 +991,7 @@ inline void ptir_m1_execute_part(
           else result = x <= y;
         }
         m1_store_b(o0, i, result);
-      } else if (d0.dtype == 0) {
+      } else if (m1_is_float(d0.dtype)) {
         const float x = m1_load_f(a0, xindex, d0.dtype);
         const float y = m1_load_f(a1, yindex, d1.dtype);
         float result = 0;
@@ -794,7 +1002,7 @@ inline void ptir_m1_execute_part(
         else if (p.tag == 0x14) result = m1_element_max(x, y);
         else if (p.tag == 0x15) result = m1_element_min(x, y);
         else result = fmod(x, y);
-        m1_store_f(o0, i, result);
+        m1_store_fd(o0, i, result, out0.dtype);
       } else if (d0.dtype == 1) {
         const int x = m1_load_i(a0, xindex, d0.dtype);
         const int y = m1_load_i(a1, yindex, d1.dtype);
@@ -832,9 +1040,9 @@ inline void ptir_m1_execute_part(
     for (uint i = tid; i < out0.len; i += nthreads) {
       const bool select = m1_load_b(a0, m1_pick(d0.len, i), d0.dtype);
       const uint xi = m1_pick(d1.len, i), yi = m1_pick(d2.len, i);
-      if (out0.dtype == 0)
-        m1_store_f(o0, i, select ? m1_load_f(a1, xi, d1.dtype)
-                                 : m1_load_f(a2, yi, d2.dtype));
+      if (m1_is_float(out0.dtype))
+        m1_store_fd(o0, i, select ? m1_load_f(a1, xi, d1.dtype)
+                                 : m1_load_f(a2, yi, d2.dtype), out0.dtype);
       else if (out0.dtype == 1)
         m1_store_i(o0, i, select ? m1_load_i(a1, xi, d1.dtype)
                                  : m1_load_i(a2, yi, d2.dtype));
@@ -849,7 +1057,7 @@ inline void ptir_m1_execute_part(
   }
 
   if (p.tag >= 0x30 && p.tag <= 0x32) {
-    if (d0.dtype == 0)
+    if (m1_is_float(d0.dtype))
       m1_reduce_float_part(p.tag, a0, o0, temporary, d0, tid, nthreads);
     else
       m1_reduce_integer_part(p.tag, a0, o0, temporary, d0, tid, nthreads);
@@ -876,7 +1084,7 @@ inline void ptir_m1_execute_part(
         const uint source_dim = dim < d0.rank ? d0.dims[dim] : 1u;
         if (source_dim != 1) source_index += coordinate * source_stride[dim];
       }
-      if (out0.dtype == 0) m1_store_f(o0, linear, m1_load_f(a0, source_index, d0.dtype));
+      if (out0.dtype == 0 || out0.dtype == 5) m1_store_fd(o0, linear, m1_load_f(a0, source_index, d0.dtype), out0.dtype);
       else if (out0.dtype == 1) m1_store_i(o0, linear, m1_load_i(a0, source_index, d0.dtype));
       else if (out0.dtype == 2) m1_store_u(o0, linear, m1_load_u(a0, source_index, d0.dtype));
       else m1_store_b(o0, linear, m1_load_b(a0, source_index, d0.dtype));
@@ -895,7 +1103,7 @@ inline void ptir_m1_execute_part(
     const uint m = d0.dims[0], n = d0.dims[1];
     for (uint index = tid; index < m * n; index += nthreads) {
       const uint source = (index % m) * n + index / m;
-      if (out0.dtype == 0) m1_store_f(o0, index, m1_load_f(a0, source, d0.dtype));
+      if (out0.dtype == 0 || out0.dtype == 5) m1_store_fd(o0, index, m1_load_f(a0, source, d0.dtype), out0.dtype);
       else if (out0.dtype == 1) m1_store_i(o0, index, m1_load_i(a0, source, d0.dtype));
       else if (out0.dtype == 2) m1_store_u(o0, index, m1_load_u(a0, source, d0.dtype));
       else m1_store_b(o0, index, m1_load_b(a0, source, d0.dtype));
@@ -923,7 +1131,7 @@ inline void ptir_m1_execute_part(
         } else {
           const float value = m1_load_f(a0, index, d0.dtype);
           accumulated_f = is_sum ? accumulated_f + value : accumulated_f * value;
-          m1_store_f(o0, index, accumulated_f);
+          m1_store_fd(o0, index, accumulated_f, out0.dtype);
         }
       }
     }
@@ -947,7 +1155,7 @@ inline void ptir_m1_execute_part(
           best_index = candidate;
         }
       }
-      m1_store_f(o0, position, best_value);
+      m1_store_fd(o0, position, best_value, out0.dtype);
       m1_store_u(o1, position, best_index);
     }
     return;
@@ -973,7 +1181,7 @@ inline void ptir_m1_execute_part(
             best_index = candidate;
           }
         }
-        m1_store_f(o0, row * count + position, best_value);
+        m1_store_fd(o0, row * count + position, best_value, out0.dtype);
         m1_store_u(o1, row * count + position, best_index);
       }
     }
@@ -988,14 +1196,14 @@ inline void ptir_m1_execute_part(
     const uint m = d0.dims[0], inner = d0.dims[1], n = d1.dims[1];
     for (uint row = tid; row < m; row += nthreads) {
       for (uint column = 0; column < n; ++column)
-        m1_store_f(o0, row * n + column, 0.0f);
+        m1_store_fd(o0, row * n + column, 0.0f, out0.dtype);
       for (uint k = 0; k < inner; ++k) {
         const float left = m1_load_f(a0, row * inner + k, d0.dtype);
         if (left == 0.0f) continue;
         for (uint column = 0; column < n; ++column) {
           const uint index = row * n + column;
           const float old = m1_load_f(o0, index, 0);
-          m1_store_f(o0, index, old + left * m1_load_f(a1, k * n + column, d1.dtype));
+          m1_store_fd(o0, index, old + left * m1_load_f(a1, k * n + column, d1.dtype), out0.dtype);
         }
       }
     }
@@ -1012,73 +1220,11 @@ inline void ptir_m1_execute_part(
       return;
     }
 
+    // Top-k (pred 0) / top-p (pred 1), a thread a row: the rule and the
+    // radix select of the cut the threadgroup forms use (m1_cut_select_mt),
+    // with the histograms in the thread's own arrays.
     for (uint row = tid; row < d0.rows; row += nthreads) {
-      const uint base = row * d0.last;
-      if (p.pred_tag == 0) {
-        int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
-        uint k = signed_k <= 0 ? 0u : uint(signed_k);
-        if (k > d0.last) k = d0.last;
-        if (k == 0u) {
-          for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
-        } else {
-
-          uint histogram[256];
-          uint prefix = 0u;
-          uint target = k;
-          for (int pass = 0; pass < 4; ++pass) {
-            const int shift = 24 - 8 * pass;
-
-            const uint high_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
-            for (uint bucket = 0u; bucket < 256u; ++bucket) histogram[bucket] = 0u;
-            for (uint j = 0; j < d0.last; ++j) {
-              const uint key = m1_desc_key(m1_load_f(a0, base + j, d0.dtype));
-              if ((key & high_mask) == (prefix & high_mask))
-                ++histogram[(key >> shift) & 0xFFu];
-            }
-            uint run = 0u;
-            uint chosen = 255u;
-            for (uint bucket = 0u; bucket < 256u; ++bucket) {
-              if (run + histogram[bucket] >= target) { chosen = bucket; break; }
-              run += histogram[bucket];
-            }
-            target -= run;
-            prefix |= chosen << shift;
-          }
-          for (uint i = 0; i < d0.last; ++i) {
-            const float value = m1_load_f(a0, base + i, d0.dtype);
-            m1_store_b(o0, base + i, !isnan(value) && m1_desc_key(value) <= prefix);
-          }
-        }
-      } else {
-
-        const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
-        for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
-        float exclusive = 0.0f;
-        float prev_value = 0.0f;
-        uint prev_index = 0;
-        bool have_prev = false;
-        for (uint position = 0; position < d0.last && exclusive < threshold; ++position) {
-          uint best_index = 0;
-          float best_value = 0.0f;
-          bool found = false;
-          for (uint candidate = 0; candidate < d0.last; ++candidate) {
-            const float value = m1_load_f(a0, base + candidate, d0.dtype);
-            if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate))
-              continue;
-            if (!found || m1_sort_better(value, candidate, best_value, best_index)) {
-              found = true;
-              best_value = value;
-              best_index = candidate;
-            }
-          }
-          if (!found) break;
-          m1_store_b(o0, base + best_index, exclusive < threshold);
-          exclusive += best_value;
-          prev_value = best_value;
-          prev_index = best_index;
-          have_prev = true;
-        }
-      }
+      m1_cut_select_row(a0, a1, o0, d0, d1, p.pred_tag == 0 ? 0u : 1u, row);
     }
     return;
   }
@@ -1091,7 +1237,7 @@ inline void ptir_m1_execute_part(
       const long index = m1_load_index(a1, k, d1.dtype);
       const bool valid = index >= 0 && uint(index) < n0;
       const uint source = valid ? uint(index) * rest + r : 0;
-      if (out0.dtype == 0) m1_store_f(o0, output_index, valid ? m1_load_f(a0, source, d0.dtype) : 0.0f);
+      if (out0.dtype == 0 || out0.dtype == 5) m1_store_fd(o0, output_index, valid ? m1_load_f(a0, source, d0.dtype) : 0.0f, out0.dtype);
       else if (out0.dtype == 1) m1_store_i(o0, output_index, valid ? m1_load_i(a0, source, d0.dtype) : 0);
       else if (out0.dtype == 2) m1_store_u(o0, output_index, valid ? m1_load_u(a0, source, d0.dtype) : 0u);
       else m1_store_b(o0, output_index, valid && m1_load_b(a0, source, d0.dtype));
@@ -1104,7 +1250,7 @@ inline void ptir_m1_execute_part(
       const long column = m1_load_index(a1, row, d1.dtype);
       const bool valid = column >= 0 && uint(column) < columns;
       const uint source = valid ? row * columns + uint(column) : 0;
-      if (out0.dtype == 0) m1_store_f(o0, row, valid ? m1_load_f(a0, source, d0.dtype) : 0.0f);
+      if (out0.dtype == 0 || out0.dtype == 5) m1_store_fd(o0, row, valid ? m1_load_f(a0, source, d0.dtype) : 0.0f, out0.dtype);
       else if (out0.dtype == 1) m1_store_i(o0, row, valid ? m1_load_i(a0, source, d0.dtype) : 0);
       else if (out0.dtype == 2) m1_store_u(o0, row, valid ? m1_load_u(a0, source, d0.dtype) : 0u);
       else m1_store_b(o0, row, valid && m1_load_b(a0, source, d0.dtype));
@@ -1130,11 +1276,12 @@ inline void ptir_m1_execute_part(
       const uint column = i % mask_width;
       const uint word = column >> 5;
       const uint mask = word < d1.len ? m1_load_u(a1, word, d1.dtype) : 0u;
-      m1_store_f(
+      m1_store_fd(
           o0, i,
           ((mask >> (column & 31)) & 1u) != 0
               ? m1_load_f(a0, i, d0.dtype)
-              : -INFINITY);
+              : -INFINITY,
+          out0.dtype);
     }
     return;
   }
@@ -1173,13 +1320,14 @@ inline void ptir_m1_execute_part(
     }
     for (uint i = tid; i < out0.len; i += nthreads) {
       if (p.kind == 2) {
-        m1_store_f(o0, i, ptir_rng_hash_normal(seed, i));
+        m1_store_fd(o0, i, ptir_rng_hash_normal(seed, i), out0.dtype);
         continue;
       }
       const float uniform = ptir_rng_hash_uniform(seed, i);
-      m1_store_f(
+      m1_store_fd(
           o0, i,
-          p.kind == 0 ? uniform : -precise::log(-precise::log(uniform)));
+          p.kind == 0 ? uniform : -precise::log(-precise::log(uniform)),
+          out0.dtype);
     }
     return;
   }
@@ -1208,120 +1356,28 @@ inline M1ArgmaxCandidate m1_sort_pick(M1ArgmaxCandidate left, M1ArgmaxCandidate 
   return m1_sort_better(right.value, right.index, left.value, left.index) ? right : left;
 }
 
-inline void m1_nucleus_select_mt(
-    const device uchar* a0,
-    const device uchar* a1,
-    device uchar* o0,
-    const M1ValueDesc d0,
-    const M1ValueDesc d1,
-    uint tid,
-    uint nthreads,
-    threadgroup M1ArgmaxCandidate* tgbuf) {
-  for (uint row = 0; row < d0.rows; ++row) {
-    const uint base = row * d0.last;
-    const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
-    for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
-    threadgroup_barrier(mem_flags::mem_device);
-    float exclusive = 0.0f;
-    float prev_value = 0.0f;
-    uint prev_index = 0;
-    bool have_prev = false;
-    for (uint position = 0; position < d0.last && exclusive < threshold; ++position) {
-      M1ArgmaxCandidate best = {0.0f, 0u, 0u, 0u};
-      for (uint candidate = tid; candidate < d0.last; candidate += nthreads) {
-        const float value = m1_load_f(a0, base + candidate, d0.dtype);
-        if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate)) continue;
-        best = m1_sort_pick(best, M1ArgmaxCandidate{value, candidate, 1u, 0u});
-      }
-      tgbuf[tid] = best;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint stride = 1u; stride < nthreads; stride <<= 1) {
-        if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
-          tgbuf[tid] = m1_sort_pick(tgbuf[tid], tgbuf[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-      const M1ArgmaxCandidate found = tgbuf[0];
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (found.have == 0u) break;
-      if (tid == 0) m1_store_b(o0, base + found.index, exclusive < threshold);
-      exclusive += found.value;
-      prev_value = found.value;
-      prev_index = found.index;
-      have_prev = true;
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-  }
-}
-
-inline void m1_topk_select_mt(
-    const device uchar* a0,
-    const device uchar* a1,
-    device uchar* o0,
-    const M1ValueDesc d0,
-    const M1ValueDesc d1,
-    uint tid,
-    uint nthreads,
-    threadgroup M1ArgmaxCandidate* tgbuf) {
-  threadgroup atomic_uint* histogram = reinterpret_cast<threadgroup atomic_uint*>(tgbuf);
-  for (uint row = 0; row < d0.rows; ++row) {
-    const uint base = row * d0.last;
-    const int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
-    uint k = signed_k <= 0 ? 0u : uint(signed_k);
-    if (k > d0.last) k = d0.last;
-    if (k == 0u) {
-      for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
-      continue;
-    }
-    uint prefix = 0u;
-    uint target = k;
-    for (int pass = 0; pass < 4; ++pass) {
-      const int shift = 24 - 8 * pass;
-      const uint high_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
-      for (uint bucket = tid; bucket < 256u; bucket += nthreads)
-        atomic_store_explicit(histogram + bucket, 0u, memory_order_relaxed);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint j = tid; j < d0.last; j += nthreads) {
-        const uint key = m1_desc_key(m1_load_f(a0, base + j, d0.dtype));
-        if ((key & high_mask) == (prefix & high_mask))
-          atomic_fetch_add_explicit(histogram + ((key >> shift) & 0xFFu), 1u,
-                                    memory_order_relaxed);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      uint run = 0u;
-      uint chosen = 255u;
-      for (uint bucket = 0u; bucket < 256u; ++bucket) {
-        const uint count = atomic_load_explicit(histogram + bucket, memory_order_relaxed);
-        if (run + count >= target) { chosen = bucket; break; }
-        run += count;
-      }
-      target -= run;
-      prefix |= chosen << shift;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint i = tid; i < d0.last; i += nthreads) {
-      const float value = m1_load_f(a0, base + i, d0.dtype);
-      m1_store_b(o0, base + i, !isnan(value) && m1_desc_key(value) <= prefix);
-    }
-  }
-}
-
-
 inline uint m4_reduce_count(uint last, uint level) {
   uint count = last;
   for (uint l = 0; l < level; ++l) count = (count + 31u) / 32u;
   return count;
 }
 
+// Element `i` of a reduction's input as the bits its fold reads: a bf16
+// element widened to its f32's bits, any other a word.
+inline uint m4_element_bits(const device uchar* input, uint i, uint dtype) {
+  if (dtype == 5) return uint(reinterpret_cast<const device ushort*>(input)[i]) << 16;
+  return reinterpret_cast<const device uint*>(input)[i];
+}
+
 inline uint m4_reduce_identity(uint tag, uint dtype) {
-  if (dtype == 0) return as_type<uint>(tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY));
+  if (m1_is_float(dtype)) return as_type<uint>(tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY));
   if (tag == 0x30) return 0u;
   if (dtype == 1) return tag == 0x31 ? uint(INT_MIN) : uint(INT_MAX);
   return tag == 0x31 ? 0u : UINT_MAX;
 }
 
 inline uint m4_fold_chunk(uint tag, uint dtype, uint bits) {
-  if (dtype == 0) {
+  if (m1_is_float(dtype)) {
     float v = as_type<float>(bits);
     for (uint offset = 16u; offset > 0u; offset >>= 1) {
       const float other = simd_shuffle_down(v, offset);
@@ -1359,7 +1415,12 @@ inline void m4_reduce_two_levels(
     uint threads,
     threadgroup M1ArgmaxCandidate* tgbuf,
     uint simd_lane,
-    uint simd_id) {
+    uint simd_id,
+    // Where stated, level 0 reads exp(x - center[row]) for x, both read
+    // through their dtypes: a log-softmax's sum of exponentials from its
+    // row itself.
+    const device uchar* center = nullptr,
+    uint center_dtype = 0u) {
   const uint count = m4_reduce_count(d.last, level);
   const uint chunks = (count + 31u) / 32u;
   const uint pitch = (d.last + 31u) / 32u;
@@ -1376,27 +1437,42 @@ inline void m4_reduce_two_levels(
         result[row] = identity;
       } else {
         result[row] = level == 0u
-            ? reinterpret_cast<const device uint*>(input)[row * d.last]
+            ? (center != nullptr
+                   ? as_type<uint>(precise::exp(m1_load_f(input, row * d.last, d.dtype) - m1_load_f(center, row, center_dtype)))
+                   : m4_element_bits(input, row * d.last, d.dtype))
             : plane[((level - 1u) & 1u) * d.rows * pitch + row * pitch];
       }
     }
     return;
   }
   const uint span = 32u * M4_REDUCE_CHUNKS_PER_GROUP;
-  if (group * M4_REDUCE_CHUNKS_PER_GROUP >= next_chunks) return;
+  // A row's groups side by side, the rows one after another: the host
+  // launches per_row groups a row (`StepKind::Reduce`), so the rows fold
+  // at once, not one after another in every group.
+  const uint per_row = max((next_chunks + M4_REDUCE_CHUNKS_PER_GROUP - 1u) / M4_REDUCE_CHUNKS_PER_GROUP, 1u);
+  const uint row = group / per_row;
+  group = group % per_row;
+  if (row >= d.rows || group * M4_REDUCE_CHUNKS_PER_GROUP >= next_chunks) return;
   threadgroup uint* tg = reinterpret_cast<threadgroup uint*>(tgbuf);
   const uint simds = threads / 32u;
   const uint rounds = span / simds;
-  for (uint row = 0; row < d.rows; ++row) {
+  {
     const device uint* src = level == 0u
         ? reinterpret_cast<const device uint*>(input) + row * d.last
         : plane + ((level - 1u) & 1u) * d.rows * pitch + row * pitch;
+    const float centre = (level == 0u && center != nullptr) ? m1_load_f(center, row, center_dtype) : 0.0f;
 
     uint held[8];
     for (uint k = 0; k < 8u; ++k) {
       const uint chunk = group * span + simd_id + k * simds;
       const uint at = chunk * 32u + simd_lane;
-      held[k] = (k < rounds && chunk < chunks && at < count) ? src[at] : identity;
+      held[k] = (k < rounds && chunk < chunks && at < count)
+          ? (level == 0u ? m4_element_bits(input, row * d.last + at, d.dtype) : src[at])
+          : identity;
+      // A bf16 element is read widened to its f32's bits.
+      if (level == 0u && center != nullptr && k < rounds && chunk < chunks && at < count) {
+        held[k] = as_type<uint>(precise::exp(m1_bits_f(held[k], d.dtype == 5u ? 0u : d.dtype) - centre));
+      }
     }
     for (uint k = 0; k < 8u; ++k) {
       if (k < rounds) {
@@ -1422,14 +1498,13 @@ inline void m4_reduce_partial(
     uint tag, uint dtype, const device uchar* input, device uint* plane, uint n,
     uint gtid, uint gthreads, uint simd_lane) {
   const uint identity = m4_reduce_identity(tag, dtype);
-  const device uint* src = reinterpret_cast<const device uint*>(input);
 
   uint i0 = gtid - simd_lane;
   for (; i0 < n; i0 += 8u * gthreads) {
     uint held[8];
     for (uint k = 0; k < 8u; ++k) {
       const uint i = i0 + k * gthreads + simd_lane;
-      held[k] = i < n ? src[i] : identity;
+      held[k] = i < n ? m4_element_bits(input, i, dtype) : identity;
     }
     for (uint k = 0; k < 8u; ++k) {
       const uint chunk0 = i0 + k * gthreads;
@@ -1447,7 +1522,7 @@ inline uint m4_reduce_final(
     threadgroup M1ArgmaxCandidate* tgbuf) {
   const uint identity = m4_reduce_identity(tag, dtype);
   if (n == 0u) return identity;
-  if (n == 1u) return reinterpret_cast<const device uint*>(input)[0];
+  if (n == 1u) return m4_element_bits(input, 0u, dtype);
   uint count = (n + 31u) / 32u;
   if (count == 1u) return plane[0];
   if (count > 32768u) {
@@ -1494,340 +1569,454 @@ inline uint m4_reduce_final(
 }
 
 
-#define M4_SEL_CAP 1024u
-#define M4_SEL_BYTES 16384u
+// The streamed top-k / top-p select (`pivot_threshold` under RANK_LE or
+// CUMMASS_LE): which tokens of each row a sample may draw, as a mask.
+//
+// Tokens are taken in descending value, ties in ascending index. Top-k takes
+// the first k. Top-p takes every token whose exclusive mass (the mass of the
+// tokens before it) is below p: the boundary is the first token whose
+// exclusive mass is not below p, as before.
+//
+// The cut is found by a radix select on the descending key, 8 bits a pass,
+// four passes over the row whatever the nucleus's size: each pass histograms
+// the tokens still in play by count and by mass, and one thread walks the 256
+// buckets to the one the cut lies in. The mass is exact and order-independent:
+// a probability p is the 64-bit integer floor(p * 2^32) (a token below 2^-32
+// weighs nothing), summed as two 32-bit words with carry, so no summation
+// order moves the cut. A row's total is at most V * 2^32 for probabilities
+// (2^50 at V = 2^18), far inside the two words. The threshold is
+// floor(p * 2^32) the same way.
+//
+// Each row keeps its state and histograms at `base + row * M4_SEL_ROW_BYTES`,
+// for up to M4_SEL_ROWS rows; a select of more rows is refused by name.
+
+#define M4_SEL_ROWS 16u
+#define M4_SEL_ROW_BYTES 3200u
+#define M4_SEL_BYTES (M4_SEL_ROWS * M4_SEL_ROW_BYTES)
 
 struct M4SelState {
-  uint fast;
-  uint done;
-  uint have_bound;
-  uint bound_key;
-  uint bound_idx;
-  float exclusive;
-  uint taken;
-  uint want;
-  uint sel_prefix;
-  uint sel_remaining;
-  uint total_lt;
-  uint held;
-  uint pad[4];
+  uint done;        // the cut is known (or the row takes nothing / all)
+  uint all;         // every token of the row is taken
+  uint prefix;      // the cut key's digits picked so far
+  uint before;      // tokens strictly before the bucket in play
+  uint before_lo;   // their mass, low word
+  uint before_hi;   // their mass, high word
+  uint target_lo;   // top-p: the threshold's mass; top-k: k in target_lo
+  uint target_hi;
+  uint take;        // tokens of the cut key taken (in index order)
+  uint ties;        // tokens of the cut key in the row
+  uint pad[6];
 };
 
-inline device M4SelState* m4_sel_state(device uchar* base) {
-  return reinterpret_cast<device M4SelState*>(base);
+inline device M4SelState* m4_sel_state(device uchar* base, uint row) {
+  return reinterpret_cast<device M4SelState*>(base + row * M4_SEL_ROW_BYTES);
 }
-inline device atomic_uint* m4_sel_hist(device uchar* base) {
-  return reinterpret_cast<device atomic_uint*>(base + 64u);
+// Per row: counts at +64, mass low words at +1088, high words at +2112.
+inline device atomic_uint* m4_sel_count(device uchar* base, uint row) {
+  return reinterpret_cast<device atomic_uint*>(base + row * M4_SEL_ROW_BYTES + 64u);
 }
-inline device atomic_uint* m4_sel_fill(device uchar* base) {
-  return reinterpret_cast<device atomic_uint*>(base + 64u + 2048u);
+inline device atomic_uint* m4_sel_lo(device uchar* base, uint row) {
+  return reinterpret_cast<device atomic_uint*>(base + row * M4_SEL_ROW_BYTES + 1088u);
 }
-inline device uint* m4_sel_keys(device uchar* base) {
-  return reinterpret_cast<device uint*>(base + 64u + 2048u + 16u);
-}
-inline device uint* m4_sel_idx(device uchar* base) {
-  return reinterpret_cast<device uint*>(base + 64u + 2048u + 16u + 4096u);
+inline device atomic_uint* m4_sel_hi(device uchar* base, uint row) {
+  return reinterpret_cast<device atomic_uint*>(base + row * M4_SEL_ROW_BYTES + 2112u);
 }
 
-inline bool m4_sel_after(const device M4SelState* st, uint key, uint idx) {
-  if (st->have_bound == 0u) return true;
-  return key > st->bound_key || (key == st->bound_key && idx > st->bound_idx);
+// Adds `v` to the two-word counter (lo, hi), carrying out of the low word.
+inline void m4_sel_add(threadgroup atomic_uint* lo, threadgroup atomic_uint* hi, ulong v) {
+  const uint low = uint(v);
+  const uint old = atomic_fetch_add_explicit(lo, low, memory_order_relaxed);
+  const uint carry = (old + low < old) ? 1u : 0u;
+  const uint high = uint(v >> 32) + carry;
+  if (high != 0u) atomic_fetch_add_explicit(hi, high, memory_order_relaxed);
+}
+inline void m4_sel_add(device atomic_uint* lo, device atomic_uint* hi, ulong v) {
+  const uint low = uint(v);
+  const uint old = atomic_fetch_add_explicit(lo, low, memory_order_relaxed);
+  const uint carry = (old + low < old) ? 1u : 0u;
+  const uint high = uint(v >> 32) + carry;
+  if (high != 0u) atomic_fetch_add_explicit(hi, high, memory_order_relaxed);
 }
 
 inline void m4_sel_init(
     device uchar* base, device uchar* o0, const M1ValueDesc d0, const M1ValueDesc d1,
-    const device uchar* a1, uint mode, uint gtid, uint gthreads) {
-  const uint n = d0.rows * d0.last;
-  for (uint i = gtid; i < n; i += gthreads) m1_store_b(o0, i, false);
-  device atomic_uint* hist = m4_sel_hist(base);
-  for (uint b = gtid; b < 512u; b += gthreads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
-  if (gtid == 0u) {
-    device M4SelState* st = m4_sel_state(base);
-    st->fast = d0.rows == 1u ? 1u : 0u;
-    st->have_bound = 0u;
-    st->bound_key = 0u;
-    st->bound_idx = 0u;
-    st->exclusive = 0.0f;
-    st->taken = 0u;
-    st->sel_prefix = 0u;
-    st->sel_remaining = 0u;
-    st->total_lt = 0u;
-    st->held = 0u;
-    uint want = M4_SEL_CAP;
-    bool done = d0.last == 0u;
-    if (mode == 0u) {
-      const int signed_k = m1_load_i(a1, 0u, d1.dtype);
-      const uint k = signed_k <= 0 ? 0u : uint(signed_k);
-      want = min(k, M4_SEL_CAP);
-      if (k == 0u) done = true;
+    const device uchar* a1, uint mode, uint gtid, uint gthreads, device M1Status* status,
+    M1OpParams p) {
+  const uint rows = d0.rows;
+  if (rows > M4_SEL_ROWS) {
+    // A guard the host names (site 4): a select of more rows than its state holds.
+    if (gtid == 0u) m1_fault_op(status, 4u, p);
+    return;
+  }
+  for (uint row = 0u; row < rows; ++row) {
+    device atomic_uint* count = m4_sel_count(base, row);
+    device atomic_uint* lo = m4_sel_lo(base, row);
+    device atomic_uint* hi = m4_sel_hi(base, row);
+    for (uint b = gtid; b < 256u; b += gthreads) {
+      atomic_store_explicit(&count[b], 0u, memory_order_relaxed);
+      atomic_store_explicit(&lo[b], 0u, memory_order_relaxed);
+      atomic_store_explicit(&hi[b], 0u, memory_order_relaxed);
     }
-    st->want = want;
-    st->done = done ? 1u : 0u;
-    atomic_store_explicit(&m4_sel_fill(base)[0], 0u, memory_order_relaxed);
-    atomic_store_explicit(&m4_sel_fill(base)[1], 0u, memory_order_relaxed);
+  }
+  if (gtid == 0u) {
+    for (uint row = 0u; row < rows; ++row) {
+      device M4SelState* st = m4_sel_state(base, row);
+      st->prefix = 0u;
+      st->before = 0u;
+      st->before_lo = 0u;
+      st->before_hi = 0u;
+      st->take = 0u;
+      st->ties = 0u;
+      st->all = 0u;
+      uint done = d0.last == 0u ? 1u : 0u;
+      if (mode == 0u) {
+        const int signed_k = m1_load_i(a1, 0u, d1.dtype);
+        const uint k = signed_k <= 0 ? 0u : uint(signed_k);
+        st->target_lo = k;
+        st->target_hi = 0u;
+        if (k == 0u) done = 1u;
+        if (k >= d0.last) { st->all = 1u; done = 1u; }
+      } else {
+        const ulong target = m4_sel_fixed(m1_load_f(a1, 0u, d1.dtype));
+        st->target_lo = uint(target);
+        st->target_hi = uint(target >> 32);
+        // A threshold of no mass takes nothing: the first token's exclusive
+        // mass, zero, is not below it.
+        if (target == 0ul) done = 1u;
+      }
+      st->done = done;
+    }
   }
 }
 
 inline void m4_sel_hist_pass(
     device uchar* base, const device uchar* a0, const M1ValueDesc d0, uint pass,
-    uint gtid, uint gthreads, uint tid, uint threads, threadgroup atomic_uint* tg_hist) {
-  const device M4SelState* st = m4_sel_state(base);
-  if (st->done != 0u || st->fast == 0u) return;
+    uint gtid, uint gthreads, uint tid, uint threads, threadgroup atomic_uint* tg) {
+  if (d0.rows > M4_SEL_ROWS) return;
   const uint n = d0.last;
   const uint shift = 24u - 8u * pass;
-  const uint prefix = st->sel_prefix;
-  for (uint b = tid; b < 256u; b += threads) atomic_store_explicit(&tg_hist[b], 0u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i0 = gtid; i0 < n; i0 += 8u * gthreads) {
-    float held[8];
-    for (uint u = 0u; u < 8u; ++u) {
-      const uint i = i0 + u * gthreads;
-      held[u] = i < n ? m1_load_f(a0, i, d0.dtype) : 0.0f;
+  for (uint row = 0u; row < d0.rows; ++row) {
+    const device M4SelState* st = m4_sel_state(base, row);
+    if (st->done != 0u) continue;
+    const uint prefix = st->prefix;
+    for (uint b = tid; b < 768u; b += threads) atomic_store_explicit(&tg[b], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = gtid; i < n; i += gthreads) {
+      const float value = m1_load_f(a0, row * n + i, d0.dtype);
+      const uint key = m1_desc_key(value);
+      if (pass != 0u && (key >> (shift + 8u)) != (prefix >> (shift + 8u))) continue;
+      const uint digit = (key >> shift) & 255u;
+      atomic_fetch_add_explicit(&tg[digit], 1u, memory_order_relaxed);
+      m4_sel_add(&tg[256u + digit], &tg[512u + digit], m4_sel_fixed(value));
     }
-    for (uint u = 0u; u < 8u; ++u) {
-      const uint i = i0 + u * gthreads;
-      if (i >= n) break;
-      const uint key = m1_desc_key(held[u]);
-      if (!m4_sel_after(st, key, i)) continue;
-      if (pass == 0u || (key >> (shift + 8u)) == (prefix >> (shift + 8u)))
-        atomic_fetch_add_explicit(&tg_hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device atomic_uint* count = m4_sel_count(base, row);
+    device atomic_uint* lo = m4_sel_lo(base, row);
+    device atomic_uint* hi = m4_sel_hi(base, row);
+    for (uint b = tid; b < 256u; b += threads) {
+      const uint c = atomic_load_explicit(&tg[b], memory_order_relaxed);
+      if (c == 0u) continue;
+      atomic_fetch_add_explicit(&count[b], c, memory_order_relaxed);
+      const ulong m = m4_sel_pair(atomic_load_explicit(&tg[256u + b], memory_order_relaxed),
+                                  atomic_load_explicit(&tg[512u + b], memory_order_relaxed));
+      m4_sel_add(&lo[b], &hi[b], m);
     }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  device atomic_uint* hist = m4_sel_hist(base);
-  for (uint b = tid; b < 256u; b += threads) {
-    const uint c = atomic_load_explicit(&tg_hist[b], memory_order_relaxed);
-    if (c != 0u) atomic_fetch_add_explicit(&hist[b], c, memory_order_relaxed);
-  }
-}
-
-inline void m4_sel_pick(device uchar* base, uint pass, uint tid, uint threads) {
-  device M4SelState* st = m4_sel_state(base);
-  if (st->done != 0u || st->fast == 0u) return;
-  device atomic_uint* hist = m4_sel_hist(base);
-  if (tid == 0u) {
-    const uint shift = 24u - 8u * pass;
-    const uint remaining = pass == 0u ? st->want : st->sel_remaining;
-    uint before = 0u;
-    uint digit = 0u;
-    for (; digit + 1u < 256u; ++digit) {
-      const uint here = atomic_load_explicit(&hist[digit], memory_order_relaxed);
-      if (before + here >= remaining) break;
-      before += here;
-    }
-    st->sel_prefix = (pass == 0u ? 0u : st->sel_prefix) | (digit << shift);
-    st->sel_remaining = remaining - before;
-    if (pass == 3u) st->total_lt = st->want - (remaining - before);
-  }
-  threadgroup_barrier(mem_flags::mem_device);
-  for (uint b = tid; b < 512u; b += threads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
-  if (tid == 0u) {
-    atomic_store_explicit(&m4_sel_fill(base)[0], 0u, memory_order_relaxed);
-    atomic_store_explicit(&m4_sel_fill(base)[1], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
 
-inline void m4_sel_compact(
-    device uchar* base, const device uchar* a0, const M1ValueDesc d0, uint gtid, uint gthreads) {
-  const device M4SelState* st = m4_sel_state(base);
-  if (st->done != 0u || st->fast == 0u) return;
-  const uint n = d0.last;
-  const uint pivot = st->sel_prefix;
-  const uint total_lt = st->total_lt;
-  device atomic_uint* fill = m4_sel_fill(base);
-  device uint* keys = m4_sel_keys(base);
-  device uint* idx = m4_sel_idx(base);
-  for (uint i0 = gtid; i0 < n; i0 += 8u * gthreads) {
-    float held[8];
-    for (uint u = 0u; u < 8u; ++u) {
-      const uint i = i0 + u * gthreads;
-      held[u] = i < n ? m1_load_f(a0, i, d0.dtype) : 0.0f;
-    }
-    for (uint u = 0u; u < 8u; ++u) {
-      const uint i = i0 + u * gthreads;
-      if (i >= n) break;
-      const uint key = m1_desc_key(held[u]);
-      if (!m4_sel_after(st, key, i)) continue;
-      if (key < pivot) {
-        const uint slot = atomic_fetch_add_explicit(&fill[0], 1u, memory_order_relaxed);
-        if (slot < M4_SEL_CAP) { keys[slot] = key; idx[slot] = i; }
-      } else if (key == pivot) {
-        const uint slot = atomic_fetch_add_explicit(&fill[1], 1u, memory_order_relaxed);
-        if (total_lt + slot < M4_SEL_CAP) { keys[total_lt + slot] = key; idx[total_lt + slot] = i; }
+// One thread walks a row's 256 buckets, in descending key, to the one the cut
+// lies in, then clears the histograms for the next pass.
+inline void m4_sel_pick(device uchar* base, const M1ValueDesc d0, uint mode, uint pass, uint tid, uint threads) {
+  if (d0.rows > M4_SEL_ROWS) return;
+  for (uint row = 0u; row < d0.rows; ++row) {
+    device M4SelState* st = m4_sel_state(base, row);
+    device atomic_uint* count = m4_sel_count(base, row);
+    device atomic_uint* lo = m4_sel_lo(base, row);
+    device atomic_uint* hi = m4_sel_hi(base, row);
+    if (tid == 0u && st->done == 0u) {
+      const uint shift = 24u - 8u * pass;
+      uint before = st->before;
+      M4Mass mass = m4_mass(st->before_lo, st->before_hi);
+      const M4Mass target = m4_mass(st->target_lo, st->target_hi);
+      uint digit = 256u;
+      for (uint d = 0u; d < 256u; ++d) {
+        const uint c = atomic_load_explicit(&count[d], memory_order_relaxed);
+        const M4Mass m = m4_mass(atomic_load_explicit(&lo[d], memory_order_relaxed),
+                                 atomic_load_explicit(&hi[d], memory_order_relaxed));
+        // The cut lies in this bucket where its tokens reach the target:
+        // top-k by count, top-p by mass (the bucket's last token's exclusive
+        // mass stays below the target until its inclusive mass reaches it).
+        const bool here = c != 0u &&
+            (mode == 0u ? (before + c >= st->target_lo) : m4_mass_ge(m4_mass_add(mass, m), target));
+        if (digit == 256u && here) digit = d;
+        if (digit == 256u) {
+          before += c;
+          mass = m4_mass_add(mass, m);
+        }
+      }
+      if (digit == 256u) {
+        // Only at the first pass: the row's whole mass (or count) does not
+        // reach the cut, so every token is taken. (Past it, the bucket in
+        // play crossed at the pass before, so one of its digits does.)
+        st->all = 1u;
+        st->done = 1u;
+      } else {
+        st->prefix = (pass == 0u ? 0u : st->prefix) | (digit << shift);
+        st->before = before;
+        st->before_lo = mass.lo;
+        st->before_hi = mass.hi;
+        if (pass == 3u) {
+          const uint ties = atomic_load_explicit(&count[digit], memory_order_relaxed);
+          uint take = ties;
+          if (mode == 0u) {
+            take = st->target_lo - before;
+          } else {
+            // Every tie weighs the same: the mass of the cut key's value.
+            const M4Mass v = m4_mass(m4_sel_fixed_lo(digit, st->prefix), m4_sel_fixed_hi(st->prefix));
+            if (v.lo != 0u || v.hi != 0u) {
+              // The j-th tie (from 0) is taken while mass + j * v is below
+              // the target: the least j where it is not, by bisection.
+              const M4Mass room = m4_mass_sub(target, mass);
+              uint low = 0u, high = ties;
+              while (low < high) {
+                const uint mid = low + (high - low) / 2u;
+                if (m4_mass_ge(m4_mass_mul(v, mid), room)) high = mid; else low = mid + 1u;
+              }
+              take = low;
+            }
+          }
+          st->ties = ties;
+          st->take = min(take, ties);
+          st->done = 1u;
+        }
       }
     }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint b = tid; b < 256u; b += threads) {
+      atomic_store_explicit(&count[b], 0u, memory_order_relaxed);
+      atomic_store_explicit(&lo[b], 0u, memory_order_relaxed);
+      atomic_store_explicit(&hi[b], 0u, memory_order_relaxed);
+    }
   }
 }
 
-inline void m4_sel_finish(
-    device uchar* base, const device uchar* a0, const device uchar* a1, device uchar* o0,
-    const M1ValueDesc d0, const M1ValueDesc d1, uint mode,
-    uint tid, uint threads, threadgroup uint* tg_key, threadgroup uint* tg_idx, threadgroup uint* tg_scan) {
-  device M4SelState* st = m4_sel_state(base);
-  if (st->done != 0u || st->fast == 0u) return;
+// Writes every token's mask: taken where its key comes before the cut key,
+// or the cut key itself where all its ties are taken.
+inline void m4_sel_mark(
+    device uchar* base, const device uchar* a0, device uchar* o0, const M1ValueDesc d0,
+    uint gtid, uint gthreads) {
+  if (d0.rows > M4_SEL_ROWS) return;
   const uint n = d0.last;
-  const uint pivot = st->sel_prefix;
-  const uint total_lt = st->total_lt;
-  const uint want = st->want;
-  const uint remaining = st->sel_remaining;
-  const uint n_eq = atomic_load_explicit(&m4_sel_fill(base)[1], memory_order_relaxed);
-  const uint eq_room = M4_SEL_CAP - total_lt;
-  device uint* keys = m4_sel_keys(base);
-  device uint* idx = m4_sel_idx(base);
-  uint held = total_lt + min(n_eq, eq_room);
-  for (uint p = tid; p < held; p += threads) {
-    tg_key[p] = keys[p];
-    tg_idx[p] = idx[p];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (n_eq > eq_room) {
-    const uint chunk_begin = uint((ulong(n) * tid) / threads);
-    const uint chunk_end = uint((ulong(n) * (tid + 1u)) / threads);
-    uint mine = 0u;
-    for (uint i = chunk_begin; i < chunk_end; ++i) {
-      const uint key = m1_desc_key(m1_load_f(a0, i, d0.dtype));
-      mine += (key == pivot && m4_sel_after(st, key, i)) ? 1u : 0u;
+  for (uint row = 0u; row < d0.rows; ++row) {
+    const device M4SelState* st = m4_sel_state(base, row);
+    const bool all = st->all != 0u;
+    const bool none = !all && st->ties == 0u;
+    const uint cut = st->prefix;
+    const bool every_tie = st->take == st->ties;
+    for (uint i = gtid; i < n; i += gthreads) {
+      bool taken = all;
+      if (!all && !none) {
+        const uint key = m1_desc_key(m1_load_f(a0, row * n + i, d0.dtype));
+        taken = key < cut || (key == cut && every_tie);
+      }
+      m1_store_b(o0, row * n + i, taken);
     }
-    tg_scan[tid] = mine;
+  }
+}
+
+// Where only some of the cut key's ties are taken, takes the first `take` of
+// them in index order: one threadgroup, each thread a contiguous chunk.
+inline void m4_sel_ties(
+    device uchar* base, const device uchar* a0, device uchar* o0, const M1ValueDesc d0,
+    uint tid, uint threads, threadgroup uint* scan) {
+  if (d0.rows > M4_SEL_ROWS) return;
+  const uint n = d0.last;
+  for (uint row = 0u; row < d0.rows; ++row) {
+    const device M4SelState* st = m4_sel_state(base, row);
+    if (st->all != 0u || st->ties == 0u || st->take == st->ties) continue;
+    const uint cut = st->prefix;
+    const uint take = st->take;
+    const uint begin = uint((ulong(n) * tid) / threads);
+    const uint end = uint((ulong(n) * (tid + 1u)) / threads);
+    uint mine = 0u;
+    for (uint i = begin; i < end; ++i)
+      mine += m1_desc_key(m1_load_f(a0, row * n + i, d0.dtype)) == cut ? 1u : 0u;
+    scan[tid] = mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
       uint run = 0u;
       for (uint t = 0u; t < threads; ++t) {
-        const uint here = tg_scan[t];
-        tg_scan[t] = run;
+        const uint here = scan[t];
+        scan[t] = run;
         run += here;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint at = tg_scan[tid];
-    for (uint i = chunk_begin; i < chunk_end; ++i) {
-      const uint key = m1_desc_key(m1_load_f(a0, i, d0.dtype));
-      if (key == pivot && m4_sel_after(st, key, i)) {
-        if (at < remaining) {
-          tg_key[total_lt + at] = pivot;
-          tg_idx[total_lt + at] = i;
-        }
+    uint at = scan[tid];
+    for (uint i = begin; i < end && at < take; ++i) {
+      if (m1_desc_key(m1_load_f(a0, row * n + i, d0.dtype)) == cut) {
+        m1_store_b(o0, row * n + i, true);
         ++at;
       }
     }
-    held = want;
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+}
 
-  uint n_all = 1u;
-  while (n_all < held) n_all <<= 1u;
-  for (uint p = held + tid; p < n_all; p += threads) {
-    tg_key[p] = ~0u;
-    tg_idx[p] = ~0u;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint size = 2u; size <= n_all; size <<= 1u) {
-    for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
-      for (uint t = tid; t < n_all / 2u; t += threads) {
-        const uint lo = 2u * stride * (t / stride) + (t % stride);
-        const uint hi = lo + stride;
-        const bool ascending = ((lo & size) == 0u);
-        const uint klo = tg_key[lo], khi = tg_key[hi];
-        const uint ilo = tg_idx[lo], ihi = tg_idx[hi];
-        const bool lo_greater = klo > khi || (klo == khi && ilo > ihi);
-        if (lo_greater == ascending) {
-          tg_key[lo] = khi; tg_key[hi] = klo;
-          tg_idx[lo] = ihi; tg_idx[hi] = ilo;
+// The single-threadgroup top-k (mode 0) / top-p (mode 1) cut, the fused and
+// grouped forms' select: the same rule and the same radix select as the
+// streamed one (m4_sel_*), four passes over each row, ties in index order,
+// its histograms and state in `tgbuf` (at least 5184 bytes: 768 histogram
+// words, a scan word a thread, 16 state words).
+inline void m1_cut_select_mt(
+    const device uchar* a0,
+    const device uchar* a1,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    uint mode,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  threadgroup atomic_uint* hist = reinterpret_cast<threadgroup atomic_uint*>(tgbuf);
+  threadgroup uint* scan = reinterpret_cast<threadgroup uint*>(tgbuf) + 768u;
+  threadgroup uint* st = scan + nthreads;  // prefix, before, mass lo, mass hi, ties, take, all, done
+  const uint n = d0.last;
+  for (uint row = 0; row < d0.rows; ++row) {
+    const uint base = row * n;
+    uint k = 0u;
+    ulong target64 = 0ul;
+    if (mode == 0u) {
+      const int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
+      k = signed_k <= 0 ? 0u : uint(signed_k);
+    } else {
+      target64 = m4_sel_fixed(m1_load_f(a1, m1_pick(d1.len, row), d1.dtype));
+    }
+    const M4Mass target = m4_mass(uint(target64), uint(target64 >> 32));
+    if (tid == 0u) {
+      st[0] = 0u; st[1] = 0u; st[2] = 0u; st[3] = 0u; st[4] = 0u; st[5] = 0u;
+      const bool every = mode == 0u && k >= n;
+      st[6] = every ? 1u : 0u;
+      st[7] = (n == 0u || every || (mode == 0u ? k == 0u : target64 == 0ul)) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint pass = 0u; pass < 4u; ++pass) {
+      if (st[7] != 0u) break;
+      const uint shift = 24u - 8u * pass;
+      const uint prefix = st[0];
+      for (uint b = tid; b < 768u; b += nthreads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = tid; i < n; i += nthreads) {
+        const float value = m1_load_f(a0, base + i, d0.dtype);
+        const uint key = m1_desc_key(value);
+        if (pass != 0u && (key >> (shift + 8u)) != (prefix >> (shift + 8u))) continue;
+        const uint digit = (key >> shift) & 255u;
+        atomic_fetch_add_explicit(&hist[digit], 1u, memory_order_relaxed);
+        m4_sel_add(&hist[256u + digit], &hist[512u + digit], m4_sel_fixed(value));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid == 0u) {
+        uint before = st[1];
+        M4Mass mass = m4_mass(st[2], st[3]);
+        uint digit = 256u;
+        for (uint d = 0u; d < 256u; ++d) {
+          const uint c = atomic_load_explicit(&hist[d], memory_order_relaxed);
+          const M4Mass m = m4_mass(atomic_load_explicit(&hist[256u + d], memory_order_relaxed),
+                                   atomic_load_explicit(&hist[512u + d], memory_order_relaxed));
+          const bool here = c != 0u &&
+              (mode == 0u ? (before + c >= k) : m4_mass_ge(m4_mass_add(mass, m), target));
+          if (digit == 256u && here) digit = d;
+          if (digit == 256u) {
+            before += c;
+            mass = m4_mass_add(mass, m);
+          }
+        }
+        if (digit == 256u) {
+          st[6] = 1u;
+          st[7] = 1u;
+        } else {
+          st[0] = (pass == 0u ? 0u : st[0]) | (digit << shift);
+          st[1] = before;
+          st[2] = mass.lo;
+          st[3] = mass.hi;
+          if (pass == 3u) {
+            const uint ties = atomic_load_explicit(&hist[digit], memory_order_relaxed);
+            uint take = ties;
+            const M4Mass v = m4_mass(m4_sel_fixed_lo(digit, st[0]), m4_sel_fixed_hi(st[0]));
+            if (mode == 0u) {
+              take = k - before;
+            } else if (v.lo != 0u || v.hi != 0u) {
+              const M4Mass room = m4_mass_sub(target, mass);
+              uint low = 0u, high = ties;
+              while (low < high) {
+                const uint mid = low + (high - low) / 2u;
+                if (m4_mass_ge(m4_mass_mul(v, mid), room)) high = mid; else low = mid + 1u;
+              }
+              take = low;
+            }
+            st[4] = ties;
+            st[5] = min(take, ties);
+            st[7] = 1u;
+          }
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-  }
-  if (tid == 0u) {
-
-    float exclusive = st->exclusive;
-    uint taken = st->taken;
-    bool done = false;
-    const float threshold = mode == 1u ? m1_load_f(a1, 0u, d1.dtype) : 0.0f;
-    uint k = 0u;
-    if (mode == 0u) {
-      const int signed_k = m1_load_i(a1, 0u, d1.dtype);
-      k = signed_k <= 0 ? 0u : uint(signed_k);
+    const bool all = st[6] != 0u;
+    const uint ties = st[4];
+    const uint take = st[5];
+    const uint cut = st[0];
+    const bool none = !all && ties == 0u;
+    const bool every_tie = take == ties;
+    for (uint i = tid; i < n; i += nthreads) {
+      bool taken = all;
+      if (!all && !none) {
+        const uint key = m1_desc_key(m1_load_f(a0, base + i, d0.dtype));
+        taken = key < cut || (key == cut && every_tie);
+      }
+      m1_store_b(o0, base + i, taken);
     }
-    uint p = 0u;
-    for (; p < held; ++p) {
-      const uint index = tg_idx[p];
-      if (mode == 1u) {
-        if (!(exclusive < threshold)) { done = true; break; }
-        m1_store_b(o0, index, true);
-        exclusive += m1_load_f(a0, index, d0.dtype);
-      } else {
-        if (taken >= k) { done = true; break; }
-        m1_store_b(o0, index, true);
-        ++taken;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (!all && ties != 0u && !every_tie) {
+      const uint begin = uint((ulong(n) * tid) / nthreads);
+      const uint end = uint((ulong(n) * (tid + 1u)) / nthreads);
+      uint mine = 0u;
+      for (uint i = begin; i < end; ++i)
+        mine += m1_desc_key(m1_load_f(a0, base + i, d0.dtype)) == cut ? 1u : 0u;
+      scan[tid] = mine;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid == 0u) {
+        uint run = 0u;
+        for (uint t = 0u; t < nthreads; ++t) {
+          const uint here = scan[t];
+          scan[t] = run;
+          run += here;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      uint at = scan[tid];
+      for (uint i = begin; i < end && at < take; ++i) {
+        if (m1_desc_key(m1_load_f(a0, base + i, d0.dtype)) == cut) {
+          m1_store_b(o0, base + i, true);
+          ++at;
+        }
       }
     }
-    if (!done && (held < want || held == 0u)) done = true;
-    if (!done && mode == 0u && taken >= k) done = true;
-    if (!done && mode == 1u && !(exclusive < threshold)) done = true;
-    if (!done && held > 0u) {
-      st->have_bound = 1u;
-      st->bound_key = tg_key[held - 1u];
-      st->bound_idx = tg_idx[held - 1u];
-    }
-    st->exclusive = exclusive;
-    st->taken = taken;
-    st->want = mode == 0u ? min(k - taken, M4_SEL_CAP) : M4_SEL_CAP;
-    st->held = held;
-    st->done = done ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_device);
   }
 }
 
-inline void m4_sel_fallback(
-    device uchar* base, const device uchar* a0, const device uchar* a1, device uchar* o0,
-    const M1ValueDesc d0, const M1ValueDesc d1, uint mode,
-    uint tid, uint threads, threadgroup M1ArgmaxCandidate* tgbuf) {
-  device M4SelState* st = m4_sel_state(base);
-  if (st->done != 0u) return;
-  if (st->fast == 0u) {
-    if (mode == 1u) m1_nucleus_select_mt(a0, a1, o0, d0, d1, tid, threads, tgbuf);
-    else m1_topk_select_mt(a0, a1, o0, d0, d1, tid, threads, tgbuf);
-    return;
-  }
-  const uint n = d0.last;
-  const float threshold = mode == 1u ? m1_load_f(a1, 0u, d1.dtype) : 0.0f;
-  uint k = 0u;
-  if (mode == 0u) {
-    const int signed_k = m1_load_i(a1, 0u, d1.dtype);
-    k = signed_k <= 0 ? 0u : uint(signed_k);
-  }
-  float exclusive = st->exclusive;
-  uint taken = st->taken;
-  bool have_prev = st->have_bound != 0u;
+inline void m1_nucleus_select_mt(
+    const device uchar* a0, const device uchar* a1, device uchar* o0, const M1ValueDesc d0,
+    const M1ValueDesc d1, uint tid, uint nthreads, threadgroup M1ArgmaxCandidate* tgbuf) {
+  m1_cut_select_mt(a0, a1, o0, d0, d1, 1u, tid, nthreads, tgbuf);
+}
 
-  float prev_value = have_prev ? m1_load_f(a0, st->bound_idx, d0.dtype) : 0.0f;
-  uint prev_index = st->bound_idx;
-  for (uint position = 0; position < n; ++position) {
-    if (mode == 1u ? !(exclusive < threshold) : taken >= k) break;
-    M1ArgmaxCandidate best = {0.0f, 0u, 0u, 0u};
-    for (uint candidate = tid; candidate < n; candidate += threads) {
-      const float value = m1_load_f(a0, candidate, d0.dtype);
-      if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate)) continue;
-      best = m1_sort_pick(best, M1ArgmaxCandidate{value, candidate, 1u, 0u});
-    }
-    tgbuf[tid] = best;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 1u; stride < threads; stride <<= 1) {
-      if ((tid % (2u * stride)) == 0u && tid + stride < threads)
-        tgbuf[tid] = m1_sort_pick(tgbuf[tid], tgbuf[tid + stride]);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const M1ArgmaxCandidate found = tgbuf[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (found.have == 0u) break;
-    if (tid == 0) m1_store_b(o0, found.index, true);
-    exclusive += found.value;
-    ++taken;
-    prev_value = found.value;
-    prev_index = found.index;
-    have_prev = true;
-  }
-  if (tid == 0u) st->done = 1u;
+inline void m1_topk_select_mt(
+    const device uchar* a0, const device uchar* a1, device uchar* o0, const M1ValueDesc d0,
+    const M1ValueDesc d1, uint tid, uint nthreads, threadgroup M1ArgmaxCandidate* tgbuf) {
+  m1_cut_select_mt(a0, a1, o0, d0, d1, 0u, tid, nthreads, tgbuf);
 }
 
 inline void m4_argmax_partial(
@@ -1840,14 +2029,13 @@ inline void m4_argmax_partial(
     uint nthreads,
     threadgroup M1ArgmaxCandidate* tgbuf) {
   device M1ArgmaxCandidate* partials = reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
-  const device float* values = reinterpret_cast<const device float*>(input);
   const uint span = groups * nthreads;
   const uint begin = group * nthreads + tid;
   for (uint row = 0; row < d.rows; ++row) {
     const uint base = row * d.last;
     M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
     for (uint i = begin; i < d.last; i += span) {
-      const float value = values[base + i];
+      const float value = m1_load_f(input, base + i, d.dtype);
       best = m1_argmax_combine(best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
     }
     tgbuf[tid] = best;
@@ -1889,6 +2077,120 @@ inline void m4_argmax_final(
   }
 }
 
+// `gumbel_argmax`'s first level across the grid: each group's best lane of
+// each row, every lane made as `m1_gumbel_argmax_mt` makes it; the second
+// level is `m4_argmax_final`.
+inline void m4_gumbel_partial(
+    const device uchar* logits,
+    const device uchar* keep,
+    const device uchar* divisor,
+    const device uchar* state,
+    device uchar* temporary,
+    const M1ValueDesc dl,
+    const M1ValueDesc dk,
+    const M1ValueDesc dd,
+    const M1ValueDesc ds,
+    uint group,
+    uint groups,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  #pragma clang fp contract(off)
+  device M1ArgmaxCandidate* partials = reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
+  const ulong key = ulong(m1_load_u(state, 0, ds.dtype));
+  const ulong counter = ulong(ds.len > 1 ? m1_load_u(state, 1, ds.dtype) : 0u);
+  const ulong seed = ptir_rng_keyed_seed(uint(key), uint(counter));
+  // The draw multiplies by its scale (the host's rounded 1 / T), never
+  // divides: a multiply is correctly rounded on every backend. The product
+  // is its own statement and nothing contracts it, so the lane is the
+  // interpreter's two roundings, `logit * scale` then `+ noise`.
+  const float scale = m1_load_f(divisor, 0, dd.dtype);
+  const uint span = groups * nthreads;
+  const uint begin = group * nthreads + tid;
+  for (uint row = 0; row < dl.rows; ++row) {
+    const uint base = row * dl.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = begin; i < dl.last; i += span) {
+      const uint flat = base + i;
+      float value = -INFINITY;
+      if (m1_load_b(keep, m1_pick(dk.len, flat), dk.dtype)) {
+        const float uniform = ptir_rng_hash_uniform(seed, flat);
+        const float noise = -precise::log(-precise::log(uniform));
+        const float scaled = m1_load_f(logits, flat, dl.dtype) * scale;
+        value = scaled + noise;
+      }
+      best = m1_argmax_combine(best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads)
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) partials[row * groups + group] = tgbuf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// `gumbel_argmax`: each row's index of its largest `logits[i] * scale +
+// gumbel(state, i)`, a lane whose `keep` is false `-inf`. Every lane is
+// made in f32 from its operands and never stored: the noise is lane `i`
+// (the flat index) of `rng_keyed(state, logits' shape, Gumbel)`, made with
+// the same operations as the keyed rng's Gumbel lane, so over f32 logits
+// the draw is bit for bit `reduce_argmax(select(keep, logits * scale,
+// -inf) + rng_keyed(..))`. Ties and NaN as `reduce_argmax`'s.
+inline void m1_gumbel_argmax_mt(
+    const device uchar* logits,
+    const device uchar* keep,
+    const device uchar* divisor,
+    const device uchar* state,
+    device uchar* output,
+    const M1ValueDesc dl,
+    const M1ValueDesc dk,
+    const M1ValueDesc dd,
+    const M1ValueDesc ds,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  #pragma clang fp contract(off)
+  const ulong key = ulong(m1_load_u(state, 0, ds.dtype));
+  const ulong counter = ulong(ds.len > 1 ? m1_load_u(state, 1, ds.dtype) : 0u);
+  const ulong seed = ptir_rng_keyed_seed(uint(key), uint(counter));
+  // The draw multiplies by its scale (the host's rounded 1 / T), never
+  // divides: a multiply is correctly rounded on every backend. The product
+  // is its own statement and nothing contracts it, so the lane is the
+  // interpreter's two roundings, `logit * scale` then `+ noise`.
+  const float scale = m1_load_f(divisor, 0, dd.dtype);
+  device int* result = reinterpret_cast<device int*>(output);
+  for (uint row = 0; row < dl.rows; ++row) {
+    const uint base = row * dl.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = tid; i < dl.last; i += nthreads) {
+      const uint flat = base + i;
+      float value = -INFINITY;
+      if (m1_load_b(keep, m1_pick(dk.len, flat), dk.dtype)) {
+        const float uniform = ptir_rng_hash_uniform(seed, flat);
+        const float noise = -precise::log(-precise::log(uniform));
+        const float scaled = m1_load_f(logits, flat, dl.dtype) * scale;
+        value = scaled + noise;
+      }
+      best = m1_argmax_combine(
+          best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) result[row] = int(tgbuf[0].index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 inline void ptir_m1_execute_mt(
     uint generated_tag,
     device M1Status* status,
@@ -1910,6 +2212,13 @@ inline void ptir_m1_execute_mt(
 
   if (p.tag == 0x33) {
     m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
+    return;
+  }
+  if (p.tag == 0x34) {
+    // The rng state, the fourth operand, is named by `imm` and its bytes
+    // ride in `o1` (the op has one result).
+    m1_gumbel_argmax_mt(a0, a1, a2, o1, o0, d0, descriptors[p.a1], descriptors[p.a2],
+                        descriptors[p.imm], tid, nthreads, tgbuf);
     return;
   }
   if (p.tag == 0x58 && nthreads > 1u && p.pred_tag != 2) {

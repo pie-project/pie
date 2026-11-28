@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backend::{self, Boot, Clips, Context, DeviceBoot, Lane, Seated, Shell};
+use crate::backend::{self, Boot, Clips, Context, Lane, Seated, Shell};
 use poem::ops::attn;
 use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, Input, StateRows, Weight, trace_hybrid};
@@ -380,8 +380,8 @@ fn scratch() -> PathBuf {
 
 #[test]
 fn a_conv_decoder_fires_over_a_voxel_input() {
-    let device = DeviceBoot::default();
-    if Context::bind(&device, 0.25).is_err() {
+    let device = crate::gpu::device_boot();
+    if Context::bind(&device, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;
     }
@@ -416,10 +416,16 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
         slots: 4,
         runahead: engine::runahead::Runahead::F1,
         device: &device,
-        residency: engine::load::Residency::default(),
+        residency: engine::load::Residency {
+            device: crate::gpu::share(),
+            ..engine::load::Residency::default()
+        },
         handed: None,
+        check: None,
+        places_programs: false,
     })
     .expect("the decoder loads");
+    let built = shell.compiled();
     assert_eq!(
         shell.pixels_width(),
         Some(4),
@@ -492,6 +498,11 @@ fn a_conv_decoder_fires_over_a_voxel_input() {
             "lane {lane} drifts from the reference: max {worst}, mean {mean}"
         );
     }
+    assert_eq!(
+        shell.compiled(),
+        built,
+        "a fire of the decoder and its pixels built a pipeline the load did not"
+    );
     drop(shell);
     let _ = std::fs::remove_dir_all(&dir);
 }

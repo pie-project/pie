@@ -109,23 +109,6 @@ pub fn partial_rows(tile: u32, num_qo_heads: u32, num_kv_heads: u32) -> u64 {
     u64::from(tile.div_ceil(group))
 }
 
-#[must_use]
-pub fn graph_padding(
-    rows: u32,
-    lanes: u32,
-    num_qo_heads: u32,
-    num_kv_heads: u32,
-    head_dim: u32,
-    device: &Device,
-    ctas_per_sm: u32,
-) -> (u32, u64) {
-    let kv_heads = num_kv_heads.max(1);
-    let group = u64::from((num_qo_heads / kv_heads).max(1));
-    let (tile, tiles) = graph_tiles(rows, lanes, group, head_dim);
-    let floor = u64::from(ctas_per_sm.max(1) * device.num_sm.max(1)) / u64::from(kv_heads);
-    (tile, floor.max(tiles))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     pub split_kv: bool,
@@ -190,11 +173,29 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         window_reach(window_left, cta_tile_q, group).div_ceil(u64::from(req.page_size))
             <= WINDOW_WHOLE * min_kv_chunk_size
     });
-    // Query tiles that already fill the grid (the graph's bound on them,
-    // under capture) read each request's kv whole: a split would only add
-    // partials and their fold. The tiles alone decide, so a captured plan
-    // keeps its layout across replays.
-    let filled = total_num_tiles_q >= u64::from(max_batch_size_if_split);
+    // Query tiles that already fill the grid read each request's kv whole:
+    // a split would only add partials and their fold. Under capture the
+    // graph's rows decide, packed and cut at the tile (as CUDA's plan,
+    // `kernels_cuda::attn::plan::prefill`), not the tiles it is padded to:
+    // those count a tile a lane past the first, the bound of a replay whose
+    // every lane is its own request, and would leave one long request's few
+    // tiles walking its whole prefix on a fraction of the grid. A replay
+    // whose lanes do fill the grid is still split, one chunk a tile
+    // (`search_kv_chunk_size`), and the fold has one partial to take. The
+    // rows alone decide, so a captured plan keeps its layout across replays.
+    //
+    // A captured layout splits only where a replay could cut each of those
+    // tiles' prefixes in two at least: past half the grid in tiles, one long
+    // request's replay takes one chunk a tile (as its eager plan does,
+    // unsplit), and the split layout would only add the partials and their
+    // fold. On an MI300X, Qwen3-0.6B's bodies of 2436-4467 rows (39-70 tiles
+    // of a 76-item grid) replayed 8-10% slower than the same fires walked.
+    let filled = if req.enable_cuda_graph {
+        let tiles = (u64::from(req.total_num_rows) * group).div_ceil(u64::from(cta_tile_q));
+        tiles.saturating_mul(2) > u64::from(max_batch_size_if_split)
+    } else {
+        total_num_tiles_q >= u64::from(max_batch_size_if_split)
+    };
     let (split_kv, kv_chunk_size_in_pages) = if whole || filled {
         (
             false,
@@ -254,10 +255,18 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     };
     let o_indptr = narrow_all(op, "batch_prefill_o_indptr", &o_indptr)?;
 
-    let padded_batch_size = if req.enable_cuda_graph {
+    // A captured grid holds every work item a replay of the rung could lay:
+    // its tiles, and where its layout splits, the split's grid. An unsplit
+    // layout's replays lay no more than its tiles, so its grid is them: padding
+    // it to the split's capacity only parks empty blocks on the CUs, which on
+    // CUDA changed how a 2048-row replay's blocks paired on the SMs (4.16 ms
+    // against 3.49 walked).
+    let padded_batch_size = if !req.enable_cuda_graph {
+        new_batch_size
+    } else if split_kv {
         u64::from(max_batch_size_if_split).max(total_num_tiles_q)
     } else {
-        new_batch_size
+        total_num_tiles_q
     };
     if new_batch_size > padded_batch_size {
         return Err(refuse(
@@ -330,6 +339,7 @@ fn layout(
     info.kv_chunk_size_ptr_offset = Some(ints.alloc(4, 1, "batch_prefill_kv_chunk_size_ptr")?);
     if req.enable_cuda_graph {
         info.total_num_rows_offset = Some(ints.alloc(4, 16, "batch_prefill_total_num_rows")?);
+        info.block_live_offset = Some(ints.alloc(4, 16, "batch_prefill_block_live")?);
     }
 
     let mut floats = AlignedAllocator::new(op, float_space);
@@ -353,8 +363,8 @@ fn layout(
             "batch_prefill_merge_indptr",
         )?);
     }
-    // A captured grid is padded past the work: its extra blocks read the
-    // mask and leave.
+    // A captured grid is padded past the work: its extra blocks leave on the
+    // live count (`block_live_offset`) or the mask.
     if sched.split_kv || req.enable_cuda_graph {
         info.block_valid_mask_offset =
             Some(ints.alloc(padded, 16, "batch_prefill_block_valid_mask")?);
@@ -410,6 +420,15 @@ fn stage(
             at(info.total_num_rows_offset),
             req.qo_indptr[req.live.requests as usize],
             "batch_prefill_total_num_rows",
+        )?;
+        staging.put_i32(
+            at(info.block_live_offset),
+            narrow(
+                op,
+                "batch_prefill_block_live",
+                i64::from(sched.new_batch_size),
+            )?,
+            "batch_prefill_block_live",
         )?;
     }
     if sched.split_kv {

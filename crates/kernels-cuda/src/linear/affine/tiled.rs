@@ -141,7 +141,7 @@ pub fn matmul(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows());
     tiled_launch(
         ctx,
         "linear.matmul",
@@ -164,7 +164,7 @@ pub fn lm_head(
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
-    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows);
+    let tuple = tuple_for(y.rows, ctx.tuning().qmm_long_rows());
     tiled_launch(
         ctx,
         "linear.matmul",
@@ -283,12 +283,12 @@ fn carve_for(n: u32, rows: u32, ctx: &Ctx) -> Carve {
     let tuning = ctx.tuning();
     // A context that cannot say its SM count aims as an L40S would.
     let sms = ctx.multiprocessors().unwrap_or(142);
-    let warps = sms.saturating_mul(tuning.qmm_split_warps_per_sm).max(1);
+    let warps = sms.saturating_mul(tuning.qmm_split_warps_per_sm()).max(1);
     let bands = n.div_ceil(BAND);
     let deepest = if rows <= THIN_ROWS {
-        tuning.qmm_split_thin_max
+        tuning.qmm_split_thin_max()
     } else {
-        tuning.qmm_split_wide_max
+        tuning.qmm_split_wide_max()
     };
     #[allow(clippy::manual_checked_ops)]
     let want = if bands == 0 {
@@ -416,7 +416,7 @@ pub fn gemv_with(
     }
     // From `kernel.qmm.gemv_mma_from` rows the tensor-core twin multiplies:
     // its rows are half an mma tile or a whole one.
-    let mma = y.rows >= ctx.tuning().qmm_gemv_mma_from;
+    let mma = y.rows >= ctx.tuning().qmm_gemv_mma_from();
     let rows = if mma {
         if y.rows <= 8 { 8 } else { BAND }
     } else {

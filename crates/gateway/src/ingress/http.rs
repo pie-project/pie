@@ -13,7 +13,7 @@ use futures::Stream;
 
 use crate::GatewayState;
 use crate::ingress::identity;
-use crate::session::{Affinity, Identity, SessionHandle, TokenRx, TurnInput};
+use crate::session::{Identity, SessionHandle, TokenRx, TurnInput};
 use client_api::ClientMessage;
 use worker_api::{Priority, Tokens};
 
@@ -37,13 +37,10 @@ pub async fn generate(
         message: payload,
         blobs: Vec::new(),
         priority: Priority::Normal,
+        resume: None,
     };
 
-    let (handle, rx) = match state
-        .sessions
-        .create(ident, turn, Affinity::Ephemeral)
-        .await
-    {
+    let (handle, rx) = match state.sessions.create(ident, turn).await {
         Ok(pair) => pair,
         Err(e) => {
             return (
@@ -63,6 +60,10 @@ fn token_event_stream(
     handle: SessionHandle,
     rx: TokenRx,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    #[allow(
+        clippy::large_enum_variant,
+        reason = "one state a stream, moved once an event"
+    )]
     enum St {
         Streaming { rx: TokenRx, handle: SessionHandle },
         End,

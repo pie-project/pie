@@ -4,6 +4,9 @@ use poem_exec::KernelError;
 
 #[derive(Debug)]
 pub enum Fault {
+    /// The disk tier's slot file is full ([`engine::Error::TierFull`]).
+    TierFull(String),
+
     Deviceless,
 
     /// The system would not back `bytes` more: memory it is short of, not a
@@ -82,10 +85,27 @@ pub enum Fault {
         rows: u64,
     },
 
-    MaskWord {
+    MaskUnread {
         lane: u32,
         word: u64,
-        runs_masked_arm: bool,
+    },
+
+    /// The instance attached at `lane` describes, through its geometry
+    /// ports, more lanes than its attachment owns: refused, never setting
+    /// another request's positions or kv slots.
+    GeometryLanes {
+        lane: u32,
+        instance: u64,
+        carried: u32,
+        owned: u32,
+    },
+
+    /// The instance attached at `lane` reads an output's rows past what its
+    /// lanes hold: refused, never launched into another request's rows.
+    OutputRows {
+        lane: u32,
+        instance: u64,
+        why: String,
     },
 
     Adapterless {
@@ -99,6 +119,11 @@ pub enum Fault {
     },
 
     Compile(eta_exec::Failure),
+
+    /// Two live guest holders' state would overlap, or a member alone would
+    /// move its group's pair: a bind or a rebind refused before it wrote
+    /// there ([`engine::guest_claims`]).
+    Claimed(engine::guest_claims::Refusal),
 
     Program {
         at: &'static str,
@@ -139,6 +164,16 @@ pub enum Fault {
 
     Residency(String),
 
+    /// A fire met a pipeline the load did not build before ready.
+    Unprepared {
+        file: &'static str,
+        entrypoint: &'static str,
+        stamp: &'static str,
+    },
+    /// The state pool does not seat one working set beside the widest
+    /// fire's activation under the device's allowance: the load's fit.
+    FitShort(engine::chunk::FitShort),
+
     Backing {
         step: &'static str,
         bytes: u64,
@@ -152,6 +187,17 @@ pub enum Fault {
     },
 
     Recipe(String),
+
+    /// A fire names a state slot whose chunk lies inside the activation
+    /// span's backed carve: the activation, the guests' tables and their
+    /// scratch lie there, so reading or writing the slot would read or
+    /// overwrite them ([`crate::store::pool::Pool::clear_of_carve`]).
+    UnderCarve {
+        logical: u32,
+        physical: u32,
+        carve: u64,
+        range: u64,
+    },
 }
 
 impl Fault {
@@ -161,6 +207,42 @@ impl Fault {
             at,
             why: why.into(),
         }
+    }
+}
+
+impl Fault {
+    /// The lane of its step a fault refuses for its own sake, where one
+    /// does: what the lane states (its word, mask, positions, adapter,
+    /// payload) is what this load cannot serve, and every other lane of
+    /// the step could be ([`engine::Error::Lanes`]).
+    #[must_use]
+    pub fn lane(&self) -> Option<u32> {
+        match self {
+            Self::PatchPayload { lane, .. }
+            | Self::Mask { lane, .. }
+            | Self::Maskless { lane, .. }
+            | Self::MaskRows { lane, .. }
+            | Self::Positions { lane, .. }
+            | Self::MaskUnread { lane, .. }
+            | Self::GeometryLanes { lane, .. }
+            | Self::OutputRows { lane, .. }
+            | Self::Adapterless { lane, .. }
+            | Self::AdapterWord { lane, .. } => Some(*lane),
+            Self::Fire(error) => error.lane(),
+            _ => None,
+        }
+    }
+
+    /// A mask staging's fault, its lane counted in `rows`' order, named by
+    /// the step's lane that row is of.
+    #[must_use]
+    pub fn of_rows(mut self, rows: &[poem_exec::fire::LaneRow]) -> Fault {
+        if let Self::Mask { lane, .. } | Self::MaskRows { lane, .. } = &mut self
+            && let Some(row) = rows.get(*lane as usize)
+        {
+            *lane = row.source;
+        }
+        self
     }
 }
 
@@ -176,6 +258,7 @@ impl fmt::Display for Fault {
                  device half is its refusing twin"
             ),
             Self::Device { call, why } => write!(f, "`{call}` refused: {why}"),
+            Self::TierFull(why) => write!(f, "the disk tier's slot file is full: {why}"),
             Self::Shader {
                 file,
                 entrypoint,
@@ -254,15 +337,32 @@ impl fmt::Display for Fault {
                 "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
                  stated run is parallel to the lane's tokens or it is not stated at all"
             ),
-            Self::MaskWord {
+            Self::GeometryLanes {
                 lane,
-                word,
-                runs_masked_arm,
+                instance,
+                carried,
+                owned,
             } => write!(
                 f,
-                "lane {lane}'s word {word:#x} {} the masked arm and its mask says the \
-                 other thing",
-                if *runs_masked_arm { "runs" } else { "skips" }
+                "the instance {instance} attached at lane {lane} is refused: its \
+                 `embed_indptr` port describes {carried} lane(s) and its attachment owns \
+                 {owned}; past them its ports would set another request's positions and kv \
+                 slots"
+            ),
+            Self::OutputRows {
+                lane,
+                instance,
+                why,
+            } => write!(
+                f,
+                "the instance {instance} attached at lane {lane} is refused: {why}; it reads \
+                 only the rows its own lanes hold"
+            ),
+            Self::MaskUnread { lane, word } => write!(
+                f,
+                "lane {lane} states an attention mask and its word {word:#x} reads it in no \
+                 arm this engine applies a mask in: here a selection's and a bias's arms \
+                 read no per-lane mask"
             ),
             Self::Adapterless { lane } => write!(
                 f,
@@ -304,6 +404,17 @@ impl fmt::Display for Fault {
                  `{step}`: {why}"
             ),
             Self::Recipe(refusal) => f.write_str(refusal),
+            Self::UnderCarve {
+                logical,
+                physical,
+                carve,
+                range,
+            } => write!(
+                f,
+                "state chunk {logical} (physical {physical}) lies inside the activation \
+                 span's backed carve, the top {carve} bytes of the {range}-byte pool, where a \
+                 fire lays its activation and its guests' tables: refused, not read or written"
+            ),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
             Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
             Self::AdapterSlots { seats } => write!(
@@ -320,6 +431,7 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
+            Self::Claimed(refusal) => write!(f, "`guest::claims` refused: {refusal}"),
             Self::Interpret(error) => write!(f, "{error}"),
             Self::Unaffine {
                 slot,
@@ -339,6 +451,18 @@ impl fmt::Display for Fault {
                 "the plan names {what}, which this shell binds no seat for"
             ),
             Self::Residency(why) => write!(f, "{why}"),
+            Self::Unprepared {
+                file,
+                entrypoint,
+                stamp,
+            } => write!(
+                f,
+                "this fire meets pipeline `{entrypoint}` of `{file}` ({stamp}), which the load \
+                 did not build before ready: a load builds every pipeline its rungs dispatch, so \
+                 this key is one the load's walk does not reach, and the fire is refused rather \
+                 than compiled while serving"
+            ),
+            Self::FitShort(short) => write!(f, "{short}"),
         }
     }
 }
@@ -402,5 +526,17 @@ pub fn kernel(error: kernels_metal::Error) -> KernelError {
             KernelError::DtypeUnsupported { op, dtype }
         }
         kernels_metal::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+    }
+}
+
+impl From<engine::guest_claims::Overlap> for Fault {
+    fn from(overlap: engine::guest_claims::Overlap) -> Fault {
+        Fault::Claimed(overlap.into())
+    }
+}
+
+impl From<engine::guest_claims::Refusal> for Fault {
+    fn from(refusal: engine::guest_claims::Refusal) -> Fault {
+        Fault::Claimed(refusal)
     }
 }

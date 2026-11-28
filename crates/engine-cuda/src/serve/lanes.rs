@@ -15,12 +15,23 @@ pub struct Seated<'a> {
     pub positions: &'a [u32],
     pub pages: &'a [u32],
     pub held: Option<u32>,
+    /// The set's committed boundary (`KvDelta::folded`): the lane's mask
+    /// speaks of the keys from it on.
+    pub folded: u32,
+    /// The set's written end the runtime states, and the set
+    /// (`KvDelta::readable`, `KvDelta::set`): what its rows may read.
+    pub readable: u32,
+    pub set: u64,
     pub kv_less: bool,
     pub translation: &'a [u32],
+    /// One past the last slot a row the lane's program places may land at
+    /// (`KvDelta::write_end`); its rows land in `[folded, write_end)`.
+    pub write_end: u32,
     pub window: &'a [u32],
-    /// The lane's slot refs of the window lists past the first, narrowest
-    /// first: a list each, where lanes name slot refs.
-    pub more_windows: &'a [&'a [u32]],
+    /// How the lane's windowed layers stand as ring + buffer and how far its
+    /// fire folds them (`Lane::window`); `None` where the runtime states
+    /// none (a runtimeless lane folds every row it writes).
+    pub window_fold: Option<engine::fire::WindowFold>,
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
     pub rs: RsVerb,
@@ -32,6 +43,10 @@ pub struct Seated<'a> {
     /// lane's rows land in `rs_slot`'s. `None`: `rs_slot`'s.
     pub rs_read: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
+    /// The lane's replay as the runtime stated it (`Lane::replay_stated`):
+    /// what the submit check's cross-check compares this engine's count
+    /// with (`engine::fire::replay_agrees`).
+    pub replay_stated: Option<engine::fire::LaneReplay>,
     pub readout: Option<&'a [u32]>,
     pub group: Option<u32>,
     pub inputs: &'a [InputFeed],
@@ -47,10 +62,14 @@ impl<'a> Seated<'a> {
             positions: &[],
             pages: &[],
             held: None,
+            folded: 0,
+            readable: 0,
+            set: 0,
             kv_less: false,
             translation: &[],
+            write_end: 0,
             window: &[],
-            more_windows: &[],
+            window_fold: None,
             mask: None,
             adapter: None,
             rs: RsVerb::Fold,
@@ -58,6 +77,7 @@ impl<'a> Seated<'a> {
             rs_slot: None,
             rs_read: None,
             rs_snapshots: &[],
+            replay_stated: None,
             readout: None,
             group: None,
             inputs: &[],
@@ -91,6 +111,14 @@ pub struct Attached {
     pub instance: engine::InstanceId,
     /// Carries the pass's adapter alone and runs none of its stages.
     pub adapter_only: bool,
+}
+
+impl Attached {
+    /// The step's lanes its pass spans.
+    #[must_use]
+    pub fn span(&self) -> std::ops::Range<u32> {
+        self.lane..self.lane + self.lanes.max(1)
+    }
 }
 
 pub(crate) const MROPE_COORDS: usize = 3;

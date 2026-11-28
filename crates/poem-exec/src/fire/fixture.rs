@@ -133,6 +133,7 @@ impl Build {
         let o = self.value(Def::Op(node), act(4));
         self.push(
             Attn::Decode {
+                mask: None,
                 q,
                 plan,
                 cache,
@@ -170,6 +171,7 @@ impl Build {
             value: v,
             layer: None,
             grid: None,
+            planes: Vec::new(),
         });
         self
     }

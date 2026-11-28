@@ -27,8 +27,11 @@
 struct Params {
     float eps;
     int axis_size;
+    // The element the window's first row starts at in the bound rows (the
+    // fire's whole, bound once whatever window a fire cuts): the fire's data.
+    uint first;
 };
-PIE_PARAMS(2, Params, params);
+PIE_PARAMS_FIRED(2, Params, params);
 
 float gain_at(uint i, uint plane) {
     return 1.0;
@@ -46,8 +49,11 @@ struct Params {
 #ifdef PIE_GROUPED
     uint groups;
 #endif
+    // The element the window's first row starts at in the bound rows (the
+    // fire's whole, bound once whatever window a fire cuts): the fire's data.
+    uint first;
 };
-PIE_PARAMS(3, Params, params);
+PIE_PARAMS_FIRED(3, Params, params);
 
 float gain_at(uint i, uint plane) {
     float wv = bf16_at(w, plane + params.w_stride * i);
@@ -59,7 +65,7 @@ float gain_at(uint i, uint plane) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint axis_size = uint(max(params.axis_size, 0));
-    uint base = group.x * axis_size;
+    uint base = PIE_FIRE(first) + group.x * axis_size;
 #ifdef PIE_GROUPED
     uint plane = (group.x % max(params.groups, 1u)) * axis_size * params.w_stride;
 #else
@@ -107,8 +113,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 struct Params {
     float eps;
     int vd;
+    // The element the window's first row starts at in the bound rows (the
+    // fire's whole, bound once whatever window a fire cuts): the fire's data.
+    uint first;
 };
-PIE_PARAMS(4, Params, params);
+PIE_PARAMS_FIRED(4, Params, params);
 
 float gate(float zr) {
     float e = 1.0 / (1.0 + exp(-abs(zr)));
@@ -124,7 +133,7 @@ float gate(float zr) {
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint vd = uint(max(params.vd, 0));
-    uint base = group.x * vd;
+    uint base = PIE_FIRE(first) + group.x * vd;
     uint lid = local.x;
     float acc = 0.0;
     for (uint i = lid; i < vd; i += uint(PIE_GROUP_X)) {
@@ -160,14 +169,17 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 struct Params {
     float eps;
     int axis_size;
+    // The element the window's first row starts at in the bound rows (the
+    // fire's whole, bound once whatever window a fire cuts): the fire's data.
+    uint first;
 };
-PIE_PARAMS(PIE_PARAMS_AT, Params, params);
+PIE_PARAMS_FIRED(PIE_PARAMS_AT, Params, params);
 
 [shader("compute")]
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint n = uint(max(params.axis_size, 0));
-    uint base = group.x * n;
+    uint base = PIE_FIRE(first) + group.x * n;
     uint lid = local.x;
     uint stride = 2u * uint(PIE_GROUP_X);
 

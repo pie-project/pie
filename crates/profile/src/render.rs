@@ -309,5 +309,6 @@ pub fn dump(profile: &Profile) -> String {
             let _ = writeln!(out, "{comment}{key} = {list}");
         }
     }
+    out.push_str(&profile.tuned().toml());
     out
 }

@@ -55,7 +55,7 @@ pub struct RuntimeHandle {
 enum ClusterControl {
     None,
     Distributed {
-        _client: control::Controller,
+        _client: controller_api::ControllerLink,
         worker_id: WorkerId,
     },
     Embedded {
@@ -235,8 +235,8 @@ async fn boot_decode(
     Ok((model, booted, kv_agent))
 }
 
-/// Serves other workers' passes, and dials the peers this worker's passes
-/// may be prefilled on, retrying until one takes them.
+/// Serves other workers' passes. The workers this one's passes go to are
+/// the cluster's to name (`placement/helpers`).
 async fn start_peers(user_cfg: &config::Config) -> Result<Option<kv::KvAgent>> {
     let engine = engine_of(user_cfg);
     // Its kv agent first: the hello says whether peers can read it in place.
@@ -264,24 +264,6 @@ async fn start_peers(user_cfg: &config::Config) -> Result<Option<kv::KvAgent>> {
         peer::set_link(listen.clone());
     }
     peer::clients();
-    if !user_cfg.offload.pools.is_empty() {
-        tokio::spawn(peer::push_to_pools(user_cfg.offload.pools.clone()));
-    }
-    let peers = user_cfg.offload.peers.clone();
-    let listen = peer::listen();
-    if !peers.is_empty() {
-        tokio::spawn(async move {
-            loop {
-                for addr in &peers {
-                    match peer::dial(addr, &hello, listen.clone()).await {
-                        Ok(()) => return,
-                        Err(error) => tracing::debug!(peer = %addr, %error, "peer not taken"),
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        });
-    }
     Ok(kv_agent)
 }
 
@@ -310,7 +292,7 @@ async fn assemble_control_and_edge(
             controller,
             gateways,
         } => {
-            let client = control::Controller::dial(&controller)
+            let client = controller_api::ControllerLink::dial(&controller)
                 .await
                 .with_context(|| format!("dialing controller at {controller}"))?;
             let (edge, control_tasks, worker_id) = assemble_distributed(
@@ -365,11 +347,6 @@ async fn assemble_distributed<C: ControlLink>(
         model,
         engine,
         addr,
-        // Launched by the controller's actuator, the token it was given.
-        launch: std::env::var(controller_api::LAUNCH_ENV).ok(),
-        // So a controller restarted after the one that launched it can
-        // signal it.
-        pid: Some(std::process::id()),
         prior: None,
     };
     let worker_id = ControlLink::register_worker(&control, info.clone())

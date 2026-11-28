@@ -2,14 +2,6 @@ use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Default)]
 pub struct FireProbes {
-    pub inter_fire_us: AtomicU64,
-
-    pub post_dispatch_to_fire_us: AtomicU64,
-
-    pub recv_block_wait_us: AtomicU64,
-
-    pub accumulate: AccumulateProbes,
-    pub pre_dispatch: PreDispatchProbes,
     pub execute: ExecuteProbes,
     pub post_dispatch: PostDispatchProbes,
     pub quorum: QuorumProbes,
@@ -38,6 +30,13 @@ pub struct QuorumProbes {
     pub seal_while_executing: AtomicU64,
 
     pub dispatch_blocked_holds: AtomicU64,
+    /// Frames whose seal waited on an awaited lane that had not submitted
+    /// (parked behind a running frame, or held with none running): each
+    /// frame once.
+    pub frames_parked_on_lane: AtomicU64,
+    /// Frames sealed without a lane that waits on its own output from a
+    /// frame still running: it joins the next frame it submits for.
+    pub frames_past_waiting_lane: AtomicU64,
 
     pub device_idle_us: AtomicU64,
     pub device_idle_gaps: AtomicU64,
@@ -64,28 +63,17 @@ pub struct QuorumProbes {
     pub lane_control_max_us: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-pub struct AccumulateProbes {
-    pub accum_loop_us: AtomicU64,
-}
-
-#[derive(Debug, Default)]
-pub struct PreDispatchProbes {
-    pub fire_prepare_us: AtomicU64,
-}
-
+/// A fire's execute times, fed under `profile-fire`.
 #[derive(Debug, Default)]
 pub struct ExecuteProbes {
-    pub total_us: AtomicU64,
-
     pub batch_build_us: AtomicU64,
 
     pub engine_fire_us: AtomicU64,
 }
 
+/// What a fire's stats take to record, fed under `profile-fire`.
 #[derive(Debug, Default)]
 pub struct PostDispatchProbes {
-    pub context_tick_us: AtomicU64,
     pub stats_update_us: AtomicU64,
 }
 
@@ -142,6 +130,28 @@ pub struct HostSubmitProbes {
     pub shadow_advance_us: AtomicU64,
     pub validate_frame_us: AtomicU64,
     pub validate_frame_calls: AtomicU64,
+}
+
+impl HostSubmitProbes {
+    /// Every count back to none: a boot's probes count that boot's submits.
+    pub(crate) fn reset(&self) {
+        self.submits.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.total_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.drain_settled_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.geometry_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.kv_prepare_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.scheduler_submit_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.shadow_advance_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.validate_frame_us
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.validate_frame_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub fn host_submit() -> &'static HostSubmitProbes {

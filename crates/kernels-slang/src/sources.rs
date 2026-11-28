@@ -9,15 +9,28 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/wgsl.rs"));
 }
 
-pub use generated::{CENSUS, SPIRV, WGSL};
+pub use generated::{CENSUS, POOL_OWN_MAX, SPIRV, WGSL};
 
-/// The key `name` is built under at `tier`, if it is instantiated there.
+/// The key `name` is built under at `tier`, if it is instantiated there:
+/// looked up in an index of the census built once (every dispatch an
+/// encode lays asks, the arm walk's millions of them too).
 #[must_use]
 pub fn key(name: &str, tier: Tier) -> Option<&'static str> {
-    CENSUS
+    type Index = std::collections::HashMap<&'static str, Vec<(&'static str, &'static str)>>;
+    static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
+    let tier = tier.name();
+    INDEX
+        .get_or_init(|| {
+            let mut index = Index::with_capacity(CENSUS.len());
+            for &(key, name, tier, _) in CENSUS {
+                index.entry(name).or_default().push((tier, key));
+            }
+            index
+        })
+        .get(name)?
         .iter()
-        .find(|(_, n, t, _)| *n == name && *t == tier.name())
-        .map(|(key, ..)| *key)
+        .find(|(at, _)| *at == tier)
+        .map(|&(_, key)| key)
 }
 
 /// The SPIR-V module built under `key`, if this build carries it.
@@ -37,6 +50,17 @@ pub fn wgsl(key: &str) -> Option<&'static str> {
         .map(|(_, _, text)| *text)
 }
 
+/// The one-segment WGSL form of `key` (`<key>.s1`, `kernels/prim/pool.slang`'s
+/// `PIE_POOL_SEG_COUNT=1`), where `key` binds the pool and this build
+/// carries it.
+#[must_use]
+pub fn wgsl_one_segment(key: &str) -> Option<&'static str> {
+    let one = format!("{key}.s1");
+    WGSL.iter()
+        .find(|(k, _, _)| *k == one)
+        .map(|(_, _, text)| *text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,14 +71,33 @@ mod tests {
         for (key, _, _, unit) in CENSUS {
             assert!(unit.ends_with(".slang"), "{key} lives in {unit}");
         }
-        let compiled = SPIRV
-            .iter()
-            .map(|(k, u, _)| (*k, *u))
-            .chain(WGSL.iter().map(|(k, u, _)| (*k, *u)));
+        let compiled = SPIRV.iter().map(|(k, u, _)| (*k, *u)).chain(
+            WGSL.iter()
+                .map(|(k, u, _)| (k.strip_suffix(".s1").unwrap_or(k), *u)),
+        );
         for (key, unit) in compiled {
             assert!(
                 CENSUS.iter().any(|(k, _, _, u)| *k == key && *u == unit),
                 "{key} is compiled but not counted"
+            );
+        }
+    }
+
+    /// Every pool form a WGSL build carries has its one-segment form beside
+    /// it, which binds one segment (its others name it) and the kernel's own
+    /// buffers as before.
+    #[test]
+    fn a_pool_form_has_its_one_segment_form() {
+        for (key, _, text) in WGSL.iter().filter(|(k, _, _)| !k.ends_with(".s1")) {
+            if !text.contains("pie_seg1") {
+                continue;
+            }
+            let one = wgsl_one_segment(key).unwrap_or_else(|| panic!("{key} has no `.s1` form"));
+            assert!(!one.contains("pie_seg1"), "{key}.s1 binds a second segment");
+            assert_eq!(
+                one.matches("var<storage").count() + 3,
+                text.matches("var<storage").count(),
+                "{key}.s1 binds three segments fewer"
             );
         }
     }
