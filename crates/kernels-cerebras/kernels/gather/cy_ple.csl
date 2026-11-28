@@ -8,8 +8,8 @@
 // the column, [14] bus words; the core's word: bit 0 on a PLE bus.
 //
 // Params: pe, fab, math, ON (false: no PLE), K (layers a unit).
-// (seats) the bus carries a launch's first lap's words first (into pls, posted at the //+seats
-// last launch's end), then each later pass's into a FIFO of M passes: a CY runs up to M passes //+seats
+// (seats) a launch's first lap's words are the host's (pls, a seat's after another); the bus //+seats
+// carries each later pass's, one a pass, into a FIFO of M passes: a CY runs up to M passes //+seats
 // ahead of the head without holding the bus. SEATS, LV (the most bus words). //+seats
 param pe: imported_module;
 param fab: imported_module;
@@ -26,7 +26,7 @@ var pui: u16 = 0;
 var plv: u16 = 0;
 var chk = @zeros([1]f32);
 const NW: u16 = if (ON) SEATS * (LV + 1) else 1; //+seats
-var pls = @zeros([NW]f32);   // the first lap's words, a seat's after another //+seats
+var pls = @zeros([NW]f32);   // the first lap's words, a seat's after another (host-written) //+seats
 var fbuf = @zeros([NW]f32); //+seats
 const fq = @allocate_fifo(fbuf);   // the later passes' //+seats
 const ut_f = @get_ut_id(7);   // its reads //+seats
@@ -46,23 +46,12 @@ fn post() void {
   pl[plv] = -1.0;
   @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PN} -> pl[i] }), plv + 1), fab.fin(pe.q_sm, plv + 1), .{ .async = true, .ut_id = pe.ut_p });
 }
-// (seats) the first lap's words: posted at the launch's end (and at init) //+seats
-fn post_lap() void { //+seats
-  const n = SEATS * (plv + 1); //+seats
-  pls[n - 1] = -1.0; //+seats
-  @fmovs(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NW} -> pls[i] }), n), fab.fin(pe.q_sm, n), .{ .async = true, .ut_id = pe.ut_p }); //+seats
-} //+seats
-// (seats) pass s of n's words into pl: the first lap's from pls (once they are all in, the FIFO //+seats
-// takes the rest), the later ones' from the FIFO //+seats
+// (seats) pass s of n's words into pl: the first lap's from pls, the later ones' from the FIFO //+seats
 fn take(s: u32, n: u32) void { //+seats
   const w = plv + 1; //+seats
   const pd = @set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{PN} -> pl[i] }), w); //+seats
-  if (s == 0) { //+seats
-    const cd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> chk[i] }); //+seats
-    const sd = @increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> pls[i] }), @as(i16, SEATS * w - 1), f32); //+seats
-    @fmovs(cd, sd); //+seats
-    while (chk[0] < 0.0) { @fmovs(cd, sd); } //+seats
-    if (n > SEATS) { @fmovs(fq, fab.fin(pe.q_sm, (@as(u16, n) - SEATS) * w), .{ .async = true, .ut_id = pe.ut_p }); } //+seats
+  if (s == 0 and n > SEATS) { //+seats
+    @fmovs(fq, fab.fin(pe.q_sm, (@as(u16, n) - SEATS) * w), .{ .async = true, .ut_id = pe.ut_p }); //+seats
   } //+seats
   if (s < SEATS) { //+seats
     @fmovs(pd, @increment_dsd_offset(@set_dsd_length(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NW} -> pls[i] }), w), @as(i16, @as(u16, s) * w), f32)); //+seats

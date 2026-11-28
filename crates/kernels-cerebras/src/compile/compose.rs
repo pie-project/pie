@@ -353,7 +353,8 @@ pub fn blocks(plan: &Plan, set: KernelSet, fp: &Floorplan) -> R<Vec<Box<dyn Bloc
             }
         }
     }
-    out.push(Box::new(Seats { m: plan.seats }));
+    let ple = fp.aux.iter().any(|a| matches!(a, Aux::Store(_)));
+    out.push(Box::new(Seats { m: plan.seats, ple }));
     Ok(out)
 }
 

@@ -57,6 +57,11 @@ pub fn levels(plan: &Plan, units: usize) -> u32 {
     plan.partition.layers_per_unit * units as u32
 }
 
+/// The storage rows a staged PLE file holds: `cols` PEs a row of `tokens` x `lv` f16 words each.
+pub fn rows_a_file(cols: u32, tokens: u32, lv: u32) -> u32 {
+    (FILE_MAX / (u64::from(cols) * u64::from(tokens) * u64::from(lv) * 2)).max(1) as u32
+}
+
 /// The store kernel's words a PE (`NTW`): the largest column's tokens times its bus words.
 pub fn words(plan: &Plan, floor: &Floor) -> u32 {
     floor
@@ -181,8 +186,7 @@ impl Block for Ple {
         for (ci, st) in floor.stores.iter().enumerate() {
             let xc = px / 2;
             let lv = levels(plan, st.units.len());
-            let per = (FILE_MAX / (u64::from(px) * u64::from(st.tokens_per_pe) * u64::from(lv) * 2))
-                .max(1) as u32;
+            let per = rows_a_file(px, st.tokens_per_pe, lv);
             for (n, fr0) in (0..st.rect.h).step_by(per as usize).enumerate() {
                 let fr1 = (fr0 + per).min(st.rect.h);
                 for (c0, c1) in [(0, xc), (xc, px)] {

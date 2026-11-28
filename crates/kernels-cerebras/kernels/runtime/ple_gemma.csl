@@ -8,7 +8,6 @@
 param memcpy_params;
 param NTW: u16 = 1;     // table words (NT LV)
 param DLY: u16 = 1500;
-param SEATS: u16 = 1;   // a ring of seats: a launch's first lap's tokens come first //+seats
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{});
@@ -106,9 +105,10 @@ task pass_task() void {
   while (s < n_steps) : (s += 1) { //-seats
     if ((pfl & 2) != 0) { take_tb(pos0 + s + 2); } //-seats
   } //-seats
-  // (seats: the first lap's tokens, then each pass's; the sequence word only marks the words in) //+seats
-  if ((pfl & 2) != 0 and n_steps > 0) { //+seats
-    while (s < n_steps + SEATS) : (s += 1) { take_tb(s + 1); } //+seats
+  // (seats: each pass's token, one a pass; the first lap's words are the host's, never the bus's: //+seats
+  // a lap's tokens back to back would turn owners' routes while a word is still on its way) //+seats
+  if ((pfl & 2) != 0) { //+seats
+    while (s < n_steps) : (s += 1) { take_tb(s + 1); } //+seats
   } //+seats
   sys_mod.unblock_cmd_stream();
 }

@@ -125,6 +125,7 @@ const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = ma
 const ple = @import_module("ops/cy_ple.csl", .{ .pe = pe, .fab = fab, .math = math, .ON = PLE == 1, .K = K, .SEATS = SEATS, .LV = PLV }); //+seats
 var pl_ptr: [*]f32 = &ple.pl;
 var plog_ptr: [*]f32 = &ple.plog;
+var pls_ptr: [*]f32 = &ple.pls; //+seats
 const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh, //-seats
   .Dc = Dc, .NROT = NROT, .NLV = NLV, .QSC = QSC, .CYV = CYV, .QB = QB, .SNK = SNK, .QKN = QKN, .SKW = SKW }); //-seats
 const swa = @import_module("ops/cy_swa.csl", .{ .pe = pe, .math = math, .ON = MIXK == 2, .K = K, .NQA = NQA, .Qh = Qh, //+seats
@@ -148,7 +149,6 @@ fn init() void {
   if (MIXK <= 1) { act.init(); }
   if (MIXK == 0) { gdn.init(); }
   if (PLE == 1 and ple.on_bus() and (DIAG & 32) == 0) { ple.post(); }   // step 0's words //-seats
-  if (PLE == 1 and ple.on_bus() and (DIAG & 32) == 0) { ple.post_lap(); }   // the first lap's words //+seats
   sys_mod.unblock_cmd_stream();
 }
 
@@ -253,7 +253,6 @@ task pass_task() void {
         if ((pe.word & 4) != 0) { flush(); }
       }
       if (bus) { ple.post(); }   // (the next pass's, this launch's or the next one's) //-seats
-      if (bus and s + 1 == n_steps) { ple.post_lap(); }   // (the next launch's first lap) //+seats
       seats.next(); //+seats
     }
   }
@@ -283,6 +282,7 @@ comptime {
   if (PLE == 1) {
     @export_symbol(pl_ptr, "pl");
     @export_symbol(plog_ptr, "plog");
+    @export_symbol(pls_ptr, "pls"); //+seats
   }
   if (MIXK == 2) {
     @export_symbol(qb_ptr, "qb");

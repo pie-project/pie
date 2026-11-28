@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use kernels_cerebras::compile::artifact::Artifact;
-use kernels_cerebras::compile::emit::host::HostLayout;
+use kernels_cerebras::compile::emit::host::{HostLayout, SeatsHost};
 use kernels_cerebras::compile::floor;
 use kernels_cerebras::compile::npy::Npy;
 
@@ -94,6 +94,9 @@ pub struct ArtifactModel {
     wins: Vec<(usize, usize)>,
     /// The wafer holds `wins`' first positions (`sbase`): put again only once they change.
     wins_put: bool,
+    /// A ring's per-layer-input files, a storage column's (`pt<store>_<n>`, [`HostLayout`]'s
+    /// `ple`): a launch's first lap's words are the host's.
+    ple: Vec<Vec<Rows>>,
 }
 
 /// Where a token's embedding row comes from: the head's tiles (`hemb`), else (a tied head with
@@ -191,6 +194,15 @@ impl ArtifactModel {
         } else {
             Embed::Table(Rows::open(spec.npy("embed")?, &spec.file("embed.npy")))
         };
+        let mut ple = Vec::new();
+        for st in hl.seats.iter().flat_map(|s| &s.ple) {
+            let mut files = Vec::new();
+            while spec.has(&format!("pt{}_{}", st.store, files.len())) {
+                let name = format!("pt{}_{}", st.store, files.len());
+                files.push(Rows::open(spec.npy(&name)?, &spec.file(&format!("{name}.npy"))));
+            }
+            ple.push(files);
+        }
         Ok(ArtifactModel {
             vocab: vocab.min(model.vocab as usize),
             hidden: model.hidden as usize,
@@ -206,6 +218,7 @@ impl ArtifactModel {
             lgt_scale: model.logit_scale,
             wins: even_windows(&hl),
             wins_put: false,
+            ple,
             hl,
             dev,
         })
@@ -222,6 +235,38 @@ impl ArtifactModel {
         let r = self.dev.put("tin", rect(&r), v.len(), &words);
         self.host_ns[1] += ns(t0);
         r
+    }
+
+    /// A ring's first lap's per-layer inputs, each seat's first token's (`pls`, a seat after
+    /// another in every CY row PE of a storage column's units): the bus carries one token a pass.
+    fn put_ple(&mut self, s: &SeatsHost, first: &[u32]) -> R<()> {
+        let t0 = Instant::now();
+        for (st, files) in s.ple.iter().zip(&self.ple) {
+            let (nt, lv, cols) = (st.tokens as usize, st.words as usize, st.cols as usize);
+            let mut col: Vec<Vec<u32>> = vec![Vec::with_capacity(first.len() * (lv + 1)); cols];
+            let mut h = Vec::with_capacity(lv);
+            for &t in first {
+                let r = t as usize / nt;
+                let f = files
+                    .get(r / st.per as usize)
+                    .ok_or_else(|| format!("artifact: no PLE file of store {} for token {t}", st.store))?;
+                for (c, w) in col.iter_mut().enumerate() {
+                    h.clear();
+                    let at = ((r % st.per as usize * cols + c) * nt + t as usize % nt) * lv;
+                    f.words(at, lv, &mut h)?;
+                    w.extend(h.iter().map(|&b| f16_bits(b as u16).to_bits()));
+                    w.push(1f32.to_bits());
+                }
+            }
+            for &(r, c0) in &st.cy {
+                let words: Vec<u32> = (0..r.w as usize)
+                    .flat_map(|i| col[c0 as usize + i].iter().copied())
+                    .collect();
+                self.dev.put("pls", rect(&r), first.len() * (lv + 1), &words)?;
+            }
+        }
+        self.host_ns[1] += ns(t0);
+        Ok(())
     }
 
     /// Token `v`'s embedding row (bf16 bits), from the head's tiles or the table.
@@ -458,7 +503,7 @@ impl ArtifactModel {
                 self.launch(n, pos[0])?;
             }
             Some(s) => {
-                self.put_token(first)?;
+                self.put_ple(&s, first)?;
                 let t0 = Instant::now();
                 let total = *self.x_off.last().unwrap();
                 let mut es = Vec::with_capacity(m);
@@ -558,6 +603,23 @@ impl ArtifactModel {
         }
         Ok(l)
     }
+}
+
+/// An f16's value (bits) as f32, exactly.
+fn f16_bits(h: u16) -> f32 {
+    let (s, e, m) = (u32::from(h >> 15), u32::from((h >> 10) & 0x1f), u32::from(h & 0x3ff));
+    let v = match e {
+        0 => (m as f32) * (2f32).powi(-24),
+        0x1f => {
+            if m == 0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => f32::from_bits(((e + 127 - 15) << 23) | (m << 13)),
+    };
+    if s == 1 { -v } else { v }
 }
 
 /// `t0`'s age in ns.

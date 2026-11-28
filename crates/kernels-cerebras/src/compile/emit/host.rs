@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::floor::{Coord, CtlLine, Rect, Unit};
+use crate::compile::floor::{Coord, CtlLine, Rect, Unit, unskip};
 use crate::compile::program::Program;
 
 /// The host's map of the program.
@@ -73,6 +73,24 @@ pub struct SeatsHost {
     /// The pool's KV rows (a window's first position their multiple); 0: the unit's rows.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub rows: u32,
+    /// The per-layer-input storage columns: a launch's first lap's words go to their units' CY
+    /// rows from the host (`pls`), never down the bus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ple: Vec<PleHost>,
+}
+
+/// A storage column's words for a ring's first lap: token `t`'s are storage row `t / tokens`'s,
+/// staged in `pt<store>_<row / per>` (`[row % per][column][tokens][words]`, f16), at weight column
+/// `c`; each of its units' CY row PEs (a rectangle and its first weight column) takes a seat's
+/// `words` values (f32) and a word past them, a seat after another.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PleHost {
+    pub store: u32,
+    pub per: u32,
+    pub tokens: u32,
+    pub words: u32,
+    pub cols: u32,
+    pub cy: Vec<(Rect, u32)>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -192,6 +210,37 @@ impl HostLayout {
                 cy: f.units.iter().flat_map(cy_rects).collect(),
                 pool: p.kv_entries.per_row * p.kv_rows,
                 rows: if p.kv_rows == p.rows { 0 } else { p.kv_rows },
+                ple: f
+                    .stores
+                    .iter()
+                    .enumerate()
+                    .map(|(i, st)| {
+                        let lv = crate::compile::block::ple::levels(&prog.plan, st.units.len());
+                        let cy = st
+                            .units
+                            .iter()
+                            .filter_map(|&u| f.units.iter().find(|v| v.index == u))
+                            .flat_map(|u| {
+                                cy_rects(u)
+                                    .into_iter()
+                                    .map(|r| (r, unskip(r.x - u.rect.x, u.cx)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        PleHost {
+                            store: i as u32,
+                            per: crate::compile::block::ple::rows_a_file(
+                                p.cols,
+                                st.tokens_per_pe,
+                                lv,
+                            ),
+                            tokens: st.tokens_per_pe,
+                            words: lv,
+                            cols: p.cols,
+                            cy,
+                        }
+                    })
+                    .collect(),
             }),
         })
     }

@@ -76,6 +76,55 @@ pub fn seat_bus(cap: u32, words: u32) -> Option<String> {
     })
 }
 
+/// A ring's head control source (`text`, as the ring writes it): its token words feed PEs that
+/// turn a route to send (the PLE stores on TB, the token loop's winner row on its row word), each
+/// turning back only at the next word, after a fixed wait. One word a pass leaves a pass between
+/// owners; words back to back (a lap of seats' in a loop) turn the next owner's route while the
+/// last one's words are still on it. A send on those queues in a loop inside the pass loop (or
+/// any loop of a function, which runs once a pass) is that burst.
+#[must_use]
+pub fn seat_turns(text: &str) -> Option<String> {
+    const FEEDS: [&str; 2] = ["fout(q_tb", "fout(q_ww"];
+    // the open blocks: (a while loop, a task's body)
+    let mut open: Vec<(bool, bool)> = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        let mut ev: Vec<(usize, u8)> = code
+            .match_indices(['{', '}'])
+            .map(|(i, c)| (i, c.as_bytes()[0]))
+            .collect();
+        for f in FEEDS {
+            ev.extend(code.match_indices(f).map(|(i, _)| (i, b's')));
+        }
+        ev.sort_unstable();
+        for (i, c) in ev {
+            match c {
+                b'{' => {
+                    let head = &code[..i];
+                    let task = head.contains("task ") || open.last().is_some_and(|o| o.1);
+                    open.push((head.contains("while"), task));
+                }
+                b'}' => {
+                    open.pop();
+                }
+                _ => {
+                    let loops = open.iter().filter(|o| o.0).count();
+                    let task = open.last().is_some_and(|o| o.1);
+                    if loops > usize::from(task) {
+                        return Some(format!(
+                            "head control line {}: a token word sent in a loop within a pass: \
+                             back to back, a route-turning PE's next turn cuts the last one's \
+                             words (send one a pass)",
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The input queues of a ring of seats re-coloured during a launch to a colour whose words come
 /// from outside the PE's unit, one line a kernel's host word. A pass ahead sends on that colour
 /// whenever its own unit is done (the hand-offs carry no credit), so its words may be at the

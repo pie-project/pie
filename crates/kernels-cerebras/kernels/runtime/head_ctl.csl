@@ -102,7 +102,7 @@ var tb_on = false;
 const q_tb = @get_output_queue(5);
 var tbw = @zeros([1]f32);
 var tin = @zeros([1]u32);           // the launch's first token id, host-written //-seats
-var tin = @zeros([SEATS]u32);       // the launch's first lap's token ids, host-written //+seats
+var tin = @zeros([1]u32);           // (seats: none; a first lap's PLE words are the host's) //+seats
 var tin_ptr: [*]u32 = &tin;
 const tbw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> tbw[i] });
 fn wmerge() void {
@@ -148,10 +148,6 @@ task pass_task() void {
   while (s < n_steps) : (s += 1) {
     if (TB == 1) {
       if (s == 0 and tb_on) { tbw[0] = @as(f32, tin[0]); @fmovs(fab.fout(q_tb, 1), tbw_d); } //-seats
-      if (s == 0 and tb_on) { //+seats
-        var j: u16 = 0; //+seats
-        while (j < SEATS) : (j += 1) { tbw[0] = @as(f32, tin[j]); @fmovs(fab.fout(q_tb, 1), tbw_d); } //+seats
-      } //+seats
     }
     stamp(0);
     red.root(t_d, VR);
