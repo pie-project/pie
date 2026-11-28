@@ -37,8 +37,9 @@ pub const SYMBOLS_PLE: &[(&str, &str)] = &[
     ("pls", "f32"),
 ];
 
-/// The seats a ring may hold: CY's word to the attention carries 2 seat + 1 under 2^8.
-const MOST: u32 = 127;
+/// The seats a ring may hold: CY's word to the attention carries 2 seat + 1 under 2^7 (an f32's
+/// whole numbers: bit 23 marks a seat with no window, 16 bits the window's position).
+const MOST: u32 = 63;
 
 /// `m` seats (1: one sequence; the block then only writes the sources); `ple`: per-layer inputs.
 pub struct Seats {

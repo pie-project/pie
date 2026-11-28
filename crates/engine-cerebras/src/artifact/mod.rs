@@ -199,7 +199,10 @@ impl ArtifactModel {
             let mut files = Vec::new();
             while spec.has(&format!("pt{}_{}", st.store, files.len())) {
                 let name = format!("pt{}_{}", st.store, files.len());
-                files.push(Rows::open(spec.npy(&name)?, &spec.file(&format!("{name}.npy"))));
+                files.push(Rows::open(
+                    spec.npy(&name)?,
+                    &spec.file(&format!("{name}.npy")),
+                ));
             }
             ple.push(files);
         }
@@ -247,9 +250,9 @@ impl ArtifactModel {
             let mut h = Vec::with_capacity(lv);
             for &t in first {
                 let r = t as usize / nt;
-                let f = files
-                    .get(r / st.per as usize)
-                    .ok_or_else(|| format!("artifact: no PLE file of store {} for token {t}", st.store))?;
+                let f = files.get(r / st.per as usize).ok_or_else(|| {
+                    format!("artifact: no PLE file of store {} for token {t}", st.store)
+                })?;
                 for (c, w) in col.iter_mut().enumerate() {
                     h.clear();
                     let at = ((r % st.per as usize * cols + c) * nt + t as usize % nt) * lv;
@@ -262,7 +265,8 @@ impl ArtifactModel {
                 let words: Vec<u32> = (0..r.w as usize)
                     .flat_map(|i| col[c0 as usize + i].iter().copied())
                     .collect();
-                self.dev.put("pls", rect(&r), first.len() * (lv + 1), &words)?;
+                self.dev
+                    .put("pls", rect(&r), first.len() * (lv + 1), &words)?;
             }
         }
         self.host_ns[1] += ns(t0);
@@ -408,8 +412,8 @@ impl ArtifactModel {
     }
 
     /// The seats' KV windows from here on, (first position, positions) a seat: each within the
-    /// pool, from a multiple of the rows, none over another but the same (seats with no
-    /// sequence sharing a scratch window: their cells no one's). A seat's window changes only as it
+    /// pool, from a multiple of the rows, none over another; one of no positions a seat with no
+    /// sequence (its passes write no KV). A seat's window changes only as it
     /// starts again at position 0 (the attention learns a window's first entry there).
     pub fn windows(&mut self, wins: &[(usize, usize)]) -> R<()> {
         let pool = self.hl.seats.as_ref().map_or(0, |s| s.pool as usize);
@@ -421,12 +425,13 @@ impl ArtifactModel {
                 self.seats()
             ));
         }
-        let mut by: Vec<(usize, usize)> = wins.to_vec();
+        // (a window of no positions: a seat with no sequence, its KV unwritten)
+        let mut by: Vec<(usize, usize)> = wins.iter().copied().filter(|w| w.1 > 0).collect();
         by.sort_unstable();
         let fits = by
             .iter()
             .all(|&(b, n)| b % rows == 0 && b + n <= pool && n <= self.positions)
-            && by.windows(2).all(|w| w[0] == w[1] || w[0].0 + w[0].1 <= w[1].0);
+            && by.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0);
         if !fits {
             return Err(format!(
                 "artifact: windows {wins:?} over a pool of {pool} (rows {rows}, a seat at most {})",
@@ -476,7 +481,9 @@ impl ArtifactModel {
             return Err(format!("artifact: {n} passes past the ring's {}", self.cap));
         }
         let laps = n.div_ceil(m);
-        if let Some(j) = (0..m).find(|&j| pos[j] + laps > self.room(j)) {
+        // (a seat of no window runs from 0, its KV unwritten)
+        let idle = |j: usize| self.wins.get(j).is_some_and(|w| w.1 == 0) && pos[j] == 0;
+        if let Some(j) = (0..m).find(|&j| !idle(j) && pos[j] + laps > self.room(j)) {
             return Err(format!(
                 "artifact: {laps} laps from {} past seat {j}'s {} positions",
                 pos[j],
@@ -527,7 +534,12 @@ impl ArtifactModel {
                     self.dev.put("xs", rect(&r), m * dims as usize, &w)?;
                 }
                 let sp: Vec<u32> = pos.iter().map(|&p| p as u32).collect();
-                let sb: Vec<u32> = self.wins.iter().map(|w| w.0 as u32).collect();
+                // (bit 23: a seat with no window, as CY's word to the attention carries it)
+                let sb: Vec<u32> = self
+                    .wins
+                    .iter()
+                    .map(|w| w.0 as u32 | if w.1 == 0 { 1 << 23 } else { 0 })
+                    .collect();
                 for r in &s.cy {
                     let words: Vec<u32> = (0..r.w * r.h).flat_map(|_| sp.iter().copied()).collect();
                     self.dev.put("spos", rect(r), m, &words)?;
@@ -608,7 +620,11 @@ impl ArtifactModel {
 
 /// An f16's value (bits) as f32, exactly.
 fn f16_bits(h: u16) -> f32 {
-    let (s, e, m) = (u32::from(h >> 15), u32::from((h >> 10) & 0x1f), u32::from(h & 0x3ff));
+    let (s, e, m) = (
+        u32::from(h >> 15),
+        u32::from((h >> 10) & 0x1f),
+        u32::from(h & 0x3ff),
+    );
     let v = match e {
         0 => (m as f32) * (2f32).powi(-24),
         0x1f => {

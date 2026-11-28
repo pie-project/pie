@@ -62,19 +62,21 @@ fn mix(a: u16) void {
   const pos = @as(u16, ab[QD + 2 * Dc]); //-seats
   const sw = @as(u32, ab[QD + 2 * Dc]); //+seats
   const pos = @as(u16, sw & 0xffff); //+seats
-  const mine = (pos % PYW) == pe.myrow;
+  const idle = ((sw >> 23) & 1) != 0;   // (a seat with no window: its KV unwritten) //+seats
+  const mine = (pos % PYW) == pe.myrow; //-seats
+  const mine = !idle and (pos % PYW) == pe.myrow; //+seats
   const e0 = pos / PYW;
   if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts //-seats
     @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{KCW} -> kc[1 + i] }), @as(i16, kb), u16), @as(u16, 0)); //-seats
     @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb), u16), @as(u16, 0)); //-seats
     @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] }), @as(i16, a * NE), f32), NE), 0.0); //-seats
   // (seats: pos is the seat's window's position; w0 its first entry, lp the seat's own position) //+seats
-  const st: u16 = @as(u16, sw >> 17); //+seats
+  const st: u16 = @as(u16, (sw >> 17) & 63); //+seats
   if (((sw >> 16) & 1) != 0) { wb[st] = e0; } //+seats
   const w0: u16 = wb[st]; //+seats
   const lp: u16 = pos - w0 * PYW; //+seats
   mref = @ptrcast([*]f32, &mrefs[st * NL * Qh]); //+seats
-  if (lp % PYW == 0) {   // the seat's next entry, empty before its rows write it //+seats
+  if (!idle and lp % PYW == 0) {   // the seat's next entry, empty before its rows write it //+seats
     var dz: u16 = 0; //+seats
     while (dz < Dc) : (dz += 1) { kc[1 + kb + dz * NE + e0] = 0; } //+seats
     @mov16(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb + e0 * (Dc + 1)), u16), Dc + 1), @as(u16, 0)); //+seats

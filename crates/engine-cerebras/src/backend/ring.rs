@@ -55,16 +55,17 @@ struct Seat {
 }
 
 /// The seats' shared KV pool: its positions and rows, and each seat's window in it (first
-/// position, positions); `sent` once the wafer was told them. The lanes' windows are in its
-/// first `size` positions; every seat with no lane shares the scratch window past them (its
-/// idle passes' cells, no one's), `least` positions.
+/// position, positions); `sent` once the wafer was told them. A seat with no lane has no window
+/// (none of its positions: its idle passes write no KV).
 struct Pool {
     size: usize,
-    least: usize,
     rows: usize,
     wins: Vec<(usize, usize)>,
     sent: bool,
 }
+
+/// A seat's window when it has no lane: no positions (the wafer writes none of its KV).
+pub(super) const IDLE: (usize, usize) = (0, 0);
 
 /// The pool's free stretches (from, to) past the windows of the seats `of` takes.
 fn gaps(wins: &[(usize, usize)], size: usize, of: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
@@ -163,7 +164,7 @@ pub(super) struct Ring {
 }
 
 impl Ring {
-    /// `pool`: the seats' shared KV pool, (positions, rows); every seat starts on its scratch.
+    /// `pool`: the seats' shared KV pool, (positions, rows); every seat starts with no window.
     pub(super) fn new(
         seats: usize,
         positions: usize,
@@ -172,18 +173,13 @@ impl Ring {
         pool: Option<(usize, usize)>,
     ) -> Ring {
         let most = (cap / seats).max(1);
-        let pool = pool.map(|(size, rows)| {
-            let least = most.div_ceil(rows) * rows;
-            let size = size.saturating_sub(least) / rows * rows;
-            Pool {
-                size,
-                least,
-                rows,
-                wins: vec![(size, least); seats],
-                sent: false,
-            }
+        let pool = pool.map(|(size, rows)| Pool {
+            size: size / rows * rows,
+            rows,
+            wins: vec![IDLE; seats],
+            sent: false,
         });
-        // (a seat holds at most the lanes' part of the pool)
+        // (a seat holds at most the pool)
         let positions = pool.as_ref().map_or(positions, |p| positions.min(p.size));
         Ring {
             positions,
@@ -209,7 +205,7 @@ impl Ring {
 
     /// Pie's pages on a shared pool: (a page's positions, pages). A page is a pool row, the
     /// unit a window takes, so the rows Pie's lanes hold are their windows' rows (no rounding
-    /// slack); the pages are the lanes' part of the pool (the scratch past it no lane's).
+    /// slack, and a seat with no lane holds none).
     pub(super) fn pool_pages(&self) -> Option<(u32, u32)> {
         let p = self.pool.as_ref()?;
         Some((
@@ -241,7 +237,7 @@ impl Ring {
         let Some(pool) = self.pool.as_ref() else {
             return Ok(());
         };
-        let (size, rows, scratch) = (pool.size, pool.rows, (pool.size, pool.least));
+        let (size, rows) = (pool.size, pool.rows);
         let m = self.seats.len();
         let least = self.least(rows);
         let up = |n: usize| n.div_ceil(rows) * rows;
@@ -249,7 +245,7 @@ impl Ring {
         let cap = up(self.positions).min(size);
         let even = size / m / rows * rows;
         let mut wins = pool.wins.clone();
-        // (a seat that holds nothing and asks for nothing: on the scratch)
+        // (a seat that holds nothing and asks for nothing: no window)
         let idle = |k: usize, wins: &Windows| {
             let s = self.seats[k];
             let asks = s.lane.is_some_and(|l| needs.iter().any(|w| w.0 == l));
@@ -261,14 +257,14 @@ impl Ring {
         };
         for k in 0..m {
             if idle(k, &wins) {
-                wins[k] = scratch;
+                wins[k] = IDLE;
             }
         }
         for &(slot, need, must) in needs {
             let Some(j) = self.seat_of(slot) else {
                 continue;
             };
-            if wins[j].1 >= need && wins[j].0 < size {
+            if wins[j].1 >= need {
                 continue;
             }
             if need > cap {
@@ -276,8 +272,9 @@ impl Ring {
                     "slot {slot} holds {need} positions, a seat at most {cap}"
                 ));
             }
-            let floor = up(need).max(least).min(cap);
-            let want = up(2 * need).max(even).max(floor).min(cap);
+            // (a launch's laps past its rows where room is left: Pie's pages hold the rows alone)
+            let floor = up(need).min(cap);
+            let want = up(2 * need).max(even).max(least).max(floor).min(cap);
             // the rows a seat runs again where its window moves (none for one holding nothing)
             let held = |k: usize| {
                 let s = self.seats[k];
@@ -318,8 +315,8 @@ impl Ring {
                 continue;
             }
             // every window again from the start: each at the rows its lane asks, an idle lane's
-            // at what it holds while they fit, else at the least
-            let held = |k: usize, idle: bool| {
+            // at what it holds while they fit, each at the least while they fit
+            let held = |k: usize, (idle, low): (bool, bool)| {
                 let n = match self.seats[k].lane {
                     _ if k == j => floor,
                     Some(l) => needs
@@ -328,11 +325,15 @@ impl Ring {
                         .map_or(if idle { self.lane(l).len() } else { 0 }, |w| w.1),
                     None => 0,
                 };
-                // (none: the scratch)
-                if n == 0 { 0 } else { up(n).max(least).min(cap) }
+                // (none: no window)
+                let low = if low { least } else { rows };
+                if n == 0 { 0 } else { up(n).max(low).min(cap) }
             };
-            let fits = |idle| (0..m).map(|k| held(k, idle)).sum::<usize>() <= size;
-            let idle = fits(true);
+            let fits = |t| (0..m).map(|k| held(k, t)).sum::<usize>() <= size;
+            let idle = [(true, true), (false, true), (true, false)]
+                .into_iter()
+                .find(|&t| fits(t))
+                .unwrap_or((false, false));
             // (the seat that asked last, the pool's end past it to grow into in place)
             let mut at = 0;
             for k in (0..m).filter(|&k| k != j).chain([j]) {
@@ -351,7 +352,7 @@ impl Ring {
         }
         for k in 0..m {
             if idle(k, &wins) {
-                wins[k] = scratch;
+                wins[k] = IDLE;
             }
         }
         let pool = self.pool.as_mut().expect("a pool");
@@ -499,10 +500,7 @@ impl Ring {
             force: vec![Vec::new(); m],
             passes,
             logits: reads,
-            windows: self.pool.as_mut().filter(|p| !p.sent).map(|p| {
-                p.sent = true;
-                p.wins.clone()
-            }),
+            windows: None,
         };
         let mut out = Vec::with_capacity(m);
         for j in 0..m {
@@ -553,8 +551,17 @@ impl Ring {
                 }
                 known.truncate(run.pos);
             }
+            // (a seat running no lane's rows writes no cells: it has no window)
+            if let Some(p) = self.pool.as_mut().filter(|_| laps > 0 && run.is_none()) {
+                p.sent &= p.wins[j] == IDLE;
+                p.wins[j] = IDLE;
+            }
             out.push(run);
         }
+        launch.windows = self.pool.as_mut().filter(|p| !p.sent).map(|p| {
+            p.sent = true;
+            p.wins.clone()
+        });
         self.out = Some(out);
         Ok(launch)
     }
@@ -789,11 +796,7 @@ mod tests {
                 for (j, &(b, n)) in w.iter().enumerate() {
                     assert!(b % rows == 0 && b + n <= size, "window {j} {w:?}");
                     for (k, &(c, o)) in w.iter().enumerate().skip(j + 1) {
-                        // (a shared window: the seats on it lose each other's cells)
-                        assert!(
-                            (b, n) == (c, o) || b + n <= c || c + o <= b,
-                            "windows {j} and {k} {w:?}"
-                        );
+                        assert!(b + n <= c || c + o <= b, "windows {j} and {k} {w:?}");
                     }
                     if let Some(&(a, was)) = self.wins.get(j) {
                         self.lost[j] |= a != b || n < was;
@@ -811,26 +814,27 @@ mod tests {
                 let (j, lap) = (s % m, s / m);
                 let p = l.pos[j] + lap;
                 assert!(p < self.positions, "seat {j} past its positions");
+                // (a seat of no window writes no cells: its winners are no token's)
+                let idle = self.pool.is_some() && self.wins[j].1 == 0;
+                if idle {
+                    self.lost[j] = true;
+                    winners.push(1_000_000);
+                    continue;
+                }
                 if self.pool.is_some() {
-                    assert!(p < self.wins[j].1, "seat {j} past its window");
+                    assert!(
+                        p < self.wins[j].1,
+                        "seat {j} past its window: p {p} wins {:?} pos {:?} passes {}",
+                        self.wins,
+                        l.pos,
+                        l.passes
+                    );
                 }
                 if p == 0 {
                     self.seats[j].clear();
                     self.lost[j] = false;
                 }
-                if self.pool.is_some() {
-                    for k in (0..m).filter(|&k| k != j && self.wins[k] == self.wins[j]) {
-                        self.lost[k] = true;
-                    }
-                }
-                // (on a shared window its cells are garbage: its winners are no token's)
-                let shared =
-                    self.pool.is_some() && (0..m).any(|k| k != j && self.wins[k] == self.wins[j]);
-                assert!(
-                    shared || !self.lost[j],
-                    "seat {j} ran on over cells it lost"
-                );
-                let garbage = self.lost[j];
+                assert!(!self.lost[j], "seat {j} ran on over cells it lost");
                 assert_eq!(self.seats[j].len(), p, "seat {j} rolled back");
                 let token = if lap == 0 {
                     l.first[j]
@@ -840,11 +844,7 @@ mod tests {
                     winners[s - m]
                 };
                 self.seats[j].push(token);
-                winners.push(if garbage {
-                    1_000_000
-                } else {
-                    next(&self.seats[j])
-                });
+                winners.push(next(&self.seats[j]));
             }
             let logits = l.logits.then(|| vec![winners[l.passes - 1] as f32]);
             self.out = Some(Ok((winners, logits.into_iter().collect())));
@@ -884,11 +884,10 @@ mod tests {
                     x % n
                 };
                 let mut positions = 60 + rng(80) as usize;
-                // half on a shared pool: whole rows, an idle seat's least window each and more
+                // half on a shared pool of whole rows, a row or more
                 let pool = (m > 1 && seed % 2 == 1).then(|| {
                     let rows = 8 + rng(24) as usize;
-                    let least = (256 / m).div_ceil(rows) * rows;
-                    ((m + 1 + rng(m as u32) as usize) * least, rows)
+                    ((1 + rng(3 * m as u32) as usize) * rows, rows)
                 });
                 let mut ring = Ring::new(m, positions, 256, [32, 8, 1][rng(3) as usize], pool);
                 positions = ring.positions();
@@ -960,10 +959,10 @@ mod tests {
         }
     }
 
-    /// Pie's pages on a pool are its rows past the scratch, and lanes holding them all decode
-    /// together, however they share them: five 275-row lanes and a 160 on Gemma 12B's six seats
-    /// (12 rows of 160), one at the most a sequence holds beside short ones there, and a
-    /// 2000-row lane beside five short ones on E2B's (32 rows of 128).
+    /// Pie's pages on a pool are its rows, and lanes holding them all decode together, however
+    /// they share them, the seats with no lane holding none: six 275-row lanes on Gemma 12B's six
+    /// seats (12 rows of 160), one at the most a sequence holds beside short ones or alone there,
+    /// and a 2000-row lane beside five short ones on E2B's (32 rows of 128).
     #[test]
     fn lanes_holding_every_page_decode_together() {
         let run = |m: usize, positions: usize, pool: (usize, usize), ends: &[usize]| {
@@ -987,18 +986,17 @@ mod tests {
             (page, pages, ring.positions())
         };
         let g12 = (1920, 160);
-        assert_eq!(
-            run(6, 1120, g12, &[275, 275, 275, 275, 275, 160]),
-            (160, 11, 1120)
-        );
+        let six = [275; 6];
+        assert_eq!(run(6, 1120, g12, &six), (160, 12, 1120));
         assert_eq!(
             run(6, 1120, g12, &[1120, 100, 100, 100, 100]),
-            (160, 11, 1120)
+            (160, 12, 1120)
         );
-        assert_eq!(
-            run(6, 3456, (4096, 128), &[2000, 100, 100, 100, 100, 100]),
-            (128, 31, 3456)
-        );
+        assert_eq!(run(6, 4096, g12, &[1600, 100, 100]), (160, 12, 1920));
+        assert_eq!(run(6, 4096, g12, &[1920]), (160, 12, 1920));
+        let e2b = (4096, 128);
+        let long = [2000, 100, 100, 100, 100, 100];
+        assert_eq!(run(6, 3456, e2b, &long), (128, 32, 3456));
     }
 
     /// `n` greedy lanes decode together at a lap a row; one that stops asking costs the others

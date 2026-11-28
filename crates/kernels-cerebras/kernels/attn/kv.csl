@@ -256,13 +256,14 @@ fn kv_take(pos: u32, s: u32) void {
   // (seats: the window's position, 2 seat + its reset above, as CY's multicast carries it) //+seats
   const sw = @as(u32, kvb[16]) - 1; //+seats
   const p = sw & 0xffff; //+seats
-  const st = @as(u16, sw >> 17); //+seats
+  const st = @as(u16, (sw >> 17) & 63); //+seats
+  const idle = ((sw >> 23) & 1) != 0;   // (a seat with no window: its KV no one's, unwritten) //+seats
   posq(p); //+seats
   if (((sw >> 16) & 1) != 0) { wb[st] = q_ent; } //+seats
   cw0 = wb[st]; //+seats
   if (FIX) { crb = st * NES; } //+seats
-  if (q_row == 0) { cache_clear(1, q_ent); if (q_ent - cw0 < NES) { cache_clear(0, cslot(0, p)); } } //+seats
-  if (q_row == pe.myrow) { //+seats
+  if (!idle and q_row == 0) { cache_clear(1, q_ent); if (q_ent - cw0 < NES) { cache_clear(0, cslot(0, p)); } } //+seats
+  if (!idle and q_row == pe.myrow) { //+seats
     cache_put(0, p, @ptrcast([*]f32, &kvb[0]), @ptrcast([*]f32, &kvb[DcS]), kvb[2 * DcS], kvb[2 * DcS + 1]); //+seats
     const g0 = 2 * DcS + 2;
     cache_put(1, pos, @ptrcast([*]f32, &kvb[g0]), @ptrcast([*]f32, &kvb[g0 + DcG]), kvb[g0 + 2 * DcG], kvb[g0 + 2 * DcG + 1]); //-seats
@@ -316,8 +317,9 @@ fn attm(l: u16, comptime g: u16) void {
   // (seats: pos the window's position, 2 seat + its reset above; w0 the window's first entry) //+seats
   const sw = @as(u32, ab[QD + 2 * dc]); //+seats
   const pos = sw & 0xffff; //+seats
-  const st = @as(u16, sw >> 17); //+seats
+  const st = @as(u16, (sw >> 17) & 63); //+seats
   const reset = ((sw >> 16) & 1) != 0; //+seats
+  const idle = ((sw >> 23) & 1) != 0;   // (a seat with no window: its KV unwritten) //+seats
   s_att = ab[QD + 2 * dc + Qh + 3];
   posq(pos);
   if (reset) { wb[st] = q_ent; } //+seats
@@ -326,14 +328,15 @@ fn attm(l: u16, comptime g: u16) void {
   if (FIX) { crb = st * NES; } //+seats
   const b0: u16 = if (FIX and !cg(c)) crb else w0;   // the cache's first entry of the seat's //+seats
   mref = @ptrcast([*]f32, &mrefs[st * K * Qh]); //+seats
-  const mine = q_row == pe.myrow;
+  const mine = q_row == pe.myrow; //-seats
+  const mine = !idle and q_row == pe.myrow; //+seats
   if (pos == 0) { //-seats
   if (reset) {   // a new sequence on the seat: its reference restarts //+seats
     if (SH == 0) { cache_reset(c); } //-seats
     var hh: u16 = 0;
     while (hh < Qh) : (hh += 1) { mref[l * Qh + hh] = 0.0; }
   }
-  if (SH == 0 and q_row == 0 and (cg(c) or q_ent - w0 < NES)) { cache_clear(c, cslot(c, pos)); } //+seats
+  if (!idle and SH == 0 and q_row == 0 and (cg(c) or q_ent - w0 < NES)) { cache_clear(c, cslot(c, pos)); } //+seats
   if (SH == 0 and mine) {
     cache_put(c, pos, @ptrcast([*]f32, &ab[QD]), @ptrcast([*]f32, &ab[QD + dc]), ab[QD + 2 * dc + 1 + Qh], ab[QD + 2 * dc + 2 + Qh]);
   }
