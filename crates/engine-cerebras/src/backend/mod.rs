@@ -753,6 +753,12 @@ impl Programs for CerebrasEngine {
 }
 
 impl Channels for CerebrasEngine {
+    /// The host plane takes every registration, its ring a host one.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         self.programs
             .register_channel(registration)
