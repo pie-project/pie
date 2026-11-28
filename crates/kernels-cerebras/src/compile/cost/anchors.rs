@@ -63,7 +63,8 @@ pub const ANCHORS: &[Anchor] = &[
 /// entries; sliding entries not a power of two index by multiplies (the e2b links: 692, 268 and
 /// 224 B over the e4b anchor's 128 rows, exact ring and 4 entries); a ring of seats' code past
 /// what its caches and references give, and its sliding rings a seat's where those take fewer
-/// than the pool's entries (the e4b links at 2 to 6 seats: 734 and 120 B).
+/// than the pool's entries (the e4b links at 2 to 6 seats: 880 with a seat of no window's, and
+/// 120 B).
 const SHARED: &[Code] = &[
     Code {
         what: "KV rows not a power of two",
@@ -93,7 +94,7 @@ const SHARED: &[Code] = &[
         what: "a ring of seats",
         on: |p: &Plan| p.seats > 1,
         anchor: false,
-        bytes: 734.0,
+        bytes: 880.0,
     },
     Code {
         what: "sliding rings a seat",
