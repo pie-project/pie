@@ -2430,6 +2430,10 @@ mod tests {
     /// row of the vocabulary at all.
     #[test]
     fn no_kernel_names_a_value_that_takes_no_bytes() {
+        if !crate::device::present() {
+            eprintln!("skipping: no CUDA device on this machine");
+            return;
+        }
         let vocab = shipped::QWEN_VOCAB;
         let mut unwritten_rows = Vec::new();
         for (name, traced) in shipped::all(vocab) {

@@ -54,6 +54,31 @@ pub struct DeviceBoot {
     /// (`test-limits`): no config or profile reaches it.
     #[cfg(feature = "test-limits")]
     pub fires_stated: bool,
+
+    /// A test run's forms of the tab on a native device ([`TestForms`]).
+    /// Test builds only (`test-limits`): no config or profile reaches it.
+    #[cfg(feature = "test-limits")]
+    pub test_forms: TestForms,
+}
+
+/// What a native test run takes of the tab's forms, which the tab takes
+/// for its own reasons (`cfg wasm32`) and a native device does not: stated
+/// by the test's harness, never read from the environment (a shell reads
+/// none). Test builds only (`test-limits`).
+#[cfg(feature = "test-limits")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestForms {
+    /// The storage buffers a shader stage binds at most, below the
+    /// adapter's (as SwiftShader's 10): the kernels' one-segment forms, and
+    /// the tab's aliasing refusals, on a device with room.
+    pub storage_buffers: Option<u32>,
+    /// Where those refusals are: each overlap said, none refused, for a
+    /// whole list in one run.
+    pub aliasing_said: bool,
+    /// Each guest step compacted by naga, as the tab's is.
+    pub guest_compact: bool,
+    /// The guest's pivot finish rolled, as the tab's is.
+    pub guest_rolled: bool,
 }
 
 impl Default for DeviceBoot {
@@ -71,6 +96,8 @@ impl Default for DeviceBoot {
             submit_bound: None,
             #[cfg(feature = "test-limits")]
             fires_stated: false,
+            #[cfg(feature = "test-limits")]
+            test_forms: TestForms::default(),
         }
     }
 }
