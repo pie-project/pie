@@ -99,10 +99,12 @@ pub struct ArtifactModel {
     ple: Vec<Vec<Rows>>,
 }
 
-/// Where a token's embedding row comes from: the head's tiles (`hemb`), else (a tied head with
-/// no tiles) the embedding table `embed` (bf16 [V][H]).
+/// Where a token's embedding row comes from: the head's tiles (`hemb`), the tied head's weight
+/// tiles (`hw<half>`, f16 `[row][column][dims][VR]`, rounded to bf16 as the loop rounds them),
+/// else the embedding table `embed` (bf16 [V][H]).
 enum Embed {
     Tiles { hemb: Rows, words: u32 },
+    Tied(Vec<Rows>),
     Table(Rows),
 }
 
@@ -180,7 +182,17 @@ impl ArtifactModel {
         // init.
         dev.get("rcfg", rect(&floor::Rect::new(0, 0, hl.w, hl.h)), 1)?;
         let model = &art.header.model;
-        let embed = if spec.has("hemb") {
+        let embed = if !hl.tied.is_empty() {
+            let mut hw = Vec::new();
+            while spec.has(&format!("hw{}", hw.len())) {
+                let name = format!("hw{}", hw.len());
+                hw.push(Rows::open(
+                    spec.npy(&name)?,
+                    &spec.file(&format!("{name}.npy")),
+                ));
+            }
+            Embed::Tied(hw)
+        } else if spec.has("hemb") {
             let hemb = spec.npy("hemb")?;
             let words = if hl.band.is_none() && hl.vocab_rows > 0 {
                 hemb.shape[2] as u32 / hl.vocab_rows
@@ -280,6 +292,26 @@ impl ArtifactModel {
             Embed::Table(t) => {
                 let mut out = Vec::with_capacity(self.hidden);
                 t.words(v as usize * self.hidden, self.hidden, &mut out)?;
+                return Ok(out);
+            }
+            Embed::Tied(hw) => {
+                let vr = self.hl.vocab_rows as usize;
+                let (q, k) = (v as usize / vr, v as usize % vr);
+                let mut out = Vec::with_capacity(self.hidden);
+                let mut c = 0;
+                for f in hw {
+                    let (cols, tile) = (f.npy.shape[1], f.npy.shape[2]);
+                    for i in 0..cols {
+                        let at = (q * cols + i) * tile + k;
+                        for d in 0..self.hl.tied[c] as usize {
+                            f.words(at + d * vr, 1, &mut out)?;
+                        }
+                        c += 1;
+                    }
+                }
+                for w in &mut out {
+                    *w = bf16_round(f16_bits(*w as u16));
+                }
                 return Ok(out);
             }
         };
@@ -616,6 +648,12 @@ impl ArtifactModel {
         }
         Ok(l)
     }
+}
+
+/// `x` as bf16 bits, rounded to nearest even (the token loop's rounding of its f16 tile).
+fn bf16_round(x: f32) -> u32 {
+    let b = x.to_bits();
+    (b + 0x7fff + ((b >> 16) & 1)) >> 16
 }
 
 /// An f16's value (bits) as f32, exactly.

@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::block::head_groups::group_dims;
 use crate::compile::floor::{Coord, CtlLine, Rect, Unit, unskip};
+use crate::compile::floorplan::HeadAt;
 use crate::compile::program::Program;
 
 /// The host's map of the program.
@@ -53,6 +55,11 @@ pub struct HostLayout {
     pub token_in: Option<Rect>,
     /// The final logit softcap the host applies (monotone: the wafer's argmax stands).
     pub softcap: Option<f32>,
+    /// A token loop whose embedding is the tied head's own weight tiles (f16, `hw<half>`, at a
+    /// stride of the vocabulary rows) rounded to bf16: each head column's dims. The host reads a
+    /// launch's first pass's there too, so every pass sees the same bits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tied: Vec<u32>,
     /// A ring of seats ([`crate::compile::block::seats`]); `None`: one sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seats: Option<SeatsHost>,
@@ -205,6 +212,13 @@ impl HostLayout {
             logits,
             token_in: prog.plan.shape.ple.map(|_| logits),
             softcap: prog.plan.shape.head.final_softcap,
+            tied: if prog.floorplan.head.at == HeadAt::Groups {
+                (0..p.head.cols as usize)
+                    .map(|c| group_dims(&prog.plan, c))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             seats: (prog.plan.seats > 1).then(|| SeatsHost {
                 m: prog.plan.seats,
                 cy: f.units.iter().flat_map(cy_rects).collect(),
