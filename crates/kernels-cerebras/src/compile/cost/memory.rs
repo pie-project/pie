@@ -70,6 +70,11 @@ impl Moving {
                         att += entries * (4.0 * dc + 4.0);
                     }
                 }
+                // a ring's other seats: their GDN states and log-sum-exp references (f32)
+                if plan.seats > 1 {
+                    let (gdn, nla) = seat_state(plan, unit);
+                    att += f64::from(plan.seats - 1) * 4.0 * (gdn + nla * f64::from(qh));
+                }
                 let mut w = if split { att.max(mlp) } else { att + mlp };
                 if !split && run.attention {
                     w += 10.0 * f64::from(qh * entries);
@@ -81,6 +86,15 @@ impl Moving {
         let head = 4.0 * f64::from(p.head.vocab_rows) * hdc;
         Moving { weight, head }
     }
+}
+
+/// A unit's GDN state words a weight PE (its layers' v dims a column) and its attention layers.
+fn seat_state(plan: &Plan, unit: &[LayerKind]) -> (f64, f64) {
+    let dv = plan.shape.gdn.map_or(0, |g| {
+        (g.value_heads * g.value_dim).div_ceil(plan.partition.cols.max(1))
+    });
+    let gdn = unit.iter().filter(|l| matches!(l, LayerKind::Gdn)).count() as f64;
+    (gdn * f64::from(dv), unit.len() as f64 - gdn)
 }
 
 /// A layer's projection outputs (q, k, v and gates, or GDN's) and its q heads' dims (the
@@ -108,6 +122,13 @@ fn cache_entries(plan: &Plan, kind: LayerKind) -> Option<f64> {
     let e = &plan.partition.kv_entries;
     match kind {
         LayerKind::Gdn | LayerKind::SharedKv { .. } => None,
+        // (a ring: a ring a seat, or each seat's within its window where those take fewer)
+        LayerKind::Sliding { .. } if plan.seats > 1 => {
+            let pool = e.global.unwrap_or(e.per_row);
+            Some(f64::from(
+                e.sliding.map_or(pool, |n| (n * plan.seats).min(pool)),
+            ))
+        }
         LayerKind::Sliding { .. } => Some(f64::from(e.sliding.unwrap_or(e.per_row))),
         LayerKind::Global => Some(f64::from(e.global.unwrap_or(e.per_row))),
     }
@@ -167,6 +188,9 @@ pub struct Anchor {
     pub head_moves: bool,
     /// The weight image's code paths that move with the plan.
     pub code: &'static [Code],
+    /// The attention rows' moving bytes, where the weight image measured is an attention row's
+    /// beside plain rows that move more (0: none): a ring's pool grows the attention rows'.
+    pub attention: f64,
 }
 
 /// The anchor a model's plans are measured off: its kernel set's.
@@ -184,7 +208,13 @@ pub fn anchor(shape: &Shape) -> &'static Anchor {
 pub fn room(plan: &Plan, anchor: &Anchor) -> f64 {
     let m = Moving::of(plan);
     let code: f64 = anchor.code.iter().map(|c| c.over(plan)).sum();
-    let weight = PE_BYTES - (anchor.weight_used + m.weight - anchor.moving.weight + code);
+    let mut over = m.weight - anchor.moving.weight;
+    if plan.seats > 1 && anchor.attention > 0.0 {
+        let mut rows = plan.clone();
+        rows.partition.row_dims.retain(|r| r.attention);
+        over = over.max(Moving::of(&rows).weight - anchor.attention);
+    }
+    let weight = PE_BYTES - (anchor.weight_used + over + code);
     let head = if anchor.head_moves {
         PE_BYTES - (anchor.head_used + m.head - anchor.moving.head)
     } else {

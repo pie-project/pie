@@ -152,7 +152,7 @@ pub fn placed(prog: &Program, kinds: &Kernels) -> Result<Placed, String> {
             params,
         });
     }
-    for (n, t) in crate::compile::kernels::symbols(prog.roles) {
+    for (n, t) in prog.symbols() {
         pl.export(n, t);
     }
     Ok(pl)
@@ -169,7 +169,7 @@ pub fn write(
 ) -> Result<(), String> {
     let kinds = kernels(prog, levers)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let syms = crate::compile::kernels::symbols(prog.roles);
+    let syms = &prog.symbols();
     let own = std::cell::RefCell::new(Vec::new());
     let wr = |name: &str, text: &str| {
         let p = out.join(name);
@@ -181,12 +181,14 @@ pub fn write(
         let body = if kb.source.is_empty() {
             FILLER.to_string()
         } else {
-            match kernels_dir {
+            let text = match kernels_dir {
                 Some(dir) => sources::read(dir, kb.source)?,
                 None => sources::get(kb.source)
                     .ok_or_else(|| format!("no kernel {}", kb.source))?
                     .to_string(),
-            }
+            };
+            prog.source(kb.source, &text)
+                .ok_or_else(|| format!("kernel {} not written", kb.source))?
         };
         wr(
             &format!("{}.csl", k.stem),
@@ -206,13 +208,19 @@ pub fn write(
             Some(dir) => sources::read(dir, name)?,
             None => (*src).to_string(),
         };
-        wr(&format!("ops/{name}"), &text)?;
+        if let Some(text) = prog.source(name, &text) {
+            wr(&format!("ops/{name}"), &text)?;
+        }
     }
     let pl = placed(prog, &kinds)?;
     wr("layout.csl", &pl.csl())?;
     if crate::compile::check::keeping() {
         let routes = crate::compile::check::Routes::of_rcfg(&super::rcfg::dump(prog)?, 0, 0)?;
         crate::compile::check::written(&pl, &own.borrow(), Some(routes));
+        if prog.plan.seats > 1 {
+            let late = crate::compile::check::hazard::late_inputs(prog, &kinds, &own.borrow())?;
+            crate::compile::check::found(late);
+        }
     }
     Ok(())
 }

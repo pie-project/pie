@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::floor::{Coord, CtlLine, Rect, Unit};
+use crate::compile::block::head_groups::group_dims;
+use crate::compile::floor::{Coord, CtlLine, Rect, Unit, unskip};
+use crate::compile::floorplan::HeadAt;
 use crate::compile::program::Program;
 
 /// The host's map of the program.
@@ -53,6 +55,53 @@ pub struct HostLayout {
     pub token_in: Option<Rect>,
     /// The final logit softcap the host applies (monotone: the wafer's argmax stands).
     pub softcap: Option<f32>,
+    /// A token loop whose embedding is the tied head's own weight tiles (f16, `hw<half>`, at a
+    /// stride of the vocabulary rows) rounded to bf16: each head column's dims. The host reads a
+    /// launch's first pass's there too, so every pass sees the same bits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tied: Vec<u32>,
+    /// A ring of seats ([`crate::compile::block::seats`]); `None`: one sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seats: Option<SeatsHost>,
+}
+
+/// Where a ring's host words go: its seats, and every unit's CY row (`spos`) as rectangles (the
+/// CX corner left out). Each seat's first x goes to unit 0's CX column (`xs`, `[seat][dims]` a
+/// PE), its forced laps to the root (`nforce`, a seat's laps; `force` by pass).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SeatsHost {
+    pub m: u32,
+    pub cy: Vec<Rect>,
+    /// The positions the seats' shared KV pool holds (its entries a row by the rows); each seat's
+    /// window starts at a position the host states (`sbase`), a multiple of the rows. 0: a
+    /// program of fixed windows (`NE / m` entries a row each), no `sbase`.
+    #[serde(default)]
+    pub pool: u32,
+    /// The pool's KV rows (a window's first position their multiple); 0: the unit's rows.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rows: u32,
+    /// The per-layer-input storage columns: a launch's first lap's words go to their units' CY
+    /// rows from the host (`pls`), never down the bus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ple: Vec<PleHost>,
+}
+
+/// A storage column's words for a ring's first lap: token `t`'s are storage row `t / tokens`'s,
+/// staged in `pt<store>_<row / per>` (`[row % per][column][tokens][words]`, f16), at weight column
+/// `c`; each of its units' CY row PEs (a rectangle and its first weight column) takes a seat's
+/// `words` values (f32) and a word past them, a seat after another.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PleHost {
+    pub store: u32,
+    pub per: u32,
+    pub tokens: u32,
+    pub words: u32,
+    pub cols: u32,
+    pub cy: Vec<(Rect, u32)>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A unit's CX column.
@@ -63,6 +112,21 @@ fn cx_rect(u: &Unit) -> Rect {
         w: 1,
         h: u.rect.h,
     }
+}
+
+/// A unit's CY row, either side of its CX column.
+fn cy_rects(u: &Unit) -> Vec<Rect> {
+    let (x0, x1, cx) = (u.rect.x, u.rect.x + u.rect.w, u.cx_x());
+    [(x0, cx), (cx + 1, x1)]
+        .into_iter()
+        .filter(|(a, b)| b > a)
+        .map(|(a, b)| Rect {
+            x: a,
+            y: u.cy_y(),
+            w: b - a,
+            h: 1,
+        })
+        .collect()
 }
 
 impl HostLayout {
@@ -148,7 +212,60 @@ impl HostLayout {
             logits,
             token_in: prog.plan.shape.ple.map(|_| logits),
             softcap: prog.plan.shape.head.final_softcap,
+            tied: if prog.floorplan.head.at == HeadAt::Groups {
+                (0..p.head.cols as usize)
+                    .map(|c| group_dims(&prog.plan, c))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            seats: (prog.plan.seats > 1).then(|| SeatsHost {
+                m: prog.plan.seats,
+                cy: f.units.iter().flat_map(cy_rects).collect(),
+                pool: p.kv_entries.per_row * p.kv_rows,
+                rows: if p.kv_rows == p.rows { 0 } else { p.kv_rows },
+                ple: f
+                    .stores
+                    .iter()
+                    .enumerate()
+                    .map(|(i, st)| {
+                        let lv = crate::compile::block::ple::levels(&prog.plan, st.units.len());
+                        let cy = st
+                            .units
+                            .iter()
+                            .filter_map(|&u| f.units.iter().find(|v| v.index == u))
+                            .flat_map(|u| {
+                                cy_rects(u)
+                                    .into_iter()
+                                    .map(|r| (r, unskip(r.x - u.rect.x, u.cx)))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        PleHost {
+                            store: i as u32,
+                            per: crate::compile::block::ple::rows_a_file(
+                                p.cols,
+                                st.tokens_per_pe,
+                                lv,
+                            ),
+                            tokens: st.tokens_per_pe,
+                            words: lv,
+                            cols: p.cols,
+                            cy,
+                        }
+                    })
+                    .collect(),
+            }),
         })
+    }
+
+    /// The rows a ring's windows start at a multiple of: its pool's KV rows (at least 1).
+    #[must_use]
+    pub fn pool_rows(&self) -> u32 {
+        match self.seats.as_ref().map_or(0, |s| s.rows) {
+            0 => self.rows.max(1),
+            r => r,
+        }
     }
 
     /// Every CX row's x offset in the hidden vector, `rows + 1` entries (the runs' dims summed).

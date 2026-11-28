@@ -25,6 +25,7 @@ param PFTZ: u16;
 param QKN: u16 = 0;
 param HD: u16 = 64;
 param EPS: f32 = 1.0e-6;
+param SEATS: u16 = 1; //+seats
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 fn nla() u16 { var n: u16 = 0; var l: u16 = 0; while (l < K) : (l += 1) { if (((KM >> l) & 1) == 1) { n += 1; } } return n; }
@@ -34,10 +35,18 @@ const NS: u16 = Qh * NE;
 
 const KCW: u16 = Dc * NE;          // full layers' keys, entry-major [e][d]
 const VCW: u16 = NE * (Dc + 1);    // values, entry-major [e][d | 1]
-var kc = @zeros([NLA * KCW + NLS * Dc + 1]u16);
-var vc = @zeros([NLA * VCW + NLS * (Dc + 1) + 1]u16);
-var spos = @zeros([if (NLS > 0) NLS else 1]u16);   // sliding: 1 + its entry's position (0: none)
-var mref = @zeros([if (ON) K * Qh else 1]f32);
+var kc = @zeros([NLA * KCW + NLS * Dc + 1]u16); //-seats
+var vc = @zeros([NLA * VCW + NLS * (Dc + 1) + 1]u16); //-seats
+var spos = @zeros([if (NLS > 0) NLS else 1]u16);   // sliding: 1 + its entry's position (0: none) //-seats
+var mref = @zeros([if (ON) K * Qh else 1]f32); //-seats
+// (seats: the full caches the pool's entries, a seat's window of them; a sliding entry a seat) //+seats
+var kc = @zeros([NLA * KCW + SEATS * NLS * Dc + 1]u16); //+seats
+var vc = @zeros([NLA * VCW + SEATS * NLS * (Dc + 1) + 1]u16); //+seats
+var spos = @zeros([if (NLS > 0) SEATS * NLS else 1]u16);   // sliding: 1 + its entry's own position //+seats
+var mrefs = @zeros([if (ON) SEATS * K * Qh else 1]f32);   // a reference a seat //+seats
+var mref: [*]f32 = &mrefs;   // the pass's seat's //+seats
+var moff: u16 = 0; //+seats
+var wb = @zeros([SEATS]u16);   // each seat's window's first entry, learnt at its position 0 //+seats
 const NVF: u16 = if (ON) Dc + 1 else 1;
 var vf = @zeros([NVF]f32);         // one entry's value row widened (the values' scaled adds)
 const vf_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NVF} -> vf[i] });
@@ -68,7 +77,8 @@ const QD: u16 = Qh * Dc;
 const AB: u16 = if (ON) QD + 2 * Dc + 1 + (if (QKN == 1) Qh + 1 else 0) else 1;
 const SQ: u16 = QD + 2 * Dc + 1;   // (QKN 1) the raw sums of squares' offset in CY's multicast
 // (QKN 1) 1 / rms(k) of every live entry (full layers [a][e], then sliding), 1 / rms(q) a head
-var kinv = @zeros([if (ON and QKN == 1) NLA * NE + NLS else 1]f32);
+var kinv = @zeros([if (ON and QKN == 1) NLA * NE + NLS else 1]f32); //-seats
+var kinv = @zeros([if (ON and QKN == 1) NLA * NE + SEATS * NLS else 1]f32); //+seats
 var rq = @zeros([if (ON and QKN == 1) Qh else 1]f32);
 const rq_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON and QKN == 1) Qh else 1} -> rq[i] });
 const HDF: f32 = @as(f32, HD);
@@ -92,26 +102,52 @@ var lpa: u16 = 0;   // 1 + the layer whose log-sum-exp steps follow o (read afte
 fn mix(l: u16, full: bool, a: u16, s: u16) void {
   const xh_d = pe.xh_d;
   @fmovs(ab_d, fab.fin(pe.q_ym, AB));
-  const pos = @as(u16, ab[QD + 2 * Dc]);
-  const mine = (pos % PYW) == pe.myrow;
+  const pos = @as(u16, ab[QD + 2 * Dc]); //-seats
+  // (seats: pos the window's position, 2 seat + its reset above; w0 the window's first entry, //+seats
+  // lp the seat's own position, si its sliding entry) //+seats
+  const sw = @as(u32, ab[QD + 2 * Dc]); //+seats
+  const pos = @as(u16, sw & 0xffff); //+seats
+  const st = @as(u16, (sw >> 17) & 63); //+seats
+  const reset = ((sw >> 16) & 1) != 0; //+seats
+  const idle = ((sw >> 23) & 1) != 0;   // (a seat with no window: its KV unwritten) //+seats
+  if (reset) { wb[st] = pos / PYW; } //+seats
+  const w0: u16 = wb[st]; //+seats
+  const lp: u16 = pos - w0 * PYW; //+seats
+  const si: u16 = st * NLS + s; //+seats
+  mref = @ptrcast([*]f32, &mrefs[st * K * Qh]); //+seats
+  moff = st * K * Qh; //+seats
+  const mine = (pos % PYW) == pe.myrow; //-seats
+  const mine = !idle and (pos % PYW) == pe.myrow; //+seats
   var kb: u16 = 0;
   var vb: u16 = 0;
   var e0: u16 = 0;
   var nel: u16 = 0;
-  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts
+  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts //-seats
+  if (reset) {   // a new sequence on the seat: no live entries, its reference restarts //+seats
     var hh: u16 = 0;
     while (hh < Qh) : (hh += 1) { mref[l * Qh + hh] = 0.0; }
-    if (!full) { spos[s] = 0; }
+    if (!full) { spos[s] = 0; } //-seats
+    if (!full) { spos[si] = 0; } //+seats
   }
   if (full) {
     kb = a * KCW; vb = a * VCW; e0 = pos / PYW;
-    nel = if (e0 + 1 < NE) e0 + 1 else NE;
-    if (pos == 0) { @mov16(@set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[i] }), @ptrcast([*]u16, &vc[1 + vb])), VCW), @as(u16, 0)); }
+    nel = if (e0 + 1 < NE) e0 + 1 else NE; //-seats
+    if (pos == 0) { @mov16(@set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[i] }), @ptrcast([*]u16, &vc[1 + vb])), VCW), @as(u16, 0)); } //-seats
+    nel = e0 + 1 - w0; //+seats
+    if (!idle and lp % PYW == 0) {   // the seat's next entry, empty before its rows write it //+seats
+      @mov16(@set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[i] }), @ptrcast([*]u16, &kc[1 + kb + e0 * Dc])), Dc), @as(u16, 0)); //+seats
+      @mov16(@set_dsd_length(@set_dsd_base_addr(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[i] }), @ptrcast([*]u16, &vc[1 + vb + e0 * (Dc + 1)])), Dc + 1), @as(u16, 0)); //+seats
+      if (QKN == 1) { kinv[a * NE + e0] = 0.0; } //+seats
+    } //+seats
   } else {
-    kb = NLA * KCW + s * Dc; vb = NLA * VCW + s * (Dc + 1);
-    if (mine) { spos[s] = pos + 1; }
-    nel = if (spos[s] != 0 and pos + 1 - spos[s] < WIN) 1 else 0;
+    kb = NLA * KCW + s * Dc; vb = NLA * VCW + s * (Dc + 1); //-seats
+    if (mine) { spos[s] = pos + 1; } //-seats
+    nel = if (spos[s] != 0 and pos + 1 - spos[s] < WIN) 1 else 0; //-seats
+    kb = NLA * KCW + si * Dc; vb = NLA * VCW + si * (Dc + 1); //+seats
+    if (mine) { spos[si] = lp + 1; } //+seats
+    nel = if (spos[si] != 0 and lp + 1 - spos[si] < WIN) 1 else 0; //+seats
   }
+  const b0: u16 = if (full) w0 else 0;   // (seats) the cache's first live entry //+seats
   if (mine) {
     const ee = if (full) e0 else 0;
     var d: u16 = 0;
@@ -133,7 +169,8 @@ fn mix(l: u16, full: bool, a: u16, s: u16) void {
       }
       var e: u16 = 0;
       while (e < nel) : (e += 1) {
-        const xk = @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &kc[1 + kb + e * Dc])), Dc);
+        const xk = @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &kc[1 + kb + e * Dc])), Dc); //-seats
+        const xk = @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &kc[1 + kb + (b0 + e) * Dc])), Dc); //+seats
         pe.mvx(@ptrcast([*]u16, &qt), Dc, Qh, xk, e * Qh);
       }
       @fmovs(@set_dsd_length(sx_d, nsl), yv(0, nsl));
@@ -144,7 +181,8 @@ fn mix(l: u16, full: bool, a: u16, s: u16) void {
       }
       if (pe.seg.role != 5) { seg_ar(if (QKN == 1) nsl + Qh + 1 else nsl); }
       if (QKN == 1) {
-        const k0: u16 = if (full) a * NE else NLA * NE + s;
+        const k0: u16 = if (full) a * NE else NLA * NE + s; //-seats
+        const k0: u16 = if (full) a * NE else NLA * NE + si; //+seats
         if (mine) { kinv[k0 + (if (full) e0 else 0)] = math.rsqrt(sx[nsl + Qh] / HDF + EPS); }
         h = 0;
         while (h < Qh) : (h += 1) { rq[h] = math.rsqrt(sx[nsl + h] / HDF + EPS); }
@@ -152,10 +190,12 @@ fn mix(l: u16, full: bool, a: u16, s: u16) void {
         while (e < nel) : (e += 1) {
           const se = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, e * Qh), f32), Qh);
           @fmuls(se, se, rq_d);
-          @fmuls(se, se, kinv[k0 + e]);
+          @fmuls(se, se, kinv[k0 + e]); //-seats
+          @fmuls(se, se, kinv[k0 + b0 + e]); //+seats
         }
       }
-      const mr = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) K * Qh else 1} -> mref[i] }), @as(i16, l * Qh), f32), Qh);
+      const mr = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) K * Qh else 1} -> mref[i] }), @as(i16, l * Qh), f32), Qh); //-seats
+      const mr = @set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{if (ON) SEATS * K * Qh else 1} -> mrefs[i] }), @as(i16, moff + l * Qh), f32), Qh); //+seats
       e = 0;
       while (e < nel) : (e += 1) {
         const se = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, e * Qh), f32), Qh);
@@ -175,7 +215,8 @@ fn mix(l: u16, full: bool, a: u16, s: u16) void {
         @fmovs(yv(0, Qh * (Dc + 1)), 0.0);
         var e2: u16 = 0;
         while (e2 < nel) : (e2 += 1) {
-          @fh2s(vf_d, @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &vc[1 + vb + e2 * (Dc + 1)])), Dc + 1));
+          @fh2s(vf_d, @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &vc[1 + vb + e2 * (Dc + 1)])), Dc + 1)); //-seats
+          @fh2s(vf_d, @set_dsd_length(@set_dsd_base_addr(xh_d, @ptrcast([*]@fp16(), &vc[1 + vb + (b0 + e2) * (Dc + 1)])), Dc + 1)); //+seats
           h = 0;
           while (h < Qh) : (h += 1) {
             const pv = @as(f32, pe.xh[e2 * Qh + h]);
@@ -185,7 +226,8 @@ fn mix(l: u16, full: bool, a: u16, s: u16) void {
       } else {
         while (h < Qh) : (h += 1) {
           const xp = @set_dsd_stride(@set_dsd_length(@increment_dsd_offset(xh_d, @as(i16, h), @fp16()), nel), Qh);
-          pe.mvx(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, xp, h * (Dc + 1));
+          pe.mvx(@ptrcast([*]u16, &vc[1 + vb]), nel, Dc + 1, xp, h * (Dc + 1)); //-seats
+          pe.mvx(@ptrcast([*]u16, &vc[1 + vb + b0 * (Dc + 1)]), nel, Dc + 1, xp, h * (Dc + 1)); //+seats
         }
       }
     } else {

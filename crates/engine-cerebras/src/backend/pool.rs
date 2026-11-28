@@ -21,6 +21,10 @@ pub(super) const BUFFER: ShapeId = ShapeId(2);
 /// The bytes a token takes in a page, a ring or a buffer slot.
 pub(super) const TOKEN_BYTES: u64 = 4;
 
+/// The state room the pages state at the least: the kv lies on the wafer, so a page's bytes
+/// are nominal, and guest state lives in host memory.
+const GUEST_ROOM: u64 = 1 << 30;
+
 /// What the pool holds.
 pub(super) struct Pool {
     pub page_size: u32,
@@ -87,13 +91,19 @@ impl Pool {
             .collect()
     }
 
+    /// A page's bytes: a token's, or the pages' share of the guest room where more.
+    fn page_bytes(&self) -> u64 {
+        let tokens = self.kv_pages.saturating_mul(u64::from(self.page_size)).max(1);
+        u64::from(self.page_size) * TOKEN_BYTES.max(GUEST_ROOM.div_ceil(tokens))
+    }
+
     /// How a unit program's kv refs name its pages; `None` where its pages
     /// are not the wafer's.
     #[must_use]
     pub fn wafer_pages(&self) -> Option<WaferPages> {
         let ids = self.wafer?;
         let chunk_bytes = self.facts().chunk_bytes;
-        let page_bytes = u64::from(self.page_size) * TOKEN_BYTES;
+        let page_bytes = self.page_bytes();
         Some(WaferPages {
             per_chunk: u32::try_from(chunk_bytes / page_bytes.max(1)).unwrap_or(u32::MAX),
             pages: ids.pages,
@@ -104,7 +114,7 @@ impl Pool {
     /// shape and as many of the narrower ones as fill it.
     #[must_use]
     pub fn facts(&self) -> ChunkFacts {
-        let page_bytes = u64::from(self.page_size) * TOKEN_BYTES;
+        let page_bytes = self.page_bytes();
         let rings = self.rings();
         let record_bytes = self.state_bytes + rings.iter().map(|ring| ring.bytes).sum::<u64>();
         let has_record = record_bytes > 0;

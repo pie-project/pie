@@ -7,6 +7,7 @@ mod kv;
 mod launch;
 mod pool;
 mod posted;
+mod ring;
 mod stream;
 mod window;
 
@@ -66,6 +67,8 @@ pub struct CerebrasEngine {
     stream: Option<stream::Streams>,
     /// A unit program's pages, as its lanes' kv refs name them.
     wafer_pages: Option<pool::WaferPages>,
+    /// The program's ring of seats, when it holds more than one sequence.
+    ring: Option<ring::Ring>,
 }
 
 impl CerebrasEngine {
@@ -95,6 +98,7 @@ impl CerebrasEngine {
             posted: std::collections::VecDeque::new(),
             stream: None,
             wafer_pages: None,
+            ring: None,
         }
     }
 
@@ -259,11 +263,17 @@ impl Engine for CerebrasEngine {
         }
         let width = readout.map(|(_, width)| width);
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-        // a stream reading's program (its host.json), or a directory of them, one a reading
+        // a stream reading's program (its host.json), or a directory of them, one a reading (a
+        // linked decode program's own artifact is not one)
         if let Some(programs) = self
             .debug
             .program
             .as_deref()
+            .filter(|d| {
+                !d.join(crate::artifact::ARTIFACT)
+                    .join("program.json")
+                    .is_file()
+            })
             .and_then(|d| stream::programs_in(d, self.debug.link.as_deref()))
         {
             return self.load_stream(trace, &path, &contract, &budgets, &steps, &programs);
@@ -356,13 +366,31 @@ impl Engine for CerebrasEngine {
         let facts = Facts::of(trace, &budgets, slots).map_err(Error::Load)?;
         self.readout = facts.readout();
         // The context the model holds: the wafer program's positions.
-        let model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
+        let mut model_context = u32::try_from(w.positions).unwrap_or(u32::MAX);
         // a unit program's pages are Pie's (its K / V columns' own, a lane's ids its pages)
         let wafer_pages = w.paging;
         // (a unit program's state slots its lane slots)
         let wafer_lanes = w.lanes;
         let posted_loop = w.posted_loop;
+        let (seats, cap) = w.ring;
+        let ring_pool = w.pool;
         self.model = Some(w);
+        if seats > 1 {
+            let ring = ring::Ring::new(
+                seats,
+                model_context as usize,
+                cap,
+                self.lookahead(),
+                ring_pool,
+            );
+            model_context = u32::try_from(ring.positions()).unwrap_or(model_context);
+            self.ring = Some(ring);
+        }
+        // the sequences a fire's lanes run on: a ring's seats, a unit program's lanes, else one
+        let seats = self.ring.as_ref().map_or(
+            if wafer_lanes.is_some() { u32::MAX } else { 1 },
+            ring::Ring::seats,
+        );
         self.kv = Kv::default();
         let lookahead = self.lookahead();
         let dispatch_depth = fire::dispatch_depth(posted_loop, lookahead);
@@ -381,11 +409,19 @@ impl Engine for CerebrasEngine {
         // are Pie's (its K / V columns' own, a lane's ids its pages).
         let windowed = facts.windowed_layers().map_err(Error::Load)?;
         let lanes = budgets.max_lanes.max(1);
-        let page_size = wafer_pages.map_or(paging.page_size, |(_, _, size)| size);
+        // (a ring's shared pool: a page is a pool row, Pie's pages the lanes' rows)
+        let ring_pages = self.ring.as_ref().and_then(ring::Ring::pool_pages);
+        let page_size = wafer_pages.map_or(
+            ring_pages.map_or(paging.page_size, |(s, _)| s),
+            |(_, _, size)| size,
+        );
         self.kv.page_size = page_size;
         let pool = pool::Pool {
             page_size,
-            kv_pages: wafer_pages.map_or(paging.pages(), |(_, pages, _)| u64::from(pages)),
+            kv_pages: wafer_pages.map_or(
+                ring_pages.map_or(paging.pages(), |(_, p)| u64::from(p)),
+                |(_, pages, _)| u64::from(pages),
+            ),
             // each seat's record and a snapshot's, and a copy-on-write one a lane a fire runs
             records: paging.slots.saturating_mul(2).saturating_add(lanes),
             state_bytes: if facts.has_state() {
@@ -428,12 +464,21 @@ impl Engine for CerebrasEngine {
             pools,
             chunks,
             limits: FireLimits {
-                // The model holds one sequence's cache; a fire's lanes run one after another.
-                max_lanes: budgets.max_lanes.max(1),
+                // One a sequence the program holds, the lanes past them waiting in the runtime
+                // (lanes taking turns on one sequence's cache would replay its history each turn).
+                max_lanes: budgets.max_lanes.max(1).min(seats),
                 max_tokens: budgets.max_tokens,
-                max_page_refs: wafer_pages.map_or(paging.pages_per_slot, |(_, pages, _)| pages),
-                max_context: wafer_pages
-                    .map_or(paging.context().min(model_context), |(_, p, s)| p * s),
+                max_page_refs: wafer_pages.map_or(
+                    ring_pages.map_or(paging.pages_per_slot, |_| model_context / page_size.max(1)),
+                    |(_, pages, _)| pages,
+                ),
+                // (whole pages: the runtime grants a sequence its last page whole)
+                max_context: wafer_pages.map_or(
+                    paging
+                        .context()
+                        .min(model_context / page_size.max(1) * page_size.max(1)),
+                    |(_, p, s)| p * s,
+                ),
                 prefill_rows: 0,
                 prefill_lanes: 0,
                 max_readouts: budgets.max_tokens,
@@ -632,7 +677,6 @@ impl Tiers for CerebrasEngine {
                 .pages
                 .entry(run.dst_page)
                 .or_insert_with(|| vec![None; size as usize]);
-            self.kv.copied.insert(run.dst_page);
             for k in 0..run.tokens as usize {
                 if let (Some(&cell), Some(slot)) = (
                     src.get(run.src_token as usize + k),
@@ -696,6 +740,9 @@ impl Programs for CerebrasEngine {
 
     fn close(&mut self, id: InstanceId) -> EngineResult<u64> {
         self.drain();
+        if let Some(ring) = &mut self.ring {
+            ring.close(id);
+        }
         self.programs.close_instance(id).map_err(refusal)?;
         Ok(0)
     }
@@ -706,6 +753,12 @@ impl Programs for CerebrasEngine {
 }
 
 impl Channels for CerebrasEngine {
+    /// The host plane takes every registration, its ring a host one.
+    fn holds(&self, registration: &ChannelRegistration) -> bool {
+        let _ = registration;
+        true
+    }
+
     fn open(&mut self, registration: &ChannelRegistration) -> EngineResult<RegisteredChannel> {
         self.programs
             .register_channel(registration)

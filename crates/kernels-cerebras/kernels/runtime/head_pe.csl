@@ -181,9 +181,13 @@ fn hloop() void {
     wrow = @as(u16, rcfg[RQ + 12]);
     const j = @as(u16, w);
     if (GRP == 1) {
-      // row j of the tied tile (dim-major: stride VR), f16 widened
+      // row j of the tied tile (dim-major: stride VR), f16 widened and rounded to bf16 (to
+      // nearest even, as the host rounds the same tile: every pass sees the same bits)
       var d: u16 = 0;
-      while (d < nx) : (d += 1) { eb[d] = @as(f32, @bitcast(@fp16(), hw[d * VR + j])); }
+      while (d < nx) : (d += 1) {
+        const u = @bitcast(u32, @as(f32, @bitcast(@fp16(), hw[d * VR + j])));
+        eb[d] = @bitcast(f32, (u + 0x7fff + ((u >> 16) & 1)) & 0xffff0000);
+      }
     } else {
       // row j of the tile, bf16 bits into the high halves of f32 words
       @fmovs(eb_d, 0.0);

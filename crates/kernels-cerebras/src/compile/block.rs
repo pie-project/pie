@@ -9,7 +9,7 @@
 //! [`super::wiring::NoteKey`]s it lays are consts in its module, and the kernels' rcfg writers
 //! read the slots by them. Nothing in the core names a block's.
 
-use super::abi::Overrides;
+use super::abi::{Kernels, Overrides};
 use super::floor::{Floor, FloorBuilder};
 use super::plan::Plan;
 use super::program::Program;
@@ -23,6 +23,7 @@ pub mod head_groups;
 pub mod moe;
 pub mod ple;
 pub mod row_runs;
+pub mod seats;
 pub mod segments;
 pub mod shared_kv;
 pub mod token_loop;
@@ -61,5 +62,20 @@ pub trait Block: Send + Sync {
     /// This block's copies onto the wafer, in placement order.
     fn bindings(&self, _prog: &Program, _out: &mut Copies) -> R<()> {
         Ok(())
+    }
+
+    /// Its params and exported names over the kinds' kernels.
+    fn kernels(&self, _prog: &Program, _ks: &mut Kernels) -> R<()> {
+        Ok(())
+    }
+
+    /// The names it exports beside the kernel set's (each kind not owning one has its dummy).
+    fn symbols(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// A kernel or op source `name` as this program writes it (`None`: not written).
+    fn source(&self, _name: &str, text: String) -> Option<String> {
+        Some(text)
     }
 }

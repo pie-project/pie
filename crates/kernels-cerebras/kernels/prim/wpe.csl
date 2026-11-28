@@ -143,11 +143,24 @@ fn relay(o: u16, comptime qm: u16) void {
   const n = @as(u16, rcfg[RQ + o]);
   if (n == 0) { return; }
   while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {}
-  fab.iqc(6, rcfg[RQ + o + 1]);
+  fab.iqc(6, rcfg[RQ + o + 1]); //-seats
   fab.oqc(4, rcfg[RQ + o + 2]);
   @fmovs(fab.fout(q_ao, n), fab.fin(q_xm, n));
   if (qm == 1) { seg.qmode(0); } else { fab.iqc(6, rcfg[RQ + 4]); }
 }
+// A ring's pass-start relay: the next pass's x may come while this one's is taken, so its colour //+seats
+// is never rebound: it holds a level-2 input (iq3, else iq5) this PE's reduction role leaves idle. //+seats
+fn relay_in(o: u16) void { //+seats
+  const n = @as(u16, rcfg[RQ + o]); //+seats
+  if (n == 0) { return; } //+seats
+  while ((tile_config.output_queue_status.get_raw() & 0x1000) == 0) {} //+seats
+  fab.oqc(4, rcfg[RQ + o + 2]); //+seats
+  if (rx.role != 2) { @fmovs(fab.fout(q_ao, n), fab.fin(q_xb, n)); } //+seats
+  else { @fmovs(fab.fout(q_ao, n), fab.fin(q_yb, n)); } //+seats
+} //+seats
+// A ring's pass-end relay's colour on iq6, before the PE's last partial is posted: CX casts the next //+seats
+// pass's x down the row only after that partial, so iq6 never leaves the cast's colour late. //+seats
+fn post_in() void { if (rcfg[RQ + 21] != 0) { fab.iqc(6, rcfg[RQ + 22]); } } //+seats
 
 comptime {
   @initialize_queue(q_xa, .{ .color = @get_color(13) });   // parked (distinct a queue)

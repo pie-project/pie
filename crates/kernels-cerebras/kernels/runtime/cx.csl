@@ -35,6 +35,7 @@ param SSQL: u16 = 1;   // (NRM 0) 1: x g goes first, the sum of squares (only CY
 param XKEEP: u16 = 0;  // 1 (diagnostics): copies of each reduction's sum (xred) and x after each layer
 param XDLY: u16 = 0;   // (NRM 2, diagnostics) unit 0's wait after the embedding chunk arrives
 param FIFOW: u16 = 32; // the reductions' FIFO depth (words)
+param SEATS: u16 = 1;  // a ring of seats (ops/seats.csl): unit 0 takes each seat's first x from xs //+seats
 
 const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const fab = @import_module("ops/fabric.csl", .{ .NQ = if (HG == 1) 6 else 5 });
@@ -73,6 +74,9 @@ const x_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> x[i] });
 const xw_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{HW} -> x[i] });
 const t_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> t[i] });
 const t1_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NT} -> t[i] });
+var xs = @zeros([SEATS * Hc]f32);   // (host-written, unit 0) each seat's x at the launch's first lap //+seats
+var xs_ptr: [*]f32 = &xs; //+seats
+const xs_d = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Hc} -> xs[i] }); //+seats
 fn keep_red(i: u16) void { if (XKEEP == 0) { return; } @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |j|{NXRED} -> xred[j] }), @as(i16, i * Hc), f32), Hc), t_d); }
 fn keep_x(l: u16) void { if (XKEEP == 0) { return; } @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NDBG} -> xdbg[i] }), @as(i16, l * Hc), f32), Hc), x_d); }
 
@@ -207,7 +211,9 @@ fn take(go: u16, i: u16) void {
 // x in: the host's, the handoff's (2 Hc + 1), or (unit 0) the token loop's embedding, scaled
 fn x_in1(s: u32, fl: u32) void {
   if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(xw_d, fab.fin(q_hi, HW)); return; }
-  if (s > 0 and (fl & 4) != 0) {     // the wafer loop's next token (else the host's x)
+  if (s > 0 and (fl & 4) != 0) {     // the wafer loop's next token (else the host's x) //-seats
+  if (s < SEATS) { @fmovs(x_d, @increment_dsd_offset(xs_d, @as(i16, @as(u16, s) * Hc), f32)); }   // a seat's first lap //+seats
+  else if ((fl & 4) != 0) {     // the wafer loop's next token (else the host's x) //+seats
     if (HG == 1) {
       const nfe = @as(u16, rcfg[RQ + 13]);
       if ((fl & 128) != 0) {
@@ -340,6 +346,7 @@ task pass_task() void {
     const fl = rcfg[RQ + 7];
     if (NRM == 1) { x_in1(s, fl); }
     else if (HOSTX == 0 and (fl & 1) == 0) { @fmovs(x_d, fab.fin(q_hi, Hc)); }
+    else if (s < SEATS) { @fmovs(x_d, @increment_dsd_offset(xs_d, @as(i16, @as(u16, s) * Hc), f32)); }   // a seat's first lap //+seats
     else if (s > 0 and (fl & 4) != 0) { @fmovs(x_d, fab.fin(q_em, Hc)); if (NRM == 2) { xdly(); } }   // the wafer loop's next token
     stamp(0);
     var l: u16 = 0;
@@ -373,6 +380,7 @@ comptime {
   @initialize_queue(q_mc, .{ .color = C_PARK });
   @initialize_queue(q_ho, .{ .color = C_PARK });
   @export_symbol(x_ptr, "x");
+  @export_symbol(xs_ptr, "xs"); //+seats
   @export_symbol(xdbg_ptr, "xdbg");
   @export_symbol(xred_ptr, "xred");
   @export_symbol(tdbg_ptr, "tdbg");

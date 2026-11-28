@@ -20,6 +20,7 @@ param PYW: u16;
 param HD: u16;
 param QKN: u16;
 param ATTL: u16;
+param SEATS: u16 = 1; //+seats
 
 fn mx(a: u16, b: u16) u16 { return if (a > b) a else b; }
 const ON: bool = NL > 0;   // (NL 0: a unit with no such layer, every buffer one word)
@@ -30,7 +31,10 @@ const VCW: u16 = NE * (Dc + 1);         // values, entry-major [e][d | 1]
 var kc = @zeros([NL * KCW + 1]u16);
 var vc = @zeros([NL * VCW + 1]u16);
 var kinv = @zeros([mx(NL * NE, 1)]f32);
-var mref = @zeros([mx(NL * Qh, 1)]f32);
+var mref = @zeros([mx(NL * Qh, 1)]f32); //-seats
+var wb = @zeros([SEATS]u16);   // each seat's window's first entry, learnt at its position 0 //+seats
+var mrefs = @zeros([mx(SEATS * NL * Qh, 1)]f32);   // a reference a seat //+seats
+var mref: [*]f32 = &mrefs;   // the pass's seat's //+seats
 var ab = @zeros([if (ON) Qh * Dc + 2 * Dc + 2 + Qh else 1]f32);
 var sx = @zeros([NS]f32);
 // (exp_v's 2^k bits live in y16, the f16 matvec accumulator, never live during the scores' exp)
@@ -55,13 +59,30 @@ fn mix(a: u16) void {
   const xh_d = pe.xh_d;
   const y_d = pe.y_d;
   @fmovs(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{AB} -> ab[i] }), fab.fin(pe.q_ym, AB));
-  const pos = @as(u16, ab[QD + 2 * Dc]);
-  const mine = (pos % PYW) == pe.myrow;
+  const pos = @as(u16, ab[QD + 2 * Dc]); //-seats
+  const sw = @as(u32, ab[QD + 2 * Dc]); //+seats
+  const pos = @as(u16, sw & 0xffff); //+seats
+  const idle = ((sw >> 23) & 1) != 0;   // (a seat with no window: its KV unwritten) //+seats
+  const mine = (pos % PYW) == pe.myrow; //-seats
+  const mine = !idle and (pos % PYW) == pe.myrow; //+seats
   const e0 = pos / PYW;
-  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts
-    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{KCW} -> kc[1 + i] }), @as(i16, kb), u16), @as(u16, 0));
-    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb), u16), @as(u16, 0));
-    @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] }), @as(i16, a * NE), f32), NE), 0.0);
+  if (pos == 0) {   // a new sequence: no live entries, the log-sum-exp reference restarts //-seats
+    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{KCW} -> kc[1 + i] }), @as(i16, kb), u16), @as(u16, 0)); //-seats
+    @mov16(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb), u16), @as(u16, 0)); //-seats
+    @fmovs(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{NE} -> kinv[i] }), @as(i16, a * NE), f32), NE), 0.0); //-seats
+  // (seats: pos is the seat's window's position; w0 its first entry, lp the seat's own position) //+seats
+  const st: u16 = @as(u16, (sw >> 17) & 63); //+seats
+  if (((sw >> 16) & 1) != 0) { wb[st] = e0; } //+seats
+  const w0: u16 = wb[st]; //+seats
+  const lp: u16 = pos - w0 * PYW; //+seats
+  mref = @ptrcast([*]f32, &mrefs[st * NL * Qh]); //+seats
+  if (!idle and lp % PYW == 0) {   // the seat's next entry, empty before its rows write it //+seats
+    var dz: u16 = 0; //+seats
+    while (dz < Dc) : (dz += 1) { kc[1 + kb + dz * NE + e0] = 0; } //+seats
+    @mov16(@set_dsd_length(@increment_dsd_offset(@get_dsd(mem1d_dsd, .{ .tensor_access = |i|{VCW} -> vc[1 + i] }), @as(i16, vb + e0 * (Dc + 1)), u16), Dc + 1), @as(u16, 0)); //+seats
+    kinv[a * NE + e0] = 0.0; //+seats
+  } //+seats
+  if (lp == 0) {   // a new sequence on the seat: its reference restarts //+seats
     var hh: u16 = 0;
     while (hh < Qh) : (hh += 1) { mref[a * Qh + hh] = 0.0; }
   }
@@ -76,7 +97,8 @@ fn mix(a: u16) void {
   @fs2h(@set_dsd_length(xh_d, QD), @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{QD} -> ab[i] }));
   // live entries only: every row's live entries are below p / PYW + 1 (a row's one unwritten
   // entry scores 0 and adds 0: its ones column is 0)
-  const NEl: u16 = if (pos / PYW + 1 < NE) pos / PYW + 1 else NE;
+  const NEl: u16 = if (pos / PYW + 1 < NE) pos / PYW + 1 else NE; //-seats
+  const NEl: u16 = if (lp / PYW + 1 < NE - w0) lp / PYW + 1 else NE - w0; //+seats
   const nsl: u16 = Qh * NEl + Qh + 1;
   var apass: u16 = 0;
   while (apass < 8) : (apass += 1) {
@@ -85,7 +107,8 @@ fn mix(a: u16) void {
       // keys are dim-major rows of NE: the matvec spans them all (cheap), only NEl are kept
       pe.kvmv(@ptrcast([*]u16, &kc[1 + kb]), Dc, NE, h * Dc, h * NE);
       @fmovs(@set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl),
-             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NEl));
+             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE), f32), NEl)); //-seats
+             @set_dsd_length(@increment_dsd_offset(y_d, @as(i16, h * NE + w0), f32), NEl)); //+seats
       sx[Qh * NEl + h] = ab[QD + 2 * Dc + 1 + h];
     }
     sx[Qh * NEl + Qh] = if (mine) ab[QD + 2 * Dc + 1 + Qh] else 0.0;
@@ -96,7 +119,8 @@ fn mix(a: u16) void {
     while (h < Qh) : (h += 1) {
       const sh = @set_dsd_length(@increment_dsd_offset(sx_d, @as(i16, h * NEl), f32), NEl);
       if (QKN == 1) {
-        @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32));
+        @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE), f32)); //-seats
+        @fmuls(sh, sh, @increment_dsd_offset(ki, @as(i16, a * NE + w0), f32)); //+seats
         @fmuls(sh, sh, math.rsqrt(sx[Qh * NEl + h] / HDF + 1.0e-6));
       }
       @fsubs(sh, sh, mref[a * Qh + h]);
@@ -109,7 +133,8 @@ fn mix(a: u16) void {
     @fnegs(sp, sp);
     @fs2h(@set_dsd_length(xh_d, Qh * NEl), sp);
     h = 0;
-    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, Dc + 1, h * NEl, h * (Dc + 1)); }
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb]), NEl, Dc + 1, h * NEl, h * (Dc + 1)); } //-seats
+    while (h < Qh) : (h += 1) { pe.kvmv(@ptrcast([*]u16, &vc[1 + vb + w0 * (Dc + 1)]), NEl, Dc + 1, h * NEl, h * (Dc + 1)); } //+seats
     pe.send_y(Qh * (Dc + 1));
     // o (the o_proj's x), then the redo word and the heads' log-sum-exp steps (every pass)
     @fs2h(@set_dsd_length(xh_d, QO), fab.fin(pe.q_ym, QO));

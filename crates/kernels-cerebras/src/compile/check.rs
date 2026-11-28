@@ -969,6 +969,15 @@ pub(crate) fn written(p: &Placed, own: &[(String, String)], routes: Option<Route
     }
 }
 
+/// Findings of a program's own rules, added to its report ([`written`]).
+pub(crate) fn found(errors: impl IntoIterator<Item = String>) {
+    LAST.with(|l| {
+        if let Some(rep) = l.borrow_mut().as_mut() {
+            rep.errors.extend(errors);
+        }
+    });
+}
+
 /// The check of the program written last (since [`keep`]), once.
 pub fn last() -> Option<Report> {
     LAST.with(|l| l.borrow_mut().take())

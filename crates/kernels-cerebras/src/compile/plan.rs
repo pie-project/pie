@@ -355,6 +355,18 @@ pub struct Plan {
     /// The kernel levers the build applies (the preset's, `K:V,...`).
     #[serde(default)]
     pub levers: String,
+    /// Sequences the program holds at once, a ring of seats over its units
+    /// ([`super::block::seats`], `SEATS`): 1, one sequence.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub seats: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(v: &u32) -> bool {
+    *v == 1
 }
 
 impl Plan {
@@ -451,6 +463,9 @@ impl Plan {
             if seen.iter().any(|s| !s) {
                 return bad("head groups leave a row out".into());
             }
+        }
+        if let Some(e) = super::check::hazard::seats(self.seats, pa.units) {
+            return bad(e);
         }
         if co.rope_levels > 0 {
             let bits = co.rope_bits * co.rope_levels;

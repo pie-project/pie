@@ -44,6 +44,7 @@ pub const OPS: &[(&str, &str)] = &[
     csl!("linear", "mv.csl"),
     csl!("collective", "red.csl"),
     csl!("elemwise", "rope.csl"),
+    csl!("runtime", "seats.csl"),
     csl!("collective", "seg.csl"),
     csl!("attn", "swa.csl"),
     csl!("prim", "wpe.csl"),

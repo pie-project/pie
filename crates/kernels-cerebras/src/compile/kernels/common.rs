@@ -116,8 +116,22 @@ pub fn weight(
     hn: u32,
     relays: [Option<(u32, u32)>; 2],
 ) -> R<Vec<u32>> {
-    let rx = pe.member(ROW_REDUCE)?;
-    let ry = pe.member(COL_REDUCE)?;
+    let mut rx = pe.member(ROW_REDUCE)?;
+    let mut ry = pe.member(COL_REDUCE)?;
+    // (a ring: the pass-start turn's colour bound for good, on a level-2 input no role reads)
+    if let Some((from, _)) = relays[0].filter(|_| pe.prog.plan.seats > 1) {
+        let idle = match (rx.recv2, ry.recv2) {
+            (None, _) => &mut rx,
+            (_, None) => &mut ry,
+            _ => {
+                return Err(format!(
+                    "{:?}: a ring's handoff turn on a PE heading a group of both reductions",
+                    pe.at
+                ));
+            }
+        };
+        idle.recv2 = Some(Colour(u8::try_from(from).map_err(|e| e.to_string())?));
+    }
     let need = [rx.recv1, rx.recv2, ry.recv1, ry.recv2]
         .iter()
         .filter(|v| v.is_none())

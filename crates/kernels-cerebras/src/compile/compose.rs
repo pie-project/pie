@@ -17,6 +17,7 @@ use crate::compile::block::head_groups::HeadGroups;
 use crate::compile::block::moe::{MoeCopies, Router};
 use crate::compile::block::ple::Ple;
 use crate::compile::block::row_runs::RunCopies;
+use crate::compile::block::seats::Seats;
 use crate::compile::block::segments::{Onorm, Scores};
 use crate::compile::block::shared_kv::SharedKv;
 use crate::compile::block::token_loop::TokenLoop;
@@ -285,7 +286,8 @@ fn take<T>(c: Option<T>, what: &str) -> R<T> {
 }
 
 /// The blocks of `plan`'s floorplan, in order: the units, the segments over them, the feature
-/// blocks beside them (side-input storage, shared caches' line), the head, the token loop.
+/// blocks beside them (side-input storage, shared caches' line), the head, the token loop, the
+/// seats.
 pub fn blocks(plan: &Plan, set: KernelSet, fp: &Floorplan) -> R<Vec<Box<dyn Block>>> {
     let copies = copies::of(plan, set)?;
     let shape = &fp.units.shape;
@@ -351,6 +353,8 @@ pub fn blocks(plan: &Plan, set: KernelSet, fp: &Floorplan) -> R<Vec<Box<dyn Bloc
             }
         }
     }
+    let ple = fp.aux.iter().any(|a| matches!(a, Aux::Store(_)));
+    out.push(Box::new(Seats { m: plan.seats, ple }));
     Ok(out)
 }
 

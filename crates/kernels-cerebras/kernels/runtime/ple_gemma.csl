@@ -101,10 +101,15 @@ var pos0: u32 = 0;
 const pass_id: local_task_id = @get_local_task_id(8);
 task pass_task() void {
   var s: u32 = 0;
-  if ((pfl & 2) != 0 and n_steps > 0) { take_tb(pos0 + 1); }   // the launch's first token (tin)
-  while (s < n_steps) : (s += 1) {
-    if ((pfl & 2) != 0) { take_tb(pos0 + s + 2); }
-  }
+  if ((pfl & 2) != 0 and n_steps > 0) { take_tb(pos0 + 1); }   // the launch's first token (tin) //-seats
+  while (s < n_steps) : (s += 1) { //-seats
+    if ((pfl & 2) != 0) { take_tb(pos0 + s + 2); } //-seats
+  } //-seats
+  // (seats: each pass's token, one a pass; the first lap's words are the host's, never the bus's: //+seats
+  // a lap's tokens back to back would turn owners' routes while a word is still on its way) //+seats
+  if ((pfl & 2) != 0) { //+seats
+    while (s < n_steps) : (s += 1) { take_tb(s + 1); } //+seats
+  } //+seats
   sys_mod.unblock_cmd_stream();
 }
 fn compute(steps: u32, start_pos: u32) void {

@@ -17,7 +17,7 @@ type R<T> = Result<T, String>;
 /// Preset keys: the unit shape (PX, PY, NU; its arrangement [`Arrangement::derive`]), head rows (HR), global KV entries a KV row (NEG), reduction groups
 /// (G2, G2W), posted loop (LOOP). The sliding window runs over `PYW` KV rows (exact ring where
 /// NES divides it, else every row with older entries masked). Overrides: `PYW`, `NEG`, `G2`,
-/// `G2W`, `G3W`, `CAP`, `LOOP`.
+/// `G2W`, `G3W`, `CAP`, `LOOP`, `SEATS`.
 pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let (px, py, nu) = (pr.need("PX")?, pr.need("PY")?, pr.need("NU")?);
     let n = s.layers.len() as u32;
@@ -81,6 +81,16 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
     let nes = window.div_ceil(pyw);
     let neg = pr.need("NEG")?;
     let hr = pr.need("HR")?;
+    // a ring of seats shares the global KV pool, NEG PYW: a sequence holds what the others'
+    // least windows (a launch's laps, whole rows) leave
+    let seats = pr.int("SEATS").unwrap_or(1).max(1);
+    let cap = pr.int("CAP").unwrap_or(256);
+    let least = (cap / seats).max(1).div_ceil(pyw) * pyw;
+    if seats > neg || (seats - 1) * least >= neg * pyw {
+        return Err(format!(
+            "stacked: {seats} seats over {neg} KV entries a row"
+        ));
+    }
     let partition = Partition {
         unit_grid: None,
         units: nu,
@@ -122,10 +132,10 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         arrangement: Some(Arrangement::derive(s, (px, py, nu))),
     };
     let contract = Contract {
-        positions: neg * pyw,
+        positions: neg * pyw - (seats - 1) * least,
         rope_levels: 4,
         rope_bits: 3,
-        cap: pr.int("CAP").unwrap_or(256),
+        cap,
         loop_len: pr.need("LOOP")?,
         token_loop: true,
         logit_scale: 1.0,
@@ -135,6 +145,7 @@ pub fn plan(s: &Shape, pr: &Preset) -> R<Plan> {
         partition,
         contract,
         levers: pr.levers.clone(),
+        seats,
     })
 }
 

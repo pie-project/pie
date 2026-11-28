@@ -547,6 +547,40 @@ impl Plane {
         }
     }
 
+    /// One pass of `instance` as [`Plane::fire_interpreted`], with the outputs in `argmax`
+    /// (name, the pass's lane, each row's argmax) answered by their argmax alone: no logits row is
+    /// made, copied or scanned. Exact where [`Plane::greedy_reads`] holds (the output reaches only
+    /// reshapes and `reduce_argmax`); any other reader gets the one-hot rows the argmax stands for.
+    #[doc(hidden)]
+    pub fn fire_argmaxed(
+        &mut self,
+        instance: InstanceId,
+        outputs: &[(String, u32, Value)],
+        argmax: &[(String, u32, Vec<i32>)],
+        at: Stage,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let inputs = PassInputs { outputs };
+        let mut runner = Argmaxed {
+            argmax,
+            carried: std::collections::HashMap::new(),
+        };
+        let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
+        let program = seat.program;
+        match outcome {
+            StepOutcome::Committed => Ok(()),
+            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) blocked on channel {channel}"
+            ))),
+            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
+                "instance {instance} (program {program}) faulted: {why}"
+            ))),
+        }
+    }
+
     /// Nothing is ever in flight on this backend.
     fn settle_ring(&self, _ring: &Arc<ChannelState>) {}
 
@@ -742,5 +776,140 @@ impl Plane {
             )));
         }
         Ok(ring.front())
+    }
+}
+
+/// The interpreter with some outputs known by their rows' argmax ([`Plane::fire_argmaxed`]): an
+/// output it binds, and the reshapes of it, carry the argmax; `reduce_argmax` of one is the
+/// argmax; any other op reading one gets the one-hot rows.
+struct Argmaxed<'a> {
+    argmax: &'a [(String, u32, Vec<i32>)],
+    /// Value id -> its rows' argmax (an output or a reshape of one).
+    carried: std::collections::HashMap<u32, Vec<i32>>,
+}
+
+impl Argmaxed<'_> {
+    fn of(&self, root: &eta_compiler::codegen::launch::LaunchValue) -> Option<&Vec<i32>> {
+        let name = root.output.as_deref()?;
+        self.argmax
+            .iter()
+            .find(|(n, lane, _)| n == name && *lane == root.lane)
+            .map(|(_, _, rows)| rows)
+    }
+
+    /// Value `id`'s one-hot rows, in place of its argmax.
+    fn materialize(
+        &mut self,
+        package: &eta_compiler::codegen::launch::LaunchPackage,
+        id: u32,
+        vals: &mut [Value],
+    ) {
+        let Some(rows) = self.carried.remove(&id) else {
+            return;
+        };
+        let numel: usize = package.values[id as usize]
+            .shape
+            .iter()
+            .map(|&d| d as usize)
+            .product::<usize>()
+            .max(1);
+        let width = numel / rows.len().max(1);
+        let mut v = vec![0f32; numel];
+        for (r, &at) in rows.iter().enumerate() {
+            if let Some(cell) = v.get_mut(r * width + at as usize) {
+                *cell = 1.0;
+            }
+        }
+        vals[id as usize] = Value::F32(v);
+    }
+}
+
+impl eta_exec::StageRunner for Argmaxed<'_> {
+    fn binds(&self, root: &eta_compiler::codegen::launch::LaunchValue) -> bool {
+        self.of(root).is_some()
+    }
+
+    fn run(
+        &mut self,
+        plan: &ExecPlan,
+        sp: &eta_exec::StagePlan,
+        roots: &[u32],
+        _wanted: &[u32],
+        vals: &mut [Value],
+    ) -> eta_exec::Result<()> {
+        use eta_compiler::eval::interp::Evaled;
+        use eta_ir::op::Op;
+        let package = &plan.package;
+        for &id in roots {
+            let root = &package.values[id as usize];
+            if matches!(
+                root.source,
+                eta_compiler::codegen::launch::ValueOrigin::Output
+            ) && let Some(rows) = self.of(root)
+            {
+                let rows = rows.clone();
+                self.carried.insert(id, rows);
+            }
+        }
+        let no_outputs = eta_compiler::eval::interp::PassInputs::default();
+        let ty_of = |id: u32| plan.types[id as usize];
+        for &id in &sp.value_ids {
+            let Some(op) = sp.op_by_result.get(&id).and_then(|&k| sp.ops.get(k)) else {
+                continue;
+            };
+            let operands = op.operands();
+            let a0 = operands.first().copied();
+            let carried = a0.and_then(|a| self.carried.get(&a).cloned());
+            match (op, carried) {
+                (Op::Reshape { .. }, Some(rows)) => {
+                    self.carried.insert(id, rows);
+                    continue;
+                }
+                (Op::ReduceArgmax(_), Some(rows)) => {
+                    let shape = &package.values[a0.unwrap_or(0) as usize].shape;
+                    let want: usize = if shape.len() < 2 {
+                        1
+                    } else {
+                        shape[..shape.len() - 1]
+                            .iter()
+                            .map(|&d| d as usize)
+                            .product()
+                    };
+                    if want == rows.len() {
+                        vals[id as usize] = Value::I32(rows);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            for &a in &operands {
+                self.materialize(package, a, vals);
+            }
+            let fault = |message: String| eta_exec::Error { message };
+            match eta_compiler::eval::interp::eval_op(op, vals, &ty_of, &no_outputs, &package.names)
+                .map_err(|e| fault(e.to_string()))?
+            {
+                Evaled::One(value) => vals[id as usize] = value,
+                Evaled::Two(first, second) => {
+                    vals[id as usize] = first;
+                    vals[id as usize + 1] = second;
+                }
+                Evaled::Kernel { args, .. } => match args[..] {
+                    [arg] => vals[id as usize] = vals[arg as usize].clone(),
+                    _ => {
+                        return Err(fault(format!(
+                            "value {id}: the identity boundary takes one value"
+                        )));
+                    }
+                },
+                Evaled::Sink { .. } => {}
+                Evaled::Chan(_) => {
+                    return Err(fault(format!(
+                        "value {id}: a channel op among a stage's ops"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }

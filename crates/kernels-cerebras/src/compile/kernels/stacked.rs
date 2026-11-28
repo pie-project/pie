@@ -119,10 +119,11 @@ pub const W_SHARER: u32 = 2;
 pub const W_FLUSH: u32 = 4;
 /// The last CX's flush bits.
 pub const CX_FLUSH: u32 = 8 | 16;
-/// A CY's PLE bits: on a bus, the shared-KV source, the last unit.
+/// A CY's PLE bits: on a bus, the shared-KV source, the last unit; (a ring) the last sharer.
 pub const CY_BUS: u32 = 1;
 pub const CY_KV_SOURCE: u32 = 2;
 pub const CY_FLUSH: u32 = 4;
+pub const CY_KV_ACK: u32 = 8;
 /// A store PE's bits: it stores, takes the token word, is its column's top.
 pub const S_STORES: u32 = 1;
 pub const S_TOKEN: u32 = 2;
@@ -177,9 +178,9 @@ fn cx(pe: &Pe) -> R<Vec<u32>> {
 }
 
 /// A CY PE: the shared words (no segment), then its PLE bits, its column's bus colour, its place
-/// in the column, the bus words, the shared-KV colour.
+/// in the column, the bus words, the shared-KV colour; (a ring) its credit's colour.
 fn cy(pe: &Pe) -> R<Vec<u32>> {
-    let Place::Cy { unit, .. } = pe.role().place else {
+    let Place::Cy { unit, col: c } = pe.role().place else {
         return Err(format!("{:?}: cy off a CY PE", pe.at));
     };
     let plan = &pe.prog.plan;
@@ -191,12 +192,24 @@ fn cy(pe: &Pe) -> R<Vec<u32>> {
         } else {
             0
         }
-        | if unit == last_unit(pe) { CY_FLUSH } else { 0 };
+        | if unit == last_unit(pe) { CY_FLUSH } else { 0 }
+        | if plan.seats > 1 && shared_kv::units(plan).1.iter().max() == Some(&unit) {
+            CY_KV_ACK
+        } else {
+            0
+        };
     let (pb, ui, lv) = match col {
         Some((i, ui, lv)) => (pe.c(bus(i))?, ui, lv),
         None => (0, 0, 0),
     };
     w.extend_from_slice(&[fl, pb, ui, lv, line(pe)?]);
+    if plan.seats > 1 {
+        let ack = match pe.c(shared_kv::ack(c)) {
+            Ok(c) => c,
+            Err(_) => pe.parks(1)?[0],
+        };
+        w.push(ack);
+    }
     Ok(w)
 }
 

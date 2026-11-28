@@ -39,7 +39,21 @@ pub enum Logits {
     All,
 }
 
+/// A launch of a ring's seats ([`ArtifactModel::ring_launch`]), and whether its last pass's logits
+/// are read.
+pub struct Launch {
+    pub first: Vec<u32>,
+    pub pos: Vec<usize>,
+    pub force: Vec<Vec<u32>>,
+    pub passes: usize,
+    pub logits: bool,
+    /// The seats' KV windows in the pool from this launch on, where they change.
+    pub windows: Option<Vec<(usize, usize)>>,
+}
+
 enum Job {
+    /// Answered on the posted channel.
+    Ring(Launch),
     /// Rows of Pie's lanes, each over its own pages (a unit program's: [`UnitModel::rows`]).
     Rows(Vec<crate::units::Row>),
     Forward {
@@ -57,7 +71,7 @@ enum Job {
 }
 
 /// The argmax after each row, and the logits rows asked for.
-type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
+pub type Answer = R<(Vec<u32>, Vec<Vec<f32>>)>;
 
 /// The model a wafer program serves: the decode template's, or a program of stream units.
 enum Model {
@@ -95,6 +109,39 @@ impl Model {
             Model::Artifact(_) => None,
             Model::Units(m) => m.pages().map(|(p, s)| (m.lanes(), p, s)),
         }
+    }
+
+    /// The seats of the template's ring and the passes a launch may run (1 seat: no ring).
+    fn ring(&self) -> (usize, usize) {
+        match self {
+            Model::Artifact(m) => (m.seats(), m.cap),
+            Model::Units(_) => (1, 0),
+        }
+    }
+
+    /// The ring's shared KV pool: its positions and rows (none: a fixed window a seat).
+    fn pool(&self) -> Option<(usize, usize)> {
+        match self {
+            Model::Artifact(m) => m.pool(),
+            Model::Units(_) => None,
+        }
+    }
+
+    fn launch(&mut self, l: &Launch) -> Answer {
+        let m = match self {
+            Model::Artifact(m) => m,
+            Model::Units(_) => return Err("a unit program has no ring".into()),
+        };
+        if let Some(w) = &l.windows {
+            m.windows(w)?;
+        }
+        let winners = m.ring_launch(&l.first, &l.pos, &l.force, l.passes)?;
+        let logits = if l.logits {
+            vec![m.logits()?]
+        } else {
+            Vec::new()
+        };
+        Ok((winners, logits))
     }
 
     /// A unit program's lane slots a launch; none for the template's.
@@ -149,6 +196,10 @@ pub struct Wafer {
     pub paging: Option<(usize, u32, u32)>,
     /// A unit program's lane slots a launch (its rows: Pie's lanes run together).
     pub lanes: Option<usize>,
+    /// The program's seats and the passes a launch of them may run (1 seat: no ring).
+    pub ring: (usize, usize),
+    /// The ring's shared KV pool: its positions and rows (none: a fixed window a seat).
+    pub pool: Option<(usize, usize)>,
     /// Whether the program runs the token loop (a template's WL build; a unit program's rows).
     pub token_loop: bool,
 }
@@ -222,6 +273,8 @@ impl Wafer {
                 (usize, usize, usize),
                 Option<(usize, u32, u32)>,
                 Option<usize>,
+                (usize, usize),
+                Option<(usize, usize)>,
             )>,
         >();
         let thread = std::thread::Builder::new()
@@ -229,7 +282,13 @@ impl Wafer {
             .spawn(move || {
                 let mut m = match open() {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok((m.sizes(), m.paging(), m.lanes())));
+                        let _ = ready_tx.send(Ok((
+                            m.sizes(),
+                            m.paging(),
+                            m.lanes(),
+                            m.ring(),
+                            m.pool(),
+                        )));
                         m
                     }
                     Err(e) => {
@@ -278,6 +337,16 @@ impl Wafer {
                             start,
                             which,
                         } => (forward(&mut m, &tokens, start, which), &ans_tx),
+                        Job::Ring(l) => {
+                            let a = m.launch(&l);
+                            tracing::info!(
+                                passes = l.passes,
+                                idle_ms = (t0 - idle_from).as_secs_f64() * 1e3,
+                                ms = t0.elapsed().as_secs_f64() * 1e3,
+                                "spatial wafer: ring launch"
+                            );
+                            (a, &post_tx)
+                        }
                         Job::Rows(rows) => (m.rows(&rows), &ans_tx),
                     };
                     idle_from = Instant::now();
@@ -289,7 +358,7 @@ impl Wafer {
                 }
             })
             .map_err(|e| format!("spawning the wafer thread: {e}"))?;
-        let ((positions, vocab, hidden), paging, lanes) = ready_rx
+        let ((positions, vocab, hidden), paging, lanes, ring, pool) = ready_rx
             .recv()
             .map_err(|_| "the wafer thread died while loading".to_string())??;
         Ok(Wafer {
@@ -303,6 +372,8 @@ impl Wafer {
             posted_loop,
             paging,
             lanes,
+            ring,
+            pool,
             token_loop,
         })
     }
@@ -347,6 +418,18 @@ impl Wafer {
     /// A posted loop's argmax after each row (as [`Wafer::greedy`]'s): waiting for it, or `None`
     /// if it has not landed.
     pub fn take_posted(&mut self, wait: bool) -> Option<R<Vec<u32>>> {
+        self.take_answer(wait)
+            .map(|got| got.map(|(argmax, _)| argmax))
+    }
+
+    /// Posts a launch of the ring's seats: every pass's argmax, and the logits it reads, come from
+    /// [`Wafer::take_answer`].
+    pub fn post_ring(&mut self, launch: Launch) -> R<()> {
+        self.send(Job::Ring(launch))
+    }
+
+    /// The next posted answer: waiting for it, or `None` if it has not landed.
+    pub fn take_answer(&mut self, wait: bool) -> Option<Answer> {
         let got = if wait {
             let _busy = Busy::start();
             self.posted
@@ -359,7 +442,7 @@ impl Wafer {
                 Err(_) => Err("the wafer thread went away".to_string()),
             }
         };
-        Some(got.and_then(|a| a.map(|(argmax, _)| argmax)))
+        Some(got.and_then(|a| a))
     }
 
     /// Rows of Pie's lanes over their own pages: each row's argmax, and the logits of those that
