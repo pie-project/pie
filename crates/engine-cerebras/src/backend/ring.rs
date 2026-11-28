@@ -180,11 +180,11 @@ impl Ring {
                 sent: false,
             }
         });
-        // (one seat holds at most the pool past the others' least windows)
-        let positions = pool.as_ref().map_or(positions, |p| {
-            let least = most.div_ceil(p.rows) * p.rows;
-            positions.min(p.size.saturating_sub((seats - 1) * least))
-        });
+        // (a seat holds at most its even share of the pool, whole rows: any lanes, one a seat,
+        // then fit at once, each window rounding to rows within its own share)
+        let positions = pool
+            .as_ref()
+            .map_or(positions, |p| positions.min(p.size / seats / p.rows * p.rows));
         Ring {
             positions,
             pool,
@@ -207,17 +207,11 @@ impl Ring {
         u32::try_from(self.seats.len()).unwrap_or(u32::MAX)
     }
 
-    /// The positions of the pool Pie's lanes may hold, in `page`s: what is left past each seat's
-    /// rounding to whole rows (or an idle seat's least window); windows sized to their lanes'
-    /// rows then always fit, laid out again if they must (none where every seat's window holds
-    /// a sequence's most at once: Pie's lanes hold what they would on fixed windows).
+    /// The positions of the pool Pie's lanes may hold, in `page`s: a sequence's most on every
+    /// seat (each within its even share, whole rows: the lanes a fire runs always fit at once).
     pub(super) fn pool_pages(&self, page: u32) -> Option<u32> {
-        let p = self.pool.as_ref()?;
-        if p.wins.iter().all(|w| w.1 >= self.positions) {
-            return None;
-        }
-        let kept = self.seats.len() * self.least(p.rows).max(p.rows - 1);
-        u32::try_from(p.size.saturating_sub(kept) / page.max(1) as usize).ok()
+        self.pool.as_ref()?;
+        u32::try_from(self.seats.len() * self.positions / page.max(1) as usize).ok()
     }
 
     /// The positions seat `j` may run: its window's, else a seat's.
