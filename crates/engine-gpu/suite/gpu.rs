@@ -42,7 +42,7 @@ pub fn device_boot() -> DeviceBoot {
     open(false);
     DeviceBoot {
         profiles: Some(profiles),
-        ..DeviceBoot::default()
+        ..crate::backend::default_boot()
     }
 }
 
@@ -102,7 +102,7 @@ pub fn profiles() -> &'static std::path::Path {
         let boot = DeviceBoot {
             profiles: Some(dir.clone()),
             submit_bound: Some(MEASURED_UNDER),
-            ..DeviceBoot::default()
+            ..crate::backend::default_boot()
         };
         // No device: no rates, and no test that would read them runs.
         if let Err(why) =

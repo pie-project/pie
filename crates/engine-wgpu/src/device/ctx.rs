@@ -233,6 +233,9 @@ pub(crate) struct Core {
     /// ([`super::memory::reservation_bound`]): every buffer made is no
     /// larger, and one past it is refused by name, never made invalid.
     pub(crate) bound: u64,
+    /// What a test run takes of the tab's forms (`api::TestForms`).
+    #[cfg(feature = "test-limits")]
+    pub(crate) test_forms: crate::api::TestForms,
 }
 
 /// A wgpu device's loss, once seen, and where: its lost callback (a driver
@@ -734,15 +737,12 @@ impl Context {
         #[cfg(feature = "test-limits")]
         let max_buffer = max_buffer.min(boot.max_buffer.unwrap_or(u64::MAX));
         // A test run's adapter binding a stage fewer storage buffers
-        // (`PIE_TEST_STORAGE_BUFFERS`, as SwiftShader's 10): the kernels'
+        // (`TestForms::storage_buffers`, as SwiftShader's 10): the kernels'
         // one-segment forms, forced on a device with room. Test builds only.
         #[cfg(feature = "test-limits")]
         let limits = {
             let mut limits = limits;
-            if let Some(fewer) = std::env::var("PIE_TEST_STORAGE_BUFFERS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-            {
+            if let Some(fewer) = boot.test_forms.storage_buffers {
                 limits.max_storage_buffers_per_shader_stage =
                     limits.max_storage_buffers_per_shader_stage.min(fewer);
             }
@@ -773,6 +773,8 @@ impl Context {
             shares_host: reading.source == super::memory::Source::HostAvailable,
             whose_memory,
             bound,
+            #[cfg(feature = "test-limits")]
+            test_forms: boot.test_forms.clone(),
         });
         // Where no two views of a buffer may overlap (the tab), each argument
         // a dispatch names none of binds a window of its own

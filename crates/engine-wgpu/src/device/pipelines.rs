@@ -354,15 +354,22 @@ pub(crate) fn exact_guest(one_segment: bool) -> bool {
 /// and their bytes.
 ///
 /// Where it refuses: in the tab, and in a test-limits build whose adapter
-/// takes the one-segment forms (`PIE_TEST_STORAGE_BUFFERS`), so a native
-/// suite finds what the tab would refuse; there `PIE_TEST_ALIASING=log`
+/// takes the one-segment forms (`TestForms::storage_buffers`), so a native
+/// suite finds what the tab would refuse; there `TestForms::aliasing_said`
 /// says every overlap and refuses none, for a whole list in one run.
 /// Natively it only says each, at debug: native serves its four segments'
 /// overlaps, which wgpu does not check.
-pub(crate) fn aliased(group: &str, bound: &[Bound<'_>], one_segment: bool) -> Result<()> {
+pub(crate) fn aliased(
+    core: &Core,
+    group: &str,
+    bound: &[Bound<'_>],
+    one_segment: bool,
+) -> Result<()> {
     let refuses = exact_views(one_segment);
     #[cfg(feature = "test-limits")]
-    let refuses = refuses && std::env::var("PIE_TEST_ALIASING").as_deref() != Ok("log");
+    let refuses = refuses && !core.test_forms.aliasing_said;
+    #[cfg(not(feature = "test-limits"))]
+    let _ = core;
     for (i, a) in bound.iter().enumerate() {
         for b in &bound[i + 1..] {
             if !(a.writable && b.writable) || a.buffer != b.buffer {
@@ -483,7 +490,7 @@ pub(crate) fn group_of(
             dynamic: false,
         })
         .collect();
-    aliased(pipeline.name, &bound, pipeline.one_segment)?;
+    aliased(core, pipeline.name, &bound, pipeline.one_segment)?;
     let layout = match rebased {
         Some(rebased) => {
             let buffer = core.uniform_buffer.get().ok_or_else(|| Fault::Device {

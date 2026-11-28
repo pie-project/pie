@@ -1431,19 +1431,23 @@ fn bind_layout(core: &Core, one: bool) -> wgpu::BindGroupLayout {
 /// select's workgroup tables), which SwiftShader in Chrome takes minutes on;
 /// naga drops what the entry never reaches and writes the rest back. Native
 /// drivers strip it themselves, and serve the module as emitted faster.
-/// A native test takes the tab's forms with `PIE_TEST_GUEST_COMPACT` (this)
-/// and `PIE_TEST_GUEST_ROLLED` (the pivot finish rolled), to compare them.
-fn compacted(call: usize, source: &str) -> std::result::Result<String, String> {
+/// A native test takes the tab's forms with `TestForms::guest_compact`
+/// (this) and `TestForms::guest_rolled` (the pivot finish rolled), to
+/// compare them.
+fn compacted(core: &Core, call: usize, source: &str) -> std::result::Result<String, String> {
     #[cfg(feature = "test-limits")]
-    let source = &if std::env::var_os("PIE_TEST_GUEST_ROLLED").is_some() {
+    let source = &if core.test_forms.guest_rolled {
         eta_compiler::codegen::wgsl::roll_pivot(source)
     } else {
         source.to_string()
     };
     #[cfg(feature = "test-limits")]
-    let tab = cfg!(target_arch = "wasm32") || std::env::var_os("PIE_TEST_GUEST_COMPACT").is_some();
+    let tab = cfg!(target_arch = "wasm32") || core.test_forms.guest_compact;
     #[cfg(not(feature = "test-limits"))]
-    let tab = cfg!(target_arch = "wasm32");
+    let tab = {
+        let _ = core;
+        cfg!(target_arch = "wasm32")
+    };
     if !tab {
         return Ok(source.to_string());
     }
@@ -1477,7 +1481,7 @@ fn build_call(
     let source = <crate::device::Api as engine_gpu::guest::Lower>::lower(call, source)
         .map_err(|why| why.to_string())?;
     let source = if one { merged(call, source)? } else { source };
-    let source = compacted(call, &source)?;
+    let source = compacted(core, call, &source)?;
     // Said before the module is made, so the last line before a device's
     // loss names what it was making.
     tracing::info!(
@@ -1533,6 +1537,7 @@ fn segment_group(
         }
     }
     crate::device::pipelines::aliased(
+        core,
         "pie guest",
         &[
             bound(STATUS_BINDING, slots, false),
@@ -1602,6 +1607,7 @@ fn mirror_group(
         }
     }
     crate::device::pipelines::aliased(
+        core,
         "pie guest",
         &[
             bound(STATUS_BINDING, &mirrors.status, mirrors.status.bytes()),

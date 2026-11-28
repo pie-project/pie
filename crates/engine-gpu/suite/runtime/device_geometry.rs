@@ -278,7 +278,7 @@ impl Rig {
 }
 
 fn answers_the_host_path(frames: u8) {
-    let boot = backend::DeviceBoot::default();
+    let boot = backend::default_boot();
     if backend::Context::bind(&boot, backend::ALLOWANCE).is_err() {
         eprintln!("not asked: no device");
         return;

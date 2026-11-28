@@ -10,6 +10,11 @@ mod backend {
     pub use engine_vulkan::device::{Api, Buffer, Context, Pipelines};
     pub use engine_vulkan::encode::Sink;
 
+    /// The backend's boot as a test run states it: its default.
+    pub fn default_boot() -> DeviceBoot {
+        DeviceBoot::default()
+    }
+
     pub type Handles = engine_gpu::Handles<Api>;
     pub type Shell = engine_gpu::serve::Shell<Api>;
     pub type Boot<'a> = engine_gpu::serve::Boot<'a, Api>;

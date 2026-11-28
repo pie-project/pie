@@ -17,6 +17,26 @@ mod backend {
     /// The backend's engine.
     pub type Engine = engine_gpu::api::Gpu<Api>;
 
+    /// The backend's boot as a test run states it: the tab's forms this
+    /// run takes on a native device (`DeviceBoot::test_forms`), from the
+    /// harness's environment, which the shell itself never reads:
+    /// `PIE_TEST_STORAGE_BUFFERS` (a stage's storage buffers, below the
+    /// adapter's), `PIE_TEST_ALIASING=log` (each overlap said, none
+    /// refused), `PIE_TEST_GUEST_COMPACT` and `PIE_TEST_GUEST_ROLLED`.
+    pub fn default_boot() -> DeviceBoot {
+        DeviceBoot {
+            test_forms: engine_wgpu::api::TestForms {
+                storage_buffers: std::env::var("PIE_TEST_STORAGE_BUFFERS")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                aliasing_said: std::env::var("PIE_TEST_ALIASING").as_deref() == Ok("log"),
+                guest_compact: std::env::var_os("PIE_TEST_GUEST_COMPACT").is_some(),
+                guest_rolled: std::env::var_os("PIE_TEST_GUEST_ROLLED").is_some(),
+            },
+            ..DeviceBoot::default()
+        }
+    }
+
     /// wgpu times no frame apart from its own fires here: nothing to watch.
     pub fn watch_frames(_on: bool) {}
 
