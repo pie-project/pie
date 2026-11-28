@@ -402,6 +402,8 @@ pub struct Shell {
 
     patch_seat: Option<crate::inputs::PatchSeat>,
     voxel_seat: Option<crate::inputs::VoxelSeat>,
+    /// The classes whose passes read the token grid (as engine-gpu keeps).
+    token_gridded: poem_ir::ClassSet,
     patch_fold: u32,
     drops_patch_rows: bool,
     states_mrope: bool,
@@ -1209,6 +1211,9 @@ impl PreparedLoad<'_> {
 
         let facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
+        let token_gridded = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
+            matches!(def, poem_ir::Def::Input(RuntimeInput::TokenGrid { .. }))
+        });
 
         let Classes {
             masked,
@@ -1962,6 +1967,7 @@ impl PreparedLoad<'_> {
             nan_flags,
             patch_seat,
             voxel_seat,
+            token_gridded,
             patch_fold,
             drops_patch_rows,
             states_mrope,
@@ -3396,10 +3402,12 @@ impl Shell {
         let patch = self.voxel_seat.and_then(|seat| seat.token_patch);
         let mut guests = vec![poem_exec::fire::GuestRows::default(); lanes.len()];
         for row in composition.lanes() {
+            let gridded = self.token_gridded.contains(row.class as usize);
             let clips = clips_of
                 .get(row.source as usize)
                 .copied()
                 .flatten()
+                .filter(|_| gridded)
                 .map(|clips| clips.boxes);
             guests[row.source as usize] =
                 poem_exec::fire::guest_rows(row, clips, patch).map_err(fire)?;
