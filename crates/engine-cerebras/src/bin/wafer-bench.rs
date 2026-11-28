@@ -896,6 +896,14 @@ fn run() -> Result<bool, String> {
             _ => return Err(USAGE.into()),
         }
     }
+    // (a flag the usage doesn't name is refused: ignored, it would run something else)
+    let known: Vec<&str> = USAGE
+        .split(|c: char| c.is_whitespace() || "[]()|".contains(c))
+        .filter_map(|w| w.strip_prefix("--"))
+        .collect();
+    if let Some(k) = get.keys().find(|k| !known.contains(&k.as_str())) {
+        return Err(format!("wafer-bench: no flag --{k}\n{USAGE}"));
+    }
     if get.contains_key("decode") && (get.contains_key("reading") || get.contains_key("cache")) {
         return decode(&get);
     }
