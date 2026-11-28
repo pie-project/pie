@@ -1638,6 +1638,9 @@ impl Shell {
                 let Some(tile) = clips_of[row.source as usize] else {
                     continue;
                 };
+                // A lane outside the token grid (a VAE pass) has no token rows to check.
+                let token_patch =
+                    token_patch.filter(|_| self.token_gridded.contains(row.class as usize));
                 let mut offset = row.voxel_offset;
                 let mut token_row = row.row_offset;
                 for boxed in tile.boxes {
