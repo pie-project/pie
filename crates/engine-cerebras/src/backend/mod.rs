@@ -409,16 +409,17 @@ impl Engine for CerebrasEngine {
         // are Pie's (its K / V columns' own, a lane's ids its pages).
         let windowed = facts.windowed_layers().map_err(Error::Load)?;
         let lanes = budgets.max_lanes.max(1);
-        let page_size = wafer_pages.map_or(paging.page_size, |(_, _, size)| size);
+        // (a ring's shared pool: a page is a pool row, Pie's pages the lanes' rows)
+        let ring_pages = self.ring.as_ref().and_then(ring::Ring::pool_pages);
+        let page_size = wafer_pages.map_or(
+            ring_pages.map_or(paging.page_size, |(s, _)| s),
+            |(_, _, size)| size,
+        );
         self.kv.page_size = page_size;
         let pool = pool::Pool {
             page_size,
-            // (a ring's shared pool: the pages its windows hold)
             kv_pages: wafer_pages.map_or(
-                self.ring
-                    .as_ref()
-                    .and_then(|r| r.pool_pages(paging.page_size))
-                    .map_or(paging.pages(), u64::from),
+                ring_pages.map_or(paging.pages(), |(_, p)| u64::from(p)),
                 |(_, pages, _)| u64::from(pages),
             ),
             // each seat's record and a snapshot's, and a copy-on-write one a lane a fire runs
@@ -467,7 +468,10 @@ impl Engine for CerebrasEngine {
                 // (lanes taking turns on one sequence's cache would replay its history each turn).
                 max_lanes: budgets.max_lanes.max(1).min(seats),
                 max_tokens: budgets.max_tokens,
-                max_page_refs: wafer_pages.map_or(paging.pages_per_slot, |(_, pages, _)| pages),
+                max_page_refs: wafer_pages.map_or(
+                    ring_pages.map_or(paging.pages_per_slot, |_| model_context / page_size.max(1)),
+                    |(_, pages, _)| pages,
+                ),
                 // (whole pages: the runtime grants a sequence its last page whole)
                 max_context: wafer_pages.map_or(
                     paging

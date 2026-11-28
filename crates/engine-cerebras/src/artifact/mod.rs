@@ -408,7 +408,8 @@ impl ArtifactModel {
     }
 
     /// The seats' KV windows from here on, (first position, positions) a seat: each within the
-    /// pool, from a multiple of the rows, none over another. A seat's window changes only as it
+    /// pool, from a multiple of the rows, none over another but the same (seats with no
+    /// sequence sharing a scratch window: their cells no one's). A seat's window changes only as it
     /// starts again at position 0 (the attention learns a window's first entry there).
     pub fn windows(&mut self, wins: &[(usize, usize)]) -> R<()> {
         let pool = self.hl.seats.as_ref().map_or(0, |s| s.pool as usize);
@@ -425,7 +426,7 @@ impl ArtifactModel {
         let fits = by
             .iter()
             .all(|&(b, n)| b % rows == 0 && b + n <= pool && n <= self.positions)
-            && by.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0);
+            && by.windows(2).all(|w| w[0] == w[1] || w[0].0 + w[0].1 <= w[1].0);
         if !fits {
             return Err(format!(
                 "artifact: windows {wins:?} over a pool of {pool} (rows {rows}, a seat at most {})",
