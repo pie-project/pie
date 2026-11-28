@@ -30,8 +30,12 @@ const ONE: &str = " //-seats";
 /// The seats' exported names: their positions and windows (CY) and first x (CX).
 pub const SYMBOLS: &[(&str, &str)] = &[("spos", "u32"), ("sbase", "u32"), ("xs", "f32")];
 /// And with per-layer inputs: a launch's first lap's words (CY).
-pub const SYMBOLS_PLE: &[(&str, &str)] =
-    &[("spos", "u32"), ("sbase", "u32"), ("xs", "f32"), ("pls", "f32")];
+pub const SYMBOLS_PLE: &[(&str, &str)] = &[
+    ("spos", "u32"),
+    ("sbase", "u32"),
+    ("xs", "f32"),
+    ("pls", "f32"),
+];
 
 /// The seats a ring may hold: CY's word to the attention carries 2 seat + 1 under 2^8.
 const MOST: u32 = 127;
